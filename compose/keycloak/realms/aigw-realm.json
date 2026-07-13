@@ -1,0 +1,177 @@
+{
+  "realm": "aigw",
+  "enabled": true,
+  "displayName": "AI Gateway",
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxTemporaryLockouts": 0,
+  "bruteForceStrategy": "MULTIPLE",
+  "failureFactor": 5,
+  "waitIncrementSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "minimumQuickLoginWaitSeconds": 60,
+  "maxFailureWaitSeconds": 900,
+  "maxDeltaTimeSeconds": 43200,
+  "loginTheme": "keycloak",
+  "accessTokenLifespan": 600,
+  "roles": {
+    "realm": [
+      { "name": "aigw-admins", "description": "Admin portal + Grafana + rotation control" },
+      { "name": "aigw-developers", "description": "dev-portal self-service key issuance" },
+      { "name": "aigw-users", "description": "Open WebUI chat access" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "open-webui",
+      "name": "Open WebUI",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "${WEBUI_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://chat.aigw.example.internal/oauth/oidc/callback"],
+      "webOrigins": ["https://chat.aigw.example.internal"],
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "dev-portal",
+      "name": "Developer Portal",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "${PORTAL_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://portal.aigw.example.internal/auth/callback"],
+      "webOrigins": ["https://portal.aigw.example.internal"],
+      "attributes": {
+        "post.logout.redirect.uris": "https://portal.aigw.example.internal/login"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "admin-portal",
+      "name": "AI Gateway Admin Portal",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "${ADMIN_PORTAL_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://admin-portal.aigw.example.internal/auth/callback"],
+      "webOrigins": ["https://admin-portal.aigw.example.internal"],
+      "attributes": {
+        "post.logout.redirect.uris": "https://admin-portal.aigw.example.internal/login"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "admin-ui",
+      "name": "ADM reverse-proxy OIDC gates",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "${OAUTH2_PROXY_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "https://admin.aigw.example.internal/oauth2/callback",
+        "https://prometheus.aigw.example.internal/oauth2/callback",
+        "https://vault.aigw.example.internal/oauth2/callback"
+      ],
+      "webOrigins": [
+        "https://admin.aigw.example.internal",
+        "https://prometheus.aigw.example.internal",
+        "https://vault.aigw.example.internal"
+      ],
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "grafana",
+      "name": "Grafana",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "${GRAFANA_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://grafana.aigw.example.internal/login/generic_oauth"],
+      "webOrigins": ["https://grafana.aigw.example.internal"],
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

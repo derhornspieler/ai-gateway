@@ -1,0 +1,18 @@
+# Lab-only authoritative DNS. There is deliberately no `forward` plugin: this
+# container cannot recurse or relay arbitrary DNS traffic.
+aigw.internal:53 {
+    errors
+    health 127.0.0.1:8080
+    file /etc/coredns/zones/db.aigw.internal aigw.internal
+    cache 30
+}
+
+# If a client sends a non-aigw.internal name directly to this server, answer
+# NXDOMAIN instead of recursing. macOS normally sends only aigw.internal here
+# because the service is installed as a scoped resolver.
+.:53 {
+    errors
+    template ANY ANY {
+        rcode NXDOMAIN
+    }
+}

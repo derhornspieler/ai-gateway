@@ -1,0 +1,152 @@
+---
+# Safe partial converge: bring up the container stack ONLY.
+# Host network (routing, firewalld zones, docker networks) is already converged
+# on the target; re-running those roles is unnecessary for an app-only rollout.
+# docker_stack does not touch host networking, so it is safe in isolation.
+# Kept in the ansible/ project root so playbook-adjacent group_vars/all.yml loads.
+- name: AI Gateway — container stack only
+  hosts: gateway
+  become: true
+  pre_tasks:
+    # This partial play deliberately omits os_baseline. Refuse to recreate a
+    # single container unless the full converge has already enabled Docker's
+    # SELinux integration; host enforcement alone does not label containers.
+    - name: Preflight — read effective SELinux enforcement mode
+      ansible.builtin.command: getenforce
+      register: preflight_selinux_mode
+      changed_when: false
+
+    - name: Preflight — read Docker SELinux and state-root configuration
+      ansible.builtin.command: docker info --format=json
+      register: stack_only_docker_info
+      changed_when: false
+
+    - name: Preflight — require the fully converged SELinux container boundary
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.selinux.status == 'enabled'
+          - ansible_facts.selinux.mode == 'enforcing'
+          - ansible_facts.selinux.type == 'targeted'
+          - preflight_selinux_mode.stdout | trim == 'Enforcing'
+          - "'name=selinux' in (stack_only_docker_info.stdout | from_json).SecurityOptions"
+          - (stack_only_docker_info.stdout | from_json).DockerRootDir == docker_data_root
+        quiet: true
+        fail_msg: >-
+          Refusing stack-only mutation: run the full site.yml converge first so
+          Docker is SELinux-enabled on the reviewed data root. Stack-only must
+          never recreate the graph under an unconfined daemon.
+
+    - name: Preflight — capture the SELinux AVC audit window start
+      ansible.builtin.command: date +'%m/%d/%Y %H:%M:%S'
+      environment:
+        LC_ALL: C
+      register: aigw_selinux_audit_window_start
+      changed_when: false
+
+    - name: Preflight — require encrypted backing for all sensitive state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json, pathlib, subprocess, sys
+
+            errors = []
+            for configured in json.loads(sys.argv[1]):
+                path = pathlib.Path(configured)
+                probe = path
+                while not probe.exists() and probe != probe.parent:
+                    probe = probe.parent
+                found = subprocess.run(
+                    ["findmnt", "-n", "-o", "SOURCE", "-T", str(probe)],
+                    check=True, text=True, capture_output=True,
+                ).stdout.strip()
+                source = found.split("[", 1)[0]
+                ancestry = []
+                if source.startswith("/dev/"):
+                    ancestry = subprocess.run(
+                        ["lsblk", "-s", "-n", "-o", "FSTYPE", source],
+                        check=True, text=True, capture_output=True,
+                    ).stdout.splitlines()
+                if "crypto_LUKS" not in {value.strip() for value in ancestry}:
+                    errors.append(f"{configured}: {source or found} has no crypto_LUKS ancestor")
+            if errors:
+                raise SystemExit("; ".join(errors))
+          - "{{ encrypted_state_paths | to_json }}"
+      changed_when: false
+      when: require_encrypted_state | bool
+
+    - name: Preflight — read live DOCKER-USER policy
+      ansible.builtin.command: iptables -S DOCKER-USER
+      register: stack_only_du
+      changed_when: false
+
+    - name: Preflight — require identity-pinned egress and original-direction default drop
+      ansible.builtin.assert:
+        that:
+          - "'-i br-egress' in stack_only_du.stdout"
+          - "('-s ' ~ envoy_egress_ip ~ '/32') in stack_only_du.stdout"
+          - "('-o ' ~ nic_egress ~ ' -p tcp') in stack_only_du.stdout"
+          - "'--dport 443 -j RETURN' in stack_only_du.stdout"
+          - "'--ctdir REPLY -j RETURN' in stack_only_du.stdout"
+          - "'--ctdir ORIGINAL' in stack_only_du.stdout"
+          - "'--ctstate DNAT' in stack_only_du.stdout"
+          - "('--ctorigdst ' ~ eth1_ip) in stack_only_du.stdout"
+          - "('--ctorigdst ' ~ eth2_ip) in stack_only_du.stdout"
+          - "'-i br+ ! -o br+ -j DROP' in stack_only_du.stdout"
+        fail_msg: >-
+          Refusing stack-only deployment: live DOCKER-USER does not prove the
+          exact Envoy:443 allow plus the all-bridge original-direction drop.
+          Run the full site.yml network/firewall converge first.
+
+    - name: Preflight — read container-to-host boundary
+      ansible.builtin.command: nft list table inet aigw_guard
+      register: stack_only_host_input
+      changed_when: false
+
+    - name: Preflight — require every managed bridge to be denied new host connections
+      ansible.builtin.assert:
+        that:
+          - "'chain container_forward' in stack_only_host_input.stdout"
+          - "('ip saddr ' ~ envoy_egress_ip) in stack_only_host_input.stdout"
+          - "('ip daddr ' ~ container_dns_server) in stack_only_host_input.stdout"
+          - "'ct status dnat' in stack_only_host_input.stdout"
+          - "('ct original ip daddr ' ~ eth1_ip) in stack_only_host_input.stdout"
+          - "('ct original ip daddr ' ~ eth2_ip) in stack_only_host_input.stdout"
+          - "('iifname \"' ~ item.bridge ~ '\" drop') in stack_only_host_input.stdout"
+          - "('iifname \"' ~ item.bridge ~ '\" ct state established,related ct direction reply accept') in stack_only_host_input.stdout"
+        fail_msg: "Host INPUT boundary is missing for {{ item.bridge }}; run site.yml."
+      loop: "{{ docker_networks }}"
+      loop_control:
+        label: "{{ item.bridge }}"
+
+    - name: Preflight — require firewall services active
+      ansible.builtin.command: >-
+        systemctl is-active aigw-host-input-rules.service
+        docker-user-rules.service docker-user-rules-watch.service
+      register: stack_only_firewall_services
+      changed_when: false
+
+    - name: Preflight — inspect every required external Docker network
+      ansible.builtin.command: "docker network inspect {{ item.name }}"
+      loop: "{{ docker_networks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: stack_only_networks
+      changed_when: false
+
+    - name: Preflight — require exact bridge driver, name, subnet, and IPv6-off state
+      ansible.builtin.assert:
+        that:
+          - (item.stdout | from_json | first).Driver == 'bridge'
+          - (item.stdout | from_json | first).Internal == item.item.internal
+          - not ((item.stdout | from_json | first).EnableIPv6 | bool)
+          - (item.stdout | from_json | first).Options['com.docker.network.bridge.name'] == item.item.bridge
+          - item.item.subnet in ((item.stdout | from_json | first).IPAM.Config | map(attribute='Subnet') | list)
+        fail_msg: "Docker network {{ item.item.name }} does not match group_vars; run site.yml."
+      loop: "{{ stack_only_networks.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+  roles:
+    - role: docker_stack
+    - role: verify

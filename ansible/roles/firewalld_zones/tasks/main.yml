@@ -1,0 +1,382 @@
+---
+# Host INPUT and container FORWARD policy is established before any operation
+# that can reload firewalld or start Docker. The native nft guard survives a
+# firewalld reload; DOCKER-USER remains the Docker-supported second layer.
+
+- name: Install firewall and reload-watcher prerequisites
+  ansible.builtin.dnf:
+    name:
+      - firewalld
+      - nftables
+      - iptables-nft
+      - dbus-tools
+    state: present
+
+- name: Ensure firewalld running
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+
+- name: Install atomic DOCKER-USER policy
+  ansible.builtin.template:
+    src: docker-user-rules.sh.j2
+    dest: /usr/local/sbin/docker-user-rules.sh
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Install native container INPUT/FORWARD guard
+  ansible.builtin.template:
+    src: aigw-host-input-rules.sh.j2
+    dest: /usr/local/sbin/aigw-host-input-rules.sh
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Systemd unit — protect host listeners and forwarding before Docker
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/aigw-host-input-rules.service
+    content: |
+      [Unit]
+      Description=Apply native nft container INPUT/FORWARD guard
+      After=firewalld.service
+      Before=docker.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/aigw-host-input-rules.sh
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target docker.service
+    mode: "0644"
+  register: host_input_unit
+
+- name: Enable native container guard unit
+  ansible.builtin.systemd:
+    name: aigw-host-input-rules.service
+    enabled: true
+    state: started
+    daemon_reload: "{{ host_input_unit is changed }}"
+
+- name: Systemd unit — apply DOCKER-USER before Docker publishes ports
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker-user-rules.service
+    content: |
+      [Unit]
+      Description=Apply atomic DOCKER-USER firewall policy
+      After=firewalld.service aigw-host-input-rules.service
+      Wants=aigw-host-input-rules.service
+      Before=docker.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/docker-user-rules.sh
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target docker.service
+    mode: "0644"
+  register: du_unit
+
+- name: Enable DOCKER-USER unit
+  ansible.builtin.systemd:
+    name: docker-user-rules.service
+    enabled: true
+    state: started
+    daemon_reload: "{{ du_unit is changed }}"
+
+- name: Install firewalld reload watcher
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/docker-user-rules-watch.sh
+    owner: root
+    group: root
+    mode: "0750"
+    content: |
+      #!/usr/bin/env bash
+      # Managed by Ansible. Reassert both layers after firewalld Reloaded.
+      set -euo pipefail
+      dbus-monitor --system \
+        "type='signal',interface='org.fedoraproject.FirewallD1',member='Reloaded'" |
+      while read -r line; do
+        case "$line" in
+          *member=Reloaded*)
+            /usr/local/sbin/aigw-host-input-rules.sh
+            /usr/local/sbin/docker-user-rules.sh
+            ;;
+        esac
+      done
+  register: du_watch_script
+
+- name: Systemd unit — reapply policy after runtime firewalld reloads
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker-user-rules-watch.service
+    content: |
+      [Unit]
+      Description=Reapply AI Gateway container firewall after firewalld reloads
+      After=firewalld.service docker.service
+      Wants=firewalld.service
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/sbin/docker-user-rules-watch.sh
+      Restart=always
+      RestartSec=2
+      [Install]
+      WantedBy=multi-user.target
+    mode: "0644"
+  register: du_watch_unit
+
+- name: Enable and activate firewalld reload watcher
+  ansible.builtin.systemd:
+    name: docker-user-rules-watch.service
+    enabled: true
+    state: "{{ 'restarted' if (du_watch_unit is changed or du_watch_script is changed) else 'started' }}"
+    daemon_reload: "{{ du_watch_unit is changed }}"
+
+# Apply before the first zone-creation reload. On an upgrade with live
+# containers this closes the old policy immediately; on first installation
+# Docker has not started yet.
+- name: Apply native INPUT/FORWARD guard before firewalld churn
+  ansible.builtin.command: /usr/local/sbin/aigw-host-input-rules.sh
+  changed_when: false
+
+- name: Apply DOCKER-USER policy before firewalld churn
+  ansible.builtin.command: /usr/local/sbin/docker-user-rules.sh
+  changed_when: false
+
+# ── Host firewalld zones ───────────────────────────────────────────────
+- name: Create project-owned zones
+  ansible.posix.firewalld:
+    zone: "{{ item.zone }}"
+    state: present
+    permanent: true
+  loop: "{{ firewalld_zones }}"
+  notify: reload firewalld
+
+- name: Flush handlers so new zones exist at runtime
+  ansible.builtin.meta: flush_handlers
+
+- name: Read permanent project-zone targets
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - --permanent
+      - "--zone={{ item.zone }}"
+      - --get-target
+  loop: "{{ firewalld_zones }}"
+  register: permanent_zone_targets
+  changed_when: false
+
+- name: Set only drifted project-zone targets
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - --permanent
+      - "--zone={{ item.item.zone }}"
+      - "--set-target={{ item.item.target }}"
+  loop: "{{ permanent_zone_targets.results }}"
+  loop_control:
+    label: "{{ item.item.zone }}"
+  # firewalld accepts %%REJECT%% as a zone target but reports it canonically as
+  # REJECT. Compare canonical forms so an unchanged converge does not force a
+  # reload and transiently rebuild the live ruleset every time.
+  when: (item.stdout | trim) != (item.item.target | replace('%%', ''))
+  notify: reload firewalld
+
+# NetworkManager is authoritative for zones on Rocky 9. A permanent firewalld
+# interface entry is not sufficient: after a reload, an active profile with a
+# blank connection.zone is re-advertised into firewalld's default (public)
+# zone. Persist only this firewall-owned profile property. Never reactivate a
+# connection or modify its customer-supplied addresses, routes, gateway, DNS,
+# or interface binding.
+- name: Read the active NetworkManager connection UUID for each physical interface
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - --get-values
+      - GENERAL.CON-UUID
+      - device
+      - show
+      - "{{ item.1 }}"
+  loop: "{{ firewalld_zones | subelements('interfaces') }}"
+  loop_control:
+    label: "{{ item.1 }} -> {{ item.0.zone }}"
+  register: aigw_active_nm_connections
+  changed_when: false
+
+- name: Initialize the physical-interface NetworkManager zone map
+  ansible.builtin.set_fact:
+    aigw_nm_zone_bindings: []
+
+- name: Build the physical-interface NetworkManager zone map
+  ansible.builtin.set_fact:
+    aigw_nm_zone_bindings: >-
+      {{
+        aigw_nm_zone_bindings +
+        [{
+          'interface': item.item.1,
+          'zone': item.item.0.zone,
+          'uuid': item.stdout | trim
+        }]
+      }}
+  loop: "{{ aigw_active_nm_connections.results }}"
+  loop_control:
+    label: "{{ item.item.1 }} -> {{ item.item.0.zone }}"
+
+- name: Require one safe, unique active NetworkManager profile per physical interface
+  ansible.builtin.assert:
+    that:
+      - item.uuid is match('^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')
+      - item.interface in ansible_facts.interfaces
+    quiet: true
+    fail_msg: >-
+      {{ item.interface }} must have one active, UUID-addressable NetworkManager
+      profile before its firewalld zone can be persisted safely.
+  loop: "{{ aigw_nm_zone_bindings }}"
+  loop_control:
+    label: "{{ item.interface }}"
+
+- name: Require distinct NetworkManager profiles for the physical interfaces
+  ansible.builtin.assert:
+    that:
+      - >-
+        (aigw_nm_zone_bindings | map(attribute='uuid') | unique | length) ==
+        (aigw_nm_zone_bindings | length)
+    quiet: true
+    fail_msg: Each physical interface must have a distinct active NetworkManager profile.
+
+- name: Read saved NetworkManager zones for the physical interfaces
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - --get-values
+      - connection.zone
+      - connection
+      - show
+      - uuid
+      - "{{ item.uuid }}"
+  loop: "{{ aigw_nm_zone_bindings }}"
+  loop_control:
+    label: "{{ item.interface }} -> {{ item.zone }}"
+  register: aigw_saved_nm_zones
+  changed_when: false
+
+- name: Persist only drifted NetworkManager firewalld zones without cycling links
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - connection
+      - modify
+      - uuid
+      - "{{ item.item.uuid }}"
+      - connection.zone
+      - "{{ item.item.zone }}"
+  loop: "{{ aigw_saved_nm_zones.results }}"
+  loop_control:
+    label: "{{ item.item.interface }} -> {{ item.item.zone }}"
+  when: item.stdout | trim != item.item.zone
+
+- name: Prove saved NetworkManager firewalld zones before any later reload
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - --get-values
+      - connection.zone
+      - connection
+      - show
+      - uuid
+      - "{{ item.uuid }}"
+  loop: "{{ aigw_nm_zone_bindings }}"
+  loop_control:
+    label: "{{ item.interface }} -> {{ item.zone }}"
+  register: aigw_persisted_nm_zones
+  changed_when: false
+  failed_when: aigw_persisted_nm_zones.stdout | trim != item.zone
+
+- name: Bind interfaces to project zones
+  ansible.posix.firewalld:
+    zone: "{{ item.0.zone }}"
+    interface: "{{ item.1 }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ firewalld_zones | subelements('interfaces') }}"
+
+# Customer addresses/routes remain immutable. Reassert only runtime zone
+# ownership on NetworkManager link events; never cycle a connection.
+- name: Reassert firewalld zones after NetworkManager link events
+  ansible.builtin.template:
+    src: 91-aigw-firewalld-zones.j2
+    dest: /etc/NetworkManager/dispatcher.d/91-aigw-firewalld-zones
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Remove legacy zone-wide port openings
+  ansible.posix.firewalld:
+    zone: "{{ item.zone }}"
+    port: "{{ item.port }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  loop:
+    - { zone: aigw-adm, port: 22/tcp }
+    - { zone: aigw-adm, port: 443/tcp }
+    - { zone: aigw-adm, port: 53/tcp }
+    - { zone: aigw-adm, port: 53/udp }
+    - { zone: aigw-internal, port: 443/tcp }
+
+- name: Remove legacy source-to-zone assignments
+  ansible.posix.firewalld:
+    zone: "{{ item.zone }}"
+    source: "{{ item.source }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  loop:
+    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}" }
+    - { zone: aigw-internal, source: "{{ internal_cidr }}" }
+
+- name: Allow ports only from approved source CIDRs
+  ansible.posix.firewalld:
+    zone: "{{ item.0.zone }}"
+    rich_rule: "{{ item.1 }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ firewalld_zones | subelements('rich_rules') }}"
+
+- name: Reconcile lab-only source-scoped authoritative DNS rules
+  ansible.posix.firewalld:
+    zone: "{{ item.zone }}"
+    rich_rule: >-
+      rule family="ipv4" source address="{{ item.source }}"
+      destination address="{{ item.destination }}" port port="53"
+      protocol="{{ item.protocol }}" accept
+    permanent: true
+    immediate: true
+    state: "{{ 'enabled' if (lab_dns_enabled | bool) else 'disabled' }}"
+  loop:
+    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}", destination: "{{ eth1_ip }}", protocol: tcp }
+    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}", destination: "{{ eth1_ip }}", protocol: udp }
+    - { zone: aigw-internal, source: "{{ internal_cidr }}", destination: "{{ eth2_ip }}", protocol: tcp }
+    - { zone: aigw-internal, source: "{{ internal_cidr }}", destination: "{{ eth2_ip }}", protocol: udp }
+
+- name: Read denied-packet logging mode
+  ansible.builtin.command: firewall-cmd --get-log-denied
+  register: firewalld_log_denied
+  changed_when: false
+
+- name: Enable denied-unicast logging only when drifted
+  ansible.builtin.command: firewall-cmd --set-log-denied=unicast
+  when: firewalld_log_denied.stdout | trim != 'unicast'
+
+# Drain the target-change reload, wait for the watcher transaction, then apply
+# once more synchronously. No later task in this role changes firewalld state.
+- name: Flush final firewalld handler
+  ansible.builtin.meta: flush_handlers
+
+- name: Reassert native guard after all firewalld reloads
+  ansible.builtin.command: /usr/local/sbin/aigw-host-input-rules.sh
+  changed_when: false
+
+- name: Reassert DOCKER-USER after all firewalld reloads
+  ansible.builtin.command: /usr/local/sbin/docker-user-rules.sh
+  changed_when: false

@@ -1,0 +1,204 @@
+{
+  "realm": "aigw",
+  "enabled": true,
+  "displayName": "AI Gateway",
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxTemporaryLockouts": 0,
+  "bruteForceStrategy": "MULTIPLE",
+  "failureFactor": 5,
+  "waitIncrementSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "minimumQuickLoginWaitSeconds": 60,
+  "maxFailureWaitSeconds": 900,
+  "maxDeltaTimeSeconds": 43200,
+  "loginTheme": "keycloak",
+  "accessTokenLifespan": 600,
+  "roles": {
+    "realm": [
+      { "name": "aigw-admins", "description": "Admin portal + Grafana + rotation control" },
+      { "name": "aigw-developers", "description": "dev-portal self-service key issuance" },
+      { "name": "aigw-users", "description": "Open WebUI chat access" }
+    ]
+  },
+{# Test users are seeded ONLY when aigw_seed_test_users is explicitly enabled
+   (defaults OFF — see group_vars/all.yml). Passwords must come from an
+   Ansible-Vault/SOPS overlay; templating fails loudly if they are unset. #}
+{% if aigw_seed_test_users | default(false) %}
+  "users": [
+    {
+      "username": "testadmin",
+      "enabled": true,
+      "email": "testadmin@{{ aigw_domain }}",
+      "emailVerified": true,
+      "firstName": "Test",
+      "lastName": "Admin",
+      "credentials": [{ "type": "password", "value": {{ aigw_test_admin_password | mandatory("aigw_test_admin_password must be set (vault overlay) when aigw_seed_test_users is true") | to_json }}, "temporary": false }],
+      "realmRoles": ["aigw-admins", "aigw-developers", "aigw-users"]
+    },
+    {
+      "username": "testuser",
+      "enabled": true,
+      "email": "testuser@{{ aigw_domain }}",
+      "emailVerified": true,
+      "firstName": "Test",
+      "lastName": "User",
+      "credentials": [{ "type": "password", "value": {{ aigw_test_user_password | mandatory("aigw_test_user_password must be set (vault overlay) when aigw_seed_test_users is true") | to_json }}, "temporary": false }],
+      "realmRoles": ["aigw-developers", "aigw-users"]
+    }
+  ],
+{% endif %}
+  "clients": [
+    {
+      "clientId": "open-webui",
+      "name": "Open WebUI",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": {{ webui_oidc_client_secret | mandatory("webui_oidc_client_secret must be set in an ansible-vault overlay (alphanumeric [A-Za-z0-9] only — Keycloak realm import mangles $ / ${...})") | to_json }},
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://chat.{{ aigw_domain }}/oauth/oidc/callback"],
+      "webOrigins": ["https://chat.{{ aigw_domain }}"],
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "dev-portal",
+      "name": "Developer Portal",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": {{ portal_oidc_client_secret | mandatory("portal_oidc_client_secret must be set in an ansible-vault overlay (alphanumeric [A-Za-z0-9] only — Keycloak realm import mangles $ / ${...})") | to_json }},
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://portal.{{ aigw_domain }}/auth/callback"],
+      "webOrigins": ["https://portal.{{ aigw_domain }}"],
+      "attributes": {
+        "post.logout.redirect.uris": "https://portal.{{ aigw_domain }}/login"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "admin-portal",
+      "name": "AI Gateway Admin Portal",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": {{ admin_portal_oidc_client_secret | mandatory("admin_portal_oidc_client_secret must be set in an ansible-vault overlay") | to_json }},
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://admin-portal.{{ aigw_domain }}/auth/callback"],
+      "webOrigins": ["https://admin-portal.{{ aigw_domain }}"],
+      "attributes": {
+        "post.logout.redirect.uris": "https://admin-portal.{{ aigw_domain }}/login"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "admin-ui",
+      "name": "ADM reverse-proxy OIDC gates",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": {{ oauth2_proxy_client_secret | mandatory("oauth2_proxy_client_secret must be set in an ansible-vault overlay (alphanumeric [A-Za-z0-9] only — Keycloak realm import mangles $ / ${...})") | to_json }},
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "https://admin.{{ aigw_domain }}/oauth2/callback",
+        "https://prometheus.{{ aigw_domain }}/oauth2/callback",
+        "https://vault.{{ aigw_domain }}/oauth2/callback"
+      ],
+      "webOrigins": [
+        "https://admin.{{ aigw_domain }}",
+        "https://prometheus.{{ aigw_domain }}",
+        "https://vault.{{ aigw_domain }}"
+      ],
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "grafana",
+      "name": "Grafana",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": {{ grafana_oidc_client_secret | mandatory("grafana_oidc_client_secret must be set in an ansible-vault overlay") | to_json }},
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["https://grafana.{{ aigw_domain }}/login/generic_oauth"],
+      "webOrigins": ["https://grafana.{{ aigw_domain }}"],
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

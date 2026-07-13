@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# NetworkManager dispatcher: reassert only this project's policy tables/rules.
+set -euo pipefail
+
+device="${1:-}"
+action="${2:-}"
+
+case "$action" in
+  up|reapply|dhcp4-change)
+    exec /usr/local/sbin/aigw-policy-routing "$device"
+    ;;
+esac
+
+exit 0

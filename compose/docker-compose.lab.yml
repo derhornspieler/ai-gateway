@@ -1,0 +1,168 @@
+# Parallels/Rocky 9 identity lab overlay.
+#
+# This file is never loaded by the generic deployment. Use it only with the
+# explicit lab profile:
+#   docker compose -f docker-compose.yml -f docker-compose.lab.yml \
+#     --profile lab-ad up -d
+
+networks:
+  net-identity:
+    external: true
+  net-lab-dns:
+    external: true
+
+volumes:
+  samba_ad_config:
+  samba_ad_state:
+  samba_ad_public:
+
+services:
+  # Authoritative, non-recursive DNS for the Mac's scoped aigw.internal
+  # resolver. The dedicated bridge has no application-plane adjacency;
+  # DOCKER-USER/native firewall default-deny rules block its egress while
+  # allowing these exact ADM-bound published ports to function.
+  lab-dns:
+    profiles: [lab-ad]
+    build:
+      context: ./services/lab-dns
+      network: none
+    image: ai-gateway/lab-dns:1.14.4
+    command: [-conf, /etc/coredns/Corefile]
+    restart: unless-stopped
+    privileged: false
+    user: "65532:65532"
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    # The official image carries this file capability on /coredns; retaining
+    # only the matching bounding capability is required for exec and :53.
+    cap_add: [NET_BIND_SERVICE]
+    pids_limit: 64
+    labels:
+      com.aigw.contract.selinux-generation: "1"
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_LAB_DNS:?AIGW_BIND_DIGEST_LAB_DNS must be set}
+    deploy:
+      resources:
+        limits: { memory: 64M, cpus: "0.25", pids: 64 }
+    ports:
+      - "${ETH1_IP:?ETH1_IP must be set}:53:53/tcp"
+      - "${ETH1_IP:?ETH1_IP must be set}:53:53/udp"
+      - "${ETH2_IP:?ETH2_IP must be set}:53:53/tcp"
+      - "${ETH2_IP:?ETH2_IP must be set}:53:53/udp"
+    volumes:
+      - ./services/lab-dns/Corefile:/etc/coredns/Corefile:ro,Z
+      - ./services/lab-dns/db.aigw.internal:/etc/coredns/zones/db.aigw.internal:ro,Z
+    networks:
+      net-lab-dns:
+        ipv4_address: ${LAB_DNS_IP:?LAB_DNS_IP must be set}
+    healthcheck:
+      test: [CMD, /dns-healthcheck]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+        labels: "com.docker.compose.project,com.docker.compose.service"
+
+  samba-ad:
+    profiles: [lab-ad]
+    build:
+      context: ./services/samba-ad-lab
+      # Build-time package retrieval uses host egress; the running AD service
+      # remains isolated on net-identity with no physical-network allowance.
+      network: host
+    hostname: samba-ad
+    restart: unless-stopped
+    privileged: false
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add:
+      [CHOWN, DAC_OVERRIDE, NET_BIND_SERVICE, SETGID, SETUID, SYS_ADMIN]
+    dns: [127.0.0.1]
+    pids_limit: 2048
+    labels:
+      com.aigw.contract.selinux-generation: "1"
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_SAMBA_AD:?AIGW_BIND_DIGEST_SAMBA_AD must be set}
+    tmpfs:
+      - /run
+      - /tmp
+      - /var/cache/samba
+      - /var/log/samba
+    deploy:
+      resources:
+        limits: { memory: 2G, cpus: "2.0", pids: 2048 }
+    environment:
+      SAMBA_REALM: LAB.AIGW.INTERNAL
+      SAMBA_DOMAIN: AIGWLAB
+      SAMBA_HOSTNAME: samba-ad
+      SAMBA_BIND_USER: svc-keycloak-ldap
+      SAMBA_ADMIN_PASSWORD_FILE: /run/secrets/samba_ad_admin_password
+      SAMBA_BIND_PASSWORD_FILE: /run/secrets/samba_ad_bind_password
+      SAMBA_SEED_USERS: lab-admin,lab-developer,lab-user
+    volumes:
+      # File-backed Compose secrets are ordinary bind mounts and cannot carry
+      # an explicit SELinux relabel contract. Keep the same in-container
+      # secret-file API with explicitly checked binds instead. The LDAP bind
+      # value alone is shared with key-rotator; every other source is private
+      # to this lab-only DC. Direct Compose invocation is forbidden; Ansible's
+      # preflight prevents short syntax from ever creating a missing directory.
+      # Ansible has already failed closed unless each source is a regular,
+      # single-link file with the exact root-only/group-readable mode. Short
+      # syntax is required for reliable Engine-side z/Z relabeling.
+      - ./secrets/samba_ad_admin_password:/run/secrets/samba_ad_admin_password:ro,Z
+      - ./secrets/samba_ad_bind_password:/run/secrets/samba_ad_bind_password:ro,z
+      - ./secrets/samba_user_lab-admin_password:/run/secrets/samba_user_lab-admin_password:ro,Z
+      - ./secrets/samba_user_lab-developer_password:/run/secrets/samba_user_lab-developer_password:ro,Z
+      - ./secrets/samba_user_lab-user_password:/run/secrets/samba_user_lab-user_password:ro,Z
+      - samba_ad_config:/etc/samba
+      - samba_ad_state:/var/lib/samba
+      - samba_ad_public:/var/lib/samba-public
+    networks: [net-identity]
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+        labels: "com.docker.compose.project,com.docker.compose.service"
+    # Repeat the image contract explicitly so a rendered Compose audit can
+    # prove it. The script validates database/config presence, Samba control
+    # responsiveness, domain policy, and hostname-verified LDAPS—not only PID.
+    healthcheck:
+      test: [CMD, /usr/local/sbin/samba-ad-healthcheck]
+      interval: 15s
+      timeout: 8s
+      retries: 4
+      start_period: 90s
+
+  keycloak:
+    environment:
+      # Trust only the lab DC's published certificate for LDAPS federation.
+      KC_TRUSTSTORE_PATHS: /var/lib/samba-public/ca.pem
+    volumes:
+      - samba_ad_public:/var/lib/samba-public:ro
+    networks:
+      net-identity: {}
+    depends_on:
+      postgres:
+        condition: service_started
+      samba-ad:
+        condition: service_healthy
+        required: true
+
+  key-rotator:
+    environment:
+      LAB_SAMBA_LDAP_ENABLED: "true"
+      LAB_SAMBA_LDAP_URL: ldaps://samba-ad:636
+      LAB_SAMBA_USERS_DN: OU=AIGWUsers,DC=lab,DC=aigw,DC=internal
+      LAB_SAMBA_BIND_DN: CN=svc-keycloak-ldap,CN=Users,DC=lab,DC=aigw,DC=internal
+      LAB_SAMBA_BIND_PASSWORD_FILE: /run/secrets/samba_keycloak_bind_password
+    volumes:
+      - ./secrets/samba_ad_bind_password:/run/secrets/samba_keycloak_bind_password:ro,z
+    labels:
+      com.aigw.contract.selinux-generation: "1"
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_KEY_ROTATOR_LAB:?AIGW_BIND_DIGEST_KEY_ROTATOR_LAB must be set}

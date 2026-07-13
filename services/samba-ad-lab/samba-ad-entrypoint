@@ -1,0 +1,152 @@
+#!/bin/sh
+set -eu
+
+umask 077
+
+STATE_DB=/var/lib/samba/private/sam.ldb
+CONFIG=/etc/samba/smb.conf
+BOOTSTRAP_MARKER=/var/lib/samba/.aigw-bootstrap-complete
+TLS_DIR=/var/lib/samba/private/tls
+PUBLIC_DIR=${SAMBA_PUBLIC_DIR:-/var/lib/samba-public}
+# Fixed lab password-spray control. Keep this non-permanent and bounded: an
+# attacker who knows a username can cause at most a 15-minute denial, while
+# five bad attempts still stop high-rate guessing against the lab directory.
+LOCKOUT_THRESHOLD=5
+LOCKOUT_DURATION_MINUTES=15
+LOCKOUT_RESET_MINUTES=15
+
+die() {
+    printf '%s\n' "samba-ad-lab: $*" >&2
+    exit 1
+}
+
+require_name() {
+    label=$1
+    value=$2
+    pattern=$3
+    printf '%s' "$value" | grep -Eq "$pattern" \
+        || die "$label contains unsupported characters"
+}
+
+realm=${SAMBA_REALM:-LAB.AIGW.INTERNAL}
+domain=${SAMBA_DOMAIN:-AIGWLAB}
+hostname_short=${SAMBA_HOSTNAME:-samba-ad}
+admin_password_file=${SAMBA_ADMIN_PASSWORD_FILE:-/run/secrets/samba_ad_admin_password}
+bind_password_file=${SAMBA_BIND_PASSWORD_FILE:-/run/secrets/samba_ad_bind_password}
+bind_user=${SAMBA_BIND_USER:-svc-keycloak-ldap}
+human_users_ou=${SAMBA_HUMAN_USERS_OU:-AIGWUsers}
+
+require_name SAMBA_REALM "$realm" '^[A-Z0-9][A-Z0-9.-]{2,252}[A-Z0-9]$'
+require_name SAMBA_DOMAIN "$domain" '^[A-Z0-9][A-Z0-9-]{0,14}$'
+require_name SAMBA_HOSTNAME "$hostname_short" '^[a-z0-9][a-z0-9-]{0,62}$'
+require_name SAMBA_BIND_USER "$bind_user" '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+require_name SAMBA_HUMAN_USERS_OU "$human_users_ou" '^[A-Za-z][A-Za-z0-9-]{0,63}$'
+
+domain_dn="DC=$(printf '%s' "$realm" | sed 's/\./,DC=/g')"
+human_users_dn="OU=$human_users_ou,$domain_dn"
+
+if [ ! -f "$STATE_DB" ]; then
+    if [ -e "$CONFIG" ] || find /var/lib/samba -mindepth 1 \
+        \( -type f -o -type l \) -print -quit | grep -q .; then
+        die "refusing to overwrite a partial or inconsistent domain provision"
+    fi
+
+    samba-ad-secret-tool domain-provision \
+        "$admin_password_file" "$realm" "$domain" "$hostname_short"
+fi
+
+if [ ! -f "$BOOTSTRAP_MARKER" ]; then
+    [ -s "$STATE_DB" ] || die "bootstrap state is missing the domain database"
+    [ -s "$CONFIG" ] || die "bootstrap state is missing smb.conf"
+
+    if samba-tool user show "$bind_user" >/dev/null 2>&1; then
+        samba-ad-secret-tool user-setpassword "$bind_password_file" "$bind_user"
+    else
+        samba-ad-secret-tool bind-user-create "$bind_password_file" "$bind_user"
+    fi
+    samba-tool user setexpiry "$bind_user" --noexpiry
+    touch "$BOOTSTRAP_MARKER"
+fi
+
+[ -s "$CONFIG" ] || die "domain database exists but smb.conf is missing"
+
+# Domain policy lives in sam.ldb, so reconcile it on every start rather than
+# assuming the one-time bootstrap marker still represents current state.
+samba-tool domain passwordsettings set \
+    --account-lockout-threshold="$LOCKOUT_THRESHOLD" \
+    --account-lockout-duration="$LOCKOUT_DURATION_MINUTES" \
+    --reset-account-lockout-after="$LOCKOUT_RESET_MINUTES" \
+    --quiet
+password_settings=$(samba-tool domain passwordsettings show)
+printf '%s\n' "$password_settings" \
+    | grep -Eq "^Account lockout threshold \(attempts\):[[:space:]]+$LOCKOUT_THRESHOLD$" \
+    || die "account lockout threshold did not persist"
+printf '%s\n' "$password_settings" \
+    | grep -Eq "^Account lockout duration \(mins\):[[:space:]]+$LOCKOUT_DURATION_MINUTES$" \
+    || die "account lockout duration did not persist"
+printf '%s\n' "$password_settings" \
+    | grep -Eq "^Reset account lockout after \(mins\):[[:space:]]+$LOCKOUT_RESET_MINUTES$" \
+    || die "account lockout reset window did not persist"
+
+# Keep disposable human identities out of AD's broad CN=Users container,
+# which also holds privileged/system principals such as Administrator.  The
+# Keycloak lab provider is rooted at this OU, making those built-ins
+# impossible to import or assign through the portal. Existing lab volumes are
+# migrated idempotently below.
+if ! samba-tool ou list --full-dn | grep -Fxiq "$human_users_dn"; then
+    samba-tool ou create "OU=$human_users_ou" \
+        --description='AI Gateway disposable lab identities'
+fi
+
+# Seed only explicitly requested disposable lab identities. Passwords remain
+# Samba-owned and arrive through per-user secret files; a restart never resets
+# an existing user's password.
+old_ifs=$IFS
+IFS=,
+for seed_user in ${SAMBA_SEED_USERS:-}; do
+    IFS=$old_ifs
+    require_name SAMBA_SEED_USERS "$seed_user" '^[a-z][a-z0-9-]{0,31}$'
+    if ! samba-tool user show "$seed_user" >/dev/null 2>&1; then
+        samba-ad-secret-tool user-create \
+            "/run/secrets/samba_user_${seed_user}_password" \
+            "$seed_user" "OU=$human_users_ou"
+        samba-tool user setexpiry "$seed_user" --noexpiry
+    else
+        current_dn=$(samba-tool user show "$seed_user" \
+            --attributes=distinguishedName \
+            | sed -n 's/^distinguishedName: //p')
+        case "$current_dn" in
+            *",$human_users_dn") ;;
+            *) samba-tool user move "$seed_user" "$human_users_dn" ;;
+        esac
+    fi
+    IFS=,
+done
+IFS=$old_ifs
+
+# Samba's private-key-jwt use is unrelated to this certificate. This TLS key
+# protects LDAP bind and user-password validation between Keycloak and the lab
+# DC. A self-signed leaf is sufficient because Keycloak trusts this exact
+# certificate through the read-only public volume; no browser receives it.
+mkdir -p "$TLS_DIR" "$PUBLIC_DIR"
+fqdn=$(printf '%s.%s' "$hostname_short" "$realm" | tr '[:upper:]' '[:lower:]')
+if [ ! -s "$TLS_DIR/key.pem" ] || [ ! -s "$TLS_DIR/cert.pem" ]; then
+    openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 825 \
+        -subj "/CN=$fqdn" \
+        -addext "subjectAltName=DNS:$hostname_short,DNS:$fqdn" \
+        -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+        -addext 'extendedKeyUsage=serverAuth' \
+        -keyout "$TLS_DIR/key.pem" \
+        -out "$TLS_DIR/cert.pem" >/dev/null 2>&1
+    cp "$TLS_DIR/cert.pem" "$TLS_DIR/ca.pem"
+    chmod 0600 "$TLS_DIR/key.pem"
+    chmod 0644 "$TLS_DIR/cert.pem" "$TLS_DIR/ca.pem"
+fi
+
+if [ ! -s "$PUBLIC_DIR/ca.pem" ] \
+    || ! cmp -s "$TLS_DIR/ca.pem" "$PUBLIC_DIR/ca.pem"; then
+    cp "$TLS_DIR/ca.pem" "$PUBLIC_DIR/ca.pem"
+    chmod 0644 "$PUBLIC_DIR/ca.pem"
+fi
+
+exec "$@"

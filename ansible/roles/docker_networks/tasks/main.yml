@@ -1,0 +1,55 @@
+---
+# Fixed subnets so firewalld/DOCKER-USER can reference them.
+# All plain NAT bridges — macvlan/ipvlan rejected (solution-map §7).
+
+# os_baseline may have notified a Docker restart after changing daemon.json.
+# Drain it only now: firewalld_zones has already installed and applied the
+# DOCKER-USER policy, so even restored restart-policy containers fail closed.
+- name: Activate pending Docker daemon configuration behind the live firewall
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start Docker only after DOCKER-USER is live
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Reassert atomic DOCKER-USER policy after Docker startup
+  ansible.builtin.command: /usr/local/sbin/docker-user-rules.sh
+  changed_when: false
+  when: manage_firewalld | bool
+
+- name: Require Docker to evaluate DOCKER-USER before creating networks
+  ansible.builtin.command: iptables -C FORWARD -j DOCKER-USER
+  changed_when: false
+  when: manage_firewalld | bool
+
+- name: Create docker networks
+  community.docker.docker_network:
+    name: "{{ item.name }}"
+    driver: bridge
+    internal: "{{ item.internal }}"
+    enable_ipv6: false
+    ipam_config:
+      - subnet: "{{ item.subnet }}"
+        # Reserve the lower half for the fixed workload addresses that form
+        # the proxy/firewall ABI. Without a separate dynamic pool, concurrent
+        # Compose startup can allocate .2/.3 to an ordinary service before its
+        # fixed-IP owner attaches, producing a nondeterministic collision.
+        iprange: "{{ item.subnet | regex_replace('\\.0/24$', '.128/25') }}"
+    driver_options:
+      # stable bridge names -> referencable in firewall rules / debugging
+      com.docker.network.bridge.name: "{{ item.bridge }}"
+    state: present
+  loop: "{{ docker_networks }}"
+
+# moby#48375: new bridges aren't always auto-added to firewalld's docker
+# zone. Assert/repair instead of trusting it.
+- name: Pin bridges into firewalld docker zone
+  ansible.builtin.command: >
+    firewall-cmd --zone=docker
+    --change-interface={{ item.bridge }}
+  loop: "{{ docker_networks }}"
+  register: zone_pin
+  changed_when: "'success' in zone_pin.stdout"
+  when: manage_firewalld | bool

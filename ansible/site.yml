@@ -1,0 +1,411 @@
+---
+# Ordering is deliberate: sysctl + routing + firewalld (incl. DOCKER-USER
+# egress lockdown) must be LIVE before docker_networks/docker_stack bring
+# containers up; stack starts last; verify asserts all. network_routing and
+# firewalld_zones flush their own handlers in-role — nothing security-relevant
+# may be deferred to end-of-play handlers, or containers would run unlocked
+# and verify would assert against unpopulated state.
+- name: AI Gateway host — full converge
+  hosts: gateway
+  become: true
+  pre_tasks:
+    # These checks intentionally run before os_baseline. A stale NIC mapping
+    # must not install/restart Docker or alter forwarding before we fail.
+    - name: Preflight — read effective SELinux enforcement mode
+      ansible.builtin.command: getenforce
+      register: preflight_selinux_mode
+      changed_when: false
+
+    - name: Preflight — require the Rocky targeted policy in enforcing mode
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.selinux.status == 'enabled'
+          - ansible_facts.selinux.mode == 'enforcing'
+          - ansible_facts.selinux.type == 'targeted'
+          - preflight_selinux_mode.stdout | trim == 'Enforcing'
+        quiet: true
+        fail_msg: >-
+          Refusing to mutate host: AI Gateway requires the Rocky targeted
+          SELinux policy loaded in enforcing mode before Docker is installed
+          or restarted. Host enforcement without Docker labeling is not an
+          acceptable container boundary.
+
+    - name: Preflight — capture the SELinux AVC audit window start
+      ansible.builtin.command: date +'%m/%d/%Y %H:%M:%S'
+      environment:
+        LC_ALL: C
+      register: aigw_selinux_audit_window_start
+      changed_when: false
+
+    - name: Preflight — require concrete, syntactically valid topology inputs
+      ansible.builtin.assert:
+        that:
+          - deployment_profile | length > 0
+          - stack_dir is string
+          - stack_dir | length <= 192
+          - stack_dir is match('^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}$')
+          - docker_data_root is string
+          - docker_data_root | length <= 192
+          - docker_data_root is match('^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}$')
+          - stack_dir != docker_data_root
+          - not stack_dir.startswith(docker_data_root ~ '/')
+          - not docker_data_root.startswith(stack_dir ~ '/')
+          - compose_project_name is string
+          - compose_project_name is match('^[a-z0-9][a-z0-9_-]{0,62}$')
+          - nic_egress is match('^[A-Za-z0-9_.:-]{1,15}$')
+          - nic_adm is match('^[A-Za-z0-9_.:-]{1,15}$')
+          - nic_internal is match('^[A-Za-z0-9_.:-]{1,15}$')
+          - eth0_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - eth1_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - eth2_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - eth0_gateway is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - eth1_gateway is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - eth2_gateway is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - vpn_client_cidr is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[1-9]|[12][0-9]|3[0-2])$')
+          - internal_cidr is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[1-9]|[12][0-9]|3[0-2])$')
+          - container_dns_server is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - not container_dns_server.startswith('127.')
+          - not container_dns_server.startswith('169.254.')
+          - not container_dns_server.startswith('224.')
+          - envoy_egress_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - alloy_internal_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - lab_dns_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - not (cribl_external_export_enabled | bool) or
+            cribl_otlp_allowed_cidr is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[1-9]|[12][0-9]|3[0-2])$')
+          - not (cribl_external_export_enabled | bool) or
+            (cribl_otlp_allowed_port | int >= 1 and cribl_otlp_allowed_port | int <= 65535)
+          - (cribl_external_export_enabled | bool) or cribl_otlp_endpoint == 'cribl-mock:4317'
+          - not (cribl_external_export_enabled | bool) or cribl_otlp_endpoint != 'cribl-mock:4317'
+          - pbr_tables | map(attribute='id') | unique | length == pbr_tables | length
+          - pbr_tables | map(attribute='name') | unique | length == pbr_tables | length
+          - pbr_tables | map(attribute='priority') | unique | length == pbr_tables | length
+        fail_msg: >-
+          Refusing to mutate host: supply canonical bounded stack/Docker paths,
+          a safe Compose project name, the three NIC names, three existing IPv4
+          addresses, three gateways, and ADM/internal source CIDRs via an
+          environment inventory, --extra-vars, or documented AIGW_* variables.
+
+    - name: Preflight — validate all three NIC identities before mutation
+      ansible.builtin.assert:
+        that:
+          - nic_egress in ansible_facts.interfaces
+          - nic_adm in ansible_facts.interfaces
+          - nic_internal in ansible_facts.interfaces
+          - "[nic_egress, nic_adm, nic_internal] | unique | length == 3"
+          - ansible_facts[nic_egress].ipv4.address == eth0_ip
+          - ansible_facts[nic_adm].ipv4.address == eth1_ip
+          - ansible_facts[nic_internal].ipv4.address == eth2_ip
+          - ansible_facts.default_ipv4.interface == nic_egress
+          - ansible_facts.default_ipv4.gateway == eth0_gateway
+        fail_msg: >-
+          Refusing to mutate host: configured egress/ADM/internal NICs must be
+          distinct, own the expected IPs, and the only default route must be on
+          the configured egress interface/gateway.
+
+    - name: Preflight — read main-table default routes
+      ansible.builtin.command:
+        argv: [ip, -4, -o, route, show, table, main, default]
+      register: preflight_main_defaults
+      changed_when: false
+
+    - name: Preflight — require exactly one existing egress default
+      ansible.builtin.assert:
+        that:
+          - preflight_main_defaults.stdout_lines | length == 1
+          - "'dev ' ~ nic_egress in preflight_main_defaults.stdout"
+          - "'via ' ~ eth0_gateway in preflight_main_defaults.stdout"
+        fail_msg: >-
+          Refusing to mutate host: the main table must already have exactly one
+          default route through the supplied egress NIC and gateway.
+
+    - name: Preflight — read live main-table routes as structured data
+      ansible.builtin.command:
+        argv: [ip, -j, -4, route, show, table, main]
+      register: preflight_main_routes_json
+      changed_when: false
+
+    - name: Preflight — reject Docker subnet collisions and invalid fixed workload IPs
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import ipaddress, json, sys
+
+            networks = json.loads(sys.argv[1])
+            routes = json.loads(sys.argv[2])
+            protected = [ipaddress.ip_network(value, strict=False)
+                         for value in json.loads(sys.argv[3])]
+            envoy_ip = ipaddress.ip_address(sys.argv[4])
+            alloy_ip = ipaddress.ip_address(sys.argv[5])
+            lab_dns_ip = ipaddress.ip_address(sys.argv[6])
+            declared_egress = ipaddress.ip_network(sys.argv[7], strict=True)
+
+            parsed = []
+            errors = []
+            for item in networks:
+                network = ipaddress.ip_network(item["subnet"], strict=True)
+                parsed.append((item["name"], item["bridge"], network))
+
+            for index, (name, bridge, network) in enumerate(parsed):
+                for other_name, _, other_network in parsed[index + 1:]:
+                    if network.overlaps(other_network):
+                        errors.append(f"Docker subnets overlap: {name}={network} and {other_name}={other_network}")
+                for protected_network in protected:
+                    if network.overlaps(protected_network):
+                        errors.append(f"Docker subnet {name}={network} overlaps protected CIDR {protected_network}")
+
+            by_name = {name: network for name, _, network in parsed}
+            if by_name.get("net-egress") != declared_egress:
+                errors.append(f"net_egress_subnet={declared_egress} does not match net-egress={by_name.get('net-egress')}")
+
+            def check_workload_ip(label, address, network_name):
+                network = by_name.get(network_name)
+                if network is None or address not in network:
+                    errors.append(f"{label}={address} is not inside {network_name}={network}")
+                    return
+                # Docker reserves the first usable address as the bridge gateway.
+                if address in (network.network_address, network.broadcast_address, network.network_address + 1):
+                    errors.append(f"{label}={address} is a reserved address in {network}")
+
+            check_workload_ip("envoy_egress_ip", envoy_ip, "net-egress")
+            check_workload_ip("alloy_internal_ip", alloy_ip, "net-internal")
+            check_workload_ip("lab_dns_ip", lab_dns_ip, "net-lab-dns")
+
+            for route in routes:
+                destination = route.get("dst")
+                if not destination or destination == "default":
+                    continue
+                try:
+                    route_network = ipaddress.ip_network(destination, strict=False)
+                except ValueError:
+                    continue
+                route_device = route.get("dev", "")
+                for name, bridge, network in parsed:
+                    if not network.overlaps(route_network):
+                        continue
+                    # A rerun may see the exact route created by this exact
+                    # Docker bridge. Anything broader/different is a customer
+                    # route collision and must fail before Docker mutates it.
+                    if route_device == bridge and route_network == network:
+                        continue
+                    errors.append(f"Docker subnet {name}={network} overlaps live route {route_network} dev {route_device or '?'}")
+
+            if errors:
+                raise SystemExit("; ".join(dict.fromkeys(errors)))
+          - "{{ docker_networks | to_json }}"
+          - "{{ preflight_main_routes_json.stdout }}"
+          - >-
+            {{ ([vpn_client_cidr, internal_cidr, container_dns_server ~ '/32']
+                + ([cribl_otlp_allowed_cidr] if (cribl_external_export_enabled | bool) else [])) | to_json }}
+          - "{{ envoy_egress_ip }}"
+          - "{{ alloy_internal_ip }}"
+          - "{{ lab_dns_ip }}"
+          - "{{ net_egress_subnet }}"
+      changed_when: false
+
+    - name: Preflight — resolve the approved container DNS route
+      ansible.builtin.command:
+        argv: [ip, -4, route, get, "{{ container_dns_server }}"]
+      register: preflight_container_dns_route
+      changed_when: false
+
+    - name: Preflight — require container DNS to use a supplied physical leg
+      ansible.builtin.assert:
+        that:
+          - >-
+            preflight_container_dns_route.stdout is search(
+              'dev (' ~ ([nic_egress, nic_adm, nic_internal] | map('regex_escape') | join('|')) ~ ')( |$)'
+            )
+        fail_msg: >-
+          The approved container resolver {{ container_dns_server }} is not
+          reachable through any supplied physical NIC.
+
+    - name: Preflight — bind an external Cribl endpoint to its exact firewall tuple
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import ipaddress, sys
+
+            host, port_text = sys.argv[1].rsplit(":", 1)
+            host_ip = ipaddress.ip_address(host)
+            allowed = ipaddress.ip_network(sys.argv[2], strict=True)
+            allowed_port = int(sys.argv[3])
+            if allowed.prefixlen != 32 or host_ip not in allowed:
+                raise SystemExit(f"external Cribl endpoint {host_ip} must equal exact allowed /32 {allowed}")
+            if int(port_text) != allowed_port:
+                raise SystemExit(f"external Cribl port {port_text} does not equal firewall port {allowed_port}")
+          - "{{ cribl_otlp_endpoint }}"
+          - "{{ cribl_otlp_allowed_cidr }}"
+          - "{{ cribl_otlp_allowed_port | string }}"
+      changed_when: false
+      when: cribl_external_export_enabled | bool
+
+    - name: Preflight — prove external Cribl uses the internal physical leg
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -4
+          - route
+          - get
+          - "{{ cribl_otlp_endpoint.rsplit(':', 1)[0] }}"
+          - oif
+          - "{{ nic_internal }}"
+      register: preflight_cribl_route
+      changed_when: false
+      failed_when: >-
+        preflight_cribl_route.rc != 0 or
+        ('dev ' ~ nic_internal) not in preflight_cribl_route.stdout
+      when: cribl_external_export_enabled | bool
+
+    # A genuinely vanilla Rocky 9 host ships the vendor registry beneath
+    # /usr/share and does not create the /etc override until an administrator
+    # needs one.  Inspect the effective source without creating it in this
+    # mutation-free preflight; the network role later seeds the override from
+    # the vendor file before adding the bounded project block.
+    - name: Preflight — inspect policy-routing registry locations
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - /etc/iproute2/rt_tables
+        - /usr/share/iproute2/rt_tables
+      register: preflight_rt_table_paths
+
+    - name: Preflight — require a safe effective policy-routing registry
+      ansible.builtin.assert:
+        that:
+          - >-
+            not (preflight_rt_table_paths.results[0].stat.exists | default(false)) or
+            (preflight_rt_table_paths.results[0].stat.isreg | default(false))
+          - not (preflight_rt_table_paths.results[0].stat.islnk | default(false))
+          - >-
+            (preflight_rt_table_paths.results[0].stat.exists | default(false)) or
+            (preflight_rt_table_paths.results[1].stat.isreg | default(false))
+          - >-
+            (preflight_rt_table_paths.results[0].stat.exists | default(false)) or
+            not (preflight_rt_table_paths.results[1].stat.islnk | default(false))
+        quiet: true
+        fail_msg: >-
+          The effective iproute2 table registry must be a regular non-symlink
+          at /etc/iproute2/rt_tables, or a vanilla host must provide the Rocky
+          vendor registry at /usr/share/iproute2/rt_tables.
+
+    - name: Preflight — read the effective policy-routing table registry
+      ansible.builtin.slurp:
+        src: >-
+          {{ '/etc/iproute2/rt_tables'
+             if (preflight_rt_table_paths.results[0].stat.exists | default(false))
+             else '/usr/share/iproute2/rt_tables' }}
+      register: preflight_rt_tables
+
+    - name: Preflight — reject routing table ID or name collisions
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json, sys
+
+            desired = json.loads(sys.argv[1])
+            existing = []
+            for raw in sys.argv[2].splitlines():
+                fields = raw.split("#", 1)[0].split()
+                if len(fields) != 2 or not fields[0].isdigit():
+                    continue
+                existing.append((int(fields[0]), fields[1]))
+            errors = []
+            for table in desired:
+                table_id, name = int(table["id"]), table["name"]
+                for existing_id, existing_name in existing:
+                    if existing_id == table_id and existing_name != name:
+                        errors.append(f"routing table ID {table_id} is already named {existing_name}, not {name}")
+                    if existing_name == name and existing_id != table_id:
+                        errors.append(f"routing table name {name} already uses ID {existing_id}, not {table_id}")
+            if errors:
+                raise SystemExit("; ".join(dict.fromkeys(errors)))
+          - "{{ pbr_tables | to_json }}"
+          - "{{ preflight_rt_tables.content | b64decode }}"
+      changed_when: false
+
+    - name: Preflight — verify policy gateways are reachable on existing NICs
+      ansible.builtin.command:
+        argv: [ip, -4, route, get, "{{ item.gw }}", oif, "{{ item.dev }}"]
+      loop: "{{ pbr_tables }}"
+      register: preflight_policy_gateways
+      changed_when: false
+      failed_when: >-
+        preflight_policy_gateways.rc != 0 or
+        ('dev ' ~ item.dev) not in preflight_policy_gateways.stdout
+
+    - name: Preflight — reject documentation placeholders
+      ansible.builtin.assert:
+        that:
+          - eth0_gateway not in ['203.0.113.1', '192.0.2.1', '198.51.100.1']
+          - vpn_client_cidr not in ['0.0.0.0/0', '10.8.0.0/24']
+          - internal_cidr not in ['0.0.0.0/0', '10.20.0.0/16']
+        fail_msg: >-
+          Placeholder gateway/CIDRs remain. Supply a concrete inventory
+          profile before running the mutating full converge.
+
+    - name: Preflight — validate concrete Parallels lab profile
+      ansible.builtin.assert:
+        that:
+          - nic_egress == 'enp0s5'
+          - nic_adm == 'enp0s7'
+          - nic_internal == 'enp0s8'
+          - eth0_ip == '10.211.55.3'
+          - eth0_gateway == '10.211.55.1'
+          - eth1_gateway == '10.8.10.2'
+          - eth2_gateway == '10.20.0.2'
+          - vpn_client_cidr == '10.8.10.0/24'
+          - internal_cidr == '10.20.0.0/24'
+        fail_msg: The parallels-rocky9-lab profile does not match verified wiring.
+      when: deployment_profile | default('') == 'parallels-rocky9-lab'
+
+    - name: Preflight — require encrypted backing for all sensitive state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json, os, pathlib, subprocess, sys
+
+            errors = []
+            for configured in json.loads(sys.argv[1]):
+                path = pathlib.Path(configured)
+                probe = path
+                while not probe.exists() and probe != probe.parent:
+                    probe = probe.parent
+                found = subprocess.run(
+                    ["findmnt", "-n", "-o", "SOURCE", "-T", str(probe)],
+                    check=True, text=True, capture_output=True,
+                ).stdout.strip()
+                source = found.split("[", 1)[0]
+                if not source.startswith("/dev/"):
+                    errors.append(f"{configured}: backing source {found!r} is not a verifiable block device")
+                    continue
+                ancestry = subprocess.run(
+                    ["lsblk", "-s", "-n", "-o", "FSTYPE", source],
+                    check=True, text=True, capture_output=True,
+                ).stdout.splitlines()
+                if "crypto_LUKS" not in {value.strip() for value in ancestry}:
+                    errors.append(f"{configured}: {source} has no crypto_LUKS ancestor")
+            if errors:
+                raise SystemExit("; ".join(errors))
+          - "{{ encrypted_state_paths | to_json }}"
+      changed_when: false
+      when: require_encrypted_state | bool
+  roles:
+    - role: network_routing
+      when: manage_networking | bool
+    - role: firewalld_zones
+      when: manage_firewalld | bool
+    # Docker installation/start follows the live firewall. os_baseline does
+    # not start the daemon; docker_networks does so after flushing its handler.
+    - role: os_baseline
+    - role: docker_networks
+    - role: docker_stack
+    - role: verify

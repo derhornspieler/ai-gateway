@@ -1,0 +1,12 @@
+[Unit]
+Description=AI Gateway additive source-policy routing
+After=NetworkManager-wait-online.service
+Wants=NetworkManager-wait-online.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aigw-policy-routing
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

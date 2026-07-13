@@ -1,0 +1,66 @@
+---
+- name: Validate offline image seed opt-in contract
+  ansible.builtin.assert:
+    that:
+      - >-
+        (not (offline_image_seed_enabled | bool)
+         and offline_image_seed_remote_path | length == 0
+         and offline_image_seed_sha256 | length == 0
+         and offline_image_seed_manifest_remote_path | length == 0
+         and offline_image_seed_manifest_sha256 | length == 0)
+        or
+        (offline_image_seed_enabled | bool
+         and offline_image_seed_remote_path is match('^/[A-Za-z0-9._/-]+\\.docker\\.tar\\.zst$')
+         and offline_image_seed_sha256 is match('^[a-f0-9]{64}$')
+         and offline_image_seed_manifest_remote_path
+             is match('^/[A-Za-z0-9._/-]+\\.manifest\\.json$')
+         and offline_image_seed_manifest_sha256 is match('^[a-f0-9]{64}$'))
+      - offline_image_seed_marker_dir is match('^/[A-Za-z0-9._/-]+$')
+    quiet: true
+    fail_msg: >-
+      Offline image seeding is fail-closed. Leave it disabled with empty path
+      and digests, or explicitly enable it with absolute remote archive and
+      manifest paths plus both exact lowercase SHA-256 values. Never use a
+      controller path or an unpinned archive.
+
+- name: Verify and load the opt-in offline image seed
+  when: offline_image_seed_enabled | bool
+  block:
+    # docker_networks normally starts Docker after the firewall boundary is
+    # live. This explicit check also protects stack-only use of this role.
+    - name: Ensure Docker is ready before image seed processing
+      ansible.builtin.systemd_service:
+        name: docker.service
+        state: started
+        enabled: true
+
+    - name: Install the fail-closed offline image seed loader
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/load-offline-image-seed.py"
+        dest: /usr/local/sbin/aigw-load-offline-image-seed
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Verify and idempotently load the offline image seed
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - /usr/local/sbin/aigw-load-offline-image-seed
+          - "{{ offline_image_seed_remote_path }}"
+          - "{{ offline_image_seed_sha256 }}"
+          - "{{ offline_image_seed_manifest_remote_path }}"
+          - "{{ offline_image_seed_manifest_sha256 }}"
+          - "{{ offline_image_seed_marker_dir }}"
+      register: offline_image_seed_result
+      changed_when: not offline_image_seed_result.stdout.startswith('SKIPPED ')
+      failed_when: >-
+        offline_image_seed_result.rc != 0
+        or offline_image_seed_result.stdout
+           is not match('^(LOADED|RELOADED|SKIPPED) [a-f0-9]{64}$')
+
+    - name: Report offline image seed disposition
+      ansible.builtin.debug:
+        msg: "Offline image seed {{ offline_image_seed_result.stdout | lower }}"
+      changed_when: false

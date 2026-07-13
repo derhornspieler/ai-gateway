@@ -1,0 +1,213 @@
+{% extends "base.html" %}
+{% block title %}Administration — AI Gateway{% endblock %}
+{% block content %}
+<h1>AI Gateway administration</h1>
+
+<h2>Identity and authorization</h2>
+<p class="muted">Samba AD owns lab usernames and passwords. This portal manages only Keycloak-local authorization groups and their imported directory users.</p>
+
+{% if identity_status %}
+<div class="card">
+  <h3>Keycloak controller
+    <span class="badge">{{ 'ready' if identity_status.configured else 'setup required' }}</span>
+  </h3>
+  <p>Controller credential: {{ 'usable' if identity_status.controller_usable else 'unavailable' }}<br>
+     LDAP federation: {{ 'configured' if identity_status.ldap_configured else 'not configured' }}</p>
+  {% if identity_status.controller_certificate_sha256 %}
+  <p class="muted">Controller certificate SHA-256</p>
+  <code>{{ identity_status.controller_certificate_sha256 }}</code>
+  {% endif %}
+  {% if identity_status.broker_certificate_sha256 %}
+  <p class="muted">Anthropic broker certificate SHA-256</p>
+  <code>{{ identity_status.broker_certificate_sha256 }}</code>
+  {% endif %}
+</div>
+
+{% if not identity_step_up_recent %}
+<div class="card">
+  <h3>Fresh authentication required for changes</h3>
+  <p class="muted">Viewing status is allowed with your current admin session. Identity mutations require a new Keycloak login and remain unlocked for five minutes.</p>
+  <a class="btn" href="/admin/reauth">Reauthenticate with Keycloak</a>
+</div>
+{% endif %}
+
+{% if not identity_status.configured %}
+<div class="card">
+  <h3>Initialize identity control</h3>
+  {% if identity_status.bootstrap_available %}
+  <p class="muted">Creates Vault-backed private_key_jwt clients, configures the read-only lab LDAP federation, and consumes the temporary Keycloak bootstrap client.</p>
+  {% if identity_step_up_recent %}
+  <form method="post" action="/admin/identity/bootstrap" data-confirm="Initialize Keycloak identity control and consume the one-time bootstrap credential?">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="identity-confirmation">Type INITIALIZE to continue</label>
+    <input type="text" id="identity-confirmation" name="confirmation" required maxlength="32" autocomplete="off">
+    <div style="margin-top: 14px;"><button type="submit">Initialize</button></div>
+  </form>
+  {% endif %}
+  {% else %}
+  <p class="muted">The temporary bootstrap client is unavailable or already consumed. Follow the documented Keycloak recovery procedure; setup never falls back to a static admin password.</p>
+  {% endif %}
+</div>
+{% else %}
+
+{% if identity_status.bootstrap_cleanup_required %}
+<div class="card">
+  <h3>Bootstrap cleanup required</h3>
+  <p class="muted">The durable identity controller is ready, but Keycloak still accepts temporary bootstrap administration. Retry setup to delete the Keycloak-marked temporary principals after re-verifying Vault state.</p>
+  {% if identity_step_up_recent %}
+  <form method="post" action="/admin/identity/bootstrap" data-confirm="Re-verify identity state and delete temporary Keycloak bootstrap administration?">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="confirmation" value="INITIALIZE">
+    <button type="submit" class="danger">Finalize bootstrap cleanup</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if identity_step_up_recent %}
+<div class="card">
+  <h3>Create project group</h3>
+  <form method="post" action="/admin/identity/groups">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="identity-group-name">Project ID (lowercase; becomes the API-key project)</label>
+    <input type="text" id="identity-group-name" name="name" required maxlength="64" pattern="[a-z0-9][a-z0-9_.-]{0,63}" autocomplete="off">
+    <label>Capabilities</label>
+    {% for capability in identity_capabilities %}
+    <label><input type="checkbox" name="capabilities" value="{{ capability }}"> {{ capability }}</label>
+    {% endfor %}
+    <div style="margin-top: 14px;"><button type="submit">Create group</button></div>
+  </form>
+</div>
+{% endif %}
+
+<h3>Managed groups</h3>
+{% if identity_groups %}
+{% for group in identity_groups %}
+<div class="card">
+  <h3>{{ group.name }} <span class="badge">{{ group.member_count }} members</span></h3>
+  <p class="muted">{{ group.capabilities | join(', ') }}</p>
+  <a class="btn ghost" href="/admin?group_id={{ group.id }}">Manage members</a>
+  {% if identity_step_up_recent and group.member_count == 0 %}
+  <form method="post" action="/admin/identity/groups/{{ group.id }}/delete" style="margin-top: 10px;" data-confirm="Delete the empty group {{ group.name }}?">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="danger">Delete empty group</button>
+  </form>
+  {% endif %}
+</div>
+{% endfor %}
+{% else %}
+<p class="muted">No managed authorization groups have been created.</p>
+{% endif %}
+
+{% if selected_group_id %}
+<div class="card">
+  <h3>Directory-user assignment</h3>
+  <form method="get" action="/admin">
+    <input type="hidden" name="group_id" value="{{ selected_group_id }}">
+    <label for="identity-user-search">Find an imported AD user</label>
+    <input type="text" id="identity-user-search" name="user_search" value="{{ user_search }}" maxlength="64" autocomplete="off">
+    <button type="submit" class="ghost">Search</button>
+  </form>
+  {% if identity_step_up_recent and identity_users %}
+  <form method="post" action="/admin/identity/groups/{{ selected_group_id }}/members" style="margin-top: 14px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="identity-user-id">Directory user</label>
+    <select id="identity-user-id" name="user_id" required>
+      {% for directory_user in identity_users %}
+      <option value="{{ directory_user.id }}">{{ directory_user.username }}{% if directory_user.email %} — {{ directory_user.email }}{% endif %}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Assign user</button>
+  </form>
+  {% endif %}
+
+  <h3>Current members</h3>
+  {% if identity_members %}
+  <table>
+    <thead><tr><th>User</th><th>Email</th><th>Action</th></tr></thead>
+    <tbody>
+      {% for member in identity_members %}
+      <tr>
+        <td>{{ member.username }}</td>
+        <td class="muted">{{ member.email }}</td>
+        <td>
+          {% if identity_step_up_recent %}
+          <form class="inline" method="post" action="/admin/identity/groups/{{ selected_group_id }}/members/{{ member.id }}/remove" data-confirm="Remove {{ member.username }} from this group?">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="danger">Remove</button>
+          </form>
+          {% else %}
+          <span class="muted">Reauthenticate to change</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">This group has no imported directory members.</p>
+  {% endif %}
+</div>
+{% endif %}
+{% endif %}
+{% else %}
+<p class="muted">Identity-controller status is unavailable.</p>
+{% endif %}
+
+<h2>Provider key rotation</h2>
+<p class="muted">Changes below are hot-applied to the key-rotator scheduler.</p>
+
+{% if status %}
+<div class="card">
+  <h3>Rotator status</h3>
+  <pre>{{ status }}</pre>
+</div>
+{% endif %}
+
+<h2>Vendors</h2>
+{% if vendors %}
+{% for v in vendors %}
+{% set vendor_id = v.vendor or v.name %}
+<div class="card">
+  <h3>{{ vendor_id }} <span class="badge">{{ 'enabled' if v.enabled else 'disabled' }}</span></h3>
+  <form method="post" action="/admin/settings/{{ vendor_id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label><input type="checkbox" name="enabled" {% if v.enabled %}checked{% endif %}> Rotation enabled</label>
+    <label for="interval-{{ vendor_id }}">Interval (seconds)</label>
+    <input type="number" id="interval-{{ vendor_id }}" name="interval_seconds" value="{{ v.interval_seconds or 3600 }}" min="60" max="31536000">
+    <label for="grace-{{ vendor_id }}">Grace / soak window (seconds)</label>
+    <input type="number" id="grace-{{ vendor_id }}" name="grace_seconds" value="{{ v.grace_seconds or 300 }}" min="0" max="86400">
+    <div style="margin-top: 14px;"><button type="submit">Save</button></div>
+  </form>
+  <form method="post" action="/admin/rotate/{{ vendor_id }}" style="margin-top: 10px;" data-confirm="Rotate {{ vendor_id }} now?">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="ghost">Rotate now</button>
+  </form>
+</div>
+{% endfor %}
+{% else %}
+<p class="muted">No vendor settings available (key-rotator may be unreachable).</p>
+{% endif %}
+
+<h2>Rotation history</h2>
+{% if history %}
+<div class="card">
+<table>
+  <thead><tr><th>Time</th><th>Vendor</th><th>Action</th><th>Status</th><th>Detail</th></tr></thead>
+  <tbody>
+    {% for h in history %}
+    <tr>
+      <td class="muted">{{ h.timestamp or h.time or "" }}</td>
+      <td>{{ h.vendor or "" }}</td>
+      <td>{{ h.action or h.event or "" }}</td>
+      <td>{{ h.status or "" }}</td>
+      <td class="muted">{{ h.detail or h.message or "" }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">No rotation history available.</p>
+{% endif %}
+{% endblock %}

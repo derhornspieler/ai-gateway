@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+test -s /var/lib/samba/private/sam.ldb
+test -s /etc/samba/smb.conf
+smbcontrol samba ping >/dev/null 2>&1
+samba-tool domain info 127.0.0.1 2>/dev/null \
+    | grep -Eq '^Domain[[:space:]]+:'
+password_settings=$(samba-tool domain passwordsettings show 2>/dev/null)
+printf '%s\n' "$password_settings" \
+    | grep -Eq '^Account lockout threshold \(attempts\):[[:space:]]+5$'
+printf '%s\n' "$password_settings" \
+    | grep -Eq '^Account lockout duration \(mins\):[[:space:]]+15$'
+printf '%s\n' "$password_settings" \
+    | grep -Eq '^Reset account lockout after \(mins\):[[:space:]]+15$'
+fqdn=$(hostname).$(samba-tool domain info 127.0.0.1 2>/dev/null \
+    | awk -F: '/^Forest[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print tolower($2)}')
+test -n "$fqdn"
+timeout 5 openssl s_client \
+    -connect 127.0.0.1:636 \
+    -CAfile /var/lib/samba-public/ca.pem \
+    -verify_hostname "$fqdn" \
+    -verify_return_error </dev/null >/dev/null 2>&1

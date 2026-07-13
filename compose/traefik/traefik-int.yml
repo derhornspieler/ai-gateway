@@ -1,0 +1,53 @@
+# traefik-int — internal-user edge (eth2). Static config.
+# File-provider routing (reviewed config, not docker-label discovery) per solution-map FAQ.
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+entryPoints:
+  websecure:
+    address: ":443"
+  metrics:
+    address: ":9100"
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+
+# Keep the native health handler on the private metrics entrypoint. It is not
+# host-published; Docker executes Traefik's own `healthcheck` command inside
+# the container and receives 503 while the edge is gracefully terminating.
+ping:
+  entryPoint: metrics
+
+log:
+  level: INFO
+accessLog:
+  # JSON field controls are deliberate: OIDC authorization codes and logout
+  # id_token_hint values are query parameters and must never enter the
+  # Docker -> Alloy -> Loki/Cribl log pipeline.  RequestLine embeds
+  # RequestPath, so both fields are dropped.  Status, method, vhost, router,
+  # service, duration, size, and TLS metadata remain available.
+  format: json
+  fields:
+    defaultMode: keep
+    names:
+      ClientUsername: drop
+      RequestLine: drop
+      RequestPath: drop
+    headers:
+      defaultMode: drop
+    queryParameters:
+      defaultMode: drop
+
+api:
+  dashboard: false
+
+# ACME vs Vault PKI (certificatesResolvers) is the production path — for the
+# first VM test, certs are files issued by scripts/vault-bootstrap.sh (see
+# dynamic config tls section). ACME upgrade: docs/test-runbook.md "next steps".

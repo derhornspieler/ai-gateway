@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Atomic DOCKER-USER policy for the Docker iptables firewall backend.
+# Managed by Ansible; safe before or after dockerd starts.
+set -euo pipefail
+
+{% set _egress_net = docker_networks | selectattr('name', 'equalto', 'net-egress') | first %}
+{% set _internal_net = docker_networks | selectattr('name', 'equalto', 'net-internal') | first %}
+
+# iptables-restore commits the complete filter-table transaction atomically.
+# `iptables -F` followed by one-rule-at-a-time appends created a real fail-open
+# interval on every firewalld reload. --noflush preserves Docker/firewalld's
+# other chains; only DOCKER-USER is replaced. --wait serializes with dockerd.
+iptables-restore --wait 15 --noflush <<'AIGW_IPV4_RULES'
+*filter
+:DOCKER-USER - [0:0]
+-F DOCKER-USER
+
+# Same managed bridge is a legitimate application plane. Cross-bridge traffic
+# is denied in both directions; a service is attached to every plane it needs.
+{% for net in docker_networks %}
+-A DOCKER-USER -i {{ net.bridge }} -o {{ net.bridge }} -j RETURN
+{% endfor %}
+{% for net in docker_networks %}
+-A DOCKER-USER -i {{ net.bridge }} -o br+ -j DROP
+-A DOCKER-USER -i br+ -o {{ net.bridge }} -j DROP
+{% endfor %}
+-A DOCKER-USER -i br+ -o docker0 -j DROP
+-A DOCKER-USER -i docker0 -o br+ -j DROP
+-A DOCKER-USER -i docker0 -o docker0 -j RETURN
+
+# Only the REPLY direction bypasses the original-direction policy. A generic
+# ESTABLISHED return at the top let a connection opened during a firewall
+# reload remain authorized indefinitely after the policy was restored.
+-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+
+# Inbound DNAT to the exact published host addresses. DOCKER-USER sees the
+# translated container port, so a source/port-only allow would also authorize
+# routed transit traffic. Require a managed bridge output plus conntrack's
+# original destination tuple and DNAT state before accepting the flow.
+-A DOCKER-USER -i {{ nic_adm }} -o br+ -s {{ vpn_client_cidr }} -p tcp --dport 443 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth1_ip }}/32 --ctorigdstport 443 -j RETURN
+{% if lab_dns_enabled | bool %}
+-A DOCKER-USER -i {{ nic_adm }} -o br+ -s {{ vpn_client_cidr }} -p udp --dport 53 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth1_ip }}/32 --ctorigdstport 53 -j RETURN
+-A DOCKER-USER -i {{ nic_adm }} -o br+ -s {{ vpn_client_cidr }} -p tcp --dport 53 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth1_ip }}/32 --ctorigdstport 53 -j RETURN
+-A DOCKER-USER -i {{ nic_internal }} -o br+ -s {{ internal_cidr }} -p udp --dport 53 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth2_ip }}/32 --ctorigdstport 53 -j RETURN
+-A DOCKER-USER -i {{ nic_internal }} -o br+ -s {{ internal_cidr }} -p tcp --dport 53 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth2_ip }}/32 --ctorigdstport 53 -j RETURN
+{% endif %}
+-A DOCKER-USER -i {{ nic_internal }} -o br+ -s {{ internal_cidr }} -p tcp --dport 443 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth2_ip }}/32 --ctorigdstport 443 -j RETURN
+-A DOCKER-USER -i {{ nic_egress }} -j DROP
+-A DOCKER-USER -i {{ nic_adm }} -j DROP
+-A DOCKER-USER -i {{ nic_internal }} -j DROP
+
+# Original-direction physical egress is identity-pinned. Authorizing the whole
+# 172.28.0.0/24 bridge meant any later attachment inherited internet access.
+-A DOCKER-USER -i {{ _egress_net.bridge }} -s {{ envoy_egress_ip }}/32 -d {{ container_dns_server }}/32 -p udp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ _egress_net.bridge }} -s {{ envoy_egress_ip }}/32 -d {{ container_dns_server }}/32 -p tcp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ _egress_net.bridge }} -s {{ envoy_egress_ip }}/32 -o {{ nic_egress }} -p tcp --dport 443 -j RETURN
+{% if cribl_external_export_enabled | bool %}
+-A DOCKER-USER -i {{ _internal_net.bridge }} -s {{ alloy_internal_ip }}/32 -o {{ nic_internal }} -d {{ cribl_otlp_allowed_cidr }} -p tcp --dport {{ cribl_otlp_allowed_port }} -j RETURN
+{% endif %}
+
+# Default-deny every original-direction flow from a Docker-style bridge to a
+# non-bridge interface. This covers all three supplied physical NICs plus any
+# later VLAN/tunnel interface; docker0 is handled explicitly as it lacks br-*.
+-A DOCKER-USER -i br+ ! -o br+ -j DROP
+-A DOCKER-USER -i docker0 ! -o docker0 -j DROP
+-A DOCKER-USER -j RETURN
+COMMIT
+AIGW_IPV4_RULES
+
+# Docker networks are explicitly IPv6-disabled. Keep a fail-closed v6 policy
+# anyway so a future accidental enablement cannot silently bypass IPv4 rules.
+if command -v ip6tables-restore >/dev/null 2>&1 && ip6tables -L -n >/dev/null 2>&1; then
+  ip6tables-restore --wait 15 --noflush <<'AIGW_IPV6_RULES'
+*filter
+:DOCKER-USER - [0:0]
+-F DOCKER-USER
+{% for net in docker_networks %}
+-A DOCKER-USER -i {{ net.bridge }} -o {{ net.bridge }} -j RETURN
+{% endfor %}
+{% for net in docker_networks %}
+-A DOCKER-USER -i {{ net.bridge }} -o br+ -j DROP
+-A DOCKER-USER -i br+ -o {{ net.bridge }} -j DROP
+{% endfor %}
+-A DOCKER-USER -i br+ -o docker0 -j DROP
+-A DOCKER-USER -i docker0 -o br+ -j DROP
+-A DOCKER-USER -i docker0 -o docker0 -j RETURN
+-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+-A DOCKER-USER -i {{ nic_egress }} -j DROP
+-A DOCKER-USER -i {{ nic_adm }} -j DROP
+-A DOCKER-USER -i {{ nic_internal }} -j DROP
+-A DOCKER-USER -i br+ ! -o br+ -j DROP
+-A DOCKER-USER -i docker0 ! -o docker0 -j DROP
+-A DOCKER-USER -j RETURN
+COMMIT
+AIGW_IPV6_RULES
+fi

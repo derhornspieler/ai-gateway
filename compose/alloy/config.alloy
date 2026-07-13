@@ -1,0 +1,271 @@
+// Grafana Alloy — observability fan-out (solution-map §1.8).
+//
+// Trust boundaries:
+// - OTLP listens only on Alloy's fixed net-telemetry address. Attaching Alloy
+//   to storage/export networks must never expose its unauthenticated receiver
+//   or HTTP UI on those networks.
+// - Full prompt/completion bodies are deliberate span attributes (§9.7). They
+//   go to local Tempo and the customer Cribl endpoint; they are not metric
+//   labels and are never written to stdout by this configuration.
+// - Docker logs are read from the host's json-file directory, read-only. The
+//   Docker API socket is intentionally not mounted.
+
+otelcol.receiver.otlp "default" {
+  grpc { endpoint = sys.env("ALLOY_TELEMETRY_IP") + ":4317" }
+  http { endpoint = sys.env("ALLOY_TELEMETRY_IP") + ":4318" }
+  output {
+    traces  = [otelcol.processor.memory_limiter.default.input]
+    logs    = [otelcol.processor.memory_limiter.default.input]
+    metrics = [otelcol.processor.memory_limiter.default.input]
+  }
+}
+
+// The container limit is 512 MiB. Refuse/retry upstream before an exporter
+// outage or several large full-prompt spans OOM-kill the collector.
+otelcol.processor.memory_limiter "default" {
+  check_interval = "1s"
+  limit          = "384MiB"
+  spike_limit    = "64MiB"
+  output {
+    traces  = [otelcol.processor.transform.aigw_correlation.input]
+    logs    = [otelcol.processor.batch.default.input]
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+
+// Promote only server-authenticated LiteLLM key metadata into stable,
+// first-class trace correlation fields. These are trace attributes, never
+// metric labels. Client-supplied llm.user and raw authorization/token fields
+// are intentionally not authoritative inputs. Missing or malformed metadata
+// leaves the span untouched; error_mode=ignore prevents a bad optional field
+// from dropping prompt-bearing traces.
+// BEGIN AIGW MANAGED TRACE CORRELATION
+otelcol.processor.transform "aigw_correlation" {
+  error_mode = "ignore"
+
+  trace_statements {
+    context = "span"
+    statements = [
+      `set(attributes["aigw.user.id"], attributes["metadata.user_api_key_user_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_user_id"]) and IsMatch(attributes["metadata.user_api_key_user_id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
+      `set(attributes["aigw.api_key.id"], attributes["metadata.user_api_key_hash"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_hash"]) and IsMatch(attributes["metadata.user_api_key_hash"], "^[0-9a-f]{64}$")`,
+      `set(attributes["aigw.api_key.alias"], attributes["metadata.user_api_key_alias"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_alias"]) and IsMatch(attributes["metadata.user_api_key_alias"], "^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")`,
+      `set(attributes["aigw.request.id"], attributes["litellm.call_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["litellm.call_id"]) and IsMatch(attributes["litellm.call_id"], "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")`,
+      `set(attributes["aigw.project.id"], ExtractPatterns(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")["project"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_auth_metadata"]) and IsMatch(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")`,
+    ]
+  }
+
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+// END AIGW MANAGED TRACE CORRELATION
+
+otelcol.processor.batch "default" {
+  timeout             = "1s"
+  send_batch_size     = 512
+  send_batch_max_size = 1024
+  output {
+    traces = [
+      otelcol.exporter.otlp.cribl.input,
+      otelcol.exporter.otlp.tempo.input,
+      otelcol.connector.spanmetrics.default.input,
+    ]
+    logs = [
+      otelcol.exporter.otlp.cribl.input,
+      otelcol.exporter.loki.local.input,
+    ]
+    metrics = [
+      otelcol.exporter.otlp.cribl.input,
+      otelcol.exporter.prometheus.local.input,
+    ]
+  }
+}
+
+// LiteLLM's Prometheus endpoint is enterprise-gated. Derive bounded
+// request-rate/latency/error metrics from spans. Key aliases are deliberately
+// NOT dimensions: users choose them and can mint arbitrarily many keys, which
+// otherwise creates an unbounded Prometheus series-cardinality DoS.
+otelcol.connector.spanmetrics "default" {
+  histogram { explicit {} }
+  dimension { name = "gen_ai.request.model" }
+  output {
+    metrics = [otelcol.exporter.prometheus.local.input]
+  }
+}
+
+otelcol.exporter.prometheus "local" {
+  forward_to = [prometheus.remote_write.local.receiver]
+}
+
+prometheus.remote_write "local" {
+  endpoint { url = "http://prometheus:9090/api/v1/write" }
+}
+
+otelcol.exporter.loki "local" {
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  max_streams = 1000
+  endpoint {
+    url              = "http://loki:3100/loki/api/v1/push"
+    batch_size       = "1MiB"
+    batch_wait       = "1s"
+    follow_redirects = false
+    remote_timeout   = "10s"
+  }
+}
+
+// Local trace store. Plaintext is acceptable only on isolated net-traces;
+// Tempo's OTLP receiver is bound to its fixed address on that bridge.
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = sys.env("TEMPO_INGEST_IP") + ":4317"
+    tls { insecure = true }
+  }
+  sending_queue {
+    enabled           = true
+    num_consumers     = 2
+    queue_size        = 33554432
+    sizer             = "bytes"
+    block_on_overflow = false
+  }
+  retry_on_failure {
+    enabled          = true
+    initial_interval = "1s"
+    max_interval     = "10s"
+    max_elapsed_time = "1m"
+  }
+}
+
+// Customer Cribl (or the cribl-mock stand-in). The queue is byte-bounded so
+// one endpoint outage cannot consume all collector memory. Plaintext remains
+// an explicit lab-only switch enforced by Ansible.
+otelcol.exporter.otlp "cribl" {
+  client {
+    endpoint = sys.env("CRIBL_OTLP_ENDPOINT")
+    // Pure Compose is a development profile pointed only at cribl-mock.
+    // Ansible replaces this entire marked block with either this plaintext
+    // form or a verified customer TLS form. Do not mix TLS-only arguments
+    // into the insecure block: Alloy 1.17.1 then attempts a TLS handshake.
+    // BEGIN AIGW MANAGED CRIBL TLS
+    tls {
+      insecure = true
+    }
+    // END AIGW MANAGED CRIBL TLS
+  }
+  sending_queue {
+    enabled           = true
+    num_consumers     = 2
+    queue_size        = 67108864
+    sizer             = "bytes"
+    block_on_overflow = false
+  }
+  retry_on_failure {
+    enabled          = true
+    initial_interval = "1s"
+    max_interval     = "30s"
+    max_elapsed_time = "5m"
+  }
+}
+
+// Docker json-file logs. Compose configures the project/service labels as
+// json-file attributes, so querying never needs a high-cardinality filename or
+// container-id label. Positions persist under Alloy's --storage.path volume.
+loki.source.file "docker" {
+  targets = [{
+    __path__ = "/var/lib/docker/containers/*/*-json.log",
+    job      = "docker",
+  }]
+  forward_to = [loki.process.docker.receiver]
+  file_match {
+    enabled     = true
+    sync_period = "10s"
+  }
+}
+
+loki.process "docker" {
+  stage.json {
+    expressions = {
+      message   = "log",
+      stream    = "stream",
+      timestamp = "time",
+      project   = "attrs.\"com.docker.compose.project\"",
+      service   = "attrs.\"com.docker.compose.service\"",
+    }
+  }
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339Nano"
+  }
+  stage.labels {
+    values = {
+      project = "",
+      service = "",
+      stream  = "",
+    }
+  }
+  stage.output { source = "message" }
+  // Full prompts live in traces by explicit policy. Ordinary service logs are
+  // a different data class: redact credential-shaped fields and vendor keys if
+  // a dependency ever prints them during an error path.
+  stage.replace {
+    expression = `(?i)("?(?:api[_-]?key|client[_-]?secret|password|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*["']?)[^"'\s,}]{8,}`
+    replace    = `${1}<redacted>`
+  }
+  stage.replace {
+    expression = `\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b`
+    replace    = `<redacted-vendor-key>`
+  }
+  stage.label_drop { values = ["filename"] }
+  forward_to = [
+    loki.write.local.receiver,
+    loki.process.external_file_logs.receiver,
+  ]
+}
+
+// Do not feed the collector's own logs or the development Cribl debug sink
+// back into Cribl: either path forms a recursive log-amplification loop.
+loki.process "external_file_logs" {
+  stage.match {
+    selector            = "{service=~\"alloy|cribl-mock\"}"
+    action              = "drop"
+    drop_counter_reason = "telemetry_feedback_loop"
+  }
+  forward_to = [otelcol.receiver.loki.file_logs.receiver]
+}
+
+// Vault audit records are HMAC-redacted by Vault and live on a dedicated
+// read-only mount in Alloy. They are retained locally and dual-exported.
+loki.source.file "vault_audit" {
+  targets = [{
+    __path__ = "/var/log/aigw/vault/audit.log",
+    job      = "vault-audit",
+    service  = "vault-audit",
+  }]
+  forward_to = [
+    loki.write.local.receiver,
+    otelcol.receiver.loki.file_logs.receiver,
+  ]
+  file_match {
+    enabled     = true
+    sync_period = "10s"
+  }
+}
+
+// Bridge stable Loki file tailing into OTLP for the Cribl copy. Keep it on a
+// separate batch path so the local Loki write is never duplicated.
+otelcol.receiver.loki "file_logs" {
+  output {
+    logs = [otelcol.processor.batch.file_logs.input]
+  }
+}
+
+otelcol.processor.batch "file_logs" {
+  timeout             = "1s"
+  send_batch_size     = 512
+  send_batch_max_size = 1024
+  output {
+    logs = [otelcol.exporter.otlp.cribl.input]
+  }
+}

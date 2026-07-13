@@ -1,0 +1,1040 @@
+# AI Gateway stack — implementation (design: docs/solution-map.md)
+# Deployed by Ansible to /opt/ai-gateway (compose file at root, ./services/ synced beside it).
+# Networks are created by Ansible (docker_networks role) => external: true.
+# Published ports bind to specific NIC IPs — NEVER 0.0.0.0.
+#
+# Container hardening baseline (security review): every service runs with
+# no-new-privileges + cap_drop ALL (caps re-added only where the entrypoint
+# needs them), memory/cpu limits, and read_only rootfs where the writable
+# paths are known. Services whose write set can't be verified keep a
+# writable rootfs with an inline comment.
+
+name: ai-gateway
+
+networks:
+  net-egress:   { external: true }
+  net-adm:      { external: true }
+  net-internal: { external: true }
+  # Application/data planes are separate bridges.  Keeping every component on
+  # one flat backend bridge let a compromised frontend query unauthenticated
+  # Loki/Prometheus/Redis/Vault endpoints directly.
+  net-chat:         { external: true }
+  net-portal:       { external: true }
+  net-admin-app:    { external: true }
+  net-grafana:      { external: true }
+  net-vendor:       { external: true }
+  net-vault:        { external: true }
+  net-db-litellm:   { external: true }
+  net-db-keycloak:  { external: true }
+  net-db-rotator:   { external: true }
+  net-cache:        { external: true }
+  net-telemetry:    { external: true }
+  net-metrics:      { external: true }
+  net-observability: { external: true }
+  net-traces:       { external: true }
+  # Ordinary bridge required for Docker 29's published-port DNAT. It has no
+  # application peers and remains egress-denied by both host firewall layers.
+  net-int-edge:     { external: true }
+
+x-selinux-labels: &selinux-labels
+  com.aigw.contract.selinux-generation: "1"
+
+x-hardening: &hardening
+  restart: unless-stopped
+  # Changing this contract once forces containers created while dockerd lacked
+  # SELinux support to be recreated with an MCS process/mount label. A daemon
+  # restart with live-restore does not retrofit labels onto existing objects.
+  labels: *selinux-labels
+  # Never inherit the host resolver implicitly. Docker 29 sends inherited-DNS
+  # upstream traffic from dockerd's host namespace, bypassing DOCKER-USER.
+  # An explicit override keeps upstream DNS in the container network namespace;
+  # the host firewall permits it only for the fixed Envoy identity.
+  dns:
+    - ${CONTAINER_DNS_SERVER:?CONTAINER_DNS_SERVER must be set}
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  # Bounded json-file logs are tailed read-only by Alloy. Including only the
+  # Compose project/service labels gives useful routing without Docker socket
+  # access or high-cardinality container-path labels.
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+      labels: "com.docker.compose.project,com.docker.compose.service"
+  # Fork-bomb cap. 512 suits the small single-process services; the JVM /
+  # Postgres / Python-worker services override with a higher value below.
+  pids_limit: 512
+
+services:
+  # Greenfield DHI state initializer. DHI runtimes are non-root and do not
+  # mutate named-volume ownership. This one-shot runs without networking,
+  # owns only CHOWN/FOWNER/FSETID, and exits before stateful services start.
+  volume-init:
+    image: dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    # FSETID is required to retain the SGID bit on vault_audit after changing
+    # it to a group that is not one of this bounded helper's supplementary
+    # groups. Without it, chmod 2750 silently leaves the directory at 0750.
+    cap_add: [CHOWN, FOWNER, FSETID]
+    pids_limit: 32
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        chown 70:70 /state/postgres && chmod 0700 /state/postgres
+        chown 1000:1000 /state/vault && chmod 0700 /state/vault
+        chown 1000:473 /state/vault-audit && chmod 2750 /state/vault-audit
+        chown 473:473 /state/alloy && chmod 0700 /state/alloy
+        chown 65532:65532 /state/prometheus && chmod 0700 /state/prometheus
+        chown 65532:65532 /state/loki && chmod 0700 /state/loki
+        chown 65532:65532 /state/tempo && chmod 0700 /state/tempo
+        chown 65532:65532 /state/grafana && chmod 0700 /state/grafana
+    volumes:
+      - pg_data:/state/postgres
+      - vault_data:/state/vault
+      - vault_audit:/state/vault-audit
+      - alloy_data:/state/alloy
+      - prom_data:/state/prometheus
+      - loki_data:/state/loki
+      - tempo_data:/state/tempo
+      - grafana_data:/state/grafana
+
+  # ── edge: internal users (eth2) ─────────────────────────────────────
+  traefik-int:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_TRAEFIK_INT:?AIGW_BIND_DIGEST_TRAEFIK_INT must be set}
+    # Docker's Traefik DHI currently stops at vulnerable v3.7.6. Build a
+    # shellless/non-root DHI derivative containing the exact patched v3.7.7
+    # binary instead of accepting either the vulnerable DHI or upstream base.
+    build:
+      context: ./services/traefik
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/traefik:3.7.6@sha256:790392e8d8dc7c572afacd6d598cabab103034c79ad04a4c3c84116dbc12f2f4
+        PATCH_IMAGE: traefik:v3.7.7@sha256:1cb3845d7a05e1473c9086351426597e911db49db382b6e4769f9b0744962ac8
+    image: ai-gateway/dhi-traefik:3.7.7-patched
+    user: "65532:65532"
+    cap_add: [NET_BIND_SERVICE]   # binds :443 in-container
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN must be set}   # used by Go templating in dynamic config
+    ports:
+      - "${ETH2_IP:?ETH2_IP must be set}:443:443"
+    volumes:
+      - ./traefik/traefik-int.yml:/etc/traefik/traefik.yml:ro,Z
+      - ./traefik/dynamic-int.yml:/etc/traefik/dynamic/dynamic.yml:ro,Z
+      # Both edge instances share the private key, and Open WebUI/Alloy share
+      # only the CA file. `z` is therefore intentional; `Z` would let the last
+      # container relabel the source away from its peers.
+      - ./certs:/certs:ro,z
+    networks:
+      # Open WebUI performs OIDC discovery against the public issuer.  Scope
+      # the public-name aliases to only the app planes that require them.
+      net-chat:
+        ipv4_address: ${TRAEFIK_INT_CHAT_IP:?TRAEFIK_INT_CHAT_IP must be set}
+        aliases: ["auth.${DOMAIN}", "api.${DOMAIN}", "chat.${DOMAIN}"]
+      net-portal:
+        ipv4_address: ${TRAEFIK_INT_PORTAL_IP:?TRAEFIK_INT_PORTAL_IP must be set}
+        aliases: ["auth.${DOMAIN}", "portal.${DOMAIN}"]
+      net-metrics: {}
+      net-int-edge: {}
+    healthcheck:
+      # Native Traefik probe: checks the configured /ping handler and returns
+      # unhealthy during graceful termination so an external LB can drain it.
+      test: [CMD, traefik, healthcheck]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ── edge: admins (eth1) ─────────────────────────────────────────────
+  traefik-adm:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_TRAEFIK_ADM:?AIGW_BIND_DIGEST_TRAEFIK_ADM must be set}
+    build:
+      context: ./services/traefik
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/traefik:3.7.6@sha256:790392e8d8dc7c572afacd6d598cabab103034c79ad04a4c3c84116dbc12f2f4
+        PATCH_IMAGE: traefik:v3.7.7@sha256:1cb3845d7a05e1473c9086351426597e911db49db382b6e4769f9b0744962ac8
+    image: ai-gateway/dhi-traefik:3.7.7-patched
+    user: "65532:65532"
+    cap_add: [NET_BIND_SERVICE]   # binds :443 in-container
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN must be set}
+    ports:
+      - "${ETH1_IP:?ETH1_IP must be set}:443:443"
+    volumes:
+      - ./traefik/traefik-adm.yml:/etc/traefik/traefik.yml:ro,Z
+      - ./traefik/dynamic-adm.yml:/etc/traefik/dynamic/dynamic.yml:ro,Z
+      - ./certs:/certs:ro,z
+    networks:
+      net-adm: {}
+      # Stable address lets oauth2-proxy trust forwarded headers from only the
+      # actual reverse proxy instead of every container on the app plane.
+      net-admin-app:
+        ipv4_address: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}
+      net-grafana:
+        ipv4_address: ${TRAEFIK_ADM_GRAFANA_IP:?TRAEFIK_ADM_GRAFANA_IP must be set}
+      net-metrics: {}
+    healthcheck:
+      test: [CMD, traefik, healthcheck]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # oauth2-proxy fronts the LiteLLM Admin UI (its built-in SSO is
+  # enterprise-gated) — OIDC vs Keycloak, role aigw-admins.
+  oauth2-proxy:
+    <<: *hardening
+    # 7.7.1 is affected by multiple auth bypass/header-smuggling advisories,
+    # including critical GHSA-7x63-xv5r-3p2x. 7.15.3 contains the fixes.
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/oauth2-proxy:7.15.3@sha256:3e225291283ad41745327dcbd2e97b8a6aed461d38e9e84d1e664092b53f1158
+    image: ai-gateway/dhi-oauth2-proxy:7.15.3-probe
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: "0.5", pids: 512 }
+    environment:
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_CLIENT_ID: admin-ui
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      # Re-run the Keycloak refresh flow frequently enough that logout and AD
+      # group/role revocation are not hidden behind a week-long signed cookie.
+      OAUTH2_PROXY_COOKIE_REFRESH: 5m
+      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      # Start the only configured provider directly. oauth2-proxy otherwise
+      # presents its own misleading 403/sign-in interstitial at every admin
+      # surface, which was reported as a broken authorization redirect.
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_REDIRECT_URL: "https://admin.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      OAUTH2_PROXY_UPSTREAMS: http://litellm:4000
+      OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
+      OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
+      OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: "false"
+      # Split public/internal endpoints (skip discovery; issuer stays public):
+      OAUTH2_PROXY_OIDC_ISSUER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw"
+      OAUTH2_PROXY_SKIP_OIDC_DISCOVERY: "true"
+      OAUTH2_PROXY_LOGIN_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/protocol/openid-connect/auth"
+      OAUTH2_PROXY_REDEEM_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/token"
+      OAUTH2_PROXY_OIDC_JWKS_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/certs"
+    networks: [net-admin-app]
+    healthcheck:
+      # /ready is oauth2-proxy's readiness contract (including configured
+      # session-store connectivity), not merely a TCP/process existence test.
+      test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:4180/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ── core ────────────────────────────────────────────────────────────
+  litellm:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_LITELLM:?AIGW_BIND_DIGEST_LITELLM must be set}
+    # v1.74.0 is affected by critical auth bypasses (including
+    # GHSA-4xpc-pv4p-pm3w). This signed stable release was independently
+    # resolved to the immutable multi-arch index below.
+    image: ghcr.io/berriai/litellm:v1.91.3@sha256:b6e44a97d551dfaa37a13dd02c0d05b2e7e38f5e900aaaea6fd39431ff6207fa
+    # read_only intentionally NOT set: the image runs prisma generate /
+    # schema migrations and writes caches under /app and $HOME at startup;
+    # the write set isn't stable across releases.
+    pids_limit: 1024   # Python workers + prisma spawn more than the 512 default
+    deploy:
+      resources:
+        limits: { memory: 4G, cpus: "2.0", pids: 1024 }
+    environment:
+      DATABASE_URL: postgresql://litellm:${PG_LITELLM_PASSWORD:?PG_LITELLM_PASSWORD must be set}@postgres:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?LITELLM_SALT_KEY must be set}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_SERVICE_NAME: litellm
+      # Deliberate customer requirement (§9.7). Make capture explicit rather
+      # than relying on LiteLLM's legacy callback default, which can change on
+      # upgrade. SPAN_ONLY avoids duplicating every body as an OTel log event.
+      OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: SPAN_ONLY
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro,Z
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    networks:
+      [net-chat, net-portal, net-admin-app, net-vendor, net-db-litellm,
+       net-cache, net-telemetry]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3).read()
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      envoy-egress: { condition: service_healthy }
+
+  open-webui:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_OPEN_WEBUI:?AIGW_BIND_DIGEST_OPEN_WEBUI must be set}
+    # <0.10.0 has multiple cross-user authorization and code-execution
+    # advisories. Open WebUI runs its documented DB migrations on startup;
+    # back up openwebui_data before rolling this security upgrade out.
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: ghcr.io/open-webui/open-webui:v0.10.2@sha256:9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4
+    image: ai-gateway/open-webui:0.10.2-probe
+    # read_only intentionally NOT set: writes /app/backend/data (volume)
+    # plus embedding-model/cache dirs under $HOME and /tmp at startup.
+    deploy:
+      resources:
+        limits: { memory: 2G, cpus: "2.0", pids: 512 }
+    environment:
+      WEBUI_URL: "https://chat.${DOMAIN:?DOMAIN must be set}"
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      OPENAI_API_KEY: ${WEBUI_LITELLM_KEY:?WEBUI_LITELLM_KEY must be set}
+      # Must remain stable across replacement or every Open WebUI session and
+      # application-signed value is invalidated. It is supplied by the
+      # encrypted Ansible overlay, never generated by the container image.
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY must be set}
+      ENABLE_OAUTH_SIGNUP: "true"
+      ENABLE_LOGIN_FORM: "false"
+      OAUTH_CLIENT_ID: open-webui
+      OAUTH_CLIENT_SECRET: ${WEBUI_OIDC_CLIENT_SECRET:?WEBUI_OIDC_CLIENT_SECRET must be set}
+      OPENID_PROVIDER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/.well-known/openid-configuration"
+      OAUTH_PROVIDER_NAME: "AIGW SSO"
+      ENABLE_OAUTH_ROLE_MANAGEMENT: "true"
+      OAUTH_ROLES_CLAIM: "roles"
+      OAUTH_ALLOWED_ROLES: "aigw-users,aigw-developers,aigw-admins"
+      OAUTH_ADMIN_ROLES: "aigw-admins"
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/aigw-ca.pem   # trust internal CA for OIDC discovery
+      # Per solution-map FAQ: Open WebUI's own API keys stay disabled —
+      # gateway keys come from dev-portal only.
+      ENABLE_API_KEYS: "false"
+    volumes:
+      - openwebui_data:/app/backend/data
+      - ./certs/ca.pem:/etc/ssl/certs/aigw-ca.pem:ro,z
+    networks: [net-chat]
+    healthcheck:
+      # Official unauthenticated check includes application initialization and
+      # basic database connectivity; the long start period covers migrations.
+      test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:8080/health]
+      interval: 15s
+      timeout: 5s
+      retries: 24
+      start_period: 90s
+    depends_on:
+      litellm: { condition: service_healthy }
+      keycloak: { condition: service_healthy }
+
+  keycloak:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_KEYCLOAK:?AIGW_BIND_DIGEST_KEYCLOAK must be set}
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/keycloak:26.6.4@sha256:c55933def225cf694779682220c0585e69ec30e574eff95ea71f96d85cf6a555
+    image: ai-gateway/dhi-keycloak:26.6.4-probe
+    user: "65532:65532"
+    # DHI Keycloak is a tested shellless uid-65532 runtime. The probe is the
+    # only added binary; realm import and Samba LDAPS login were exercised.
+    # Deliberate writable-rootfs exception: non-optimized `start
+    # --import-realm` writes beneath /opt/keycloak/{data,lib}. A read-only
+    # rootfs was tested and fails startup; narrowing it requires dedicated,
+    # separately-owned writable mounts rather than a misleading toggle.
+    pids_limit: 2048   # JVM: thread-heavy (each thread counts toward pids)
+    deploy:
+      resources:
+        limits: { memory: 2G, cpus: "2.0", pids: 2048 }
+    command:
+      - start
+      - --import-realm
+      - --hostname=https://auth.${DOMAIN:?DOMAIN must be set}
+      - --hostname-admin=https://auth.${DOMAIN:?DOMAIN must be set}
+      - --proxy-headers=xforwarded
+      # Only the two edge proxies may supply client/scheme/host forwarding
+      # metadata. Without this option Keycloak trusts forwarded headers from
+      # every peer, including compromised application containers.
+      - --proxy-trusted-addresses=${TRAEFIK_INT_CHAT_IP:?TRAEFIK_INT_CHAT_IP must be set}/32,${TRAEFIK_INT_PORTAL_IP:?TRAEFIK_INT_PORTAL_IP must be set}/32,${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
+      - --http-enabled=true
+      - --health-enabled=true
+      - --metrics-enabled=true
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${PG_KEYCLOAK_PASSWORD:?PG_KEYCLOAK_PASSWORD must be set}
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD:?KC_ADMIN_PASSWORD must be set}
+      # One-time master-realm service account consumed by the portal-backed
+      # identity controller. Keycloak creates it only while bootstrapping an
+      # empty database; the rotator deletes both temporary, Keycloak-marked
+      # bootstrap principals after verified setup.
+      KC_BOOTSTRAP_ADMIN_CLIENT_ID: aigw-bootstrap-controller
+      KC_BOOTSTRAP_ADMIN_CLIENT_SECRET: ${KC_BOOTSTRAP_ADMIN_CLIENT_SECRET:?KC_BOOTSTRAP_ADMIN_CLIENT_SECRET must be set}
+      # Consumed by ${VAR} placeholders in the realm import JSONs — Keycloak
+      # resolves env vars at --import-realm, so no client secret lives in git.
+      WEBUI_OIDC_CLIENT_SECRET: ${WEBUI_OIDC_CLIENT_SECRET:?WEBUI_OIDC_CLIENT_SECRET must be set}
+      PORTAL_OIDC_CLIENT_SECRET: ${PORTAL_OIDC_CLIENT_SECRET:?PORTAL_OIDC_CLIENT_SECRET must be set}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
+    volumes:
+      - ./keycloak/realms:/opt/keycloak/data/import:ro,Z
+    networks: [net-chat, net-portal, net-admin-app, net-db-keycloak, net-metrics]
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/aigw-health-probe
+        - http
+        - --url
+        - http://127.0.0.1:9000/health/ready
+        - --contains
+        - '"UP"'
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 60s
+    depends_on:
+      postgres: { condition: service_healthy }
+      volume-init: { condition: service_completed_successfully }
+
+  dev-portal:
+    <<: *hardening
+    build:
+      context: ./services/dev-portal
+      # Runtime bridge egress is deliberately default-deny. Trusted image
+      # builds fetch pinned dependencies through the host namespace so a
+      # transient BuildKit bridge never requires a firewall exception.
+      network: host
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    environment:
+      OIDC_ISSUER: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw"
+      OIDC_INTERNAL_ISSUER: "http://keycloak:8080/realms/aigw"
+      OIDC_CLIENT_ID: dev-portal
+      OIDC_CLIENT_SECRET: ${PORTAL_OIDC_CLIENT_SECRET:?PORTAL_OIDC_CLIENT_SECRET must be set}
+      SESSION_SECRET: ${PORTAL_SESSION_SECRET:?PORTAL_SESSION_SECRET must be set}
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
+      ROTATOR_URL: http://key-rotator:8080
+      ROTATOR_INTERNAL_TOKEN: ${ROTATOR_INTERNAL_TOKEN:?ROTATOR_INTERNAL_TOKEN must be set}
+      # Uvicorn must trust only the portal edge so it reconstructs the HTTPS
+      # browser callback without accepting spoofed forwarding headers from
+      # arbitrary application peers.
+      FORWARDED_ALLOW_IPS: ${TRAEFIK_INT_PORTAL_IP:?TRAEFIK_INT_PORTAL_IP must be set}
+      PUBLIC_API_BASE: "https://api.${DOMAIN:?DOMAIN must be set}"
+      ADMIN_ROLE: aigw-admins
+      ADMIN_STEP_UP_SECONDS: "300"
+    networks: [net-portal, net-telemetry]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      litellm: { condition: service_healthy }
+      keycloak: { condition: service_healthy }
+
+  # ── egress (eth0) + rotation ────────────────────────────────────────
+  envoy-egress:
+    <<: *hardening
+    build:
+      context: ./services/egress-proxy
+      network: none
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    # Envoy admin listens on 127.0.0.1:9901 INSIDE the container only (see
+    # services/egress-proxy/envoy.yaml) and is never published or exposed
+    # to any network; healthchecks must exec in-container.
+    networks:
+      # This fixed source identity is consumed by the host DOCKER-USER egress
+      # allow-list. Do not broaden the rule to the entire bridge subnet.
+      net-egress:
+        ipv4_address: ${ENVOY_EGRESS_IP:?ENVOY_EGRESS_IP must be set}
+      net-vendor: {}
+      net-metrics: {}
+    healthcheck:
+      test: [CMD, /usr/local/bin/aigw-envoy-entrypoint, health]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  key-rotator:
+    <<: *hardening
+    build:
+      context: ./services/key-rotator
+      network: host
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${ROTATOR_VAULT_TOKEN:-}
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
+      DATABASE_URL: postgresql://rotator:${PG_ROTATOR_PASSWORD:?PG_ROTATOR_PASSWORD must be set}@postgres:5432/rotator
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_PUBLIC_URL: "https://auth.${DOMAIN:?DOMAIN must be set}"
+      WIF_KEYCLOAK_PUBLIC_URL: https://idp.wif-a.example.invalid
+      EGRESS_BASE: http://envoy-egress:8080
+      ROTATOR_INTERNAL_TOKEN: ${ROTATOR_INTERNAL_TOKEN:?ROTATOR_INTERNAL_TOKEN must be set}
+      # The portal invokes the rotator's constrained setup controller. The
+      # temporary master secret never reaches the portal or browser.
+      KC_BOOTSTRAP_ADMIN_CLIENT_ID: aigw-bootstrap-controller
+      KC_BOOTSTRAP_ADMIN_CLIENT_SECRET: ${KC_BOOTSTRAP_ADMIN_CLIENT_SECRET:?KC_BOOTSTRAP_ADMIN_CLIENT_SECRET must be set}
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      IDENTITY_CONTROLLER_KEY_VAULT_PATH: ${IDENTITY_CONTROLLER_KEY_VAULT_PATH:-ai-gateway/keycloak/identity-controller-key}
+      IDENTITY_STATE_VAULT_PATH: ${IDENTITY_STATE_VAULT_PATH:-ai-gateway/keycloak/identity-state}
+      IDENTITY_REALM: aigw
+      IDENTITY_MANAGED_ROOT_GROUP: aigw-managed
+      IDENTITY_CONTROLLER_CLIENT_ID: aigw-identity-controller
+      KC_CLIENT_ASSERTION_KEY_VAULT_PATH: ${KC_CLIENT_ASSERTION_KEY_VAULT_PATH:-ai-gateway/anthropic-wif-client-key}
+      ANTHROPIC_WIF_ALLOW_INSECURE_CLIENT_SECRET: "false"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+    networks: [net-portal, net-vendor, net-vault, net-db-rotator, net-telemetry]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3).read()
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 130s
+    depends_on:
+      postgres: { condition: service_healthy }
+      # First converge intentionally starts the rotator before Vault is
+      # initialized. Its /readyz stays unhealthy until the bootstrap script
+      # writes a valid token and recreates it; post-bootstrap deploys enforce
+      # full readiness.
+      vault: { condition: service_started }
+      envoy-egress: { condition: service_healthy }
+
+  vault:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_VAULT:?AIGW_BIND_DIGEST_VAULT must be set}
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/vault:2.0.3@sha256:743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6
+    image: ai-gateway/dhi-vault:2.0.3-probe
+    cap_add: [IPC_LOCK]
+    # CAP_IPC_LOCK alone is insufficient when Docker leaves RLIMIT_MEMLOCK at
+    # its small host default. Keep Vault's anti-swap guarantee enabled and
+    # allow only this process to lock the memory it owns.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    command: [server, -config=/vault/config/aigw.hcl]
+    volumes:
+      - ./vault/config.hcl:/vault/config/aigw.hcl:ro,Z
+      - vault_data:/vault/data
+      - vault_audit:/vault/logs
+    networks: [net-vault]
+    depends_on:
+      volume-init: { condition: service_completed_successfully }
+    # Strict readiness. The Ansible deploy is explicitly two-phase and does
+    # not wait on this probe during the first, pre-initialization converge.
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/aigw-health-probe
+        - http
+        - --url
+        - http://127.0.0.1:8200/v1/sys/health?standbyok=true
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    # TLS is still required for a production rollout; net-vault limits this
+    # bootstrap-only plaintext listener to the rotator/Vault pair and is never
+    # published. Manual unseal per §9.6.
+
+  # ── data ────────────────────────────────────────────────────────────
+  postgres:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_POSTGRES:?AIGW_BIND_DIGEST_POSTGRES must be set}
+    image: dhi.io/postgres:16.14@sha256:5b1b603cbb414af8ee417d0f6b4c170be7fed0b7e433c137f1b9f2a63ba313cd
+    read_only: true
+    tmpfs: [/tmp, /run/postgresql]
+    pids_limit: 1024   # one backend process per connection + workers
+    deploy:
+      resources:
+        limits: { memory: 2G, cpus: "2.0", pids: 1024 }
+    environment:
+      POSTGRES_PASSWORD: ${PG_SUPER_PASSWORD:?PG_SUPER_PASSWORD must be set}
+      PG_LITELLM_PASSWORD: ${PG_LITELLM_PASSWORD:?PG_LITELLM_PASSWORD must be set}
+      PG_KEYCLOAK_PASSWORD: ${PG_KEYCLOAK_PASSWORD:?PG_KEYCLOAK_PASSWORD must be set}
+      PG_ROTATOR_PASSWORD: ${PG_ROTATOR_PASSWORD:?PG_ROTATOR_PASSWORD must be set}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - pg_data:/var/lib/postgresql/16/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro,Z
+    networks: [net-db-litellm, net-db-keycloak, net-db-rotator]
+    healthcheck:
+      test: [CMD, pg_isready, --username, postgres, --dbname, postgres]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    depends_on:
+      volume-init: { condition: service_completed_successfully }
+
+  redis:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_REDIS:?AIGW_BIND_DIGEST_REDIS must be set}
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/redis:7.4.9@sha256:4feb8a348f13e623392857774371cc9a2e1d8f8c6f897645410a527dfea83397
+    image: ai-gateway/dhi-redis:7.4.9-probe
+    # Keep the image's shellless non-root identity explicit because both
+    # root-rendered authentication files grant read access only to this GID.
+    user: "65532:65532"
+    read_only: true
+    # /data on tmpfs: redis is a cache here — snapshots need a writable
+    # dir but don't need to survive container recreation.
+    tmpfs:
+      - /tmp:mode=1777
+      - /data:uid=65532,gid=65532,mode=0700
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    volumes:
+      # Do not put authentication material in Config.Cmd or Config.Env. The
+      # host sources are rendered root:65532 0440 by Ansible beneath a 0700
+      # directory; Docker exposes each exact file read-only to this container.
+      # Short bind syntax is deliberate: Engine's volume API reliably applies
+      # `Z`, while Compose's long Mount API has historically ignored SELinux
+      # relabel requests. Ansible proves both sources are regular, single-link
+      # root:65532 0440 files immediately before Compose may run.
+      - ./secrets/redis_users.acl:/run/secrets/redis_users.acl:ro,Z
+      - ./secrets/redis_password:/run/secrets/redis_password:ro,Z
+    command:
+      - redis-server
+      # Retain the DHI image's full hardened base configuration and override
+      # only the cache/network settings required by this isolated deployment.
+      - /etc/redis/redis.conf
+      - --bind
+      - "0.0.0.0"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --aclfile
+      - /run/secrets/redis_users.acl
+      # Redis is explicitly disposable cache state. Bound its own allocator
+      # below the cgroup ceiling so cache growth evicts keys instead of
+      # repeatedly OOM-killing the process.
+      - --maxmemory
+      - 384mb
+      - --maxmemory-policy
+      - allkeys-lru
+    networks: [net-cache]
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/aigw-health-probe
+        - redis
+        - --password-file
+        - /run/secrets/redis_password
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # ── observability (solution-map §1.8; log path = internal, never eth0) ─
+  alloy:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_ALLOY:?AIGW_BIND_DIGEST_ALLOY must be set}
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/alloy:1.17.1@sha256:52060718ec1670736178717a0ef2e66aa9f87eb1d515d9c49aacf4300bc1bfb1
+    image: ai-gateway/dhi-alloy:1.17.1-probe
+    # Narrow exception: Alloy must tail Docker's runtime-owned json logs.
+    # Relabeling /var/lib/docker is forbidden, so this one non-root, capless,
+    # read-only service disables only its SELinux process label. Host ACLs and
+    # the absence of the Docker socket remain the access boundary.
+    security_opt: [no-new-privileges:true, label=disable]
+    read_only: true
+    # DHI Alloy runs uid/gid 473. Ansible grants that exact UID read/traverse
+    # ACLs on Docker's read-only json-log tree; no DAC capability is added.
+    tmpfs: [/tmp:mode=1777]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy
+      - --server.http.listen-addr=${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}:12345
+    environment:
+      ALLOY_TELEMETRY_IP: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}
+      TEMPO_INGEST_IP: ${TEMPO_INGEST_IP:?TEMPO_INGEST_IP must be set}
+      CRIBL_OTLP_ENDPOINT: ${CRIBL_OTLP_ENDPOINT:?CRIBL_OTLP_ENDPOINT must be set}
+      CRIBL_OTLP_INSECURE: ${CRIBL_OTLP_INSECURE:-false}
+      CRIBL_OTLP_CA_FILE: ${CRIBL_OTLP_CA_FILE:-/etc/ssl/certs/aigw-ca.pem}
+      CRIBL_OTLP_SERVER_NAME: ${CRIBL_OTLP_SERVER_NAME:-}
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ./certs/ca.pem:/etc/ssl/certs/aigw-ca.pem:ro
+      - alloy_data:/var/lib/alloy
+      # Read-only Docker json-file ingestion; never mount /var/run/docker.sock.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - vault_audit:/var/log/aigw/vault:ro
+    networks:
+      net-telemetry:
+        ipv4_address: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}
+      net-observability:
+        ipv4_address: ${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}
+      net-traces: {}
+      # Fixed source identity for an explicitly enabled external Cribl export.
+      # The in-stack mock remains reachable without a physical-NIC exception.
+      net-internal:
+        ipv4_address: ${ALLOY_INTERNAL_IP:?ALLOY_INTERNAL_IP must be set}
+    depends_on:
+      volume-init: { condition: service_completed_successfully }
+    healthcheck:
+      # Official readiness checks that the initial configuration loaded. Do
+      # not use /-/healthy as Docker liveness: Grafana warns that restarting
+      # for a failed external component can interrupt still-healthy pipelines.
+      test:
+        - CMD
+        - /usr/local/bin/aigw-health-probe
+        - http
+        - --url
+        - "http://${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}:12345/-/ready"
+        - --contains
+        - Alloy is ready.
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  prometheus:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_PROMETHEUS:?AIGW_BIND_DIGEST_PROMETHEUS must be set}
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/prometheus:3.5.5@sha256:098f1065ce3fdb4c725962bda64ec67d2f6d4f573141d08f3270361ce632d9b0
+    image: ai-gateway/dhi-prometheus:3.5.5-probe
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 1G, cpus: "1.0", pids: 512 }
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+      # Listen only on the observability bridge. Prometheus can still initiate
+      # scrapes over net-metrics, but compromised scrape targets cannot query or
+      # inject remote-write series into its unauthenticated web API.
+      - --web.listen-address=${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}:9090
+      - --storage.tsdb.path=/var/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-5GB}
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
+      - ./prometheus/rules.yml:/etc/prometheus/rules.yml:ro,Z
+      - prom_data:/var/prometheus
+    networks:
+      net-observability:
+        ipv4_address: ${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}
+      net-metrics: {}
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/aigw-health-probe
+        - http
+        - --url
+        - "http://${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}:9090/-/ready"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      volume-init: { condition: service_completed_successfully }
+
+  node-exporter:
+    <<: *hardening
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/node-exporter:1.11.1@sha256:5b688b176c6d056570121078073e6998d7fa312277727a6513f6c9a5039123e8
+    image: ai-gateway/dhi-node-exporter:1.11.1-probe
+    # Docker explicitly warns never to apply `z`/`Z` to a system-directory
+    # bind such as `/`. Keep this second and final label-disable exception
+    # bounded by uid 65532, cap-drop ALL, a read-only rootfs/root mount, and
+    # the metrics-only network. It has no Docker socket or host PID namespace.
+    security_opt: [no-new-privileges:true, label=disable]
+    read_only: true
+    tmpfs: [/tmp]
+    pids_limit: 256
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: "0.25", pids: 256 }
+    command:
+      - --path.rootfs=/host
+      # Keep the Docker-root mount itself visible while excluding its many
+      # per-container overlay mounts from metric cardinality.
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/(containers|overlay2)/.+)($|/)
+    volumes:
+      - /:/host:ro,rslave
+    networks: [net-metrics]
+    healthcheck:
+      # A successful scrape containing the exporter's own build metric proves
+      # the HTTP collector path, not only that a socket or process exists.
+      test:
+        - CMD
+        - /usr/local/bin/aigw-health-probe
+        - http
+        - --url
+        - http://127.0.0.1:9100/metrics
+        - --contains
+        - node_exporter_build_info
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  loki:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_LOKI:?AIGW_BIND_DIGEST_LOKI must be set}
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/loki:3.7.3@sha256:abafe2374acfc0a644edc8e10f98cedb13f329cc2365d169dbcf917362dd97f9
+    image: ai-gateway/dhi-loki:3.7.3-probe
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 1G, cpus: "1.0", pids: 512 }
+    command: ["-config.file=/etc/loki/config.yml"]
+    volumes:
+      - ./loki/config.yml:/etc/loki/config.yml:ro,Z
+      - loki_data:/loki
+    networks: [net-observability]
+    healthcheck:
+      # Loki /ready checks its internal service manager and ingester state.
+      test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:3100/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    depends_on:
+      volume-init: { condition: service_completed_successfully }
+
+  tempo:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_TEMPO:?AIGW_BIND_DIGEST_TEMPO must be set}
+    # Immutable multi-arch v3.0.2 index. Full-prompt attributes require the
+    # explicit non-default size limits in tempo/config.yml.
+    image: dhi.io/tempo:3.0.2@sha256:bf79f4006e80cee3ef1b402fedf7899fb423b20173ff9d49337110df76d36203
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 1G, cpus: "1.0", pids: 512 }
+    command:
+      - -target=all
+      - -config.file=/etc/tempo/config.yml
+      - -config.expand-env=true
+    environment:
+      TEMPO_INGEST_IP: ${TEMPO_INGEST_IP:?TEMPO_INGEST_IP must be set}
+    volumes:
+      - ./tempo/config.yml:/etc/tempo/config.yml:ro,Z
+      - tempo_data:/var/tempo
+    networks:
+      net-traces:
+        ipv4_address: ${TEMPO_INGEST_IP:?TEMPO_INGEST_IP must be set}
+      net-observability: {}
+    healthcheck:
+      # Tempo provides this shell-free native /ready client specifically for
+      # its distroless image; no extra probe layer is required.
+      # DHI relocates the upstream binary from /tempo to /opt/tempo/tempo.
+      test: [CMD, /opt/tempo/tempo, --health]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    depends_on:
+      volume-init: { condition: service_completed_successfully }
+
+  grafana:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_GRAFANA:?AIGW_BIND_DIGEST_GRAFANA must be set}
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/grafana:12.4.5@sha256:bf28b93e5f122d0d93574f865df15ba01ca630e91e9af1138c4bfd3461e8619e
+    image: ai-gateway/dhi-grafana:12.4.5-probe
+    read_only: true
+    tmpfs: [/tmp:mode=1777]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+      GF_SERVER_ROOT_URL: "https://grafana.${DOMAIN:?DOMAIN must be set}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+      # DHI stays deterministic/offline: do not install background plugins.
+      GF_PLUGINS_PREINSTALL: ""
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro,Z
+      - grafana_data:/var/lib/grafana
+    networks: [net-grafana, net-observability]
+    healthcheck:
+      test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:3000/api/health]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    depends_on:
+      prometheus: { condition: service_healthy }
+      loki: { condition: service_started }
+      tempo: { condition: service_started }
+      volume-init: { condition: service_completed_successfully }
+
+  cribl-mock:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_CRIBL_MOCK:?AIGW_BIND_DIGEST_CRIBL_MOCK must be set}
+    # Stand-in for the customer's Cribl Stream (internal network): an OTLP
+    # sink that logs what it receives. Swap = point CRIBL_OTLP_ENDPOINT at
+    # the real Cribl worker; delete this service.
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/opentelemetry-collector:0.156.0-contrib@sha256:04dc55c259a159b8b6b833d1be3ede9f4b1a94d870c193fc40e61564950d6757
+    image: ai-gateway/dhi-opentelemetry-collector:0.156.0-contrib-probe
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "0.5", pids: 512 }
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./cribl-mock/config.yaml:/etc/otelcol/config.yaml:ro,Z
+    networks: [net-internal]
+    healthcheck:
+      # The collector's health_check extension becomes ready after service
+      # construction and is loopback-only; OTLP listeners stay private.
+      test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:13133/]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  pg_data:
+  openwebui_data:
+  vault_data:
+  vault_audit:
+  alloy_data:
+  prom_data:
+  loki_data:
+  tempo_data:
+  grafana_data:

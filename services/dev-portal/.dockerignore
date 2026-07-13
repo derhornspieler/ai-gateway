@@ -1,0 +1,10 @@
+.env
+.env.*
+secrets/
+**/*.key
+**/*.p12
+**/*.pfx
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+tests/

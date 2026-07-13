@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Managed by Ansible. Apply only additive runtime PBR state; never edit an
+# existing NetworkManager connection or its addresses/routes.
+set -euo pipefail
+
+target_device="${1:-}"
+
+apply_table() {
+  local dev="$1" gateway="$2" source_ip="$3" table_id="$4" table_name="$5" priority="$6"
+  local route escaped_source normalized_route
+  local nm_default_count=0
+  local -a route_parts
+
+  if [[ -n "$target_device" && "$target_device" != "$dev" ]]; then
+    return 0
+  fi
+
+  if ! ip -4 -o address show dev "$dev" scope global \
+      | awk '{print $4}' | cut -d/ -f1 | grep -Fqx "$source_ip"; then
+    echo "Refusing PBR apply: $dev does not own expected address $source_ip" >&2
+    return 1
+  fi
+  ip -4 route get "$gateway" oif "$dev" >/dev/null
+
+  # A policy table needs the interface's existing connected routes so its
+  # gateway and directly attached peers resolve correctly. Copy runtime kernel
+  # routes into the policy table without touching the main table or NM profile.
+  while IFS= read -r route; do
+    if [[ -n "$route" ]]; then
+      read -r -a route_parts <<< "$route"
+      # `ip route show ... dev $dev` filters by the device but omits the
+      # `dev` token from its output. Reattach the already validated interface
+      # when copying the connected route into the policy table; otherwise the
+      # kernel cannot resolve the link route and returns ENODEV.
+      ip -4 route replace table "$table_id" "${route_parts[@]}" dev "$dev"
+    fi
+  done < <(ip -4 route show table main dev "$dev" scope link)
+  # The supplied host may already persist this exact policy-table default in
+  # its customer-owned NetworkManager profile. Accept that route as the source
+  # of truth without editing/cycling the profile. If it exists, remove only
+  # the exact source-pinned runtime duplicate created by older AIGW revisions.
+  while IFS= read -r route; do
+    if [[ " $route " == *" via $gateway "* \
+          && " $route " == *" dev $dev "* \
+          && " $route " == *" proto static "* ]]; then
+      ((nm_default_count += 1))
+    fi
+  done < <(ip -4 route show table "$table_id" default)
+  if (( nm_default_count > 1 )); then
+    echo "Refusing PBR apply: multiple persisted defaults in table $table_id" >&2
+    return 1
+  fi
+  if (( nm_default_count == 1 )); then
+    while IFS= read -r route; do
+      read -r -a route_parts <<< "$route"
+      normalized_route="${route_parts[*]}"
+      if [[ "$normalized_route" == \
+          "default via $gateway dev $dev src $source_ip" ]]; then
+        ip -4 route del table "$table_id" default via "$gateway" \
+          dev "$dev" src "$source_ip"
+      fi
+    done < <(ip -4 route show table "$table_id" default)
+  else
+    # With no persisted equivalent, this dedicated, collision-checked table
+    # may contain only our exact runtime default. Fail on anything else rather
+    # than deleting a route that could belong to the supplied host.
+    while IFS= read -r route; do
+      read -r -a route_parts <<< "$route"
+      normalized_route="${route_parts[*]}"
+      if [[ "$normalized_route" != \
+          "default via $gateway dev $dev src $source_ip" ]]; then
+        echo "Refusing PBR apply: unexpected default in table $table_id" >&2
+        return 1
+      fi
+    done < <(ip -4 route show table "$table_id" default)
+    ip -4 route replace table "$table_id" default via "$gateway" \
+      dev "$dev" src "$source_ip"
+  fi
+
+  if [[ "$(ip -4 route show table "$table_id" default | wc -l)" -ne 1 ]]; then
+    echo "Refusing PBR apply: table $table_id does not have one default" >&2
+    return 1
+  fi
+
+  escaped_source="${source_ip//./\\.}"
+  if ! ip -4 rule show | grep -Eq \
+      "^[[:space:]]*${priority}:[[:space:]]+from ${escaped_source}(/32)? lookup (${table_name}|${table_id})([[:space:]]|$)"; then
+    ip -4 rule add priority "$priority" from "$source_ip/32" table "$table_id"
+  fi
+
+  # v7 used priority 100 for both project rules. Install the dedicated rule
+  # first, then remove only that exact legacy source/table tuple so there is no
+  # routing gap and no customer-owned priority-100 rule is touched.
+  while ip -4 rule show | grep -Eq \
+      "^[[:space:]]*100:[[:space:]]+from ${escaped_source}(/32)? lookup (${table_name}|${table_id})([[:space:]]|$)"; do
+    ip -4 rule del priority 100 from "$source_ip/32" table "$table_id"
+  done
+}
+
+{% for item in pbr_tables %}
+apply_table {{ item.dev | quote }} {{ item.gw | quote }} {{ item.src | quote }} {{ item.id }} {{ item.name | quote }} {{ item.priority }}
+{% endfor %}

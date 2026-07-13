@@ -1,0 +1,102 @@
+# Data-driven tool config templates for dev-portal /snippets.
+#
+# Each entry:
+#   id:          short slug, used in HTML anchors/ids
+#   name:        display name
+#   description: one-line blurb shown above the snippet
+#   snippet:     template text; {api_base} and {key} are substituted
+#                (plain string replace, not str.format — see app/tools.py)
+#   note:        optional extra caveat/instructions shown below the snippet
+#
+# Adding a new tool is a YAML-only change; no code change required.
+
+tools:
+  - id: claude-code
+    name: Claude Code
+    description: >-
+      Anthropic's official CLI. Point it at the gateway's Anthropic-compatible
+      /v1/messages endpoint instead of api.anthropic.com.
+    snippet: |
+      # Claude Code — point at the AI gateway instead of Anthropic directly
+      export ANTHROPIC_BASE_URL="{api_base}"
+      export ANTHROPIC_AUTH_TOKEN="{key}"
+
+      # IMPORTANT: unset ANTHROPIC_API_KEY, or Claude Code may prefer it over
+      # ANTHROPIC_AUTH_TOKEN and bypass the gateway entirely.
+      unset ANTHROPIC_API_KEY
+    note: >-
+      If ANTHROPIC_API_KEY is exported in your shell profile (~/.zshrc,
+      ~/.bashrc, etc.), remove it there too — otherwise it will silently
+      win again in every new shell.
+
+  - id: codex
+    name: Codex CLI
+    description: >-
+      OpenAI's Codex CLI, pointed at the gateway's OpenAI-compatible
+      /v1 endpoint.
+    snippet: |
+      # Codex CLI — point at the AI gateway instead of OpenAI directly
+      export OPENAI_BASE_URL="{api_base}/v1"
+      export OPENAI_API_KEY="{key}"
+    note: >-
+      Some Codex CLI versions ignore OPENAI_BASE_URL and require an explicit
+      provider override instead, e.g.:
+      codex -c model_provider.base_url="{api_base}/v1" -c model_provider.api_key="{key}"
+
+  - id: opencode
+    name: OpenCode
+    description: >-
+      Add an openai-compatible provider block to your opencode.json pointing
+      at the gateway.
+    snippet: |
+      {
+        "provider": {
+          "openai-compatible": {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {
+              "baseURL": "{api_base}/v1",
+              "apiKey": "{key}"
+            }
+          }
+        }
+      }
+    note: "Save this block into your opencode.json (merge with any existing config)."
+
+  - id: kiro
+    name: Kiro
+    description: >-
+      Kiro's OpenAI-compatible provider settings, pointed at the gateway.
+    snippet: |
+      {
+        "openai": {
+          "baseUrl": "{api_base}/v1",
+          "apiKey": "{key}"
+        }
+      }
+    note: "Paste into Kiro's settings.json under the OpenAI-compatible provider section."
+
+  - id: curl
+    name: curl (manual testing)
+    description: >-
+      Quick sanity checks against both API shapes the gateway serves.
+    snippet: |
+      # OpenAI-compatible chat completions
+      curl "{api_base}/v1/chat/completions" \
+        -H "Authorization: Bearer {key}" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "model": "gpt-4o",
+          "messages": [{"role": "user", "content": "hello"}]
+        }'
+
+      # Anthropic-compatible messages
+      curl "{api_base}/v1/messages" \
+        -H "x-api-key: {key}" \
+        -H "anthropic-version: 2023-06-01" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "model": "claude-sonnet-4-5",
+          "max_tokens": 256,
+          "messages": [{"role": "user", "content": "hello"}]
+        }'
+    note: "Model names above are examples — use whatever your gateway config exposes."

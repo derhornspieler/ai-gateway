@@ -1,0 +1,96 @@
+---
+# Source-based policy routing keeps replies on the NIC/address where a flow
+# arrived. The host's existing NetworkManager connection profiles and static
+# addressing are customer-owned: this role never creates a connection, changes
+# an address/gateway, or replaces a connection's route list.
+
+- name: Assert expected NICs exist and are distinct
+  ansible.builtin.assert:
+    that:
+      - nic_egress in ansible_facts.interfaces
+      - nic_adm in ansible_facts.interfaces
+      - nic_internal in ansible_facts.interfaces
+      - "[nic_egress, nic_adm, nic_internal] | unique | length == 3"
+    fail_msg: "Configured egress/ADM/internal interfaces do not match the host."
+
+- name: Inspect the administrator policy-routing table registry
+  ansible.builtin.stat:
+    path: /etc/iproute2/rt_tables
+    follow: false
+  register: administrator_rt_tables
+
+- name: Refuse an unsafe administrator policy-routing registry
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (administrator_rt_tables.stat.exists | default(false)) or
+        (administrator_rt_tables.stat.isreg | default(false))
+      - not (administrator_rt_tables.stat.islnk | default(false))
+    quiet: true
+    fail_msg: /etc/iproute2/rt_tables must be a regular non-symlink file.
+
+# Rocky 9 keeps the pristine registry in /usr/share and creates no /etc file
+# on a vanilla installation. Preserve its standard table names when creating
+# the administrator override; a blank project-only override would otherwise
+# shadow the vendor registry for name resolution.
+- name: Seed the administrator registry from the Rocky vendor registry
+  ansible.builtin.copy:
+    src: /usr/share/iproute2/rt_tables
+    dest: /etc/iproute2/rt_tables
+    remote_src: true
+    force: false
+    owner: root
+    group: root
+    mode: "0644"
+  when: not (administrator_rt_tables.stat.exists | default(false))
+
+- name: Named routing tables
+  ansible.builtin.blockinfile:
+    path: /etc/iproute2/rt_tables
+    create: true
+    mode: "0644"
+    marker: "# {mark} AI GATEWAY POLICY TABLES"
+    block: |
+      {% for t in pbr_tables %}
+      {{ t.id }} {{ t.name }}
+      {% endfor %}
+
+- name: Install additive AI Gateway policy-routing applicator
+  ansible.builtin.template:
+    src: aigw-policy-routing.sh.j2
+    dest: /usr/local/sbin/aigw-policy-routing
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Reapply policy routing after a relevant NetworkManager event
+  ansible.builtin.copy:
+    src: 90-aigw-policy-routing
+    dest: /etc/NetworkManager/dispatcher.d/90-aigw-policy-routing
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install boot-time policy-routing unit
+  ansible.builtin.copy:
+    src: aigw-policy-routing.service
+    dest: /etc/systemd/system/aigw-policy-routing.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: pbr_unit
+
+- name: Reload systemd for policy-routing unit
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: pbr_unit.changed
+
+- name: Apply policy routes without modifying NetworkManager connections
+  ansible.builtin.command: /usr/local/sbin/aigw-policy-routing
+  changed_when: false
+
+- name: Enable policy routing after network-online at boot
+  ansible.builtin.systemd:
+    name: aigw-policy-routing.service
+    enabled: true
+    state: started

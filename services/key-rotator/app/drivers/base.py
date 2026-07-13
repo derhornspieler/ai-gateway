@@ -1,0 +1,67 @@
+"""Driver base class + shared types for key-rotator vendor plugins.
+
+Design ref: docs/solution-map.md §9.4 — "per-vendor driver plugin
+interface in the key-rotator ... initial drivers: Anthropic (WIF), OpenAI
+(service-account blue/green); designed-in but dormant: Azure OpenAI,
+Bedrock ... future custom vendors = new driver + config, no core change."
+"""
+from __future__ import annotations
+
+import dataclasses
+from typing import Any, Optional
+
+
+@dataclasses.dataclass
+class RotationResult:
+    """Outcome of a single driver.rotate() call.
+
+    status: one of "success" | "skipped" | "disabled" | "failed" |
+        "rotated_pending_revocation" (new credential live, but the old
+        one could not be confirmed deleted/revoked — a cleanup pass will
+        retry; see app/drivers/openai_svcacct.py).
+    next_run_seconds: optional dynamic next-run override, honored by
+        app.scheduler.RotationScheduler (used by the Anthropic WIF driver
+        to reschedule at 80% of the minted token's lifetime — see
+        docs/anthropic-wif-bootstrap.md Phase 1 step 3).
+    settings_self_disabled: the driver durably set its own settings row to
+        enabled=false. The scheduler uses this explicit signal to complete a
+        zero-interval lifecycle even when the run came from Rotate now rather
+        than the canonical one-shot callback.
+    """
+
+    status: str
+    detail: str = ""
+    next_run_seconds: Optional[float] = None
+    settings_self_disabled: bool = False
+
+
+@dataclasses.dataclass
+class DriverContext:
+    """Dependencies handed to every driver on each rotate() call.
+
+    Typed as `Any` for the client objects to avoid import cycles between
+    drivers/, db.py, litellm_client.py, and vault_client.py; each concrete
+    driver knows the real types (app.config.Settings, app.vault_client.
+    VaultClient, app.litellm_client.LiteLLMClient, app.db.Database).
+    """
+
+    settings: Any
+    vault: Any
+    litellm: Any
+    db: Any
+    vendor_settings: dict[str, Any]
+
+
+class BaseDriver:
+    """Base class for all vendor rotation drivers."""
+
+    name: str = "base"
+
+    async def rotate(self, ctx: DriverContext) -> RotationResult:
+        """Perform one rotation cycle. Must not raise for expected/handled
+        failure modes (return RotationResult(status="failed"/"disabled"/
+        "skipped", ...) instead) — the scheduler treats an unhandled
+        exception as an additional bug-level failure and records it, but
+        drivers should prefer returning a structured result.
+        """
+        raise NotImplementedError

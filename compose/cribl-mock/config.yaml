@@ -1,0 +1,38 @@
+# cribl-mock — OTLP sink standing in for the customer's Cribl Stream on the
+# internal network. Logs everything it receives so the export leg is testable.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+# Loopback-only collector lifecycle endpoint for Docker health. This is the
+# upstream extension; it is not published and adds no application-plane API.
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  extensions: [health_check]
+  # This disposable sink has no consumer for the collector's own Prometheus
+  # metrics. Disabling them removes the default localhost:8888 listener and
+  # its unnecessary DNS/address-family dependency.
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]

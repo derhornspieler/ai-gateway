@@ -1,0 +1,43 @@
+---
+# Concrete Parallels Rocky 9 lab wiring (verified read-only on the live VM).
+# This applies only to the lab-aigw01 alias in inventory/lab.yml.
+deployment_profile: parallels-rocky9-lab
+aigw_domain: aigw.internal
+# Disposable Parallels validation VM only. Customer/generic profiles retain
+# require_encrypted_state=true and must mount Docker + stack state on LUKS.
+require_encrypted_state: false
+require_preupgrade_backup: false
+# This clean-room lab lacks dhi.io credentials. The operator must pre-stage
+# this exact secret-free arm64 archive as root:root 0600 before the converge.
+# The role validates its digest and loads it before any Compose build. Generic
+# inventory remains disabled/pathless and does not inherit this lab exception.
+offline_image_seed_enabled: true
+offline_image_seed_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260713.docker.tar.zst
+offline_image_seed_sha256: e418ac9299351254412028b3a1481eccaf8791a4847e931d724a4882de2defde
+offline_image_seed_manifest_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260713.manifest.json
+offline_image_seed_manifest_sha256: ebde9dd8a2f8053666414e665be03acbfcf3b841af94d9e7b26e3da9ed6b5515
+# One Keycloak-local administrator is required only to enter the portal before
+# Samba federation exists. After assigning lab-admin to an aigw-admins managed
+# group, remove this disposable bootstrap identity through Keycloak recovery
+# administration. Its password remains encrypted in the inventory overlay.
+aigw_seed_test_users: true
+# The disposable lab keeps one vaulted, ADM-only Keycloak console recovery
+# operator. Generic/customer profiles delete all bootstrap principals.
+retain_bootstrap_admin_user: true
+nic_egress: enp0s5
+nic_adm: enp0s7
+nic_internal: enp0s8
+
+eth0_ip: "10.211.55.3"
+eth0_gateway: "10.211.55.1"
+eth1_ip: "10.8.10.10"
+eth1_gateway: "10.8.10.2"
+eth2_ip: "10.20.0.10"
+eth2_gateway: "10.20.0.2"
+
+# The lab reaches ADM directly on the Parallels host-only subnet.
+vpn_client_cidr: "10.8.10.0/24"
+internal_cidr: "10.20.0.0/24"
+
+# Parallels shared-network resolver; explicit container DNS is firewall-visible.
+container_dns_server: "10.211.55.1"

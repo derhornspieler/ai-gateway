@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Managed by Ansible. Reassert runtime zone ownership without cycling or
+# reactivating customer-owned NetworkManager profiles. The Ansible role
+# separately persists only each active profile's connection.zone by UUID.
+set -euo pipefail
+
+device="${1:-}"
+action="${2:-}"
+
+case "$action" in
+  up|reapply|dhcp4-change)
+    case "$device" in
+{% for zone in firewalld_zones %}
+{% for interface in zone.interfaces %}
+      {{ interface }}) exec firewall-cmd --zone={{ zone.zone }} --change-interface={{ interface }} ;;
+{% endfor %}
+{% endfor %}
+    esac
+    ;;
+esac
+
+exit 0

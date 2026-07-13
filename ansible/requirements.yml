@@ -1,0 +1,10 @@
+---
+# Control-node Ansible collections. Install with:
+#   ansible-galaxy collection install -r ansible/requirements.yml
+collections:
+  - name: community.docker      # docker_network, docker_compose_v2
+    version: "5.2.1"
+  - name: community.general     # nmcli (policy-based routing)
+    version: "13.1.0"
+  - name: ansible.posix         # firewalld, sysctl
+    version: "2.2.0"

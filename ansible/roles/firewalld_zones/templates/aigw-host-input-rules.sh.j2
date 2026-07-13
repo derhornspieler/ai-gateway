@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Container-to-host boundary. DOCKER-USER is FORWARD-only and cannot protect
+# host listeners from a compromised container. This independent nftables table
+# executes before firewalld's input hook and is not owned/flushed by Docker.
+set -euo pipefail
+
+{% set _egress_net = docker_networks | selectattr('name', 'equalto', 'net-egress') | first %}
+{% set _internal_net = docker_networks | selectattr('name', 'equalto', 'net-internal') | first %}
+
+# Ensure the table exists once, then atomically flush/rebuild it in one nft
+# transaction. First creation occurs before Docker starts, so there is no
+# container traffic during that one-time empty-table step.
+nft list table inet aigw_guard >/dev/null 2>&1 || nft add table inet aigw_guard
+nft -f - <<'AIGW_HOST_INPUT_RULES'
+flush table inet aigw_guard
+table inet aigw_guard {
+  chain container_input {
+    type filter hook input priority -5; policy accept;
+
+    # A host-initiated health/admin connection may receive its established
+    # reply from a container. No container is otherwise required to initiate a
+    # connection to a host listener; Docker DNS/service discovery happens in
+    # the container network namespace and does not traverse this hook.
+{% for net in docker_networks %}
+    iifname "{{ net.bridge }}" ct state established,related ct direction reply accept
+{% endfor %}
+{% for net in docker_networks %}
+    iifname "{{ net.bridge }}" drop
+{% endfor %}
+  }
+
+  # Native nft fallback for the Docker FORWARD boundary. firewalld 1.3's nft
+  # backend deletes only its own `inet firewalld` table on reload, while its
+  # direct-backend flush temporarily removes DOCKER-USER. This independent hook
+  # therefore preserves the deny boundary throughout a reload; DOCKER-USER is
+  # retained as the Docker-supported enforcement layer and defense in depth.
+  chain container_forward {
+    type filter hook forward priority -5; policy accept;
+
+{% for net in docker_networks %}
+    iifname "{{ net.bridge }}" oifname "{{ net.bridge }}" accept
+{% endfor %}
+    iifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } drop
+
+    # Cross-plane flows are evaluated before this reply allowance, so a flow
+    # opened during a prior policy gap cannot preserve lateral movement.
+    ct state established,related ct direction reply accept
+
+    # A source/port-only allow would turn this forwarding host into a transit
+    # router. Accept only a real Docker DNAT whose original destination was the
+    # exact published host address and whose translated output is managed.
+    iifname "{{ nic_adm }}" oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 443 tcp dport 443 accept
+{% if lab_dns_enabled | bool %}
+    # Lab-only published authoritative DNS. These are FORWARD rules for the
+    # DNAT path; the host INPUT chain remains closed to container traffic.
+    iifname "{{ nic_adm }}" oifname "br-lab-dns" ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 53 udp dport 53 accept
+    iifname "{{ nic_adm }}" oifname "br-lab-dns" ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 53 tcp dport 53 accept
+    iifname "{{ nic_internal }}" oifname "br-lab-dns" ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 53 udp dport 53 accept
+    iifname "{{ nic_internal }}" oifname "br-lab-dns" ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 53 tcp dport 53 accept
+{% endif %}
+    iifname "{{ nic_internal }}" oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 443 tcp dport 443 accept
+    iifname { "{{ nic_egress }}", "{{ nic_adm }}", "{{ nic_internal }}" } drop
+
+    iifname "{{ _egress_net.bridge }}" ip saddr {{ envoy_egress_ip }} ip daddr {{ container_dns_server }} udp dport 53 accept
+    iifname "{{ _egress_net.bridge }}" ip saddr {{ envoy_egress_ip }} ip daddr {{ container_dns_server }} tcp dport 53 accept
+    iifname "{{ _egress_net.bridge }}" oifname "{{ nic_egress }}" ip saddr {{ envoy_egress_ip }} tcp dport 443 accept
+{% if cribl_external_export_enabled | bool %}
+    iifname "{{ _internal_net.bridge }}" oifname "{{ nic_internal }}" ip saddr {{ alloy_internal_ip }} ip daddr {{ cribl_otlp_allowed_cidr }} tcp dport {{ cribl_otlp_allowed_port }} accept
+{% endif %}
+
+    # Anything originating on a managed application bridge that did not match
+    # an exact exception above is denied, regardless of output interface.
+{% for net in docker_networks %}
+    iifname "{{ net.bridge }}" drop
+{% endfor %}
+  }
+}
+AIGW_HOST_INPUT_RULES

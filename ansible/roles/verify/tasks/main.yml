@@ -1,0 +1,936 @@
+---
+# Post-converge assertions. Fail loudly rather than assume.
+
+- name: Read Docker daemon state-root configuration
+  ansible.builtin.command: docker info --format=json
+  register: docker_info_json
+  changed_when: false
+
+- name: Docker uses the reviewed encrypted state root
+  ansible.builtin.assert:
+    that:
+      - (docker_info_json.stdout | from_json).DockerRootDir == docker_data_root
+      - "'name=selinux' in (docker_info_json.stdout | from_json).SecurityOptions"
+    fail_msg: >-
+      Docker must use {{ docker_data_root }} and report active SELinux support;
+      host getenforce alone does not confine container processes.
+
+- name: Prove exact SELinux, health, restart, seccomp, and capability contracts
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import re
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        project = sys.argv[1]
+        expected = set(json.loads(sys.argv[2]))
+        disabled = set(json.loads(sys.argv[3]))
+        expected_bind_digests = json.loads(sys.argv[4])
+        allowed_unhealthy = set(json.loads(sys.argv[5]))
+        ids = subprocess.check_output(
+            ["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={project}"],
+            text=True,
+        ).split()
+        if not ids:
+            raise SystemExit("no running project containers")
+        containers = json.loads(
+            subprocess.check_output(["docker", "inspect", *ids], text=True)
+        )
+        actual = {}
+        for container in containers:
+            service = container["Config"]["Labels"].get(
+                "com.docker.compose.service", ""
+            )
+            if not service or service in actual:
+                raise SystemExit(f"missing/duplicate Compose service label: {service!r}")
+            actual[service] = container
+        if set(actual) != expected:
+            raise SystemExit(
+                f"running service drift: missing={sorted(expected-set(actual))} "
+                f"unexpected={sorted(set(actual)-expected)}"
+            )
+        if not disabled < expected or disabled != {"alloy", "node-exporter"}:
+            raise SystemExit("SELinux label-disable exception set drifted")
+        if not isinstance(expected_bind_digests, dict) or not set(
+            expected_bind_digests
+        ) < expected:
+            raise SystemExit("bind-source digest inventory drifted")
+        if any(
+            not re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in expected_bind_digests.values()
+        ):
+            raise SystemExit("bind-source digest marker is malformed")
+        if not allowed_unhealthy <= {"vault", "key-rotator"}:
+            raise SystemExit("bootstrap health exception set drifted")
+
+        process_pattern = re.compile(
+            r"^system_u:system_r:container_t:s0:c[0-9]+,c[0-9]+$"
+        )
+        mount_pattern = re.compile(
+            r"^system_u:object_r:container_file_t:s0:c[0-9]+,c[0-9]+$"
+        )
+        bounded_caps = {
+            "traefik-int": 0x400,
+            "traefik-adm": 0x400,
+            "lab-dns": 0x400,
+            "vault": 0x4000,
+            "samba-ad": 0x2004C3,
+        }
+        effective_caps = {"samba-ad": 0x2004C3}
+        checked_bind_objects = 0
+
+        def require_bind_context(source, expected):
+            nonlocal_checked = 0
+            root = Path(source)
+            if not root.exists() or root.is_symlink():
+                raise SystemExit(f"unsafe/missing bind source: {source}")
+            candidates = [root]
+            if root.is_dir():
+                for current, directories, files in os.walk(root, followlinks=False):
+                    directories.sort()
+                    files.sort()
+                    for name in directories + files:
+                        candidate = Path(current, name)
+                        if candidate.is_symlink():
+                            raise SystemExit(f"symlink below bind source: {candidate}")
+                        candidates.append(candidate)
+                        if len(candidates) > 4096:
+                            raise SystemExit(f"bind-source walk exceeds safety cap: {source}")
+            for candidate in candidates:
+                try:
+                    context = os.getxattr(
+                        candidate, "security.selinux", follow_symlinks=False
+                    ).rstrip(b"\x00").decode("ascii")
+                except (OSError, UnicodeError) as exc:
+                    raise SystemExit(
+                        f"cannot read SELinux context for {candidate}: {exc}"
+                    ) from exc
+                if expected == "shared":
+                    if not re.fullmatch(
+                        r"[^:]+:object_r:container_file_t:s0", context
+                    ):
+                        raise SystemExit(
+                            f"{candidate}: shared bind context drift: {context}"
+                        )
+                elif context != expected:
+                    raise SystemExit(
+                        f"{candidate}: private bind MCS drift: {context} != {expected}"
+                    )
+                nonlocal_checked += 1
+            return nonlocal_checked
+
+        for service, container in sorted(actual.items()):
+            labels = container["Config"]["Labels"]
+            if labels.get("com.aigw.contract.selinux-generation") != "1":
+                raise SystemExit(f"{service}: missing SELinux recreation generation")
+            bind_digest = labels.get("com.aigw.contract.bind-source-digest")
+            if service in expected_bind_digests:
+                if bind_digest != expected_bind_digests[service]:
+                    raise SystemExit(f"{service}: stale bind-source recreation marker")
+            elif bind_digest is not None:
+                raise SystemExit(f"{service}: unexpected bind-source recreation marker")
+            host = container["HostConfig"]
+            state = container["State"]
+            options = set(host.get("SecurityOpt") or [])
+            if host.get("Privileged"):
+                raise SystemExit(f"{service}: privileged container")
+            if "no-new-privileges:true" not in options:
+                raise SystemExit(f"{service}: no-new-privileges absent")
+            if set(host.get("CapDrop") or []) != {"ALL"}:
+                raise SystemExit(f"{service}: cap-drop ALL absent")
+            if not state.get("Running") or state.get("OOMKilled"):
+                raise SystemExit(f"{service}: not running cleanly")
+            if int(container.get("RestartCount", -1)) != 0:
+                raise SystemExit(f"{service}: Docker restart count is nonzero")
+            health = state.get("Health") or {}
+            if service in allowed_unhealthy:
+                if health.get("Status") not in {"starting", "unhealthy", "healthy"}:
+                    raise SystemExit(f"{service}: health contract is absent")
+            elif health.get("Status") != "healthy" or int(
+                health.get("FailingStreak", -1)
+            ) != 0:
+                raise SystemExit(f"{service}: health contract is not clean")
+
+            pid = int(state["Pid"])
+            proc_label = (
+                Path(f"/proc/{pid}/attr/current")
+                .read_bytes()
+                .replace(b"\x00", b"")
+                .decode("ascii")
+                .strip()
+            )
+            process_label = container.get("ProcessLabel") or ""
+            mount_label = container.get("MountLabel") or ""
+            if service in disabled:
+                if "label=disable" not in options or any(
+                    option.startswith("label=") and option != "label=disable"
+                    for option in options
+                ):
+                    raise SystemExit(f"{service}: label-disable option drift")
+                if process_label or mount_label or proc_label != "system_u:system_r:spc_t:s0":
+                    raise SystemExit(f"{service}: bounded spc_t exception drift")
+            else:
+                if "label=disable" in options or any(
+                    option.startswith("label=") for option in options
+                ):
+                    raise SystemExit(f"{service}: unexpected SELinux label override")
+                if not process_pattern.fullmatch(process_label):
+                    raise SystemExit(f"{service}: missing container_t MCS ProcessLabel")
+                if not mount_pattern.fullmatch(mount_label):
+                    raise SystemExit(f"{service}: missing container_file_t MCS MountLabel")
+                if proc_label != process_label:
+                    raise SystemExit(f"{service}: live process label differs from Docker metadata")
+
+                # Prove the host side of each bind remains readable at this
+                # container's exact MCS level. This catches an unconditional
+                # restorecon on a repeated converge: Compose retains an
+                # unchanged container and therefore does not reapply `Z`.
+                for bind in host.get("Binds") or []:
+                    fields = bind.split(":")
+                    if len(fields) != 3:
+                        raise SystemExit(f"{service}: noncanonical bind: {bind}")
+                    source, _target, option_text = fields
+                    options_set = set(option_text.split(","))
+                    relabel = options_set & {"z", "Z"}
+                    if "ro" not in options_set or len(relabel) != 1:
+                        raise SystemExit(f"{service}: unsafe bind options: {bind}")
+                    if source == "/" or source.startswith("/var/lib/docker"):
+                        raise SystemExit(f"{service}: system path requested relabel: {source}")
+                    expected_context = mount_label if relabel == {"Z"} else "shared"
+                    checked_bind_objects += require_bind_context(
+                        source, expected_context
+                    )
+
+            status = {}
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    status[key] = value.strip().split()[0]
+            if status.get("NoNewPrivs") != "1" or status.get("Seccomp") != "2":
+                raise SystemExit(f"{service}: live NNP/seccomp contract drift")
+            cap_eff = int(status.get("CapEff", "-1"), 16)
+            cap_bnd = int(status.get("CapBnd", "-1"), 16)
+            if cap_eff != effective_caps.get(service, 0):
+                raise SystemExit(f"{service}: unexpected effective capabilities")
+            if cap_bnd != bounded_caps.get(service, 0):
+                raise SystemExit(f"{service}: unexpected capability bounding set")
+
+        print(
+            f"selinux-runtime-contract=ok confined={len(expected-disabled)} "
+            f"bounded-disabled={len(disabled)} bind-objects={checked_bind_objects}"
+        )
+      - "{{ compose_project_name }}"
+      - >-
+        {{
+          ([
+            'traefik-int', 'traefik-adm', 'oauth2-proxy',
+            'oauth2-proxy-grafana', 'litellm', 'open-webui', 'keycloak',
+            'dev-portal', 'envoy-egress', 'key-rotator', 'vault', 'postgres',
+            'redis', 'alloy', 'prometheus', 'node-exporter', 'loki', 'tempo',
+            'grafana', 'cribl-mock'
+          ] + (['lab-dns', 'samba-ad'] if (samba_lab_enabled | bool) else []))
+          | to_json
+        }}
+      - "{{ ['alloy', 'node-exporter'] | to_json }}"
+      - "{{ aigw_bind_source_digests | to_json }}"
+      - >-
+        {{
+          (['vault', 'key-rotator']
+           if (vault_strict_readiness is defined and vault_strict_readiness.rc != 0)
+           else [])
+          | to_json
+        }}
+  register: selinux_runtime_contract
+  changed_when: false
+  retries: 24
+  delay: 5
+  until: selinux_runtime_contract.rc == 0
+
+- name: Read Docker runtime-root SELinux types without relabeling them
+  ansible.builtin.command:
+    argv: [stat, -c, '%C', --, "{{ item }}"]
+  loop:
+    - "{{ docker_data_root }}"
+    - "{{ docker_data_root }}/containers"
+  register: docker_runtime_contexts
+  changed_when: false
+
+- name: Docker runtime roots retain the policy-owned container runtime type
+  ansible.builtin.assert:
+    that:
+      - item.stdout is match('^system_u:object_r:container_var_lib_t:s0$')
+    quiet: true
+    fail_msg: >-
+      {{ item.item }} was relabeled as application content. z/Z must never be
+      applied to the Docker data root or containers tree.
+  loop: "{{ docker_runtime_contexts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read SELinux denials created during this converge window
+  ansible.builtin.command:
+    argv:
+      - ausearch
+      - -m
+      - AVC,USER_AVC
+      - --start
+      - "{{ aigw_selinux_audit_window_start.stdout.split()[0] }}"
+      - "{{ aigw_selinux_audit_window_start.stdout.split()[1] }}"
+  environment:
+    LC_ALL: C
+  register: aigw_recent_selinux_denials
+  changed_when: false
+  failed_when: false
+
+- name: Require zero SELinux denials during the controlled converge
+  ansible.builtin.assert:
+    that:
+      - aigw_recent_selinux_denials.rc == 1
+      - aigw_recent_selinux_denials.stderr is search('(?i)<no matches>')
+    quiet: true
+    fail_msg: >-
+      SELinux recorded an AVC/USER_AVC after the preflight checkpoint. Review
+      the audit record and narrow the mount/policy contract; never disable
+      labeling on another service as a generic workaround.
+
+- name: Read each dedicated PBR rule
+  ansible.builtin.command: "ip -4 rule show priority {{ item.priority }}"
+  loop: "{{ pbr_tables }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: ip_rules
+  changed_when: false
+  failed_when: >-
+    ('from ' ~ item.src) not in ip_rules.stdout or
+    ('lookup ' ~ item.name) not in ip_rules.stdout
+
+- name: Read each PBR default route
+  ansible.builtin.command: "ip -4 route show table {{ item.id }} default"
+  loop: "{{ pbr_tables }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: pbr_defaults
+  changed_when: false
+  failed_when: >-
+    pbr_defaults.stdout_lines | length != 1 or
+    ('via ' ~ item.gw) not in pbr_defaults.stdout or
+    ('dev ' ~ item.dev) not in pbr_defaults.stdout or
+    (('src ' ~ item.src) not in pbr_defaults.stdout and
+     'proto static' not in pbr_defaults.stdout)
+
+- name: Read IPv4 default routes
+  ansible.builtin.command: ip -4 route show default
+  register: defroute
+  changed_when: false
+
+- name: Exactly one default route exists and it exits the egress NIC
+  ansible.builtin.assert:
+    that:
+      - defroute.stdout_lines | length == 1
+      - "('dev ' ~ nic_egress) in defroute.stdout_lines[0]"
+      - "('via ' ~ eth0_gateway) in defroute.stdout_lines[0]"
+    fail_msg: "Expected exactly one IPv4 default route, via {{ nic_egress }}."
+
+- name: firewalld — interfaces in expected zones
+  ansible.builtin.command: firewall-cmd --get-active-zones
+  register: active_zones
+  changed_when: false
+  # Assert every configured zone is active by its real name. Substring checks
+  # broke when zones were renamed to aigw-* (e.g. "ext" is not in "aigw-egress").
+  failed_when: >
+    firewalld_zones | map(attribute='zone') | reject('in', active_zones.stdout) | list | length > 0
+
+- name: firewalld — exact runtime and saved-profile zone ownership
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import subprocess
+        import sys
+
+        interface, expected = sys.argv[1:]
+
+        def read(*argv):
+            result = subprocess.run(
+                argv,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                raise SystemExit(
+                    f"{argv[0]} failed for {interface}: {result.stderr.strip()}"
+                )
+            return result.stdout.strip()
+
+        runtime = read("firewall-cmd", "--get-zone-of-interface", interface)
+        uuid = read("nmcli", "--get-values", "GENERAL.CON-UUID", "device", "show", interface)
+        saved = read(
+            "nmcli", "--get-values", "connection.zone",
+            "connection", "show", "uuid", uuid,
+        )
+        permanent = read(
+            "firewall-cmd", "--permanent", f"--zone={expected}", "--list-interfaces"
+        ).split()
+
+        errors = []
+        if runtime != expected:
+            errors.append(f"runtime={runtime!r}")
+        if saved != expected:
+            errors.append(f"saved={saved!r}")
+        if permanent != [interface]:
+            errors.append(f"permanent={permanent!r}")
+        if errors:
+            raise SystemExit(f"{interface} expected {expected}: " + ", ".join(errors))
+      - "{{ item.1 }}"
+      - "{{ item.0.zone }}"
+  loop: "{{ firewalld_zones | subelements('interfaces') }}"
+  loop_control:
+    label: "{{ item.1 }} -> {{ item.0.zone }}"
+  changed_when: false
+
+- name: firewalld — no legacy zone-wide port openings remain
+  ansible.builtin.command: "firewall-cmd --zone={{ item.zone }} --list-ports"
+  loop: "{{ firewalld_zones }}"
+  loop_control:
+    label: "{{ item.zone }}"
+  register: zone_ports
+  changed_when: false
+  failed_when: zone_ports.stdout | trim | length > 0
+
+- name: firewalld — read source-scoped rich rules
+  ansible.builtin.command: "firewall-cmd --zone={{ item.zone }} --list-rich-rules"
+  loop: "{{ firewalld_zones }}"
+  loop_control:
+    label: "{{ item.zone }}"
+  register: zone_rich_rules
+  changed_when: false
+
+- name: firewalld — every approved source/port rule is present
+  ansible.builtin.assert:
+    that:
+      - item.1 in item.0.stdout
+    fail_msg: "Missing source-scoped rule in zone {{ item.0.item.zone }}: {{ item.1 }}"
+  loop: "{{ zone_rich_rules.results | subelements('item.rich_rules') }}"
+  loop_control:
+    label: "{{ item.0.item.zone }}"
+
+# firewalld_zones applies these in-role (and at boot Before=docker.service),
+# so by verify time the chain must hold the real lockdown, not just "some rules":
+# the exact Envoy 443 allow AND the all-bridge original-direction deny.
+- name: DOCKER-USER chain populated with egress lockdown
+  ansible.builtin.command: iptables -S DOCKER-USER
+  register: du
+  changed_when: false
+  failed_when: >
+    du.stdout_lines | length < 5 or
+    '-i br-egress' not in du.stdout or
+    ('-s ' ~ envoy_egress_ip ~ '/32') not in du.stdout or
+    '--ctdir REPLY -j RETURN' not in du.stdout or
+    '-i br+ ! -o br+ -j DROP' not in du.stdout
+
+- name: Lab DNS DNAT is source-scoped in DOCKER-USER
+  ansible.builtin.assert:
+    that:
+      # iptables canonicalizes source before the interfaces and emits the
+      # conntrack options after the transport match.
+      - "du.stdout is search('(?m).* -s ' ~ (vpn_client_cidr | regex_escape) ~ ' -i ' ~ (nic_adm | regex_escape) ~ ' -o br\\+ -p udp .*--dport 53.*--ctstate DNAT.*--ctorigdst ' ~ (eth1_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 53.*--ctdir ORIGINAL.*RETURN')"
+      - "du.stdout is search('(?m).* -s ' ~ (vpn_client_cidr | regex_escape) ~ ' -i ' ~ (nic_adm | regex_escape) ~ ' -o br\\+ -p tcp .*--dport 53.*--ctstate DNAT.*--ctorigdst ' ~ (eth1_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 53.*--ctdir ORIGINAL.*RETURN')"
+      - "du.stdout is search('(?m).* -s ' ~ (internal_cidr | regex_escape) ~ ' -i ' ~ (nic_internal | regex_escape) ~ ' -o br\\+ -p udp .*--dport 53.*--ctstate DNAT.*--ctorigdst ' ~ (eth2_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 53.*--ctdir ORIGINAL.*RETURN')"
+      - "du.stdout is search('(?m).* -s ' ~ (internal_cidr | regex_escape) ~ ' -i ' ~ (nic_internal | regex_escape) ~ ' -o br\\+ -p tcp .*--dport 53.*--ctstate DNAT.*--ctorigdst ' ~ (eth2_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 53.*--ctdir ORIGINAL.*RETURN')"
+      - "du.stdout is not search('(?m).*' ~ (nic_egress | regex_escape) ~ '.*--dport 53.*RETURN')"
+    fail_msg: Lab DNS TCP/UDP 53 is not source-scoped before the ADM drop.
+  when: lab_dns_enabled | bool
+
+- name: Physical ingress is restricted to exact Docker DNAT tuples
+  ansible.builtin.assert:
+    that:
+      - "du.stdout is search('(?m).*' ~ (nic_adm | regex_escape) ~ '.*-o br\\+.*--dport 443.*--ctstate DNAT.*--ctorigdst ' ~ (eth1_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 443.*--ctdir ORIGINAL.*RETURN')"
+      - "du.stdout is search('(?m).*' ~ (nic_internal | regex_escape) ~ '.*-o br\\+.*--dport 443.*--ctstate DNAT.*--ctorigdst ' ~ (eth2_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 443.*--ctdir ORIGINAL.*RETURN')"
+      - "du.stdout is not search('(?m)^-A DOCKER-USER -i (' ~ ([nic_adm, nic_internal] | map('regex_escape') | join('|')) ~ ').*--dport (53|443) -j RETURN$')"
+    fail_msg: >-
+      Physical ingress allows source/port-only forwarding instead of exact
+      DNAT to the approved host addresses; the gateway could become a transit router.
+
+- name: Read persistent container-to-host boundary
+  ansible.builtin.command: nft list table inet aigw_guard
+  register: host_input_guard
+  changed_when: false
+
+- name: Every managed bridge denies new container-to-host connections
+  ansible.builtin.assert:
+    that:
+      - "'chain container_forward' in host_input_guard.stdout"
+      - "('ip saddr ' ~ envoy_egress_ip) in host_input_guard.stdout"
+      - "('ip daddr ' ~ container_dns_server) in host_input_guard.stdout"
+      - "('iifname \"' ~ item.bridge ~ '\" drop') in host_input_guard.stdout"
+      - "('iifname \"' ~ item.bridge ~ '\" ct state established,related ct direction reply accept') in host_input_guard.stdout"
+    fail_msg: "Missing host INPUT boundary for {{ item.bridge }}."
+  loop: "{{ docker_networks }}"
+  loop_control:
+    label: "{{ item.bridge }}"
+
+- name: Lab DNS DNAT is source-scoped in the independent nft guard
+  ansible.builtin.assert:
+    that:
+      - "host_input_guard.stdout is search('iifname \\\"' ~ (nic_adm | regex_escape) ~ '\\\".*ip saddr ' ~ (vpn_client_cidr | regex_escape) ~ '.*udp dport 53 accept')"
+      - "host_input_guard.stdout is search('iifname \\\"' ~ (nic_adm | regex_escape) ~ '\\\".*ip saddr ' ~ (vpn_client_cidr | regex_escape) ~ '.*tcp dport 53 accept')"
+      - "host_input_guard.stdout is search('iifname \\\"' ~ (nic_internal | regex_escape) ~ '\\\".*ip saddr ' ~ (internal_cidr | regex_escape) ~ '.*udp dport 53 accept')"
+      - "host_input_guard.stdout is search('iifname \\\"' ~ (nic_internal | regex_escape) ~ '\\\".*ip saddr ' ~ (internal_cidr | regex_escape) ~ '.*tcp dport 53 accept')"
+      - "host_input_guard.stdout is not search('iifname \\\"' ~ (nic_egress | regex_escape) ~ '\\\".*dport 53 accept')"
+    fail_msg: Lab DNS TCP/UDP 53 is absent from the persistent native guard.
+  when: lab_dns_enabled | bool
+
+- name: Independent nft guard restricts physical ingress to exact DNAT tuples
+  ansible.builtin.assert:
+    that:
+      - "'ct status dnat' in host_input_guard.stdout"
+      - "('ct original ip daddr ' ~ eth1_ip) in host_input_guard.stdout"
+      - "('ct original ip daddr ' ~ eth2_ip) in host_input_guard.stdout"
+      - "'ct original proto-dst 443' in host_input_guard.stdout"
+      - "host_input_guard.stdout is not search('(?m)iifname \\\"(' ~ ([nic_adm, nic_internal] | map('regex_escape') | join('|')) ~ ')\\\" ip saddr .* (tcp|udp) dport (53|443) accept$')"
+    fail_msg: >-
+      The independent nft guard lacks exact original-destination/DNAT proof
+      for physical ingress and does not independently prevent routed transit.
+
+- name: Firewall persistence services are active
+  ansible.builtin.command: >-
+    systemctl is-active aigw-host-input-rules.service
+    docker-user-rules.service docker-user-rules-watch.service
+  changed_when: false
+
+- name: Vault audit rotation timer is active
+  ansible.builtin.command: systemctl is-active aigw-vault-audit-rotate.timer
+  changed_when: false
+
+- name: Inspect every managed Docker network
+  ansible.builtin.command: "docker network inspect {{ item.name }}"
+  loop: "{{ docker_networks }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: verified_networks
+  changed_when: false
+
+- name: Docker networks match the firewall ABI and have IPv6 disabled
+  ansible.builtin.assert:
+    that:
+      - (item.stdout | from_json | first).Driver == 'bridge'
+      - (item.stdout | from_json | first).Internal == item.item.internal
+      - not ((item.stdout | from_json | first).EnableIPv6 | bool)
+      - (item.stdout | from_json | first).Options['com.docker.network.bridge.name'] == item.item.bridge
+      - item.item.subnet in ((item.stdout | from_json | first).IPAM.Config | map(attribute='Subnet') | list)
+      - >-
+        (item.stdout | from_json | first).IPAM.Config[0].IPRange ==
+        (item.item.subnet | regex_replace('\\.0/24$', '.128/25'))
+    fail_msg: "Docker network {{ item.item.name }} does not match the firewall ABI."
+  loop: "{{ verified_networks.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Wait for the lab Samba AD health contract
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "{{ compose_project_name }}-samba-ad-1"
+  register: samba_lab_inspect
+  changed_when: false
+  retries: 45
+  delay: 4
+  until: >-
+    samba_lab_inspect.rc == 0 and
+    ((((samba_lab_inspect.stdout | from_json | first).State.Health | default({})).Status) | default('')) == 'healthy'
+  when: samba_lab_enabled | bool
+
+- name: Samba lab runtime matches the reviewed isolation boundary
+  ansible.builtin.assert:
+    that:
+      - not ((samba_lab_inspect.stdout | from_json | first).HostConfig.Privileged | bool)
+      - (samba_lab_inspect.stdout | from_json | first).HostConfig.ReadonlyRootfs | bool
+      - ((samba_lab_inspect.stdout | from_json | first).HostConfig.CapDrop | sort) == ['ALL']
+      - ((samba_lab_inspect.stdout | from_json | first).HostConfig.CapAdd | sort) == ['CAP_CHOWN', 'CAP_DAC_OVERRIDE', 'CAP_NET_BIND_SERVICE', 'CAP_SETGID', 'CAP_SETUID', 'CAP_SYS_ADMIN']
+      - (((samba_lab_inspect.stdout | from_json | first).HostConfig.PortBindings | default({}, true)) | length) == 0
+      - ((samba_lab_inspect.stdout | from_json | first).NetworkSettings.Networks | dict2items | map(attribute='key') | list) == ['net-identity']
+    fail_msg: >-
+      Samba AD is unhealthy, privileged, externally published, over-capable,
+      writable, or attached outside net-identity.
+  when: samba_lab_enabled | bool
+
+- name: Wait for the authoritative lab DNS health contract
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "{{ compose_project_name }}-lab-dns-1"
+  register: lab_dns_inspect
+  changed_when: false
+  retries: 30
+  delay: 2
+  until: >-
+    lab_dns_inspect.rc == 0 and
+    ((((lab_dns_inspect.stdout | from_json | first).State.Health | default({})).Status) | default('')) == 'healthy'
+  when: lab_dns_enabled | bool
+
+- name: Lab DNS runtime matches the reviewed isolation boundary
+  ansible.builtin.assert:
+    that:
+      - not ((lab_dns_inspect.stdout | from_json | first).HostConfig.Privileged | bool)
+      - (lab_dns_inspect.stdout | from_json | first).HostConfig.ReadonlyRootfs | bool
+      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.CapDrop | sort) == ['ALL']
+      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.CapAdd | sort) == ['CAP_NET_BIND_SERVICE']
+      - ((lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks | dict2items | map(attribute='key') | list) == ['net-lab-dns']
+      - (lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-lab-dns'].IPAddress == lab_dns_ip
+      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings | dict2items | map(attribute='key') | sort | list) == ['53/tcp', '53/udp']
+      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/tcp'] | map(attribute='HostIp') | sort | list) == ([eth1_ip, eth2_ip] | sort)
+      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/udp'] | map(attribute='HostIp') | sort | list) == ([eth1_ip, eth2_ip] | sort)
+      - eth0_ip not in ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/tcp'] | map(attribute='HostIp') | list)
+      - eth0_ip not in ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/udp'] | map(attribute='HostIp') | list)
+    fail_msg: >-
+      Lab DNS is unhealthy, privileged, writable, over-capable, attached to an
+      application plane, or published outside TCP/UDP 53.
+  when: lab_dns_enabled | bool
+
+- name: Query authoritative lab DNS over UDP and TCP from the host bridge
+  ansible.builtin.command:
+    argv:
+      - dig
+      - "@{{ (lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-lab-dns'].IPAddress }}"
+      - "{{ item.name }}"
+      - A
+      - +short
+      - "{{ item.transport }}"
+  loop:
+    - { name: portal.aigw.internal, transport: +notcp }
+    - { name: admin.aigw.internal, transport: +tcp }
+  register: lab_dns_queries
+  changed_when: false
+  failed_when: >-
+    lab_dns_queries.rc != 0 or
+    (item.name == 'portal.aigw.internal' and lab_dns_queries.stdout | trim != eth2_ip) or
+    (item.name == 'admin.aigw.internal' and lab_dns_queries.stdout | trim != eth1_ip)
+  when: lab_dns_enabled | bool
+
+- name: Prove the lab DNS process cannot originate DNS, TCP, or ICMP egress
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ compose_project_name }}-lab-dns-1"
+      - /dns-healthcheck
+      - --assert-no-egress
+      - "{{ container_dns_server }}"
+  changed_when: false
+  when: lab_dns_enabled | bool
+
+- name: Samba lab directory database is internally consistent
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - samba-ad
+      - samba-tool
+      - dbcheck
+      - --cross-ncs
+  args:
+    chdir: "{{ stack_dir }}"
+  changed_when: false
+  when: samba_lab_enabled | bool
+
+- name: Read TCP listeners
+  ansible.builtin.shell: |
+    ss -H -tlnp | awk '{print $4}'
+  register: tcp_binds
+  changed_when: false
+
+- name: Nothing except SSH binds wildcard, and nothing binds the egress IP
+  ansible.builtin.assert:
+    that:
+      - >-
+        tcp_binds.stdout_lines
+        | select('match', '^(0\\.0\\.0\\.0|\\[::\\]):')
+        | reject('search', ':22$') | list | length == 0
+      - >-
+        tcp_binds.stdout_lines
+        | select('match', '^' ~ (ansible_facts[nic_egress].ipv4.address | regex_escape) ~ ':')
+        | list | length == 0
+    fail_msg: "A non-SSH wildcard listener or explicit {{ nic_egress }} listener is exposed."
+
+- name: Prove exact non-root bind-source ownership and modes
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        from pathlib import Path
+        import stat
+        import sys
+
+        root = Path(sys.argv[1])
+        samba_enabled = sys.argv[2] == "true"
+        expected = {
+            "certs": ("dir", 0, 65532, 0o750),
+            "certs/int.key": ("file", 0, 65532, 0o640),
+            "certs/int.crt": ("file", 0, 0, 0o644),
+            "certs/ca.pem": ("file", 0, 0, 0o644),
+            "traefik/dynamic-int.yml": ("file", 0, 0, 0o644),
+            "traefik/dynamic-adm.yml": ("file", 0, 0, 0o644),
+            "grafana": ("dir", 0, 0, 0o755),
+            "grafana/provisioning": ("dir", 0, 0, 0o755),
+            "grafana/provisioning/datasources": ("dir", 0, 0, 0o755),
+            "grafana/provisioning/datasources/datasources.yml": ("file", 0, 0, 0o644),
+            "keycloak/realms": ("dir", 0, 65532, 0o750),
+            "keycloak/realms/aigw-realm.json": ("file", 0, 65532, 0o640),
+            "keycloak/realms/anthropic-wif-realm.json": ("file", 0, 65532, 0o640),
+            "secrets": ("dir", 0, 0, 0o700),
+            "secrets/redis_password": ("file", 0, 65532, 0o440),
+            "secrets/redis_users.acl": ("file", 0, 65532, 0o440),
+        }
+        if samba_enabled:
+            expected.update({
+                "secrets/samba_ad_admin_password": ("file", 0, 0, 0o400),
+                "secrets/samba_ad_bind_password": ("file", 0, 65532, 0o440),
+                "secrets/samba_user_lab-admin_password": ("file", 0, 0, 0o400),
+                "secrets/samba_user_lab-developer_password": ("file", 0, 0, 0o400),
+                "secrets/samba_user_lab-user_password": ("file", 0, 0, 0o400),
+            })
+        errors = []
+        for relative, (kind, uid, gid, mode) in expected.items():
+            path = root / relative
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                errors.append(f"{relative}: missing")
+                continue
+            actual_kind = "file" if stat.S_ISREG(info.st_mode) else "dir" if stat.S_ISDIR(info.st_mode) else "unsafe"
+            actual = (actual_kind, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode))
+            wanted = (kind, uid, gid, mode)
+            if path.is_symlink() or actual != wanted or (kind == "file" and info.st_nlink != 1):
+                errors.append(f"{relative}: got={actual!r} wanted={wanted!r} links={info.st_nlink}")
+        if errors:
+            raise SystemExit("; ".join(errors))
+      - "{{ stack_dir }}"
+      - "{{ samba_lab_enabled | bool | lower }}"
+  changed_when: false
+
+- name: Prove selected DHI services actually run as uid and gid 65532
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        from pathlib import Path
+        import subprocess
+        import sys
+
+        name = sys.argv[1]
+        details = json.loads(subprocess.check_output(["docker", "inspect", name], text=True))[0]
+        pid = int(details["State"]["Pid"])
+        if pid <= 0 or not details["State"]["Running"]:
+            raise SystemExit(f"{name} is not running")
+        fields = {}
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith(("Uid:", "Gid:")):
+                key, values = line.split(":", 1)
+                fields[key] = tuple(int(value) for value in values.split())
+        if fields.get("Uid") != (65532, 65532, 65532, 65532):
+            raise SystemExit(f"{name} unexpected Uid tuple")
+        if fields.get("Gid") != (65532, 65532, 65532, 65532):
+            raise SystemExit(f"{name} unexpected Gid tuple")
+      - "{{ compose_project_name }}-{{ item }}-1"
+  loop:
+    - traefik-int
+    - traefik-adm
+    - keycloak
+    - redis
+    - grafana
+    - key-rotator
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+
+- name: Prove trusted TLS and SNI routing through the exact service-plane edge addresses
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import socket
+        import ssl
+        import sys
+
+        ca_file, address, hostname, path, expected_csv = sys.argv[1:]
+        expected = {int(value) for value in expected_csv.split(",")}
+        context = ssl.create_default_context(cafile=ca_file)
+        with socket.create_connection((address, 443), timeout=5) as plain:
+            with context.wrap_socket(plain, server_hostname=hostname) as tls:
+                request = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {hostname}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+                tls.sendall(request)
+                response = bytearray()
+                while b"\r\n\r\n" not in response and len(response) <= 65536:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+        first_line = bytes(response).split(b"\r\n", 1)[0].decode("ascii", "strict")
+        fields = first_line.split()
+        if len(fields) < 2 or not fields[1].isdigit():
+            raise SystemExit(f"invalid HTTP response for {hostname}{path}: {first_line!r}")
+        status = int(fields[1])
+        if status not in expected:
+            raise SystemExit(
+                f"unexpected status for {hostname}{path}: {status}, wanted {sorted(expected)}"
+            )
+      - "{{ stack_dir }}/certs/ca.pem"
+      - "{{ item.address }}"
+      - "{{ item.hostname }}"
+      - "{{ item.path }}"
+      - "{{ item.status }}"
+  loop:
+    # Probe each reviewed Traefik attachment directly. Host-origin traffic to
+    # a physical published address is deliberately denied while the separate
+    # disaster-recovery maintenance guard admits only the recovery operator;
+    # listener/DNAT/firewall verification above proves physical publication.
+    - { address: "{{ traefik_int_portal_ip }}", hostname: "portal.{{ aigw_domain }}", path: /healthz, status: "200" }
+    - { address: "{{ traefik_int_chat_ip }}", hostname: "api.{{ aigw_domain }}", path: /ui, status: "403" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin.{{ aigw_domain }}", path: /, status: "403" }
+  loop_control:
+    label: "{{ item.hostname }}{{ item.path }} -> {{ item.status }}"
+  changed_when: false
+
+- name: Prove Grafana loaded the exact provisioned datasource graph
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --rm
+      - -i
+      - --pull=never
+      - --network
+      - net-grafana
+      - --read-only
+      - --tmpfs
+      - /tmp:rw,noexec,nosuid,nodev
+      - --cap-drop
+      - ALL
+      - --security-opt
+      - no-new-privileges:true
+      - --log-driver
+      - none
+      - --entrypoint
+      - /opt/venv/bin/python
+      - ai-gateway-dev-portal
+      - -I
+      - -c
+      - |
+        import base64
+        import json
+        import sys
+        import urllib.request
+
+        password = sys.stdin.read().removesuffix("\n")
+        if not password or "\n" in password or "\r" in password:
+            raise SystemExit("invalid Grafana password input")
+        authorization = base64.b64encode(f"admin:{password}".encode()).decode()
+        request = urllib.request.Request("http://grafana:3000/api/datasources")
+        request.add_header("Authorization", f"Basic {authorization}")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.load(response)
+        actual = {
+            (item["name"], item["uid"], item["type"], item["url"])
+            for item in payload
+        }
+        expected = {
+            ("Prometheus", "prometheus", "prometheus", "http://prometheus:9090"),
+            ("Loki", "loki", "loki", "http://loki:3100"),
+            ("Tempo", "tempo", "tempo", "http://tempo:3200"),
+        }
+        if actual != expected:
+            raise SystemExit("Grafana datasource graph does not match the reviewed provisioning")
+        for uid in ("prometheus", "loki", "tempo"):
+            request = urllib.request.Request(
+                f"http://grafana:3000/api/datasources/uid/{uid}/health"
+            )
+            request.add_header("Authorization", f"Basic {authorization}")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                health = json.load(response)
+            if health.get("status") != "OK":
+                raise SystemExit(f"Grafana datasource {uid} health is not OK")
+  args:
+    stdin: "{{ grafana_admin_password }}"
+    stdin_add_newline: false
+  register: grafana_datasource_graph
+  retries: 12
+  delay: 5
+  until: grafana_datasource_graph.rc == 0
+  changed_when: false
+  no_log: true
+
+- name: Prove Prometheus scraped the host filesystem through node-exporter
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import sys
+        import urllib.parse
+        import urllib.request
+
+        base = f"http://{sys.argv[1]}:9090/api/v1/query?"
+
+        def query(expression):
+            url = base + urllib.parse.urlencode({"query": expression})
+            with urllib.request.urlopen(url, timeout=5) as response:
+                payload = json.load(response)
+            if payload.get("status") != "success":
+                raise SystemExit("Prometheus query failed")
+            return payload["data"]["result"]
+
+        up = query('up{job="node-exporter"}')
+        if len(up) != 1 or float(up[0]["value"][1]) != 1.0:
+            raise SystemExit("node-exporter scrape target is not exactly up")
+        filesystems = query(
+            'node_filesystem_size_bytes{job="node-exporter",mountpoint="/"}'
+        )
+        if not filesystems or not all(float(item["value"][1]) > 0 for item in filesystems):
+            raise SystemExit("node-exporter did not expose the host root filesystem")
+      - "{{ prometheus_observability_ip }}"
+  changed_when: false
+
+- name: Egress canary — vendor reachable only via the pinned reverse proxy
+  ansible.builtin.command: >
+    docker exec {{ compose_project_name }}-key-rotator-1
+    python3 -c "import urllib.request,sys;
+    r=urllib.request.urlopen(urllib.request.Request('http://envoy-egress:8080/anthropic/v1/models'),timeout=15);
+    print(r.status)"
+  register: canary
+  changed_when: false
+  failed_when: false   # 401 (no key) still proves path+TLS; informational
+  # expected: HTTPError 401 from api.anthropic.com through envoy — proves the
+  # pinned egress path works; a connection error means routing/DNS/eth0 issue.
+
+- name: Show canary result
+  ansible.builtin.debug:
+    var: canary.stdout_lines + canary.stderr_lines | default([])

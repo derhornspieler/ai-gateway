@@ -1,0 +1,2439 @@
+---
+- name: Validate fixed edge IP / trusted-proxy network ABI
+  ansible.builtin.assert:
+    that:
+      - traefik_int_chat_ip == '172.28.3.2'
+      - traefik_int_portal_ip == '172.28.4.2'
+      - traefik_adm_admin_ip == '172.28.5.2'
+      - traefik_adm_grafana_ip == '172.28.6.2'
+      - alloy_telemetry_ip == '172.28.13.2'
+      - alloy_observability_ip == '172.28.15.2'
+      - prometheus_observability_ip == '172.28.15.3'
+      - tempo_ingest_ip == '172.28.16.2'
+      - lab_dns_ip == '172.28.18.2'
+      - (docker_networks | selectattr('name', 'equalto', 'net-chat') | map(attribute='subnet') | first) == '172.28.3.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-portal') | map(attribute='subnet') | first) == '172.28.4.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-admin-app') | map(attribute='subnet') | first) == '172.28.5.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-grafana') | map(attribute='subnet') | first) == '172.28.6.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-telemetry') | map(attribute='subnet') | first) == '172.28.13.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-observability') | map(attribute='subnet') | first) == '172.28.15.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-traces') | map(attribute='subnet') | first) == '172.28.16.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-identity') | map(attribute='subnet') | first) == '172.28.17.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-lab-dns') | map(attribute='subnet') | first) == '172.28.18.0/24'
+    fail_msg: >-
+      Fixed Traefik IPs and application subnets are a proxy-trust ABI. Update
+      Compose, Keycloak/oauth2-proxy/Uvicorn trust, and these assertions as one
+      reviewed change; do not let callback reconstruction drift.
+
+- name: Process optional offline external-image seed before Compose
+  ansible.builtin.include_tasks: offline_image_seed.yml
+
+- name: Stack directory
+  ansible.builtin.file:
+    path: "{{ stack_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# Deploy an explicit allow-list. A recursive copy of the working tree also
+# copied ignored local .env/private-key/secrets files; .gitignore is not an
+# Ansible deployment boundary.
+- name: Create allow-listed compose config directories
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/{{ item }}"
+    state: directory
+    # These directories contain reviewed non-secret service configuration.
+    # Several DHI services run as distinct non-root UIDs and Grafana mounts a
+    # whole provisioning tree, so deterministic traverse permission is part
+    # of the runtime contract. Secrets use the separate root-only directory.
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - alloy
+    - cribl-mock
+    - grafana
+    - grafana/provisioning
+    - grafana/provisioning/datasources
+    - litellm
+    - loki
+    - postgres/init
+    - prometheus
+    - traefik
+    - tempo
+    - vault
+
+- name: Sync allow-listed compose configuration files
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/{{ item }}"
+    dest: "{{ stack_dir }}/{{ item }}"
+    owner: root
+    group: root
+    # Controller checkout modes are not a deployment policy. In particular,
+    # a local 0600 dynamic route file leaves non-root Traefik healthy at /ping
+    # but unable to load TLS/routes. Only the PostgreSQL initializer executes.
+    mode: "{{ '0755' if item == 'postgres/init/01-init-databases.sh' else '0644' }}"
+  loop:
+    - bind-source-digest-inputs.json
+    - docker-compose.yml
+    - docker-compose.lab.yml
+    - alloy/config.alloy
+    - cribl-mock/config.yaml
+    - grafana/provisioning/datasources/datasources.yml
+    - litellm/config.yaml
+    - loki/config.yml
+    - postgres/init/01-init-databases.sh
+    - prometheus/prometheus.yml
+    - prometheus/rules.yml
+    - traefik/traefik-int.yml
+    - traefik/traefik-adm.yml
+    - traefik/dynamic-int.yml
+    - traefik/dynamic-adm.yml
+    - tempo/config.yml
+    - vault/config.hcl
+
+- name: Render mutually exclusive Cribl plaintext or verified-TLS client
+  ansible.builtin.blockinfile:
+    path: "{{ stack_dir }}/alloy/config.alloy"
+    marker: "    // {mark} AIGW MANAGED CRIBL TLS"
+    block: |
+      {% if cribl_otlp_insecure | bool %}
+          tls {
+            insecure = true
+          }
+      {% else %}
+          tls {
+            insecure             = false
+            ca_file              = "{{ cribl_otlp_ca_file }}"
+            server_name          = "{{ cribl_otlp_server_name }}"
+            insecure_skip_verify = false
+            min_version          = "1.2"
+          }
+      {% endif %}
+
+- name: Inspect PostgreSQL initialization mount permissions
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/{{ item }}"
+  loop:
+    - postgres/init
+    - postgres/init/01-init-databases.sh
+  register: postgres_init_mount
+
+- name: Verify PostgreSQL can traverse and execute its initialization mount
+  ansible.builtin.assert:
+    that:
+      - postgres_init_mount.results[0].stat.isdir | default(false)
+      - postgres_init_mount.results[0].stat.mode == '0755'
+      - postgres_init_mount.results[1].stat.isreg | default(false)
+      - postgres_init_mount.results[1].stat.mode in ['0555', '0755']
+    quiet: true
+    fail_msg: >-
+      The PostgreSQL image drops privileges before enumerating
+      /docker-entrypoint-initdb.d; its non-secret init directory must be 0755
+      and 01-init-databases.sh must be world-readable/executable.
+
+# Realm imports: Ansible vars are the single source of truth. The static
+# compose/keycloak/realms/*.json copied above are pure-docker-compose dev
+# defaults; these templates overwrite them with var-driven values.
+- name: Keycloak realms dir
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/keycloak/realms"
+    state: directory
+    owner: root
+    group: "65532"
+    mode: "0750"
+
+- name: Template Keycloak realm imports (overrides static dev defaults)
+  ansible.builtin.template:
+    src: "keycloak-realms/{{ item }}.j2"
+    dest: "{{ stack_dir }}/keycloak/realms/{{ item }}"
+    owner: root
+    group: "65532"
+    mode: "0640"
+  loop:
+    - aigw-realm.json
+    - anthropic-wif-realm.json
+  no_log: true
+
+- name: Create custom-service build-context directories
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/services/{{ item.path }}"
+    state: directory
+    # These directories contain only the strict source allow-list below. Build
+    # context directory modes are preserved by COPY; 0750 made nested Python
+    # packages and templates unreadable to uid-1000 runtime users.
+    mode: "0755"
+  loop: "{{ query('community.general.filetree', playbook_dir ~ '/../services/') }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when:
+    - item.state == 'directory'
+    - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.git|secrets)(/|$)')
+
+- name: Sync allow-listed custom-service source files
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ stack_dir }}/services/{{ item.path }}"
+    owner: root
+    group: root
+    # Avoid copying workstation umask drift into image layers. The only files
+    # that must execute directly in a build are the explicitly reviewed shell
+    # entrypoints; application/config source remains non-writable 0644.
+    mode: >-
+      {{
+        '0755'
+        if ((item.path | basename) in
+            ['policy-rc.d', 'samba-ad-entrypoint', 'samba-ad-healthcheck',
+             'samba-ad-secret-tool'] or item.path is regex('.*\.sh$'))
+        else '0644'
+      }}
+  loop: "{{ query('community.general.filetree', playbook_dir ~ '/../services/') }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when:
+    - item.state == 'file'
+    - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.git|secrets)(/|$)')
+    - item.path is regex('(^|/)(Dockerfile|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem)|Corefile|db\.aigw\.internal)$')
+
+- name: Find stale unsafe build-context artifacts from older recursive syncs
+  ansible.builtin.find:
+    paths: "{{ stack_dir }}/services"
+    recurse: true
+    # Hidden cache/credential artifacts are exactly what this cleanup targets.
+    hidden: true
+    file_type: any
+    patterns:
+      - __pycache__
+      - .pytest_cache
+      - .ruff_cache
+      - "*.pyc"
+      - .env
+      - "*.key"
+      - "*.p12"
+      - "*.pfx"
+  register: stale_service_artifacts
+
+- name: Remove stale unsafe build-context artifacts
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ stale_service_artifacts.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+# Backups intentionally carry the deployed service source needed to recreate
+# images.  Reconciliation must also retire reviewed files that disappeared
+# from the current source; otherwise a restore can leave obsolete root-owned
+# executable code behind even when a strict .dockerignore keeps it out of the
+# image.  Keep this list explicit so deletion never expands to customer data.
+- name: Remove explicitly retired service-source artifacts
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/services/{{ item }}"
+    state: absent
+  loop:
+    - egress-proxy/docker-entrypoint.sh
+
+- name: Reconcile the exact operational-script deployment boundary
+  vars:
+    # Keep this a flat, reviewed manifest. Never recursively copy scripts/:
+    # controller caches, tests, editor metadata, or a future local credential
+    # must not become root-owned target code merely because it exists nearby.
+    aigw_operational_scripts:
+      - aigw-compose.sh
+      - aigw-runtime-up.sh
+      - compute-bind-source-digests.py
+      - load-offline-image-seed.py
+      - plan-compose-builds.py
+      - preserve-compose-rollbacks.py
+      - pre-upgrade-check.sh
+      - reconcile-openwebui-key.py
+      - remove-lab-local-keycloak-users.py
+      - restore_archive.py
+      - rotate-vault-audit.sh
+      - state-backup.sh
+      - state-restore.sh
+      - test-portal-group-flow.py
+      - test-portal-identity-flow.py
+      - test-portal-key-lifecycle.py
+      - test-portal-login.py
+      - validate-build-contract.py
+      - validate-compose.sh
+      - validate-identity-policy.py
+      - validate-vault-config.sh
+      - vault-bootstrap.sh
+      - vault-unseal.sh
+      - verify-live-lab-identity.py
+  block:
+    - name: Inspect the deployed scripts path without following a link
+      ansible.builtin.stat:
+        path: "{{ stack_dir }}/scripts"
+        follow: false
+      register: deployed_scripts_path
+
+    - name: Remove a non-directory or symlinked scripts-path boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/scripts"
+        state: absent
+      when: >-
+        deployed_scripts_path.stat.exists and
+        (deployed_scripts_path.stat.islnk | default(false) or
+         not (deployed_scripts_path.stat.isdir | default(false)))
+
+    - name: Create the private operational scripts directory
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/scripts"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Inventory top-level deployed script entries without following links
+      ansible.builtin.find:
+        paths: "{{ stack_dir }}/scripts"
+        recurse: false
+        hidden: true
+        file_type: any
+        follow: false
+      register: deployed_script_top_level
+
+    # Deleting an unexpected top-level directory removes its contained stale
+    # cache/test tree as one boundary. ansible.builtin.file removes symlinks as
+    # links and does not traverse their targets.
+    - name: Remove every non-manifest top-level script entry
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ deployed_script_top_level.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: (item.path | basename) not in aigw_operational_scripts
+
+    - name: Inspect manifest destinations without following links
+      ansible.builtin.stat:
+        path: "{{ stack_dir }}/scripts/{{ item }}"
+        follow: false
+      loop: "{{ aigw_operational_scripts }}"
+      register: deployed_script_targets
+
+    - name: Remove unsafe manifest destination objects
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/scripts/{{ item.item }}"
+        state: absent
+      loop: "{{ deployed_script_targets.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: >-
+        item.stat.exists and
+        (item.stat.islnk | default(false) or
+         not (item.stat.isreg | default(false)) or
+         (item.stat.nlink | default(1) | int) != 1)
+
+    - name: Deploy only reviewed top-level operational scripts
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/{{ item }}"
+        dest: "{{ stack_dir }}/scripts/{{ item }}"
+        owner: root
+        group: root
+        # Match the two later container-readability tasks on the copy itself so
+        # an unchanged converge does not oscillate 0750 -> 0555 on every run.
+        mode: >-
+          {{ '0555' if
+             (item == 'reconcile-openwebui-key.py' or
+              (item == 'remove-lab-local-keycloak-users.py' and
+               (samba_lab_enabled | bool)))
+             else '0750' }}
+      loop: "{{ aigw_operational_scripts }}"
+
+    - name: Inventory the complete deployed scripts tree without following links
+      ansible.builtin.find:
+        paths: "{{ stack_dir }}/scripts"
+        recurse: true
+        hidden: true
+        file_type: any
+        follow: false
+      register: deployed_script_inventory
+
+    - name: Require exactly the flat operational-script manifest
+      ansible.builtin.assert:
+        that:
+          - deployed_script_inventory.matched == aigw_operational_scripts | length
+        quiet: true
+        fail_msg: >-
+          The deployed scripts tree contains a missing, unexpected, or nested
+          entry outside the reviewed operational-script manifest.
+
+    - name: Prove every deployed script is a root-owned top-level regular file
+      ansible.builtin.assert:
+        that:
+          - item.isreg | default(false)
+          - not (item.islnk | default(false))
+          - item.uid == 0
+          - item.gid == 0
+          - item.path == stack_dir ~ '/scripts/' ~ (item.path | basename)
+          - (item.path | basename) in aigw_operational_scripts
+        quiet: true
+        fail_msg: "Unsafe deployed script object: {{ item.path }}"
+      loop: "{{ deployed_script_inventory.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+# This bounded, non-secret source file is bind-mounted read-only into the
+# non-root one-shot reconciliation container. Keep the rest of scripts/ at
+# 0750; only this exact helper needs container readability.
+- name: Make the Open WebUI key reconciliation tool readable in its container
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/scripts/reconcile-openwebui-key.py"
+    owner: root
+    group: root
+    mode: "0555"
+
+# This one script is bind-mounted into a non-root, one-shot key-rotator
+# container after the directory administrator is proven. It contains no
+# secret material and still requires an exact destructive confirmation.
+- name: Make the bounded lab local-user cleanup tool readable in its container
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/scripts/remove-lab-local-keycloak-users.py"
+    owner: root
+    group: root
+    mode: "0555"
+  when: samba_lab_enabled | bool
+
+# Install these non-secret runtime artifacts before the render-only gate.
+# On a genuinely pristine host the deployed validator has no controller-side
+# Ansible tree to inspect, so it validates the exact helper and unit bytes that
+# the later timer will execute. Neither artifact is started at this point.
+- name: Install scoped Docker json-log ACL reconciler
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/aigw-docker-log-acl
+    owner: root
+    group: root
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+      unset DOCKER_CONFIG DOCKER_CONTEXT DOCKER_HOST
+      [[ $# -eq 0 ]] || { echo "arguments are not accepted" >&2; exit 2; }
+      state_root={{ docker_data_root | quote }}
+      root="$state_root/containers"
+
+      [[ -d "$state_root" && ! -L "$state_root" ]] || {
+        echo "Docker state root is missing or symlinked" >&2
+        exit 1
+      }
+      [[ -d "$root" && ! -L "$root" ]] || {
+        echo "Docker containers root is missing or symlinked" >&2
+        exit 1
+      }
+      for boundary in "$state_root" "$root"; do
+        [[ "$(/usr/bin/stat -c '%u:%g' -- "$boundary")" == 0:0 ]] || {
+          echo "Docker ACL boundary must be owned by root:root: $boundary" >&2
+          exit 1
+        }
+      done
+
+      intersect_permissions() {
+        local granted=$1 mask=$2 result='' index character
+        for index in 0 1 2; do
+          character=${granted:index:1}
+          if [[ "$character" != - && "${mask:index:1}" != - ]]; then
+            result+=$character
+          else
+            result+=-
+          fi
+        done
+        printf '%s\n' "$result"
+      }
+
+      require_access_acl() {
+        local path=$1 expected=$2 count=0 permissions='' mask='rwx' effective
+        while IFS=: read -r kind qualifier value _; do
+          if [[ "$kind" == user && "$qualifier" == 473 ]]; then
+            count=$((count + 1))
+            permissions=$value
+          elif [[ "$kind" == mask && -z "$qualifier" ]]; then
+            mask=$value
+          fi
+        done < <(/usr/bin/getfacl -cpn -- "$path")
+        effective=$(intersect_permissions "$permissions" "$mask")
+        ((count == 1)) && [[ "$permissions" == "$expected" ]] &&
+          [[ "$effective" == "$expected" ]] || {
+          echo "unexpected uid473 access ACL on $path" >&2
+          exit 1
+        }
+      }
+
+      require_default_acl() {
+        local path=$1 class=$2 qualifier=$3 expected=$4
+        local count=0 permissions='' mask='rwx' effective
+        while IFS=: read -r prefix entry_class entry_qualifier value _; do
+          if [[ "$prefix" == default && "$entry_class" == "$class" &&
+                "$entry_qualifier" == "$qualifier" ]]; then
+            count=$((count + 1))
+            permissions=$value
+          elif [[ "$prefix" == default && "$entry_class" == mask &&
+                  -z "$entry_qualifier" ]]; then
+            mask=$value
+          fi
+        done < <(/usr/bin/getfacl -cpn -- "$path")
+        effective=$permissions
+        if [[ "$class" == user && -n "$qualifier" ]]; then
+          effective=$(intersect_permissions "$permissions" "$mask")
+        fi
+        ((count == 1)) && [[ "$permissions" == "$expected" ]] &&
+          [[ "$effective" == "$expected" ]] || {
+          echo "unexpected default $class ACL on $path" >&2
+          exit 1
+        }
+      }
+
+      require_root_owned_real() {
+        local path=$1 expected_type=$2
+        [[ ! -L "$path" ]] || {
+          echo "refusing symlinked Docker ACL target: $path" >&2
+          exit 1
+        }
+        if [[ "$expected_type" == directory ]]; then
+          [[ -d "$path" ]] || {
+            echo "Docker ACL target is not a directory: $path" >&2
+            exit 1
+          }
+        else
+          [[ -f "$path" ]] || {
+            echo "Docker ACL target is not a regular file: $path" >&2
+            exit 1
+          }
+        fi
+        [[ "$(/usr/bin/stat -c '%u:%g' -- "$path")" == 0:0 ]] || {
+          echo "Docker ACL target must be owned by root:root: $path" >&2
+          exit 1
+        }
+      }
+
+      # Validate every object this helper may mutate before the first ACL
+      # write. Docker's containers root contains only one real root-owned
+      # directory per container and root-owned immediate runtime files.
+      unexpected_child=$(/usr/bin/find "$root" -xdev -mindepth 1 -maxdepth 1 \
+        \( ! -type d -o ! -uid 0 -o ! -gid 0 \) -print -quit)
+      [[ -z "$unexpected_child" ]] || {
+        echo "unexpected type/owner beneath Docker containers root" >&2
+        exit 1
+      }
+      unsafe_runtime_object=$(/usr/bin/find "$root" -xdev -mindepth 2 -maxdepth 2 \
+        -type f \( ! -uid 0 -o ! -gid 0 \) -print -quit)
+      [[ -z "$unsafe_runtime_object" ]] || {
+        echo "Docker runtime file must be owned by root:root" >&2
+        exit 1
+      }
+      unexpected_log_link=$(/usr/bin/find "$root" -xdev -mindepth 2 -maxdepth 2 \
+        -type l -name '*-json.log*' -print -quit)
+      [[ -z "$unexpected_log_link" ]] || {
+        echo "refusing symlinked Docker json-log target" >&2
+        exit 1
+      }
+
+      # The state-root ACL is established explicitly by Ansible and survives a
+      # Docker restart on the supported host. Verify that immutable boundary;
+      # do not give this recurring Docker-socket helper write access to the
+      # whole Docker root. Restore only the containers-root/default ACL before
+      # touching a child: uid473 may traverse the state root, may enumerate the
+      # containers root, and inherits traverse-only access.
+      require_access_acl "$state_root" --x
+      /usr/bin/setfacl -m u:473:r-x "$root"
+      /usr/bin/setfacl -m d:u:473:--x,d:o:r-x "$root"
+      require_access_acl "$root" r-x
+      require_default_acl "$root" user 473 --x
+      require_default_acl "$root" other '' r-x
+
+      # Establish the positive boundary first so an ordinary reconcile never
+      # creates a log collection gap. Then deny uid473 on every non-log file;
+      # named ACL entries override world-readable Docker runtime files.
+      /usr/bin/find "$root" -xdev -mindepth 1 -maxdepth 1 -type d \
+        -exec /usr/bin/setfacl -m u:473:r-x {} +
+      /usr/bin/find "$root" -xdev -mindepth 1 -maxdepth 1 -type d \
+        -exec /usr/bin/setfacl -x d:u:473 {} +
+      /usr/bin/find "$root" -xdev -mindepth 2 -maxdepth 2 -type f ! -name '*-json.log*' \
+        -exec /usr/bin/setfacl -m u:473:--- {} +
+      /usr/bin/find "$root" -xdev -mindepth 2 -maxdepth 2 -type f -name '*-json.log*' \
+        -exec /usr/bin/setfacl -m u:473:r-- {} +
+
+      # Alloy itself needs its Docker-injected identity/resolver files for
+      # service discovery. Grant only these three non-secret files for the one
+      # exact running project/service container; resolv.conf.hash stays denied.
+      alloy_ids=()
+      if ! alloy_output=$(
+        /usr/bin/docker --host unix:///run/docker.sock ps --no-trunc -q \
+          --filter 'label=com.docker.compose.project={{ compose_project_name }}' \
+          --filter 'label=com.docker.compose.service=alloy'
+      ); then
+        echo "Docker failed to enumerate the running Alloy container" >&2
+        exit 1
+      fi
+      if [[ -n "$alloy_output" ]]; then
+        mapfile -t alloy_ids <<<"$alloy_output"
+      fi
+      alloy_count=${#alloy_ids[@]}
+      ((alloy_count <= 1)) || {
+        echo "multiple running Alloy containers violate the ACL boundary" >&2
+        exit 1
+      }
+      if ((alloy_count == 1)); then
+        [[ "${alloy_ids[0]}" =~ ^[0-9a-f]{64}$ ]] || {
+          echo "Docker returned an invalid Alloy container ID" >&2
+          exit 1
+        }
+        alloy_dir="$root/${alloy_ids[0]}"
+        require_root_owned_real "$alloy_dir" directory
+        for runtime_file in hosts hostname resolv.conf; do
+          require_root_owned_real "$alloy_dir/$runtime_file" file
+          /usr/bin/setfacl -m u:473:r-- "$alloy_dir/$runtime_file"
+        done
+      fi
+
+      # Fail closed if a concurrent Docker action changed either parent ACL.
+      require_access_acl "$state_root" --x
+      require_access_acl "$root" r-x
+      require_default_acl "$root" user 473 --x
+      require_default_acl "$root" other '' r-x
+
+- name: Install scoped Docker json-log ACL reconciliation service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/aigw-docker-log-acl.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Grant DHI Alloy read access only to Docker json logs
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/aigw-docker-log-acl
+      NoNewPrivileges=true
+      PrivateTmp=true
+      PrivateDevices=true
+      PrivateNetwork=true
+      ProtectSystem=strict
+      ProtectHome=true
+      ProtectKernelTunables=true
+      ProtectKernelModules=true
+      ProtectControlGroups=true
+      ProtectProc=invisible
+      ProcSubset=pid
+      RestrictAddressFamilies=AF_UNIX
+      RestrictNamespaces=true
+      RestrictSUIDSGID=true
+      LockPersonality=true
+      MemoryDenyWriteExecute=true
+      SystemCallArchitectures=native
+      CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
+      UMask=0077
+      BindReadOnlyPaths=/run/docker.sock
+      ReadOnlyPaths={{ docker_data_root }}
+      ReadWritePaths={{ docker_data_root }}/containers
+
+- name: Validate render-only Compose and restricted build-network contracts
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/validate-compose.sh"
+  environment:
+    # Non-secret pristine-host input for the identity callback check. Once
+    # .env exists, the validator requires this value and DOMAIN to agree.
+    AIGW_VALIDATION_DOMAIN: "{{ aigw_domain }}"
+  changed_when: false
+
+- name: Validate static Vault server configuration in an isolated container
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/validate-vault-config.sh"
+  changed_when: false
+
+- name: Preserve rotator vault token across re-runs (vault-bootstrap writes it)
+  ansible.builtin.slurp:
+    src: "{{ stack_dir }}/.env"
+  register: existing_env
+  failed_when: false
+  no_log: true
+
+- name: Extract existing ROTATOR_VAULT_TOKEN
+  ansible.builtin.set_fact:
+    rotator_vault_token: "{{ (existing_env.content | b64decode | regex_search('ROTATOR_VAULT_TOKEN=(.*)', '\\1') or ['']) | first }}"
+  when:
+    - existing_env.content is defined
+    - rotator_vault_token | length == 0
+  no_log: true
+
+- name: Fail closed on missing, placeholder, or unsafe stack secrets
+  ansible.builtin.assert:
+    that:
+      - lookup('vars', item.name, default='') | length >= item.min_length
+      - lookup('vars', item.name, default='') is regex('^[A-Za-z0-9_-]+$')
+      - lookup('vars', item.name, default='') | lower not in ['change_me', 'changeme', 'replace_me', 'password', 'secret']
+    quiet: true
+    fail_msg: >-
+      {{ item.name }} must be at least {{ item.min_length }} characters, must
+      not be a placeholder, and may contain only A-Z/a-z/0-9/_/-. This keeps
+      Compose interpolation and PostgreSQL URI embedding unambiguous.
+  loop:
+    - { name: pg_super_password, min_length: 24 }
+    - { name: pg_litellm_password, min_length: 24 }
+    - { name: pg_keycloak_password, min_length: 24 }
+    - { name: pg_rotator_password, min_length: 24 }
+    - { name: kc_admin_password, min_length: 24 }
+    - { name: litellm_master_key, min_length: 32 }
+    - { name: litellm_salt_key, min_length: 32 }
+    - { name: redis_password, min_length: 32 }
+    - { name: webui_litellm_key, min_length: 24 }
+    - { name: webui_secret_key, min_length: 32 }
+    - { name: webui_oidc_client_secret, min_length: 32 }
+    - { name: portal_oidc_client_secret, min_length: 32 }
+    - { name: admin_portal_oidc_client_secret, min_length: 32 }
+    - { name: oauth2_proxy_client_secret, min_length: 32 }
+    - { name: grafana_oidc_client_secret, min_length: 32 }
+    - { name: portal_session_secret, min_length: 32 }
+    - { name: admin_portal_session_secret, min_length: 32 }
+    - { name: rotator_internal_token, min_length: 32 }
+    - { name: portal_identity_token, min_length: 32 }
+    - { name: grafana_admin_password, min_length: 24 }
+    - { name: kc_bootstrap_admin_client_secret, min_length: 32 }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Require distinct credentials across portal and OIDC trust boundaries
+  ansible.builtin.assert:
+    that:
+      - portal_identity_token != rotator_internal_token
+      - portal_session_secret != admin_portal_session_secret
+      - >-
+        [webui_oidc_client_secret, portal_oidc_client_secret,
+         admin_portal_oidc_client_secret, oauth2_proxy_client_secret,
+         grafana_oidc_client_secret] | unique | length == 5
+    quiet: true
+    fail_msg: Portal tokens, session keys, and OIDC client secrets must be distinct.
+  no_log: true
+
+- name: Fail closed on missing or unsafe Samba lab secrets
+  ansible.builtin.assert:
+    that:
+      - lookup('vars', item, default='') | length >= 16
+      - lookup('vars', item, default='') is regex('^[A-Za-z0-9_-]+$')
+      - lookup('vars', item, default='') | lower not in ['change_me', 'changeme', 'replace_me', 'password', 'secret']
+    quiet: true
+    fail_msg: >-
+      {{ item }} must be a non-placeholder 16+ character [A-Za-z0-9_-]
+      secret in the encrypted lab overlay.
+  loop:
+    - samba_ad_admin_password
+    - samba_ad_bind_password
+    - samba_user_lab_admin_password
+    - samba_user_lab_developer_password
+    - samba_user_lab_user_password
+  when: samba_lab_enabled | bool
+  no_log: true
+
+- name: Validate oauth2-proxy cookie secret shape
+  ansible.builtin.assert:
+    that:
+      - oauth2_proxy_cookie_secret is defined
+      - oauth2_proxy_cookie_secret is regex('^[A-Za-z0-9]{32}$')
+    quiet: true
+    fail_msg: oauth2_proxy_cookie_secret must be exactly 32 alphanumeric bytes.
+
+- name: Refuse plaintext Cribl export except for the in-stack development mock
+  ansible.builtin.assert:
+    that:
+      - not (cribl_otlp_insecure | bool) or cribl_otlp_endpoint == 'cribl-mock:4317'
+      - (cribl_external_export_enabled | bool) or cribl_otlp_endpoint == 'cribl-mock:4317'
+      - not (cribl_external_export_enabled | bool) or cribl_otlp_endpoint != 'cribl-mock:4317'
+      - cribl_otlp_endpoint is regex('^[A-Za-z0-9.-]+:[0-9]{1,5}$')
+      - (cribl_otlp_insecure | bool) or (cribl_otlp_server_name | length > 0)
+      - (cribl_otlp_insecure | bool) or (cribl_otlp_ca_file | length > 0)
+      - cribl_otlp_server_name is regex('^[A-Za-z0-9.-]+$')
+      - cribl_otlp_ca_file is regex('^/[A-Za-z0-9_./-]+$')
+    quiet: true
+    fail_msg: >-
+      CRIBL OTLP plaintext is allowed only for cribl-mock:4317. Real endpoints
+      require cribl_otlp_insecure=false plus CA file and TLS server name.
+
+- name: Create root-only runtime secret source directory
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/secrets"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Materialize Redis authentication files outside command and environment metadata
+  ansible.builtin.copy:
+    content: "{{ item.content }}\n"
+    dest: "{{ stack_dir }}/secrets/{{ item.filename }}"
+    owner: root
+    # The pinned DHI Redis image runs uid/gid 65532. The parent directory is
+    # root-only on the host; Docker bind-mounts only these exact files into the
+    # one authorized container, where group-read is the minimum usable mode.
+    group: "65532"
+    mode: "0440"
+    follow: false
+  loop:
+    - filename: redis_password
+      content: "{{ redis_password }}"
+    - filename: redis_users.acl
+      # Redis accepts exact SHA-256 verifiers in ACL files. The plaintext is
+      # present only in the separate health/client file, never in server argv,
+      # Config.Env, source, or the ACL verifier file.
+      content: "user default reset on #{{ redis_password | hash('sha256') }} ~* &* +@all"
+  loop_control:
+    label: "{{ item.filename }}"
+  no_log: true
+
+- name: Inspect rendered Redis authentication-file boundary
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/secrets/{{ item }}"
+    follow: false
+  loop:
+    - redis_password
+    - redis_users.acl
+  register: redis_auth_files
+
+- name: Require exact Redis authentication-file ownership and mode
+  ansible.builtin.assert:
+    that:
+      - item.stat.isreg | default(false)
+      - not (item.stat.islnk | default(false))
+      - item.stat.uid == 0
+      - item.stat.gid == 65532
+      - item.stat.mode == '0440'
+      - (item.stat.nlink | default(1) | int) == 1
+    quiet: true
+    fail_msg: Redis authentication source files must be root:65532 0440 regular single-link files.
+  loop: "{{ redis_auth_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Materialize Samba lab Docker secret source files
+  ansible.builtin.copy:
+    content: "{{ lookup('vars', item.variable) }}\n"
+    dest: "{{ stack_dir }}/secrets/{{ item.filename }}"
+    owner: root
+    # The bind secret is shared only with root Samba and gid-65532 key-rotator.
+    # Keep every other Samba credential root-only and never use world-read.
+    group: "{{ '65532' if item.variable == 'samba_ad_bind_password' else 'root' }}"
+    mode: "{{ '0440' if item.variable == 'samba_ad_bind_password' else '0400' }}"
+  loop:
+    - { variable: samba_ad_admin_password, filename: samba_ad_admin_password }
+    - { variable: samba_ad_bind_password, filename: samba_ad_bind_password }
+    - { variable: samba_user_lab_admin_password, filename: samba_user_lab-admin_password }
+    - { variable: samba_user_lab_developer_password, filename: samba_user_lab-developer_password }
+    - { variable: samba_user_lab_user_password, filename: samba_user_lab-user_password }
+  loop_control:
+    label: "{{ item.filename }}"
+  when: samba_lab_enabled | bool
+  no_log: true
+
+- name: Inspect the Samba lab secret-file boundary
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/secrets/{{ item.filename }}"
+    follow: false
+  loop:
+    - { filename: samba_ad_admin_password, gid: 0, mode: '0400' }
+    - { filename: samba_ad_bind_password, gid: 65532, mode: '0440' }
+    - { filename: samba_user_lab-admin_password, gid: 0, mode: '0400' }
+    - { filename: samba_user_lab-developer_password, gid: 0, mode: '0400' }
+    - { filename: samba_user_lab-user_password, gid: 0, mode: '0400' }
+  register: samba_secret_files
+  when: samba_lab_enabled | bool
+
+- name: Require exact Samba lab secret-file ownership and modes
+  ansible.builtin.assert:
+    that:
+      - item.stat.isreg | default(false)
+      - not (item.stat.islnk | default(false))
+      - item.stat.uid == 0
+      - item.stat.gid == item.item.gid
+      - item.stat.mode == item.item.mode
+      - (item.stat.nlink | default(1) | int) == 1
+    quiet: true
+    fail_msg: "Unsafe Samba secret-file boundary: {{ item.item.filename }}"
+  loop: "{{ samba_secret_files.results }}"
+  loop_control:
+    label: "{{ item.item.filename }}"
+  when: samba_lab_enabled | bool
+
+- name: Placeholder certs dir (vault-bootstrap issues real ones)
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/certs"
+    state: directory
+    owner: root
+    # Both shellless Traefik DHI processes run uid/gid 65532. The host parent
+    # remains non-world-traversable; only the exact read-only bind recipients
+    # receive the private key through this group.
+    group: "65532"
+    mode: "0750"
+
+- name: Inspect existing edge certificate SANs
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ stack_dir }}/certs/int.crt"
+      - -noout
+      - -ext
+      - subjectAltName
+  register: existing_edge_certificate
+  changed_when: false
+  failed_when: false
+
+- name: Remove edge material that belongs to a different lab domain
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/certs/{{ item }}"
+    state: absent
+  loop:
+    - int.crt
+    - int.key
+    - ca.pem
+  when: >-
+    existing_edge_certificate.rc != 0 or
+    ('DNS:*.' ~ aigw_domain) not in existing_edge_certificate.stdout or
+    ('DNS:' ~ aigw_domain) not in existing_edge_certificate.stdout
+
+- name: Self-signed placeholder cert so traefik/open-webui start pre-bootstrap
+  ansible.builtin.command:
+    cmd: >
+      openssl req -x509 -newkey rsa:2048 -nodes -days 7
+      -subj "/CN=*.{{ aigw_domain }}"
+      -addext "subjectAltName=DNS:*.{{ aigw_domain }},DNS:{{ aigw_domain }}"
+      -keyout {{ stack_dir }}/certs/int.key -out {{ stack_dir }}/certs/int.crt
+    creates: "{{ stack_dir }}/certs/int.crt"
+
+- name: Placeholder CA bundle (replaced by vault-bootstrap)
+  ansible.builtin.copy:
+    src: "{{ stack_dir }}/certs/int.crt"
+    dest: "{{ stack_dir }}/certs/ca.pem"
+    remote_src: true
+    force: false
+    mode: "0644"
+
+- name: Reconcile public edge certificate material permissions
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/certs/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+    follow: false
+  loop:
+    - int.crt
+    - ca.pem
+
+- name: Reconcile the non-root Traefik private-key boundary
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/certs/int.key"
+    owner: root
+    group: "65532"
+    mode: "0640"
+    follow: false
+
+# Linux bind mounts retain the source inode selected at container creation.
+# Ansible's safe atomic replacement can therefore install correct new bytes at
+# the host path while a running container continues to see the old inode, and
+# path-stable Compose configuration alone does not request recreation. Keyed
+# per-service content digests make the affected service's Compose metadata
+# change without exposing a reusable verifier for file-backed credentials.
+- name: Inspect the bind-digest state path without following links
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/.state"
+    follow: false
+    get_checksum: false
+  register: aigw_bind_digest_state_before
+
+- name: Reject an unsafe pre-existing bind-digest state path
+  ansible.builtin.assert:
+    that:
+      - aigw_bind_digest_state_before.stat.isdir | default(false)
+      - not (aigw_bind_digest_state_before.stat.islnk | default(false))
+      - aigw_bind_digest_state_before.stat.uid == 0
+      - aigw_bind_digest_state_before.stat.gid == 0
+      - aigw_bind_digest_state_before.stat.mode == '0700'
+    quiet: true
+    fail_msg: Existing bind-digest state path is not a private root-owned directory.
+  when: aigw_bind_digest_state_before.stat.exists
+
+- name: Create the private bind-digest state directory
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/.state"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Inspect the stable bind-digest HMAC key without following links
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/.state/bind-digest.key"
+    follow: false
+    get_checksum: false
+  register: aigw_bind_digest_key_before
+  no_log: true
+
+- name: Reject an unsafe pre-existing bind-digest HMAC key
+  ansible.builtin.assert:
+    that:
+      - not (aigw_bind_digest_key_before.stat.islnk | default(false))
+      - aigw_bind_digest_key_before.stat.isreg | default(false)
+      - aigw_bind_digest_key_before.stat.uid == 0
+      - aigw_bind_digest_key_before.stat.gid == 0
+      - aigw_bind_digest_key_before.stat.mode == '0600'
+      - (aigw_bind_digest_key_before.stat.nlink | int) == 1
+      - (aigw_bind_digest_key_before.stat.size | int) == 64
+    quiet: true
+    fail_msg: Existing bind-digest HMAC key has an unsafe object/ownership/mode boundary.
+  when: aigw_bind_digest_key_before.stat.exists
+  no_log: true
+
+- name: Create a stable root-only bind-digest HMAC key once
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import secrets
+        import sys
+
+        path = sys.argv[1]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            payload = secrets.token_hex(32).encode("ascii")
+            while payload:
+                written = os.write(descriptor, payload)
+                if written <= 0:
+                    raise OSError("short write creating bind-digest key")
+                payload = payload[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+      - "{{ stack_dir }}/.state/bind-digest.key"
+  when: not aigw_bind_digest_key_before.stat.exists
+  no_log: true
+
+- name: Reinspect the stable bind-digest HMAC key
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/.state/bind-digest.key"
+    follow: false
+    get_checksum: false
+  register: aigw_bind_digest_key_after
+  no_log: true
+
+- name: Require the exact stable bind-digest key boundary
+  ansible.builtin.assert:
+    that:
+      - aigw_bind_digest_key_after.stat.isreg | default(false)
+      - not (aigw_bind_digest_key_after.stat.islnk | default(false))
+      - aigw_bind_digest_key_after.stat.uid == 0
+      - aigw_bind_digest_key_after.stat.gid == 0
+      - aigw_bind_digest_key_after.stat.mode == '0600'
+      - (aigw_bind_digest_key_after.stat.nlink | int) == 1
+      - (aigw_bind_digest_key_after.stat.size | int) == 64
+    quiet: true
+    fail_msg: Bind-digest HMAC key creation did not produce the exact private boundary.
+  no_log: true
+
+- name: Read the stable bind-digest HMAC key for stdin-only use
+  ansible.builtin.slurp:
+    src: "{{ stack_dir }}/.state/bind-digest.key"
+  register: aigw_bind_digest_key
+  no_log: true
+
+- name: Require a canonical high-entropy bind-digest HMAC key
+  ansible.builtin.assert:
+    that:
+      - (aigw_bind_digest_key.content | b64decode) is match('^[0-9a-f]{64}$')
+    quiet: true
+    fail_msg: Bind-digest HMAC key content is malformed.
+  no_log: true
+
+- name: Read the deployed bind-source digest inventory
+  ansible.builtin.slurp:
+    src: "{{ stack_dir }}/bind-source-digest-inputs.json"
+  register: aigw_bind_source_digest_manifest_raw
+
+- name: Define exact per-service bind-source digest inputs
+  ansible.builtin.set_fact:
+    aigw_bind_source_digest_inputs: >-
+      {{
+        ((aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).base)
+        |
+        combine(
+          (aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).lab
+          if (samba_lab_enabled | bool) else {}
+        )
+      }}
+
+- name: Compute keyed bind-source content digests without exposing secret verifiers
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ stack_dir }}/scripts/compute-bind-source-digests.py"
+      - "{{ stack_dir }}"
+      - "{{ aigw_bind_source_digest_inputs | to_json }}"
+  args:
+    stdin: "{{ aigw_bind_digest_key.content | b64decode }}"
+    stdin_add_newline: false
+  register: aigw_bind_source_digests_raw
+  changed_when: false
+  no_log: true
+
+- name: Record the exact bind-source recreation contract
+  ansible.builtin.set_fact:
+    aigw_bind_source_digests: "{{ aigw_bind_source_digests_raw.stdout | from_json }}"
+  no_log: true
+
+- name: Require one SHA-256 HMAC recreation marker per bind consumer
+  ansible.builtin.assert:
+    that:
+      - aigw_bind_source_digests.keys() | sort == aigw_bind_source_digest_inputs.keys() | sort
+      - aigw_bind_source_digests.values() | select('match', '^[0-9a-f]{64}$') | list | length == aigw_bind_source_digests | length
+    quiet: true
+    fail_msg: Per-service bind-source digest inventory is incomplete or malformed.
+  no_log: true
+
+- name: Template .env only after every bind-source digest is final
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ stack_dir }}/.env"
+    mode: "0600"
+  no_log: true
+
+# Docker's SELinux integration assigns a unique MCS process/mount level when a
+# container is created. Persist a read-only content *type* for only the exact
+# host paths that the reviewed Compose graph bind-mounts. This keeps later
+# Ansible atomic copies usable before Compose applies z/Z categories, and adds
+# a second write denial beneath the read-only bind flag. Never match stack_dir
+# wholesale: .env and non-mounted operational code are outside this boundary.
+#
+# restorecon is safe only before the project owns a container. Docker's private
+# `Z` contract deliberately replaces the persistent s0 type with that
+# container's unique MCS range. Running restorecon during a repeated converge
+# would erase the range while Compose correctly retains an unchanged container.
+# The presence check includes stopped/one-shot and non-project containers: a
+# manually-created consumer can hold the same bind inode without our labels.
+- name: Inventory every existing Docker container before persistent relabeling
+  ansible.builtin.command:
+    argv:
+      - docker
+      - ps
+      - -aq
+  register: aigw_containers_before_selinux
+  changed_when: false
+
+- name: Define the exact SELinux read-only bind-source boundary
+  ansible.builtin.set_fact:
+    aigw_selinux_ro_bind_sources: >-
+      {{
+        [
+          {'path': stack_dir ~ '/alloy/config.alloy', 'recursive': false},
+          {'path': stack_dir ~ '/certs', 'recursive': true},
+          {'path': stack_dir ~ '/cribl-mock/config.yaml', 'recursive': false},
+          {'path': stack_dir ~ '/grafana/provisioning', 'recursive': true},
+          {'path': stack_dir ~ '/keycloak/realms', 'recursive': true},
+          {'path': stack_dir ~ '/litellm/config.yaml', 'recursive': false},
+          {'path': stack_dir ~ '/loki/config.yml', 'recursive': false},
+          {'path': stack_dir ~ '/postgres/init', 'recursive': true},
+          {'path': stack_dir ~ '/prometheus/prometheus.yml', 'recursive': false},
+          {'path': stack_dir ~ '/prometheus/rules.yml', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/redis_password', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/redis_users.acl', 'recursive': false},
+          {'path': stack_dir ~ '/tempo/config.yml', 'recursive': false},
+          {'path': stack_dir ~ '/traefik/dynamic-adm.yml', 'recursive': false},
+          {'path': stack_dir ~ '/traefik/dynamic-int.yml', 'recursive': false},
+          {'path': stack_dir ~ '/traefik/traefik-adm.yml', 'recursive': false},
+          {'path': stack_dir ~ '/traefik/traefik-int.yml', 'recursive': false},
+          {'path': stack_dir ~ '/vault/config.hcl', 'recursive': false}
+        ]
+        +
+        ([
+          {'path': stack_dir ~ '/services/lab-dns/Corefile', 'recursive': false},
+          {'path': stack_dir ~ '/services/lab-dns/db.aigw.internal', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/samba_ad_admin_password', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/samba_ad_bind_password', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/samba_user_lab-admin_password', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/samba_user_lab-developer_password', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/samba_user_lab-user_password', 'recursive': false}
+        ] if (samba_lab_enabled | bool) else [])
+      }}
+
+- name: Persist exact read-only container file-context rules
+  community.general.sefcontext:
+    target: "{{ (item.path | regex_escape) ~ ('(/.*)?' if item.recursive else '') ~ '$' }}"
+    setype: container_ro_file_t
+    state: present
+  loop: "{{ aigw_selinux_ro_bind_sources }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Apply the reviewed read-only container contexts before Compose
+  ansible.builtin.command:
+    argv:
+      - restorecon
+      - -RFv
+      - "{{ item.path }}"
+  loop: "{{ aigw_selinux_ro_bind_sources }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: restored_bind_source_contexts
+  changed_when: restored_bind_source_contexts.stdout | length > 0
+  when: aigw_containers_before_selinux.stdout_lines | length == 0
+
+- name: Read effective SELinux contexts on every bind-source root
+  ansible.builtin.command:
+    argv: [stat, -c, '%C', --, "{{ item.path }}"]
+  loop: "{{ aigw_selinux_ro_bind_sources }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: effective_bind_source_contexts
+  changed_when: false
+  when: aigw_containers_before_selinux.stdout_lines | length == 0
+
+- name: Require the exact read-only container type before Compose relabels it
+  ansible.builtin.assert:
+    that:
+      - item.stdout is match('^[^:]+:object_r:container_ro_file_t:s0$')
+    quiet: true
+    fail_msg: "Unsafe SELinux bind-source context on {{ item.item.path }}: {{ item.stdout }}"
+  loop: "{{ effective_bind_source_contexts.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: aigw_containers_before_selinux.stdout_lines | length == 0
+
+# DHI Alloy runs as uid 473 with no capabilities. Rocky's Docker json-log tree
+# is 0710/0640 root-owned. Grant traverse access to container directories, but
+# never recursively remove the same UID ACL: that creates a collection gap by
+# deleting the intended per-directory/per-log entries. The authoritative
+# reconciler below strips uid 473 only from non-log siblings, targets
+# *-json.log* exactly, and catches later log rotation. Never grant DAC_OVERRIDE
+# or expose the Docker socket.
+
+- name: Allow DHI Alloy to traverse the Docker state root
+  ansible.posix.acl:
+    path: "{{ docker_data_root }}"
+    entity: "473"
+    etype: user
+    permissions: x
+    state: present
+
+- name: Allow DHI Alloy to enumerate the Docker containers root
+  ansible.posix.acl:
+    path: "{{ docker_data_root }}/containers"
+    entity: "473"
+    etype: user
+    permissions: rx
+    state: present
+
+- name: Inherit traverse-only Alloy access on future container directories
+  ansible.posix.acl:
+    path: "{{ docker_data_root }}/containers"
+    entity: "473"
+    etype: user
+    permissions: x
+    default: true
+    state: present
+
+# A default ACL must not erase Docker's requested other/read bit on injected
+# /etc/hosts, /etc/hostname, and /etc/resolv.conf. POSIX creation-mode masking
+# still removes these permissions from 0640 logs and 0600 metadata.
+- name: Preserve Docker-requested other permissions beneath the containers root
+  ansible.posix.acl:
+    path: "{{ docker_data_root }}/containers"
+    etype: other
+    permissions: rX
+    default: true
+    state: present
+
+- name: Find existing Docker-injected non-secret identity and resolver files
+  ansible.builtin.find:
+    paths: "{{ docker_data_root }}/containers"
+    recurse: true
+    file_type: file
+    patterns:
+      - hosts
+      - hostname
+      - resolv.conf
+  register: docker_injected_runtime_files
+
+- name: Restore read access required by non-root container processes
+  ansible.posix.acl:
+    path: "{{ item.path }}"
+    etype: other
+    permissions: r
+    state: present
+  loop: "{{ docker_injected_runtime_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+- name: Install scoped Docker json-log ACL reconciliation timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/aigw-docker-log-acl.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Reconcile DHI Alloy Docker json-log ACLs after rotation
+
+      [Timer]
+      OnBootSec=15s
+      OnUnitActiveSec=15s
+      AccuracySec=1s
+      Persistent=true
+      Unit=aigw-docker-log-acl.service
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable the scoped Docker json-log ACL timer
+  ansible.builtin.systemd_service:
+    name: aigw-docker-log-acl.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Reconcile the scoped Docker json-log ACL boundary immediately
+  ansible.builtin.systemd_service:
+    name: aigw-docker-log-acl.service
+    state: started
+
+- name: Gate stateful image upgrades on a recent encrypted backup
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/pre-upgrade-check.sh"
+  args:
+    chdir: "{{ stack_dir }}"
+  changed_when: false
+  when: require_preupgrade_backup | bool
+
+- name: Read the effective Compose service set
+  ansible.builtin.command:
+    argv: >-
+      {{
+        ['docker', 'compose', '--project-name', compose_project_name,
+         '--file', 'docker-compose.yml']
+        + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
+           if (samba_lab_enabled | bool) else [])
+        + ['config', '--services']
+      }}
+  args:
+    chdir: "{{ stack_dir }}"
+  register: effective_compose_services
+  changed_when: false
+
+- name: Read the desired volume initializer configuration hash
+  ansible.builtin.command:
+    argv: >-
+      {{
+        ['docker', 'compose', '--project-name', compose_project_name,
+         '--file', 'docker-compose.yml']
+        + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
+           if (samba_lab_enabled | bool) else [])
+        + ['config', '--hash', 'volume-init']
+      }}
+  args:
+    chdir: "{{ stack_dir }}"
+  register: desired_volume_init_hash
+  changed_when: false
+
+- name: Derive the long-running service set without the one-shot initializer
+  ansible.builtin.set_fact:
+    compose_long_running_services: >-
+      {{ effective_compose_services.stdout_lines
+         | reject('equalto', 'volume-init') | list }}
+    compose_volume_init_hash: "{{ desired_volume_init_hash.stdout.split() | last }}"
+
+- name: Validate the one-shot / long-running service boundary
+  ansible.builtin.assert:
+    that:
+      - effective_compose_services.stdout_lines | select('equalto', 'volume-init') | list | length == 1
+      - compose_long_running_services | length == effective_compose_services.stdout_lines | length - 1
+      - compose_long_running_services | length > 0
+      - compose_volume_init_hash is regex('^[a-f0-9]{64}$')
+    quiet: true
+
+- name: Inspect the existing volume initializer
+  community.docker.docker_container_info:
+    name: "{{ compose_project_name }}-volume-init-1"
+  register: existing_volume_init
+
+- name: Inspect the state-volume owner and mode contract
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        import subprocess
+        import sys
+
+        project = sys.argv[1]
+        expected = {
+            "pg_data": (70, 70, 0o700),
+            "vault_data": (1000, 1000, 0o700),
+            "vault_audit": (1000, 473, 0o2750),
+            "alloy_data": (473, 473, 0o700),
+            "prom_data": (65532, 65532, 0o700),
+            "loki_data": (65532, 65532, 0o700),
+            "tempo_data": (65532, 65532, 0o700),
+            "grafana_data": (65532, 65532, 0o700),
+        }
+        drift = []
+        for volume, contract in expected.items():
+            result = subprocess.run(
+                ["docker", "volume", "inspect", f"{project}_{volume}"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            if result.returncode:
+                drift.append(f"{volume}:missing")
+                continue
+            mountpoint = json.loads(result.stdout)[0]["Mountpoint"]
+            try:
+                metadata = os.stat(mountpoint)
+            except OSError:
+                drift.append(f"{volume}:unreadable")
+                continue
+            actual = (metadata.st_uid, metadata.st_gid, metadata.st_mode & 0o7777)
+            if actual != contract:
+                drift.append(f"{volume}:owner-or-mode")
+        print("\n".join(drift))
+      - "{{ compose_project_name }}"
+  register: volume_init_permission_drift
+  changed_when: false
+
+# Compose restarts an exited one-shot whenever a broad `up` includes it through
+# depends_on. Run it only when absent, failed, or its reviewed service
+# definition or state-volume ownership contract changed; all subsequent Compose
+# calls explicitly exclude it.
+- name: Run the versioned volume initializer when required
+  community.docker.docker_compose_v2:
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: >-
+      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
+         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
+    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    services: [volume-init]
+    dependencies: false
+    state: present
+    build: never
+  when: >-
+    not existing_volume_init.exists or
+    existing_volume_init.container.State.Status != 'exited' or
+    existing_volume_init.container.State.ExitCode != 0 or
+    existing_volume_init.container.Config.Labels['com.docker.compose.config-hash']
+      | default('') != compose_volume_init_hash or
+    volume_init_permission_drift.stdout_lines | length > 0
+  no_log: true
+
+- name: Wait for the volume initializer success contract
+  community.docker.docker_container_info:
+    name: "{{ compose_project_name }}-volume-init-1"
+  register: verified_volume_init
+  retries: 30
+  delay: 1
+  until: >-
+    verified_volume_init.exists and
+    verified_volume_init.container.State.Status == 'exited' and
+    verified_volume_init.container.State.ExitCode == 0 and
+    verified_volume_init.container.Config.Labels['com.docker.compose.config-hash']
+      | default('') == compose_volume_init_hash
+
+- name: Prove the initializer repaired the state-volume owner and mode contract
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        import subprocess
+        import sys
+
+        project = sys.argv[1]
+        expected = {
+            "pg_data": (70, 70, 0o700),
+            "vault_data": (1000, 1000, 0o700),
+            "vault_audit": (1000, 473, 0o2750),
+            "alloy_data": (473, 473, 0o700),
+            "prom_data": (65532, 65532, 0o700),
+            "loki_data": (65532, 65532, 0o700),
+            "tempo_data": (65532, 65532, 0o700),
+            "grafana_data": (65532, 65532, 0o700),
+        }
+        drift = []
+        for volume, contract in expected.items():
+            result = subprocess.run(
+                ["docker", "volume", "inspect", f"{project}_{volume}"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            if result.returncode:
+                drift.append(f"{volume}:missing")
+                continue
+            mountpoint = json.loads(result.stdout)[0]["Mountpoint"]
+            try:
+                metadata = os.stat(mountpoint)
+            except OSError:
+                drift.append(f"{volume}:unreadable")
+                continue
+            actual = (metadata.st_uid, metadata.st_gid, metadata.st_mode & 0o7777)
+            if actual != contract:
+                drift.append(f"{volume}:owner-or-mode")
+        print("\n".join(drift))
+      - "{{ compose_project_name }}"
+  register: verified_volume_init_permissions
+  changed_when: false
+  failed_when: verified_volume_init_permissions.stdout_lines | length > 0
+
+- name: Start PostgreSQL before credential reconciliation
+  community.docker.docker_compose_v2:
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: >-
+      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
+         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
+    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    services: [postgres]
+    dependencies: false
+    state: present
+    build: policy
+  no_log: true
+
+- name: Wait for PostgreSQL local-socket readiness
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - postgres
+      - pg_isready
+      - --username
+      - postgres
+      - --dbname
+      - postgres
+  args:
+    chdir: "{{ stack_dir }}"
+  register: postgres_ready
+  changed_when: false
+  retries: 30
+  delay: 2
+  until: postgres_ready.rc == 0
+
+# docker-entrypoint-initdb.d runs only for an empty PGDATA. Re-running this
+# idempotent script over PostgreSQL's trusted local Unix socket is the
+# deliberate existing-volume password-rotation path; no secret is placed in
+# argv or task output.
+- name: Reconcile PostgreSQL roles, passwords, databases, and CONNECT ACLs
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - postgres
+      - /docker-entrypoint-initdb.d/01-init-databases.sh
+  args:
+    chdir: "{{ stack_dir }}"
+  register: postgres_reconcile
+  changed_when: "'AIGW_POSTGRES_CHANGED' in postgres_reconcile.stdout"
+  no_log: true
+
+- name: Read the exact PostgreSQL service-role security matrix
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - postgres
+      - psql
+      - --username
+      - postgres
+      - --dbname
+      - postgres
+      - --tuples-only
+      - --no-align
+      - --command
+      - |
+        SELECT role_name || '|' || db_name || '|' ||
+               CASE WHEN has_database_privilege(role_name, db_name, 'CONNECT')
+                    THEN 'true' ELSE 'false' END
+          FROM unnest(ARRAY['keycloak','litellm','rotator']) AS role_name
+         CROSS JOIN unnest(ARRAY['keycloak','litellm','rotator','postgres']) AS db_name
+         ORDER BY role_name, db_name;
+        SELECT 'postgres|postgres|' ||
+               CASE WHEN has_database_privilege('postgres', 'postgres', 'CONNECT')
+                    THEN 'true' ELSE 'false' END;
+        SELECT 'owner|' || datname || '|' || pg_get_userbyid(datdba)
+          FROM pg_database
+         WHERE datname IN ('keycloak','litellm','rotator')
+         ORDER BY datname;
+        SELECT 'role|' || rolname || '|' ||
+               CASE WHEN rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND
+                         NOT rolcreaterole AND NOT rolinherit AND NOT rolreplication AND
+                         NOT rolbypassrls AND rolconnlimit = -1 AND rolconfig IS NULL AND
+                         (rolvaliduntil IS NULL OR rolvaliduntil = 'infinity'::timestamptz)
+                    THEN 'true' ELSE 'false' END
+          FROM pg_roles
+         WHERE rolname IN ('keycloak','litellm','rotator')
+         ORDER BY rolname;
+        SELECT 'membership|' || count(*)
+          FROM pg_auth_members membership
+          JOIN pg_roles granted_role ON granted_role.oid = membership.roleid
+          JOIN pg_roles member_role ON member_role.oid = membership.member
+         WHERE granted_role.rolname IN ('keycloak','litellm','rotator')
+            OR member_role.rolname IN ('keycloak','litellm','rotator');
+  args:
+    chdir: "{{ stack_dir }}"
+  register: postgres_connect_matrix
+  changed_when: false
+
+- name: Assert the exact PostgreSQL service-role security matrix
+  ansible.builtin.assert:
+    that:
+      - postgres_connect_matrix.stdout_lines | sort == expected_postgres_connect_matrix | sort
+    quiet: true
+    fail_msg: >-
+      PostgreSQL service-role drift: roles must have exact least-privilege
+      attributes, no memberships, exact database ownership, and CONNECT only
+      to their own database; postgres alone retains maintenance access.
+  vars:
+    expected_postgres_connect_matrix:
+      - keycloak|keycloak|true
+      - keycloak|litellm|false
+      - keycloak|postgres|false
+      - keycloak|rotator|false
+      - litellm|keycloak|false
+      - litellm|litellm|true
+      - litellm|postgres|false
+      - litellm|rotator|false
+      - postgres|postgres|true
+      - rotator|keycloak|false
+      - rotator|litellm|false
+      - rotator|postgres|false
+      - rotator|rotator|true
+      - owner|keycloak|keycloak
+      - owner|litellm|litellm
+      - owner|rotator|rotator
+      - role|keycloak|true
+      - role|litellm|true
+      - role|rotator|true
+      - membership|0
+
+- name: Create private deployment-state directory
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/.state"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# `docker compose up --build` asks BuildKit to consider every local context on
+# every converge. Apart from making an unchanged run report build activity, a
+# changed shared probe context can update several image tags at once and make
+# the subsequent `up` recreate stateful services such as Vault. Vault then
+# correctly starts sealed. Plan builds by a stable digest of each service's
+# effective build definition and deployed context instead; an absent image is
+# also rebuilt even when its prior digest is still recorded.
+- name: Render effective Compose model for the custom-image build planner
+  ansible.builtin.command:
+    argv: >-
+      {{
+        ['docker', 'compose', '--project-name', compose_project_name,
+         '--file', 'docker-compose.yml']
+        + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
+           if (samba_lab_enabled | bool) else [])
+        + ['config', '--format', 'json']
+      }}
+  args:
+    chdir: "{{ stack_dir }}"
+  register: effective_compose_model
+  changed_when: false
+  no_log: true
+
+- name: Plan only missing or build-input-changed custom images
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ stack_dir }}/scripts/plan-compose-builds.py"
+      - "{{ stack_dir }}"
+      - "{{ stack_dir }}/.state/compose-build-inputs.json"
+      - "{{ compose_project_name }}"
+  args:
+    chdir: "{{ stack_dir }}"
+    stdin: "{{ effective_compose_model.stdout }}"
+    stdin_add_newline: false
+  register: compose_build_plan_raw
+  changed_when: (compose_build_plan_raw.stdout | from_json).services | length > 0
+  no_log: true
+
+- name: Record custom-image build plan
+  ansible.builtin.set_fact:
+    compose_build_plan: "{{ compose_build_plan_raw.stdout | from_json }}"
+  no_log: true
+
+# The containerd image store can discard the prior image record as soon as a
+# stable tag moves and Compose removes the old container. Resolve the exact
+# running container image—not merely that mutable tag—then retain one verified
+# content-addressed generation and its root-only manifest before the first build
+# mutates Docker. A partial multi-service attempt never moves a committed tag.
+- name: Preserve exact running images for planned build rollback
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ stack_dir }}/scripts/preserve-compose-rollbacks.py"
+      - "{{ stack_dir }}"
+      - "{{ compose_project_name }}"
+  args:
+    chdir: "{{ stack_dir }}"
+    stdin: "{{ compose_build_plan | to_json }}"
+    stdin_add_newline: false
+  register: compose_rollback_preservation
+  changed_when: true
+  when: compose_build_plan.services | length > 0
+
+- name: Inspect the pre-build rollback manifest boundary
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/.state/compose-build-rollbacks.json"
+    follow: false
+  register: compose_rollback_manifest
+  when: compose_build_plan.services | length > 0
+
+- name: Require a private single-link pre-build rollback manifest
+  ansible.builtin.assert:
+    that:
+      - compose_rollback_manifest.stat.isreg | default(false)
+      - not (compose_rollback_manifest.stat.islnk | default(false))
+      - (compose_rollback_manifest.stat.nlink | default(0) | int) == 1
+      - compose_rollback_manifest.stat.uid == 0
+      - compose_rollback_manifest.stat.gid == 0
+      - compose_rollback_manifest.stat.mode == '0600'
+      - (compose_rollback_preservation.stdout | from_json).schema == 2
+      - (compose_rollback_preservation.stdout | from_json).project == compose_project_name
+      - >-
+        ((compose_rollback_preservation.stdout | from_json).updated_services |
+         sort) == (compose_build_plan.services | sort)
+      - >-
+        (compose_build_plan.services |
+         difference((compose_rollback_preservation.stdout | from_json).services.keys() | list) |
+         length) == 0
+    quiet: true
+    fail_msg: >-
+      Planned custom images must have an exact root-only rollback record before
+      any mutable build tag is replaced.
+  when: compose_build_plan.services | length > 0
+
+- name: Build only missing or build-input-changed custom images
+  ansible.builtin.command:
+    argv: >-
+      {{
+        ['docker', 'compose', '--project-name', compose_project_name,
+         '--file', 'docker-compose.yml']
+        + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
+           if (samba_lab_enabled | bool) else [])
+        + ['build']
+        + compose_build_plan.services
+      }}
+  args:
+    chdir: "{{ stack_dir }}"
+  when: compose_build_plan.services | length > 0
+  no_log: true
+
+# Capture the tag's immutable image ID after builds. This also detects a later
+# manual retag or deletion even when source inputs have not changed.
+- name: Finalize custom-image manifest with built image IDs
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import json
+        import subprocess
+        import sys
+
+        manifest = json.load(sys.stdin)
+        for name, record in manifest.get("services", {}).items():
+            try:
+                output = subprocess.check_output(
+                    ["docker", "image", "inspect", record["image"]],
+                    stdin=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                record["image_id"] = json.loads(output)[0]["Id"]
+            except subprocess.CalledProcessError as exc:
+                raise SystemExit(
+                    f"built image is missing after Compose build: {name}"
+                ) from exc
+        print(json.dumps(manifest, sort_keys=True))
+  args:
+    stdin: "{{ compose_build_plan.manifest | to_json }}"
+    stdin_add_newline: false
+  register: finalized_compose_build_manifest
+  changed_when: false
+  no_log: true
+
+# Install the marker only after every planned build succeeds. A failed build
+# therefore remains pending on the next converge instead of blessing stale
+# tags. The backup tooling already excludes `.state` from stateful archives.
+- name: Persist successful custom-image build-input manifest
+  ansible.builtin.copy:
+    content: "{{ finalized_compose_build_manifest.stdout | from_json | to_nice_json }}\n"
+    dest: "{{ stack_dir }}/.state/compose-build-inputs.json"
+    owner: root
+    group: root
+    mode: "0600"
+
+# A first-build record authorizes retry only until this successful image marker
+# is durable. Retire that proof on every converge (including recovery from an
+# interruption immediately after the marker write) so a later deleted container
+# cannot be mistaken for a service that has never had a deployable generation.
+- name: Retire completed first-build rollback retry proofs
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ stack_dir }}/scripts/preserve-compose-rollbacks.py"
+      - --retire-first-builds
+      - "{{ stack_dir }}"
+      - "{{ compose_project_name }}"
+  args:
+    chdir: "{{ stack_dir }}"
+    stdin: "{{ finalized_compose_build_manifest.stdout }}"
+    stdin_add_newline: false
+  register: retired_first_build_rollback_proofs
+  changed_when: >-
+    (retired_first_build_rollback_proofs.stdout |
+     from_json).retired_services | length > 0
+
+- name: Deploy stack without implicitly rebuilding custom images
+  community.docker.docker_compose_v2:
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: >-
+      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
+         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
+    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    services: "{{ compose_long_running_services }}"
+    dependencies: false
+    state: present
+    # Builds are content-addressed and completed above. Keeping `up` in
+    # --no-build mode prevents an unchanged converge from retagging images or
+    # recreating/resealing Vault as a side effect of unrelated build contexts.
+    build: never
+    remove_orphans: true
+  no_log: true
+
+- name: Reconcile scoped ACLs for newly-created Docker json logs
+  ansible.builtin.systemd_service:
+    name: aigw-docker-log-acl.service
+    state: started
+
+- name: Inspect Vault immediately after Compose start
+  community.docker.docker_container_info:
+    name: "{{ compose_project_name }}-vault-1"
+  register: vault_container_startup
+
+- name: Refuse a Vault restart loop before the bootstrap phase
+  ansible.builtin.assert:
+    that:
+      - vault_container_startup.exists
+      - vault_container_startup.container.State.Running | bool
+      - not (vault_container_startup.container.State.Restarting | bool)
+      - vault_container_startup.container.RestartCount | int == 0
+    quiet: true
+    fail_msg: >-
+      Vault failed its hardened startup contract before initialization. Its
+      reviewed config must be mounted read-only and the container must remain
+      running without a restart loop.
+
+- name: Read effective identity and capabilities of the Vault server process
+  ansible.builtin.command:
+    argv:
+      - awk
+      - /^(Uid|CapPrm|CapEff|CapBnd|NoNewPrivs):/
+      - "/proc/{{ vault_container_startup.container.State.Pid }}/status"
+  register: vault_process_security
+  changed_when: false
+
+- name: Vault runs non-root and drops IPC_LOCK after locking memory
+  ansible.builtin.assert:
+    that:
+      - vault_process_security.stdout is search('Uid:\\s+1000\\s+1000\\s+1000\\s+1000')
+      - vault_process_security.stdout is search('CapPrm:\\s+0000000000000000')
+      - vault_process_security.stdout is search('CapEff:\\s+0000000000000000')
+      - vault_process_security.stdout is search('CapBnd:\\s+0000000000004000')
+      - vault_process_security.stdout is search('NoNewPrivs:\\s+1')
+    quiet: true
+    fail_msg: >-
+      The DHI Vault server must run as uid 1000 under no-new-privileges, have
+      only IPC_LOCK in its bounding set, and drop all permitted/effective
+      capabilities after locking memory.
+
+- name: Inspect DHI Alloy after Compose start
+  community.docker.docker_container_info:
+    name: "{{ compose_project_name }}-alloy-1"
+  register: alloy_container_startup
+  retries: 15
+  delay: 2
+  until: >-
+    alloy_container_startup.exists and
+    (alloy_container_startup.container.State.Running | bool)
+
+- name: Read effective Alloy identity and capabilities
+  ansible.builtin.command:
+    argv:
+      - awk
+      - /^(Uid|Gid|CapEff):/
+      - "/proc/{{ alloy_container_startup.container.State.Pid }}/status"
+  register: alloy_process_security
+  changed_when: false
+  retries: 15
+  delay: 2
+  until: alloy_process_security.rc == 0
+
+- name: Alloy has only owner/group DAC access and no effective capabilities
+  ansible.builtin.assert:
+    that:
+      - alloy_process_security.stdout is search('Uid:\\s+473\\s+473\\s+473\\s+473')
+      - alloy_process_security.stdout is search('Gid:\\s+473\\s+473\\s+473\\s+473')
+      - alloy_process_security.stdout is search('CapEff:\\s+0000000000000000')
+    quiet: true
+    fail_msg: >-
+      DHI Alloy must run uid/gid 473 with CapEff=0. Host ACLs provide only
+      read/traverse access to Docker json logs.
+
+- name: Prove Alloy can read mounted logs and write only its state volume
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --rm
+      - --network
+      - none
+      - --user
+      - 473:473
+      - --cap-drop
+      - ALL
+      - --security-opt
+      - no-new-privileges:true
+      # This bounded verifier exercises the same Docker-log path as Alloy.
+      # Never relabel Docker's runtime-owned state to a container content type.
+      - --security-opt
+      - label=disable
+      - --read-only
+      - --entrypoint
+      - /bin/sh
+      - --volume
+      - "{{ docker_data_root }}/containers:/logs:ro"
+      - --volume
+      - "{{ compose_project_name }}_alloy_data:/state"
+      - --volume
+      - "{{ compose_project_name }}_vault_audit:/audit:ro"
+      - dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad
+      - -ec
+      - >-
+        test -r /audit;
+        test -w /state;
+        set -- /logs/*/*-json.log*;
+        test -e "$1";
+        head -c 0 "$1";
+        for sensitive in /logs/*/config.v2.json /logs/*/hostconfig.json; do
+          test -e "$sensitive" || continue;
+          if head -c 0 "$sensitive" >/dev/null 2>&1; then exit 1; fi;
+        done
+  changed_when: false
+
+# Vault is intentionally uninitialized/sealed on the first converge. Starting
+# the complete graph is necessary so the operator can execute the bootstrap,
+# but waiting for every readiness probe here would deadlock that ceremony.
+- name: Probe strict Vault readiness after stack start
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - vault
+      - /usr/local/bin/aigw-health-probe
+      - http
+      - --url
+      - http://127.0.0.1:8200/v1/sys/health?standbyok=true
+  args:
+    chdir: "{{ stack_dir }}"
+  register: vault_strict_readiness
+  changed_when: false
+  failed_when: false
+
+- name: Inspect the authenticated-restore marker
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/.state/restore-required-unseal"
+    follow: false
+  register: restore_required_unseal_marker
+
+- name: Read the authenticated-restore marker
+  ansible.builtin.slurp:
+    src: "{{ stack_dir }}/.state/restore-required-unseal"
+  register: restore_required_unseal_content
+  when: restore_required_unseal_marker.stat.exists | default(false)
+
+- name: Require a root-only authenticated-restore marker
+  ansible.builtin.assert:
+    that:
+      - restore_required_unseal_marker.stat.isreg | default(false)
+      - not (restore_required_unseal_marker.stat.islnk | default(false))
+      - restore_required_unseal_marker.stat.uid == 0
+      - restore_required_unseal_marker.stat.gid == 0
+      - restore_required_unseal_marker.stat.mode == '0600'
+      - (restore_required_unseal_marker.stat.nlink | default(1) | int) == 1
+      - (restore_required_unseal_content.content | b64decode | trim) is match('^[0-9a-f]{64}$')
+    quiet: true
+    fail_msg: >-
+      The authenticated-restore marker must be a root:root 0600 regular
+      single-link file containing only the independently authenticated backup SHA-256.
+  when: restore_required_unseal_marker.stat.exists | default(false)
+
+- name: Read public Vault initialization and seal state
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - exec
+      - -T
+      - vault
+      - vault
+      - status
+      - -address=http://127.0.0.1:8200
+      - -format=json
+  args:
+    chdir: "{{ stack_dir }}"
+  register: vault_public_status
+  changed_when: false
+  failed_when: vault_public_status.rc not in [0, 2]
+
+- name: Bound the Vault bootstrap health exception to public sealed state
+  ansible.builtin.assert:
+    that:
+      - >-
+        vault_strict_readiness.rc == 0 or
+        not ((vault_public_status.stdout | from_json).initialized | bool) or
+        ((vault_public_status.stdout | from_json).sealed | bool)
+    quiet: true
+    fail_msg: >-
+      Vault is initialized and unsealed but its strict readiness probe failed.
+      This is not a bootstrap exception: fail closed and diagnose Vault rather
+      than allowing Vault/key-rotator health failures through verification.
+
+- name: Require restored Vault state instead of replacement initialization
+  ansible.builtin.assert:
+    that:
+      - (vault_public_status.stdout | from_json).initialized | bool
+    quiet: true
+    fail_msg: >-
+      A restore marker exists but Vault reports uninitialized. Do not run
+      vault-bootstrap.sh or create replacement identity; preserve the target
+      and investigate the authenticated restore.
+  when: restore_required_unseal_marker.stat.exists | default(false)
+
+- name: Wait for the complete post-bootstrap stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: >-
+      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
+         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
+    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    services: "{{ compose_long_running_services }}"
+    dependencies: false
+    state: present
+    build: never
+    wait: true
+    wait_timeout: 300
+  when: vault_strict_readiness.rc == 0
+  no_log: true
+
+- name: Wait only for bootstrap-independent core on first converge
+  community.docker.docker_compose_v2:
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: >-
+      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
+         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
+    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    services:
+      - postgres
+      - redis
+      - envoy-egress
+      - keycloak
+      - litellm
+      - dev-portal
+      - open-webui
+      - prometheus
+      - grafana
+      - traefik-int
+      - traefik-adm
+    dependencies: false
+    state: present
+    build: never
+    wait: true
+    wait_timeout: 300
+  when: vault_strict_readiness.rc != 0
+  no_log: true
+
+- name: Read the deployed dev-portal image used for secretless reconciliation
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/aigw-compose.sh"
+      - images
+      - --quiet
+      - dev-portal
+  args:
+    chdir: "{{ stack_dir }}"
+  register: dev_portal_runtime_image
+  changed_when: false
+  # Docker Compose may emit the same content-addressed ID with or without its
+  # `sha256:` algorithm prefix. Accept only those two exact representations.
+  failed_when: dev_portal_runtime_image.stdout is not regex('^(sha256:)?[a-f0-9]{64}$')
+
+- name: Reconcile the dedicated Open WebUI LiteLLM workload key
+  block:
+    # A transient private `Z` category must never be applied to the persistent
+    # deployed script. Stage exact bytes in a disposable directory so Docker
+    # can relabel them without stealing a long-lived host source's MCS range.
+    - name: Create private reconciliation staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: aigw-openwebui-reconcile-
+      register: openwebui_reconcile_staging
+
+    - name: Stage the exact reconciliation program for private relabeling
+      ansible.builtin.copy:
+        src: "{{ stack_dir }}/scripts/reconcile-openwebui-key.py"
+        dest: "{{ openwebui_reconcile_staging.path }}/reconcile.py"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0555"
+
+    - name: Run secretless reconciliation from the private staged copy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - -i
+          - --network
+          - net-portal
+          - --read-only
+          - --cap-drop
+          - ALL
+          - --security-opt
+          - no-new-privileges:true
+          - --user
+          - 65532:65532
+          - --log-driver
+          - none
+          - --volume
+          - "{{ openwebui_reconcile_staging.path }}/reconcile.py:/reconcile.py:ro,Z"
+          - --entrypoint
+          - python3
+          - "{{ dev_portal_runtime_image.stdout }}"
+          - /reconcile.py
+      args:
+        stdin: >-
+          {{ {'master_key': litellm_master_key,
+              'candidate_key': webui_litellm_key} | to_json }}
+        stdin_add_newline: false
+      register: openwebui_key_reconciliation
+      changed_when: "'created=true' in openwebui_key_reconciliation.stdout"
+      no_log: true
+  always:
+    - name: Remove private reconciliation staging directory
+      ansible.builtin.file:
+        path: >-
+          {{ (openwebui_reconcile_staging | default({})).get(
+               'path', stack_dir ~ '/.state/.missing-reconcile-stage') }}
+        state: absent
+      when:
+        - openwebui_reconcile_staging is defined
+        - openwebui_reconcile_staging.path is defined
+
+- name: Prove Open WebUI can list exactly its allowed models
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/aigw-compose.sh"
+      - exec
+      - -T
+      - open-webui
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        import urllib.request
+
+        request = urllib.request.Request(
+            os.environ["OPENAI_API_BASE_URL"].rstrip("/") + "/models",
+            headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]},
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=15) as response:
+            data = json.load(response)
+            if response.status != 200:
+                raise SystemExit("Open WebUI model list returned non-success")
+        actual = sorted(item.get("id") for item in data.get("data", []))
+        expected = sorted(["claude-sonnet", "claude-haiku", "gpt"])
+        if actual != expected:
+            raise SystemExit("Open WebUI workload key model scope drifted")
+        print("OPENWEBUI_MODELS_SCOPE_PASS")
+  args:
+    chdir: "{{ stack_dir }}"
+  changed_when: false
+  no_log: true
+
+- name: Prove LiteLLM stores only the Open WebUI workload key hash and safe metadata
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/aigw-compose.sh"
+      - exec
+      - -T
+      - postgres
+      - psql
+      - --username
+      - postgres
+      - --dbname
+      - litellm
+      - --tuples-only
+      - --no-align
+      - --command
+      - >-
+        SELECT CASE WHEN count(*) = 1
+          AND bool_and(token = '{{ webui_litellm_key | hash('sha256') }}')
+          AND bool_and(position('sk-' in coalesce(metadata::text, '')) = 0)
+        THEN 'pass' ELSE 'fail' END
+        FROM "LiteLLM_VerificationToken"
+        WHERE key_alias = 'aigw-open-webui-service';
+  args:
+    chdir: "{{ stack_dir }}"
+  register: openwebui_key_database_contract
+  changed_when: false
+  failed_when: openwebui_key_database_contract.stdout.strip() != 'pass'
+  no_log: true
+
+- name: Prove the Open WebUI workload key plaintext is absent from project logs
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import subprocess
+        import sys
+
+        secret = sys.stdin.buffer.read(513).strip()
+        if len(secret) < 16:
+            raise SystemExit("bounded workload key input unavailable")
+        ids = subprocess.check_output(
+            ["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={sys.argv[1]}"],
+            text=True,
+        ).split()
+        for container_id in ids:
+            result = subprocess.run(
+                ["docker", "logs", container_id],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            if secret in result.stdout:
+                raise SystemExit("Open WebUI workload key plaintext found in Docker logs")
+        print("OPENWEBUI_KEY_LOG_HYGIENE_PASS")
+      - "{{ compose_project_name }}"
+  args:
+    stdin: "{{ webui_litellm_key }}"
+    stdin_add_newline: false
+  changed_when: false
+  no_log: true
+
+- name: Prove exact published-port bindings and Docker DNAT rules
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import json
+        import re
+        import subprocess
+        import sys
+
+        project, egress_ip, adm_ip, internal_ip, lab_dns = sys.argv[1:]
+        container_ids = subprocess.check_output(
+            ["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"],
+            text=True,
+        ).split()
+        containers = json.loads(
+            subprocess.check_output(["docker", "inspect", *container_ids], text=True)
+        )
+        actual = set()
+        for container in containers:
+            service = container["Config"]["Labels"].get("com.docker.compose.service", "")
+            for container_port, bindings in (container["NetworkSettings"].get("Ports") or {}).items():
+                port, protocol = container_port.split("/", 1)
+                for binding in bindings or []:
+                    actual.add(
+                        (service, protocol, int(port), binding["HostIp"], int(binding["HostPort"]))
+                    )
+
+        expected = {
+            ("traefik-adm", "tcp", 443, adm_ip, 443),
+            ("traefik-int", "tcp", 443, internal_ip, 443),
+        }
+        nat_expected = {
+            (adm_ip, "tcp", 443),
+            (internal_ip, "tcp", 443),
+        }
+        if lab_dns == "true":
+            for host_ip in (adm_ip, internal_ip):
+                for protocol in ("tcp", "udp"):
+                    expected.add(("lab-dns", protocol, 53, host_ip, 53))
+                    nat_expected.add((host_ip, protocol, 53))
+        if actual != expected:
+            raise SystemExit(f"published-port runtime mismatch: {sorted(actual)}")
+        if any(binding[3] in {"0.0.0.0", "::", egress_ip} for binding in actual):
+            raise SystemExit("wildcard or egress-NIC published binding detected")
+
+        nat = subprocess.check_output(["iptables-save", "-t", "nat"], text=True)
+        for host_ip, protocol, port in nat_expected:
+            pattern = (
+                rf"^-A DOCKER -d {re.escape(host_ip)}/32 .* -p {protocol} "
+                rf".* --dport {port} -j DNAT --to-destination "
+            )
+            if not re.search(pattern, nat, re.MULTILINE):
+                raise SystemExit(f"missing Docker DNAT for {host_ip}/{protocol}/{port}")
+        for line in nat.splitlines():
+            if line.startswith("-A DOCKER ") and re.search(r"--dport (53|443)(?: |$)", line):
+                if f"-d {egress_ip}/32 " in line or " -d 0.0.0.0/0 " in line:
+                    raise SystemExit("forbidden egress-NIC or wildcard DNAT detected")
+        print("Exact TLS/DNS host bindings and Docker DNAT rules are present.")
+      - "{{ compose_project_name }}"
+      - "{{ eth0_ip }}"
+      - "{{ eth1_ip }}"
+      - "{{ eth2_ip }}"
+      - "{{ lab_dns_enabled | bool | lower }}"
+  register: published_port_contract
+  changed_when: false
+
+- name: Report the authenticated-restore Vault unseal gate
+  ansible.builtin.debug:
+    msg: >-
+      Authenticated restored state is present and Vault is sealed. Initializing
+      or running scripts/vault-bootstrap.sh is forbidden. Keep the restore
+      marker and maintenance ingress in place; stream the separately held old
+      unseal share to scripts/vault-unseal.sh, then run the full runtime wait.
+  when:
+    - vault_strict_readiness.rc != 0
+    - restore_required_unseal_marker.stat.exists | default(false)
+
+- name: Report the existing initialized Vault unseal gate
+  ansible.builtin.debug:
+    msg: >-
+      Vault is already initialized but sealed. Do not run
+      scripts/vault-bootstrap.sh; use the separately held existing unseal
+      shares and then run the full runtime wait.
+  when:
+    - vault_strict_readiness.rc != 0
+    - not (restore_required_unseal_marker.stat.exists | default(false))
+    - (vault_public_status.stdout | from_json).initialized | bool
+
+- name: Report the fresh Vault bootstrap gate
+  ansible.builtin.debug:
+    msg: >-
+      This fresh deployment's Vault is uninitialized and the deployment is
+      intentionally not claiming full readiness. Only this no-restore-marker
+      state may use the approved lab scripts/vault-bootstrap.sh ceremony,
+      which performs its own final full-stack wait.
+  when:
+    - vault_strict_readiness.rc != 0
+    - not (restore_required_unseal_marker.stat.exists | default(false))
+    - not ((vault_public_status.stdout | from_json).initialized | bool)
+
+- name: Install bounded Vault audit rotation service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/aigw-vault-audit-rotate.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Rotate AI Gateway Vault audit file safely
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      WorkingDirectory={{ stack_dir }}
+      Environment=COMPOSE_PROJECT_NAME={{ compose_project_name }}
+      ExecStart={{ stack_dir }}/scripts/rotate-vault-audit.sh
+      User=root
+      Group=root
+      NoNewPrivileges=true
+      PrivateTmp=true
+      ProtectHome=true
+      ProtectSystem=strict
+      ReadWritePaths=/run/lock
+
+- name: Install bounded Vault audit rotation timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/aigw-vault-audit-rotate.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Check AI Gateway Vault audit file size every 15 minutes
+
+      [Timer]
+      OnBootSec=15min
+      OnUnitActiveSec=15min
+      AccuracySec=1min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable bounded Vault audit rotation timer
+  ansible.builtin.systemd:
+    name: aigw-vault-audit-rotate.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Remove the retired flat backend network after services are segmented
+  community.docker.docker_network:
+    name: net-backend
+    state: absent
+
+# firewalld reloads and Docker bridge activation can cause NetworkManager to
+# replay a customer-owned policy-table route after the early routing role.
+# Normalize only the dedicated AIGW tables once all network churn is complete;
+# the applicator never edits or cycles the supplied connection profiles.
+- name: Reassert dedicated policy routing after stack network activation
+  ansible.builtin.command: /usr/local/sbin/aigw-policy-routing
+  changed_when: false
+  when: manage_networking | bool

@@ -1,0 +1,29 @@
+{
+  "base": {
+    "alloy": ["alloy/config.alloy", "certs/ca.pem"],
+    "cribl-mock": ["cribl-mock/config.yaml"],
+    "grafana": ["grafana/provisioning"],
+    "keycloak": ["keycloak/realms"],
+    "litellm": ["litellm/config.yaml"],
+    "loki": ["loki/config.yml"],
+    "open-webui": ["certs/ca.pem"],
+    "postgres": ["postgres/init"],
+    "prometheus": ["prometheus/prometheus.yml", "prometheus/rules.yml"],
+    "redis": ["secrets/redis_users.acl", "secrets/redis_password"],
+    "tempo": ["tempo/config.yml"],
+    "traefik-adm": ["traefik/traefik-adm.yml", "traefik/dynamic-adm.yml", "certs"],
+    "traefik-int": ["traefik/traefik-int.yml", "traefik/dynamic-int.yml", "certs"],
+    "vault": ["vault/config.hcl"]
+  },
+  "lab": {
+    "key-rotator": ["secrets/samba_ad_bind_password"],
+    "lab-dns": ["services/lab-dns/Corefile", "services/lab-dns/db.aigw.internal"],
+    "samba-ad": [
+      "secrets/samba_ad_admin_password",
+      "secrets/samba_ad_bind_password",
+      "secrets/samba_user_lab-admin_password",
+      "secrets/samba_user_lab-developer_password",
+      "secrets/samba_user_lab-user_password"
+    ]
+  }
+}

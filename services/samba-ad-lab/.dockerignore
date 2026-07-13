@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!policy-rc.d
+!samba-ad-entrypoint
+!samba-ad-healthcheck
+!samba-ad-secret-tool

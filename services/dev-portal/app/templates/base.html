@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}AI Gateway {{ 'Admin Portal' if admin_surface else 'Dev Portal' }}{% endblock %}</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-border: #263048;
+    --text: #e6e9f0;
+    --muted: #93a0b8;
+    --accent: #4f7cff;
+    --accent-hover: #6a90ff;
+    --success: #35c98f;
+    --error: #ff6b6b;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    padding: 14px 24px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--panel-border);
+  }
+  header a { color: var(--text); text-decoration: none; margin-right: 18px; font-weight: 500; }
+  header a:hover { color: var(--accent-hover); }
+  header .brand { font-weight: 700; color: var(--accent); }
+  header .spacer { flex: 1; }
+  header .user { color: var(--muted); font-size: 0.9em; margin-right: 12px; }
+  main { max-width: 880px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1, h2, h3 { color: var(--text); }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+  }
+  .muted { color: var(--muted); }
+  input[type=text], input[type=number], select {
+    background: #0c111c;
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 0.95em;
+  }
+  label { display: block; margin: 10px 0 4px; font-size: 0.9em; color: var(--muted); }
+  button, .btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    cursor: pointer;
+    font-size: 0.95em;
+    text-decoration: none;
+    display: inline-block;
+  }
+  button:hover, .btn:hover { background: var(--accent-hover); }
+  button.danger { background: transparent; border: 1px solid var(--error); color: var(--error); }
+  button.danger:hover { background: var(--error); color: #fff; }
+  button.ghost { background: transparent; border: 1px solid var(--panel-border); color: var(--text); }
+  pre {
+    background: #0c111c;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.85em;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  code { font-family: var(--mono); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--panel-border); }
+  th { color: var(--muted); font-weight: 600; }
+  .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; font-size: 0.92em; }
+  .flash.success { background: rgba(53,201,143,0.12); border: 1px solid var(--success); color: var(--success); }
+  .flash.error { background: rgba(255,107,107,0.12); border: 1px solid var(--error); color: var(--error); }
+  .flash.info { background: rgba(79,124,255,0.12); border: 1px solid var(--accent); color: var(--accent-hover); }
+  .key-box { display: flex; align-items: center; gap: 10px; }
+  .key-box code { flex: 1; word-break: break-all; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75em; background: var(--panel-border); color: var(--muted); }
+  form.inline { display: inline; }
+  footer { text-align: center; color: var(--muted); font-size: 0.8em; padding: 20px; }
+</style>
+</head>
+<body>
+<header>
+  {% if admin_surface %}
+  <a href="/admin" class="brand">AI Gateway / admin-portal</a>
+  {% else %}
+  <a href="/" class="brand">AI Gateway / dev-portal</a>
+  {% endif %}
+  {% if user %}
+  {% if admin_surface %}
+  <a href="/admin">Identity &amp; rotation</a>
+  {% else %}
+  <a href="/">Keys</a>
+  <a href="/snippets">Snippets</a>
+  {% endif %}
+  {% endif %}
+  <span class="spacer"></span>
+  {% if user %}
+  <span class="user">{{ user.name or user.email }}</span>
+  <a href="/logout" class="btn ghost">Log out</a>
+  {% endif %}
+</header>
+<main>
+  {% for f in flashes %}
+  <div class="flash {{ f.category }}">{{ f.message }}</div>
+  {% endfor %}
+  {% block content %}{% endblock %}
+</main>
+<footer>AI Gateway {{ 'admin-portal — ADM network only' if admin_surface else 'dev-portal — internal use only' }}</footer>
+<script nonce="{{ csp_nonce }}">
+function copyToClipboard(id, btn) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  var text = el.innerText || el.value || "";
+  navigator.clipboard.writeText(text).then(function () {
+    if (btn) {
+      var original = btn.textContent;
+      btn.textContent = "Copied!";
+      setTimeout(function () { btn.textContent = original; }, 1500);
+    }
+  });
+}
+
+document.addEventListener("click", function (event) {
+  var btn = event.target.closest("[data-copy-target]");
+  if (btn) copyToClipboard(btn.getAttribute("data-copy-target"), btn);
+});
+
+document.addEventListener("submit", function (event) {
+  var message = event.target.getAttribute("data-confirm");
+  if (message && !window.confirm(message)) event.preventDefault();
+});
+
+function clearSensitiveValues() {
+  document.querySelectorAll("[data-sensitive-value]").forEach(function (el) {
+    if ("value" in el) el.value = "";
+    el.textContent = "";
+  });
+}
+
+// A generated key exists only in the immediate POST document. Replace the
+// POST history entry so refresh/back navigation performs GET /, and scrub the
+// DOM before the document can enter the back-forward cache.
+if (document.querySelector("[data-one-time-secret]")) {
+  window.history.replaceState(null, "", "/");
+  window.addEventListener("pagehide", clearSensitiveValues, { once: true });
+  window.addEventListener("pageshow", function (event) {
+    if (event.persisted) clearSensitiveValues();
+  });
+}
+</script>
+</body>
+</html>

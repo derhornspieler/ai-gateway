@@ -1,0 +1,34 @@
+groups:
+  - name: aigw-state-capacity
+    rules:
+      - alert: AIGatewayFilesystemSpaceLow
+        expr: >-
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}) < 0.15
+          and node_filesystem_readonly == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "AI Gateway host filesystem has less than 15% free"
+          description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.device }} is approaching capacity."
+
+      - alert: AIGatewayFilesystemSpaceCritical
+        expr: >-
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}) < 0.05
+          and node_filesystem_readonly == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "AI Gateway host filesystem has less than 5% free"
+          description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.device }} is near exhaustion."
+
+      - alert: AIGatewayFilesystemPredictedFull
+        expr: >-
+          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}[6h], 24 * 3600) < 0
+          and node_filesystem_readonly == 0
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "AI Gateway host filesystem predicted full within 24 hours"
+          description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.device }} is growing too quickly."

@@ -1,0 +1,64 @@
+# Tempo monolith for the single-VM deployment. It is the local store for
+# prompt-bearing traces; Grafana queries :3200 on net-observability while OTLP
+# ingestion binds only to the fixed address on isolated net-traces.
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "${TEMPO_INGEST_IP}:4317"
+        http:
+          endpoint: "${TEMPO_INGEST_IP}:4318"
+  # Tempo 3 defaults to truncating attributes at 2 KiB, which silently destroys
+  # full prompts/completions. Eight MiB preserves accepted text/tool payloads
+  # while retaining a hard memory-safety boundary.
+  max_attribute_bytes: 8388608
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# Tempo 3 runs compaction/retention through the backend scheduler and worker.
+# Both must carry the same policy: local sensitive telemetry is deleted after
+# 30 days; Cribl owns any customer-approved longer retention.
+backend_scheduler:
+  provider:
+    compaction:
+      compaction:
+        block_retention: 720h
+        compacted_block_retention: 1h
+        compaction_window: 1h
+
+backend_worker:
+  compaction:
+    block_retention: 720h
+    compacted_block_retention: 1h
+    compaction_window: 1h
+
+overrides:
+  defaults:
+    ingestion:
+      rate_strategy: local
+      rate_limit_bytes: 10485760
+      burst_size_bytes: 16777216
+      max_traces_per_user: 5000
+      max_attribute_bytes: 8388608
+    global:
+      # Bound a malicious or malformed trace independently of collector queues.
+      max_bytes_per_trace: 16777216
+    read:
+      max_bytes_per_tag_values_query: 1048576
+      max_search_duration: 720h
+
+usage_report:
+  reporting_enabled: false

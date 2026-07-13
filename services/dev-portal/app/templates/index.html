@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Your API keys — dev-portal{% endblock %}
+{% block content %}
+<h1>Your gateway API keys</h1>
+<p class="muted">Generate a LiteLLM virtual key scoped to your identity ({{ user.email }}). Keys are shown once in full — copy them immediately.</p>
+
+{% if new_key %}
+<div class="card" data-one-time-secret style="border-color: var(--success);">
+  <h3>New key created</h3>
+  <p class="muted">This POST response is the only time the full key will be shown. Copy the key and any needed snippets now; later pages use a placeholder.</p>
+  <div class="key-box">
+    <code id="new-key-value" data-sensitive-value>{{ new_key }}</code>
+    <button type="button" data-copy-target="new-key-value">Copy</button>
+  </div>
+  <h3>One-time tool snippets</h3>
+  {% for tool in new_tools %}
+  <div style="position: relative;">
+    <p class="muted"><strong>{{ tool.name }}</strong> — {{ tool.description }}</p>
+    <pre id="new-snippet-{{ tool.id }}" data-sensitive-value>{{ tool.snippet }}</pre>
+    <button type="button" data-copy-target="new-snippet-{{ tool.id }}">Copy</button>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h3>Generate a new key</h3>
+  <p class="muted">Each user may have at most one active key per project. Deactivate the current project key before replacing it.</p>
+  {% if project_ids %}
+  <form method="post" action="/keys">
+    {% if project_ids|length > 1 %}
+    <label for="project-id">Project</label>
+    <select id="project-id" name="project_id" required>
+      {% for project_id in project_ids %}
+      <option value="{{ project_id }}"{% if selected_project == project_id %} selected{% endif %}>{{ project_id }}</option>
+      {% endfor %}
+    </select>
+    {% else %}
+    <p>Project: <code>{{ project_ids[0] }}</code></p>
+    <input type="hidden" name="project_id" value="{{ project_ids[0] }}">
+    {% endif %}
+    <label for="alias">Key alias (helps you tell keys apart later)</label>
+    <input type="text" id="alias" name="alias" maxlength="128" placeholder="e.g. laptop-claude-code" required>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div style="margin-top: 14px;"><button type="submit">Generate key</button></div>
+  </form>
+  {% else %}
+  <p class="muted">Key generation is unavailable until an administrator assigns your directory account to a managed developer project.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>Existing keys</h3>
+  {% if list_error %}
+  <div class="flash error">{{ list_error }}</div>
+  {% endif %}
+  {% if keys %}
+  <table>
+    <thead><tr><th>Project</th><th>Alias</th><th>Identifier</th><th>Status</th><th>Created</th><th></th></tr></thead>
+    <tbody>
+      {% for k in keys %}
+      <tr>
+        <td><code>{{ k.portal_project_id }}</code></td>
+        <td>{{ k.key_alias or k.alias or "(no alias)" }}</td>
+        <td><code>{{ (k.token or k.key_name or "")[:16] }}&hellip;</code></td>
+        <td><span class="badge">{{ "active" if k.portal_active else "inactive" }}</span></td>
+        <td class="muted">{{ k.created_at or k.created_via or "" }}</td>
+        <td>
+          {% if k.portal_active %}
+          <form class="inline" method="post" action="/keys/deactivate" data-confirm="Deactivate this key? It will stop working immediately.">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="token" value="{{ k.token or k.key_name or '' }}">
+            <input type="hidden" name="project_id" value="{{ k.portal_project_id }}">
+            <button type="submit" class="danger">Deactivate</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No keys yet. Generate one above to get started.</p>
+  {% endif %}
+</div>
+
+<p><a href="/snippets">View placeholder tool config snippets &rarr;</a></p>
+{% endblock %}

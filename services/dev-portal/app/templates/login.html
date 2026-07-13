@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Sign in — {{ 'admin-portal' if admin_surface else 'dev-portal' }}{% endblock %}
+{% block content %}
+<div class="card" style="max-width: 420px; margin: 60px auto; text-align: center;">
+  <h1>AI Gateway {{ 'admin-portal' if admin_surface else 'dev-portal' }}</h1>
+  {% if admin_surface %}
+  <p class="muted">Sign in with an AI Gateway administrator account to manage Keycloak project groups, directory membership, and provider rotation.</p>
+  {% else %}
+  <p class="muted">Sign in with your organization account to generate gateway API keys and get tool config snippets.</p>
+  {% endif %}
+  <p><a class="btn" href="/login/start">Sign in with Keycloak</a></p>
+</div>
+{% endblock %}

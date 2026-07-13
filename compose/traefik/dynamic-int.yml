@@ -1,0 +1,80 @@
+# traefik-int dynamic config — internal vhosts (eth2).
+http:
+  routers:
+    chat:
+      rule: 'Host(`chat.{{ env "DOMAIN" }}`)'
+      entryPoints: [websecure]
+      service: open-webui
+      tls: {}
+    # api.$DOMAIN — explicit allow-list of LiteLLM's INFERENCE surface only.
+    # The management API (/key, /user, /team, /model, /config, /global, ...)
+    # and the Admin UI (/ui, /sso, /login) must never be reachable on the
+    # internal edge: the admin path is admin.$DOMAIN on traefik-adm, behind
+    # oauth2-proxy + the aigw-admins role. Anything not matched here falls
+    # through to api-deny below.
+    api:
+      rule: 'Host(`api.{{ env "DOMAIN" }}`) && (PathPrefix(`/v1/`) || Path(`/v1`) || PathPrefix(`/chat/completions`) || PathPrefix(`/completions`) || PathPrefix(`/embeddings`) || PathPrefix(`/models`) || Path(`/health/liveliness`) || Path(`/health/readiness`))'
+      priority: 100
+      entryPoints: [websecure]
+      service: litellm
+      tls: {}
+    # Catch-all deny for the api host. deny-all never matches a real client,
+    # so every non-allow-listed path gets 403 before reaching litellm.
+    api-deny:
+      rule: 'Host(`api.{{ env "DOMAIN" }}`)'
+      priority: 1
+      entryPoints: [websecure]
+      middlewares: [deny-all]
+      service: litellm   # unreachable — deny-all rejects first
+      tls: {}
+    auth:
+      # Internal users need the aigw realm and Keycloak's static theme assets,
+      # not the master realm or /admin console/API. Keycloak administration is
+      # routed only on traefik-adm (VPN/ADM NIC).
+      rule: 'Host(`auth.{{ env "DOMAIN" }}`) && (Path(`/realms/aigw`) || PathPrefix(`/realms/aigw/`) || PathPrefix(`/resources/`))'
+      priority: 100
+      entryPoints: [websecure]
+      service: keycloak
+      tls: {}
+    auth-deny:
+      rule: 'Host(`auth.{{ env "DOMAIN" }}`)'
+      priority: 1
+      entryPoints: [websecure]
+      middlewares: [deny-all]
+      service: keycloak
+      tls: {}
+    portal:
+      rule: 'Host(`portal.{{ env "DOMAIN" }}`)'
+      entryPoints: [websecure]
+      service: dev-portal
+      tls: {}
+
+  middlewares:
+    # 403-everything middleware: an IP allow-list no client can satisfy.
+    deny-all:
+      ipAllowList:
+        sourceRange: ["127.0.0.1/32"]
+
+  services:
+    open-webui:
+      loadBalancer:
+        servers: [{ url: "http://open-webui:8080" }]
+    litellm:
+      loadBalancer:
+        servers: [{ url: "http://litellm:4000" }]
+    keycloak:
+      loadBalancer:
+        servers: [{ url: "http://keycloak:8080" }]
+    dev-portal:
+      loadBalancer:
+        servers: [{ url: "http://dev-portal:8080" }]
+
+tls:
+  certificates:
+    - certFile: /certs/int.crt
+      keyFile: /certs/int.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/int.crt
+        keyFile: /certs/int.key

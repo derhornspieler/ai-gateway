@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Tool config snippets — dev-portal{% endblock %}
+{% block content %}
+<h1>Coding tool config snippets</h1>
+<p class="muted">Gateway base URL: <code>{{ api_base }}</code></p>
+{% if using_placeholder %}
+<div class="flash info">For security, later pages never retain or redisplay a generated key. These snippets use <code>YOUR_KEY</code>; replace it locally with the key you copied from its one-time creation response.</div>
+{% endif %}
+
+{% for tool in tools %}
+<div class="card">
+  <h3>{{ tool.name }}</h3>
+  <p class="muted">{{ tool.description }}</p>
+  <div style="position: relative;">
+    <pre id="snippet-{{ tool.id }}">{{ tool.snippet }}</pre>
+    <button type="button" data-copy-target="snippet-{{ tool.id }}">Copy</button>
+  </div>
+  {% if tool.note %}
+  <p class="muted"><strong>Note:</strong> {{ tool.note }}</p>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

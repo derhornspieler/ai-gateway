@@ -1,0 +1,25 @@
+# secrets & generated material — never commit
+compose/.env
+compose/secrets/
+compose/certs/
+**/vault-init.json
+*.key
+!**/templates/*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# workstation metadata
+.DS_Store
+
+# ansible
+*.retry
+.aigw-vault-pass
+ansible/inventory/group_vars/gateway/vault.yml.predeploy-*

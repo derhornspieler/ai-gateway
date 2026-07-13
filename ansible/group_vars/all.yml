@@ -1,0 +1,260 @@
+---
+# ── Host interfaces / zones ─────────────────────────────────────────────
+# The generic Rocky 9 playbook never guesses or changes NIC addressing.
+# Supply every value in an environment-specific inventory/host_vars file, as
+# --extra-vars, or through the AIGW_* controller environment shown below.
+# Empty lookups are deliberate: site.yml rejects them before the first role
+# can install packages, write firewall state, or add policy routes.
+deployment_profile: "{{ lookup('ansible.builtin.env', 'AIGW_DEPLOYMENT_PROFILE') | default('generic-rocky9', true) }}"
+nic_egress: "{{ lookup('ansible.builtin.env', 'AIGW_NIC_EGRESS') }}"
+nic_adm: "{{ lookup('ansible.builtin.env', 'AIGW_NIC_ADM') }}"
+nic_internal: "{{ lookup('ansible.builtin.env', 'AIGW_NIC_INTERNAL') }}"
+eth0_ip: "{{ lookup('ansible.builtin.env', 'AIGW_EGRESS_IP') }}"
+eth0_gateway: "{{ lookup('ansible.builtin.env', 'AIGW_EGRESS_GATEWAY') }}"
+eth1_ip: "{{ lookup('ansible.builtin.env', 'AIGW_ADM_IP') }}"
+eth1_gateway: "{{ lookup('ansible.builtin.env', 'AIGW_ADM_GATEWAY') }}"
+eth2_ip: "{{ lookup('ansible.builtin.env', 'AIGW_INTERNAL_IP') }}"
+eth2_gateway: "{{ lookup('ansible.builtin.env', 'AIGW_INTERNAL_GATEWAY') }}"
+vpn_client_cidr: "{{ lookup('ansible.builtin.env', 'AIGW_VPN_CLIENT_CIDR') }}"
+internal_cidr: "{{ lookup('ansible.builtin.env', 'AIGW_INTERNAL_CIDR') }}"
+# A real, non-loopback resolver address. Compose passes it as an explicit DNS
+# override so Docker 29 forwards queries from the container namespace where
+# DOCKER-USER can enforce them; inherited host resolvers are dialed by dockerd
+# from the host namespace and bypass FORWARD entirely.
+container_dns_server: "{{ lookup('ansible.builtin.env', 'AIGW_CONTAINER_DNS_SERVER') }}"
+
+# Observability export target. Plaintext is permitted only for the in-stack
+# development mock; docker_stack asserts that any real target uses validated
+# TLS. A production overlay sets endpoint/server name/CA and false here.
+cribl_otlp_endpoint: "cribl-mock:4317"
+cribl_otlp_insecure: true
+cribl_otlp_ca_file: "/etc/ssl/certs/aigw-ca.pem"
+cribl_otlp_server_name: "cribl-mock"
+
+# ── Policy routing ──────────────────────────────────────────────────────
+pbr_tables:
+  # Dedicated priorities avoid colliding with the low priorities commonly
+  # installed by VPN clients and NetworkManager. site.yml rejects table
+  # ID/name collisions before this project changes rt_tables.
+  - { name: adm,      id: 101, priority: 10101, dev: "{{ nic_adm }}",      gw: "{{ eth1_gateway }}", src: "{{ eth1_ip }}" }
+  - { name: internal, id: 102, priority: 10102, dev: "{{ nic_internal }}", gw: "{{ eth2_gateway }}", src: "{{ eth2_ip }}" }
+
+# ── Docker networks (fixed subnets; referenced by DOCKER-USER rules) ───
+docker_networks:
+  # Explicit <=15-character bridge names are a firewall ABI; Linux IFNAMSIZ
+  # makes deriving them from long Compose network names unsafe.
+  - { name: net-egress,        bridge: br-egress, subnet: 172.28.0.0/24,  internal: false }
+  - { name: net-adm,           bridge: br-adm,    subnet: 172.28.1.0/24,  internal: false }
+  - { name: net-internal,      bridge: br-internal, subnet: 172.28.2.0/24, internal: false }
+  - { name: net-chat,          bridge: br-chat,   subnet: 172.28.3.0/24,  internal: true }
+  - { name: net-portal,        bridge: br-portal, subnet: 172.28.4.0/24,  internal: true }
+  - { name: net-admin-app,     bridge: br-admin,  subnet: 172.28.5.0/24,  internal: true }
+  - { name: net-grafana,       bridge: br-graf,   subnet: 172.28.6.0/24,  internal: true }
+  - { name: net-vendor,        bridge: br-vendor, subnet: 172.28.7.0/24,  internal: true }
+  - { name: net-vault,         bridge: br-vault,  subnet: 172.28.8.0/24,  internal: true }
+  - { name: net-db-litellm,    bridge: br-db-llm, subnet: 172.28.9.0/24,  internal: true }
+  - { name: net-db-keycloak,   bridge: br-db-kc,  subnet: 172.28.10.0/24, internal: true }
+  - { name: net-db-rotator,    bridge: br-db-rot, subnet: 172.28.11.0/24, internal: true }
+  - { name: net-cache,         bridge: br-cache,  subnet: 172.28.12.0/24, internal: true }
+  - { name: net-telemetry,     bridge: br-otel,   subnet: 172.28.13.0/24, internal: true }
+  - { name: net-metrics,       bridge: br-metrics, subnet: 172.28.14.0/24, internal: true }
+  - { name: net-observability, bridge: br-obs,    subnet: 172.28.15.0/24, internal: true }
+  - { name: net-traces,        bridge: br-traces, subnet: 172.28.16.0/24, internal: true }
+  - { name: net-identity,      bridge: br-ident,  subnet: 172.28.17.0/24, internal: true }
+  # Published ports do not traverse a Docker `internal: true` bridge. This
+  # dedicated ordinary bridge has no application peers; DOCKER-USER and the
+  # independent nft guard still deny every container-originated egress flow.
+  # It is used only by the explicit Parallels lab overlay.
+  - { name: net-lab-dns,       bridge: br-lab-dns, subnet: 172.28.18.0/24, internal: false }
+  # Docker 29 silently omits published-port DNAT when every attached bridge is
+  # `internal: true`. This ordinary no-peer bridge exists only for traefik-int;
+  # DOCKER-USER and the native nft guard deny every bridge-originated egress.
+  - { name: net-int-edge,      bridge: br-int-edge, subnet: 172.28.19.0/24, internal: false }
+
+net_egress_subnet: 172.28.0.0/24
+
+# Fixed workload addresses are part of the host-firewall ABI. Compose renders
+# these exact addresses; DOCKER-USER must never authorize an entire bridge
+# subnet to use a physical NIC.
+envoy_egress_ip: 172.28.0.2
+alloy_internal_ip: 172.28.2.2
+
+# The in-stack Cribl mock stays on the Docker bridge and needs no physical-NIC
+# exception. A customer overlay that exports to a real Cribl worker must opt in
+# and supply its exact destination /32 and port. The firewall
+# then permits only alloy_internal_ip -> that destination on nic_internal.
+cribl_external_export_enabled: false
+cribl_otlp_allowed_cidr: ""
+cribl_otlp_allowed_port: 4317
+
+# Fixed edge addresses are rendered into both Compose's network attachments
+# and every downstream proxy-trust allowlist. A single source of truth avoids
+# the HTTPS callback/trusted-proxy values drifting apart.
+traefik_int_chat_ip: 172.28.3.2
+traefik_int_portal_ip: 172.28.4.2
+traefik_adm_admin_ip: 172.28.5.2
+traefik_adm_grafana_ip: 172.28.6.2
+alloy_telemetry_ip: 172.28.13.2
+alloy_observability_ip: 172.28.15.2
+prometheus_observability_ip: 172.28.15.3
+tempo_ingest_ip: 172.28.16.2
+lab_dns_ip: 172.28.18.2
+
+# ── firewalld ───────────────────────────────────────────────────────────
+# Zone names are prefixed (aigw-*) deliberately: firewalld ships built-in
+# zones named "internal" (and "external", "public", "dmz", "home", "work",
+# "trusted", "block", "drop") — reusing one of those names doesn't create a
+# blank zone, it activates the built-in template, which has its own default
+# services pre-enabled (the "internal" built-in ships with ssh, cockpit,
+# mdns, samba-client, dhcpv6-client allowed). That silently punched a wider
+# hole than intended. aigw-egress/aigw-adm/aigw-internal can't collide with
+# any current or future firewalld built-in. Also aligned with the
+# nic_egress/nic_adm/nic_internal and net-egress/net-adm/net-internal naming
+# already used elsewhere in this repo.
+firewalld_zones:
+  - zone: aigw-egress
+    interfaces: ["{{ nic_egress }}"]
+    target: DROP
+    rich_rules: []
+  - zone: aigw-adm
+    interfaces: ["{{ nic_adm }}"]
+    target: "%%REJECT%%"
+    rich_rules:
+      - 'rule family="ipv4" source address="{{ vpn_client_cidr }}" port port="22" protocol="tcp" accept'
+      - 'rule family="ipv4" source address="{{ vpn_client_cidr }}" port port="443" protocol="tcp" accept'
+  - zone: aigw-internal
+    interfaces: ["{{ nic_internal }}"]
+    target: "%%REJECT%%"
+    rich_rules:
+      - 'rule family="ipv4" source address="{{ internal_cidr }}" port port="443" protocol="tcp" accept'
+
+# ── Feature flags (set false for a reduced local test VM) ──────────────
+manage_networking: true      # additive runtime PBR only; never NIC addressing
+manage_firewalld: true       # zones + DOCKER-USER
+lab_dns_enabled: "{{ deployment_profile == 'parallels-rocky9-lab' }}"
+
+# ── Stack ───────────────────────────────────────────────────────────────
+stack_dir: /opt/ai-gateway
+docker_data_root: /var/lib/docker
+# Optional pre-staged Docker image archive. Generic/customer deployments are
+# disabled and pathless by default. An environment-specific inventory may opt
+# in with a remote target path and a separately reviewed exact SHA-256. The
+# checksum marker lives with Docker state so resetting the image store also
+# removes the skip decision.
+offline_image_seed_enabled: false
+offline_image_seed_remote_path: ""
+offline_image_seed_sha256: ""
+offline_image_seed_manifest_remote_path: ""
+offline_image_seed_manifest_sha256: ""
+offline_image_seed_marker_dir: "{{ docker_data_root }}/.aigw-image-seeds"
+# Full prompts, Vault state, database pages, rendered credentials, and the
+# edge private key all land under these two paths. Generic/customer deploys
+# fail before mutation unless both resolve through a dm-crypt/LUKS ancestor.
+# The explicit Parallels profile opts out because it is disposable local test.
+require_encrypted_state: true
+require_preupgrade_backup: true
+encrypted_state_paths:
+  - "{{ docker_data_root }}"
+  - "{{ stack_dir }}"
+compose_project_name: ai-gateway
+aigw_domain: aigw.example.internal
+samba_lab_enabled: "{{ deployment_profile == 'parallels-rocky9-lab' }}"
+retain_bootstrap_admin_user: false
+samba_lab_seed_users:
+  - lab-admin
+  - lab-developer
+  - lab-user
+
+# ── Keycloak seeded test users (default OFF — no credentials in git) ────
+# When true, the aigw realm template seeds testadmin/testuser. The passwords
+# have NO defaults on purpose: define aigw_test_admin_password and
+# aigw_test_user_password in an Ansible-Vault/SOPS overlay or templating
+# fails. Leave false for anything beyond a disposable test VM.
+aigw_seed_test_users: false
+# aigw_test_admin_password: <vault overlay only>
+# aigw_test_user_password: <vault overlay only>
+
+# ── Stack secrets ───────────────────────────────────────────────────────
+# NO secret defaults ship in git. Every credential below is intentionally
+# UNDEFINED here and MUST be supplied by an Ansible-Vault/SOPS-encrypted
+# overlay, e.g.:
+#   ansible-vault create inventory/group_vars/gateway/vault.yml
+# env.j2 and the Keycloak realm templates wrap each of these in
+# `| mandatory(...)`, so a deploy WITHOUT the overlay ABORTS with a clear
+# message instead of silently coming up with a known-weak, git-published
+# credential. This matches the fail-closed behavior of the dev-portal /
+# key-rotator services (which refuse to start on placeholder secrets).
+#
+# ── CHARSET CONSTRAINT (read before generating secrets) ─────────────────
+# docker_stack validates every stack secret before rendering: 24/32+ chars as
+# appropriate and only [A-Za-z0-9_-]. This avoids Compose `$` interpolation,
+# newline/comment injection, and URI delimiter ambiguity in DATABASE_URL.
+# oauth2_proxy_cookie_secret is stricter: exactly 32 alphanumeric bytes.
+#
+# ── Overlay MUST define ALL of these ────────────────────────────────────
+#   pg_super_password         pg_litellm_password        pg_keycloak_password
+#   pg_rotator_password       kc_admin_password          litellm_master_key
+#   litellm_salt_key          redis_password             webui_litellm_key
+#   webui_secret_key          webui_oidc_client_secret
+#   portal_oidc_client_secret admin_portal_oidc_client_secret
+#   oauth2_proxy_client_secret grafana_oidc_client_secret
+#   oauth2_proxy_cookie_secret portal_session_secret admin_portal_session_secret
+#   rotator_internal_token portal_identity_token grafana_admin_password
+#   kc_bootstrap_admin_client_secret
+# The parallels-rocky9-lab profile additionally requires:
+#   samba_ad_admin_password     samba_ad_bind_password
+#   samba_user_lab_admin_password samba_user_lab_developer_password
+#   samba_user_lab_user_password
+#
+# Left undefined on purpose (uncomment ONLY in a vault overlay, never here):
+# pg_super_password:          <vault overlay only>
+# pg_litellm_password:        <vault overlay only>
+# pg_keycloak_password:       <vault overlay only>
+# pg_rotator_password:        <vault overlay only>
+# kc_admin_password:          <vault overlay only>
+# litellm_master_key:         <vault overlay only>
+# litellm_salt_key:           <vault overlay only>
+# redis_password:             <vault overlay only>
+# webui_litellm_key:          <vault overlay only>  # High-entropy candidate for
+#     the SCOPED Open WebUI LiteLLM virtual key — NEVER the master key. Ansible
+#     reconciles this exact value only after LiteLLM is ready and fails closed
+#     on alias/hash collisions; operators do not mint it manually.
+# webui_secret_key:           <vault overlay only>  # STABLE 32+ char session/
+#     application signing secret. Never regenerate during a normal converge or
+#     container replacement because doing so invalidates every Open WebUI session.
+# webui_oidc_client_secret:   <vault overlay only>  # alphanumeric only
+# portal_oidc_client_secret:  <vault overlay only>  # alphanumeric only
+# admin_portal_oidc_client_secret: <vault overlay only>  # alphanumeric only
+# oauth2_proxy_client_secret: <vault overlay only>  # alphanumeric only
+# grafana_oidc_client_secret: <vault overlay only>  # alphanumeric only
+# oauth2_proxy_cookie_secret: <vault overlay only>  # STABLE 32-char alphanumeric
+#     (16/24/32 bytes for AES). Was regenerated every ansible run via a
+#     /dev/null password lookup, which invalidated every admin session on each
+#     redeploy — it is now a stable overlay var. Alphanumeric only.
+# portal_session_secret:      <vault overlay only>
+# admin_portal_session_secret: <vault overlay only>
+# rotator_internal_token:     <vault overlay only>
+# portal_identity_token:      <vault overlay only; distinct from rotator token>
+# grafana_admin_password:     <vault overlay only>
+# kc_bootstrap_admin_client_secret: <vault overlay only>
+# samba_ad_admin_password:    <lab vault overlay only>
+# samba_ad_bind_password:     <lab vault overlay only>
+# samba_user_lab_admin_password: <lab vault overlay only>
+# samba_user_lab_developer_password: <lab vault overlay only>
+# samba_user_lab_user_password: <lab vault overlay only>
+
+# Not an overlay secret: starts empty, written in place on the VM by
+# scripts/vault-bootstrap.sh after Vault init/unseal.
+rotator_vault_token: ""
+
+# ── Anthropic WIF broker client authentication ──────────────────────────
+# The imported broker is deliberately DISABLED with client-jwt selected and no
+# key material. Post-start, the portal asks the rotator to have Keycloak mint
+# the keypair, stores the private key only in Vault, proves authentication, and
+# then enables the client. The static-client-secret escape hatch stays off.
+
+# Vault path where the key-rotator reads its private_key_jwt signing key
+# (non-secret path string; safe to keep here).
+kc_client_assertion_key_vault_path: "ai-gateway/anthropic-wif-client-key"
+identity_controller_key_vault_path: "ai-gateway/keycloak/identity-controller-key"
+identity_state_vault_path: "ai-gateway/keycloak/identity-state"
