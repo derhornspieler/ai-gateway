@@ -1,15 +1,17 @@
 # AI Gateway — Current Architecture and Trust Boundaries
 
 This document describes the implementation currently present in `compose/`,
-`ansible/`, and `services/`. It is the architecture anchor the other operator
+`ansible/`, and `services/`. The companion diagram set is in
+[architecture-diagrams.md](architecture-diagrams.md); the dedicated security
+references are [network-security.md](network-security.md),
+[os-security.md](os-security.md), and [docker-security.md](docker-security.md). It is the architecture anchor the other operator
 guides reference: [deploy-guide.md](deploy-guide.md),
 [operations.md](operations.md),
 [identity-operations.md](identity-operations.md),
 [observability-operations.md](observability-operations.md),
 [litellm-scaling.md](litellm-scaling.md),
 [high-availability.md](high-availability.md),
-[anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md),
-[lab-dr-rehearsal.md](lab-dr-rehearsal.md), and
+[anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md), and
 [test-runbook.md](test-runbook.md). Live release and gate status lives in
 [project-status.md](project-status.md). This is a customer prototype, not a
 turnkey production appliance; historical design notes are superseded by the
@@ -52,7 +54,7 @@ Ansible orchestrates the host through the ordered roles in `ansible/site.yml`:
 `host_preflight`, `selinux_baseline`, `network_routing`, `firewalld_zones`,
 `os_baseline`, `docker_networks`, `docker_stack`, and `verify`. `ansible/deploy-stack-only.yml` performs an
 app-only rollout and refuses to run against a stale firewall or network ABI.
-The inventory ships a generic `inventory/hosts.yml` and an explicit Parallels
+The inventory ships a generic `inventory/hosts.yml` and an explicit lab
 `inventory/lab.yml`. See [deploy-guide.md](deploy-guide.md).
 
 ## Implemented component inventory
@@ -100,7 +102,7 @@ but run as different ASGI applications in different containers, Docker planes,
 OIDC clients, session secrets, and hostnames. `key-rotator` is the rotation
 engine and Keycloak identity controller built from `services/key-rotator`.
 
-The explicit Parallels lab overlay adds `samba-ad` and `lab-dns` under the
+The explicit lab overlay adds `samba-ad` and `lab-dns` under the
 `lab-ad` profile, bringing the running set to 25 long-running services plus
 `volume-init`. The overlay defines `samba-ad` on `net-identity` and joins
 `keycloak` to `net-identity` so Keycloak can perform LDAPS user federation
@@ -346,7 +348,7 @@ auth. Keycloak administration is reached through the same `auth.<domain>`
 hostname on the ADM leg, which is source-restricted to the VPN CIDR and carries
 the full admin console and master-realm login; the internal leg's
 `auth.<domain>` router allow-lists only the `aigw` realm and static
-`/resources` and denies everything else. The Parallels lab retains one vaulted,
+`/resources` and denies everything else. The lab retains one vaulted,
 ADM-only local recovery operator; generic profiles delete temporary bootstrap
 principals.
 
@@ -361,7 +363,7 @@ There is no flat `net-backend`. The `docker_networks` role pre-creates all 20
 bridges (`172.28.0.0/24` through `172.28.19.0/24`) as `external: true` with
 stable, sub-16-character Linux bridge names and IPv6 disabled; each container
 receives the `.128/25` half of its subnet. The base Compose project attaches to
-18 of them, and the Parallels lab overlay adds `net-identity` and `net-lab-dns`.
+18 of them, and the lab overlay adds `net-identity` and `net-lab-dns`.
 Five bridges are ordinary `internal: false` — the three physical planes
 (`net-egress`, `net-adm`, `net-internal`) plus the two no-peer port-publication
 bridges (`net-int-edge`, `net-lab-dns`) — while every application/data plane is
@@ -545,7 +547,7 @@ backups.
 The repository does not create or unlock LUKS. Generic/customer playbooks fail
 before mutation unless both the configured Docker data root and `/opt/ai-gateway`
 resolve through a block device with a `crypto_LUKS` ancestor; only the explicit
-disposable Parallels profile opts out. Prompt and completion content is
+disposable lab profile opts out. Prompt and completion content is
 explicitly captured as OpenTelemetry span attributes and retained in Tempo for
 30 days, and is also sent to Cribl when configured. Before export, Alloy
 promotes only validated, server-authenticated LiteLLM metadata into canonical
@@ -614,15 +616,16 @@ Important residuals before production:
   callback, or domain changes require an explicit Keycloak update;
 - Open WebUI's bounded workload key provides service/project attribution only;
   trusted per-human browser-chat attribution is not implemented;
-- this is a single VM with no application or telemetry replication. The
-  service-by-service minimum topology, rolling rules, and customer blockers for a
-  future production profile are in [high-availability.md](high-availability.md);
-  duplicate containers on this host are not host redundancy.
+- this is a single VM with no application or telemetry replication. Capacity
+  is added by vertically scaling the VM; HA and horizontal scaling require a
+  separate Kubernetes design (see
+  [high-availability.md](high-availability.md)). Duplicate containers on this
+  host are not host redundancy.
 
 Live converge, recovery-gate, and destructive-rehearsal status — including the
 Anthropic WIF exchange that remains dependent on absent customer external
 configuration — is recorded in [project-status.md](project-status.md) and
-[lab-dr-rehearsal.md](lab-dr-rehearsal.md), not here.
+[lab-dr-rehearsal.md](archive/lab-dr-rehearsal.md), not here.
 
 ## Decision history
 

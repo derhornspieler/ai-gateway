@@ -292,5 +292,5 @@ restart, and that same pending source converge must enable Docker SELinux
 integration, confine the ordinary graph under MCS labels, retain Alloy as one of
 only two bounded disabled-label readers, and prove its bind and ACL access with no
 converge-window AVC. These remain source assertions until the gate receipts record
-them on the replacement VM; the register is [lab-dr-rehearsal.md](lab-dr-rehearsal.md)
+them on the replacement VM; the register is [lab-dr-rehearsal.md](archive/lab-dr-rehearsal.md)
 and the living status is [project-status.md](project-status.md).

@@ -1,8 +1,12 @@
 # Deployment Guide
 
+For the condensed, execution-order procedure and the exact engineer-supplied
+values, start with the [deployment runbook](deploy-runbook.md); this guide is
+the full reference behind it.
+
 This guide covers two distinct targets: a generic customer Rocky Linux 9 host
 with three existing, statically addressed interfaces, and the committed
-Parallels Rocky 9 lab profile used for local acceptance, including the
+Rocky Linux 9 lab profile used for local acceptance, including the
 disposable Samba AD overlay. For the trust-boundary architecture read
 [solution-map.md](solution-map.md); for recovery, upgrades, and troubleshooting
 read [operations.md](operations.md); for the current release posture read
@@ -18,7 +22,7 @@ One converge brings up a single Compose project. The base stack is 24 services:
 one `volume-init` one-shot plus 23 long-running services, spread across 18 of
 the 20 pre-created Docker bridges, fronted by two Traefik instances, gated by
 four oauth2-proxy OIDC reverse proxies, and served through two portals. The
-Parallels lab overlay adds a Samba AD directory and an authoritative lab DNS
+lab overlay adds a Samba AD directory and an authoritative lab DNS
 service, taking the graph to 25 long-running services plus `volume-init` and
 using all 20 bridges.
 
@@ -60,9 +64,9 @@ waiver earned by the successful durable-state comparison or image recovery.
 
 The [operations guide](operations.md) treats these as blockers, not completed
 features, and [project-status.md](project-status.md) tracks the open gates. The
-current Compose profiles are not HA; a future multi-host profile requires the
-external infrastructure choices and service-specific design in the
-[HA and rolling-update matrix](high-availability.md).
+current Compose profiles are not HA: capacity is added by vertically scaling
+the VM, and true HA/horizontal scaling means re-platforming to Kubernetes. See
+the [scaling and HA posture](high-availability.md).
 
 ## Prerequisites
 
@@ -105,7 +109,7 @@ normally with substantially more memory and encrypted storage.
 For a generic/customer profile, `/var/lib/docker` (or the configured
 `docker_data_root`) and `/opt/ai-gateway` must both resolve through a block
 device with a `crypto_LUKS` ancestor before Ansible runs. The explicit
-disposable Parallels inventory is the only committed opt-out.
+disposable lab inventory is the only committed opt-out.
 
 The baseline role installs Docker CE, the Compose plugin, firewalld/nftables
 dependencies, OpenSSL, `container-selinux`, SELinux policy tooling, the audit
@@ -128,7 +132,7 @@ existing SSH session available until the postflight passes.
 
 Keep environment topology in a customer inventory/host-vars file or a separate
 `--extra-vars` file. Keep credentials only in an Ansible-Vault/SOPS-encrypted
-overlay. Do not turn the generic defaults or the Parallels profile into a
+overlay. Do not turn the generic defaults or the lab profile into a
 customer template.
 
 ### Connection and topology
@@ -190,7 +194,7 @@ values in the example are intentionally blank so Compose's `${VAR:?}` guards
 fail closed until each is populated.
 
 `DEPLOYMENT_PROFILE` selects the profile (`generic-rocky9` by default,
-`parallels-rocky9-lab` for the lab; `aigw-compose.sh` and `vault-bootstrap.sh`
+`rocky9-lab` for the lab; `aigw-compose.sh` and `vault-bootstrap.sh`
 key off this exact value). `DOMAIN` is the base domain every router host is
 built from. `ETH1_IP` is the ADM leg that `traefik-adm` binds `:443` on, and
 `ETH2_IP` is the internal leg that `traefik-int` binds `:443` on — nothing
@@ -359,7 +363,7 @@ provide a customer-rooted chain and a renewal procedure before access is opened.
 Traefik currently consumes certificate files; Vault ACME is a design option, not
 implemented configuration.
 
-The Parallels overlay supplies this split view through an authoritative,
+The lab overlay supplies this split view through an authoritative,
 non-recursive `aigw.internal` CoreDNS service. It publishes TCP and UDP 53 on
 the exact ADM and internal lab addresses, not on the egress address, and has no
 forwarder. Its dedicated ordinary bridge has no peers; it exists because Docker
@@ -476,7 +480,7 @@ Document that temporary grant and remove it only after two durable customer
 administrator identities have been proved. See
 [identity operations](identity-operations.md) for the full procedure.
 
-## Explicit Parallels lab deployment
+## Explicit lab deployment
 
 The only committed lab topology is:
 
@@ -488,7 +492,7 @@ The only committed lab topology is:
 
 The lab resolver is `10.211.55.1`; approved sources are `10.8.10.0/24` and
 `10.20.0.0/24`. `site.yml` has an additional assertion that the named
-`parallels-rocky9-lab` profile matches those exact facts, and `lab.yml` sets the
+`rocky9-lab` profile matches those exact facts, and `lab.yml` sets the
 SSH target to `10.8.10.10` directly.
 
 The committed lab inventory also enables the reviewed secret-free external image
@@ -546,8 +550,8 @@ unset ANTHROPIC_API_KEY OPENAI_API_KEY
 This is a lab/test bootstrap: a single 1-of-1 unseal share, a local file
 backend, an internally generated test root, and a plaintext listener isolated on
 `net-vault`. The script refuses to run unless `DEPLOYMENT_PROFILE` is
-`parallels-rocky9-lab`, or `AIGW_ALLOW_INSECURE_VAULT_BOOTSTRAP` is set to the
-exact acknowledgement string for an explicitly disposable non-Parallels test VM.
+`rocky9-lab`, or `AIGW_ALLOW_INSECURE_VAULT_BOOTSTRAP` is set to the
+exact acknowledgement string for an explicitly disposable non-production test VM.
 It is not the customer Vault initialization path and is forbidden on the restore
 path. Immediately move its generated unseal key/root token into approved offline
 custody and remove the plaintext `secrets/vault-init.json` as the script
@@ -561,7 +565,7 @@ address (`auth.DOMAIN` resolved to the ADM leg) using the server bootstrap
 administrator. For a generic deployment, use the approved customer IdP or
 controlled Keycloak process to establish the required pre-existing `aigw` realm
 user with `aigw-admins`; the portal cannot create its own first administrator.
-Only the Parallels lab seeds a disposable Keycloak-local `testadmin`. Then
+Only the lab seeds a disposable Keycloak-local `testadmin`. Then
 follow [identity operations](identity-operations.md) to initialize the
 Vault-backed controller, configure lab Samba LDAPS federation where applicable,
 create authorization groups, hand off to durable administrators, and remove the

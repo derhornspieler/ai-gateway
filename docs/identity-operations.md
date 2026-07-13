@@ -2,7 +2,7 @@
 
 This guide keeps three ownership domains distinct, because blurring them is how
 directory operations go wrong. AD or LDAP owns usernames, passwords, account
-enablement, and password policy; the Parallels lab uses a disposable Samba AD
+enablement, and password policy; the lab uses a disposable Samba AD
 domain, while a customer deployment uses the customer's own directory through a
 separately reviewed integration. Keycloak (realm `aigw`) imports or federates
 those directory users, authenticates them, emits realm-role claims, and stores
@@ -21,7 +21,7 @@ receive a Keycloak administration credential or a private key. See
 ## Current deployment contract
 
 The base Compose stack runs both portals and the rotator identity controller.
-The Parallels profile additionally merges `compose/docker-compose.lab.yml` under
+The lab profile additionally merges `compose/docker-compose.lab.yml` under
 the explicit `lab-ad` Compose profile, which starts `samba-ad` (the lab domain
 controller) and `lab-dns`, attaches Samba and Keycloak to the isolated,
 internal `net-identity` bridge, publishes no Samba host ports, mounts the
@@ -145,8 +145,7 @@ needs the controls in [deploy-guide.md](deploy-guide.md) and
 Finally, an existing `aigw` realm user whose token already carries `aigw-admins`
 must be able to sign in to `admin-portal.<domain>`. The portal cannot create or
 authorize its own first administrator. A generic deployment must establish this
-user through a controlled Keycloak or customer-IdP process. Only the Parallels
-inventory seeds disposable Keycloak-local users for this first entry — and only
+user through a controlled Keycloak or customer-IdP process. Only the lab inventory seeds disposable Keycloak-local users for this first entry — and only
 when `aigw_seed_test_users` is explicitly enabled — because lab LDAP is not
 configured yet: `testadmin` (all three roles) is the first-entry administrator
 and `testuser` (developer and user roles) is a non-admin fixture. Both are
@@ -197,7 +196,7 @@ bootstrap service client and establishing durable controls:
 9. only after every prior proof succeeds, delete the temporary bootstrap
    principals. The broad temporary service client is always deleted; the
    password-backed temporary admin user is deleted too, unless
-   `RETAIN_BOOTSTRAP_ADMIN_USER` is set (Parallels lab only), in which case it is
+   `RETAIN_BOOTSTRAP_ADMIN_USER` is set (lab only), in which case it is
    converted into a marked ADM-console recovery operator. Customer profiles keep
    that flag false and rely on their own reviewed break-glass process.
 
@@ -254,7 +253,7 @@ partial state fails closed. A disposable lab reset must stop the merged project
 and remove `samba_ad_config`, `samba_ad_state`, and `samba_ad_public` together;
 removing only one volume produces an intentionally rejected inconsistent state.
 Never run that reset against a customer directory. See
-[lab-dr-rehearsal.md](lab-dr-rehearsal.md) for the destructive rebuild register.
+[lab-dr-rehearsal.md](archive/lab-dr-rehearsal.md) for the destructive rebuild register.
 
 ## Recovery
 
@@ -284,7 +283,7 @@ scripts/aigw-compose.sh up -d --no-deps --no-build keycloak
 
 `--no-deps` prevents the dependency graph from restarting the successful
 `volume-init` one-shot; this assumes Keycloak's Postgres dependency is already
-healthy. In the Parallels lab, add `-f docker-compose.yml -f
+healthy. In the lab, add `-f docker-compose.yml -f
 docker-compose.lab.yml --profile lab-ad` to each Compose command. Then
 reauthenticate in the admin portal and run **Initialize identity control**
 again; the bootstrap reuses and proves valid state, repairs mismatched keys
@@ -348,7 +347,7 @@ failures from a separate authorized ADM session; if every administrator is
 unavailable, use the stopped-Keycloak bootstrap recovery above rather than
 weakening the realm policy or exposing the admin API on the internal edge.
 
-The Parallels Samba domain independently locks an AD account after five failed
+The lab Samba domain independently locks an AD account after five failed
 passwords for 15 minutes and resets its bad-attempt count after 15 minutes. The
 entrypoint reconciles this policy on every restart and the health probe verifies
 it. Inspect or recover a lab account locally with no password in the process
@@ -396,7 +395,7 @@ The 2026-07-13 replacement-VM G6 identity lane passed the retained-realm,
 LDAP-provider, managed-group, federated-user, service-account, Samba-object,
 immutable GUID/SID, hostname-verified-LDAPS, live directory-login, portal-role,
 and corrected logout-redirect checks; its protected evidence is indexed in
-[the destructive rehearsal](lab-dr-rehearsal.md#g6-evidence-and-disposition).
+[the destructive rehearsal](archive/lab-dr-rehearsal.md#g6-evidence-and-disposition).
 Not every persistent-session count change is identity loss: in that rehearsal
 the backup held 9 rows in each of `offline_client_session` and
 `offline_user_session`, but authenticated inspection proved all 18 had
@@ -424,7 +423,7 @@ Portal-driven atomic bind-password rotation is not implemented.
 
 ## Bootstrap completion sequence
 
-After the first successful initialization in the Parallels lab, create an
+After the first successful initialization in the lab, create an
 administrator-capability group below `/aigw-managed`, assign the imported
 `lab-admin` user to it, sign out, and prove `lab-admin` can authenticate with the
 Samba-owned password and reach the expected admin functions. Only then remove

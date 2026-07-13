@@ -34,7 +34,7 @@ The service also exposes the authenticated identity-administration controller
 used by the admin portal. It bootstraps a least-privilege Keycloak controller,
 manages the `aigw-managed` group tree, assigns existing Keycloak/federated
 users to capability groups, invalidates affected sessions, and protects the
-last managed administrator. In the explicit Parallels lab profile it also
+last managed administrator. In the explicit lab profile it also
 configures the bounded Samba AD LDAP provider; generic deployments leave that
 lab integration disabled.
 

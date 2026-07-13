@@ -3,10 +3,10 @@
 The deployment can optionally load a pre-staged, secret-free Docker archive
 before any Compose validation or build needs an external image. This is a
 bootstrap aid for a host that cannot authenticate to one or more image
-registries — the committed Parallels lab is exactly that case, since the clean
+registries — the committed lab is exactly that case, since the clean
 VM has no DHI registry credential. It is not a substitute for normal image
 provenance review, and it never exports or accepts locally built
-`ai-gateway/*` outputs. For where this fits in a lab converge see the Parallels
+`ai-gateway/*` outputs. For where this fits in a lab converge see the lab-deployment
 section of the [deployment guide](deploy-guide.md); for image provenance overall
 see [solution-map.md](solution-map.md).
 
@@ -89,7 +89,7 @@ retired. Because the loader clears its environment and runs on a fixed system
 `PATH`, an ambient controller environment cannot influence it; see
 [operations.md](operations.md) for the surrounding recovery procedures.
 
-## Current Parallels rehearsal artifact
+## Current lab rehearsal artifact
 
 The 2026-07-13 rebuild uses this manifest-backed, secret-free seed from the
 recovery workstation, matching the hashes committed in

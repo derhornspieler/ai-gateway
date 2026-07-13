@@ -4,7 +4,7 @@ _As of 2026-07-13._
 
 This is the living implementation-status record for AI Gateway. For the
 authoritative, gate-by-gate destructive-recovery evidence, see the
-[Parallels lab rebuild and restore rehearsal register](lab-dr-rehearsal.md). For
+[lab rebuild and restore rehearsal register](archive/lab-dr-rehearsal.md). For
 architecture and trust boundaries, see the [solution map](solution-map.md).
 
 ## Maturity
@@ -20,7 +20,7 @@ accepted, highly available, or ready for access reopening.
 The repository contains an implemented base Compose stack of 24 services — one
 `volume-init` one-shot DHI volume initializer plus 23 long-running services —
 using 18 of the 20 segmented Docker bridges that Ansible pre-creates. The
-Parallels lab overlay adds two long-running services: Samba AD on the isolated
+lab overlay adds two long-running services: Samba AD on the isolated
 identity bridge and an authoritative, non-recursive CoreDNS service on a
 dedicated bridge. Samba publishes no AD port; lab DNS publishes TCP/UDP 53 only
 on the exact ADM and internal host addresses, never egress. Samba is lab-only
@@ -46,7 +46,7 @@ The current security-audit workspace has passed local Compose render, Ansible
 syntax/configuration, runtime-start, service-unit, ARM64 Samba/Keycloak, and
 disposable age-encrypted backup/restore tests.
 
-The most recent full three-NIC Parallels lab converge passed clean
+The most recent full three-NIC lab converge passed clean
 (`failed=0`), with all long-running services healthy and `volume-init` exited
 zero. Live checks proved the key-only, no-forwarding SSH policy and fresh sudo
 path, the full PostgreSQL privilege matrix, the stable Open WebUI signing
@@ -71,7 +71,7 @@ before Docker, the exact container/image/volume/network inventory survived,
 `volume-init` did not re-run, and Vault returned sealed by design and accepted
 exactly one stdin-only lab unseal.
 
-See the [rehearsal register](lab-dr-rehearsal.md) for exact per-gate figures.
+See the [rehearsal register](archive/lab-dr-rehearsal.md) for exact per-gate figures.
 
 ## Open items before production and access reopening
 
@@ -103,13 +103,13 @@ The following are explicitly **not yet closed**:
   [operations](operations.md) guides.
 - **First administrator provisioning.** A generic deployment requires one
   pre-existing `aigw` realm user mapped to `aigw-admins` through a controlled
-  Keycloak or customer-IdP procedure. Only the Parallels lab seeds disposable
+  Keycloak or customer-IdP procedure. Only the lab seeds disposable
   `testadmin`, which must be removed after the Samba `lab-admin` handoff is
   proved.
-- **High availability.** There is no HA today; see the
-  [high-availability matrix](high-availability.md) for the bounded future
-  `production-ha` profile and the customer infrastructure decisions that block
-  it.
+- **High availability.** There is no HA today, and HA is not pursued on
+  Docker Compose: the VM scales vertically, and horizontal scaling/HA would be
+  a separate Kubernetes design. See the
+  [scaling and HA posture](high-availability.md).
 
 These residuals are not waived by any local or recovery test. Rehearse stateful
 upgrades and restore, and run the full [acceptance test runbook](test-runbook.md)

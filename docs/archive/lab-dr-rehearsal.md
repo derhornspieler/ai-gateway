@@ -1,7 +1,7 @@
-# Parallels Lab Destructive Rebuild and Restore Rehearsal
+# Lab Destructive Rebuild and Restore Rehearsal
 
-This runbook recreates the disposable Rocky Linux 9 Parallels VM from vanilla
-media and restores the `parallels-rocky9-lab` AI Gateway state. It is a
+This runbook recreates the disposable Rocky Linux 9 lab VM from vanilla
+media and restores the `rocky9-lab` AI Gateway state. It is a
 destructive recovery exercise, not the ordinary lab deployment procedure.
 The 2026-07-13 execution record below is updated only when a gate has its
 required evidence. A passed preparation gate does not imply that converge,
@@ -9,7 +9,7 @@ restore, persistence comparison, or release has passed.
 
 The repository's Ansible does not create the VM, attach NICs, create
 NetworkManager profiles, or change their static addresses, routes, gateways,
-DNS, or interface bindings. Perform those steps from Parallels and the Rocky
+DNS, or interface bindings. Perform those steps from the hypervisor and the Rocky
 console before running Ansible. The bounded exception is the firewalld-owned
 `connection.zone` property: Ansible persists it by the supplied profile's
 active UUID without cycling or reactivating the link.
@@ -24,7 +24,7 @@ Use two distinct systems:
   encrypted artifact, its authenticated receipt, the repository or source
   archive, and the deployment material needed to recreate the VM.
 
-A Parallels snapshot, a Parallels disk image on the same Mac storage, or a file
+A hypervisor snapshot, a hypervisor disk image on the same Mac storage, or a file
 under `/var/backups` on the source VM is not an off-box backup. It can be useful
 for lab rollback, but it does not demonstrate recovery from loss of that
 device. This rehearsal may prove VM-loss recovery only after the encrypted
@@ -43,7 +43,7 @@ recovery secret.
 |---|---|---|---|
 | G0 | Off-box artifact and every separately held recovery input verified | **PASS** | 2026-07-13 recovery-workstation custody record summarized below |
 | G1 | Source quiesced; destructive action and rollback choice approved | **PASS** | final artifact verified, destructive replacement explicitly approved, old VM deleted; the verified recovery inputs are now the rollback path |
-| G2 | Vanilla VM, three NICs, static topology, SSH key, and sudo verified | **PASS** | new Parallels/console/SSH identity and topology record summarized below |
+| G2 | Vanilla VM, three NICs, static topology, SSH key, and sudo verified | **PASS** | new hypervisor/console/SSH identity and topology record summarized below |
 | G3 | Full Ansible security baseline completed before any manual container start | **PASS** | fifth full converge, `2026-07-13T05:38:42Z`–`05:41:32Z`, exit 0; protected log named below |
 | G4 | Artifact checksum and hostile-archive validation passed before mutation | **PASS** | corrected offline repeat `2026-07-13T07:07:00Z`–`07:07:39Z`, exit 0, zero running project containers; receipt named below |
 | G5 | Current-source converge passed, then restored Vault unsealed with the old separately held share and the complete runtime became healthy | **PASS** | sealed converge exit 0; one-share unseal exit 0; bounded runtime-only retry exit 0 with 22/22 healthy and zero restarts; receipts named below |
@@ -65,7 +65,7 @@ was deleted:
   SHA-256
   `ebf2bf27d7bd0dd524d1d6305ce13a1e14db7187c27833ae7434ece718bf1d94`,
   backup ID `6528e403-2940-452b-835e-aee85e77cb21`, profile
-  `parallels-rocky9-lab`, with 12 declared volumes, 23 images, and 22 running
+  `rocky9-lab`, with 12 declared volumes, 23 images, and 22 running
   services;
 - independent decryption/listing and complete hostile-archive parsing of that
   artifact, without extracting it into the working tree;
@@ -124,7 +124,7 @@ deleted:
 
 | Fact | Verified value |
 |---|---|
-| Parallels identity | `aigw01`, UUID `eb1cdcf8-af33-4057-bf43-85ec1f6cd71d` |
+| hypervisor identity | `aigw01`, UUID `eb1cdcf8-af33-4057-bf43-85ec1f6cd71d` |
 | Capacity/firmware | 6 vCPU, 16 GiB RAM, 80 GiB disk, ARM64 EFI, Secure Boot off |
 | OS/kernel | Rocky Linux 9.8, `5.14.0-687.24.1.el9_8.aarch64` |
 | Static hostname | `aigw01.aigw.internal` |
@@ -452,7 +452,7 @@ Do not destroy or detach the source VM until every item in this section is
 present and independently verified.
 
 1. Create a fresh quiesced encrypted backup as described in
-   [operations](operations.md#create-an-encrypted-backup). Prefer a destination
+   [operations](../operations.md#create-an-encrypted-backup). Prefer a destination
    physically backed by recovery storage. If the lab-only same-device override
    is used, immediately copy the completed `.age` file from the source VM to
    the recovery workstation; the source copy alone is not recovery evidence.
@@ -508,13 +508,13 @@ age --decrypt -i /secure-recovery/age-identity.txt \
 
 Do not put API keys, tokens, passwords, session cookies, prompt/completion
 bodies, Vault responses, unseal shares, or private keys in the marker set. The
-acceptance procedures in [the test runbook](test-runbook.md) are the source of
+acceptance procedures in [the test runbook](../test-runbook.md) are the source of
 truth for obtaining the identity and isolation evidence.
 
 **Stop G0** if the copied checksum differs, the age identity cannot decrypt the
 artifact, the artifact/profile is unknown, the source/deployment overlay is
 missing, or the old Vault share is not available. Do not rely on the existing
-same-device artifact or a Parallels snapshot as the only copy.
+same-device artifact or a hypervisor snapshot as the only copy.
 
 ## G1 -- quiesce the source and preserve rollback
 
@@ -522,7 +522,7 @@ same-device artifact or a Parallels snapshot as the only copy.
 2. Finish G0 after that quiesce so the backup represents the final approved
    source state. Remember that backup restarts Vault sealed; either unseal it
    for final source checks or keep the source intentionally offline.
-3. Record the source VM identity, Parallels configuration, virtual disk size,
+3. Record the source VM identity, hypervisor configuration, virtual disk size,
    Rocky release, CPU/memory, NIC order/network attachment, and the three MAC
    addresses as evidence. Do not reuse the old and new VM simultaneously with
    the same static IPs.
@@ -547,7 +547,7 @@ blindly shrinking to those values.
 
 Attach three adapters in this role order:
 
-| Adapter role | Parallels attachment | Required Rocky interface/address | Gateway use |
+| Adapter role | hypervisor attachment | Required Rocky interface/address | Gateway use |
 |---|---|---|---|
 | egress | shared/NAT lab network | `enp0s5`, `10.211.55.3/24` | only main-table default via `10.211.55.1` |
 | ADM | ADM host-only network | `enp0s7`, `10.8.10.10/24` | directly reachable `10.8.10.2`; no main default |
@@ -560,7 +560,7 @@ service does not exist until the stack is deployed.
 
 Interface enumeration can change when virtual hardware/order changes. This
 lab profile deliberately asserts the exact names and addresses above. If they
-do not match, stop and correct the Parallels adapter order/virtual hardware or
+do not match, stop and correct the hypervisor adapter order/virtual hardware or
 perform a separately reviewed profile change; do not conceal the mismatch with
 an ad hoc Ansible override.
 
@@ -637,7 +637,7 @@ replaced by the authenticated artifact.
 
 Before admitting restored state, capture the routing/firewall/listener/network
 verification results from the full play and confirm the deployed `.env`
-contains `DEPLOYMENT_PROFILE=parallels-rocky9-lab`. Keep user and ADM client
+contains `DEPLOYMENT_PROFILE=rocky9-lab`. Keep user and ADM client
 traffic closed except for the recovery operator.
 
 **Stop G3** if containers existed before policy, the full play reports a
@@ -739,7 +739,7 @@ clean target.
 
 ## G6 -- compare persistence and security
 
-Repeat the complete [acceptance test runbook](test-runbook.md), including its
+Repeat the complete [acceptance test runbook](../test-runbook.md), including its
 stateful recovery section, on the isolated restored target. At minimum compare
 every G0 marker and prove:
 

@@ -4,7 +4,7 @@ This runbook is the release gate for a complete Rocky Linux 9 deployment. A
 single-NIC shortcut is not supported: routing, firewalld, Docker forwarding,
 and listener placement are part of the product and require the real three-leg
 topology. Use customer-supplied interfaces and addresses, or the exact
-Parallels lab profile in [the deployment guide](deploy-guide.md).
+lab profile in [the deployment guide](deploy-guide.md).
 
 Run destructive and fault-injection cases only on the disposable lab. Record
 the source revision, image digests, inventory profile, timestamps, and pass or
@@ -140,7 +140,7 @@ Prove a permissive/disabled fixture is rejected before any baseline role can
 install packages, write Docker configuration, or change host networking. The
 playbook is not an SELinux-mode conversion mechanism.
 
-For the Parallels lab, prove all of these exact facts before deployment:
+For the lab, prove all of these exact facts before deployment:
 
 | Leg | Interface | Address | Gateway |
 |---|---|---|---|
@@ -160,7 +160,7 @@ topology file documented in `deploy-guide.md`. The play must complete its
 post-converge assertions. Confirm NetworkManager connection profiles and the
 three static addresses did not change.
 
-The Parallels profile is the only supported exception to encrypted-state
+The lab profile is the only supported exception to encrypted-state
 enforcement. A generic/customer converge must fail before starting Docker if
 the configured Docker and stack state paths do not resolve through the
 reviewed encrypted block-device boundary.
@@ -328,7 +328,7 @@ credentials.
 
 ## 5. Vault and application readiness
 
-Use the lab bootstrap only on the Parallels/disposable profile, as described
+Use the lab bootstrap only on the disposable lab profile, as described
 in `deploy-guide.md`. Unseal Vault without putting the share in an argument or
 shell history, then wait for health checks:
 
@@ -593,7 +593,7 @@ fresh step-up reauthentication bounded to roughly five minutes.
 
 ## 8. Samba AD and identity-controller lab acceptance
 
-This section applies only to the Parallels overlay.
+This section applies only to the lab overlay.
 
 1. Confirm `samba-ad` is healthy, read-only, non-privileged, has only the
    reviewed capabilities, publishes no port, and joins only `net-identity`.
@@ -766,18 +766,17 @@ Pass a changed topology only after readiness removal, planned drain, replica
 failure, credential/key propagation, shared-state outage, network isolation,
 and an unchanged second converge all meet their declared bounds.
 
-For any future production-HA profile, also execute every applicable failure
-domain and component rollout in the
-[HA and rolling-update matrix](high-availability.md). Multiple containers on
-the same Rocky host do not satisfy those tests.
+Any future HA design is a separate Kubernetes architecture accepted on its
+own evidence; see the [scaling and HA posture](high-availability.md). Multiple
+containers on the same Rocky host do not constitute host redundancy.
 
 ## 12. Stateful recovery and upgrade gate
 
 Execute `scripts/state-backup.sh` to independent/off-host storage and perform a
 destructive `scripts/state-restore.sh` drill on an isolated target, following
-[operations](operations.md). For the vanilla Parallels VM-loss exercise, use
+[operations](operations.md). For the vanilla lab VM-loss exercise, use
 the explicit pending gates in the
-[lab rebuild and restore rehearsal](lab-dr-rehearsal.md). Test both a changed
+[lab rebuild and restore rehearsal](archive/lab-dr-rehearsal.md). Test both a changed
 stateful direct-image reference and a Dockerfile/context-only change beneath a
 stateful custom build while its image tag remains unchanged. Prove
 `scripts/pre-upgrade-check.sh` rejects a missing, stale, unavailable, or
@@ -806,7 +805,7 @@ realm bind tree. It is failed/non-evidence; the corrected offline procedure
 was subsequently repeated in full and passed G4. The current-source sealed
 converge, old-share unseal, and healthy runtime passed G5. The protected
 receipts are indexed in the
-[lab rebuild and restore rehearsal](lab-dr-rehearsal.md), which controls the
+[lab rebuild and restore rehearsal](archive/lab-dr-rehearsal.md), which controls the
 final gate dispositions. The configured G6 lanes, including the
 collector-only synthetic correlation batch, have now passed; real
 Anthropic/WIF exchange/inference remains NOT EXECUTED. One host reboot passed

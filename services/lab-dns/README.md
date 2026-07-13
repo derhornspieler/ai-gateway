@@ -1,7 +1,7 @@
-# Parallels lab DNS
+# Lab DNS
 
 This is an authoritative, non-recursive CoreDNS configuration for the local
-`aigw.internal` test domain. It is loaded only by the Parallels lab Compose
+`aigw.internal` test domain. It is loaded only by the lab Compose
 overlay. The service binds TCP and UDP port 53 only on the VM's exact ADM and
 internal addresses, never the egress address, and has no forwarding plugin.
 The host firewall accepts those listeners only from the corresponding

@@ -1,7 +1,7 @@
 # Samba AD lab image
 
 This image exists only to exercise Keycloak's Microsoft Active Directory LDAP
-provider in the `parallels-rocky9-lab` deployment profile. It is not a customer
+provider in the `rocky9-lab` deployment profile. It is not a customer
 directory and must never be enabled by the default/production Compose profile.
 
 It is built from the official multi-architecture Debian 13 base and Debian's

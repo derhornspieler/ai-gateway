@@ -11,8 +11,7 @@ NetworkManager profile, readdress an interface, or change customer-owned routes,
 gateways, DNS, or static IP addressing. It owns exactly one bounded property on
 each supplied active physical profile — `connection.zone`, keyed by its live
 UUID — so a firewalld reload cannot move that interface back to the default
-zone. It neither cycles nor reactivates the connection. The committed Parallels
-inventory is an explicit lab profile, not a production default.
+zone. It neither cycles nor reactivates the connection. The committed lab inventory is an explicit lab profile, not a production default.
 
 ## Architecture at a glance
 
@@ -48,9 +47,10 @@ flowchart LR
   EV -->|pinned TLS, egress NIC only| VEND[Anthropic / OpenAI vendor APIs]
 ```
 
-The full component, network, and trust-boundary detail — including the
-per-plane Docker bridge map and the complete request-flow diagram — lives in
-the [solution map](docs/solution-map.md).
+The full component, network, and trust-boundary detail lives in the
+[solution map](docs/solution-map.md); the complete diagram set (network,
+authentication, key-lifecycle, rotation, telemetry, and converge flows) is in
+[technical diagrams](docs/architecture-diagrams.md).
 
 ## Host interfaces
 
@@ -68,26 +68,30 @@ AI Gateway is a **customer prototype under active hardening** — one Compose
 project on one Rocky VM, not highly available and not a turnkey production
 appliance; Vault bootstrap is currently lab/test-grade. Implementation state,
 verification evidence, and the open items gating production live in
-[project status](docs/project-status.md); the
-[lab rebuild and restore rehearsal register](docs/lab-dr-rehearsal.md) is the
-authoritative gate record.
+[project status](docs/project-status.md); the historical destructive
+rebuild-and-restore evidence is archived in
+[docs/archive/lab-dr-rehearsal.md](docs/archive/lab-dr-rehearsal.md).
 
 ## Documentation
 
 Read these in order for a deployment:
 
 1. [Architecture and trust boundaries](docs/solution-map.md)
-2. [Generic Rocky 9 and Parallels deployment](docs/deploy-guide.md)
-3. [Offline external-image seed](docs/offline-image-seed.md)
-4. [Identity, Samba AD lab, and group administration](docs/identity-operations.md)
-5. [Anthropic WIF and `private_key_jwt`](docs/anthropic-wif-bootstrap.md)
-6. [Operations, recovery, upgrades, and troubleshooting](docs/operations.md)
-7. [Parallels destructive rebuild and restore rehearsal](docs/lab-dr-rehearsal.md)
-8. [Sensitive telemetry and retention](docs/observability-operations.md)
-9. [LiteLLM capacity and scaling design](docs/litellm-scaling.md)
-10. [High availability and rolling-update matrix](docs/high-availability.md)
-11. [Acceptance test runbook](docs/test-runbook.md)
-12. [Project status and open items](docs/project-status.md)
+2. [Technical diagrams](docs/architecture-diagrams.md)
+3. [Network architecture and enforcement](docs/network-security.md)
+4. [Operating system security baseline](docs/os-security.md)
+5. [Container platform security](docs/docker-security.md)
+6. [Ansible deployment runbook](docs/deploy-runbook.md)
+7. [Generic Rocky 9 and lab deployment reference](docs/deploy-guide.md)
+8. [Offline external-image seed](docs/offline-image-seed.md)
+9. [Identity, Samba AD lab, and group administration](docs/identity-operations.md)
+10. [Anthropic WIF and `private_key_jwt`](docs/anthropic-wif-bootstrap.md)
+11. [Operations, recovery, upgrades, and troubleshooting](docs/operations.md)
+12. [Sensitive telemetry and retention](docs/observability-operations.md)
+13. [LiteLLM capacity and scaling design](docs/litellm-scaling.md)
+14. [Scaling and high-availability posture](docs/high-availability.md)
+15. [Acceptance test runbook](docs/test-runbook.md)
+16. [Project status and open items](docs/project-status.md)
 
 The original
 [architecture skeleton](docs/archive/architecture-skeleton.md) is archived as
@@ -105,7 +109,7 @@ ansible-playbook -i ansible/inventory/hosts.yml ansible/site.yml \
   -e @/secure/customer-topology.yml --ask-vault-pass
 ```
 
-For the explicit Parallels lab only:
+For the explicit lab only:
 
 ```bash
 ansible-playbook -i ansible/inventory/lab.yml ansible/site.yml \
@@ -128,14 +132,14 @@ scripts/validate-compose.sh
 ansible/
   site.yml                 full host + network + stack converge (heavy preflight gates)
   deploy-stack-only.yml    app-only rollout; refuses a stale firewall/network ABI
-  inventory/               generic entry point (hosts.yml) + Parallels lab (lab.yml)
+  inventory/               generic entry point (hosts.yml) + lab (lab.yml)
   group_vars/all.yml       20 segmented bridge definitions and host variables
   roles/                   host_preflight, selinux_baseline, network_routing,
                            firewalld_zones, os_baseline, docker_networks,
                            docker_stack, verify
 compose/
   docker-compose.yml       base stack, 24 services; images tag-and-digest pinned
-  docker-compose.lab.yml   Parallels lab overlay (Samba AD + authoritative DNS)
+  docker-compose.lab.yml   lab overlay (Samba AD + authoritative DNS)
   .env.example             fail-closed variable contract templated by Ansible
   traefik/                 separate internal and ADM routing
   keycloak/ litellm/ postgres/ vault/

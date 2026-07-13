@@ -7,15 +7,15 @@ bootstrap today. Recovery acceptance does not confer high availability. The guid
 distinguishes commands that verify current state from controls that remain
 production blockers, and it cross-links the architecture in
 [solution-map.md](solution-map.md), the install flow in
-[deploy-guide.md](deploy-guide.md), the high-availability and rolling-update
-matrix in [high-availability.md](high-availability.md), and the living status in
+[deploy-guide.md](deploy-guide.md), the scaling and HA
+posture in [high-availability.md](high-availability.md), and the living status in
 [project-status.md](project-status.md).
 
 The base project is 24 services: one `volume-init` one-shot plus 23 long-running
-services. The Parallels lab overlay adds `samba-ad` and `lab-dns`, for 25
+services. The lab overlay adds `samba-ad` and `lab-dns`, for 25
 long-running services. Wherever a service count matters below it refers to that
 current topology; historical rehearsal receipts that recorded a smaller set are
-held in [lab-dr-rehearsal.md](lab-dr-rehearsal.md).
+held in [lab-dr-rehearsal.md](archive/lab-dr-rehearsal.md).
 
 ## Compose command context
 
@@ -23,7 +23,7 @@ Deployed operator scripts never call Compose directly. `scripts/aigw-compose.sh`
 is the one authoritative, profile-aware selector: it reads `DEPLOYMENT_PROFILE`
 from the rendered `.env`, always passes the base `docker-compose.yml`, and adds
 `-f docker-compose.lab.yml --profile lab-ad` only when the profile is
-`parallels-rocky9-lab`. Using that wrapper for every inspection, quiesce, and
+`rocky9-lab`. Using that wrapper for every inspection, quiesce, and
 restore guarantees the lab's Samba and DNS services cannot be silently omitted.
 For a plain base deployment it resolves to an ordinary `docker compose` call:
 
@@ -125,7 +125,7 @@ Unlock and mount the encrypted state filesystems before Docker starts. The
 repository does not provision or unlock LUKS, but both the full and stack-only
 customer playbooks fail unless the configured Docker data root and stack
 directory resolve through a block device with a `crypto_LUKS` ancestor; the
-disposable Parallels profile is the only committed opt-out.
+disposable lab profile is the only committed opt-out.
 
 The host-input firewall guard is ordered `Before=docker.service` and wanted by
 `docker.service`, so the packet policy loads before Docker can publish any port;
@@ -283,7 +283,7 @@ controlled source converge and Docker restart proving the new runtime labels and
 parent-ACL repair, followed by an explicit restart of only the long-running
 service set proving the sealed-to-unsealed retry path, remains PENDING; the
 successful durable-state reboot must not be cited as that proof. The gate
-register is [lab-dr-rehearsal.md](lab-dr-rehearsal.md).
+register is [lab-dr-rehearsal.md](archive/lab-dr-rehearsal.md).
 
 ## SSH access and recovery
 
@@ -360,7 +360,7 @@ runtime zone matching and the corresponding permanent project zone listing
 exactly that one interface; `aigw-egress` at canonical target `DROP` and
 `aigw-adm`/`aigw-internal` at `REJECT`; no legacy zone-wide open ports; only SSH
 binding a wildcard host address; Traefik binding exactly the ADM and internal
-addresses on 443; in the Parallels lab only, authoritative DNS binding TCP and
+addresses on 443; in the lab only, authoritative DNS binding TCP and
 UDP 53 on those same exact addresses and nowhere else; and nothing binding the
 egress address.
 
@@ -609,7 +609,7 @@ corrected offline restore was repeated from the immutable authenticated artifact
 and an operator may never continue, patch around, or bootstrap over a failed
 target. The corrected repeat and the full gate evidence, including the
 still-pending G7 disposition, are recorded in
-[lab-dr-rehearsal.md](lab-dr-rehearsal.md).
+[lab-dr-rehearsal.md](archive/lab-dr-rehearsal.md).
 
 `docker compose down` preserves named volumes. `docker compose down -v` destroys
 all project databases, Vault, identity, and telemetry state; in the lab use the
@@ -617,8 +617,8 @@ merged files and profile through `aigw-compose.sh` or Samba volumes can be misse
 
 ## Recovery order
 
-For the destructive vanilla-VM Parallels exercise, follow the dedicated
-[lab rebuild and restore rehearsal](lab-dr-rehearsal.md), which holds the gate
+For the destructive vanilla-VM lab exercise, follow the dedicated
+[lab rebuild and restore rehearsal](archive/lab-dr-rehearsal.md), which holds the gate
 register and the protected execution receipts. The summarized order is:
 
 1. Recover the host or VM and unlock both encrypted state filesystems.
@@ -697,7 +697,7 @@ The gated stateful set is Postgres, Keycloak, LiteLLM, Open WebUI, Vault, Alloy,
 Prometheus, Loki, Tempo, Grafana, and lab Samba, so Alloy's durable positions and
 the lab Samba state are covered as well as application data. The check also
 refuses to run while `.state/restore-required-unseal` exists. The disposable
-Parallels profile disables this gate only so candidate upgrades can be tested; do
+lab profile disables this gate only so candidate upgrades can be tested; do
 not copy that exception to customer inventory.
 
 Review the shared build plan and, for every planned custom build with an existing
@@ -705,7 +705,7 @@ service, require successful pre-build rollback retention before the build begins
 retaining both the exact rollback tag and the backup receipt through acceptance.
 Do not treat image retention as database-schema rollback. Then validate without
 starting containers, rebuild and run the unit, config, and runtime tests,
-converge the Parallels lab, and test schema migrations and rollback for Postgres,
+converge the lab, and test schema migrations and rollback for Postgres,
 Keycloak, LiteLLM, Open WebUI, Vault, Loki, and Tempo, because a binary rollback
 is insufficient once an on-disk schema has migrated.
 
