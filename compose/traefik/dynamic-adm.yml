@@ -1,17 +1,42 @@
 # traefik-adm dynamic config — admin vhosts (eth1).
 http:
   routers:
+    chat:
+      # Open WebUI retains its own Keycloak OIDC client, but the application
+      # is an ADM/VPN-only convenience surface—not part of the internal-user
+      # edge. Host firewall policy source-restricts this listener.
+      rule: 'Host(`chat.{{ env "DOMAIN" }}`)'
+      entryPoints: [websecure]
+      service: open-webui
+      tls: {}
     admin:
       rule: 'Host(`admin.{{ env "DOMAIN" }}`)'
       entryPoints: [websecure]
       service: oauth2-proxy    # OIDC gate (role aigw-admins) -> LiteLLM Admin UI
       tls: {}
+    admin-portal:
+      rule: 'Host(`admin-portal.{{ env "DOMAIN" }}`)'
+      entryPoints: [websecure]
+      # The separate ASGI application performs OIDC, live admin-role checks,
+      # and step-up reauthentication for identity mutations.
+      service: admin-portal
+      tls: {}
     grafana:
       rule: 'Host(`grafana.{{ env "DOMAIN" }}`)'
       entryPoints: [websecure]
-      # Separate oauth2-proxy instance enforces the Keycloak aigw-admins role
-      # before Grafana's own login/API surface is reachable.
+      # Dedicated oauth2-proxy gate checks the Keycloak aigw-admins role before
+      # any Grafana route is reachable.
       service: oauth2-proxy-grafana
+      tls: {}
+    prometheus:
+      rule: 'Host(`prometheus.{{ env "DOMAIN" }}`)'
+      entryPoints: [websecure]
+      service: oauth2-proxy-prometheus
+      tls: {}
+    vault:
+      rule: 'Host(`vault.{{ env "DOMAIN" }}`)'
+      entryPoints: [websecure]
+      service: oauth2-proxy-vault
       tls: {}
     keycloak-admin:
       # The ADM listener is source-restricted to the VPN CIDR by host firewall
@@ -23,15 +48,31 @@ http:
       tls: {}
 
   services:
+    open-webui:
+      loadBalancer:
+        servers: [{ url: "http://open-webui:8080" }]
     oauth2-proxy:
       loadBalancer:
         servers: [{ url: "http://oauth2-proxy:4180" }]
+    admin-portal:
+      loadBalancer:
+        servers: [{ url: "http://admin-portal:8080" }]
     oauth2-proxy-grafana:
       loadBalancer:
         servers: [{ url: "http://oauth2-proxy-grafana:4180" }]
+    oauth2-proxy-prometheus:
+      loadBalancer:
+        servers: [{ url: "http://oauth2-proxy-prometheus:4180" }]
+    oauth2-proxy-vault:
+      loadBalancer:
+        servers: [{ url: "http://oauth2-proxy-vault:4180" }]
     keycloak:
       loadBalancer:
-        servers: [{ url: "http://keycloak:8080" }]
+        # This network-scoped alias resolves only on net-admin-app. It prevents
+        # Docker DNS from selecting Keycloak's net-chat address, which would
+        # make the ADM proxy's source dynamic and therefore untrusted by
+        # Keycloak's exact --proxy-trusted-addresses allow-list.
+        servers: [{ url: "http://keycloak-adm:8080" }]
 
 tls:
   certificates:

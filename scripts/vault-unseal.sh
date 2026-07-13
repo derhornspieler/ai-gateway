@@ -2,18 +2,20 @@
 # Submit one Vault unseal share without placing it in argv, environment,
 # container configuration, a bind mount, or Docker logs.
 set -euo pipefail
+unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+docker_cmd=(docker --host unix:///run/docker.sock)
 
 if [[ -t 0 ]]; then
   echo "FATAL: pipe one unseal share on stdin; interactive input is disabled" >&2
   exit 2
 fi
 
-docker network inspect net-vault >/dev/null
+"${docker_cmd[@]}" network inspect net-vault >/dev/null
 
 # Vault 2.x's CLI requires a TTY for hidden input and does not implement `-`
 # as an stdin sentinel. This disposable client reads only stdin, has no proxy
 # path or redirect support, and emits only fixed non-secret status text.
-exec docker run --rm -i \
+exec "${docker_cmd[@]}" run --rm -i \
   --pull never \
   --network net-vault \
   --user 65532:65532 \

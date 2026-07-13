@@ -59,16 +59,13 @@ for filename in ("aigw-realm.json", "anthropic-wif-realm.json"):
         require_keycloak_policy(SOURCE_TEMPLATES / f"{filename}.j2", template=True)
 
 static_realm = json.loads((realm_dir / "aigw-realm.json").read_text())
-portal_clients = [
-    client for client in static_realm["clients"] if client.get("clientId") == "dev-portal"
-]
-assert len(portal_clients) == 1, "static realm must contain exactly one dev-portal client"
 if source_layout:
-    expected_logout = "https://portal.aigw.example.internal/login"
+    domain = "aigw.example.internal"
     realm_template = (SOURCE_TEMPLATES / "aigw-realm.json.j2").read_text()
-    assert realm_template.count(
-        '"post.logout.redirect.uris": "https://portal.{{ aigw_domain }}/login"'
-    ) == 1
+    for hostname in ("portal", "admin-portal"):
+        assert realm_template.count(
+            f'"post.logout.redirect.uris": "https://{hostname}.{{{{ aigw_domain }}}}/login"'
+        ) == 1
 else:
     # On an existing deployment, read only the exact non-secret DOMAIN line;
     # never parse or emit credential lines. A pristine Ansible converge runs
@@ -98,12 +95,58 @@ else:
         r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
         domain,
     ), "deployed DOMAIN is not a safe DNS name"
-    expected_logout = f"https://portal.{domain}/login"
 
-assert (
-    portal_clients[0].get("attributes", {}).get("post.logout.redirect.uris")
-    == expected_logout
-), "dev-portal post-logout redirect does not match the selected deployment layout"
+clients = static_realm.get("clients", [])
+assert isinstance(clients, list)
+clients_by_id = {client.get("clientId"): client for client in clients}
+assert len(clients_by_id) == len(clients), "duplicate OIDC client id"
+assert set(clients_by_id) == {
+    "open-webui", "dev-portal", "admin-portal", "admin-ui"
+}, "first-party OIDC client allow-list drifted"
+
+expected = {
+    "open-webui": {
+        "redirectUris": [f"https://chat.{domain}/oauth/oidc/callback"],
+        "webOrigins": [f"https://chat.{domain}"],
+    },
+    "dev-portal": {
+        "redirectUris": [f"https://portal.{domain}/auth/callback"],
+        "webOrigins": [f"https://portal.{domain}"],
+        "logout": f"https://portal.{domain}/login",
+    },
+    "admin-portal": {
+        "redirectUris": [f"https://admin-portal.{domain}/auth/callback"],
+        "webOrigins": [f"https://admin-portal.{domain}"],
+        "logout": f"https://admin-portal.{domain}/login",
+    },
+    "admin-ui": {
+        "redirectUris": [
+            f"https://admin.{domain}/oauth2/callback",
+            f"https://grafana.{domain}/oauth2/callback",
+            f"https://prometheus.{domain}/oauth2/callback",
+            f"https://vault.{domain}/oauth2/callback",
+        ],
+        "webOrigins": [
+            f"https://admin.{domain}",
+            f"https://grafana.{domain}",
+            f"https://prometheus.{domain}",
+            f"https://vault.{domain}",
+        ],
+    },
+}
+for client_id, contract in expected.items():
+    client = clients_by_id[client_id]
+    assert client.get("redirectUris") == contract["redirectUris"], client_id
+    assert client.get("webOrigins") == contract["webOrigins"], client_id
+    assert client.get("standardFlowEnabled") is True, client_id
+    assert client.get("directAccessGrantsEnabled") is False, client_id
+    if "logout" in contract:
+        assert (
+            client.get("attributes", {}).get("post.logout.redirect.uris")
+            == contract["logout"]
+        ), client_id
+    mappers = client.get("protocolMappers", [])
+    assert len(mappers) == 1 and mappers[0].get("config", {}).get("claim.name") == "roles", client_id
 
 entrypoint = (ROOT / "services/samba-ad-lab/samba-ad-entrypoint").read_text()
 for assignment in (

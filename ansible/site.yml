@@ -11,32 +11,6 @@
   pre_tasks:
     # These checks intentionally run before os_baseline. A stale NIC mapping
     # must not install/restart Docker or alter forwarding before we fail.
-    - name: Preflight — read effective SELinux enforcement mode
-      ansible.builtin.command: getenforce
-      register: preflight_selinux_mode
-      changed_when: false
-
-    - name: Preflight — require the Rocky targeted policy in enforcing mode
-      ansible.builtin.assert:
-        that:
-          - ansible_facts.selinux.status == 'enabled'
-          - ansible_facts.selinux.mode == 'enforcing'
-          - ansible_facts.selinux.type == 'targeted'
-          - preflight_selinux_mode.stdout | trim == 'Enforcing'
-        quiet: true
-        fail_msg: >-
-          Refusing to mutate host: AI Gateway requires the Rocky targeted
-          SELinux policy loaded in enforcing mode before Docker is installed
-          or restarted. Host enforcement without Docker labeling is not an
-          acceptable container boundary.
-
-    - name: Preflight — capture the SELinux AVC audit window start
-      ansible.builtin.command: date +'%m/%d/%Y %H:%M:%S'
-      environment:
-        LC_ALL: C
-      register: aigw_selinux_audit_window_start
-      changed_when: false
-
     - name: Preflight — require concrete, syntactically valid topology inputs
       ansible.builtin.assert:
         that:
@@ -59,10 +33,19 @@
           - eth1_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - eth2_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - eth0_gateway is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
-          - eth1_gateway is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
-          - eth2_gateway is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - not (manage_networking | bool) or eth1_gateway is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - not (manage_networking | bool) or eth2_gateway is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - vpn_client_cidr is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[1-9]|[12][0-9]|3[0-2])$')
           - internal_cidr is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[1-9]|[12][0-9]|3[0-2])$')
+          - aigw_management_ssh_port | int >= 1
+          - aigw_management_ssh_port | int <= 65535
+          - aigw_docker_host_mode == 'dedicated'
+          - manage_firewalld | bool
+          - aigw_docker_host_marker is string
+          - aigw_docker_host_marker | length <= 192
+          - aigw_docker_host_marker is match('^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}$')
+          - aigw_selinux_policy == 'targeted'
+          - aigw_selinux_state == 'enforcing'
           - container_dns_server is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - not container_dns_server.startswith('127.')
           - not container_dns_server.startswith('169.254.')
@@ -76,14 +59,251 @@
             (cribl_otlp_allowed_port | int >= 1 and cribl_otlp_allowed_port | int <= 65535)
           - (cribl_external_export_enabled | bool) or cribl_otlp_endpoint == 'cribl-mock:4317'
           - not (cribl_external_export_enabled | bool) or cribl_otlp_endpoint != 'cribl-mock:4317'
+          - (manage_networking | bool) or pbr_tables | length == 0
+          - not (manage_networking | bool) or pbr_tables | length == 2
           - pbr_tables | map(attribute='id') | unique | length == pbr_tables | length
           - pbr_tables | map(attribute='name') | unique | length == pbr_tables | length
           - pbr_tables | map(attribute='priority') | unique | length == pbr_tables | length
+          - aigw_ssh_password_authentication is boolean
+          - aigw_adm_socks_enabled is boolean
         fail_msg: >-
           Refusing to mutate host: supply canonical bounded stack/Docker paths,
           a safe Compose project name, the three NIC names, three existing IPv4
           addresses, three gateways, and ADM/internal source CIDRs via an
           environment inventory, --extra-vars, or documented AIGW_* variables.
+
+    # SOCKS uses SSH local/dynamic forwarding, not host packet forwarding.  It
+    # is therefore an explicit, source-scoped sshd Match exception rather than
+    # a broad ADM routing/NAT policy.  Reject arbitrary Match input before it
+    # is rendered into the root-owned sshd fragment.
+    - name: Preflight — validate default-deny ADM SSH SOCKS exception inputs
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -c
+          - |
+            import ipaddress
+            import json
+            import re
+            import sys
+
+            enabled = sys.argv[1] == "true"
+            users = json.loads(sys.argv[2])
+            groups = json.loads(sys.argv[3])
+            source_cidrs = json.loads(sys.argv[4])
+            group_test_users = json.loads(sys.argv[5])
+            vpn_network = ipaddress.ip_network(sys.argv[6], strict=True)
+            errors = []
+            safe_principal = re.compile(r"[a-z_][a-z0-9_-]{0,31}$")
+
+            if not isinstance(users, list) or not isinstance(groups, list):
+                errors.append("aigw_adm_socks_users/groups must be lists")
+                users, groups = [], []
+            if not isinstance(source_cidrs, list):
+                errors.append("aigw_adm_socks_source_cidrs must be a list")
+                source_cidrs = []
+            if not isinstance(group_test_users, dict):
+                errors.append("aigw_adm_socks_group_test_users must be a mapping")
+                group_test_users = {}
+
+            for label, values in (("user", users), ("group", groups)):
+                if any(not isinstance(value, str) or not safe_principal.fullmatch(value)
+                       for value in values):
+                    errors.append(f"unsafe SSH SOCKS {label} name")
+                if len(set(values)) != len(values):
+                    errors.append(f"duplicate SSH SOCKS {label} name")
+            if "root" in users:
+                errors.append("root cannot receive an SSH SOCKS exception")
+
+            parsed_sources = []
+            for value in source_cidrs:
+                try:
+                    network = ipaddress.ip_network(value, strict=True)
+                except ValueError:
+                    errors.append(f"invalid SSH SOCKS source CIDR {value!r}")
+                    continue
+                if network.version != 4 or network.prefixlen == 0 or not network.subnet_of(vpn_network):
+                    errors.append(
+                        f"SSH SOCKS source CIDR {value!r} is not a bounded ADM subset of {vpn_network}"
+                    )
+                    continue
+                parsed_sources.append(str(network))
+            if len(set(parsed_sources)) != len(parsed_sources):
+                errors.append("duplicate SSH SOCKS source CIDR")
+
+            if set(group_test_users) != set(groups):
+                errors.append("every SSH SOCKS group needs exactly one declared test user")
+            for group, user in group_test_users.items():
+                if (not isinstance(group, str) or not safe_principal.fullmatch(group) or
+                        not isinstance(user, str) or not safe_principal.fullmatch(user) or
+                        user == "root"):
+                    errors.append("unsafe SSH SOCKS group test-user mapping")
+
+            if enabled:
+                if not source_cidrs:
+                    errors.append("enabled SSH SOCKS requires an ADM source CIDR")
+                if not users and not groups:
+                    errors.append("enabled SSH SOCKS requires an approved user or group")
+            elif users or groups or source_cidrs or group_test_users:
+                errors.append("disabled SSH SOCKS must not retain approved principals or source CIDRs")
+
+            if errors:
+                raise SystemExit("; ".join(dict.fromkeys(errors)))
+          - "{{ 'true' if (aigw_adm_socks_enabled | bool) else 'false' }}"
+          - "{{ aigw_adm_socks_users | to_json }}"
+          - "{{ aigw_adm_socks_groups | to_json }}"
+          - "{{ aigw_adm_socks_source_cidrs | to_json }}"
+          - "{{ aigw_adm_socks_group_test_users | to_json }}"
+          - "{{ vpn_client_cidr }}"
+      changed_when: false
+
+    # Docker bridge names and firewalld zone/interface values are interpolated
+    # into root-run firewall scripts. The platform graph is fixed, so accept
+    # only its canonical topology instead of treating an arbitrary inventory
+    # list as a shell-safe extension point.
+    - name: Preflight — require exact Docker network and firewalld topology contracts
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -c
+          - |
+            import ipaddress
+            import json
+            import re
+            import sys
+
+            networks = json.loads(sys.argv[1])
+            zones = json.loads(sys.argv[2])
+            (
+                egress_nic, adm_nic, internal_nic, vpn_cidr, internal_cidr,
+                ssh_port, adm_ip, internal_ip,
+            ) = sys.argv[3:]
+            expected_networks = {
+                "net-egress": ("br-egress", "172.28.0.0/24", False),
+                "net-adm": ("br-adm", "172.28.1.0/24", False),
+                "net-internal": ("br-internal", "172.28.2.0/24", False),
+                "net-chat": ("br-chat", "172.28.3.0/24", True),
+                "net-portal": ("br-portal", "172.28.4.0/24", True),
+                "net-admin-app": ("br-admin", "172.28.5.0/24", True),
+                "net-grafana": ("br-graf", "172.28.6.0/24", True),
+                "net-vendor": ("br-vendor", "172.28.7.0/24", True),
+                "net-vault": ("br-vault", "172.28.8.0/24", True),
+                "net-db-litellm": ("br-db-llm", "172.28.9.0/24", True),
+                "net-db-keycloak": ("br-db-kc", "172.28.10.0/24", True),
+                "net-db-rotator": ("br-db-rot", "172.28.11.0/24", True),
+                "net-cache": ("br-cache", "172.28.12.0/24", True),
+                "net-telemetry": ("br-otel", "172.28.13.0/24", True),
+                "net-metrics": ("br-metrics", "172.28.14.0/24", True),
+                "net-observability": ("br-obs", "172.28.15.0/24", True),
+                "net-traces": ("br-traces", "172.28.16.0/24", True),
+                "net-identity": ("br-ident", "172.28.17.0/24", True),
+                "net-lab-dns": ("br-lab-dns", "172.28.18.0/24", False),
+                "net-int-edge": ("br-int-edge", "172.28.19.0/24", False),
+            }
+            errors = []
+            if not isinstance(networks, list):
+                errors.append("docker_networks is not a list")
+                networks = []
+            by_name = {}
+            for entry in networks:
+                if not isinstance(entry, dict):
+                    errors.append(f"Docker network entry is not an object: {entry!r}")
+                    continue
+                name = entry.get("name")
+                bridge = entry.get("bridge")
+                subnet = entry.get("subnet")
+                internal = entry.get("internal")
+                if not isinstance(name, str) or not re.fullmatch(r"net-[a-z0-9-]{1,30}", name):
+                    errors.append(f"unsafe Docker network name {name!r}")
+                    continue
+                if name in by_name:
+                    errors.append(f"duplicate Docker network name {name}")
+                    continue
+                if not isinstance(bridge, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", bridge):
+                    errors.append(f"unsafe Linux bridge name for {name}: {bridge!r}")
+                if not isinstance(subnet, str):
+                    errors.append(f"invalid Docker subnet for {name}: {subnet!r}")
+                else:
+                    try:
+                        parsed = ipaddress.ip_network(subnet, strict=True)
+                        if parsed.version != 4 or parsed.prefixlen != 24:
+                            errors.append(f"Docker subnet for {name} must be an IPv4 /24: {subnet!r}")
+                    except ValueError:
+                        errors.append(f"invalid Docker subnet for {name}: {subnet!r}")
+                if type(internal) is not bool:
+                    errors.append(f"Docker network internal flag for {name} must be boolean")
+                by_name[name] = (bridge, subnet, internal)
+            if by_name != expected_networks:
+                errors.append("docker_networks differs from the fixed AI Gateway bridge topology")
+
+            if not isinstance(zones, list):
+                errors.append("firewalld_zones is not a list")
+                zones = []
+            expected_zones = {
+                "aigw-egress": {
+                    "interfaces": [egress_nic], "target": "DROP", "rich_rules": [],
+                },
+                "aigw-adm": {
+                    "interfaces": [adm_nic], "target": "%%REJECT%%",
+                    "rich_rules": [
+                        f'rule family="ipv4" source address="{vpn_cidr}" port port="{ssh_port}" protocol="tcp" accept',
+                        f'rule family="ipv4" source address="{vpn_cidr}" port port="443" protocol="tcp" accept',
+                    ],
+                },
+                "aigw-internal": {
+                    "interfaces": [internal_nic], "target": "%%REJECT%%",
+                    "rich_rules": [
+                        f'rule family="ipv4" source address="{internal_cidr}" port port="443" protocol="tcp" accept',
+                    ],
+                },
+            }
+            by_zone = {}
+            for entry in zones:
+                if not isinstance(entry, dict):
+                    errors.append(f"firewalld zone entry is not an object: {entry!r}")
+                    continue
+                name = entry.get("zone")
+                if not isinstance(name, str) or not re.fullmatch(r"aigw-[a-z0-9-]{1,24}", name):
+                    errors.append(f"unsafe firewalld zone name {name!r}")
+                    continue
+                if name in by_zone:
+                    errors.append(f"duplicate firewalld zone {name}")
+                    continue
+                by_zone[name] = {
+                    "interfaces": entry.get("interfaces"),
+                    "target": entry.get("target"),
+                    "rich_rules": entry.get("rich_rules"),
+                }
+            if by_zone != expected_zones:
+                errors.append("firewalld_zones differs from the fixed AI Gateway interface policy")
+            try:
+                vpn_network = ipaddress.ip_network(vpn_cidr, strict=True)
+                internal_network = ipaddress.ip_network(internal_cidr, strict=True)
+                adm_address = ipaddress.ip_address(adm_ip)
+                internal_address = ipaddress.ip_address(internal_ip)
+                if vpn_network.overlaps(internal_network):
+                    errors.append("vpn_client_cidr and internal_cidr must be disjoint")
+                if adm_address not in vpn_network or adm_address in internal_network:
+                    errors.append("eth1_ip must belong only to vpn_client_cidr")
+                if internal_address not in internal_network or internal_address in vpn_network:
+                    errors.append("eth2_ip must belong only to internal_cidr")
+            except ValueError as exc:
+                errors.append(f"invalid ADM/internal address or CIDR: {exc}")
+            if errors:
+                raise SystemExit("; ".join(dict.fromkeys(errors)))
+          - "{{ docker_networks | to_json }}"
+          - "{{ firewalld_zones | to_json }}"
+          - "{{ nic_egress }}"
+          - "{{ nic_adm }}"
+          - "{{ nic_internal }}"
+          - "{{ vpn_client_cidr }}"
+          - "{{ internal_cidr }}"
+          - "{{ aigw_management_ssh_port | string }}"
+          - "{{ eth1_ip }}"
+          - "{{ eth2_ip }}"
+      changed_when: false
 
     - name: Preflight — validate all three NIC identities before mutation
       ansible.builtin.assert:
@@ -273,6 +493,7 @@
         - /etc/iproute2/rt_tables
         - /usr/share/iproute2/rt_tables
       register: preflight_rt_table_paths
+      when: manage_networking | bool
 
     - name: Preflight — require a safe effective policy-routing registry
       ansible.builtin.assert:
@@ -292,6 +513,7 @@
           The effective iproute2 table registry must be a regular non-symlink
           at /etc/iproute2/rt_tables, or a vanilla host must provide the Rocky
           vendor registry at /usr/share/iproute2/rt_tables.
+      when: manage_networking | bool
 
     - name: Preflight — read the effective policy-routing table registry
       ansible.builtin.slurp:
@@ -300,6 +522,7 @@
              if (preflight_rt_table_paths.results[0].stat.exists | default(false))
              else '/usr/share/iproute2/rt_tables' }}
       register: preflight_rt_tables
+      when: manage_networking | bool
 
     - name: Preflight — reject routing table ID or name collisions
       ansible.builtin.command:
@@ -329,6 +552,172 @@
           - "{{ pbr_tables | to_json }}"
           - "{{ preflight_rt_tables.content | b64decode }}"
       changed_when: false
+      when: manage_networking | bool
+
+    - name: Preflight — validate bounded source-policy routing inputs
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -c
+          - |
+            import ipaddress
+            import json
+            import re
+            import sys
+
+            tables = json.loads(sys.argv[1])
+            expected = {
+                sys.argv[2]: {"src": sys.argv[4], "name": "adm"},
+                sys.argv[3]: {"src": sys.argv[5], "name": "internal"},
+            }
+            errors = []
+            if not isinstance(tables, list) or len(tables) != 2:
+                errors.append("manage_networking requires exactly the ADM and internal PBR entries")
+                tables = tables if isinstance(tables, list) else []
+            seen_devices = set()
+            seen_sources = set()
+            for table in tables:
+                try:
+                    table_id = int(table["id"])
+                    priority = int(table["priority"])
+                    name = table["name"]
+                    device = table["dev"]
+                    source = table["src"]
+                    gateway = table["gw"]
+                except (KeyError, TypeError, ValueError) as exc:
+                    errors.append(f"invalid PBR entry {table!r}: {exc}")
+                    continue
+                if not 1 <= table_id <= 252:
+                    errors.append(f"PBR table ID {table_id} is reserved or out of range")
+                if not 1000 <= priority < 32766:
+                    errors.append(f"PBR priority {priority} is reserved or out of range")
+                if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+                    errors.append(f"unsafe PBR table name {name!r}")
+                if device not in expected:
+                    errors.append(f"PBR device {device!r} is not an ADM/internal NIC")
+                elif source != expected[device]["src"]:
+                    errors.append(f"PBR source {source!r} does not match {device}")
+                elif name != expected[device]["name"]:
+                    errors.append(
+                        f"PBR device {device!r} must use fixed table name {expected[device]['name']!r}"
+                    )
+                if device in seen_devices:
+                    errors.append(f"duplicate PBR device {device!r}")
+                if source in seen_sources:
+                    errors.append(f"duplicate PBR source {source!r}")
+                seen_devices.add(device)
+                seen_sources.add(source)
+                for label, value in (("source", source), ("gateway", gateway)):
+                    try:
+                        ipaddress.ip_address(value)
+                    except ValueError:
+                        errors.append(f"invalid PBR {label} {value!r}")
+            if seen_devices != set(expected):
+                errors.append("PBR entries must cover exactly the ADM and internal NICs")
+            if errors:
+                raise SystemExit("; ".join(dict.fromkeys(errors)))
+          - "{{ pbr_tables | to_json }}"
+          - "{{ nic_adm }}"
+          - "{{ nic_internal }}"
+          - "{{ eth1_ip }}"
+          - "{{ eth2_ip }}"
+      changed_when: false
+      when: manage_networking | bool
+
+    - name: Preflight — reject live policy-table and rule collisions before replacement
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -c
+          - |
+            import ipaddress
+            import json
+            import subprocess
+            import sys
+
+            tables = json.loads(sys.argv[1])
+
+            def invoke(*args):
+                result = subprocess.run(
+                    ["ip", *args], text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError("ip " + " ".join(args) + ": " + result.stderr.strip())
+                return json.loads(result.stdout)
+
+            errors = []
+            rules = invoke("-j", "-4", "rule", "show")
+            for table in tables:
+                table_id = int(table["id"])
+                priority = int(table["priority"])
+                device = table["dev"]
+                source = table["src"]
+                gateway = table["gw"]
+                existing = invoke("-j", "-4", "route", "show", "table", str(table_id))
+                main_links = invoke("-j", "-4", "route", "show", "table", "main", "dev", device, "scope", "link")
+                allowed_link_destinations = {
+                    (route.get("dst"), route.get("dev")) for route in main_links
+                }
+                for route in existing:
+                    destination = route.get("dst", "default")
+                    if destination == "default":
+                        route_source = route.get("prefsrc") or route.get("src")
+                        if not (
+                            route.get("gateway") == gateway
+                            and route.get("dev") == device
+                            and route_source == source
+                        ):
+                            errors.append(f"table {table_id} has a non-AIGW default route")
+                    elif (route.get("dst"), route.get("dev")) not in allowed_link_destinations:
+                        errors.append(f"table {table_id} has a non-AIGW route {destination!r}")
+
+                same_priority = [rule for rule in rules if int(rule.get("priority", -1)) == priority]
+                if same_priority:
+                    if len(same_priority) != 1:
+                        errors.append(f"PBR priority {priority} has multiple live rules")
+                        continue
+                    rule = same_priority[0]
+                    actual_source = rule.get("from") or rule.get("src")
+                    actual_table = str(rule.get("table", ""))
+                    if actual_source not in {source, source + "/32"} or actual_table not in {str(table_id), table["name"]}:
+                        errors.append(f"PBR priority {priority} belongs to a different live rule")
+
+                # A different policy rule evaluated before the requested AIGW
+                # source rule can silently send management replies through a
+                # customer table. The normal priority-0 `lookup local` rule is
+                # the sole safe exception; every other earlier rule that
+                # covers the exact ADM/internal source needs an operator to
+                # resolve the overlap before this role adds a shadowed rule.
+                source_address = ipaddress.ip_address(source)
+                for rule in rules:
+                    try:
+                        rule_priority = int(rule.get("priority", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if rule_priority >= priority:
+                        continue
+                    rule_source = rule.get("from") or rule.get("src") or "all"
+                    if rule_source in {"all", "0.0.0.0/0"}:
+                        covers_source = True
+                    else:
+                        try:
+                            covers_source = source_address in ipaddress.ip_network(rule_source, strict=False)
+                        except ValueError:
+                            errors.append(f"PBR priority {rule_priority} has malformed source {rule_source!r}")
+                            continue
+                    lookup = str(rule.get("table", rule.get("lookup", "")))
+                    if covers_source and lookup not in {"local", "255"}:
+                        errors.append(
+                            f"earlier policy rule priority {rule_priority} shadows AIGW source {source}"
+                        )
+            if errors:
+                raise SystemExit("; ".join(dict.fromkeys(errors)))
+          - "{{ pbr_tables | to_json }}"
+      changed_when: false
+      when: manage_networking | bool
 
     - name: Preflight — verify policy gateways are reachable on existing NICs
       ansible.builtin.command:
@@ -339,6 +728,7 @@
       failed_when: >-
         preflight_policy_gateways.rc != 0 or
         ('dev ' ~ item.dev) not in preflight_policy_gateways.stdout
+      when: manage_networking | bool
 
     - name: Preflight — reject documentation placeholders
       ansible.builtin.assert:
@@ -350,7 +740,7 @@
           Placeholder gateway/CIDRs remain. Supply a concrete inventory
           profile before running the mutating full converge.
 
-    - name: Preflight — validate concrete Parallels lab profile
+    - name: Preflight — validate concrete lab profile
       ansible.builtin.assert:
         that:
           - nic_egress == 'enp0s5'
@@ -362,8 +752,8 @@
           - eth2_gateway == '10.20.0.2'
           - vpn_client_cidr == '10.8.10.0/24'
           - internal_cidr == '10.20.0.0/24'
-        fail_msg: The parallels-rocky9-lab profile does not match verified wiring.
-      when: deployment_profile | default('') == 'parallels-rocky9-lab'
+        fail_msg: The rocky9-lab profile does not match verified wiring.
+      when: deployment_profile | default('') == 'rocky9-lab'
 
     - name: Preflight — require encrypted backing for all sensitive state
       ansible.builtin.command:
@@ -399,6 +789,15 @@
       changed_when: false
       when: require_encrypted_state | bool
   roles:
+    # These roles are intentionally first. They perform read-only controller,
+    # Docker, and packet-filter ownership gates before SELinux can install
+    # policy packages or reboot the host; only then establish the required
+    # SELinux runtime state before routing, firewalld, or Docker can mutate an
+    # existing Rocky host.
+    - role: host_preflight
+    - role: firewall_preflight
+      when: manage_firewalld | bool
+    - role: selinux_baseline
     - role: network_routing
       when: manage_networking | bool
     - role: firewalld_zones
@@ -409,3 +808,4 @@
     - role: docker_networks
     - role: docker_stack
     - role: verify
+    - role: host_finalize

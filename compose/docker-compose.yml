@@ -144,7 +144,7 @@ services:
       # the public-name aliases to only the app planes that require them.
       net-chat:
         ipv4_address: ${TRAEFIK_INT_CHAT_IP:?TRAEFIK_INT_CHAT_IP must be set}
-        aliases: ["auth.${DOMAIN}", "api.${DOMAIN}", "chat.${DOMAIN}"]
+        aliases: ["api.${DOMAIN}"]
       net-portal:
         ipv4_address: ${TRAEFIK_INT_PORTAL_IP:?TRAEFIK_INT_PORTAL_IP must be set}
         aliases: ["auth.${DOMAIN}", "portal.${DOMAIN}"]
@@ -189,6 +189,12 @@ services:
       - ./certs:/certs:ro,z
     networks:
       net-adm: {}
+      # Open WebUI is reachable only through the ADM listener. Its OIDC
+      # discovery/token/JWKS calls use the same public issuer hostname, so the
+      # net-chat alias deliberately resolves that hostname to this full ADM
+      # Keycloak route instead of the browser-only internal auth route.
+      net-chat:
+        aliases: ["auth.${DOMAIN}", "chat.${DOMAIN}"]
       # Stable address lets oauth2-proxy trust forwarded headers from only the
       # actual reverse proxy instead of every container on the app plane.
       net-admin-app:
@@ -235,6 +241,13 @@ services:
       OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      # Lab AD accounts are not required to carry an email attribute. Use the
+      # stable OIDC username claim for identity while authorization remains
+      # enforced independently by the exact `aigw-admins` role claim.
+      OAUTH2_PROXY_OIDC_EMAIL_CLAIM: preferred_username
+      # allowed_groups otherwise makes oauth2-proxy append a non-existent
+      # `groups` scope. Roles are delivered by the explicit `roles` mapper.
+      OAUTH2_PROXY_SCOPE: openid email profile
       # Start the only configured provider directly. oauth2-proxy otherwise
       # presents its own misleading 403/sign-in interstitial at every admin
       # surface, which was reported as a broken authorization redirect.
@@ -246,6 +259,7 @@ services:
       OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
       OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER: "false"
       OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_PASS_USER_HEADERS: "false"
       # Split public/internal endpoints (skip discovery; issuer stays public):
       OAUTH2_PROXY_OIDC_ISSUER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw"
       OAUTH2_PROXY_SKIP_OIDC_DISCOVERY: "true"
@@ -261,6 +275,164 @@ services:
       timeout: 5s
       retries: 12
       start_period: 15s
+
+  oauth2-proxy-grafana:
+    <<: *hardening
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/oauth2-proxy:7.15.3@sha256:3e225291283ad41745327dcbd2e97b8a6aed461d38e9e84d1e664092b53f1158
+    image: ai-gateway/dhi-oauth2-proxy:7.15.3-probe
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: "0.5", pids: 512 }
+    environment:
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_CLIENT_ID: admin-ui
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_NAME: _aigw_grafana_oauth
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_REFRESH: 5m
+      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_GRAFANA_IP:?TRAEFIK_ADM_GRAFANA_IP must be set}/32
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_OIDC_EMAIL_CLAIM: preferred_username
+      OAUTH2_PROXY_SCOPE: openid email profile
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_REDIRECT_URL: "https://grafana.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      OAUTH2_PROXY_UPSTREAMS: http://grafana:3000
+      OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
+      OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
+      OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"
+      OAUTH2_PROXY_OIDC_ISSUER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw"
+      OAUTH2_PROXY_SKIP_OIDC_DISCOVERY: "true"
+      OAUTH2_PROXY_LOGIN_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/protocol/openid-connect/auth"
+      OAUTH2_PROXY_REDEEM_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/token"
+      OAUTH2_PROXY_OIDC_JWKS_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/certs"
+    networks:
+      net-grafana:
+        ipv4_address: ${OAUTH2_PROXY_GRAFANA_IP:?OAUTH2_PROXY_GRAFANA_IP must be set}
+      net-admin-app: {}
+    healthcheck:
+      test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:4180/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  oauth2-proxy-prometheus:
+    <<: *hardening
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/oauth2-proxy:7.15.3@sha256:3e225291283ad41745327dcbd2e97b8a6aed461d38e9e84d1e664092b53f1158
+    image: ai-gateway/dhi-oauth2-proxy:7.15.3-probe
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: "0.5", pids: 512 }
+    environment:
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_CLIENT_ID: admin-ui
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_NAME: _aigw_prometheus_oauth
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_REFRESH: 5m
+      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_OIDC_EMAIL_CLAIM: preferred_username
+      OAUTH2_PROXY_SCOPE: openid email profile
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_REDIRECT_URL: "https://prometheus.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      OAUTH2_PROXY_UPSTREAMS: http://${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}:9090
+      OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
+      OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
+      OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_OIDC_ISSUER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw"
+      OAUTH2_PROXY_SKIP_OIDC_DISCOVERY: "true"
+      OAUTH2_PROXY_LOGIN_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/protocol/openid-connect/auth"
+      OAUTH2_PROXY_REDEEM_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/token"
+      OAUTH2_PROXY_OIDC_JWKS_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/certs"
+    networks: [net-admin-app, net-observability]
+    healthcheck:
+      test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:4180/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    depends_on:
+      prometheus: { condition: service_healthy }
+
+  oauth2-proxy-vault:
+    <<: *hardening
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/oauth2-proxy:7.15.3@sha256:3e225291283ad41745327dcbd2e97b8a6aed461d38e9e84d1e664092b53f1158
+    image: ai-gateway/dhi-oauth2-proxy:7.15.3-probe
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: "0.5", pids: 512 }
+    environment:
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_CLIENT_ID: admin-ui
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_NAME: _aigw_vault_oauth
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_REFRESH: 5m
+      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_OIDC_EMAIL_CLAIM: preferred_username
+      OAUTH2_PROXY_SCOPE: openid email profile
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_REDIRECT_URL: "https://vault.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      OAUTH2_PROXY_UPSTREAMS: http://vault:8200
+      OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
+      OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
+      OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_OIDC_ISSUER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw"
+      OAUTH2_PROXY_SKIP_OIDC_DISCOVERY: "true"
+      OAUTH2_PROXY_LOGIN_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/protocol/openid-connect/auth"
+      OAUTH2_PROXY_REDEEM_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/token"
+      OAUTH2_PROXY_OIDC_JWKS_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/certs"
+    networks: [net-admin-app, net-vault]
+    healthcheck:
+      test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:4180/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    depends_on:
+      vault: { condition: service_started }
 
   # ── core ────────────────────────────────────────────────────────────
   litellm:
@@ -353,6 +525,9 @@ services:
       OAUTH_ALLOWED_ROLES: "aigw-users,aigw-developers,aigw-admins"
       OAUTH_ADMIN_ROLES: "aigw-admins"
       REQUESTS_CA_BUNDLE: /etc/ssl/certs/aigw-ca.pem   # trust internal CA for OIDC discovery
+      # Open WebUI's OIDC client is httpx/Authlib, which follows OpenSSL's
+      # trust variable rather than Requests' compatibility variable.
+      SSL_CERT_FILE: /etc/ssl/certs/aigw-ca.pem
       # Per solution-map FAQ: Open WebUI's own API keys stay disabled —
       # gateway keys come from dev-portal only.
       ENABLE_API_KEYS: "false"
@@ -424,10 +599,17 @@ services:
       # resolves env vars at --import-realm, so no client secret lives in git.
       WEBUI_OIDC_CLIENT_SECRET: ${WEBUI_OIDC_CLIENT_SECRET:?WEBUI_OIDC_CLIENT_SECRET must be set}
       PORTAL_OIDC_CLIENT_SECRET: ${PORTAL_OIDC_CLIENT_SECRET:?PORTAL_OIDC_CLIENT_SECRET must be set}
+      ADMIN_PORTAL_OIDC_CLIENT_SECRET: ${ADMIN_PORTAL_OIDC_CLIENT_SECRET:?ADMIN_PORTAL_OIDC_CLIENT_SECRET must be set}
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
     volumes:
       - ./keycloak/realms:/opt/keycloak/data/import:ro,Z
-    networks: [net-chat, net-portal, net-admin-app, net-db-keycloak, net-metrics]
+    networks:
+      net-chat: {}
+      net-portal: {}
+      net-admin-app:
+        aliases: [keycloak-adm]
+      net-db-keycloak: {}
+      net-metrics: {}
     healthcheck:
       test:
         - CMD
@@ -453,6 +635,9 @@ services:
       # builds fetch pinned dependencies through the host namespace so a
       # transient BuildKit bridge never requires a firewall exception.
       network: host
+    # The admin portal uses the same reviewed immutable image but a distinct
+    # ASGI app, OIDC client, cookie secret, container, and Docker network.
+    image: ai-gateway/portal:1
     read_only: true
     tmpfs: [/tmp]
     deploy:
@@ -467,7 +652,9 @@ services:
       LITELLM_URL: http://litellm:4000
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
       ROTATOR_URL: http://key-rotator:8080
-      ROTATOR_INTERNAL_TOKEN: ${ROTATOR_INTERNAL_TOKEN:?ROTATOR_INTERNAL_TOKEN must be set}
+      # Least-privilege token: key-rotator accepts it only for the subject's
+      # live project-membership read, never for admin/rotation mutations.
+      ROTATOR_INTERNAL_TOKEN: ${PORTAL_IDENTITY_TOKEN:?PORTAL_IDENTITY_TOKEN must be set}
       # Uvicorn must trust only the portal edge so it reconstructs the HTTPS
       # browser callback without accepting spoofed forwarding headers from
       # arbitrary application peers.
@@ -491,6 +678,62 @@ services:
     depends_on:
       litellm: { condition: service_healthy }
       keycloak: { condition: service_healthy }
+
+  admin-portal:
+    <<: *hardening
+    build:
+      context: ./services/dev-portal
+      network: host
+    image: ai-gateway/portal:1
+    command:
+      - /opt/venv/bin/python
+      - -m
+      - uvicorn
+      - app.main:admin_app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --workers
+      - "1"
+      - --no-server-header
+      - --no-access-log
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.0", pids: 512 }
+    environment:
+      OIDC_ISSUER: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw"
+      OIDC_INTERNAL_ISSUER: "http://keycloak:8080/realms/aigw"
+      OIDC_CLIENT_ID: admin-portal
+      OIDC_CLIENT_SECRET: ${ADMIN_PORTAL_OIDC_CLIENT_SECRET:?ADMIN_PORTAL_OIDC_CLIENT_SECRET must be set}
+      SESSION_SECRET: ${ADMIN_PORTAL_SESSION_SECRET:?ADMIN_PORTAL_SESSION_SECRET must be set}
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
+      ROTATOR_URL: http://key-rotator:8080
+      ROTATOR_INTERNAL_TOKEN: ${ROTATOR_INTERNAL_TOKEN:?ROTATOR_INTERNAL_TOKEN must be set}
+      FORWARDED_ALLOW_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}
+      PUBLIC_API_BASE: "https://api.${DOMAIN:?DOMAIN must be set}"
+      ADMIN_ROLE: aigw-admins
+      ADMIN_STEP_UP_SECONDS: "300"
+    networks: [net-admin-app, net-telemetry]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      litellm: { condition: service_healthy }
+      keycloak: { condition: service_healthy }
+      key-rotator: { condition: service_healthy }
 
   # ── egress (eth0) + rotation ────────────────────────────────────────
   envoy-egress:
@@ -541,6 +784,7 @@ services:
       WIF_KEYCLOAK_PUBLIC_URL: https://idp.wif-a.example.invalid
       EGRESS_BASE: http://envoy-egress:8080
       ROTATOR_INTERNAL_TOKEN: ${ROTATOR_INTERNAL_TOKEN:?ROTATOR_INTERNAL_TOKEN must be set}
+      PORTAL_IDENTITY_TOKEN: ${PORTAL_IDENTITY_TOKEN:?PORTAL_IDENTITY_TOKEN must be set}
       # The portal invokes the rotator's constrained setup controller. The
       # temporary master secret never reaches the portal or browser.
       KC_BOOTSTRAP_ADMIN_CLIENT_ID: aigw-bootstrap-controller
@@ -551,10 +795,16 @@ services:
       IDENTITY_REALM: aigw
       IDENTITY_MANAGED_ROOT_GROUP: aigw-managed
       IDENTITY_CONTROLLER_CLIENT_ID: aigw-identity-controller
+      AIGW_DOMAIN: ${DOMAIN:?DOMAIN must be set}
+      WEBUI_OIDC_CLIENT_SECRET: ${WEBUI_OIDC_CLIENT_SECRET:?WEBUI_OIDC_CLIENT_SECRET must be set}
+      PORTAL_OIDC_CLIENT_SECRET: ${PORTAL_OIDC_CLIENT_SECRET:?PORTAL_OIDC_CLIENT_SECRET must be set}
+      ADMIN_PORTAL_OIDC_CLIENT_SECRET: ${ADMIN_PORTAL_OIDC_CLIENT_SECRET:?ADMIN_PORTAL_OIDC_CLIENT_SECRET must be set}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
+      RETAIN_BOOTSTRAP_ADMIN_USER: ${RETAIN_BOOTSTRAP_ADMIN_USER:-false}
       KC_CLIENT_ASSERTION_KEY_VAULT_PATH: ${KC_CLIENT_ASSERTION_KEY_VAULT_PATH:-ai-gateway/anthropic-wif-client-key}
       ANTHROPIC_WIF_ALLOW_INSECURE_CLIENT_SECRET: "false"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
-    networks: [net-portal, net-vendor, net-vault, net-db-rotator, net-telemetry]
+    networks: [net-portal, net-admin-app, net-vendor, net-vault, net-db-rotator, net-telemetry]
     healthcheck:
       test:
         - CMD
@@ -736,7 +986,7 @@ services:
         BASE_IMAGE: dhi.io/alloy:1.17.1@sha256:52060718ec1670736178717a0ef2e66aa9f87eb1d515d9c49aacf4300bc1bfb1
     image: ai-gateway/dhi-alloy:1.17.1-probe
     # Narrow exception: Alloy must tail Docker's runtime-owned json logs.
-    # Relabeling /var/lib/docker is forbidden, so this one non-root, capless,
+    # Relabeling Docker's data root is forbidden, so this one non-root, capless,
     # read-only service disables only its SELinux process label. Host ACLs and
     # the absence of the Docker socket remain the access boundary.
     security_opt: [no-new-privileges:true, label=disable]
@@ -764,7 +1014,7 @@ services:
       - ./certs/ca.pem:/etc/ssl/certs/aigw-ca.pem:ro
       - alloy_data:/var/lib/alloy
       # Read-only Docker json-file ingestion; never mount /var/run/docker.sock.
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ${DOCKER_DATA_ROOT:?DOCKER_DATA_ROOT must be set}/containers:/var/lib/docker/containers:ro
       - vault_audit:/var/log/aigw/vault:ro
     networks:
       net-telemetry:
@@ -976,6 +1226,19 @@ services:
       GF_SERVER_ROOT_URL: "https://grafana.${DOMAIN:?DOMAIN must be set}"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # oauth2-proxy is the sole trusted browser authenticator.  Grafana trusts
+      # its fixed private source address, auto-provisions only users that have
+      # already passed the aigw-admins gate, and exposes no second login form.
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-Forwarded-Preferred-Username
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_AUTH_PROXY_SYNC_TTL: "5"
+      GF_AUTH_PROXY_WHITELIST: ${OAUTH2_PROXY_GRAFANA_IP:?OAUTH2_PROXY_GRAFANA_IP must be set}
+      GF_AUTH_PROXY_HEADERS: "Name:X-Forwarded-Preferred-Username Email:X-Forwarded-Email"
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
       GF_SECURITY_COOKIE_SECURE: "true"
       GF_SECURITY_COOKIE_SAMESITE: strict
       # DHI stays deterministic/offline: do not install background plugins.

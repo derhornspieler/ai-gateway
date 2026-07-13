@@ -26,14 +26,14 @@ STACK_DIR="${STACK_DIR:-/opt/ai-gateway}"
 cd "$STACK_DIR"
 compose=("$STACK_DIR/scripts/aigw-compose.sh")
 DEPLOYMENT_PROFILE="$(grep -E '^DEPLOYMENT_PROFILE=' .env | cut -d= -f2- || true)"
-if [[ "$DEPLOYMENT_PROFILE" != "parallels-rocky9-lab" ]] &&
+if [[ "$DEPLOYMENT_PROFILE" != "rocky9-lab" ]] &&
    [[ "${AIGW_ALLOW_INSECURE_VAULT_BOOTSTRAP:-}" != "I_UNDERSTAND_THIS_IS_LAB_ONLY" ]]; then
   cat >&2 <<'EOF'
 FATAL: vault-bootstrap.sh is deliberately a lab/test bootstrap (1-of-1
 unseal, generated test root, plaintext isolated listener). It is not the
 customer Vault initialization path. Use the reviewed production ceremony, or
 set AIGW_ALLOW_INSECURE_VAULT_BOOTSTRAP=I_UNDERSTAND_THIS_IS_LAB_ONLY only for
-an explicitly disposable non-Parallels test VM.
+an explicitly disposable, non-production test VM.
 EOF
   exit 1
 fi

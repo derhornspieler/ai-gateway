@@ -44,7 +44,8 @@ def decoded_session(client) -> dict:
         (
             cookie.value
             for cookie in reversed(list(client.cookies.jar))
-            if cookie.name == "session" and cookie.domain == "portal.test"
+            if cookie.name == "aigw_portal_session"
+            and cookie.domain == "portal.test"
         ),
         None,
     )
@@ -225,7 +226,6 @@ def test_existing_active_key_blocks_generation(client, set_session, monkeypatch)
 
 
 def test_project_identifier_cannot_authorize_another_project(monkeypatch):
-    monkeypatch.setattr(settings, "key_projects", "ai-gateway,other-project")
     inventory = main._portal_key_inventory(
         [
             portal_key(
@@ -235,6 +235,7 @@ def test_project_identifier_cannot_authorize_another_project(monkeypatch):
             )
         ],
         "owner-sub",
+        ("ai-gateway", "other-project"),
     )
 
     assert (
@@ -325,7 +326,7 @@ def test_deactivation_then_regeneration(client, set_session, monkeypatch):
     )
     assert create.status_code == 201
     assert "sk-new-once" in create.text
-    inventory = main._portal_key_inventory(state, owner)
+    inventory = main._portal_key_inventory(state, owner, ("ai-gateway",))
     assert len(main._active_project_keys(inventory, "ai-gateway")) == 1
 
 
@@ -358,8 +359,12 @@ def test_two_concurrent_generations_create_only_one(monkeypatch):
 
     async def race():
         return await asyncio.gather(
-            main._generate_project_key(owner, "only", "ai-gateway"),
-            main._generate_project_key(owner, "second", "ai-gateway"),
+            main._generate_project_key(
+                owner, "only", "ai-gateway", ("ai-gateway",)
+            ),
+            main._generate_project_key(
+                owner, "second", "ai-gateway", ("ai-gateway",)
+            ),
             return_exceptions=True,
         )
 
@@ -370,7 +375,7 @@ def test_two_concurrent_generations_create_only_one(monkeypatch):
     assert (
         sum(isinstance(result, main.ActiveProjectKeyExists) for result in results) == 1
     )
-    inventory = main._portal_key_inventory(state, owner)
+    inventory = main._portal_key_inventory(state, owner, ("ai-gateway",))
     assert len(main._active_project_keys(inventory, "ai-gateway")) == 1
 
 
@@ -421,13 +426,15 @@ def test_malformed_generate_response_deactivates_unverified_candidate(monkeypatc
     monkeypatch.setattr(litellm_client, "key_deactivate", key_deactivate)
 
     async def generate():
-        return await main._generate_project_key(owner, "broken", "ai-gateway")
+        return await main._generate_project_key(
+            owner, "broken", "ai-gateway", ("ai-gateway",)
+        )
 
     with pytest.raises(litellm_client.LiteLLMError, match="no bounded plaintext"):
         asyncio.run(generate())
 
     assert deactivated == ["unverified-hash"]
-    inventory = main._portal_key_inventory(state, owner)
+    inventory = main._portal_key_inventory(state, owner, ("ai-gateway",))
     active = main._active_project_keys(inventory, "ai-gateway")
     assert [entry["token"] for entry in active] == ["concurrent-operator-hash"]
 
@@ -489,7 +496,7 @@ def test_committed_key_after_generate_disconnect_is_deactivated(monkeypatch, cap
 
     async def generate():
         return await main._generate_project_key(
-            owner, "lost-response", "ai-gateway"
+            owner, "lost-response", "ai-gateway", ("ai-gateway",)
         )
 
     with pytest.raises(litellm_client.LiteLLMError, match="could not reach"):
@@ -535,7 +542,9 @@ def test_ambiguous_generate_cleanup_refuses_unbounded_candidate_set(
     monkeypatch.setattr(litellm_client, "key_deactivate", key_deactivate)
 
     async def generate():
-        return await main._generate_project_key(owner, "flood", "ai-gateway")
+        return await main._generate_project_key(
+            owner, "flood", "ai-gateway", ("ai-gateway",)
+        )
 
     with pytest.raises(litellm_client.LiteLLMError, match="could not reach"):
         asyncio.run(generate())
@@ -586,19 +595,21 @@ def test_post_generate_duplicate_is_cleaned_up_without_disclosure(monkeypatch):
     monkeypatch.setattr(litellm_client, "key_deactivate", key_deactivate)
 
     async def generate():
-        return await main._generate_project_key(owner, "ours", "ai-gateway")
+        return await main._generate_project_key(
+            owner, "ours", "ai-gateway", ("ai-gateway",)
+        )
 
     with pytest.raises(litellm_client.LiteLLMError, match="one-active-key"):
         asyncio.run(generate())
 
     assert deactivated == ["sk-unverified"]
-    inventory = main._portal_key_inventory(state, owner)
+    inventory = main._portal_key_inventory(state, owner, ("ai-gateway",))
     active = main._active_project_keys(inventory, "ai-gateway")
     assert [entry["token"] for entry in active] == ["racer-hash"]
 
 
 def test_admin_template_contains_injection_and_cache_defenses(
-    client, set_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch
 ):
     malicious_vendor = "x');alert(document.domain);('"
     malicious_history = "<img src=x onerror=alert(1)>"
@@ -620,9 +631,9 @@ def test_admin_template_contains_injection_and_cache_defenses(
         raise AssertionError(path)
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
-    set_session({"user": portal_user(roles=[settings.admin_role])})
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
 
-    response = client.get("/admin")
+    response = admin_client.get("/admin")
 
     assert response.status_code == 200
     assert malicious_vendor not in response.text
@@ -637,7 +648,9 @@ def test_admin_template_contains_injection_and_cache_defenses(
     assert nonce and f'nonce="{nonce.group(1)}"' in response.text
 
 
-def test_invalid_vendor_path_never_reaches_rotator(client, set_session, monkeypatch):
+def test_invalid_vendor_path_never_reaches_rotator(
+    admin_client, set_admin_session, monkeypatch
+):
     called = False
 
     async def rotator_post(_path):
@@ -652,9 +665,11 @@ def test_invalid_vendor_path_never_reaches_rotator(client, set_session, monkeypa
     monkeypatch.setattr(main, "_rotator_post", rotator_post)
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     csrf = "c" * 43
-    set_session({"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf})
+    set_admin_session(
+        {"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf}
+    )
 
-    response = client.post(
+    response = admin_client.post(
         "/admin/rotate/bad%24vendor",
         data={"csrf_token": csrf},
     )
@@ -712,7 +727,7 @@ def test_rotator_client_does_not_inherit_proxy_or_follow_redirects(monkeypatch):
 
 
 def test_identity_mutation_requires_fresh_keycloak_step_up(
-    client, set_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch
 ):
     called = False
 
@@ -728,9 +743,11 @@ def test_identity_mutation_requires_fresh_keycloak_step_up(
     monkeypatch.setattr(main, "_rotator_post", rotator_post)
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     csrf = "c" * 43
-    set_session({"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf})
+    set_admin_session(
+        {"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf}
+    )
 
-    response = client.post(
+    response = admin_client.post(
         "/admin/identity/groups",
         data={
             "name": "platform-team",
@@ -746,7 +763,7 @@ def test_identity_mutation_requires_fresh_keycloak_step_up(
 
 
 def test_recent_step_up_allows_only_allowlisted_group_capabilities(
-    client, set_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch
 ):
     calls = []
 
@@ -766,9 +783,9 @@ def test_recent_step_up_allows_only_allowlisted_group_capabilities(
         "csrf_token": csrf,
         "admin_reauth_at": int(time.time()),
     }
-    set_session(base_session)
+    set_admin_session(base_session)
 
-    rejected = client.post(
+    rejected = admin_client.post(
         "/admin/identity/groups",
         data={
             "name": "bad-team",
@@ -782,8 +799,8 @@ def test_recent_step_up_allows_only_allowlisted_group_capabilities(
 
     # The first response re-signed the session with a flash; restore a clean,
     # fresh marker and submit an allowlisted capability.
-    set_session(base_session)
-    accepted = client.post(
+    set_admin_session(base_session)
+    accepted = admin_client.post(
         "/admin/identity/groups",
         data={
             "name": "platform-team",
@@ -805,7 +822,7 @@ def test_recent_step_up_allows_only_allowlisted_group_capabilities(
 
 
 def test_revoked_admin_cookie_cannot_mutate_or_restore_membership(
-    client, set_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch
 ):
     called = False
 
@@ -821,7 +838,7 @@ def test_revoked_admin_cookie_cannot_mutate_or_restore_membership(
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     monkeypatch.setattr(main, "_rotator_put", rotator_put)
     csrf = "c" * 43
-    set_session(
+    set_admin_session(
         {
             "user": portal_user(subject="revoked-admin", roles=[settings.admin_role]),
             "csrf_token": csrf,
@@ -829,7 +846,7 @@ def test_revoked_admin_cookie_cannot_mutate_or_restore_membership(
         }
     )
 
-    response = client.post(
+    response = admin_client.post(
         "/admin/identity/groups/admins/members",
         data={"user_id": "revoked-admin", "csrf_token": csrf},
         follow_redirects=False,
@@ -837,11 +854,11 @@ def test_revoked_admin_cookie_cannot_mutate_or_restore_membership(
 
     assert response.status_code == 403
     assert called is False
-    assert "session=" in response.headers.get("set-cookie", "")
+    assert "aigw_admin_session=" in response.headers.get("set-cookie", "")
 
 
 def test_revoked_admin_cookie_cannot_change_rotation_controls(
-    client, set_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch
 ):
     called = False
 
@@ -857,14 +874,14 @@ def test_revoked_admin_cookie_cannot_change_rotation_controls(
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     monkeypatch.setattr(main, "_rotator_post", rotator_post)
     csrf = "c" * 43
-    set_session(
+    set_admin_session(
         {
             "user": portal_user(subject="revoked-admin", roles=[settings.admin_role]),
             "csrf_token": csrf,
         }
     )
 
-    response = client.post(
+    response = admin_client.post(
         "/admin/rotate/openai",
         data={"csrf_token": csrf},
         follow_redirects=False,
@@ -875,7 +892,7 @@ def test_revoked_admin_cookie_cannot_change_rotation_controls(
 
 
 def test_revoked_admin_cookie_cannot_read_admin_control_plane(
-    client, set_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch
 ):
     requested: list[str] = []
 
@@ -886,7 +903,7 @@ def test_revoked_admin_cookie_cannot_read_admin_control_plane(
         raise AssertionError("revoked admin reached sensitive control-plane reads")
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
-    set_session(
+    set_admin_session(
         {
             "user": portal_user(
                 subject="revoked-admin", roles=[settings.admin_role]
@@ -894,15 +911,21 @@ def test_revoked_admin_cookie_cannot_read_admin_control_plane(
         }
     )
 
-    response = client.get("/admin", follow_redirects=False)
+    response = admin_client.get("/admin", follow_redirects=False)
 
     assert response.status_code == 403
     assert requested == ["/identity/authorization/revoked-admin"]
-    assert "session=" in response.headers.get("set-cookie", "")
+    assert "aigw_admin_session=" in response.headers.get("set-cookie", "")
+
+
+def test_user_and_admin_route_surfaces_are_disjoint(client, admin_client):
+    assert client.get("/admin", follow_redirects=False).status_code == 404
+    assert admin_client.get("/keys", follow_redirects=False).status_code == 404
+    assert admin_client.get("/snippets", follow_redirects=False).status_code == 404
 
 
 def test_admin_reauth_requests_prompt_login_and_max_age_zero(
-    client, set_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch
 ):
     captured = {}
 
@@ -918,9 +941,11 @@ def test_admin_reauth_requests_prompt_login_and_max_age_zero(
 
     monkeypatch.setattr(main.auth, "ensure_oauth_client", ensure_client)
     monkeypatch.setattr(main.auth, "oauth", SimpleNamespace(keycloak=FakeKeycloak()))
-    set_session({"user": portal_user(subject="admin-sub", roles=[settings.admin_role])})
+    set_admin_session(
+        {"user": portal_user(subject="admin-sub", roles=[settings.admin_role])}
+    )
 
-    response = client.get("/admin/reauth", follow_redirects=False)
+    response = admin_client.get("/admin/reauth", follow_redirects=False)
 
     assert response.status_code == 302
     assert captured["kwargs"] == {"prompt": "login", "max_age": 0}
@@ -928,8 +953,8 @@ def test_admin_reauth_requests_prompt_login_and_max_age_zero(
     assert captured["redirect_uri"].endswith("/auth/callback")
 
 
-def test_identity_upstream_ids_are_sanitized_before_active_controls(
-    client, set_session, monkeypatch
+def test_identity_upstream_group_ambiguity_fails_closed(
+    admin_client, set_admin_session, monkeypatch
 ):
     async def rotator_get(path):
         if path == "/identity/authorization/subject-123":
@@ -969,12 +994,13 @@ def test_identity_upstream_ids_are_sanitized_before_active_controls(
         raise AssertionError(path)
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
-    set_session({"user": portal_user(roles=[settings.admin_role])})
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
 
-    response = client.get("/admin")
+    response = admin_client.get("/admin")
 
     assert response.status_code == 200
     assert "../../admin" not in response.text
     assert "malicious" not in response.text
-    assert "safe-group-id" in response.text
+    assert "safe-group-id" not in response.text
+    assert "Could not reach the identity controller" in response.text
     assert "PRIVATE KEY" not in response.text

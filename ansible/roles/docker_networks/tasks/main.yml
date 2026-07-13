@@ -24,9 +24,191 @@
   changed_when: false
   when: manage_firewalld | bool
 
+# community.docker 5.x removes and recreates a named network when its
+# configuration differs.  That removal force-disconnects attached containers,
+# so inspect the live daemon again after it starts and immediately before the
+# module runs.  This is intentionally read-only and repeats the full-host
+# ownership boundary: no foreign workload, unexpected network, attachment, or
+# same-name network drift may be "fixed" destructively.
+- name: Preflight — reject live Docker network drift before reconciliation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/env
+      - -u
+      - DOCKER_CONFIG
+      - -u
+      - DOCKER_CONTEXT
+      - -u
+      - DOCKER_HOST
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import ipaddress
+        import re
+        import subprocess
+        import sys
+
+        project, data_root, stack_dir, expected_text, expected_volumes_text, has_marker, explicit_adoption = sys.argv[1:]
+        expected_entries = json.loads(expected_text)
+        expected_volumes = set(json.loads(expected_volumes_text))
+        expected = {
+            entry["name"]: {
+                **entry,
+                "iprange": entry["subnet"].replace(".0/24", ".128/25"),
+            }
+            for entry in expected_entries
+        }
+
+        def invoke(*args):
+            result = subprocess.run(
+                ["docker", "--host", "unix:///run/docker.sock", *args], text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+            if result.returncode:
+                raise RuntimeError("docker " + " ".join(args) + ": " + result.stderr.strip())
+            return result.stdout
+
+        errors = []
+        try:
+            info = json.loads(invoke("info", "--format=json"))
+            if info.get("DockerRootDir") != data_root:
+                errors.append(
+                    f"DockerRootDir={info.get('DockerRootDir')!r} is not the reviewed root {data_root!r}"
+                )
+
+            ids = invoke("ps", "-aq", "--no-trunc").split()
+            containers = json.loads(invoke("inspect", *ids)) if ids else []
+            project_ids = set()
+            for container in containers:
+                labels = (container.get("Config") or {}).get("Labels") or {}
+                identifier = container.get("Id", "")
+                valid_project_labels = (
+                    labels.get("com.docker.compose.project") == project
+                    and labels.get("com.docker.compose.project.working_dir") == stack_dir
+                    and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", labels.get("com.docker.compose.service", ""))
+                    and re.fullmatch(r"[0-9a-f]{64}", labels.get("com.docker.compose.config-hash", ""))
+                )
+                if valid_project_labels:
+                    project_ids.add(identifier)
+                else:
+                    errors.append(f"foreign Docker container {identifier or '?'}")
+
+            network_ids = invoke("network", "ls", "-q").split()
+            networks = json.loads(invoke("network", "inspect", *network_ids)) if network_ids else []
+            actual_by_name = {network.get("Name", ""): network for network in networks}
+            links_result = subprocess.run(
+                ["ip", "-j", "link", "show"], text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+            if links_result.returncode:
+                raise RuntimeError("ip -j link show: " + links_result.stderr.strip())
+            linux_links = {
+                link.get("ifname") for link in json.loads(links_result.stdout)
+                if link.get("ifname")
+            }
+            managed_subnets = [
+                ipaddress.ip_network(entry["subnet"], strict=True)
+                for entry in expected.values()
+            ]
+            bridge = actual_by_name.get("bridge")
+            if bridge is not None:
+                for entry in ((bridge.get("IPAM") or {}).get("Config") or []):
+                    subnet_text = entry.get("Subnet")
+                    if not subnet_text:
+                        continue
+                    subnet = ipaddress.ip_network(subnet_text, strict=True)
+                    if any(subnet.overlaps(managed) for managed in managed_subnets):
+                        errors.append(f"default Docker bridge subnet {subnet} overlaps a managed AIGW subnet")
+            for pool in info.get("DefaultAddressPools") or []:
+                base = pool.get("Base") or pool.get("base")
+                if not base:
+                    errors.append("Docker default address pool is malformed")
+                    continue
+                pool_network = ipaddress.ip_network(base, strict=True)
+                if any(pool_network.overlaps(managed) for managed in managed_subnets):
+                    errors.append(f"Docker default address pool {pool_network} overlaps a managed AIGW subnet")
+            for name in actual_by_name:
+                if name not in {"bridge", "host", "none"} and name not in expected:
+                    errors.append(f"foreign Docker network {name}")
+
+            volume_ids = invoke("volume", "ls", "-q").split()
+            volumes = json.loads(invoke("volume", "inspect", *volume_ids)) if volume_ids else []
+            expected_volume_names = {project + "_" + name for name in expected_volumes}
+            retained_expected_volumes = []
+            for volume in volumes:
+                volume_name = volume.get("Name", "")
+                if volume_name not in expected_volume_names:
+                    errors.append(f"foreign Docker volume {volume_name or '?'}")
+                    continue
+                logical_name = volume_name[len(project) + 1:]
+                labels = volume.get("Labels") or {}
+                if (
+                    labels.get("com.docker.compose.project") != project or
+                    labels.get("com.docker.compose.volume") != logical_name
+                ):
+                    errors.append(f"Compose volume {volume_name} lacks the reviewed ownership labels")
+                retained_expected_volumes.append(volume_name)
+            if retained_expected_volumes and has_marker != "true" and explicit_adoption != "true":
+                errors.append("unmarked host retains Compose-named Docker volumes")
+
+            for name, wanted in expected.items():
+                network = actual_by_name.get(name)
+                desired = {
+                    "driver": "bridge",
+                    "internal": bool(wanted["internal"]),
+                    "ipv6": False,
+                    "bridge": wanted["bridge"],
+                    "subnet": wanted["subnet"],
+                    "iprange": wanted["iprange"],
+                }
+                actual = None
+                if network is not None:
+                    config = (network.get("IPAM") or {}).get("Config") or []
+                    subnet = next((entry.get("Subnet") for entry in config if entry.get("Subnet")), None)
+                    iprange = next((entry.get("IPRange") for entry in config if entry.get("IPRange")), None)
+                    options = network.get("Options") or {}
+                    actual = {
+                        "driver": network.get("Driver"),
+                        "internal": bool(network.get("Internal")),
+                        "ipv6": bool(network.get("EnableIPv6")),
+                        "bridge": options.get("com.docker.network.bridge.name"),
+                        "subnet": subnet,
+                        "iprange": iprange,
+                    }
+                    if actual != desired:
+                        errors.append(f"named Docker network {name} differs from the reviewed contract")
+                    for identifier in (network.get("Containers") or {}):
+                        if identifier not in project_ids:
+                            errors.append(f"foreign container {identifier} is attached to {name}")
+                bridge_name = wanted["bridge"]
+                if bridge_name in linux_links and actual != desired:
+                    errors.append(
+                        f"Linux interface {bridge_name} is not the exact reviewed Docker bridge for {name}"
+                    )
+                elif bridge_name not in linux_links and actual == desired:
+                    errors.append(f"reviewed Docker network {name} is missing Linux bridge {bridge_name}")
+        except Exception as exc:
+            errors.append(str(exc))
+
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - "{{ compose_project_name }}"
+      - "{{ docker_data_root }}"
+      - "{{ stack_dir }}"
+      - "{{ docker_networks | to_json }}"
+      - "{{ aigw_expected_docker_volumes | to_json }}"
+      - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_dedicated_docker_host | bool) else 'false' }}"
+  changed_when: false
+
 - name: Create docker networks
   community.docker.docker_network:
     name: "{{ item.name }}"
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     driver: bridge
     internal: "{{ item.internal }}"
     enable_ipv6: false

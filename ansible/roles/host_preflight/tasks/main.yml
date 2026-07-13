@@ -1,0 +1,1151 @@
+---
+# This role is deliberately read-only.  The full stack owns daemon-wide Docker
+# policy and all Docker bridge egress, so it must never be applied to a host
+# carrying an unrelated workload.  A clean existing Rocky VM and a previous
+# AI Gateway-only converge are valid inputs; ambiguous Docker state is not.
+
+- name: Preflight — prove a fresh key-only controller SSH path before firewall mutation
+  ansible.builtin.command:
+    argv: "{{ aigw_controller_ssh_argv + ['/usr/bin/bash', '-c', 'sudo -n true && exec /usr/bin/printenv SSH_CONNECTION'] }}"
+  vars:
+    aigw_controller_ssh_argv: >-
+      {{
+        ['ssh', '-p', ansible_port | default(22) | string]
+        + (
+            ['-i', ansible_ssh_private_key_file]
+            if ansible_ssh_private_key_file is defined
+              and ansible_ssh_private_key_file | length > 0
+            else []
+          )
+        + [
+            '-o', 'BatchMode=yes',
+            '-o', 'PasswordAuthentication=no',
+            '-o', 'KbdInteractiveAuthentication=no',
+            '-o', 'PreferredAuthentications=publickey',
+            '-o', 'StrictHostKeyChecking=yes',
+            '-o', 'ConnectTimeout=10',
+            ansible_user ~ '@' ~ ansible_host
+          ]
+      }}
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: aigw_controller_ssh_transport
+
+- name: Preflight — require the controller to enter through the future ADM SSH rule
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import ipaddress
+        import sys
+
+        fields = sys.argv[1].split()
+        if len(fields) != 4:
+            raise SystemExit("fresh SSH transport did not yield four SSH_CONNECTION fields")
+        client, client_port, server, server_port = fields
+        try:
+            client_address = ipaddress.ip_address(client)
+            allowed = ipaddress.ip_network(sys.argv[2], strict=True)
+            expected_port = int(sys.argv[5])
+            int(client_port)
+            actual_port = int(server_port)
+        except ValueError as exc:
+            raise SystemExit(f"invalid SSH transport tuple: {exc}") from exc
+        if client_address not in allowed:
+            raise SystemExit(
+                f"controller source {client_address} is outside ADM management CIDR {allowed}"
+            )
+        if server != sys.argv[3]:
+            raise SystemExit(
+                f"controller reaches {server}, not configured ADM address {sys.argv[3]}"
+            )
+        if actual_port != expected_port:
+            raise SystemExit(
+                f"controller reaches SSH port {actual_port}, not managed firewall port {expected_port}"
+            )
+        if int(sys.argv[4]) != expected_port:
+            raise SystemExit("inventory ansible_port and managed SSH firewall port disagree")
+      - "{{ aigw_controller_ssh_transport.stdout | trim }}"
+      - "{{ vpn_client_cidr }}"
+      - "{{ eth1_ip }}"
+      - "{{ ansible_port | default(22) | string }}"
+      - "{{ aigw_management_ssh_port | string }}"
+  changed_when: false
+
+- name: Preflight — inspect Docker CLI availability without starting Docker
+  ansible.builtin.command:
+    argv: [/usr/bin/bash, -c, 'command -v docker']
+  register: aigw_docker_cli
+  changed_when: false
+  failed_when: false
+
+- name: Preflight — inspect Docker daemon state without starting it
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/env
+      - -u
+      - DOCKER_CONFIG
+      - -u
+      - DOCKER_CONTEXT
+      - -u
+      - DOCKER_HOST
+      - "{{ aigw_docker_cli.stdout | trim }}"
+      - --host
+      - unix:///run/docker.sock
+      - info
+      - --format=json
+  register: aigw_docker_info
+  changed_when: false
+  failed_when: false
+  when: aigw_docker_cli.rc == 0
+
+- name: Preflight — record whether the local Docker daemon is active
+  ansible.builtin.set_fact:
+    aigw_docker_daemon_active: >-
+      {{ (aigw_docker_cli.rc == 0) and (aigw_docker_info.rc | default(1) == 0) }}
+
+# Docker plugins are daemon-wide code/configuration. A dedicated gateway host
+# models no plugins, so even a disabled retained plugin is an adoption hazard
+# rather than harmless empty Docker state.
+- name: Preflight — inventory installed Docker plugins on the local daemon
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/env
+      - -u
+      - DOCKER_CONFIG
+      - -u
+      - DOCKER_CONTEXT
+      - -u
+      - DOCKER_HOST
+      - "{{ aigw_docker_cli.stdout | trim }}"
+      - --host
+      - unix:///run/docker.sock
+      - plugin
+      - ls
+      - --format
+      - "{{ '{{json .}}' }}"
+  register: aigw_docker_plugins
+  changed_when: false
+  when: aigw_docker_daemon_active | bool
+
+- name: Preflight — require the dedicated Docker host to have no plugins
+  ansible.builtin.assert:
+    that:
+      - aigw_docker_plugins.stdout_lines | reject('equalto', '') | list | length == 0
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: the dedicated AI Gateway Docker host
+      must not retain Docker plugins. Remove/review every plugin before this
+      platform takes ownership of daemon-wide Docker policy.
+  when: aigw_docker_daemon_active | bool
+
+- name: Preflight — determine whether a Docker systemd unit exists without starting it
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - docker.service
+      - --property=LoadState
+      - --value
+  register: aigw_docker_systemd_load_state
+  changed_when: false
+  failed_when: false
+
+- name: Preflight — record whether a Docker systemd unit is installed
+  ansible.builtin.set_fact:
+    aigw_docker_systemd_unit_installed: >-
+      {{ (aigw_docker_systemd_load_state.rc | default(1) == 0) and
+         (aigw_docker_systemd_load_state.stdout | trim == 'loaded') }}
+
+- name: Preflight — reject local or transient Docker systemd overrides before adoption
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import stat
+
+        errors = []
+        for unit_path in (
+            "/etc/systemd/system/docker.service",
+            "/run/systemd/system/docker.service",
+        ):
+            try:
+                metadata = os.lstat(unit_path)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                errors.append(f"unsafe Docker systemd unit override {unit_path}")
+            else:
+                errors.append(f"unreviewed Docker systemd unit override {unit_path}")
+
+        for directory in (
+            "/etc/systemd/system/docker.service.d",
+            "/run/systemd/system/docker.service.d",
+        ):
+            try:
+                metadata = os.lstat(directory)
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or
+                    metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022):
+                errors.append(f"unsafe Docker systemd drop-in directory {directory}")
+                continue
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        child = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        errors.append(f"uninspectable Docker systemd drop-in {entry.path}")
+                        continue
+                    if (stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or
+                            child.st_uid != 0 or child.st_gid != 0 or child.st_mode & 0o022):
+                        errors.append(f"unsafe Docker systemd drop-in {entry.path}")
+                    else:
+                        errors.append(f"unreviewed Docker systemd drop-in {entry.path}")
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+  changed_when: false
+
+- name: Preflight — inspect Docker systemd unit and drop-ins without mutation
+  ansible.builtin.command:
+    argv: [systemctl, cat, docker.service]
+  register: aigw_docker_systemd_unit
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: aigw_docker_systemd_unit_installed | bool
+
+# `systemctl cat` includes the unit and drop-ins, but does not expand an
+# EnvironmentFile.  A local administrator could otherwise hide a conflicting
+# `DOCKER_OPTS=--data-root …` (or other daemon-wide option) there.  Capture
+# systemd's resolved command/environment metadata as well; the subsequent
+# read-only parser opens only canonical, root-owned environment files and
+# reports option names, never their values.
+- name: Preflight — inspect resolved Docker systemd environment metadata without mutation
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - docker.service
+      - --no-pager
+      - --property=ExecStart
+      - --property=Environment
+      - --property=EnvironmentFiles
+  register: aigw_docker_systemd_show
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: aigw_docker_systemd_unit_installed | bool
+
+- name: Preflight — reject daemon flags hidden in Docker systemd environment files
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import re
+        import stat
+        import sys
+
+        payload = json.load(sys.stdin)
+        unit = payload.get("unit", "")
+        resolved = payload.get("resolved", "")
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_-])(?:"
+            r"--(?:data-root|iptables|ip6tables|log-driver|log-opt|"
+            r"selinux-enabled|firewall-backend|bip|fixed-cidr|"
+            r"default-address-pool|bridge|config-file)(?:=|\s|$)|"
+            r"-g(?:=|\s|$)"
+            r")"
+        )
+        environment_file_paths = set()
+        for source in (unit, resolved):
+            for candidate in re.findall(r"(?m)^\s*EnvironmentFile\s*=\s*-?([^\s#]+)", source):
+                environment_file_paths.add(candidate)
+            for candidate in re.findall(r"(?m)^EnvironmentFiles=(.*)$", source):
+                environment_file_paths.update(re.findall(r"/(?:[^\s()]*)", candidate))
+
+        sources = [unit, resolved]
+        errors = []
+        for path in sorted(environment_file_paths):
+            if not re.fullmatch(r"/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}", path):
+                errors.append(f"unsafe Docker EnvironmentFile path {path!r}")
+                continue
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                # A systemd EnvironmentFile prefixed with '-' is optional;
+                # an absent file contributes no daemon option.
+                continue
+            except OSError as exc:
+                errors.append(f"cannot inspect Docker EnvironmentFile {path}: {exc}")
+                continue
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022:
+                    errors.append(f"unsafe Docker EnvironmentFile boundary {path}")
+                    continue
+                with os.fdopen(descriptor, "r", encoding="utf-8", errors="replace", closefd=False) as stream:
+                    sources.append(stream.read())
+            finally:
+                os.close(descriptor)
+
+        matches = sorted({
+            match.group(0).strip()
+            for source in sources
+            for match in pattern.finditer(source)
+        })
+        # Refuse indirection even when the current value does not match our
+        # small flag list: an ExecStart that consumes these variables makes
+        # the unit contract dependent on an unreviewed environment file.
+        indirect = sorted({
+            name
+            for source in sources
+            for name in re.findall(r"\b(DOCKER_(?:OPTS|DAEMON_OPTIONS|EXTRA_ARGS))\b", source)
+        })
+        print(json.dumps({"errors": errors, "flags": matches, "indirect": indirect}, sort_keys=True))
+    stdin: >-
+      {{ {
+           'unit': aigw_docker_systemd_unit.stdout | default(''),
+           'resolved': aigw_docker_systemd_show.stdout | default('')
+         } | to_json }}
+    stdin_add_newline: false
+  register: aigw_docker_systemd_conflicts_raw
+  changed_when: false
+  when:
+    - aigw_docker_systemd_unit_installed | bool
+    - aigw_docker_systemd_unit.rc | default(1) == 0
+    - aigw_docker_systemd_show.rc | default(1) == 0
+  no_log: true
+
+- name: Preflight — record conflicting Docker systemd flags
+  ansible.builtin.set_fact:
+    aigw_docker_systemd_conflicts: >-
+      {{
+        (aigw_docker_systemd_conflicts_raw.stdout | from_json)
+        if (
+          (aigw_docker_systemd_unit_installed | bool) and
+          (aigw_docker_systemd_unit.rc | default(1) == 0) and
+          (aigw_docker_systemd_show.rc | default(1) == 0)
+        )
+        else {'errors': [], 'flags': [], 'indirect': []}
+      }}
+  no_log: true
+
+- name: Preflight — require an inspectable local Docker service contract
+  ansible.builtin.assert:
+    that:
+      - not (aigw_docker_systemd_unit_installed | bool) or aigw_docker_systemd_unit.rc == 0
+      - not (aigw_docker_systemd_unit_installed | bool) or aigw_docker_systemd_show.rc == 0
+      - aigw_docker_systemd_conflicts.errors | length == 0
+      - aigw_docker_systemd_conflicts.flags | length == 0
+      - aigw_docker_systemd_conflicts.indirect | length == 0
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: Docker's systemd unit/drop-ins contain
+      daemon settings that conflict with the reviewed data-root, firewall,
+      logging, address-pool, or SELinux contract, or an unreviewed DOCKER_OPTS
+      indirection.
+
+- name: Preflight — reject unsafe existing ancestors for mutable host paths
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import stat
+        import sys
+
+        errors = []
+        for configured in json.loads(sys.argv[1]):
+            current = "/"
+            parts = [part for part in configured.split("/") if part]
+            for index, part in enumerate(parts):
+                current = os.path.join(current, part)
+                try:
+                    metadata = os.lstat(current)
+                except FileNotFoundError:
+                    break
+                if stat.S_ISLNK(metadata.st_mode):
+                    errors.append(f"{configured}: symlinked ancestor {current}")
+                    break
+                if metadata.st_uid != 0 or metadata.st_gid != 0:
+                    errors.append(f"{configured}: non-root ancestor {current}")
+                    break
+                if metadata.st_mode & 0o022:
+                    errors.append(f"{configured}: group/other-writable ancestor {current}")
+                    break
+                if index < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                    errors.append(f"{configured}: non-directory ancestor {current}")
+                    break
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - >-
+        {{ [stack_dir, docker_data_root, aigw_docker_host_marker | dirname, '/etc/docker',
+            '/usr/local/sbin', '/etc/systemd/system',
+            '/etc/NetworkManager/dispatcher.d', '/etc/iproute2',
+            '/etc/ssh/sshd_config.d']
+           | unique | list | to_json }}
+  changed_when: false
+
+- name: Preflight — inspect existing AI Gateway ownership and state paths
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop:
+    - "{{ aigw_docker_host_marker }}"
+    - "{{ aigw_docker_host_pending_marker }}"
+    - /etc/docker/daemon.json
+    - "{{ stack_dir }}"
+    - "{{ docker_data_root }}"
+  register: aigw_host_boundary_paths
+  changed_when: false
+
+- name: Preflight — name existing host-boundary objects
+  ansible.builtin.set_fact:
+    aigw_host_marker_stat: "{{ aigw_host_boundary_paths.results[0].stat }}"
+    aigw_host_pending_marker_stat: "{{ aigw_host_boundary_paths.results[1].stat }}"
+    aigw_daemon_config_stat: "{{ aigw_host_boundary_paths.results[2].stat }}"
+    aigw_stack_dir_stat: "{{ aigw_host_boundary_paths.results[3].stat }}"
+    aigw_docker_root_stat: "{{ aigw_host_boundary_paths.results[4].stat }}"
+
+- name: Preflight — define root-managed host artifacts that may be replaced later
+  ansible.builtin.set_fact:
+    aigw_managed_host_artifacts:
+      - { path: "{{ aigw_docker_host_marker }}.pre-adoption-daemon.json", adoption: docker }
+      - { path: /usr/local/sbin/aigw-policy-routing, adoption: docker }
+      - { path: /etc/NetworkManager/dispatcher.d/90-aigw-policy-routing, adoption: docker }
+      - { path: /etc/systemd/system/aigw-policy-routing.service, adoption: docker }
+      - { path: /usr/local/sbin/docker-user-rules.sh, adoption: firewall }
+      - { path: /usr/local/sbin/aigw-host-input-rules.sh, adoption: firewall }
+      - { path: /usr/local/sbin/docker-user-rules-watch.sh, adoption: firewall }
+      - { path: /etc/systemd/system/aigw-host-input-rules.service, adoption: firewall }
+      - { path: /etc/systemd/system/docker-user-rules.service, adoption: firewall }
+      - { path: /etc/systemd/system/docker-user-rules-watch.service, adoption: firewall }
+      - { path: /etc/NetworkManager/dispatcher.d/91-aigw-firewalld-zones, adoption: firewall }
+      - { path: /etc/ssh/sshd_config.d/00-ai-gateway-hardening.conf, adoption: ssh }
+      - { path: /usr/local/sbin/aigw-docker-log-acl, adoption: docker }
+      - { path: /usr/local/sbin/aigw-load-offline-image-seed, adoption: docker }
+      - { path: /etc/systemd/system/aigw-docker-log-acl.service, adoption: docker }
+      - { path: /etc/systemd/system/aigw-docker-log-acl.timer, adoption: docker }
+      - { path: /etc/systemd/system/aigw-vault-audit-rotate.service, adoption: docker }
+      - { path: /etc/systemd/system/aigw-vault-audit-rotate.timer, adoption: docker }
+
+- name: Preflight — reject unsafe or unowned existing AIGW-managed host artifacts
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import stat
+        import sys
+
+        artifacts = json.loads(sys.argv[1])
+        has_marker = sys.argv[2] == "true"
+        docker_adoption = sys.argv[3] == "true"
+        firewall_adoption = sys.argv[4] == "true"
+        ssh_adoption = sys.argv[5] == "true"
+        adoptions = {
+            "docker": docker_adoption,
+            "firewall": firewall_adoption,
+            "ssh": ssh_adoption,
+        }
+        errors = []
+        for artifact in artifacts:
+            path = artifact["path"]
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISLNK(metadata.st_mode) or
+                not stat.S_ISREG(metadata.st_mode) or
+                metadata.st_uid != 0 or metadata.st_gid != 0 or
+                metadata.st_mode & 0o022
+            ):
+                errors.append(f"unsafe existing managed artifact {path}")
+                continue
+            adoption_granted = adoptions[artifact["adoption"]]
+            if not has_marker and not adoption_granted:
+                errors.append(
+                    f"unmarked existing managed artifact {path} requires explicit {artifact['adoption']} adoption"
+                )
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - "{{ aigw_managed_host_artifacts | to_json }}"
+      - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_dedicated_docker_host | bool) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_firewalld_state | bool) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_ssh_state | bool) else 'false' }}"
+  changed_when: false
+
+- name: Preflight — reject unmanaged drop-ins for AI Gateway systemd units
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import stat
+        import sys
+
+        errors = []
+        for unit in json.loads(sys.argv[1]):
+            unit_name = os.path.basename(unit)
+            for root in (
+                "/etc/systemd/system", "/run/systemd/system",
+                "/usr/local/lib/systemd/system", "/usr/lib/systemd/system",
+            ):
+                directory = os.path.join(root, unit_name + ".d")
+                try:
+                    metadata = os.lstat(directory)
+                except FileNotFoundError:
+                    continue
+                if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or
+                        metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022):
+                    errors.append(f"unsafe managed-unit drop-in directory {directory}")
+                    continue
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            child = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            errors.append(f"uninspectable managed-unit drop-in {entry.path}")
+                            continue
+                        if (stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or
+                                child.st_uid != 0 or child.st_gid != 0 or child.st_mode & 0o022):
+                            errors.append(f"unsafe managed-unit drop-in {entry.path}")
+                        else:
+                            errors.append(f"unmanaged managed-unit drop-in {entry.path}")
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - >-
+        {{ [
+             '/etc/systemd/system/aigw-policy-routing.service',
+             '/etc/systemd/system/aigw-host-input-rules.service',
+             '/etc/systemd/system/docker-user-rules.service',
+             '/etc/systemd/system/docker-user-rules-watch.service',
+             '/etc/systemd/system/aigw-docker-log-acl.service',
+             '/etc/systemd/system/aigw-docker-log-acl.timer',
+             '/etc/systemd/system/aigw-vault-audit-rotate.service',
+             '/etc/systemd/system/aigw-vault-audit-rotate.timer'
+           ] | to_json }}
+  changed_when: false
+
+- name: Preflight — reject symlinked or non-root host-boundary objects
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (aigw_host_marker_stat.exists | default(false)) or
+        (aigw_host_marker_stat.isreg | default(false) and
+         not (aigw_host_marker_stat.islnk | default(false)) and
+         aigw_host_marker_stat.uid == 0 and aigw_host_marker_stat.gid == 0 and
+         aigw_host_marker_stat.mode == '0600')
+      - >-
+        not (aigw_host_pending_marker_stat.exists | default(false)) or
+        (aigw_host_pending_marker_stat.isreg | default(false) and
+         not (aigw_host_pending_marker_stat.islnk | default(false)) and
+         aigw_host_pending_marker_stat.uid == 0 and
+         aigw_host_pending_marker_stat.gid == 0 and
+         aigw_host_pending_marker_stat.mode == '0600')
+      - >-
+        not (aigw_daemon_config_stat.exists | default(false)) or
+        (aigw_daemon_config_stat.isreg | default(false) and
+         not (aigw_daemon_config_stat.islnk | default(false)) and
+         aigw_daemon_config_stat.uid == 0 and aigw_daemon_config_stat.gid == 0)
+      - >-
+        not (aigw_stack_dir_stat.exists | default(false)) or
+        (aigw_stack_dir_stat.isdir | default(false) and
+         not (aigw_stack_dir_stat.islnk | default(false)) and
+         aigw_stack_dir_stat.uid == 0 and aigw_stack_dir_stat.gid == 0)
+      - >-
+        not (aigw_docker_root_stat.exists | default(false)) or
+        (aigw_docker_root_stat.isdir | default(false) and
+         not (aigw_docker_root_stat.islnk | default(false)) and
+         aigw_docker_root_stat.uid == 0 and aigw_docker_root_stat.gid == 0)
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: an AI Gateway marker, pending marker,
+      daemon config, stack directory, or Docker root is symlinked,
+      noncanonical, or not root-owned.
+
+- name: Preflight — read a valid-shaped existing ownership marker
+  ansible.builtin.slurp:
+    src: "{{ aigw_docker_host_marker }}"
+  register: aigw_host_marker_raw
+  no_log: true
+  when: aigw_host_marker_stat.exists | default(false)
+
+- name: Preflight — read a valid-shaped in-progress ownership marker
+  ansible.builtin.slurp:
+    src: "{{ aigw_docker_host_pending_marker }}"
+  register: aigw_host_pending_marker_raw
+  no_log: true
+  when: aigw_host_pending_marker_stat.exists | default(false)
+
+- name: Preflight — define the exact dedicated-Docker-host marker contract
+  ansible.builtin.set_fact:
+    aigw_docker_host_marker_content: |
+      format=aigw-dedicated-docker-host-v1
+      project={{ compose_project_name }}
+      docker_data_root={{ docker_data_root }}
+
+- name: Preflight — require an existing marker to describe this exact host contract
+  ansible.builtin.assert:
+    that:
+      - (aigw_host_marker_raw.content | b64decode) == aigw_docker_host_marker_content
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: the dedicated-Docker-host marker does
+      not describe this project and Docker root.
+  when: aigw_host_marker_stat.exists | default(false)
+  no_log: true
+
+- name: Preflight — require an in-progress marker to describe this exact host contract
+  ansible.builtin.assert:
+    that:
+      - (aigw_host_pending_marker_raw.content | b64decode) == aigw_docker_host_marker_content
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: the in-progress dedicated-Docker-host
+      marker does not describe this project and Docker root.
+  when: aigw_host_pending_marker_stat.exists | default(false)
+  no_log: true
+
+- name: Preflight — require explicit adoption to resume an incomplete host converge
+  ansible.builtin.assert:
+    that:
+      - aigw_adopt_dedicated_docker_host | bool
+    quiet: true
+    fail_msg: >-
+      A previous host converge stopped after Docker policy changed but before
+      verification promoted its pending marker. Inspect the VM and re-run with
+      aigw_adopt_dedicated_docker_host=true and
+      aigw_adopt_firewalld_state=true to resume deliberately. If the retained
+      managed sshd fragment is present, also set aigw_adopt_ssh_state=true.
+      These acknowledgements are intentionally separate because a partial run
+      may have already written Docker, packet-filter, and SSH host policy.
+  when: aigw_host_pending_marker_stat.exists | default(false)
+
+- name: Preflight — read an existing Docker daemon configuration without following links
+  ansible.builtin.slurp:
+    src: /etc/docker/daemon.json
+  register: aigw_daemon_config_raw
+  no_log: true
+  when: aigw_daemon_config_stat.exists | default(false)
+
+- name: Preflight — classify the Docker daemon configuration contract
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import re
+        import sys
+
+        desired = {
+            "data-root": sys.argv[1],
+            "log-driver": "json-file",
+            "log-opts": {"max-size": "50m", "max-file": "5"},
+            "live-restore": True,
+            "firewall-backend": "iptables",
+            "selinux-enabled": True,
+        }
+        canonical_path = re.compile(
+            r"^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})"
+            r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}$"
+        )
+        try:
+            actual = json.load(sys.stdin)
+        except json.JSONDecodeError:
+            print(json.dumps({"state": "invalid", "existing_data_root": "/var/lib/docker"}))
+            raise SystemExit(0)
+        if not isinstance(actual, dict):
+            print(json.dumps({"state": "invalid", "existing_data_root": "/var/lib/docker"}))
+            raise SystemExit(0)
+        existing_data_root = actual.get("data-root", "/var/lib/docker")
+        if not isinstance(existing_data_root, str) or not canonical_path.fullmatch(existing_data_root):
+            print(json.dumps({"state": "invalid", "existing_data_root": "/var/lib/docker"}))
+        elif actual == desired:
+            print(json.dumps({"state": "exact", "existing_data_root": existing_data_root}))
+        else:
+            print(json.dumps({"state": "different", "existing_data_root": existing_data_root}))
+      - "{{ docker_data_root }}"
+    stdin: "{{ aigw_daemon_config_raw.content | b64decode }}"
+    stdin_add_newline: false
+  register: aigw_daemon_config_contract_raw
+  changed_when: false
+  no_log: true
+  when: aigw_daemon_config_stat.exists | default(false)
+
+- name: Preflight — record the Docker daemon configuration contract
+  ansible.builtin.set_fact:
+    aigw_daemon_config_contract: >-
+      {{
+        (aigw_daemon_config_contract_raw.stdout | from_json)
+        if (aigw_daemon_config_stat.exists | default(false))
+        else {'state': 'absent', 'existing_data_root': '/var/lib/docker'}
+      }}
+  no_log: true
+
+- name: Preflight — inspect the data root named by an inactive existing daemon configuration
+  ansible.builtin.stat:
+    path: "{{ aigw_daemon_config_contract.existing_data_root }}"
+    follow: false
+    get_checksum: false
+  register: aigw_existing_daemon_root_stat
+  changed_when: false
+
+- name: Preflight — reject unsafe ancestors for the existing daemon data root
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import stat
+        import sys
+
+        configured = sys.argv[1]
+        current = "/"
+        for index, part in enumerate(part for part in configured.split("/") if part):
+            current = os.path.join(current, part)
+            try:
+                metadata = os.lstat(current)
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(metadata.st_mode):
+                raise SystemExit(f"{configured}: symlinked ancestor {current}")
+            if metadata.st_uid != 0 or metadata.st_gid != 0:
+                raise SystemExit(f"{configured}: non-root ancestor {current}")
+            if metadata.st_mode & 0o022:
+                raise SystemExit(f"{configured}: group/other-writable ancestor {current}")
+            if index < len([part for part in configured.split('/') if part]) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                raise SystemExit(f"{configured}: non-directory ancestor {current}")
+      - "{{ aigw_daemon_config_contract.existing_data_root }}"
+  changed_when: false
+
+- name: Preflight — reject an unsafe existing daemon data root
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (aigw_existing_daemon_root_stat.stat.exists | default(false)) or
+        (aigw_existing_daemon_root_stat.stat.isdir | default(false) and
+         not (aigw_existing_daemon_root_stat.stat.islnk | default(false)) and
+         aigw_existing_daemon_root_stat.stat.uid == 0 and
+         aigw_existing_daemon_root_stat.stat.gid == 0)
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: the Docker data root named in the
+      current daemon configuration is symlinked, noncanonical, or not
+      root-owned.
+
+- name: Preflight — initialize the exact dedicated Docker network inventory
+  ansible.builtin.set_fact:
+    aigw_expected_docker_networks: []
+
+- name: Preflight — derive each Docker network's fixed dynamic pool
+  ansible.builtin.set_fact:
+    aigw_expected_docker_networks: >-
+      {{
+        aigw_expected_docker_networks +
+        [item | combine({'iprange': item.subnet | regex_replace('\\.0/24$', '.128/25')})]
+      }}
+  loop: "{{ docker_networks }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Preflight — define every Compose-owned named Docker volume
+  ansible.builtin.set_fact:
+    aigw_expected_docker_volumes: >-
+      {{
+        [
+          'pg_data', 'openwebui_data', 'vault_data', 'vault_audit',
+          'alloy_data', 'prom_data', 'loki_data', 'tempo_data', 'grafana_data'
+        ] +
+        (
+          ['samba_ad_config', 'samba_ad_state', 'samba_ad_public']
+          if (samba_lab_enabled | bool) else []
+        )
+      }}
+
+- name: Preflight — inventory an existing stack directory before accepting live containers
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import sys
+
+        try:
+            entries = sorted(entry.name for entry in os.scandir(sys.argv[1]))
+        except FileNotFoundError:
+            entries = []
+        print(json.dumps(entries))
+      - "{{ stack_dir }}"
+  register: aigw_stack_dir_inventory_raw
+  changed_when: false
+
+- name: Preflight — reject an unmarked nonempty stack directory without explicit adoption
+  ansible.builtin.assert:
+    that:
+      - >-
+        (aigw_host_marker_stat.exists | default(false)) or
+        ((aigw_stack_dir_inventory_raw.stdout | from_json) | length == 0) or
+        (aigw_adopt_dedicated_docker_host | bool)
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: unmarked {{ stack_dir }} contains
+      {{ (aigw_stack_dir_inventory_raw.stdout | from_json) | join(', ') }}.
+      Inspect it and use aigw_adopt_dedicated_docker_host=true only when it is
+      the intended AI Gateway stack.
+
+- name: Preflight — inspect a live Docker host for foreign containers and networks
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/env
+      - -u
+      - DOCKER_CONFIG
+      - -u
+      - DOCKER_CONTEXT
+      - -u
+      - DOCKER_HOST
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import ipaddress
+        import re
+        import subprocess
+        import sys
+
+        docker, project, data_root, stack_dir, expected_text, expected_volumes_text = sys.argv[1:]
+        expected = {entry["name"]: entry for entry in json.loads(expected_text)}
+        expected_volumes = set(json.loads(expected_volumes_text))
+
+        def invoke(*args):
+            result = subprocess.run(
+                [docker, "--host", "unix:///run/docker.sock", *args], text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+            if result.returncode:
+                raise RuntimeError("docker " + " ".join(args) + ": " + result.stderr.strip())
+            return result.stdout
+
+        try:
+            info = json.loads(invoke("info", "--format=json"))
+            ids = invoke("ps", "-aq", "--no-trunc").split()
+            containers = json.loads(invoke("inspect", *ids)) if ids else []
+            project_ids = set()
+            foreign_containers = []
+            for container in containers:
+                labels = (container.get("Config") or {}).get("Labels") or {}
+                container_id = container.get("Id", "")
+                valid_project_labels = (
+                    labels.get("com.docker.compose.project") == project
+                    and labels.get("com.docker.compose.project.working_dir") == stack_dir
+                    and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", labels.get("com.docker.compose.service", ""))
+                    and re.fullmatch(r"[0-9a-f]{64}", labels.get("com.docker.compose.config-hash", ""))
+                )
+                if valid_project_labels:
+                    project_ids.add(container_id)
+                else:
+                    foreign_containers.append(container_id)
+
+            network_ids = invoke("network", "ls", "-q").split()
+            networks = json.loads(invoke("network", "inspect", *network_ids)) if network_ids else []
+            actual_by_name = {network.get("Name", ""): network for network in networks}
+            links_result = subprocess.run(
+                ["ip", "-j", "link", "show"], text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+            if links_result.returncode:
+                raise RuntimeError("ip -j link show: " + links_result.stderr.strip())
+            linux_links = {
+                link.get("ifname") for link in json.loads(links_result.stdout)
+                if link.get("ifname")
+            }
+            managed_subnets = [
+                ipaddress.ip_network(entry["subnet"], strict=True)
+                for entry in expected.values()
+            ]
+            default_bridge_overlap = []
+            bridge = actual_by_name.get("bridge")
+            if bridge is not None:
+                for entry in ((bridge.get("IPAM") or {}).get("Config") or []):
+                    subnet_text = entry.get("Subnet")
+                    if not subnet_text:
+                        continue
+                    try:
+                        subnet = ipaddress.ip_network(subnet_text, strict=True)
+                    except ValueError:
+                        default_bridge_overlap.append(f"invalid default bridge subnet {subnet_text!r}")
+                        continue
+                    if any(subnet.overlaps(managed) for managed in managed_subnets):
+                        default_bridge_overlap.append(str(subnet))
+            for pool in info.get("DefaultAddressPools") or []:
+                base = pool.get("Base") or pool.get("base")
+                if not base:
+                    default_bridge_overlap.append("malformed Docker default address pool")
+                    continue
+                try:
+                    pool_network = ipaddress.ip_network(base, strict=True)
+                except ValueError:
+                    default_bridge_overlap.append(f"invalid Docker default address pool {base!r}")
+                    continue
+                if any(pool_network.overlaps(managed) for managed in managed_subnets):
+                    default_bridge_overlap.append(f"default-pool:{pool_network}")
+            foreign_networks = sorted(
+                name for name in actual_by_name
+                if name not in {"bridge", "host", "none"} and name not in expected
+            )
+            volume_ids = invoke("volume", "ls", "-q").split()
+            volumes = json.loads(invoke("volume", "inspect", *volume_ids)) if volume_ids else []
+            expected_volume_names = {project + "_" + name for name in expected_volumes}
+            foreign_volumes = []
+            volume_mismatch = []
+            retained_expected_volumes = []
+            for volume in volumes:
+                name = volume.get("Name", "")
+                if name not in expected_volume_names:
+                    foreign_volumes.append(name or "?")
+                    continue
+                logical_name = name[len(project) + 1:]
+                labels = volume.get("Labels") or {}
+                if (
+                    labels.get("com.docker.compose.project") != project or
+                    labels.get("com.docker.compose.volume") != logical_name
+                ):
+                    volume_mismatch.append(name)
+                retained_expected_volumes.append(name)
+            mismatch = []
+            attached_foreign = []
+            bridge_collisions = []
+            for name, wanted in expected.items():
+                network = actual_by_name.get(name)
+                desired = {
+                    "driver": "bridge",
+                    "internal": bool(wanted["internal"]),
+                    "ipv6": False,
+                    "bridge": wanted["bridge"],
+                    "subnet": wanted["subnet"],
+                    "iprange": wanted["iprange"],
+                }
+                actual = None
+                if network is not None:
+                    config = (network.get("IPAM") or {}).get("Config") or []
+                    subnet = next((entry.get("Subnet") for entry in config if entry.get("Subnet")), None)
+                    iprange = next((entry.get("IPRange") for entry in config if entry.get("IPRange")), None)
+                    options = network.get("Options") or {}
+                    actual = {
+                        "driver": network.get("Driver"),
+                        "internal": bool(network.get("Internal")),
+                        "ipv6": bool(network.get("EnableIPv6")),
+                        "bridge": options.get("com.docker.network.bridge.name"),
+                        "subnet": subnet,
+                        "iprange": iprange,
+                    }
+                    if actual != desired:
+                        mismatch.append(name)
+                    for container_id in (network.get("Containers") or {}):
+                        if container_id not in project_ids:
+                            attached_foreign.append(name + ":" + container_id)
+                bridge_name = wanted["bridge"]
+                if bridge_name in linux_links:
+                    if actual != desired:
+                        bridge_collisions.append(
+                            f"Linux interface {bridge_name} is not the exact reviewed Docker bridge for {name}"
+                        )
+                elif actual == desired:
+                    bridge_collisions.append(
+                        f"reviewed Docker network {name} is missing Linux bridge {bridge_name}"
+                    )
+
+            print(json.dumps({
+                "error": "",
+                "docker_root": info.get("DockerRootDir", ""),
+                "selinux_enabled": "name=selinux" in (info.get("SecurityOptions") or []),
+                "swarm_state": (info.get("Swarm") or {}).get("LocalNodeState", "inactive"),
+                "container_count": len(containers),
+                "foreign_containers": sorted(foreign_containers),
+                "foreign_networks": foreign_networks,
+                "foreign_volumes": sorted(foreign_volumes),
+                "volume_mismatch": sorted(volume_mismatch),
+                "retained_expected_volumes": sorted(retained_expected_volumes),
+                "network_mismatch": sorted(mismatch),
+                "attached_foreign": sorted(attached_foreign),
+                "bridge_collisions": sorted(bridge_collisions),
+                "default_bridge_overlap": sorted(default_bridge_overlap),
+            }, sort_keys=True))
+        except Exception as exc:
+            print(json.dumps({
+                "error": str(exc), "docker_root": "", "container_count": 0,
+                "selinux_enabled": False, "swarm_state": "unknown",
+                "foreign_containers": [], "foreign_networks": [],
+                "foreign_volumes": [], "volume_mismatch": [], "retained_expected_volumes": [],
+                "network_mismatch": [], "attached_foreign": [],
+                "bridge_collisions": [],
+                "default_bridge_overlap": [],
+            }, sort_keys=True))
+      - "{{ aigw_docker_cli.stdout | trim }}"
+      - "{{ compose_project_name }}"
+      - "{{ docker_data_root }}"
+      - "{{ stack_dir }}"
+      - "{{ aigw_expected_docker_networks | to_json }}"
+      - "{{ aigw_expected_docker_volumes | to_json }}"
+  register: aigw_live_docker_boundary_raw
+  changed_when: false
+  when:
+    - aigw_docker_cli.rc == 0
+    - aigw_docker_info.rc | default(1) == 0
+
+- name: Preflight — record the live dedicated-Docker-host boundary
+  ansible.builtin.set_fact:
+    aigw_live_docker_boundary: >-
+      {{
+        (aigw_live_docker_boundary_raw.stdout | from_json)
+        if (aigw_docker_cli.rc == 0 and aigw_docker_info.rc | default(1) == 0)
+        else {'error': '', 'docker_root': '', 'container_count': 0,
+              'selinux_enabled': false, 'swarm_state': 'inactive',
+              'foreign_containers': [], 'foreign_networks': [],
+              'foreign_volumes': [], 'volume_mismatch': [], 'retained_expected_volumes': [],
+              'network_mismatch': [], 'attached_foreign': [],
+              'bridge_collisions': [],
+              'default_bridge_overlap': []}
+      }}
+
+- name: Preflight — inspect inactive Docker and stack roots for unknown retained state
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import sys
+
+        for path in dict.fromkeys(json.loads(sys.argv[1])):
+            try:
+                names = sorted(entry.name for entry in os.scandir(path))
+            except FileNotFoundError:
+                names = []
+            if names:
+                print(f"{path}: {', '.join(names)}")
+      - >-
+        {{ [docker_data_root, aigw_daemon_config_contract.existing_data_root, stack_dir]
+           | unique | list | to_json }}
+  register: aigw_inactive_roots
+  changed_when: false
+  when:
+    - not (aigw_docker_cli.rc == 0 and aigw_docker_info.rc | default(1) == 0)
+
+- name: Preflight — require a non-running Docker root to be empty unless this is a marked AIGW host
+  ansible.builtin.assert:
+    that:
+      - >-
+        (aigw_host_marker_stat.exists | default(false)) or
+        (aigw_inactive_roots.stdout | trim | length == 0)
+    quiet: true
+    fail_msg: >-
+      Docker is not running and a configured/current data root or stack
+      directory contains uninspectable retained state. Refuse to start or
+      adopt it blindly; bring the dedicated host up for read-only inspection
+      or restore its verified AI Gateway ownership marker first.
+  when:
+    - not (aigw_docker_cli.rc == 0 and aigw_docker_info.rc | default(1) == 0)
+
+- name: Preflight — require an active Docker host to contain only AIGW or default objects
+  ansible.builtin.assert:
+    that:
+      - aigw_live_docker_boundary.error | length == 0
+      - aigw_live_docker_boundary.docker_root == docker_data_root
+      - aigw_live_docker_boundary.foreign_containers | length == 0
+      - aigw_live_docker_boundary.foreign_networks | length == 0
+      - aigw_live_docker_boundary.foreign_volumes | length == 0
+      - aigw_live_docker_boundary.volume_mismatch | length == 0
+      - aigw_live_docker_boundary.network_mismatch | length == 0
+      - aigw_live_docker_boundary.attached_foreign | length == 0
+      - aigw_live_docker_boundary.bridge_collisions | length == 0
+      - aigw_live_docker_boundary.default_bridge_overlap | length == 0
+      - aigw_live_docker_boundary.swarm_state == 'inactive'
+    quiet: true
+    fail_msg: >-
+      Refusing existing Docker host: AI Gateway requires a dedicated Docker
+      root. Foreign containers/networks, an incompatible named AIGW network,
+      an unexpected attachment, or a different DockerRootDir would be changed
+      by daemon-wide firewall/logging policy.
+  when:
+    - aigw_docker_cli.rc == 0
+    - aigw_docker_info.rc | default(1) == 0
+
+- name: Preflight — require explicit adoption for retained named volumes on an unmarked Docker host
+  ansible.builtin.assert:
+    that:
+      - >-
+        (aigw_host_marker_stat.exists | default(false)) or
+        (aigw_live_docker_boundary.retained_expected_volumes | length == 0) or
+        (aigw_adopt_dedicated_docker_host | bool)
+    quiet: true
+    fail_msg: >-
+      Existing Compose-named Docker volumes are unmarked. Inspect the retained
+      state and re-run with aigw_adopt_dedicated_docker_host=true only when it
+      belongs to this AI Gateway deployment.
+  when:
+    - aigw_docker_cli.rc == 0
+    - aigw_docker_info.rc | default(1) == 0
+
+- name: Preflight — allow only a clean, marked, legacy-AIGW-only, or explicitly adopted daemon configuration
+  ansible.builtin.assert:
+    that:
+      - aigw_daemon_config_contract.state != 'invalid'
+      - >-
+        aigw_daemon_config_contract.state in ['absent', 'exact'] or
+        (aigw_adopt_dedicated_docker_host | bool)
+      - >-
+        not (aigw_docker_daemon_active | bool) or
+        (aigw_host_marker_stat.exists | default(false)) or
+        aigw_daemon_config_contract.state != 'absent' or
+        (aigw_adopt_dedicated_docker_host | bool)
+      - >-
+        not (aigw_host_marker_stat.exists | default(false)) or
+        aigw_daemon_config_contract.state == 'exact'
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: /etc/docker/daemon.json is not the
+      reviewed dedicated-AIGW contract. Use the explicit adoption flag only
+      after confirming this is a clean dedicated Docker host; an invalid file
+      or a marked host with drift is never overwritten automatically.
+
+- name: Preflight — record whether an explicit daemon adoption backup is required
+  ansible.builtin.set_fact:
+    aigw_docker_daemon_adoption_required: >-
+      {{
+        (aigw_daemon_config_contract.state == 'different') and
+        (aigw_adopt_dedicated_docker_host | bool)
+      }}

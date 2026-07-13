@@ -27,6 +27,7 @@ SEED_MODE = 0o600
 MARKER_DIR_MODE = 0o700
 MARKER_MODE = 0o600
 FIXED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+LOCAL_DOCKER_HOST = "unix:///run/docker.sock"
 REPOSITORY_COMPONENT = re.compile(r"^[a-z0-9]+(?:[._-]+[a-z0-9]+)*$")
 TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 
@@ -175,7 +176,7 @@ def require_executable(name: str) -> str:
 
 def require_docker_ready(docker: str) -> str:
     check = subprocess.run(
-        [docker, "info", "--format", "{{.Architecture}}"],
+        [docker, "--host", LOCAL_DOCKER_HOST, "info", "--format", "{{.Architecture}}"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -276,7 +277,7 @@ def invalid_required_images(docker: str, images: list[dict[str, str]]) -> list[s
     for image in images:
         reference = image["reference"]
         inspection = subprocess.run(
-            [docker, "image", "inspect", "--", reference],
+            [docker, "--host", LOCAL_DOCKER_HOST, "image", "inspect", "--", reference],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -326,7 +327,7 @@ def load_archive(archive: Path, zstd: str, docker: str) -> None:
 
     try:
         loader = subprocess.Popen(
-            [docker, "image", "load"],
+            [docker, "--host", LOCAL_DOCKER_HOST, "image", "load"],
             stdin=decompressor.stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

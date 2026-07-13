@@ -1,11 +1,6 @@
 # traefik-int dynamic config — internal vhosts (eth2).
 http:
   routers:
-    chat:
-      rule: 'Host(`chat.{{ env "DOMAIN" }}`)'
-      entryPoints: [websecure]
-      service: open-webui
-      tls: {}
     # api.$DOMAIN — explicit allow-list of LiteLLM's INFERENCE surface only.
     # The management API (/key, /user, /team, /model, /config, /global, ...)
     # and the Admin UI (/ui, /sso, /login) must never be reachable on the
@@ -13,7 +8,11 @@ http:
     # oauth2-proxy + the aigw-admins role. Anything not matched here falls
     # through to api-deny below.
     api:
-      rule: 'Host(`api.{{ env "DOMAIN" }}`) && (PathPrefix(`/v1/`) || Path(`/v1`) || PathPrefix(`/chat/completions`) || PathPrefix(`/completions`) || PathPrefix(`/embeddings`) || PathPrefix(`/models`) || Path(`/health/liveliness`) || Path(`/health/readiness`))'
+      # Never use a blanket /v1 prefix here. LiteLLM also places management
+      # and control-plane handlers below /v1 (for example /v1/model/info,
+      # /v1/memory, and /v1/workflows). Keep this list exact and deliberately
+      # small; query strings do not affect Traefik Path matching.
+      rule: 'Host(`api.{{ env "DOMAIN" }}`) && (Path(`/v1/chat/completions`) || Path(`/chat/completions`) || Path(`/v1/completions`) || Path(`/completions`) || Path(`/v1/embeddings`) || Path(`/embeddings`) || Path(`/v1/models`) || PathPrefix(`/v1/models/`) || Path(`/models`) || PathPrefix(`/models/`) || Path(`/v1/messages`) || Path(`/v1/messages/count_tokens`) || Path(`/health/liveliness`) || Path(`/health/readiness`))'
       priority: 100
       entryPoints: [websecure]
       service: litellm
@@ -28,10 +27,11 @@ http:
       service: litellm   # unreachable — deny-all rejects first
       tls: {}
     auth:
-      # Internal users need the aigw realm and Keycloak's static theme assets,
-      # not the master realm or /admin console/API. Keycloak administration is
-      # routed only on traefik-adm (VPN/ADM NIC).
-      rule: 'Host(`auth.{{ env "DOMAIN" }}`) && (Path(`/realms/aigw`) || PathPrefix(`/realms/aigw/`) || PathPrefix(`/resources/`))'
+      # Permit only the browser-facing endpoints needed to start/finish portal
+      # login and logout. Token redemption, JWKS, and userinfo travel directly
+      # over the private Keycloak network; the account console, master realm,
+      # and administration API remain exclusive to the ADM edge.
+      rule: 'Host(`auth.{{ env "DOMAIN" }}`) && (Path(`/realms/aigw/.well-known/openid-configuration`) || Path(`/realms/aigw/protocol/openid-connect/auth`) || Path(`/realms/aigw/protocol/openid-connect/logout`) || PathPrefix(`/realms/aigw/login-actions/`) || PathPrefix(`/resources/`))'
       priority: 100
       entryPoints: [websecure]
       service: keycloak
@@ -50,15 +50,14 @@ http:
       tls: {}
 
   middlewares:
-    # 403-everything middleware: an IP allow-list no client can satisfy.
+    # 403-everything middleware: an allow-list containing only IPv4's
+    # unspecified source address, which cannot originate an established TCP
+    # connection. Do not use loopback here; it is a real local source.
     deny-all:
       ipAllowList:
-        sourceRange: ["127.0.0.1/32"]
+        sourceRange: ["0.0.0.0/32"]
 
   services:
-    open-webui:
-      loadBalancer:
-        servers: [{ url: "http://open-webui:8080" }]
     litellm:
       loadBalancer:
         servers: [{ url: "http://litellm:4000" }]

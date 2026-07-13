@@ -7,6 +7,8 @@ umask 077
 STACK_DIR="${STACK_DIR:-/opt/ai-gateway}"
 PROJECT="${COMPOSE_PROJECT_NAME:-ai-gateway}"
 MAX_AGE="${BACKUP_MAX_AGE_SECONDS:-86400}"
+unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+docker_cmd=(docker --host unix:///run/docker.sock)
 cd "$STACK_DIR"
 compose=("$STACK_DIR/scripts/aigw-compose.sh")
 [[ ! -e .state/restore-required-unseal ]] || {
@@ -45,7 +47,7 @@ has_existing_state() {
 # Preserve the direct-image reference check for pulled/pinned services. Inspect
 # every existing container for the service rather than an arbitrary first row.
 for service in "${stateful[@]}"; do
-  cid_text="$(docker ps -a -q \
+  cid_text="$("${docker_cmd[@]}" ps -a -q \
     --filter "label=com.docker.compose.project=$PROJECT" \
     --filter "label=com.docker.compose.service=$service")"
   cids=()
@@ -60,7 +62,7 @@ service = sys.argv[1]
 print((json.load(sys.stdin).get("services", {}).get(service, {}) or {}).get("image", ""))
 ' "$service")"
   for cid in "${cids[@]}"; do
-    current="$(docker inspect --format '{{.Config.Image}}' "$cid")"
+    current="$("${docker_cmd[@]}" inspect --format '{{.Config.Image}}' "$cid")"
     [[ -z "$desired" || "$current" == "$desired" ]] || add_changed "$service"
   done
 done

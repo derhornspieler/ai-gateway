@@ -510,15 +510,16 @@ if ansible.is_file():
         '{ address: "{{ traefik_int_portal_ip }}", hostname: "portal.',
         '{ address: "{{ traefik_int_chat_ip }}", hostname: "api.',
         '{ address: "{{ traefik_adm_admin_ip }}", hostname: "admin.',
-        'hostname: "admin.{{ aigw_domain }}", path: /, status: "403"',
+        '{ address: "{{ traefik_adm_admin_ip }}", hostname: "admin-portal.',
+        'hostname: "admin.{{ aigw_domain }}", path: /, status: "302"',
         "Host-origin traffic to",
         "a physical published address is deliberately denied",
         "register: grafana_datasource_graph",
         "retries: 12",
         "delay: 5",
         "until: grafana_datasource_graph.rc == 0",
-        'stdin: "{{ grafana_admin_password }}"',
-        "stdin_add_newline: false",
+        "file:/var/lib/grafana/grafana.db?mode=ro",
+        '"{{ compose_project_name }}-grafana-1:ro"',
         "'name=selinux'",
         'disabled != {"alloy", "node-exporter"}',
         'proc_label != "system_u:system_r:spc_t:s0"',
@@ -532,7 +533,7 @@ if ansible.is_file():
         "aigw_recent_selinux_denials.stderr is search('(?i)<no matches>')",
     ):
         assert required in verify_source, required
-    assert 'stdin: "{{ grafana_admin_password }}\\n"' not in verify_source
+    assert 'stdin: "{{ grafana_admin_password }}"' not in verify_source
 PY
 
 BUSYBOX_PIN='dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad'
@@ -633,6 +634,7 @@ env \
   TRAEFIK_INT_PORTAL_IP=172.28.4.2 \
   TRAEFIK_ADM_ADMIN_IP=172.28.5.2 \
   TRAEFIK_ADM_GRAFANA_IP=172.28.6.2 \
+  OAUTH2_PROXY_GRAFANA_IP=172.28.6.3 \
   ENVOY_EGRESS_IP=172.28.0.2 \
   ALLOY_INTERNAL_IP=172.28.2.2 \
   ALLOY_TELEMETRY_IP=172.28.13.2 \
@@ -670,10 +672,13 @@ env \
   WEBUI_SECRET_KEY=ValidationStableWebuiSecret_0123456789ABC \
   WEBUI_OIDC_CLIENT_SECRET=ValidationWebuiOIDCSecret0123456789ABC \
   PORTAL_OIDC_CLIENT_SECRET=ValidationPortalOIDCSecret0123456789AB \
+  ADMIN_PORTAL_OIDC_CLIENT_SECRET=ValidationAdminPortalOIDC0123456789AB \
   OAUTH2_PROXY_CLIENT_SECRET=ValidationOauth2ClientSecret0123456789A \
   OAUTH2_PROXY_COOKIE_SECRET=ValidationCookieSecret0123456789 \
   PORTAL_SESSION_SECRET=ValidationPortalSession0123456789ABCDE \
+  ADMIN_PORTAL_SESSION_SECRET=ValidationAdminPortalSession0123456789 \
   ROTATOR_INTERNAL_TOKEN=ValidationRotatorInternal0123456789ABCDE \
+  PORTAL_IDENTITY_TOKEN=ValidationPortalIdentity0123456789ABCDE \
   ROTATOR_VAULT_TOKEN=ValidationVaultToken0123456789ABCDE \
   GRAFANA_ADMIN_PASSWORD=ValidationGrafanaAdmin_0123456789 \
   CRIBL_OTLP_ENDPOINT=cribl-mock:4317 \
@@ -702,14 +707,22 @@ manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 project_root = Path(sys.argv[2])
 services = json.load(sys.stdin)["services"]
 assert "lab-dns" not in services
-for name in ("oauth2-proxy", "oauth2-proxy-grafana"):
+for name in (
+    "oauth2-proxy", "oauth2-proxy-grafana",
+    "oauth2-proxy-prometheus", "oauth2-proxy-vault",
+):
     env = services[name]["environment"]
     assert env["OAUTH2_PROXY_COOKIE_REFRESH"] == "5m", name
     assert env["OAUTH2_PROXY_COOKIE_EXPIRE"] == "8h", name
+    assert env["OAUTH2_PROXY_SCOPE"] == "openid email profile", name
+    assert env["OAUTH2_PROXY_OIDC_EMAIL_CLAIM"] == "preferred_username", name
+    assert env["OAUTH2_PROXY_SKIP_PROVIDER_BUTTON"] == "true", name
+    assert env["OAUTH2_PROXY_OIDC_GROUPS_CLAIM"] == "roles", name
 internal_edge = services["traefik-int"]
 assert "net-int-edge" in internal_edge["networks"]
 assert [name for name, service in services.items() if "net-int-edge" in service.get("networks", {})] == ["traefik-int"]
 assert services["keycloak"]["user"] == "65532:65532"
+assert "net-grafana" not in services["keycloak"]["networks"]
 vault = services["vault"]
 assert "VAULT_LOCAL_CONFIG" not in vault.get("environment", {})
 assert vault["command"] == ["server", "-config=/vault/config/aigw.hcl"]
@@ -724,7 +737,10 @@ assert services["envoy-egress"]["healthcheck"]["test"] == ["CMD", "/usr/local/bi
 for edge in ("traefik-int", "traefik-adm"):
     assert services[edge]["user"] == "65532:65532"
     assert services[edge]["healthcheck"]["test"] == ["CMD", "traefik", "healthcheck"]
-for proxy in ("oauth2-proxy", "oauth2-proxy-grafana"):
+for proxy in (
+    "oauth2-proxy", "oauth2-proxy-grafana",
+    "oauth2-proxy-prometheus", "oauth2-proxy-vault",
+):
     assert services[proxy]["healthcheck"]["test"] == [
         "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
         "http://127.0.0.1:4180/ready",
@@ -734,6 +750,7 @@ assert services["open-webui"]["healthcheck"]["test"] == [
     "http://127.0.0.1:8080/health",
 ]
 assert services["open-webui"]["environment"]["WEBUI_SECRET_KEY"] == "ValidationStableWebuiSecret_0123456789ABC"
+assert services["open-webui"]["environment"]["SSL_CERT_FILE"] == "/etc/ssl/certs/aigw-ca.pem"
 redis = services["redis"]
 assert redis["user"] == "65532:65532"
 assert "REDIS_PASSWORD" not in redis.get("environment", {})
@@ -868,7 +885,8 @@ assert volume_init["network_mode"] == "none"
 assert sorted(volume_init["cap_add"]) == ["CHOWN", "FOWNER", "FSETID"]
 assert volume_init["cap_drop"] == ["ALL"]
 expected_dhi = {
-    "oauth2-proxy", "oauth2-proxy-grafana", "keycloak", "vault", "postgres",
+    "oauth2-proxy", "oauth2-proxy-grafana", "oauth2-proxy-prometheus",
+    "oauth2-proxy-vault", "keycloak", "vault", "postgres",
     "redis", "alloy", "prometheus", "node-exporter", "loki", "tempo",
     "grafana", "cribl-mock",
 }
@@ -877,6 +895,10 @@ for name in expected_dhi:
     image = service["image"]
     assert image.startswith("dhi.io/") or image.startswith("ai-gateway/dhi-"), (name, image)
 assert services["grafana"]["environment"]["GF_PLUGINS_PREINSTALL"] == ""
+assert services["grafana"]["environment"]["GF_AUTH_PROXY_WHITELIST"] == "172.28.6.3"
+assert services["grafana"]["environment"]["GF_AUTH_BASIC_ENABLED"] == "false"
+assert services["grafana"]["environment"]["GF_AUTH_DISABLE_LOGIN_FORM"] == "true"
+assert services["oauth2-proxy-grafana"]["networks"]["net-grafana"]["ipv4_address"] == "172.28.6.3"
 assert services["key-rotator"]["environment"]["KEYCLOAK_PUBLIC_URL"] == "https://auth.aigw.internal"
 assert services["key-rotator"]["environment"]["WIF_KEYCLOAK_PUBLIC_URL"] == "https://idp.wif-a.example.invalid"
 assert services["keycloak"].get("read_only", False) is False
@@ -884,6 +906,13 @@ portal = services["dev-portal"]
 assert portal.get("command") in (None, [])
 assert portal.get("entrypoint") in (None, [])
 assert portal.get("deploy", {}).get("replicas", 1) == 1
+admin_portal = services["admin-portal"]
+assert admin_portal["image"] == portal["image"] == "ai-gateway/portal:1"
+assert admin_portal["environment"]["OIDC_CLIENT_ID"] == "admin-portal"
+assert admin_portal["environment"]["ROTATOR_INTERNAL_TOKEN"] == "ValidationRotatorInternal0123456789ABCDE"
+assert portal["environment"]["ROTATOR_INTERNAL_TOKEN"] == "ValidationPortalIdentity0123456789ABCDE"
+assert set(admin_portal["networks"]) == {"net-admin-app", "net-telemetry"}
+assert set(portal["networks"]) == {"net-portal", "net-telemetry"}
 '\'' "$2/bind-source-digest-inputs.json" "$1"
     docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
       python3 -I "$1/scripts/validate-build-contract.py" "$1" base
@@ -1292,4 +1321,4 @@ for forbidden in ("service_account_id", "key_type", "team_id"):
     assert forbidden not in source
 PY
 
-echo "Base and Parallels-lab Compose configurations are valid (render-only; no containers started)."
+echo "Base and lab Compose configurations are valid (render-only; no containers started)."

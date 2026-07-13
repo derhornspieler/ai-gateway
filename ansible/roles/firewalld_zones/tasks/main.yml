@@ -12,11 +12,359 @@
       - dbus-tools
     state: present
 
-- name: Ensure firewalld running
+# A firewalld activation/reload can rebuild Docker's chains. Render and apply
+# both independent guards *before* starting it, so a live Docker daemon never
+# has an unprotected interval. firewall_preflight has already rejected an
+# unowned existing guard before any package/service mutation.
+- name: Install pre-firewalld atomic DOCKER-USER policy
+  ansible.builtin.template:
+    src: docker-user-rules.sh.j2
+    dest: /usr/local/sbin/docker-user-rules.sh
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Install pre-firewalld native container INPUT/FORWARD guard
+  ansible.builtin.template:
+    src: aigw-host-input-rules.sh.j2
+    dest: /usr/local/sbin/aigw-host-input-rules.sh
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Apply native INPUT/FORWARD guard before firewalld activation
+  ansible.builtin.command: /usr/local/sbin/aigw-host-input-rules.sh
+  changed_when: false
+
+- name: Apply DOCKER-USER guard before firewalld activation
+  ansible.builtin.command: /usr/local/sbin/docker-user-rules.sh
+  changed_when: false
+
+- name: Ensure firewalld running behind the live container guards
   ansible.builtin.systemd:
     name: firewalld
     enabled: true
     state: started
+
+# Do not silently inherit permissive state from an earlier partial deployment.
+# The role can remove its own known legacy port/source entries below, but any
+# other project-zone service, forwarding, rich rule, interface, or `aigw-*`
+# zone is ambiguous on an existing VM and must be reviewed by the operator
+# rather than carried into the hardened gateway policy.
+- name: Preflight — reject unknown pre-existing AI Gateway firewalld state
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import re
+        import subprocess
+        import sys
+
+        zones = json.loads(sys.argv[1])
+        lab_dns_enabled = json.loads(sys.argv[2])
+        vpn_cidr, internal_cidr, adm_ip, internal_ip, management_port = sys.argv[3:]
+        managed = {zone["zone"]: zone for zone in zones}
+
+        def invoke(scope, *arguments, allowed=(0,)):
+            command = ["firewall-cmd"]
+            if scope == "permanent":
+                command.append("--permanent")
+            command.extend(arguments)
+            result = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+            if result.returncode not in allowed:
+                raise RuntimeError(
+                    " ".join(command) + ": " + (result.stderr.strip() or result.stdout.strip())
+                )
+            return result.returncode, result.stdout.strip()
+
+        def words(value):
+            return {word for word in value.split() if word}
+
+        def normalize_rule(value):
+            return " ".join(value.split())
+
+        # The normal desired rules plus the lab DNS rules are recognizable
+        # migration state.  Disabled lab DNS is reconciled away later; an
+        # arbitrary rich rule is never accepted merely because it is in an
+        # AIGW-named zone.
+        allowed_rich = {
+            zone["zone"]: {normalize_rule(rule) for rule in zone.get("rich_rules", [])}
+            for zone in zones
+        }
+        for zone_name, source, destination in (
+            ("aigw-adm", vpn_cidr, adm_ip),
+            ("aigw-internal", internal_cidr, internal_ip),
+        ):
+            allowed_rich.setdefault(zone_name, set()).update(
+                {
+                    normalize_rule(
+                        f'rule family="ipv4" source address="{source}" '
+                        f'destination address="{destination}" port port="53" '
+                        f'protocol="{protocol}" accept'
+                    )
+                    for protocol in ("tcp", "udp")
+                }
+            )
+
+        allowed_ports = {
+            "aigw-egress": set(),
+            "aigw-adm": {"22/tcp", f"{management_port}/tcp", "443/tcp", "53/tcp", "53/udp"},
+            "aigw-internal": {"443/tcp"},
+        }
+        allowed_sources = {
+            "aigw-egress": set(),
+            "aigw-adm": {vpn_cidr},
+            "aigw-internal": {internal_cidr},
+        }
+        errors = []
+        for scope in ("runtime", "permanent"):
+            _, zone_text = invoke(scope, "--get-zones")
+            existing = words(zone_text)
+            unexpected_names = sorted(
+                name for name in existing if name.startswith("aigw-") and name not in managed
+            )
+            if unexpected_names:
+                errors.append(f"{scope}: unexpected project zones {', '.join(unexpected_names)}")
+
+            for name, desired in managed.items():
+                if name not in existing:
+                    continue
+                _, target = invoke(scope, f"--zone={name}", "--get-target")
+                allowed_targets = {"default", desired["target"].replace("%", "")}
+                if target not in allowed_targets:
+                    errors.append(f"{scope}:{name}: unsafe target {target!r}")
+
+                for option in (
+                    "--list-services",
+                    "--list-protocols",
+                    "--list-source-ports",
+                    "--list-forward-ports",
+                    "--list-icmp-blocks",
+                ):
+                    _, value = invoke(scope, f"--zone={name}", option)
+                    if value:
+                        errors.append(f"{scope}:{name}: unexpected {option[7:]} {value!r}")
+
+                _, interfaces = invoke(scope, f"--zone={name}", "--list-interfaces")
+                extra_interfaces = words(interfaces) - set(desired.get("interfaces", []))
+                if extra_interfaces:
+                    errors.append(
+                        f"{scope}:{name}: unexpected interfaces {', '.join(sorted(extra_interfaces))}"
+                    )
+
+                _, sources = invoke(scope, f"--zone={name}", "--list-sources")
+                extra_sources = words(sources) - allowed_sources.get(name, set())
+                if extra_sources:
+                    errors.append(
+                        f"{scope}:{name}: unexpected sources {', '.join(sorted(extra_sources))}"
+                    )
+
+                _, ports = invoke(scope, f"--zone={name}", "--list-ports")
+                extra_ports = words(ports) - allowed_ports.get(name, set())
+                if extra_ports:
+                    errors.append(
+                        f"{scope}:{name}: unexpected ports {', '.join(sorted(extra_ports))}"
+                    )
+
+                _, rich_text = invoke(scope, f"--zone={name}", "--list-rich-rules")
+                extra_rich = {
+                    normalize_rule(rule)
+                    for rule in rich_text.splitlines()
+                    if normalize_rule(rule)
+                } - allowed_rich.get(name, set())
+                if extra_rich:
+                    errors.append(
+                        f"{scope}:{name}: unexpected rich rules {sorted(extra_rich)!r}"
+                    )
+
+                masquerade_rc, _ = invoke(
+                    scope, f"--zone={name}", "--query-masquerade", allowed=(0, 1)
+                )
+                if masquerade_rc == 0:
+                    errors.append(f"{scope}:{name}: masquerade is enabled")
+                forward_rc, _ = invoke(
+                    scope, f"--zone={name}", "--query-forward", allowed=(0, 1)
+                )
+                if forward_rc == 0:
+                    errors.append(f"{scope}:{name}: intra-zone forwarding is enabled")
+
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - "{{ firewalld_zones | to_json }}"
+      - "{{ lab_dns_enabled | bool | to_json }}"
+      - "{{ vpn_client_cidr }}"
+      - "{{ internal_cidr }}"
+      - "{{ eth1_ip }}"
+      - "{{ eth2_ip }}"
+      - "{{ aigw_management_ssh_port | string }}"
+  environment:
+    LC_ALL: C
+  changed_when: false
+
+# The two container guards are flushed atomically by the managed templates
+# below. On an existing VM, do not erase a manually-owned nft/DOCKER-USER
+# policy merely because it uses the same shared host primitives. Only a
+# validated ownership marker or a separate explicit firewall-adoption
+# acknowledgement authorizes replacement; token-subset heuristics are not
+# sufficient to prove ownership of a packet filter.
+# firewall_preflight performs that ownership decision before these helpers are
+# rendered/applied. Re-check only authorized migrations here; on a clean host
+# the newly installed pre-firewalld guard is intentionally nonempty.
+- name: Preflight — reject unowned nftables and DOCKER-USER guard state
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import re
+        import subprocess
+        import sys
+
+        has_marker = sys.argv[1] == "true"
+        explicit_adoption = sys.argv[2] == "true"
+
+        def capture(command):
+            result = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+            # Missing nft table / iptables chain is a normal clean-host case.
+            if result.returncode not in (0, 1):
+                raise RuntimeError(
+                    " ".join(command) + ": " + (result.stderr.strip() or result.stdout.strip())
+                )
+            return result.returncode, result.stdout
+
+        def chain_rules(text):
+            return [line for line in text.splitlines() if line.startswith("-A DOCKER-USER ")]
+
+        errors = []
+        nft_rc, nft_text = capture(["nft", "list", "table", "inet", "aigw_guard"])
+        nft_body = re.sub(
+            r"^\s*table\s+inet\s+aigw_guard\s*\{\s*|\s*\}\s*$", "", nft_text, flags=re.S
+        ).strip()
+        if nft_body and not (has_marker or explicit_adoption):
+            errors.append("unowned inet/aigw_guard nftables policy")
+
+        for binary, family in (("iptables", "IPv4"), ("ip6tables", "IPv6")):
+            _, text = capture([binary, "-S", "DOCKER-USER"])
+            rules = chain_rules(text)
+            if rules and not (has_marker or explicit_adoption):
+                errors.append(f"unowned {family} DOCKER-USER policy")
+
+        if errors:
+            raise SystemExit("; ".join(errors))
+      - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_firewalld_state | bool) else 'false' }}"
+  environment:
+    LC_ALL: C
+  changed_when: false
+  when: >-
+    (aigw_host_marker_stat.exists | default(false)) or
+    (aigw_adopt_firewalld_state | bool)
+
+# NetworkManager owns the durable interface-to-zone relationship on Rocky 9.
+# A normal clean host may use the built-in `public` zone (or no saved zone),
+# but a customer-specific zone must not be silently replaced by this platform.
+- name: Preflight — read active NetworkManager profiles before zone ownership changes
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - --get-values
+      - GENERAL.CON-UUID
+      - device
+      - show
+      - "{{ item.1 }}"
+  loop: "{{ firewalld_zones | subelements('interfaces') }}"
+  loop_control:
+    label: "{{ item.1 }} -> {{ item.0.zone }}"
+  register: aigw_preflight_nm_connections
+  changed_when: false
+
+- name: Preflight — build the existing NetworkManager zone ownership map
+  ansible.builtin.set_fact:
+    aigw_preflight_nm_zone_bindings: >-
+      {{
+        (aigw_preflight_nm_zone_bindings | default([])) +
+        [{'interface': item.item.1, 'zone': item.item.0.zone, 'uuid': item.stdout | trim}]
+      }}
+  loop: "{{ aigw_preflight_nm_connections.results }}"
+  loop_control:
+    label: "{{ item.item.1 }} -> {{ item.item.0.zone }}"
+
+- name: Preflight — require an active NetworkManager profile for every managed interface
+  ansible.builtin.assert:
+    that:
+      - item.uuid is match('^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')
+    quiet: true
+    fail_msg: "{{ item.interface }} has no safe active NetworkManager profile for firewalld ownership."
+  loop: "{{ aigw_preflight_nm_zone_bindings }}"
+  loop_control:
+    label: "{{ item.interface }}"
+
+- name: Preflight — read saved NetworkManager zones before zone ownership changes
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - --get-values
+      - connection.zone
+      - connection
+      - show
+      - uuid
+      - "{{ item.uuid }}"
+  loop: "{{ aigw_preflight_nm_zone_bindings }}"
+  loop_control:
+    label: "{{ item.interface }} -> {{ item.zone }}"
+  register: aigw_preflight_saved_nm_zones
+  changed_when: false
+
+- name: Preflight — reject customer-owned saved NetworkManager zones without adoption acknowledgement
+  ansible.builtin.assert:
+    that:
+      - >-
+        (item.stdout | trim) in ['', 'public', item.item.zone] or
+        (aigw_host_marker_stat.exists | default(false)) or
+        (aigw_adopt_firewalld_state | bool)
+    quiet: true
+    fail_msg: >-
+      {{ item.item.interface }} is persistently assigned to customer-owned
+      zone {{ item.stdout | trim | default('<none>', true) }}. Set
+      aigw_adopt_firewalld_state=true only after approving that replacement.
+  loop: "{{ aigw_preflight_saved_nm_zones.results }}"
+  loop_control:
+    label: "{{ item.item.interface }}"
+
+- name: Preflight — read runtime interface zones before zone ownership changes
+  ansible.builtin.command:
+    argv: [firewall-cmd, "--get-zone-of-interface={{ item.interface }}"]
+  loop: "{{ aigw_preflight_nm_zone_bindings }}"
+  loop_control:
+    label: "{{ item.interface }} -> {{ item.zone }}"
+  register: aigw_preflight_runtime_nm_zones
+  changed_when: false
+
+- name: Preflight — reject customer-owned runtime interface zones without adoption acknowledgement
+  ansible.builtin.assert:
+    that:
+      - >-
+        (item.stdout | trim) in ['', 'no zone', 'public', item.item.zone] or
+        (aigw_host_marker_stat.exists | default(false)) or
+        (aigw_adopt_firewalld_state | bool)
+    quiet: true
+    fail_msg: >-
+      {{ item.item.interface }} is currently assigned to customer-owned zone
+      {{ item.stdout | trim | default('<none>', true) }}. Set
+      aigw_adopt_firewalld_state=true only after approving that replacement.
+  loop: "{{ aigw_preflight_runtime_nm_zones.results }}"
+  loop_control:
+    label: "{{ item.item.interface }}"
 
 - name: Install atomic DOCKER-USER policy
   ansible.builtin.template:
@@ -180,6 +528,64 @@
   when: (item.stdout | trim) != (item.item.target | replace('%%', ''))
   notify: reload firewalld
 
+# Install the replacement source-scoped policy while the interfaces are still
+# in their existing zones. Only then remove legacy broad openings or bind the
+# physical links to the new AIGW zones; this preserves the controller's proven
+# ADM path throughout an upgrade instead of creating an SSH lockout window.
+- name: Allow ports only from approved source CIDRs before zone migration
+  ansible.posix.firewalld:
+    zone: "{{ item.0.zone }}"
+    rich_rule: "{{ item.1 }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ firewalld_zones | subelements('rich_rules') }}"
+
+- name: Reconcile lab-only source-scoped authoritative DNS rules before zone migration
+  ansible.posix.firewalld:
+    zone: "{{ item.zone }}"
+    rich_rule: >-
+      rule family="ipv4" source address="{{ item.source }}"
+      destination address="{{ item.destination }}" port port="53"
+      protocol="{{ item.protocol }}" accept
+    permanent: true
+    immediate: true
+    state: "{{ 'enabled' if (lab_dns_enabled | bool) else 'disabled' }}"
+  loop:
+    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}", destination: "{{ eth1_ip }}", protocol: tcp }
+    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}", destination: "{{ eth1_ip }}", protocol: udp }
+    - { zone: aigw-internal, source: "{{ internal_cidr }}", destination: "{{ eth2_ip }}", protocol: tcp }
+    - { zone: aigw-internal, source: "{{ internal_cidr }}", destination: "{{ eth2_ip }}", protocol: udp }
+
+- name: Remove legacy zone-wide port openings after source-scoped policy is live
+  ansible.posix.firewalld:
+    zone: "{{ item.zone }}"
+    port: "{{ item.port }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  loop:
+    # Remove the configured management-port legacy opening plus a historical
+    # port-22 opening when a deployment migrates to a non-default SSH port.
+    # Duplicate disables on port 22 are intentionally idempotent.
+    - { zone: aigw-adm, port: "{{ aigw_management_ssh_port }}/tcp" }
+    - { zone: aigw-adm, port: 22/tcp }
+    - { zone: aigw-adm, port: 443/tcp }
+    - { zone: aigw-adm, port: 53/tcp }
+    - { zone: aigw-adm, port: 53/udp }
+    - { zone: aigw-internal, port: 443/tcp }
+
+- name: Remove legacy source-to-zone assignments after source-scoped policy is live
+  ansible.posix.firewalld:
+    zone: "{{ item.zone }}"
+    source: "{{ item.source }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  loop:
+    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}" }
+    - { zone: aigw-internal, source: "{{ internal_cidr }}" }
+
 # NetworkManager is authoritative for zones on Rocky 9. A permanent firewalld
 # interface entry is not sufficient: after a reload, an active profile with a
 # blank connection.zone is re-advertised into firewalld's default (public)
@@ -308,56 +714,6 @@
     owner: root
     group: root
     mode: "0755"
-
-- name: Remove legacy zone-wide port openings
-  ansible.posix.firewalld:
-    zone: "{{ item.zone }}"
-    port: "{{ item.port }}"
-    permanent: true
-    immediate: true
-    state: disabled
-  loop:
-    - { zone: aigw-adm, port: 22/tcp }
-    - { zone: aigw-adm, port: 443/tcp }
-    - { zone: aigw-adm, port: 53/tcp }
-    - { zone: aigw-adm, port: 53/udp }
-    - { zone: aigw-internal, port: 443/tcp }
-
-- name: Remove legacy source-to-zone assignments
-  ansible.posix.firewalld:
-    zone: "{{ item.zone }}"
-    source: "{{ item.source }}"
-    permanent: true
-    immediate: true
-    state: disabled
-  loop:
-    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}" }
-    - { zone: aigw-internal, source: "{{ internal_cidr }}" }
-
-- name: Allow ports only from approved source CIDRs
-  ansible.posix.firewalld:
-    zone: "{{ item.0.zone }}"
-    rich_rule: "{{ item.1 }}"
-    permanent: true
-    immediate: true
-    state: enabled
-  loop: "{{ firewalld_zones | subelements('rich_rules') }}"
-
-- name: Reconcile lab-only source-scoped authoritative DNS rules
-  ansible.posix.firewalld:
-    zone: "{{ item.zone }}"
-    rich_rule: >-
-      rule family="ipv4" source address="{{ item.source }}"
-      destination address="{{ item.destination }}" port port="53"
-      protocol="{{ item.protocol }}" accept
-    permanent: true
-    immediate: true
-    state: "{{ 'enabled' if (lab_dns_enabled | bool) else 'disabled' }}"
-  loop:
-    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}", destination: "{{ eth1_ip }}", protocol: tcp }
-    - { zone: aigw-adm, source: "{{ vpn_client_cidr }}", destination: "{{ eth1_ip }}", protocol: udp }
-    - { zone: aigw-internal, source: "{{ internal_cidr }}", destination: "{{ eth2_ip }}", protocol: tcp }
-    - { zone: aigw-internal, source: "{{ internal_cidr }}", destination: "{{ eth2_ip }}", protocol: udp }
 
 - name: Read denied-packet logging mode
   ansible.builtin.command: firewall-cmd --get-log-denied

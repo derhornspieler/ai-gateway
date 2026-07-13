@@ -57,6 +57,8 @@
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "fullScopeAllowed": false,
       "secret": {{ webui_oidc_client_secret | mandatory("webui_oidc_client_secret must be set in an ansible-vault overlay (alphanumeric [A-Za-z0-9] only — Keycloak realm import mangles $ / ${...})") | to_json }},
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
@@ -84,6 +86,8 @@
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "fullScopeAllowed": false,
       "secret": {{ portal_oidc_client_secret | mandatory("portal_oidc_client_secret must be set in an ansible-vault overlay (alphanumeric [A-Za-z0-9] only — Keycloak realm import mangles $ / ${...})") | to_json }},
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
@@ -114,6 +118,8 @@
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "fullScopeAllowed": false,
       "secret": {{ admin_portal_oidc_client_secret | mandatory("admin_portal_oidc_client_secret must be set in an ansible-vault overlay") | to_json }},
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
@@ -144,46 +150,23 @@
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "fullScopeAllowed": false,
       "secret": {{ oauth2_proxy_client_secret | mandatory("oauth2_proxy_client_secret must be set in an ansible-vault overlay (alphanumeric [A-Za-z0-9] only — Keycloak realm import mangles $ / ${...})") | to_json }},
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "redirectUris": [
         "https://admin.{{ aigw_domain }}/oauth2/callback",
+        "https://grafana.{{ aigw_domain }}/oauth2/callback",
         "https://prometheus.{{ aigw_domain }}/oauth2/callback",
         "https://vault.{{ aigw_domain }}/oauth2/callback"
       ],
       "webOrigins": [
         "https://admin.{{ aigw_domain }}",
+        "https://grafana.{{ aigw_domain }}",
         "https://prometheus.{{ aigw_domain }}",
         "https://vault.{{ aigw_domain }}"
       ],
-      "protocolMappers": [
-        {
-          "name": "realm-roles-to-roles-claim",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-usermodel-realm-role-mapper",
-          "config": {
-            "claim.name": "roles",
-            "jsonType.label": "String",
-            "multivalued": "true",
-            "id.token.claim": "true",
-            "access.token.claim": "true",
-            "userinfo.token.claim": "true"
-          }
-        }
-      ]
-    },
-    {
-      "clientId": "grafana",
-      "name": "Grafana",
-      "enabled": true,
-      "protocol": "openid-connect",
-      "publicClient": false,
-      "secret": {{ grafana_oidc_client_secret | mandatory("grafana_oidc_client_secret must be set in an ansible-vault overlay") | to_json }},
-      "standardFlowEnabled": true,
-      "directAccessGrantsEnabled": false,
-      "redirectUris": ["https://grafana.{{ aigw_domain }}/login/generic_oauth"],
-      "webOrigins": ["https://grafana.{{ aigw_domain }}"],
       "protocolMappers": [
         {
           "name": "realm-roles-to-roles-claim",

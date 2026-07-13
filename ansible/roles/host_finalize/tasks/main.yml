@@ -1,0 +1,17 @@
+---
+# Promote the marker only after the complete host converge and runtime verify
+# have succeeded. A partial Docker/firewall/stack change must never be treated
+# as a trusted dedicated-AIGW host on the next run.
+
+- name: Finalize — promote the verified dedicated-Docker-host marker
+  ansible.builtin.copy:
+    dest: "{{ aigw_docker_host_marker }}"
+    content: "{{ aigw_docker_host_marker_content }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Finalize — remove the in-progress dedicated-Docker-host marker
+  ansible.builtin.file:
+    path: "{{ aigw_docker_host_pending_marker }}"
+    state: absent

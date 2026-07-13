@@ -10,6 +10,8 @@ PROJECT="${COMPOSE_PROJECT_NAME:-ai-gateway}"
 MAX_BYTES="${VAULT_AUDIT_MAX_BYTES:-104857600}"
 KEEP_FILES="${VAULT_AUDIT_KEEP_FILES:-14}"
 HELPER_IMAGE="dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad"
+unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+docker_cmd=(docker --host unix:///run/docker.sock)
 
 if [[ ! "$MAX_BYTES" =~ ^[0-9]+$ ]] || (( MAX_BYTES < 1048576 )); then
   echo "invalid VAULT_AUDIT_MAX_BYTES" >&2
@@ -36,7 +38,7 @@ release_lock() { rm -rf "$lock_dir"; }
 trap release_lock EXIT INT TERM
 
 container_for() {
-  docker ps -q \
+  "${docker_cmd[@]}" ps -q \
     --filter "label=com.docker.compose.project=$PROJECT" \
     --filter "label=com.docker.compose.service=$1" | head -n 1
 }
@@ -48,7 +50,7 @@ vault_cid="$(container_for vault)"
 }
 
 read -r audit_volume < <(
-  docker inspect "$vault_cid" | python3 -c '
+  "${docker_cmd[@]}" inspect "$vault_cid" | python3 -c '
 import json, sys
 mounts = json.load(sys.stdin)[0].get("Mounts", [])
 matches = [m.get("Name", "") for m in mounts if m.get("Destination") == "/vault/logs"]
@@ -58,7 +60,7 @@ print(matches[0])
 '
 )
 helper() {
-  docker run --rm --network none --read-only \
+  "${docker_cmd[@]}" run --rm --network none --read-only \
     --security-opt no-new-privileges:true --cap-drop ALL \
     --user 1000:473 --entrypoint /bin/sh \
     -v "$audit_volume:/audit" "$HELPER_IMAGE" "$@"
@@ -92,7 +94,7 @@ rollback() {
 }
 trap 'rollback; release_lock' EXIT INT TERM
 
-if ! docker kill --signal HUP "$vault_cid" >/dev/null; then
+if ! "${docker_cmd[@]}" kill --signal HUP "$vault_cid" >/dev/null; then
   echo "Vault HUP failed; rolling audit file back" >&2
   exit 1
 fi

@@ -12,6 +12,11 @@ usage() {
 STACK_DIR="${STACK_DIR:-/opt/ai-gateway}"
 PROJECT="${COMPOSE_PROJECT_NAME:-ai-gateway}"
 HELPER_IMAGE="dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad"
+# Preserve registry credentials in DOCKER_CONFIG when a future helper needs
+# them, but never inherit a controller-selected daemon/context from root's
+# environment. All maintenance Docker operations target the local socket.
+unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+docker_cmd=(docker --host unix:///run/docker.sock)
 recipient=""
 output=""
 while (($#)); do
@@ -67,7 +72,7 @@ restart_original() {
     # Start only the exact containers that were running before quiesce.
     # `docker compose start` traverses dependencies and can incorrectly rerun
     # the successful exited volume-init one-shot.
-    docker start "${running_containers[@]}" >/dev/null 2>&1 || {
+    "${docker_cmd[@]}" start "${running_containers[@]}" >/dev/null 2>&1 || {
       echo "WARNING: backup completed/failed but one or more original containers did not restart" >&2
       rc=1
     }
@@ -128,7 +133,7 @@ allowed_volumes=(
 )
 archived_volumes=()
 for logical in "${allowed_volumes[@]}"; do
-  mapfile -t matches < <(docker volume ls -q \
+  mapfile -t matches < <("${docker_cmd[@]}" volume ls -q \
     --filter "label=com.docker.compose.project=$PROJECT" \
     --filter "label=com.docker.compose.volume=$logical")
   ((${#matches[@]} <= 1)) || { echo "multiple volumes found for $logical" >&2; exit 1; }
@@ -141,7 +146,7 @@ for logical in "${allowed_volumes[@]}"; do
     # durable Open WebUI database and application data.
     volume_tar_args=(--numeric-owner --exclude ./cache -czf - -C /source)
   fi
-  docker run --rm --network none --read-only --security-opt no-new-privileges:true \
+  "${docker_cmd[@]}" run --rm --network none --read-only --security-opt no-new-privileges:true \
     --cap-drop ALL --cap-add DAC_READ_SEARCH --user 0:0 \
     -v "${matches[0]}:/source:ro" --entrypoint /bin/tar "$HELPER_IMAGE" \
     "${volume_tar_args[@]}" . > "$staging/volumes/${logical}.tar.gz"
@@ -204,7 +209,7 @@ backup_sha="$(sha256sum "$output" | awk '{print $1}')"
 # successful exited one-shot and must stay exited. Vault's file backend seals
 # on process restart, so post-backup full readiness still requires unseal.
 if ((${#running_containers[@]})); then
-  docker start "${running_containers[@]}" >/dev/null
+  "${docker_cmd[@]}" start "${running_containers[@]}" >/dev/null
 fi
 restarted=true
 

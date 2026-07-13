@@ -45,16 +45,34 @@
       port tuple cannot be evaluated against Match rules.
     quiet: true
 
-- name: Install key-only SSH daemon hardening policy
+- name: Derive an ADM-address sshd Match probe without trusting a controller hostname
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import ipaddress
+        import sys
+
+        network = ipaddress.ip_network(sys.argv[1], strict=True)
+        print(next(network.hosts(), network.network_address))
+      - "{{ vpn_client_cidr }}"
+  register: aigw_default_sshd_probe_source
+  changed_when: false
+
+- name: Install default-deny SSH policy with explicit ADM SOCKS exceptions
   ansible.builtin.copy:
     dest: /etc/ssh/sshd_config.d/00-ai-gateway-hardening.conf
     owner: root
     group: root
     mode: "0644"
     content: |
-      AuthenticationMethods publickey
+      # Managed by AI Gateway. The firewalld ADM rule limits all SSH ingress
+      # to vpn_client_cidr; password authentication is an explicit inventory
+      # choice while root login remains prohibited.
       PubkeyAuthentication yes
-      PasswordAuthentication no
+      PasswordAuthentication {{ 'yes' if (aigw_ssh_password_authentication | bool) else 'no' }}
       KbdInteractiveAuthentication no
       ChallengeResponseAuthentication no
       PermitEmptyPasswords no
@@ -69,12 +87,32 @@
       AllowAgentForwarding no
       PermitTunnel no
       GatewayPorts no
+      PermitOpen none
+      PermitListen none
       PermitUserEnvironment no
       PermitUserRC no
       MaxAuthTries 3
       LoginGraceTime 30
       MaxSessions 4
       MaxStartups 10:30:30
+{% if aigw_adm_socks_enabled | bool %}
+      # SOCKS `ssh -D` is local TCP forwarding. It remains unavailable to
+      # every other account/source; remote forwarding, gateway binds, agent,
+      # stream-local, X11, and tunnels remain denied by the global policy.
+{% if aigw_adm_socks_users | length > 0 %}
+      Match User {{ aigw_adm_socks_users | join(',') }} Address {{ aigw_adm_socks_source_cidrs | join(',') }}
+        DisableForwarding no
+        AllowTcpForwarding local
+        PermitOpen any
+{% endif %}
+{% if aigw_adm_socks_groups | length > 0 %}
+      Match Group {{ aigw_adm_socks_groups | join(',') }} Address {{ aigw_adm_socks_source_cidrs | join(',') }}
+        DisableForwarding no
+        AllowTcpForwarding local
+        PermitOpen any
+{% endif %}
+      Match all
+{% endif %}
     validate: /usr/sbin/sshd -t -f %s
   notify: reload sshd
 
@@ -86,7 +124,7 @@
 - name: Apply SSH hardening only after complete-config validation
   ansible.builtin.meta: flush_handlers
 
-- name: Read effective SSH daemon policy
+- name: Read effective SSH daemon policy for the active automation path
   ansible.builtin.command:
     # Evaluate Match User/Host/Address/LocalAddress/LocalPort for the active
     # automation path. A bare `sshd -T` can report safe globals while a Match
@@ -100,12 +138,15 @@
   register: effective_sshd_policy
   changed_when: false
 
-- name: Assert effective key-only SSH policy
+- name: Assert effective active-path SSH authentication and listener policy
   ansible.builtin.assert:
     that:
-      - effective_sshd_policy.stdout is search('(?m)^authenticationmethods publickey$')
       - effective_sshd_policy.stdout is search('(?m)^pubkeyauthentication yes$')
-      - effective_sshd_policy.stdout is search('(?m)^passwordauthentication no$')
+      - >-
+        effective_sshd_policy.stdout is search(
+          '(?m)^passwordauthentication ' ~
+          ('yes' if (aigw_ssh_password_authentication | bool) else 'no') ~ '$'
+        )
       - effective_sshd_policy.stdout is search('(?m)^kbdinteractiveauthentication no$')
       - effective_sshd_policy.stdout is search('(?m)^permitemptypasswords no$')
       - effective_sshd_policy.stdout is search('(?m)^hostbasedauthentication no$')
@@ -113,8 +154,6 @@
       - effective_sshd_policy.stdout is search('(?m)^ignorerhosts yes$')
       - effective_sshd_policy.stdout is search('(?m)^permitrootlogin no$')
       - effective_sshd_policy.stdout is search('(?m)^x11forwarding no$')
-      - effective_sshd_policy.stdout is search('(?m)^disableforwarding yes$')
-      - effective_sshd_policy.stdout is search('(?m)^allowtcpforwarding no$')
       - effective_sshd_policy.stdout is search('(?m)^allowstreamlocalforwarding no$')
       - effective_sshd_policy.stdout is search('(?m)^allowagentforwarding no$')
       - effective_sshd_policy.stdout is search('(?m)^permittunnel no$')
@@ -126,6 +165,150 @@
       - effective_sshd_policy.stdout is search('(?m)^maxsessions 4$')
       - effective_sshd_policy.stdout is search('(?m)^maxstartups 10:30:30$')
     quiet: true
+
+- name: Read effective SSH forwarding policy for an unapproved ADM user
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -T
+      - -C
+      - "user=aigw-forwarding-denied,host={{ aigw_default_sshd_probe_source.stdout | trim }},addr={{ aigw_default_sshd_probe_source.stdout | trim }},laddr={{ eth1_ip }},lport={{ aigw_management_ssh_port }}"
+  register: aigw_denied_sshd_forwarding_policy
+  changed_when: false
+
+- name: Assert SSH forwarding remains default-deny for an unapproved ADM user
+  ansible.builtin.assert:
+    that:
+      - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^disableforwarding yes$')
+      - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^allowtcpforwarding no$')
+      - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^allowstreamlocalforwarding no$')
+      - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^allowagentforwarding no$')
+      - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^permitopen none$')
+      - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^permitlisten none$')
+      - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^permittunnel no$')
+      - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^gatewayports no$')
+    quiet: true
+
+- name: Derive an sshd Match probe for every approved ADM SOCKS source CIDR
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import ipaddress
+        import sys
+
+        network = ipaddress.ip_network(sys.argv[1], strict=True)
+        print(next(network.hosts(), network.network_address))
+      - "{{ item }}"
+  loop: "{{ aigw_adm_socks_source_cidrs }}"
+  register: aigw_adm_socks_source_probe
+  changed_when: false
+  when: aigw_adm_socks_enabled | bool
+
+- name: Record approved ADM SOCKS probe addresses
+  ansible.builtin.set_fact:
+    aigw_adm_socks_probe_sources: >-
+      {{ aigw_adm_socks_source_probe.results | map(attribute='stdout') | map('trim') | list }}
+  when: aigw_adm_socks_enabled | bool
+
+- name: Read effective SSH SOCKS policy for every approved user/source pair
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -T
+      - -C
+      - "user={{ item.0 }},host={{ item.1 }},addr={{ item.1 }},laddr={{ eth1_ip }},lport={{ aigw_management_ssh_port }}"
+  loop: "{{ aigw_adm_socks_users | product(aigw_adm_socks_probe_sources | default([])) | list }}"
+  loop_control:
+    label: "{{ item.0 }} from {{ item.1 }}"
+  register: aigw_adm_socks_user_policy
+  changed_when: false
+  when:
+    - aigw_adm_socks_enabled | bool
+    - aigw_adm_socks_users | length > 0
+
+- name: Assert approved user/source SSH SOCKS policy is local-only
+  ansible.builtin.assert:
+    that:
+      - item.stdout is search('(?m)^disableforwarding no$')
+      - item.stdout is search('(?m)^allowtcpforwarding local$')
+      - item.stdout is search('(?m)^permitopen any$')
+      - item.stdout is search('(?m)^allowstreamlocalforwarding no$')
+      - item.stdout is search('(?m)^allowagentforwarding no$')
+      - item.stdout is search('(?m)^permittunnel no$')
+      - item.stdout is search('(?m)^gatewayports no$')
+      - item.stdout is search('(?m)^permitlisten none$')
+    quiet: true
+  loop: "{{ aigw_adm_socks_user_policy.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0 }} from {{ item.item.1 }}"
+  when:
+    - aigw_adm_socks_enabled | bool
+    - aigw_adm_socks_users | length > 0
+
+- name: Verify every declared SSH SOCKS group test user is a current member
+  ansible.builtin.command:
+    argv: [id, -nG, "{{ item.value }}"]
+  loop: "{{ aigw_adm_socks_group_test_users | dict2items }}"
+  loop_control:
+    label: "{{ item.value }} in {{ item.key }}"
+  register: aigw_adm_socks_group_membership
+  changed_when: false
+  when:
+    - aigw_adm_socks_enabled | bool
+    - aigw_adm_socks_groups | length > 0
+
+- name: Require each declared SSH SOCKS group test user to match its group
+  ansible.builtin.assert:
+    that:
+      - item.item.key in item.stdout.split()
+    quiet: true
+    fail_msg: >-
+      SSH SOCKS Match Group {{ item.item.key }} cannot be evaluated because
+      its declared test user {{ item.item.value }} is not a current member.
+  loop: "{{ aigw_adm_socks_group_membership.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.value }} in {{ item.item.key }}"
+  when:
+    - aigw_adm_socks_enabled | bool
+    - aigw_adm_socks_groups | length > 0
+
+- name: Read effective SSH SOCKS policy for every approved group/source pair
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -T
+      - -C
+      - "user={{ item.0.value }},host={{ item.1 }},addr={{ item.1 }},laddr={{ eth1_ip }},lport={{ aigw_management_ssh_port }}"
+  loop: "{{ (aigw_adm_socks_group_test_users | dict2items) | product(aigw_adm_socks_probe_sources | default([])) | list }}"
+  loop_control:
+    label: "{{ item.0.value }} via {{ item.0.key }} from {{ item.1 }}"
+  register: aigw_adm_socks_group_policy
+  changed_when: false
+  when:
+    - aigw_adm_socks_enabled | bool
+    - aigw_adm_socks_groups | length > 0
+
+- name: Assert approved group/source SSH SOCKS policy is local-only
+  ansible.builtin.assert:
+    that:
+      - item.stdout is search('(?m)^disableforwarding no$')
+      - item.stdout is search('(?m)^allowtcpforwarding local$')
+      - item.stdout is search('(?m)^permitopen any$')
+      - item.stdout is search('(?m)^allowstreamlocalforwarding no$')
+      - item.stdout is search('(?m)^allowagentforwarding no$')
+      - item.stdout is search('(?m)^permittunnel no$')
+      - item.stdout is search('(?m)^gatewayports no$')
+      - item.stdout is search('(?m)^permitlisten none$')
+    quiet: true
+  loop: "{{ aigw_adm_socks_group_policy.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.value }} via {{ item.item.0.key }} from {{ item.item.1 }}"
+  when:
+    - aigw_adm_socks_enabled | bool
+    - aigw_adm_socks_groups | length > 0
 
 - name: Postflight — prove a fresh key-only SSH connection and passwordless become
   ansible.builtin.command:
@@ -204,6 +387,84 @@
     name: docker==7.2.0
     state: present
 
+# host_preflight has already rejected foreign Docker state and only sets this
+# fact for an explicitly acknowledged, dedicated-host daemon.json takeover.
+# Preserve the exact old document once before replacing it; this is evidence
+# for the operator, not an automatic rollback of a daemon-wide policy change.
+- name: Create the private dedicated-Docker-host marker directory
+  ansible.builtin.file:
+    path: "{{ aigw_docker_host_marker | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Preserve the prior daemon configuration before explicit dedicated-host adoption
+  ansible.builtin.copy:
+    src: /etc/docker/daemon.json
+    dest: "{{ aigw_docker_host_marker }}.pre-adoption-daemon.json"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+    force: false
+  when: aigw_docker_daemon_adoption_required | default(false) | bool
+
+- name: Record an in-progress dedicated-Docker-host ownership contract before daemon mutation
+  ansible.builtin.copy:
+    dest: "{{ aigw_docker_host_pending_marker }}"
+    content: "{{ aigw_docker_host_marker_content }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: not (aigw_host_marker_stat.exists | default(false))
+
+# Docker's default /var/lib/docker has this type from container-selinux, but a
+# reviewed custom data root does not. Label the root before dockerd starts or
+# restarts. An inactive Docker tree has no live container MCS ownership and is
+# recursively restored; an active tree receives only its root label so this
+# play cannot erase a live container's private MCS range.
+- name: Create the reviewed Docker data-root boundary
+  ansible.builtin.file:
+    path: "{{ docker_data_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0711"
+
+- name: Persist the Docker data-root SELinux file-context boundary
+  community.general.sefcontext:
+    target: "{{ (docker_data_root | regex_escape) ~ '(/.*)?' }}"
+    setype: container_var_lib_t
+    state: present
+
+- name: Apply the Docker data-root SELinux type without relabeling live descendants
+  ansible.builtin.command:
+    argv: [restorecon, -Fv, "{{ docker_data_root }}"]
+  register: aigw_docker_root_restorecon
+  changed_when: aigw_docker_root_restorecon.stdout | length > 0
+  when: aigw_docker_daemon_active | default(false) | bool
+
+- name: Restore the complete inactive Docker data-root SELinux boundary
+  ansible.builtin.command:
+    argv: [restorecon, -RFv, "{{ docker_data_root }}"]
+  register: aigw_inactive_docker_root_restorecon
+  changed_when: aigw_inactive_docker_root_restorecon.stdout | length > 0
+  when: not (aigw_docker_daemon_active | default(false) | bool)
+
+- name: Read the Docker data-root SELinux context
+  ansible.builtin.command:
+    argv: [stat, -c, '%C', --, "{{ docker_data_root }}"]
+  register: aigw_docker_root_context
+  changed_when: false
+
+- name: Require the Docker data-root SELinux type before daemon startup
+  ansible.builtin.assert:
+    that:
+      - aigw_docker_root_context.stdout is match('^[^:]+:object_r:container_var_lib_t:s0$')
+    quiet: true
+    fail_msg: "Unsafe Docker data-root SELinux context: {{ aigw_docker_root_context.stdout }}"
+
 # Keep Docker on the iptables backend (default). Do NOT enable the Docker 29
 # experimental nftables backend — it removes the DOCKER-USER chain this
 # design relies on (see docs/solution-map.md §5).
@@ -234,13 +495,17 @@
 # On a vanilla host Docker remains stopped until docker_networks starts it
 # behind both firewall layers. On an already-running host, apply a changed
 # security configuration now—while those guards are already live—rather than
-# deferring a surprise restart until after post-converge verification.
-- name: Restart only an already-active Docker daemon after config change
+# deferring a surprise restart until after post-converge verification. A
+# daemon that was active without `name=selinux` also must restart after the
+# policy RPM is installed, even if daemon.json itself was already exact.
+- name: Restart an already-active Docker daemon after config change or missing SELinux support
   ansible.builtin.systemd_service:
     name: docker.service
     state: restarted
   when:
-    - docker_daemon_config is changed
+    - >-
+      docker_daemon_config is changed or
+      not (aigw_live_docker_boundary.selinux_enabled | default(false) | bool)
     - docker_active_before_daemon_config.rc == 0
 
 # Docker is deliberately NOT started in this role. site.yml applies the
@@ -248,6 +513,18 @@
 # after the atomic DOCKER-USER policy is live. Starting it here would let
 # restart-policy containers come up before the security boundary on a fresh or
 # recovery converge.
+
+# Docker needs IPv4 forwarding, but an existing VM's reverse-path policy is
+# customer-owned unless this inventory explicitly opts into source-policy
+# routing. Do not globally loosen anti-spoofing merely because Docker is
+# installed.
+- name: Sysctl — enable IPv4 forwarding for reviewed Docker bridges
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_file: /etc/sysctl.d/90-ai-gateway.conf
+    state: present
+    reload: true
 
 # rp_filter=2 (loose, RFC3704): Rocky's strict default silently drops
 # legitimate return traffic once policy-based routing is in play (the 3-NIC
@@ -263,7 +540,7 @@
 # out eth0. Egress safety therefore relies on that -i bridge pin, NOT on
 # rp_filter. Keep the two facts linked: loosening rp_filter is only acceptable
 # while the -i pin exists.
-- name: Sysctl — forwarding + loose rp_filter
+- name: Sysctl — use loose rp_filter only with explicit source-policy routing
   ansible.posix.sysctl:
     name: "{{ item.name }}"
     value: "{{ item.value }}"
@@ -271,7 +548,7 @@
     state: present
     reload: true
   loop:
-    - { name: net.ipv4.ip_forward, value: "1" }
     - { name: net.ipv4.conf.all.rp_filter, value: "2" }
     - { name: "net.ipv4.conf.{{ nic_adm }}.rp_filter", value: "2" }
     - { name: "net.ipv4.conf.{{ nic_internal }}.rp_filter", value: "2" }
+  when: manage_networking | bool

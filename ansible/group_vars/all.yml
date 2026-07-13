@@ -23,6 +23,61 @@ internal_cidr: "{{ lookup('ansible.builtin.env', 'AIGW_INTERNAL_CIDR') }}"
 # from the host namespace and bypass FORWARD entirely.
 container_dns_server: "{{ lookup('ansible.builtin.env', 'AIGW_CONTAINER_DNS_SERVER') }}"
 
+# The full converge changes the ADM-zone SSH policy.  A controller must prove
+# it can reconnect through this exact port on the ADM interface before any
+# firewall or routing mutation occurs.  Override this alongside ansible_port
+# for a non-default management port; an arbitrary existing SSH path is never
+# silently carried through the hardened zone policy.
+aigw_management_ssh_port: 22
+
+# This stack owns Docker's daemon-wide firewall backend, logging defaults,
+# SELinux integration, and data root.  It is deliberately a dedicated-Docker-
+# host deployment, not a coexistence profile for unrelated workloads.  A
+# clean existing Rocky VM is supported; a pre-existing dedicated Docker host
+# can be adopted only with this explicit one-time acknowledgement after the
+# read-only preflight proves it contains no foreign containers/networks.
+aigw_docker_host_mode: dedicated
+aigw_adopt_dedicated_docker_host: false
+aigw_docker_host_marker: /etc/ai-gateway/dedicated-docker-host-v1
+aigw_docker_host_pending_marker: "{{ aigw_docker_host_marker }}.pending"
+# Replacing existing host firewall/NM policy is separate authority from Docker
+# adoption. It is required only when a pre-existing nonempty guard/profile is
+# not already covered by the trusted AIGW host marker.
+aigw_adopt_firewalld_state: false
+# The managed sshd fragment is host-security state too.  Do not overwrite an
+# existing AIGW fragment on a customer VM unless the operator acknowledges the
+# takeover independently of Docker/firewalld ownership.
+aigw_adopt_ssh_state: false
+
+# SSH stays reachable only through the ADM interface/CIDR firewalld rule.  The
+# platform deliberately keeps password authentication enabled during this
+# greenfield phase; switching this explicit boolean to false is the supported
+# future hardening transition. Root login and all forwarding remain denied by
+# default regardless of this setting.
+aigw_ssh_password_authentication: true
+
+# Dynamic SSH SOCKS forwarding is off by default.  Enabling it requires both
+# an approved local user and/or group and one or more source CIDRs contained
+# by vpn_client_cidr.  Group-based exceptions additionally name a real local
+# member for `sshd -T -C` verification; this prevents untested Match Group
+# policy from silently reaching production.
+aigw_adm_socks_enabled: false
+aigw_adm_socks_users: []
+aigw_adm_socks_groups: []
+aigw_adm_socks_source_cidrs: []
+aigw_adm_socks_group_test_users: {}
+
+# Configure the Rocky SELinux desired state before Docker is installed or
+# restarted.  Enabling a disabled policy requires a reboot, which remains an
+# explicit operator opt-in rather than an implicit surprise reboot.
+aigw_manage_selinux: true
+aigw_selinux_policy: targeted
+aigw_selinux_state: enforcing
+aigw_allow_selinux_reboot: false
+# Switching a live Docker host from permissive to enforcing can surface prior
+# label/permission defects immediately. Require a maintenance acknowledgement.
+aigw_allow_active_selinux_enforcement: false
+
 # Observability export target. Plaintext is permitted only for the in-stack
 # development mock; docker_stack asserts that any real target uses validated
 # TLS. A production overlay sets endpoint/server name/CA and false here.
@@ -32,12 +87,12 @@ cribl_otlp_ca_file: "/etc/ssl/certs/aigw-ca.pem"
 cribl_otlp_server_name: "cribl-mock"
 
 # ── Policy routing ──────────────────────────────────────────────────────
-pbr_tables:
-  # Dedicated priorities avoid colliding with the low priorities commonly
-  # installed by VPN clients and NetworkManager. site.yml rejects table
-  # ID/name collisions before this project changes rt_tables.
-  - { name: adm,      id: 101, priority: 10101, dev: "{{ nic_adm }}",      gw: "{{ eth1_gateway }}", src: "{{ eth1_ip }}" }
-  - { name: internal, id: 102, priority: 10102, dev: "{{ nic_internal }}", gw: "{{ eth2_gateway }}", src: "{{ eth2_ip }}" }
+# An existing host's addressing and ordinary routing are customer-owned.
+# Source-policy routing is opt-in because it adds two defaults/rules; declare
+# both this flag and the exact tables in an environment inventory only when
+# asymmetric reply routing is actually required.  The lab profile opts in.
+manage_networking: false
+pbr_tables: []
 
 # ── Docker networks (fixed subnets; referenced by DOCKER-USER rules) ───
 docker_networks:
@@ -64,7 +119,7 @@ docker_networks:
   # Published ports do not traverse a Docker `internal: true` bridge. This
   # dedicated ordinary bridge has no application peers; DOCKER-USER and the
   # independent nft guard still deny every container-originated egress flow.
-  # It is used only by the explicit Parallels lab overlay.
+  # It is used only by the explicit lab overlay.
   - { name: net-lab-dns,       bridge: br-lab-dns, subnet: 172.28.18.0/24, internal: false }
   # Docker 29 silently omits published-port DNAT when every attached bridge is
   # `internal: true`. This ordinary no-peer bridge exists only for traefik-int;
@@ -94,6 +149,7 @@ traefik_int_chat_ip: 172.28.3.2
 traefik_int_portal_ip: 172.28.4.2
 traefik_adm_admin_ip: 172.28.5.2
 traefik_adm_grafana_ip: 172.28.6.2
+oauth2_proxy_grafana_ip: 172.28.6.3
 alloy_telemetry_ip: 172.28.13.2
 alloy_observability_ip: 172.28.15.2
 prometheus_observability_ip: 172.28.15.3
@@ -120,7 +176,7 @@ firewalld_zones:
     interfaces: ["{{ nic_adm }}"]
     target: "%%REJECT%%"
     rich_rules:
-      - 'rule family="ipv4" source address="{{ vpn_client_cidr }}" port port="22" protocol="tcp" accept'
+      - 'rule family="ipv4" source address="{{ vpn_client_cidr }}" port port="{{ aigw_management_ssh_port }}" protocol="tcp" accept'
       - 'rule family="ipv4" source address="{{ vpn_client_cidr }}" port port="443" protocol="tcp" accept'
   - zone: aigw-internal
     interfaces: ["{{ nic_internal }}"]
@@ -129,9 +185,8 @@ firewalld_zones:
       - 'rule family="ipv4" source address="{{ internal_cidr }}" port port="443" protocol="tcp" accept'
 
 # ── Feature flags (set false for a reduced local test VM) ──────────────
-manage_networking: true      # additive runtime PBR only; never NIC addressing
 manage_firewalld: true       # zones + DOCKER-USER
-lab_dns_enabled: "{{ deployment_profile == 'parallels-rocky9-lab' }}"
+lab_dns_enabled: "{{ deployment_profile == 'rocky9-lab' }}"
 
 # ── Stack ───────────────────────────────────────────────────────────────
 stack_dir: /opt/ai-gateway
@@ -150,7 +205,7 @@ offline_image_seed_marker_dir: "{{ docker_data_root }}/.aigw-image-seeds"
 # Full prompts, Vault state, database pages, rendered credentials, and the
 # edge private key all land under these two paths. Generic/customer deploys
 # fail before mutation unless both resolve through a dm-crypt/LUKS ancestor.
-# The explicit Parallels profile opts out because it is disposable local test.
+# The explicit lab profile opts out because it is disposable local test.
 require_encrypted_state: true
 require_preupgrade_backup: true
 encrypted_state_paths:
@@ -158,7 +213,7 @@ encrypted_state_paths:
   - "{{ stack_dir }}"
 compose_project_name: ai-gateway
 aigw_domain: aigw.example.internal
-samba_lab_enabled: "{{ deployment_profile == 'parallels-rocky9-lab' }}"
+samba_lab_enabled: "{{ deployment_profile == 'rocky9-lab' }}"
 retain_bootstrap_admin_user: false
 samba_lab_seed_users:
   - lab-admin
@@ -197,11 +252,11 @@ aigw_seed_test_users: false
 #   litellm_salt_key          redis_password             webui_litellm_key
 #   webui_secret_key          webui_oidc_client_secret
 #   portal_oidc_client_secret admin_portal_oidc_client_secret
-#   oauth2_proxy_client_secret grafana_oidc_client_secret
+#   oauth2_proxy_client_secret
 #   oauth2_proxy_cookie_secret portal_session_secret admin_portal_session_secret
 #   rotator_internal_token portal_identity_token grafana_admin_password
 #   kc_bootstrap_admin_client_secret
-# The parallels-rocky9-lab profile additionally requires:
+# The rocky9-lab profile additionally requires:
 #   samba_ad_admin_password     samba_ad_bind_password
 #   samba_user_lab_admin_password samba_user_lab_developer_password
 #   samba_user_lab_user_password
@@ -226,7 +281,6 @@ aigw_seed_test_users: false
 # portal_oidc_client_secret:  <vault overlay only>  # alphanumeric only
 # admin_portal_oidc_client_secret: <vault overlay only>  # alphanumeric only
 # oauth2_proxy_client_secret: <vault overlay only>  # alphanumeric only
-# grafana_oidc_client_secret: <vault overlay only>  # alphanumeric only
 # oauth2_proxy_cookie_secret: <vault overlay only>  # STABLE 32-char alphanumeric
 #     (16/24/32 bytes for AES). Was regenerated every ansible run via a
 #     /dev/null password lookup, which invalidated every admin session on each

@@ -1,5 +1,5 @@
 ---
-# Explicit Parallels Rocky 9 lab inventory. Production/customer deployments
+# Explicit Rocky 9 lab inventory. Production/customer deployments
 # use hosts.yml (or their own inventory), never this file implicitly.
 all:
   children:

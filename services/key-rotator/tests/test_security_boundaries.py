@@ -61,6 +61,7 @@ async def test_readyz_requires_database_and_authenticated_unsealed_vault(
 def settings(**overrides) -> Settings:
     values = {
         "ROTATOR_INTERNAL_TOKEN": AUTH_TOKEN,
+        "PORTAL_IDENTITY_TOKEN": "abcdef0123456789abcdef0123456789",
         "VAULT_TOKEN": "vault-token",
         "LITELLM_MASTER_KEY": "litellm-master-key",
     }
@@ -172,6 +173,42 @@ async def test_auth_fails_closed_and_public_health_redacts_details() -> None:
         state.update(old_state)
         health._flags.clear()
         health._flags.update(old_flags)
+
+
+@pytest.mark.asyncio
+async def test_portal_token_is_limited_to_exact_project_membership_reads() -> None:
+    old_state = dict(state)
+
+    class Identity:
+        async def user_projects(self, user_id):
+            assert user_id == "user-1"
+            return ["project-a"]
+
+    try:
+        cfg = settings()
+        state.clear()
+        state.update({"settings": cfg, "identity": Identity()})
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rotator"
+        ) as client:
+            headers = {"X-Internal-Auth": cfg.portal_identity_token}
+            allowed = await client.get("/identity/projects/user-1", headers=headers)
+            assert allowed.status_code == 200
+            assert allowed.json() == {"projects": ["project-a"]}
+
+            assert (await client.get("/status", headers=headers)).status_code == 401
+            assert (
+                await client.post("/identity/projects/user-1", headers=headers)
+            ).status_code == 401
+
+            admin = {"X-Internal-Auth": cfg.rotator_internal_token}
+            assert (
+                await client.get("/identity/projects/user-1", headers=admin)
+            ).status_code == 200
+    finally:
+        state.clear()
+        state.update(old_state)
 
 
 class FakeVault:

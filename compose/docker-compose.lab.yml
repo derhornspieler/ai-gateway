@@ -1,4 +1,4 @@
-# Parallels/Rocky 9 identity lab overlay.
+# Rocky 9 identity lab overlay.
 #
 # This file is never loaded by the generic deployment. Use it only with the
 # explicit lab profile:
@@ -44,6 +44,10 @@ services:
     deploy:
       resources:
         limits: { memory: 64M, cpus: "0.25", pids: 64 }
+    environment:
+      # Select the administrative split-DNS view only for queries whose original
+      # client address belongs to the explicit ADM/VPN client CIDR.
+      LAB_DNS_ADM_CIDR: ${LAB_DNS_ADM_CIDR:?LAB_DNS_ADM_CIDR must be set}
     ports:
       - "${ETH1_IP:?ETH1_IP must be set}:53:53/tcp"
       - "${ETH1_IP:?ETH1_IP must be set}:53:53/udp"
@@ -52,6 +56,7 @@ services:
     volumes:
       - ./services/lab-dns/Corefile:/etc/coredns/Corefile:ro,Z
       - ./services/lab-dns/db.aigw.internal:/etc/coredns/zones/db.aigw.internal:ro,Z
+      - ./services/lab-dns/db.aigw.internal.adm:/etc/coredns/zones/db.aigw.internal.adm:ro,Z
     networks:
       net-lab-dns:
         ipv4_address: ${LAB_DNS_IP:?LAB_DNS_IP must be set}

@@ -170,10 +170,7 @@ class Settings(BaseSettings):
     oauth2_proxy_client_secret: str = Field(
         default="", alias="OAUTH2_PROXY_CLIENT_SECRET"
     )
-    grafana_oidc_client_secret: str = Field(
-        default="", alias="GRAFANA_OIDC_CLIENT_SECRET"
-    )
-    # Disposable Parallels lab only: keep the password-backed bootstrap user
+    # Disposable lab only: keep the password-backed bootstrap user
     # as a durable ADM-console recovery operator while still deleting the
     # much broader temporary bootstrap service client. Customer profiles keep
     # this false and use their reviewed Keycloak break-glass process.
@@ -385,7 +382,8 @@ class Settings(BaseSettings):
 
     def portal_token_ok(self) -> bool:
         return self._token_ok(self.portal_identity_token) and not hmac.compare_digest(
-            self.portal_identity_token.encode(), self.rotator_internal_token.encode()
+            self.portal_identity_token.strip().encode(),
+            self.rotator_internal_token.strip().encode(),
         )
 
     def bootstrap_admin_secret_ok(self) -> bool:
@@ -408,7 +406,6 @@ class Settings(BaseSettings):
             self.portal_oidc_client_secret,
             self.admin_portal_oidc_client_secret,
             self.oauth2_proxy_client_secret,
-            self.grafana_oidc_client_secret,
         )
         return all(self._token_ok(value) and len(value.strip()) >= 32 for value in values)
 

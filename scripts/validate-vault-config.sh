@@ -3,6 +3,8 @@
 # the full server config, but returns non-zero for unrelated OSS/telemetry
 # diagnostics. Accept only an explicit successful Parse Configuration child.
 set -eu
+unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+docker_cmd=(docker --host unix:///run/docker.sock)
 
 STACK_DIR="${STACK_DIR:-/opt/ai-gateway}"
 IMAGE='dhi.io/vault:2.0.3@sha256:743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6'
@@ -24,7 +26,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 install -m 0444 -- "$source_config" "$validation_dir/config.hcl"
 
-docker run --rm \
+"${docker_cmd[@]}" run --rm \
   --network none \
   --cap-drop ALL \
   --cap-add IPC_LOCK \

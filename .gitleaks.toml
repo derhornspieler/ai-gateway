@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deterministic non-production tokens used by validation and unit tests"
+targetRules = ["generic-api-key"]
+regexes = [
+  '''^0123456789abcdef0123456789abcdef$''',
+  '''^abcdef0123456789abcdef0123456789$''',
+  '''^sk-ValidationMasterKey_0123456789ABCDEF$''',
+  '''^sk-ValidationVirtualKey_0123456789$''',
+  '''^ValidationWebuiOIDCSecret0123456789ABC$''',
+  '''^ValidationRotatorInternal0123456789ABCDE$''',
+]

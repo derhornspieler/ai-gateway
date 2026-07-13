@@ -89,6 +89,66 @@
   ansible.builtin.command: /usr/local/sbin/aigw-policy-routing
   changed_when: false
 
+- name: Prove a fresh key-only controller SSH path after policy-routing change
+  ansible.builtin.command:
+    argv: "{{ aigw_post_pbr_ssh_argv + ['/usr/bin/bash', '-c', 'sudo -n true && exec /usr/bin/printenv SSH_CONNECTION'] }}"
+  vars:
+    aigw_post_pbr_ssh_argv: >-
+      {{
+        ['ssh', '-p', ansible_port | default(22) | string]
+        + (
+            ['-i', ansible_ssh_private_key_file]
+            if ansible_ssh_private_key_file is defined
+              and ansible_ssh_private_key_file | length > 0
+            else []
+          )
+        + [
+            '-o', 'BatchMode=yes',
+            '-o', 'PasswordAuthentication=no',
+            '-o', 'KbdInteractiveAuthentication=no',
+            '-o', 'PreferredAuthentications=publickey',
+            '-o', 'StrictHostKeyChecking=yes',
+            '-o', 'ConnectTimeout=10',
+            ansible_user ~ '@' ~ ansible_host
+          ]
+      }}
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: aigw_post_pbr_ssh_transport
+
+- name: Require policy routing to preserve the proven ADM controller path
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import ipaddress
+        import sys
+
+        fields = sys.argv[1].split()
+        if len(fields) != 4:
+            raise SystemExit("post-PBR SSH transport did not yield four SSH_CONNECTION fields")
+        client, client_port, server, server_port = fields
+        try:
+            client_address = ipaddress.ip_address(client)
+            allowed = ipaddress.ip_network(sys.argv[2], strict=True)
+            int(client_port)
+            actual_port = int(server_port)
+            expected_port = int(sys.argv[4])
+        except ValueError as exc:
+            raise SystemExit(f"invalid post-PBR SSH transport tuple: {exc}") from exc
+        if client_address not in allowed:
+            raise SystemExit("post-PBR controller source is outside the ADM management CIDR")
+        if server != sys.argv[3] or actual_port != expected_port:
+            raise SystemExit("policy routing did not preserve the configured ADM SSH endpoint")
+      - "{{ aigw_post_pbr_ssh_transport.stdout | trim }}"
+      - "{{ vpn_client_cidr }}"
+      - "{{ eth1_ip }}"
+      - "{{ aigw_management_ssh_port | string }}"
+  changed_when: false
+
 - name: Enable policy routing after network-online at boot
   ansible.builtin.systemd:
     name: aigw-policy-routing.service

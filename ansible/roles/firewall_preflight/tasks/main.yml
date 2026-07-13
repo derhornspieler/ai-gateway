@@ -1,0 +1,205 @@
+---
+# This role is intentionally read-only and runs before SELinux, policy-routing,
+# package, or firewalld mutation.  A stopped firewalld can still have durable
+# configuration and a host can retain nft/DOCKER-USER state after a previous
+# service; neither may be implicitly claimed by the AI Gateway converge.
+
+- name: Preflight — establish firewalld, NetworkManager, and packet-filter ownership before host mutation
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import re
+        import shutil
+        import stat
+        import subprocess
+        import sys
+
+        zones = json.loads(sys.argv[1])
+        has_marker = sys.argv[2] == "true"
+        explicit_adoption = sys.argv[3] == "true"
+        authorized = has_marker or explicit_adoption
+        managed_zones = {entry["zone"] for entry in zones}
+        interfaces = {
+            interface: entry["zone"]
+            for entry in zones
+            for interface in entry.get("interfaces", [])
+        }
+        errors = []
+
+        def run(command, allowed=(0,)):
+            result = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+            if result.returncode not in allowed:
+                raise RuntimeError(
+                    " ".join(command) + ": " +
+                    (result.stderr.strip() or result.stdout.strip())
+                )
+            return result.returncode, result.stdout.strip()
+
+        def unowned(message):
+            if not authorized:
+                errors.append(message)
+
+        # Inspect only administrator-owned /etc firewalld files. Vendor rules
+        # live under /usr/lib and are not an adoption signal. Every component
+        # is lstat'ed so a symlink cannot make this read-only check inspect a
+        # controller-selected path.
+        custom_firewalld_paths = []
+        for root in (
+            "/etc/firewalld/zones", "/etc/firewalld/policies",
+            "/etc/firewalld/services", "/etc/firewalld/icmptypes",
+            "/etc/firewalld/helpers",
+        ):
+            try:
+                entries = list(os.scandir(root))
+            except FileNotFoundError:
+                continue
+            for entry in entries:
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError:
+                    custom_firewalld_paths.append(entry.path)
+                    continue
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    custom_firewalld_paths.append(entry.path)
+                elif metadata.st_size:
+                    custom_firewalld_paths.append(entry.path)
+        for path in (
+            "/etc/firewalld/direct.xml",
+            "/etc/firewalld/lockdown-whitelist.xml",
+        ):
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size:
+                custom_firewalld_paths.append(path)
+        if custom_firewalld_paths:
+            unowned(
+                "unreviewed /etc firewalld policy exists: " +
+                ", ".join(sorted(set(custom_firewalld_paths)))
+            )
+
+        firewalld_loaded = False
+        if shutil.which("systemctl"):
+            rc, load_state = run(
+                ["systemctl", "show", "firewalld.service", "--property=LoadState", "--value"],
+                allowed=(0, 1),
+            )
+            firewalld_loaded = rc == 0 and load_state == "loaded"
+        firewalld_active = False
+        if firewalld_loaded:
+            active_result = subprocess.run(
+                ["systemctl", "is-active", "--quiet", "firewalld.service"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            firewalld_active = active_result.returncode == 0
+
+        # If the daemon is already active, inspect runtime zones before later
+        # package/service tasks can reload or replace them. Any project zone
+        # without a completed AIGW marker is an explicit migration decision.
+        if firewalld_active:
+            if not shutil.which("firewall-cmd"):
+                errors.append("firewalld is active but firewall-cmd is unavailable")
+            else:
+                _, zone_text = run(["firewall-cmd", "--get-zones"])
+                active_zones = set(zone_text.split())
+                project_zones = sorted(name for name in active_zones if name.startswith("aigw-"))
+                if project_zones and not authorized:
+                    errors.append(
+                        "unowned active AI Gateway firewalld zones: " + ", ".join(project_zones)
+                    )
+                # A later firewalld reload can discard runtime-only direct
+                # chains/rules/passthroughs. They are not represented by the
+                # durable /etc/firewalld scan above, so establish ownership
+                # before any role starts/reloads the daemon.
+                direct_state = []
+                for option, label in (
+                    ("--get-all-chains", "chains"),
+                    ("--get-all-rules", "rules"),
+                    ("--get-all-passthroughs", "passthroughs"),
+                ):
+                    _, direct_text = run(["firewall-cmd", "--direct", option])
+                    if direct_text:
+                        direct_state.append(label)
+                if direct_state:
+                    unowned(
+                        "unowned active firewalld direct runtime state: " +
+                        ", ".join(direct_state)
+                    )
+        elif firewalld_loaded and custom_firewalld_paths:
+            # This is deliberately redundant with the generic custom-policy
+            # gate above: make clear that starting a stopped daemon needs an
+            # explicit ownership decision when durable policy is present.
+            unowned("stopped firewalld has durable administrator policy")
+
+        # NetworkManager is durable interface-to-zone policy whether or not
+        # firewalld happens to be running now. Inspect it before later tasks
+        # start firewalld, otherwise an existing customer zone could be
+        # replaced after SELinux/PBR mutation and only then be discovered.
+        if not shutil.which("nmcli"):
+            errors.append("NetworkManager CLI is unavailable for firewalld interface ownership checks")
+        else:
+            for interface, expected_zone in sorted(interfaces.items()):
+                _, uuid = run(
+                    ["nmcli", "--get-values", "GENERAL.CON-UUID", "device", "show", interface],
+                    allowed=(0, 10),
+                )
+                uuid = uuid.strip()
+                if not uuid:
+                    errors.append(f"{interface} has no active NetworkManager profile")
+                    continue
+                _, saved_zone = run(
+                    ["nmcli", "--get-values", "connection.zone", "connection", "show", "uuid", uuid],
+                )
+                saved_zone = saved_zone.strip()
+                if saved_zone not in {"", "public", expected_zone}:
+                    unowned(
+                        f"{interface} persists unowned NetworkManager zone {saved_zone!r}"
+                    )
+                if firewalld_active and shutil.which("firewall-cmd"):
+                    _, runtime_zone = run(
+                        ["firewall-cmd", f"--get-zone-of-interface={interface}"],
+                        allowed=(0, 1),
+                    )
+                    runtime_zone = runtime_zone.strip()
+                    if runtime_zone not in {"", "no zone", "public", expected_zone}:
+                        unowned(
+                            f"{interface} is assigned to unowned runtime zone {runtime_zone!r}"
+                        )
+
+        # Docker's chains are host-global, not firewalld-zone state. A missing
+        # binary is normal before package installation; an existing nonempty
+        # chain/table is never replaced without the completed marker/adoption.
+        def capture_optional(command):
+            if not shutil.which(command[0]):
+                return ""
+            rc, output = run(command, allowed=(0, 1))
+            return output if rc == 0 else ""
+
+        nft_text = capture_optional(["nft", "list", "table", "inet", "aigw_guard"])
+        nft_body = re.sub(
+            r"^\s*table\s+inet\s+aigw_guard\s*\{\s*|\s*\}\s*$", "", nft_text, flags=re.S
+        ).strip()
+        if nft_body:
+            unowned("unowned inet/aigw_guard nftables policy")
+        for binary, family in (("iptables", "IPv4"), ("ip6tables", "IPv6")):
+            text = capture_optional([binary, "-S", "DOCKER-USER"])
+            if any(line.startswith("-A DOCKER-USER ") for line in text.splitlines()):
+                unowned(f"unowned {family} DOCKER-USER policy")
+
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - "{{ firewalld_zones | to_json }}"
+      - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_firewalld_state | bool) else 'false' }}"
+  environment:
+    LC_ALL: C
+  changed_when: false

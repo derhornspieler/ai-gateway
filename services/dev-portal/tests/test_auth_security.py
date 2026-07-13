@@ -252,7 +252,7 @@ def test_key_resolution_never_accepts_an_unowned_token():
     # Imported here to keep the helper's web-route module out of auth unit setup.
     from app.main import _portal_key_inventory, _resolve_owned_project_key
 
-    inventory = _portal_key_inventory(owned, "attacker")
+    inventory = _portal_key_inventory(owned, "attacker", ("ai-gateway",))
     assert _resolve_owned_project_key(inventory, "victim-hash", "ai-gateway") is None
     assert (
         _resolve_owned_project_key(inventory, "attacker-hash", "ai-gateway")

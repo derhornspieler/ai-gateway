@@ -1,0 +1,240 @@
+---
+# SELinux is a host prerequisite, not a best-effort Docker option.  Keep this
+# role ahead of every routing/firewall/Docker mutation so an existing Rocky 9
+# VM either reaches the reviewed targeted/enforcing state first, or fails
+# before the platform changes it.  A disabled runtime or a different loaded
+# policy needs a reboot; that remains an explicit operator decision.
+
+- name: SELinux preflight — require Rocky Linux 9
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == 'Rocky'
+      - ansible_facts.distribution_major_version | int == 9
+    quiet: true
+    fail_msg: >-
+      AI Gateway host preparation supports Rocky Linux 9 only. Refusing to
+      mutate an unreviewed operating-system variant.
+
+- name: SELinux preflight — read the current runtime mode
+  ansible.builtin.command: getenforce
+  register: aigw_selinux_mode_before
+  changed_when: false
+  failed_when: false
+
+- name: SELinux preflight — read the current kernel command line
+  ansible.builtin.command: cat /proc/cmdline
+  register: aigw_selinux_cmdline_before
+  changed_when: false
+
+- name: SELinux preflight — record whether the current runtime needs a reboot
+  ansible.builtin.set_fact:
+    aigw_selinux_runtime_reboot_required: >-
+      {{
+        (aigw_selinux_mode_before.rc != 0) or
+        ((aigw_selinux_mode_before.stdout | trim) == 'Disabled') or
+        (ansible_facts.selinux.status | default('disabled') != 'enabled') or
+        (ansible_facts.selinux.type | default('') != aigw_selinux_policy) or
+        ('selinux=0' in (aigw_selinux_cmdline_before.stdout | lower))
+      }}
+
+- name: SELinux preflight — require the existing desired state when management is disabled
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.selinux.status | default('disabled') == 'enabled'
+      - ansible_facts.selinux.mode | default('') == aigw_selinux_state
+      - ansible_facts.selinux.type | default('') == aigw_selinux_policy
+      - aigw_selinux_mode_before.rc == 0
+      - aigw_selinux_mode_before.stdout | trim == 'Enforcing'
+      - not aigw_selinux_runtime_reboot_required | bool
+    quiet: true
+    fail_msg: >-
+      SELinux management is disabled, but this host is not already targeted
+      and enforcing. Enable aigw_manage_selinux or prepare the host first.
+  when: not (aigw_manage_selinux | bool)
+
+- name: SELinux preflight — require explicit reboot approval before enabling runtime policy
+  ansible.builtin.assert:
+    that:
+      - not (aigw_selinux_runtime_reboot_required | bool) or
+        (aigw_allow_selinux_reboot | bool)
+    quiet: true
+    fail_msg: >-
+      This Rocky host needs a reboot before SELinux can become targeted and
+      enforcing. Re-run with aigw_allow_selinux_reboot=true after scheduling
+      the maintenance window; no host policy has been changed.
+  when: aigw_manage_selinux | bool
+
+- name: SELinux preflight — inspect Docker service and socket boot activation before a pre-firewall reboot
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import subprocess
+
+        unsafe = []
+        for unit in ("docker.service", "docker.socket"):
+            result = subprocess.run(
+                [
+                    "systemctl", "show", unit, "--no-pager",
+                    "--property=LoadState", "--property=ActiveState",
+                    "--property=UnitFileState",
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            if result.returncode:
+                continue
+            fields = dict(
+                line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+            )
+            if fields.get("LoadState") != "loaded":
+                continue
+            state = fields.get("ActiveState", "unknown")
+            unit_file_state = fields.get("UnitFileState", "unknown")
+            if state in {"active", "activating", "reloading"} or unit_file_state.startswith("enabled"):
+                unsafe.append({
+                    "unit": unit,
+                    "active_state": state,
+                    "unit_file_state": unit_file_state,
+                })
+        print(json.dumps({"unsafe_units": unsafe}, sort_keys=True))
+  register: aigw_docker_boot_activation_raw
+  changed_when: false
+  when: aigw_manage_selinux | bool
+
+- name: SELinux preflight — record Docker service and socket boot activation state
+  ansible.builtin.set_fact:
+    aigw_docker_boot_activation: >-
+      {{
+        (aigw_docker_boot_activation_raw.stdout | from_json)
+        if (aigw_manage_selinux | bool)
+        else {'unsafe_units': []}
+      }}
+
+- name: SELinux preflight — require Docker service and socket disabled before a pre-firewall SELinux reboot
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (aigw_selinux_runtime_reboot_required | bool) or
+        (aigw_docker_boot_activation.unsafe_units | length == 0)
+    quiet: true
+    fail_msg: >-
+      Docker service/socket can activate during the SELinux reboot before the
+      AIGW firewall guards exist. Stop and disable Docker plus docker.socket
+      (including restart-policy workloads) before the approved reboot; the
+      play will not reboot into an unguarded container start.
+  when: aigw_manage_selinux | bool
+
+- name: SELinux preflight — require maintenance approval before enforcing on a live Docker host
+  ansible.builtin.assert:
+    that:
+      - (aigw_allow_active_selinux_enforcement | bool)
+    quiet: true
+    fail_msg: >-
+      Docker is active while SELinux is not yet enforcing. Schedule the
+      enforcement transition and re-run with
+      aigw_allow_active_selinux_enforcement=true; no policy was changed.
+  when:
+    - aigw_manage_selinux | bool
+    - aigw_docker_daemon_active | default(false) | bool
+    - aigw_selinux_mode_before.stdout | trim != 'Enforcing'
+
+- name: SELinux preflight — require a live Docker daemon to already support SELinux before enforcement changes
+  ansible.builtin.assert:
+    that:
+      - aigw_live_docker_boundary.selinux_enabled | default(false) | bool
+    quiet: true
+    fail_msg: >-
+      Docker is active without SELinux support while host enforcement would
+      change. Stop or remediate the legacy daemon first, then run the full
+      converge; the play will not create an unlabelled enforcement window.
+  when:
+    - aigw_manage_selinux | bool
+    - aigw_docker_daemon_active | default(false) | bool
+    - aigw_selinux_mode_before.stdout | trim != 'Enforcing'
+
+- name: SELinux baseline — install the target policy and management prerequisites
+  ansible.builtin.dnf:
+    name:
+      - selinux-policy-targeted
+      - container-selinux
+      - policycoreutils
+      - policycoreutils-python-utils
+      - libselinux-utils
+      - python3-libselinux
+      - grubby
+    state: present
+  when: aigw_manage_selinux | bool
+
+- name: SELinux baseline — configure targeted enforcing policy and boot entries
+  ansible.posix.selinux:
+    policy: "{{ aigw_selinux_policy }}"
+    state: "{{ aigw_selinux_state }}"
+    update_kernel_param: true
+  register: aigw_selinux_configuration
+  when: aigw_manage_selinux | bool
+
+- name: SELinux baseline — reject an unexpected reboot requirement without approval
+  ansible.builtin.assert:
+    that:
+      - not (aigw_selinux_configuration.reboot_required | default(false) | bool) or
+        (aigw_allow_selinux_reboot | bool)
+    quiet: true
+    fail_msg: >-
+      SELinux configuration reports that a reboot is required. Re-run with
+      aigw_allow_selinux_reboot=true during an approved maintenance window.
+  when: aigw_manage_selinux | bool
+
+- name: SELinux baseline — require Docker service and socket disabled for a newly-reported reboot
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (aigw_selinux_configuration.reboot_required | default(false) | bool) or
+        (aigw_docker_boot_activation.unsafe_units | length == 0)
+    quiet: true
+    fail_msg: >-
+      SELinux configuration newly requires a reboot while Docker service or
+      socket can activate before firewall guards. Stop and disable them, then
+      re-run the explicitly approved maintenance transition.
+  when: aigw_manage_selinux | bool
+
+- name: SELinux baseline — reboot only when explicitly approved and required
+  ansible.builtin.reboot:
+    msg: Rebooting to activate the reviewed AI Gateway SELinux policy.
+    reboot_timeout: 900
+  when:
+    - aigw_manage_selinux | bool
+    - aigw_allow_selinux_reboot | bool
+    - aigw_selinux_configuration.reboot_required | default(false) | bool
+
+- name: SELinux baseline — refresh SELinux facts after an approved transition
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - selinux
+
+- name: SELinux baseline — read the effective runtime mode
+  ansible.builtin.command: getenforce
+  register: aigw_selinux_mode_after
+  changed_when: false
+
+- name: SELinux baseline — require targeted enforcing runtime before Docker policy
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.selinux.status | default('disabled') == 'enabled'
+      - ansible_facts.selinux.mode | default('') == aigw_selinux_state
+      - ansible_facts.selinux.type | default('') == aigw_selinux_policy
+      - aigw_selinux_mode_after.stdout | trim == 'Enforcing'
+    quiet: true
+    fail_msg: >-
+      SELinux did not reach the required targeted/enforcing runtime state;
+      Docker and the AI Gateway stack will not be changed.
+
+- name: SELinux baseline — capture the AVC audit window start
+  ansible.builtin.command: date +'%m/%d/%Y %H:%M:%S'
+  environment:
+    LC_ALL: C
+  register: aigw_selinux_audit_window_start
+  changed_when: false

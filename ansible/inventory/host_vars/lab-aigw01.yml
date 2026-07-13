@@ -1,9 +1,9 @@
 ---
-# Concrete Parallels Rocky 9 lab wiring (verified read-only on the live VM).
+# Concrete Rocky 9 lab wiring (verified read-only on the live VM).
 # This applies only to the lab-aigw01 alias in inventory/lab.yml.
-deployment_profile: parallels-rocky9-lab
+deployment_profile: rocky9-lab
 aigw_domain: aigw.internal
-# Disposable Parallels validation VM only. Customer/generic profiles retain
+# Disposable local validation VM only. Customer/generic profiles retain
 # require_encrypted_state=true and must mount Docker + stack state on LUKS.
 require_encrypted_state: false
 require_preupgrade_backup: false
@@ -35,9 +35,17 @@ eth1_gateway: "10.8.10.2"
 eth2_ip: "10.20.0.10"
 eth2_gateway: "10.20.0.2"
 
-# The lab reaches ADM directly on the Parallels host-only subnet.
+# The three-NIC lab needs source-policy replies for its separately
+# routed ADM/internal networks. Customer inventories leave this disabled
+# unless their supplied topology requires the same behavior.
+manage_networking: true
+pbr_tables:
+  - { name: adm,      id: 101, priority: 10101, dev: "{{ nic_adm }}",      gw: "{{ eth1_gateway }}", src: "{{ eth1_ip }}" }
+  - { name: internal, id: 102, priority: 10102, dev: "{{ nic_internal }}", gw: "{{ eth2_gateway }}", src: "{{ eth2_ip }}" }
+
+# The lab reaches ADM directly on the lab host-only ADM subnet.
 vpn_client_cidr: "10.8.10.0/24"
 internal_cidr: "10.20.0.0/24"
 
-# Parallels shared-network resolver; explicit container DNS is firewall-visible.
+# Lab shared-network resolver; explicit container DNS is firewall-visible.
 container_dns_server: "10.211.55.1"

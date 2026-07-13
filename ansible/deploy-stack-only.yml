@@ -8,6 +8,53 @@
   hosts: gateway
   become: true
   pre_tasks:
+    # Stack-only is deliberately unable to create/adopt a Docker host. Require
+    # the exact marker promoted only after a successful full converge, and
+    # refuse a host left in the pending state after a partial daemon-policy
+    # change.
+    - name: Preflight — define the completed dedicated-Docker-host marker contract
+      ansible.builtin.set_fact:
+        stack_only_docker_host_marker_content: |
+          format=aigw-dedicated-docker-host-v1
+          project={{ compose_project_name }}
+          docker_data_root={{ docker_data_root }}
+
+    - name: Preflight — inspect completed and pending dedicated-host markers
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop:
+        - "{{ aigw_docker_host_marker }}"
+        - "{{ aigw_docker_host_pending_marker }}"
+      register: stack_only_host_markers
+      changed_when: false
+
+    - name: Preflight — read the completed dedicated-host marker
+      ansible.builtin.slurp:
+        src: "{{ aigw_docker_host_marker }}"
+      register: stack_only_docker_host_marker_raw
+      no_log: true
+      when: stack_only_host_markers.results[0].stat.exists | default(false)
+
+    - name: Preflight — require a completed exact dedicated-host marker
+      ansible.builtin.assert:
+        that:
+          - stack_only_host_markers.results[0].stat.exists | default(false)
+          - stack_only_host_markers.results[0].stat.isreg | default(false)
+          - not (stack_only_host_markers.results[0].stat.islnk | default(false))
+          - stack_only_host_markers.results[0].stat.uid == 0
+          - stack_only_host_markers.results[0].stat.gid == 0
+          - stack_only_host_markers.results[0].stat.mode == '0600'
+          - (stack_only_docker_host_marker_raw.content | b64decode) == stack_only_docker_host_marker_content
+          - not (stack_only_host_markers.results[1].stat.exists | default(false))
+        quiet: true
+        fail_msg: >-
+          Refusing stack-only mutation: run a successful full site.yml converge
+          first. The exact completed dedicated-Docker-host marker is required
+          and no pending adoption marker may remain.
+      no_log: true
+
     # This partial play deliberately omits os_baseline. Refuse to recreate a
     # single container unless the full converge has already enabled Docker's
     # SELinux integration; host enforcement alone does not label containers.
@@ -17,7 +64,8 @@
       changed_when: false
 
     - name: Preflight — read Docker SELinux and state-root configuration
-      ansible.builtin.command: docker info --format=json
+      ansible.builtin.command:
+        argv: [docker, --host, unix:///run/docker.sock, info, --format=json]
       register: stack_only_docker_info
       changed_when: false
 
@@ -128,7 +176,8 @@
       changed_when: false
 
     - name: Preflight — inspect every required external Docker network
-      ansible.builtin.command: "docker network inspect {{ item.name }}"
+      ansible.builtin.command:
+        argv: [docker, --host, unix:///run/docker.sock, network, inspect, "{{ item.name }}"]
       loop: "{{ docker_networks }}"
       loop_control:
         label: "{{ item.name }}"

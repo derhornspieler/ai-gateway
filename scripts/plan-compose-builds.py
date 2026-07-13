@@ -24,6 +24,12 @@ from typing import Any, Callable
 
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+LOCAL_DOCKER_HOST = "unix:///run/docker.sock"
+FIXED_DOCKER_ENV = {
+    "HOME": "/",
+    "LC_ALL": "C",
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+}
 
 
 class PlanError(RuntimeError):
@@ -33,15 +39,17 @@ class PlanError(RuntimeError):
 def inspect_image(image: str) -> str | None:
     """Return the immutable local image ID, or None when the tag is absent."""
     # The image is one argv element from the already-rendered Compose model;
-    # shell execution is never enabled. Docker is the reviewed host CLI and is
-    # intentionally PATH-resolved consistently with every deployment script.
+    # shell execution is never enabled. The invocation clears context-bearing
+    # environment and pins the local UNIX socket, so root's persisted Docker
+    # context cannot inspect an unrelated remote daemon.
     result = subprocess.run(  # nosec B603 B607
-        ["docker", "image", "inspect", image],
+        ["docker", "--host", LOCAL_DOCKER_HOST, "image", "inspect", image],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
         check=False,
+        env=FIXED_DOCKER_ENV,
     )
     if result.returncode != 0:
         return None

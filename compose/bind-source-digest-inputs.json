@@ -17,7 +17,11 @@
   },
   "lab": {
     "key-rotator": ["secrets/samba_ad_bind_password"],
-    "lab-dns": ["services/lab-dns/Corefile", "services/lab-dns/db.aigw.internal"],
+    "lab-dns": [
+      "services/lab-dns/Corefile",
+      "services/lab-dns/db.aigw.internal",
+      "services/lab-dns/db.aigw.internal.adm"
+    ],
     "samba-ad": [
       "secrets/samba_ad_admin_password",
       "secrets/samba_ad_bind_password",

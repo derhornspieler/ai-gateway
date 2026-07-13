@@ -387,21 +387,16 @@ class KeycloakAdmin:
                 self.settings.oauth2_proxy_client_secret,
                 [
                     f"https://admin.{domain}/oauth2/callback",
+                    f"https://grafana.{domain}/oauth2/callback",
                     f"https://prometheus.{domain}/oauth2/callback",
                     f"https://vault.{domain}/oauth2/callback",
                 ],
                 [
                     f"https://admin.{domain}",
+                    f"https://grafana.{domain}",
                     f"https://prometheus.{domain}",
                     f"https://vault.{domain}",
                 ],
-            ),
-            client(
-                "grafana",
-                "Grafana generic OAuth",
-                self.settings.grafana_oidc_client_secret,
-                [f"https://grafana.{domain}/login/generic_oauth"],
-                [f"https://grafana.{domain}"],
             ),
         ]
 
@@ -1076,7 +1071,7 @@ class KeycloakAdmin:
         """Delete temporary principals; optionally retain a lab UI operator.
 
         Returns true only when the marked password-backed bootstrap user was
-        deliberately converted to the Parallels lab recovery operator.  The
+        deliberately converted to the lab recovery operator.  The
         broad temporary service client is always deleted.
         """
         retained_user = False

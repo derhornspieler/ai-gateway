@@ -2,7 +2,7 @@ $ORIGIN aigw.internal.
 $TTL 60
 
 @       IN SOA  dns.aigw.internal. hostmaster.aigw.internal. (
-                    2026071201 ; serial
+                    2026071302 ; serial
                     3600       ; refresh
                     900        ; retry
                     604800     ; expire
@@ -11,17 +11,9 @@ $TTL 60
         IN NS   dns.aigw.internal.
         IN A    10.20.0.10
 
-; Lab DNS and administrative surfaces use the Parallels ADM host-only NIC.
-dns     IN A    10.8.10.10
-admin   IN A    10.8.10.10
-grafana IN A    10.8.10.10
-
-; auth is intentionally on ADM for the Mac lab resolver. The same Keycloak
-; hostname is the browser-visible issuer and the administration hostname; its
-; ADM Traefik router serves both while firewalld limits access to the lab CIDR.
-auth    IN A    10.8.10.10
-
-; User and inference surfaces use the Parallels internal host-only NIC.
+; Restricted internal view: only DNS itself, the inference API, developer
+; portal, and the minimum Keycloak browser login route are discoverable.
+dns     IN A    10.20.0.10
 api     IN A    10.20.0.10
-chat    IN A    10.20.0.10
 portal  IN A    10.20.0.10
+auth    IN A    10.20.0.10

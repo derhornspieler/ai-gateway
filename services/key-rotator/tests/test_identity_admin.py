@@ -26,6 +26,7 @@ AUTH_TOKEN = "0123456789abcdef0123456789abcdef"
 def settings(**overrides) -> Settings:
     values = {
         "ROTATOR_INTERNAL_TOKEN": AUTH_TOKEN,
+        "PORTAL_IDENTITY_TOKEN": "abcdef0123456789abcdef0123456789",
         "VAULT_TOKEN": "vault-token",
         "LITELLM_MASTER_KEY": "litellm-master-key",
         "KC_BOOTSTRAP_ADMIN_CLIENT_SECRET": (
@@ -236,6 +237,9 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
             events.append(("keycloak", "controller"))
             return {"certificate_sha256": "a" * 64}
 
+        async def _ensure_relying_parties(self, admin_token):
+            events.append(("keycloak", "relying_parties"))
+
         async def _client_credentials_with_key(self, realm, client_id, key_doc):
             return "controller-token"
 
@@ -261,6 +265,60 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
     )
     admin_delete = events.index(("keycloak", "bootstrap_deleted"))
     assert state_write < admin_delete
+
+
+@pytest.mark.asyncio
+async def test_live_user_projects_are_sorted_and_ambiguity_fails_closed() -> None:
+    cfg = settings()
+    vault = FakeVault(
+        {
+            cfg.identity_state_vault_path: {
+                "federation_provider_id": "ldap-provider",
+                "managed_root_group_id": "managed-root",
+            }
+        }
+    )
+
+    class ProjectsAdmin(KeycloakAdmin):
+        memberships = [
+            {"id": "group-b", "path": "/aigw-managed/project-b"},
+            {"id": "group-a", "path": "/aigw-managed/project-a"},
+        ]
+
+        async def _controller_token(self):
+            return "controller-token"
+
+        async def _request(self, method, path, **kwargs):
+            if path.endswith("/users/user-1"):
+                payload = {
+                    "id": "user-1",
+                    "enabled": True,
+                    "federationLink": "ldap-provider",
+                }
+            elif path.endswith("/users/user-1/groups"):
+                payload = self.memberships
+            else:
+                raise AssertionError(path)
+            return httpx.Response(200, json=payload)
+
+        async def _group_capabilities(self, group_id, token):
+            return ["aigw-developers"]
+
+    admin = ProjectsAdmin(cfg, vault, FakeDB())
+    assert await admin.user_projects("user-1") == ["project-a", "project-b"]
+
+    admin.memberships = [
+        {"id": "group-1", "path": "/aigw-managed/project-a"},
+        {"id": "group-2", "path": "/aigw-managed/project-a"},
+    ]
+    with pytest.raises(IdentityConflict, match="multiple managed groups"):
+        await admin.user_projects("user-1")
+
+    admin.memberships = [
+        {"id": "group-1", "path": "/aigw-managed/project-a/nested"}
+    ]
+    with pytest.raises(IdentityConflict, match="nested or has an invalid ID"):
+        await admin.user_projects("user-1")
 
 
 @pytest.mark.asyncio

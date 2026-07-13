@@ -23,7 +23,10 @@ os.environ.setdefault("OIDC_CLIENT_SECRET", "Test-OIDC-Client!0123456789-Secret-
 os.environ.setdefault("OIDC_ISSUER", "https://idp.test/realms/aigw")
 
 from app.config import settings  # noqa: E402
-from app.main import app  # noqa: E402
+from app import main  # noqa: E402
+
+app = main.app
+admin_app = main.admin_app
 
 
 def session_cookie(session: dict[str, Any]) -> str:
@@ -51,6 +54,29 @@ def client() -> TestClient:
 @pytest.fixture
 def set_session(client: TestClient):
     def _set(data: dict[str, Any]) -> None:
-        client.cookies.set("session", session_cookie(data))
+        client.cookies.set("aigw_portal_session", session_cookie(data))
 
     return _set
+
+
+@pytest.fixture
+def admin_client() -> TestClient:
+    return TestClient(admin_app, base_url="https://admin-portal.test")
+
+
+@pytest.fixture
+def set_admin_session(admin_client: TestClient):
+    def _set(data: dict[str, Any]) -> None:
+        admin_client.cookies.set("aigw_admin_session", session_cookie(data))
+
+    return _set
+
+
+@pytest.fixture(autouse=True)
+def default_live_project_membership(monkeypatch):
+    """Most portal tests model one canonical managed-project assignment."""
+
+    async def live_projects(_request, _user):
+        return ("ai-gateway",)
+
+    monkeypatch.setattr(main, "_live_project_ids", live_projects)

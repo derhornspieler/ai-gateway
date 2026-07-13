@@ -12,6 +12,8 @@ usage() {
 STACK_DIR="${STACK_DIR:-/opt/ai-gateway}"
 PROJECT="${COMPOSE_PROJECT_NAME:-ai-gateway}"
 HELPER_IMAGE="dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad"
+unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+docker_cmd=(docker --host unix:///run/docker.sock)
 input="" identity="" expected_sha="" confirmation=""
 while (($#)); do
   case "$1" in
@@ -45,7 +47,7 @@ trap cleanup EXIT INT TERM
 require_project_stopped() {
   local -a running_project=()
   mapfile -t running_project < <(
-    docker ps -q --filter "label=com.docker.compose.project=$PROJECT"
+    "${docker_cmd[@]}" ps -q --filter "label=com.docker.compose.project=$PROJECT"
   )
   ((${#running_project[@]} == 0)) || {
     echo "restore requires zero running $PROJECT project containers; found ${#running_project[@]}" >&2
@@ -54,7 +56,7 @@ require_project_stopped() {
 }
 
 age --decrypt -i "$identity" "$input" > "$staging/outer.tar.gz"
-docker_root="$(docker info --format '{{.DockerRootDir}}')"
+docker_root="$("${docker_cmd[@]}" info --format '{{.DockerRootDir}}')"
 [[ "$docker_root" = /* && -d "$docker_root" && ! -L "$docker_root" ]] || {
   echo "DockerRootDir must be an existing real absolute directory" >&2; exit 1;
 }
@@ -86,23 +88,23 @@ PY
 )
 for logical in "${volumes[@]}"; do
   [[ "$logical" =~ ^[a-z0-9_]+$ ]] || { echo "unsafe logical volume name" >&2; exit 1; }
-  mapfile -t matches < <(docker volume ls -q \
+  mapfile -t matches < <("${docker_cmd[@]}" volume ls -q \
     --filter "label=com.docker.compose.project=$PROJECT" \
     --filter "label=com.docker.compose.volume=$logical")
   ((${#matches[@]} <= 1)) || { echo "multiple target volumes for $logical" >&2; exit 1; }
   if ((${#matches[@]} == 0)); then
     volume_name="${PROJECT}_${logical}"
-    docker volume create \
+    "${docker_cmd[@]}" volume create \
       --label "com.docker.compose.project=$PROJECT" \
       --label "com.docker.compose.volume=$logical" "$volume_name" >/dev/null
   else
     volume_name="${matches[0]}"
   fi
-  docker run --rm --network none --read-only --security-opt no-new-privileges:true \
+  "${docker_cmd[@]}" run --rm --network none --read-only --security-opt no-new-privileges:true \
     --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add FOWNER --user 0:0 \
     -v "$volume_name:/destination" --entrypoint /bin/sh "$HELPER_IMAGE" -ec \
     'find /destination -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'
-  docker run --rm -i --network none --read-only --security-opt no-new-privileges:true \
+  "${docker_cmd[@]}" run --rm -i --network none --read-only --security-opt no-new-privileges:true \
     --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add CHOWN --user 0:0 \
     -v "$volume_name:/destination" --entrypoint /bin/tar "$HELPER_IMAGE" \
     --numeric-owner -xzf - -C /destination < "$staging/extracted/volumes/${logical}.tar.gz"

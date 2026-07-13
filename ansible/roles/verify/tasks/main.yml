@@ -2,7 +2,8 @@
 # Post-converge assertions. Fail loudly rather than assume.
 
 - name: Read Docker daemon state-root configuration
-  ansible.builtin.command: docker info --format=json
+  ansible.builtin.command:
+    argv: [docker, --host, unix:///run/docker.sock, info, --format=json]
   register: docker_info_json
   changed_when: false
 
@@ -35,13 +36,13 @@
         expected_bind_digests = json.loads(sys.argv[4])
         allowed_unhealthy = set(json.loads(sys.argv[5]))
         ids = subprocess.check_output(
-            ["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={project}"],
+            ["docker", "--host", "unix:///run/docker.sock", "ps", "-q", "--filter", f"label=com.docker.compose.project={project}"],
             text=True,
         ).split()
         if not ids:
             raise SystemExit("no running project containers")
         containers = json.loads(
-            subprocess.check_output(["docker", "inspect", *ids], text=True)
+            subprocess.check_output(["docker", "--host", "unix:///run/docker.sock", "inspect", *ids], text=True)
         )
         actual = {}
         for container in containers:
@@ -231,10 +232,12 @@
         {{
           ([
             'traefik-int', 'traefik-adm', 'oauth2-proxy',
-            'oauth2-proxy-grafana', 'litellm', 'open-webui', 'keycloak',
-            'dev-portal', 'envoy-egress', 'key-rotator', 'vault', 'postgres',
-            'redis', 'alloy', 'prometheus', 'node-exporter', 'loki', 'tempo',
-            'grafana', 'cribl-mock'
+            'oauth2-proxy-grafana', 'oauth2-proxy-prometheus',
+            'oauth2-proxy-vault', 'litellm', 'open-webui', 'keycloak',
+            'dev-portal', 'admin-portal',
+            'envoy-egress', 'key-rotator', 'vault', 'postgres', 'redis',
+            'alloy', 'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana',
+            'cribl-mock'
           ] + (['lab-dns', 'samba-ad'] if (samba_lab_enabled | bool) else []))
           | to_json
         }}
@@ -480,6 +483,18 @@
   loop_control:
     label: "{{ item.bridge }}"
 
+- name: Docker default and future bridge names deny new container-to-host connections
+  ansible.builtin.assert:
+    that:
+      - "'iifname \"docker0\" drop' in host_input_guard.stdout"
+      - "'iifname \"br-*\" drop' in host_input_guard.stdout"
+      - "'iifname \"docker0\" ct state established,related ct direction reply accept' in host_input_guard.stdout"
+      - "'iifname \"br-*\" ct state established,related ct direction reply accept' in host_input_guard.stdout"
+    quiet: true
+    fail_msg: >-
+      The nft INPUT guard does not cover Docker's docker0/default generated
+      br-* bridge names; a future container could reach a host listener.
+
 - name: Lab DNS DNAT is source-scoped in the independent nft guard
   ansible.builtin.assert:
     that:
@@ -514,7 +529,8 @@
   changed_when: false
 
 - name: Inspect every managed Docker network
-  ansible.builtin.command: "docker network inspect {{ item.name }}"
+  ansible.builtin.command:
+    argv: [docker, --host, unix:///run/docker.sock, network, inspect, "{{ item.name }}"]
   loop: "{{ docker_networks }}"
   loop_control:
     label: "{{ item.name }}"
@@ -541,6 +557,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - inspect
       - "{{ compose_project_name }}-samba-ad-1"
   register: samba_lab_inspect
@@ -570,6 +588,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - inspect
       - "{{ compose_project_name }}-lab-dns-1"
   register: lab_dns_inspect
@@ -611,19 +631,28 @@
       - "{{ item.transport }}"
   loop:
     - { name: portal.aigw.internal, transport: +notcp }
+    - { name: auth.aigw.internal, transport: +tcp }
     - { name: admin.aigw.internal, transport: +tcp }
+    - { name: admin-portal.aigw.internal, transport: +notcp }
+    - { name: grafana.aigw.internal, transport: +notcp }
+    - { name: prometheus.aigw.internal, transport: +tcp }
+    - { name: vault.aigw.internal, transport: +notcp }
   register: lab_dns_queries
   changed_when: false
   failed_when: >-
     lab_dns_queries.rc != 0 or
-    (item.name == 'portal.aigw.internal' and lab_dns_queries.stdout | trim != eth2_ip) or
-    (item.name == 'admin.aigw.internal' and lab_dns_queries.stdout | trim != eth1_ip)
+    (item.name in ['portal.aigw.internal'] and
+     lab_dns_queries.stdout | trim != eth2_ip) or
+    (item.name not in ['portal.aigw.internal'] and
+     lab_dns_queries.stdout | trim != eth1_ip)
   when: lab_dns_enabled | bool
 
 - name: Prove the lab DNS process cannot originate DNS, TCP, or ICMP egress
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - exec
       - "{{ compose_project_name }}-lab-dns-1"
       - /dns-healthcheck
@@ -636,6 +665,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - compose
       - exec
       - -T
@@ -739,7 +770,7 @@
         import sys
 
         name = sys.argv[1]
-        details = json.loads(subprocess.check_output(["docker", "inspect", name], text=True))[0]
+        details = json.loads(subprocess.check_output(["docker", "--host", "unix:///run/docker.sock", "inspect", name], text=True))[0]
         pid = int(details["State"]["Pid"])
         if pid <= 0 or not details["State"]["Running"]:
             raise SystemExit(f"{name} is not running")
@@ -812,22 +843,32 @@
     # disaster-recovery maintenance guard admits only the recovery operator;
     # listener/DNAT/firewall verification above proves physical publication.
     - { address: "{{ traefik_int_portal_ip }}", hostname: "portal.{{ aigw_domain }}", path: /healthz, status: "200" }
+    - { address: "{{ traefik_int_portal_ip }}", hostname: "auth.{{ aigw_domain }}", path: /realms/aigw/.well-known/openid-configuration, status: "200" }
     - { address: "{{ traefik_int_chat_ip }}", hostname: "api.{{ aigw_domain }}", path: /ui, status: "403" }
-    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin.{{ aigw_domain }}", path: /, status: "403" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin.{{ aigw_domain }}", path: /, status: "302" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin-portal.{{ aigw_domain }}", path: /healthz, status: "200" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "grafana.{{ aigw_domain }}", path: /, status: "302" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "prometheus.{{ aigw_domain }}", path: /, status: "302" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "vault.{{ aigw_domain }}", path: /, status: "302" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "auth.{{ aigw_domain }}", path: /admin/, status: "302" }
   loop_control:
     label: "{{ item.hostname }}{{ item.path }} -> {{ item.status }}"
   changed_when: false
 
-- name: Prove Grafana loaded the exact provisioned datasource graph
+- name: Prove Grafana loaded the exact provisioned datasource graph without a local-login bypass
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - run
       - --rm
       - -i
       - --pull=never
       - --network
-      - net-grafana
+      - net-observability
+      - --volumes-from
+      - "{{ compose_project_name }}-grafana-1:ro"
       - --read-only
       - --tmpfs
       - /tmp:rw,noexec,nosuid,nodev
@@ -839,27 +880,19 @@
       - none
       - --entrypoint
       - /opt/venv/bin/python
-      - ai-gateway-dev-portal
+      - ai-gateway/portal:1
       - -I
       - -c
       - |
-        import base64
-        import json
-        import sys
+        import sqlite3
         import urllib.request
 
-        password = sys.stdin.read().removesuffix("\n")
-        if not password or "\n" in password or "\r" in password:
-            raise SystemExit("invalid Grafana password input")
-        authorization = base64.b64encode(f"admin:{password}".encode()).decode()
-        request = urllib.request.Request("http://grafana:3000/api/datasources")
-        request.add_header("Authorization", f"Basic {authorization}")
-        with urllib.request.urlopen(request, timeout=5) as response:
-            payload = json.load(response)
-        actual = {
-            (item["name"], item["uid"], item["type"], item["url"])
-            for item in payload
-        }
+        database = sqlite3.connect(
+            "file:/var/lib/grafana/grafana.db?mode=ro", uri=True, timeout=5
+        )
+        actual = set(
+            database.execute("SELECT name, uid, type, url FROM data_source")
+        )
         expected = {
             ("Prometheus", "prometheus", "prometheus", "http://prometheus:9090"),
             ("Loki", "loki", "loki", "http://loki:3100"),
@@ -867,24 +900,21 @@
         }
         if actual != expected:
             raise SystemExit("Grafana datasource graph does not match the reviewed provisioning")
-        for uid in ("prometheus", "loki", "tempo"):
-            request = urllib.request.Request(
-                f"http://grafana:3000/api/datasources/uid/{uid}/health"
-            )
-            request.add_header("Authorization", f"Basic {authorization}")
-            with urllib.request.urlopen(request, timeout=10) as response:
-                health = json.load(response)
-            if health.get("status") != "OK":
-                raise SystemExit(f"Grafana datasource {uid} health is not OK")
-  args:
-    stdin: "{{ grafana_admin_password }}"
-    stdin_add_newline: false
+        # Each exact provisioned backend must answer its application-native
+        # readiness endpoint from Grafana's private observability plane.
+        for url in (
+            "http://prometheus:9090/-/ready",
+            "http://loki:3100/ready",
+            "http://tempo:3200/ready",
+        ):
+            with urllib.request.urlopen(url, timeout=10) as response:
+                if response.status != 200:
+                    raise SystemExit(f"datasource backend is unhealthy: {url}")
   register: grafana_datasource_graph
   retries: 12
   delay: 5
   until: grafana_datasource_graph.rc == 0
   changed_when: false
-  no_log: true
 
 - name: Prove Prometheus scraped the host filesystem through node-exporter
   ansible.builtin.command:
@@ -920,11 +950,19 @@
   changed_when: false
 
 - name: Egress canary — vendor reachable only via the pinned reverse proxy
-  ansible.builtin.command: >
-    docker exec {{ compose_project_name }}-key-rotator-1
-    python3 -c "import urllib.request,sys;
-    r=urllib.request.urlopen(urllib.request.Request('http://envoy-egress:8080/anthropic/v1/models'),timeout=15);
-    print(r.status)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - exec
+      - "{{ compose_project_name }}-key-rotator-1"
+      - python3
+      - -c
+      - >-
+        import urllib.request,sys;
+        r=urllib.request.urlopen(urllib.request.Request('http://envoy-egress:8080/anthropic/v1/models'),timeout=15);
+        print(r.status)
   register: canary
   changed_when: false
   failed_when: false   # 401 (no key) still proves path+TLS; informational

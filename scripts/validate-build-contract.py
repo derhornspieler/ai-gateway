@@ -20,10 +20,13 @@ def main() -> None:
         "traefik-int": root / "services/traefik",
         "traefik-adm": root / "services/traefik",
         "dev-portal": root / "services/dev-portal",
+        "admin-portal": root / "services/dev-portal",
         "key-rotator": root / "services/key-rotator",
         "envoy-egress": root / "services/egress-proxy",
         "oauth2-proxy": root / "services/dhi-health-probe",
         "oauth2-proxy-grafana": root / "services/dhi-health-probe",
+        "oauth2-proxy-prometheus": root / "services/dhi-health-probe",
+        "oauth2-proxy-vault": root / "services/dhi-health-probe",
         "open-webui": root / "services/dhi-health-probe",
         "keycloak": root / "services/dhi-health-probe",
         "vault": root / "services/dhi-health-probe",
@@ -35,7 +38,7 @@ def main() -> None:
         "grafana": root / "services/dhi-health-probe",
         "cribl-mock": root / "services/dhi-health-probe",
     }
-    expected_host_networks = {"dev-portal", "key-rotator"}
+    expected_host_networks = {"dev-portal", "admin-portal", "key-rotator"}
     expected_no_networks = set(expected_contexts) - expected_host_networks
     if profile == "lab":
         expected_contexts["samba-ad"] = root / "services/samba-ad-lab"

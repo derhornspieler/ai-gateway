@@ -83,7 +83,7 @@ class ArchiveError(RuntimeError):
 
 
 def expected_volumes(profile: str) -> frozenset[str]:
-    if profile == "parallels-rocky9-lab":
+    if profile == "rocky9-lab":
         return BASE_VOLUMES | LAB_VOLUMES
     return BASE_VOLUMES
 
@@ -384,7 +384,7 @@ def prepare_restore(
             if name
         }
         required_roots = set(STACK_REQUIRED_ROOTS)
-        if profile == "parallels-rocky9-lab":
+        if profile == "rocky9-lab":
             required_roots.update({"docker-compose.lab.yml", "secrets"})
         if not required_roots.issubset(present_roots):
             raise ArchiveError(

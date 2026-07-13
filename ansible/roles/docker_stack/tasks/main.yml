@@ -6,6 +6,7 @@
       - traefik_int_portal_ip == '172.28.4.2'
       - traefik_adm_admin_ip == '172.28.5.2'
       - traefik_adm_grafana_ip == '172.28.6.2'
+      - oauth2_proxy_grafana_ip == '172.28.6.3'
       - alloy_telemetry_ip == '172.28.13.2'
       - alloy_observability_ip == '172.28.15.2'
       - prometheus_observability_ip == '172.28.15.3'
@@ -417,6 +418,7 @@
       [[ $# -eq 0 ]] || { echo "arguments are not accepted" >&2; exit 2; }
       state_root={{ docker_data_root | quote }}
       root="$state_root/containers"
+      stack_root={{ stack_dir | quote }}
 
       [[ -d "$state_root" && ! -L "$state_root" ]] || {
         echo "Docker state root is missing or symlinked" >&2
@@ -464,138 +466,135 @@
         }
       }
 
-      require_default_acl() {
-        local path=$1 class=$2 qualifier=$3 expected=$4
-        local count=0 permissions='' mask='rwx' effective
-        while IFS=: read -r prefix entry_class entry_qualifier value _; do
-          if [[ "$prefix" == default && "$entry_class" == "$class" &&
-                "$entry_qualifier" == "$qualifier" ]]; then
-            count=$((count + 1))
-            permissions=$value
-          elif [[ "$prefix" == default && "$entry_class" == mask &&
-                  -z "$entry_qualifier" ]]; then
-            mask=$value
-          fi
-        done < <(/usr/bin/getfacl -cpn -- "$path")
-        effective=$permissions
-        if [[ "$class" == user && -n "$qualifier" ]]; then
-          effective=$(intersect_permissions "$permissions" "$mask")
-        fi
-        ((count == 1)) && [[ "$permissions" == "$expected" ]] &&
-          [[ "$effective" == "$expected" ]] || {
-          echo "unexpected default $class ACL on $path" >&2
-          exit 1
-        }
-      }
-
       require_root_owned_real() {
         local path=$1 expected_type=$2
         [[ ! -L "$path" ]] || {
           echo "refusing symlinked Docker ACL target: $path" >&2
           exit 1
         }
-        if [[ "$expected_type" == directory ]]; then
-          [[ -d "$path" ]] || {
-            echo "Docker ACL target is not a directory: $path" >&2
-            exit 1
-          }
-        else
-          [[ -f "$path" ]] || {
-            echo "Docker ACL target is not a regular file: $path" >&2
-            exit 1
-          }
-        fi
+        case "$expected_type" in
+          directory)
+            [[ -d "$path" ]] || {
+              echo "Docker ACL target is not a directory: $path" >&2
+              exit 1
+            }
+            ;;
+          file)
+            [[ -f "$path" ]] || {
+              echo "Docker ACL target is not a regular file: $path" >&2
+              exit 1
+            }
+            ;;
+          entry)
+            [[ -e "$path" ]] || {
+              echo "Docker ACL target is missing: $path" >&2
+              exit 1
+            }
+            ;;
+          *)
+            echo "internal ACL target-type error" >&2
+            exit 2
+            ;;
+        esac
         [[ "$(/usr/bin/stat -c '%u:%g' -- "$path")" == 0:0 ]] || {
           echo "Docker ACL target must be owned by root:root: $path" >&2
           exit 1
         }
       }
 
-      # Validate every object this helper may mutate before the first ACL
-      # write. Docker's containers root contains only one real root-owned
-      # directory per container and root-owned immediate runtime files.
-      unexpected_child=$(/usr/bin/find "$root" -xdev -mindepth 1 -maxdepth 1 \
-        \( ! -type d -o ! -uid 0 -o ! -gid 0 \) -print -quit)
-      [[ -z "$unexpected_child" ]] || {
-        echo "unexpected type/owner beneath Docker containers root" >&2
-        exit 1
-      }
-      unsafe_runtime_object=$(/usr/bin/find "$root" -xdev -mindepth 2 -maxdepth 2 \
-        -type f \( ! -uid 0 -o ! -gid 0 \) -print -quit)
-      [[ -z "$unsafe_runtime_object" ]] || {
-        echo "Docker runtime file must be owned by root:root" >&2
-        exit 1
-      }
-      unexpected_log_link=$(/usr/bin/find "$root" -xdev -mindepth 2 -maxdepth 2 \
-        -type l -name '*-json.log*' -print -quit)
-      [[ -z "$unexpected_log_link" ]] || {
-        echo "refusing symlinked Docker json-log target" >&2
-        exit 1
+      require_no_default_acl() {
+        if /usr/bin/getfacl -cpn -- "$1" | /usr/bin/grep -q '^default:'; then
+          echo "unexpected inherited ACL on Docker log boundary: $1" >&2
+          exit 1
+        fi
       }
 
-      # The state-root ACL is established explicitly by Ansible and survives a
-      # Docker restart on the supported host. Verify that immutable boundary;
-      # do not give this recurring Docker-socket helper write access to the
-      # whole Docker root. Restore only the containers-root/default ACL before
-      # touching a child: uid473 may traverse the state root, may enumerate the
-      # containers root, and inherits traverse-only access.
+      # The parent ACLs are established once by Ansible. The recurring helper
+      # never walks or writes an arbitrary Docker container directory: it asks
+      # Docker for the exact Compose project IDs, validates *all* of their
+      # direct entries before its first write, then grants uid 473 only the
+      # json-file logs for those containers. This prevents an unrelated future
+      # container on the same host from becoming observable merely because it
+      # exists below DockerRootDir.
       require_access_acl "$state_root" --x
-      /usr/bin/setfacl -m u:473:r-x "$root"
-      /usr/bin/setfacl -m d:u:473:--x,d:o:r-x "$root"
       require_access_acl "$root" r-x
-      require_default_acl "$root" user 473 --x
-      require_default_acl "$root" other '' r-x
+      require_no_default_acl "$root"
 
-      # Establish the positive boundary first so an ordinary reconcile never
-      # creates a log collection gap. Then deny uid473 on every non-log file;
-      # named ACL entries override world-readable Docker runtime files.
-      /usr/bin/find "$root" -xdev -mindepth 1 -maxdepth 1 -type d \
-        -exec /usr/bin/setfacl -m u:473:r-x {} +
-      /usr/bin/find "$root" -xdev -mindepth 1 -maxdepth 1 -type d \
-        -exec /usr/bin/setfacl -x d:u:473 {} +
-      /usr/bin/find "$root" -xdev -mindepth 2 -maxdepth 2 -type f ! -name '*-json.log*' \
-        -exec /usr/bin/setfacl -m u:473:--- {} +
-      /usr/bin/find "$root" -xdev -mindepth 2 -maxdepth 2 -type f -name '*-json.log*' \
-        -exec /usr/bin/setfacl -m u:473:r-- {} +
-
-      # Alloy itself needs its Docker-injected identity/resolver files for
-      # service discovery. Grant only these three non-secret files for the one
-      # exact running project/service container; resolv.conf.hash stays denied.
-      alloy_ids=()
-      if ! alloy_output=$(
-        /usr/bin/docker --host unix:///run/docker.sock ps --no-trunc -q \
-          --filter 'label=com.docker.compose.project={{ compose_project_name }}' \
-          --filter 'label=com.docker.compose.service=alloy'
+      project_ids=()
+      if ! project_output=$(
+        /usr/bin/docker --host unix:///run/docker.sock ps -aq --no-trunc \
+          --filter 'label=com.docker.compose.project={{ compose_project_name }}'
       ); then
-        echo "Docker failed to enumerate the running Alloy container" >&2
+        echo "Docker failed to enumerate AI Gateway project containers" >&2
         exit 1
       fi
-      if [[ -n "$alloy_output" ]]; then
-        mapfile -t alloy_ids <<<"$alloy_output"
+      if [[ -n "$project_output" ]]; then
+        mapfile -t project_ids <<<"$project_output"
+        if ! trusted_project_output=$(
+          /usr/bin/docker --host unix:///run/docker.sock inspect "${project_ids[@]}" |
+            /usr/bin/python3 -I -c 'import json,re,sys; project,stack_root=sys.argv[1:]; containers=json.load(sys.stdin); labels=lambda container: (container.get("Config") or {}).get("Labels") or {}; bad=[container for container in containers if not (labels(container).get("com.docker.compose.project") == project and labels(container).get("com.docker.compose.project.working_dir") == stack_root and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", labels(container).get("com.docker.compose.service", "")) and re.fullmatch(r"[0-9a-f]{64}", labels(container).get("com.docker.compose.config-hash", "")))]; bad and (_ for _ in ()).throw(SystemExit("Docker returned a container without the full AI Gateway Compose ownership tuple")); print("\\n".join(container.get("Id", "") for container in containers))' {{ compose_project_name | quote }} "$stack_root"
+        ); then
+          echo "Docker failed to validate AI Gateway project container ownership" >&2
+          exit 1
+        fi
+        mapfile -t project_ids <<<"$trusted_project_output"
       fi
-      alloy_count=${#alloy_ids[@]}
-      ((alloy_count <= 1)) || {
-        echo "multiple running Alloy containers violate the ACL boundary" >&2
-        exit 1
-      }
-      if ((alloy_count == 1)); then
-        [[ "${alloy_ids[0]}" =~ ^[0-9a-f]{64}$ ]] || {
-          echo "Docker returned an invalid Alloy container ID" >&2
+      project_dirs=()
+      for identifier in "${project_ids[@]}"; do
+        [[ "$identifier" =~ ^[0-9a-f]{64}$ ]] || {
+          echo "Docker returned an invalid AI Gateway container ID" >&2
           exit 1
         }
-        alloy_dir="$root/${alloy_ids[0]}"
-        require_root_owned_real "$alloy_dir" directory
-        for runtime_file in hosts hostname resolv.conf; do
-          require_root_owned_real "$alloy_dir/$runtime_file" file
-          /usr/bin/setfacl -m u:473:r-- "$alloy_dir/$runtime_file"
-        done
-      fi
+        project_dir="$root/$identifier"
+        require_root_owned_real "$project_dir" directory
+        project_dirs+=("$project_dir")
+      done
 
-      # Fail closed if a concurrent Docker action changed either parent ACL.
+      # Validate every object that will be changed before the first ACL write.
+      # Docker json logs and runtime metadata live directly in each container
+      # directory; unexpected symlinks, owners, or types fail closed.
+      for project_dir in "${project_dirs[@]}"; do
+        while IFS= read -r -d '' candidate; do
+          require_root_owned_real "$candidate" entry
+          if [[ "$candidate" == *-json.log* ]]; then
+            require_root_owned_real "$candidate" file
+          fi
+        done < <(/usr/bin/find "$project_dir" -xdev -mindepth 1 -maxdepth 1 -print0)
+      done
+
+      for project_dir in "${project_dirs[@]}"; do
+        # Clear only legacy inherited ACLs on this exact AIGW container
+        # directory. No default ACL is left that could grant future files.
+        /usr/bin/setfacl -k -- "$project_dir"
+        /usr/bin/setfacl -m u:473:r-x "$project_dir"
+        while IFS= read -r -d '' candidate; do
+          if [[ "$candidate" == *-json.log* ]]; then
+            /usr/bin/setfacl -m u:473:r-- "$candidate"
+          else
+            # Named deny overrides Docker runtime files that happen to carry
+            # other-read permission; config.v2.json and injected resolver
+            # material remain outside Alloy's collection boundary.
+            /usr/bin/setfacl -m u:473:--- "$candidate"
+          fi
+        done < <(/usr/bin/find "$project_dir" -xdev -mindepth 1 -maxdepth 1 -print0)
+      done
+
+      # Fail closed if a concurrent action altered parent access or if a child
+      # reconciliation did not yield the exact per-file read boundary.
       require_access_acl "$state_root" --x
       require_access_acl "$root" r-x
-      require_default_acl "$root" user 473 --x
-      require_default_acl "$root" other '' r-x
+      require_no_default_acl "$root"
+      for project_dir in "${project_dirs[@]}"; do
+        require_access_acl "$project_dir" r-x
+        require_no_default_acl "$project_dir"
+        while IFS= read -r -d '' candidate; do
+          if [[ "$candidate" == *-json.log* ]]; then
+            require_access_acl "$candidate" r--
+          else
+            require_access_acl "$candidate" ---
+          fi
+        done < <(/usr/bin/find "$project_dir" -xdev -mindepth 1 -maxdepth 1 -print0)
+      done
 
 - name: Install scoped Docker json-log ACL reconciliation service
   ansible.builtin.copy:
@@ -692,7 +691,6 @@
     - { name: portal_oidc_client_secret, min_length: 32 }
     - { name: admin_portal_oidc_client_secret, min_length: 32 }
     - { name: oauth2_proxy_client_secret, min_length: 32 }
-    - { name: grafana_oidc_client_secret, min_length: 32 }
     - { name: portal_session_secret, min_length: 32 }
     - { name: admin_portal_session_secret, min_length: 32 }
     - { name: rotator_internal_token, min_length: 32 }
@@ -709,8 +707,8 @@
       - portal_session_secret != admin_portal_session_secret
       - >-
         [webui_oidc_client_secret, portal_oidc_client_secret,
-         admin_portal_oidc_client_secret, oauth2_proxy_client_secret,
-         grafana_oidc_client_secret] | unique | length == 5
+         admin_portal_oidc_client_secret,
+         oauth2_proxy_client_secret] | unique | length == 4
     quiet: true
     fail_msg: Portal tokens, session keys, and OIDC client secrets must be distinct.
   no_log: true
@@ -1126,6 +1124,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - ps
       - -aq
   register: aigw_containers_before_selinux
@@ -1210,13 +1210,11 @@
     label: "{{ item.item.path }}"
   when: aigw_containers_before_selinux.stdout_lines | length == 0
 
-# DHI Alloy runs as uid 473 with no capabilities. Rocky's Docker json-log tree
-# is 0710/0640 root-owned. Grant traverse access to container directories, but
-# never recursively remove the same UID ACL: that creates a collection gap by
-# deleting the intended per-directory/per-log entries. The authoritative
-# reconciler below strips uid 473 only from non-log siblings, targets
-# *-json.log* exactly, and catches later log rotation. Never grant DAC_OVERRIDE
-# or expose the Docker socket.
+# DHI Alloy runs as uid 473 with no capabilities. It needs parent traversal to
+# glob the Docker json-file tree, but it receives directory/log ACLs only for
+# containers that Docker currently labels as this Compose project. Never leave
+# a default ACL on the shared containers root: it would apply to an unrelated
+# container created after this converge.
 
 - name: Allow DHI Alloy to traverse the Docker state root
   ansible.posix.acl:
@@ -1234,46 +1232,16 @@
     permissions: rx
     state: present
 
-- name: Inherit traverse-only Alloy access on future container directories
-  ansible.posix.acl:
-    path: "{{ docker_data_root }}/containers"
-    entity: "473"
-    etype: user
-    permissions: x
-    default: true
-    state: present
+- name: Read existing inherited ACLs from the Docker containers root
+  ansible.builtin.command:
+    argv: [getfacl, -cpn, --, "{{ docker_data_root }}/containers"]
+  register: aigw_docker_containers_root_acl
+  changed_when: false
 
-# A default ACL must not erase Docker's requested other/read bit on injected
-# /etc/hosts, /etc/hostname, and /etc/resolv.conf. POSIX creation-mode masking
-# still removes these permissions from 0640 logs and 0600 metadata.
-- name: Preserve Docker-requested other permissions beneath the containers root
-  ansible.posix.acl:
-    path: "{{ docker_data_root }}/containers"
-    etype: other
-    permissions: rX
-    default: true
-    state: present
-
-- name: Find existing Docker-injected non-secret identity and resolver files
-  ansible.builtin.find:
-    paths: "{{ docker_data_root }}/containers"
-    recurse: true
-    file_type: file
-    patterns:
-      - hosts
-      - hostname
-      - resolv.conf
-  register: docker_injected_runtime_files
-
-- name: Restore read access required by non-root container processes
-  ansible.posix.acl:
-    path: "{{ item.path }}"
-    etype: other
-    permissions: r
-    state: present
-  loop: "{{ docker_injected_runtime_files.files }}"
-  loop_control:
-    label: "{{ item.path | basename }}"
+- name: Remove legacy inherited ACLs from the Docker containers root
+  ansible.builtin.command:
+    argv: [setfacl, -k, --, "{{ docker_data_root }}/containers"]
+  when: "'default:' in aigw_docker_containers_root_acl.stdout"
 
 - name: Install scoped Docker json-log ACL reconciliation timer
   ansible.builtin.copy:
@@ -1320,7 +1288,7 @@
   ansible.builtin.command:
     argv: >-
       {{
-        ['docker', 'compose', '--project-name', compose_project_name,
+        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name,
          '--file', 'docker-compose.yml']
         + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
            if (samba_lab_enabled | bool) else [])
@@ -1335,7 +1303,7 @@
   ansible.builtin.command:
     argv: >-
       {{
-        ['docker', 'compose', '--project-name', compose_project_name,
+        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name,
          '--file', 'docker-compose.yml']
         + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
            if (samba_lab_enabled | bool) else [])
@@ -1364,6 +1332,9 @@
 
 - name: Inspect the existing volume initializer
   community.docker.docker_container_info:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     name: "{{ compose_project_name }}-volume-init-1"
   register: existing_volume_init
 
@@ -1392,7 +1363,7 @@
         drift = []
         for volume, contract in expected.items():
             result = subprocess.run(
-                ["docker", "volume", "inspect", f"{project}_{volume}"],
+                ["docker", "--host", "unix:///run/docker.sock", "volume", "inspect", f"{project}_{volume}"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -1422,6 +1393,9 @@
 # calls explicitly exclude it.
 - name: Run the versioned volume initializer when required
   community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
     files: >-
@@ -1443,6 +1417,9 @@
 
 - name: Wait for the volume initializer success contract
   community.docker.docker_container_info:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     name: "{{ compose_project_name }}-volume-init-1"
   register: verified_volume_init
   retries: 30
@@ -1479,7 +1456,7 @@
         drift = []
         for volume, contract in expected.items():
             result = subprocess.run(
-                ["docker", "volume", "inspect", f"{project}_{volume}"],
+                ["docker", "--host", "unix:///run/docker.sock", "volume", "inspect", f"{project}_{volume}"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -1506,6 +1483,9 @@
 
 - name: Start PostgreSQL before credential reconciliation
   community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
     files: >-
@@ -1522,6 +1502,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - compose
       - exec
       - -T
@@ -1547,6 +1529,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - compose
       - exec
       - -T
@@ -1562,6 +1546,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - compose
       - exec
       - -T
@@ -1659,7 +1645,7 @@
   ansible.builtin.command:
     argv: >-
       {{
-        ['docker', 'compose', '--project-name', compose_project_name,
+        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name,
          '--file', 'docker-compose.yml']
         + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
            if (samba_lab_enabled | bool) else [])
@@ -1749,7 +1735,7 @@
   ansible.builtin.command:
     argv: >-
       {{
-        ['docker', 'compose', '--project-name', compose_project_name,
+        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name,
          '--file', 'docker-compose.yml']
         + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
            if (samba_lab_enabled | bool) else [])
@@ -1777,7 +1763,7 @@
         for name, record in manifest.get("services", {}).items():
             try:
                 output = subprocess.check_output(
-                    ["docker", "image", "inspect", record["image"]],
+                    ["docker", "--host", "unix:///run/docker.sock", "image", "inspect", record["image"]],
                     stdin=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     text=True,
@@ -1830,6 +1816,9 @@
 
 - name: Deploy stack without implicitly rebuilding custom images
   community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
     files: >-
@@ -1853,6 +1842,9 @@
 
 - name: Inspect Vault immediately after Compose start
   community.docker.docker_container_info:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     name: "{{ compose_project_name }}-vault-1"
   register: vault_container_startup
 
@@ -1894,6 +1886,9 @@
 
 - name: Inspect DHI Alloy after Compose start
   community.docker.docker_container_info:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     name: "{{ compose_project_name }}-alloy-1"
   register: alloy_container_startup
   retries: 15
@@ -1929,6 +1924,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - run
       - --rm
       - --network
@@ -1973,6 +1970,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - compose
       - exec
       - -T
@@ -2019,6 +2018,8 @@
   ansible.builtin.command:
     argv:
       - docker
+      - --host
+      - unix:///run/docker.sock
       - compose
       - exec
       - -T
@@ -2059,6 +2060,9 @@
 
 - name: Wait for the complete post-bootstrap stack
   community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
     files: >-
@@ -2076,6 +2080,9 @@
 
 - name: Wait only for bootstrap-independent core on first converge
   community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
     files: >-
@@ -2141,6 +2148,8 @@
       ansible.builtin.command:
         argv:
           - docker
+          - --host
+          - unix:///run/docker.sock
           - run
           - --rm
           - -i
@@ -2255,12 +2264,12 @@
         if len(secret) < 16:
             raise SystemExit("bounded workload key input unavailable")
         ids = subprocess.check_output(
-            ["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={sys.argv[1]}"],
+            ["docker", "--host", "unix:///run/docker.sock", "ps", "-aq", "--filter", f"label=com.docker.compose.project={sys.argv[1]}"],
             text=True,
         ).split()
         for container_id in ids:
             result = subprocess.run(
-                ["docker", "logs", container_id],
+                ["docker", "--host", "unix:///run/docker.sock", "logs", container_id],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 check=False,
@@ -2288,11 +2297,11 @@
 
         project, egress_ip, adm_ip, internal_ip, lab_dns = sys.argv[1:]
         container_ids = subprocess.check_output(
-            ["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"],
+            ["docker", "--host", "unix:///run/docker.sock", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"],
             text=True,
         ).split()
         containers = json.loads(
-            subprocess.check_output(["docker", "inspect", *container_ids], text=True)
+            subprocess.check_output(["docker", "--host", "unix:///run/docker.sock", "inspect", *container_ids], text=True)
         )
         actual = set()
         for container in containers:
@@ -2426,6 +2435,9 @@
 
 - name: Remove the retired flat backend network after services are segmented
   community.docker.docker_network:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
     name: net-backend
     state: absent
 
