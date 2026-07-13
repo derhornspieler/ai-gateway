@@ -19,14 +19,14 @@ flowchart TB
   USERS[Internal users and AI tools<br/>internal_cidr]
 
   subgraph vm [Rocky Linux 9 VM]
-    subgraph zegress [zone aigw-egress — target DROP, no listener]
-      NIC0[egress NIC<br/>only default route]
+    subgraph zegress [zone aigw-egress]
+      NIC0[egress NIC<br/>target DROP, no listener<br/>only default route]
     end
-    subgraph zadm [zone aigw-adm — TCP/22 + TCP/443 from VPN CIDR only]
-      NIC1[ADM NIC — ETH1_IP]
+    subgraph zadm [zone aigw-adm]
+      NIC1[ADM NIC — ETH1_IP<br/>TCP/22 + TCP/443<br/>from VPN CIDR only]
     end
-    subgraph zint [zone aigw-internal — TCP/443 from internal CIDR only]
-      NIC2[internal NIC — ETH2_IP]
+    subgraph zint [zone aigw-internal]
+      NIC2[internal NIC — ETH2_IP<br/>TCP/443<br/>from internal CIDR only]
     end
     EV[Envoy egress 172.28.0.2<br/>sole workload allowed external DNS + TCP/443]
     TA[traefik-adm :443]
@@ -191,7 +191,7 @@ flowchart TB
   L2[Packet policy — atomic DOCKER-USER +<br/>independent nftables aigw_guard:<br/>deny cross-plane, container-to-host,<br/>unapproved bridge egress]
   L3[Network segmentation — 18 per-function bridges;<br/>services join only required planes;<br/>fixed IPs for firewall-addressed workloads]
   L4[Identity — Keycloak OIDC everywhere;<br/>three realm roles; per-UI oauth2-proxy gates;<br/>step-up + live-role re-checks for admin mutations]
-  L5[Secrets — Vault-backed provider credentials;<br/>file-backed Docker secrets; no secret in argv/env;<br/>fail-closed blank ${VAR:?} Compose contract]
+  L5["Secrets — Vault-backed provider credentials;<br/>file-backed Docker secrets; no secret in argv/env;<br/>fail-closed blank-variable Compose contract"]
   L6[Runtime — SELinux enforcing with per-container MCS;<br/>non-root DHI images, digest-pinned;<br/>read-only binds with keyed HMAC digests;<br/>no Docker socket exposure]
   L7[Egress — Envoy as the only external identity:<br/>exact routes, exact SANs, per-vendor CA bundles]
   L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
