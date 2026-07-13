@@ -1,5 +1,11 @@
 # AI Gateway
 
+[![Infrastructure validation](https://github.com/derhornspieler/ai-gateway/actions/workflows/infrastructure-ci.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/infrastructure-ci.yml)
+[![Python quality and security](https://github.com/derhornspieler/ai-gateway/actions/workflows/python-ci.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/python-ci.yml)
+[![Secret scanning](https://github.com/derhornspieler/ai-gateway/actions/workflows/secret-scanning.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/secret-scanning.yml)
+[![Filesystem and IaC security](https://github.com/derhornspieler/ai-gateway/actions/workflows/trivy.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/trivy.yml)
+[![GitHub Actions policy](https://github.com/derhornspieler/ai-gateway/actions/workflows/actions-security.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/actions-security.yml)
+
 AI Gateway is a security-focused, self-hosted AI access platform for an existing
 Rocky Linux 9 VM. It puts OpenAI- and Anthropic-compatible API front doors,
 browser chat, per-user gateway keys, Keycloak OIDC, pinned vendor egress,
