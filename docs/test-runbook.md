@@ -11,6 +11,10 @@ the source revision, image digests, inventory profile, timestamps, and pass or
 fail evidence without copying passwords, tokens, prompt bodies, private keys,
 Vault responses, or session cookies into the evidence bundle.
 
+See the [solution map](solution-map.md) for the architecture and trust
+boundaries this runbook exercises, and [project status](project-status.md) for
+the current implementation posture and the residuals that remain pending.
+
 ## 1. Static release checks
 
 From the repository checkout on the control machine:
@@ -27,7 +31,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
   scripts/tests/test_compute_bind_source_digests.py \
   scripts/tests/test_selinux_contract.py \
   scripts/tests/test_acl_reconciler_source.py \
-  scripts/tests/test_safe_inventory_marker.py
+  scripts/tests/test_safe_inventory_marker.py \
+  scripts/tests/test_validate_identity_policy.py
 
 python3.12 -m venv /tmp/aigw-dev-portal-test
 /tmp/aigw-dev-portal-test/bin/python -m pip install --require-hashes \
@@ -265,10 +270,12 @@ SSH and the independent Docker forward guards reduced exposure.
 
 ## 4. Docker segmentation and negative packet tests
 
-The base stack has 20 long-running services plus one successful one-shot
-`volume-init`, and uses 19 of the 20 pre-created networks. The lab overlay adds
-two long-running services: Samba AD on `net-identity` and authoritative DNS on
-`net-lab-dns`. On the lab always use the merged command:
+The base stack has 23 long-running services plus one successful one-shot
+`volume-init`, and uses 18 of the 20 pre-created networks. The lab overlay adds
+two long-running services — Samba AD on `net-identity` and authoritative DNS on
+`net-lab-dns` — bringing every one of the 20 bridges into use and the total to
+25 long-running services plus `volume-init`. On the lab always use the merged
+command:
 
 ```bash
 cd /opt/ai-gateway
@@ -279,9 +286,10 @@ docker compose -f docker-compose.yml -f docker-compose.lab.yml \
 docker network ls --filter label=com.docker.compose.project=ai-gateway
 ```
 
-Inspect all 20 networks and confirm the exact subnet, stable `br-*` name,
-`EnableIPv6=false`, and `Internal` flag match Ansible. `net-egress`, `net-adm`,
-`net-internal`, `net-int-edge`, and `net-lab-dns` are non-internal. The last
+Inspect all 20 networks and confirm the exact subnet, the `.128/25` container
+`IPRange` half, the stable `br-*` name, `EnableIPv6=false`, and the `Internal`
+flag match Ansible. `net-egress`, `net-adm`, `net-internal`, `net-int-edge`, and
+`net-lab-dns` are non-internal. The last
 two must have exactly one service peer and no permitted container egress;
 they exist only to preserve exact-IP host publication under Docker 29.
 `samba-ad` must have no published port and only one attachment,
@@ -336,7 +344,7 @@ docker compose logs --since=15m \
 ```
 
 Use the merged Compose arguments in the lab. Pass criteria are healthy/ready
-state for all 22 long-running lab services, no restart loop, no
+state for all 25 long-running lab services, no restart loop, no
 placeholder-secret failure, Vault unsealed, database migrations complete, and
 no outbound TLS/pin error. `volume-init` must remain exited zero; it is the sole
 non-running exception. A container merely being `Up` is not sufficient. Compare
@@ -352,19 +360,27 @@ must not be accepted merely because `vault status` itself returned parseable
 JSON. A restore marker with uninitialized Vault must also stop and must never
 run replacement bootstrap.
 
-Require the full Ansible functional probes as well. Trusted TLS with exact SNI
-must return 200 for `portal.<domain>/healthz`, 403 for internal
-`api.<domain>/ui`, and 403 for ADM `admin.<domain>/`. During recovery
-maintenance, connect to the exact Traefik service-plane addresses rather than
-the deliberately denied physical host addresses; verify physical listeners,
-DNAT, and firewall policy separately. These checks detect unreadable Traefik
-dynamic route/TLS files that native `/ping` misses. An isolated,
-network-scoped Grafana probe must authenticate without logging its password,
-find exactly Prometheus, Loki, and Tempo with the reviewed UIDs/types/URLs, and
-receive `OK` from all three datasource health endpoints. Permit only the
-implemented bounded 12 attempts with five-second delay, and require exact
-stdin without an Ansible-added newline, `no_log`, and disabled probe-container
-logging. `/api/health` alone does not prove provisioning loaded.
+Require the full Ansible functional probes as well. Connecting to the exact
+Traefik service-plane addresses with trusted TLS and exact SNI, the reviewed
+edge contract is: 200 for internal `portal.<domain>/healthz` and
+`auth.<domain>/realms/aigw/.well-known/openid-configuration`; 403 for internal
+`api.<domain>/ui`; 200 for ADM `admin-portal.<domain>/healthz`; and a 302 OIDC
+redirect for ADM `admin.<domain>/`, `grafana.<domain>/`, `prometheus.<domain>/`,
+`vault.<domain>/`, and `auth.<domain>/admin/`, as each oauth2-proxy or the
+Keycloak admin route bounces an unauthenticated request to Keycloak. During
+recovery maintenance, connect to the exact Traefik service-plane addresses
+rather than the deliberately denied physical host addresses; verify physical
+listeners, DNAT, and firewall policy separately. These checks detect unreadable
+Traefik dynamic route/TLS files that native `/ping` misses. An isolated,
+network-scoped probe container reads Grafana's provisioned datasource table
+read-only from a `--volumes-from grafana:ro` mount — proving exactly Prometheus,
+Loki, and Tempo with the reviewed UIDs, types, and URLs — and confirms all three
+backends answer their native readiness endpoints (`/-/ready`, `/ready`,
+`/ready`). It runs inside the bounded 12 attempts with five-second delay, with
+the probe container's logging disabled and no secret in its arguments or output;
+Grafana's own login form and basic auth are disabled, so no admin password is
+presented. Reading `/api/health` alone does not prove the provisioning graph
+loaded.
 
 Inspect the rendered Redis service metadata without copying it into evidence.
 Its server `Config.Cmd` and `Config.Env` must contain no credential, and the
@@ -374,7 +390,7 @@ files must remain regular, single-link `root:65532 0440` files beneath the
 root-only secret directory. Any plaintext in Docker metadata is an exposure
 requiring value rotation, not a documentation exception.
 
-For the mandatory idempotency run, capture before and after snapshots of all 23
+For the mandatory idempotency run, capture before and after snapshots of all 26
 container IDs, image IDs, start/finish timestamps, status, health, exit code,
 and restart count, including the exited initializer. Separately record the
 initializer's definition-hash label, timestamps, and exit code; every deployed
@@ -425,7 +441,7 @@ contract is repaired, and unrelated long-running services are not recreated.
 Do not conduct this destructive drift test against retained customer state.
 
 For the final reboot/restart gate, keep maintenance ingress and any recovery
-marker in place. Capture the exact 23-container/image/configuration/volume/
+marker in place. Capture the exact 26-container/image/configuration/volume/
 network inventory, key-rotator history prefix, durable semantic markers, host
 guards, and Docker ACLs. Run two distinct controlled events; do not conflate
 their evidence.
@@ -435,7 +451,7 @@ project. Because `live-restore` is enabled, this event is expected to leave the
 running containers alive and **does not** create a sealed-Vault startup. Pass
 this daemon-restart lane only when:
 
-- the native/firewalld/`DOCKER-USER` boundaries remain active and the same 23
+- the native/firewalld/`DOCKER-USER` boundaries remain active and the same 26
   container IDs, images, configurations, volumes, and networks remain;
 - Docker still reports SELinux active; every ordinary service retains its
   exact process/mount MCS pair, only Alloy/node-exporter retain the reviewed
@@ -448,9 +464,9 @@ this daemon-restart lane only when:
   exact directory/log ACLs below it, and explicit denial on ordinary sibling
   metadata; a forced Docker enumeration failure must fail the reconciler;
 
-Then derive the exact profile-aware service list, require it to contain the 22
+Then derive the exact profile-aware service list, require it to contain the 25
 long-running services and exactly one separate `volume-init`, and explicitly
-restart only those 22 services. Do not use dependency traversal or a broad
+restart only those 25 services. Do not use dependency traversal or a broad
 `docker compose restart` with no service list. This second event keeps the
 container identities/configurations/images/volumes/networks but intentionally
 changes the long-running processes' start times. Pass the sealed-start lane
@@ -463,7 +479,7 @@ only when:
   the scheduler's bounded retry produces exactly the expected two static
   outcomes (`skipped` when no seed keys exist), with no failed row and no key
   material in evidence; and
-- all 22 long-running services return healthy, restart counts remain zero, and
+- all 25 long-running services return healthy, restart counts remain zero, and
   the complete durable/identity/packet/telemetry comparison still matches.
 
 Do not substitute a key-rotator restart for the sealed-to-unsealed scheduler
@@ -523,8 +539,9 @@ test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
 
 Also prove the internal source cannot connect to the ADM address, and an
 unapproved source cannot connect to either published address. From the VPN/ADM
-source, prove `admin`, `grafana`, and the Keycloak admin console are reachable
-with valid TLS. Inspect the served chain and SANs:
+source, prove `admin`, `admin-portal`, `grafana`, `prometheus`, `vault`, and the
+Keycloak admin console (`auth.<domain>/admin/`) are reachable with valid TLS.
+Inspect the served chain and SANs:
 
 ```bash
 openssl s_client -connect "$AIGW_INTERNAL_IP:443" \
@@ -556,18 +573,23 @@ prove that removing an admin/developer role invalidates or revalidates the
 portal session before another privileged action; a stale cookie must not retain
 authorization until its nominal session expiry.
 
-Test LiteLLM Admin and Grafana separately after Keycloak logout. Both proxies
-are configured to refresh/revalidate their cookies every five minutes and
-expire them after eight hours. Privileged access must be rejected no later
-than the first refresh after revocation; separately prove an inactive cookie
-cannot exceed the eight-hour maximum. Every portal admin page read and
-mutation must deny the live-revoked administrator immediately.
+Test each admin UI separately after Keycloak logout. Four oauth2-proxy
+instances — for the LiteLLM Admin UI, Grafana, Prometheus, and Vault — sit on
+the ADM leg and share the single `admin-ui` Keycloak client; all four
+refresh/revalidate their cookies every five minutes and expire them after eight
+hours. Privileged access must be rejected no later than the first refresh after
+revocation; separately prove an inactive cookie cannot exceed the eight-hour
+maximum. Every portal admin page read and mutation must deny the live-revoked
+administrator immediately.
 
-The LiteLLM Admin UI and Grafana must first pass their separate oauth2-proxy
-`aigw-admins` gates. Grafana then requires its local login. The portal
-`/admin` read revalidates live admin authority on every request; mutations add
-CSRF and fresh-step-up checks. It currently lives on the internal portal
-vhost; record that residual boundary.
+Each admin UI must first pass its own oauth2-proxy `aigw-admins` gate. Grafana
+then consumes the proxied identity through its auth-proxy allow-list — its login
+form and basic auth are disabled — so it presents no second login. The portal
+admin surface is the dedicated `admin-portal` ASGI application on the ADM leg
+(`admin-portal.<domain>` via traefik-adm on `net-admin-app`); the internal
+user/developer portal never registers an admin surface. The `/admin` read
+revalidates live admin authority on every request, and mutations add CSRF plus a
+fresh step-up reauthentication bounded to roughly five minutes.
 
 ## 8. Samba AD and identity-controller lab acceptance
 
@@ -575,7 +597,7 @@ This section applies only to the Parallels overlay.
 
 1. Confirm `samba-ad` is healthy, read-only, non-privileged, has only the
    reviewed capabilities, publishes no port, and joins only `net-identity`.
-2. Sign into `portal.<domain>/admin` as disposable `testadmin`, select
+2. Sign into `admin-portal.<domain>/admin` as disposable `testadmin`, select
    **Reauthenticate with Keycloak**, then submit `INITIALIZE`.
 3. Confirm status shows the durable controller and WIF broker ready, the lab
    LDAP provider ready, certificate fingerprints, and no
@@ -675,9 +697,11 @@ unset AIGW_TEST_KEY
 
 Pass only if the request traverses LiteLLM and Envoy, the provider sees the
 expected workspace/credential, and no other workload makes direct vendor
-connections. If no paid provider credential is approved for the lab, record
-the Envoy 401 canary as a network-only pass and mark inference/WIF acceptance
-not executed—never relabel it as a successful model test.
+connections. If no paid provider credential is approved for the lab, classify
+an upstream 401 as a network-only pass only when request counters independently
+prove LiteLLM and Envoy traversal. A 401 generated by LiteLLM before any Envoy
+delta is NOT EXECUTED for the egress/provider lane—never relabel either case as
+a successful model test.
 
 ## 10. Observability and sensitive-data handling
 

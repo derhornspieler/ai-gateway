@@ -93,9 +93,11 @@ post-G6 marker/lock checkpoint is
 The subsequent key-rotator sealed-retry candidate is
 `ai-gateway-source-key-rotator-sealed-retry-20260713T104657Z.tar.gz`, SHA-256
 `c5ed5b732dcf8931ce053b41833c6bd6051a517c717a6023825b0205b68d85f8`.
-Neither is the final G7 source because rollback-retention and Docker ACL
-reconciliation changes were added afterward. Freeze and receipt a new archive
-after those source changes pass review; never relabel an earlier digest.
+Neither is the final G7 source because rollback-retention, Docker ACL,
+SELinux/MCS, bind-recreation, Vault-readiness, build-framing, and portal/
+identity changes were added afterward. Freeze and receipt a new archive only
+after the complete source candidate and build plan pass review; never relabel
+an earlier digest.
 
 ### Credential-custody incident and re-key
 
@@ -366,10 +368,11 @@ the converge transcript has SHA-256
 `4e79d2de9754e667646a986b812b3c3d8c7651e55ef8dbd59e3e0aa8e67b6026`.
 
 That deployment proves the patched image and ordinary available-Vault path;
-it does **not** prove the original failure sequence. G7 must still restart
-Docker with Vault sealed, prove zero new history while sealed, unseal exactly
-once through stdin, and observe the bounded deferred runs complete without
-failed rows.
+it does **not** prove the original failure sequence. G7 must restart the Docker
+daemon separately under `live-restore`, then explicitly restart only the
+profile's long-running services so Vault starts sealed. It must prove zero new
+history before unseal, stream the share exactly once through stdin, and observe
+the bounded deferred runs complete without failed rows.
 
 ### Final security source remediation and rollback recovery
 

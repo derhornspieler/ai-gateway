@@ -14,15 +14,23 @@ Records intentionally split the two Traefik edges:
 | Name | Lab address | Plane |
 | --- | --- | --- |
 | `admin.aigw.internal` | `10.8.10.10` | ADM |
+| `admin-portal.aigw.internal` | `10.8.10.10` | ADM |
 | `grafana.aigw.internal` | `10.8.10.10` | ADM |
-| `auth.aigw.internal` | `10.8.10.10` | ADM / dual-use Keycloak issuer |
+| `keycloak.aigw.internal` | `10.8.10.10` | ADM |
+| `prometheus.aigw.internal` | `10.8.10.10` | ADM |
+| `vault.aigw.internal` | `10.8.10.10` | ADM |
 | `api.aigw.internal` | `10.20.0.10` | internal |
+| `auth.aigw.internal` | `10.20.0.10` | internal user-realm issuer only |
 | `chat.aigw.internal` | `10.20.0.10` | internal |
 | `portal.aigw.internal` | `10.20.0.10` | internal |
 
-Vault is not published or assigned a browser DNS name. The Anthropic WIF
-fabricated issuer also remains deliberately non-resolvable and is not part of
-this zone.
+`auth` and `keycloak` are intentionally different hostnames. The internal edge
+serves only the `aigw` realm and static Keycloak resources through `auth`; the
+master realm, administration console, and API are available only through the
+ADM `keycloak` name. Vault is reachable only through the ADM `vault` route,
+which applies an `aigw-admins` OIDC gate before Vault's own login. The
+Anthropic WIF fabricated issuer remains deliberately non-resolvable and is not
+part of this zone.
 
 ## macOS scoped resolver
 
@@ -43,6 +51,9 @@ Verify the scoped resolver and both address planes:
 ```sh
 scutil --dns | grep -A5 'aigw.internal'
 dig +short admin.aigw.internal
+dig +short admin-portal.aigw.internal
+dig +short auth.aigw.internal
+dig +short keycloak.aigw.internal
 dig +short portal.aigw.internal
 dig @10.8.10.10 example.com A +noall +comments
 ```

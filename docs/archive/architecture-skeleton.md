@@ -1,8 +1,8 @@
 # AI Gateway — Project Skeleton
 
 > **⚠ SUPERSEDED:** this was the v0 starting skeleton. The current, maintained design is
-> [`docs/solution-map.md`](docs/solution-map.md) (components, networks, firewalld, IaC,
-> vendor auth) + [`docs/anthropic-wif-bootstrap.md`](docs/anthropic-wif-bootstrap.md).
+> [`docs/solution-map.md`](../solution-map.md) (components, networks, firewalld, IaC,
+> vendor auth) + [`docs/anthropic-wif-bootstrap.md`](../anthropic-wif-bootstrap.md).
 > Kept for history; diagrams and `[TBD]`s below are stale.
 
 Status: draft skeleton, no requirements loaded yet. Sections marked `[TBD]` are placeholders — fill in as requirements arrive.
