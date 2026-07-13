@@ -1,0 +1,65 @@
+name: Python quality and security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  service:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [dev-portal, key-rotator]
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up production Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: |
+            services/${{ matrix.service }}/requirements.lock
+            services/${{ matrix.service }}/requirements-dev.txt
+
+      - name: Validate direct pins against production lock
+        run: python ../../.github/scripts/validate-python-locks.py requirements.txt requirements.lock
+
+      - name: Install hash-locked application and exact CI tools
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          python -m pip install --disable-pip-version-check --require-hashes -r requirements.lock
+          python -m pip check
+
+      - name: Lint Python
+        run: ruff check app tests
+
+      - name: Run unit and security regression tests
+        env:
+          PYTHONPATH: .
+        run: pytest -q
+
+      - name: Run Bandit (medium and higher)
+        run: bandit -q -r app --severity-level medium --confidence-level medium
+
+      - name: Audit the production dependency graph
+        run: pip-audit --disable-pip -r requirements.lock

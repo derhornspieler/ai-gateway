@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Fail when an exact direct requirement is absent or stale in its lock."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import sys
+
+
+PIN = re.compile(r"([A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_,.-]+\])?==([^\s;\\]+)")
+
+
+def canonical_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
+def parse_direct(path: Path) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        requirement = raw.split("#", 1)[0].strip()
+        if not requirement:
+            continue
+        match = PIN.fullmatch(requirement)
+        if match is None:
+            raise SystemExit(f"{path}: direct dependency is not exact-pinned: {requirement}")
+        pins[canonical_name(match.group(1))] = match.group(2)
+    if not pins:
+        raise SystemExit(f"{path}: no direct dependency pins found")
+    return pins
+
+
+def parse_lock(path: Path) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        match = PIN.match(raw)
+        if match is None:
+            continue
+        name = canonical_name(match.group(1))
+        if name in pins:
+            raise SystemExit(f"{path}: duplicate locked dependency: {name}")
+        pins[name] = match.group(2)
+    if not pins:
+        raise SystemExit(f"{path}: no locked dependencies found")
+    return pins
+
+
+def main() -> None:
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: validate-python-locks.py REQUIREMENTS LOCK")
+    direct_path, lock_path = map(Path, sys.argv[1:])
+    direct = parse_direct(direct_path)
+    locked = parse_lock(lock_path)
+    stale = {
+        name: (version, locked.get(name))
+        for name, version in direct.items()
+        if locked.get(name) != version
+    }
+    if stale:
+        details = ", ".join(
+            f"{name}=={expected} (lock={actual or 'missing'})"
+            for name, (expected, actual) in sorted(stale.items())
+        )
+        raise SystemExit(f"{lock_path}: regenerate from {direct_path}: {details}")
+
+
+if __name__ == "__main__":
+    main()

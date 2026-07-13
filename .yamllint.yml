@@ -1,0 +1,18 @@
+---
+extends: default
+
+ignore: |
+  ansible/inventory/group_vars/gateway/vault.yml
+  docs
+
+rules:
+  braces: disable
+  brackets: disable
+  colons: disable
+  commas: disable
+  comments: disable
+  comments-indentation: disable
+  document-start: disable
+  indentation: disable
+  line-length: disable
+  truthy: disable
