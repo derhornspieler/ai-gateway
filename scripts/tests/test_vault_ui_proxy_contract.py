@@ -112,7 +112,8 @@ class VaultUIProxyContractTests(unittest.TestCase):
                 "DEPLOYMENT_PROFILE=generic-rocky9\n"
                 "PLATFORM_AUTHORITATIVE_DNS_ENABLED=false\n"
                 "VAULT_UI_ENABLED=false\n"
-                "VAULT_UI_ENABLED=true\n",
+                "VAULT_UI_ENABLED=true\n"
+                "IDENTITY_LDAP_ENABLED=false\n",
                 encoding="utf-8",
             )
             duplicate = subprocess.run(
@@ -132,7 +133,8 @@ class VaultUIProxyContractTests(unittest.TestCase):
             (root / ".env").write_text(
                 "DEPLOYMENT_PROFILE=generic-rocky9\n"
                 "PLATFORM_AUTHORITATIVE_DNS_ENABLED=false\n"
-                "VAULT_UI_ENABLED=false\n",
+                "VAULT_UI_ENABLED=false\n"
+                "IDENTITY_LDAP_ENABLED=false\n",
                 encoding="utf-8",
             )
             fake_bin = root / "bin"
@@ -207,7 +209,8 @@ class VaultUIProxyContractTests(unittest.TestCase):
             (root / ".env").write_text(
                 "DEPLOYMENT_PROFILE=generic-rocky9\n"
                 "PLATFORM_AUTHORITATIVE_DNS_ENABLED=false\n"
-                "VAULT_UI_ENABLED=true\n",
+                "VAULT_UI_ENABLED=true\n"
+                "IDENTITY_LDAP_ENABLED=false\n",
                 encoding="utf-8",
             )
             enabled = invoke("config", ambient_selector="false")

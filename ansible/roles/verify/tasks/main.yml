@@ -854,6 +854,23 @@
     fail_msg: "Internet resolver {{ item }} is not identity- and egress-pinned."
   loop: "{{ egress_dns_servers }}"
 
+- name: External directory LDAPS is pinned to the exact Keycloak identity
+  ansible.builtin.assert:
+    that:
+      - "du.stdout is search('(?m).* -s ' ~ (keycloak_internal_ip | regex_escape) ~ '/32 .*-o ' ~ (nic_internal | regex_escape) ~ ' .*--dport 636 -j RETURN')"
+      - "du.stdout.count('--dport 636') == 1"
+      - "('ip saddr ' ~ keycloak_internal_ip ~ ' ip daddr ' ~ identity_ldap_directory_ip ~ ' tcp dport 636 accept') in host_input_guard.stdout"
+    fail_msg: The external directory allowance is missing or broader than the exact Keycloak tuple.
+  when: identity_ldap_enabled | bool
+
+- name: No external directory allowance exists while federation is disabled
+  ansible.builtin.assert:
+    that:
+      - "'--dport 636' not in du.stdout"
+      - "'dport 636' not in host_input_guard.stdout"
+    fail_msg: An unowned LDAPS firewall allowance exists.
+  when: not (identity_ldap_enabled | bool)
+
 - name: Docker default and future bridge names deny new container-to-host connections
   ansible.builtin.assert:
     that:
@@ -1342,6 +1359,7 @@
 
         root = Path(sys.argv[1])
         samba_enabled = sys.argv[2] == "true"
+        identity_ldap_enabled = sys.argv[3] == "true"
         expected = {
             "certs": ("dir", 0, 65532, 0o750),
             "certs/int.key": ("file", 0, 65532, 0o640),
@@ -1382,6 +1400,11 @@
                 "secrets/samba_user_lab-developer_password": ("file", 0, 0, 0o400),
                 "secrets/samba_user_lab-user_password": ("file", 0, 0, 0o400),
             })
+        if identity_ldap_enabled:
+            expected.update({
+                "keycloak/identity-ldap-ca.pem": ("file", 0, 65532, 0o440),
+                "secrets/identity_ldap_bind_password": ("file", 0, 65532, 0o440),
+            })
         errors = []
         for relative, (kind, uid, gid, mode) in expected.items():
             path = root / relative
@@ -1399,6 +1422,7 @@
             raise SystemExit("; ".join(errors))
       - "{{ stack_dir }}"
       - "{{ samba_lab_enabled | bool | lower }}"
+      - "{{ identity_ldap_enabled | bool | lower }}"
   changed_when: false
 
 - name: Prove selected DHI services actually run as uid and gid 65532

@@ -86,6 +86,15 @@
             (cribl_otlp_allowed_port | int >= 1 and cribl_otlp_allowed_port | int <= 65535)
           - (cribl_external_export_enabled | bool) or cribl_otlp_endpoint == 'cribl-mock:4317'
           - not (cribl_external_export_enabled | bool) or cribl_otlp_endpoint != 'cribl-mock:4317'
+          - keycloak_internal_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - identity_ldap_enabled is boolean
+          # Exactly one identity source may own the Keycloak truststore and the
+          # federation reconciliation inputs.
+          - not (identity_ldap_enabled | bool) or not (samba_lab_enabled | bool)
+          # Plaintext LDAP is refused before any host mutation.
+          - not (identity_ldap_enabled | bool) or identity_ldap_url is match('^ldaps://')
+          - not (identity_ldap_enabled | bool) or
+            identity_ldap_directory_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - (manage_networking | bool) or pbr_tables | length == 0
           - not (manage_networking | bool) or pbr_tables | length == 2
           - pbr_tables | map(attribute='id') | unique | length == pbr_tables | length
@@ -427,6 +436,7 @@
             alloy_ip = ipaddress.ip_address(sys.argv[5])
             lab_dns_ip = ipaddress.ip_address(sys.argv[6])
             declared_egress = ipaddress.ip_network(sys.argv[7], strict=True)
+            keycloak_ip = ipaddress.ip_address(sys.argv[8])
 
             parsed = []
             errors = []
@@ -458,6 +468,9 @@
             check_workload_ip("envoy_egress_ip", envoy_ip, "net-egress")
             check_workload_ip("alloy_internal_ip", alloy_ip, "net-internal")
             check_workload_ip("lab_dns_ip", lab_dns_ip, "net-lab-dns")
+            check_workload_ip("keycloak_internal_ip", keycloak_ip, "net-internal")
+            if keycloak_ip == alloy_ip:
+                errors.append("keycloak_internal_ip must differ from alloy_internal_ip")
 
             for route in routes:
                 destination = route.get("dst")
@@ -486,11 +499,14 @@
             {{ ([vpn_client_cidr, internal_cidr]
                 + ((internal_dns_servers + egress_dns_servers)
                    | map('regex_replace', '$', '/32') | list)
-                + ([cribl_otlp_allowed_cidr] if (cribl_external_export_enabled | bool) else [])) | to_json }}
+                + ([cribl_otlp_allowed_cidr] if (cribl_external_export_enabled | bool) else [])
+                + ([identity_ldap_directory_ip ~ '/32']
+                   if (identity_ldap_enabled | bool) else [])) | to_json }}
           - "{{ envoy_egress_ip }}"
           - "{{ alloy_internal_ip }}"
           - "{{ lab_dns_ip }}"
           - "{{ net_egress_subnet }}"
+          - "{{ keycloak_internal_ip }}"
       changed_when: false
 
     - name: Preflight — require corporate DNS to use only ADM/internal routing
@@ -558,6 +574,27 @@
         preflight_cribl_route.rc != 0 or
         ('dev ' ~ nic_internal) not in preflight_cribl_route.stdout
       when: cribl_external_export_enabled | bool
+
+    # The single LDAPS allowance authorizes exactly one output interface. If the
+    # directory is not actually reachable through the internal physical leg, the
+    # rendered firewall tuple would be inert and federation would fail silently
+    # at connect time instead of here.
+    - name: Preflight — prove the external directory uses the internal physical leg
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -4
+          - route
+          - get
+          - "{{ identity_ldap_directory_ip }}"
+          - oif
+          - "{{ nic_internal }}"
+      register: preflight_identity_ldap_route
+      changed_when: false
+      failed_when: >-
+        preflight_identity_ldap_route.rc != 0 or
+        ('dev ' ~ nic_internal) not in preflight_identity_ldap_route.stdout
+      when: identity_ldap_enabled | bool
 
     # A genuinely vanilla Rocky 9 host ships the vendor registry beneath
     # /usr/share and does not create the /etc override until an administrator

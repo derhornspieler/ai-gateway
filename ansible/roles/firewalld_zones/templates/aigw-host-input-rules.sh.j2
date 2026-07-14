@@ -108,6 +108,9 @@ table inet aigw_guard {
 {% if cribl_external_export_enabled | bool %}
     iifname "{{ _internal_net.bridge }}" oifname "{{ nic_internal }}" ip saddr {{ alloy_internal_ip }} ip daddr {{ cribl_otlp_allowed_cidr }} tcp dport {{ cribl_otlp_allowed_port }} accept
 {% endif %}
+{% if identity_ldap_enabled | bool %}
+    iifname "{{ _internal_net.bridge }}" oifname "{{ nic_internal }}" ip saddr {{ keycloak_internal_ip }} ip daddr {{ identity_ldap_directory_ip }} tcp dport 636 accept
+{% endif %}
 
     # Anything originating on a managed application bridge that did not match
     # an exact exception above is denied, regardless of output interface.

@@ -92,6 +92,10 @@ class GenericRocky9ContractTests(unittest.TestCase):
                 "samba_user_lab_user_password",
             ],
         )
+        # The external directory bind credential is operator-supplied, exactly
+        # like vault_unseal_key: it cannot be randomly generated here.
+        self.assertNotIn("identity_ldap_bind_password", names)
+        self.assertIn("identity_ldap_enabled", self.contract["required_nonsecret_keys"])
 
     def test_generic_and_lab_profiles_are_explicit_and_encryption_is_fail_closed(self) -> None:
         inventory = GENERIC_INVENTORY.read_text(encoding="utf-8")
@@ -281,6 +285,15 @@ print("          0123456789abcdef")
                 self.assertIn(edge_tls_key, host_text)
             secret_names = [entry["name"] for entry in self.contract["required_secret_keys"]]
             self.assertNotIn("aigw_edge_tls_private_key", secret_names)
+            # Optional external AD/LDAPS federation ships disabled with every
+            # input present and empty; the bind credential is never templated.
+            self.assertIn("identity_ldap_enabled: false", host_text)
+            self.assertIn("Optional external Active Directory / LDAPS federation", host_text)
+            for key in self.contract["conditional_feature_keys"]["identity_ldap"][
+                "required_nonsecret_keys"
+            ]:
+                self.assertIn(f"{key}:", host_text)
+            self.assertNotIn("identity_ldap_bind_password:", host_text)
             for entry in self.contract["required_secret_keys"]:
                 self.assertNotIn(entry["name"], host_text)
             vault_text = vault.read_text(encoding="utf-8")

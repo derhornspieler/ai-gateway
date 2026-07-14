@@ -119,7 +119,7 @@ class PreVaultIdentityReconciliationContractTests(unittest.TestCase):
             "_validate_pre_vault_identity_spec(spec)",
             "preserve_unmanaged=True",
             "_root_group(admin_token, create=True)",
-            "_ensure_lab_ldap(admin_token, self._lab_bind_password())",
+            "_ensure_ldap_federation(admin_token, self._ldap_bind_password())",
             "_pre_vault_group_members(",
             "pre-Vault managed baseline group has undeclared members",
             "exact pre-Vault baseline membership",

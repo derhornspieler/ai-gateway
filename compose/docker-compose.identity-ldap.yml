@@ -1,0 +1,58 @@
+# Production external directory (LDAPS) overlay.
+#
+# Loaded by Ansible only when identity_ldap_enabled=true and never together
+# with docker-compose.lab.yml: exactly one identity source may own the
+# Keycloak truststore and the federation reconciliation inputs.
+
+networks:
+  net-internal:
+    external: true
+
+services:
+  keycloak:
+    environment:
+      # Trust only the inventory-supplied public CA bundle for LDAPS.
+      KC_TRUSTSTORE_PATHS: /etc/aigw/identity-ldap-ca.pem
+      # Explicit default keeps LDAPS hostname verification strict; ANY is
+      # forbidden by contract test.
+      KC_TLS_HOSTNAME_VERIFIER: DEFAULT
+    # Deterministic name->address pinning: Keycloak keeps its fail-closed
+    # 127.0.0.1 upstream resolver from docker-compose.dns.yml, and the
+    # directory FQDN resolves to the exact address the firewall authorizes.
+    # The certificate is still verified against that FQDN, so this pin cannot
+    # weaken hostname verification.
+    extra_hosts:
+      - "${IDENTITY_LDAP_HOST:?IDENTITY_LDAP_HOST must be set}:${IDENTITY_LDAP_DIRECTORY_IP:?IDENTITY_LDAP_DIRECTORY_IP must be set}"
+    volumes:
+      - ./keycloak/identity-ldap-ca.pem:/etc/aigw/identity-ldap-ca.pem:ro,Z
+    # Keycloak joins the routable internal bridge with one fixed address so
+    # DOCKER-USER and the nft guard can authorize exactly this source for
+    # tcp/636 to the directory and nothing else.
+    networks:
+      net-internal:
+        ipv4_address: ${KEYCLOAK_INTERNAL_IP:?KEYCLOAK_INTERNAL_IP must be set}
+
+  key-rotator:
+    environment:
+      IDENTITY_LDAP_ENABLED: "true"
+      IDENTITY_LDAP_PROVIDER_NAME: ${IDENTITY_LDAP_PROVIDER_NAME:?IDENTITY_LDAP_PROVIDER_NAME must be set}
+      IDENTITY_LDAP_URL: ${IDENTITY_LDAP_URL:?IDENTITY_LDAP_URL must be set}
+      IDENTITY_LDAP_USERS_DN: ${IDENTITY_LDAP_USERS_DN:?IDENTITY_LDAP_USERS_DN must be set}
+      IDENTITY_LDAP_BIND_DN: ${IDENTITY_LDAP_BIND_DN:?IDENTITY_LDAP_BIND_DN must be set}
+      # The credential itself is never a Compose environment value; only the
+      # path to the root-owned file mounted below.
+      IDENTITY_LDAP_BIND_PASSWORD_FILE: /run/secrets/identity_ldap_bind_password
+      IDENTITY_LDAP_VENDOR: ${IDENTITY_LDAP_VENDOR:?IDENTITY_LDAP_VENDOR must be set}
+      IDENTITY_LDAP_USERNAME_ATTRIBUTE: ${IDENTITY_LDAP_USERNAME_ATTRIBUTE:?IDENTITY_LDAP_USERNAME_ATTRIBUTE must be set}
+      IDENTITY_LDAP_RDN_ATTRIBUTE: ${IDENTITY_LDAP_RDN_ATTRIBUTE:?IDENTITY_LDAP_RDN_ATTRIBUTE must be set}
+      IDENTITY_LDAP_UUID_ATTRIBUTE: ${IDENTITY_LDAP_UUID_ATTRIBUTE:?IDENTITY_LDAP_UUID_ATTRIBUTE must be set}
+      IDENTITY_LDAP_USER_OBJECT_CLASSES: ${IDENTITY_LDAP_USER_OBJECT_CLASSES:?IDENTITY_LDAP_USER_OBJECT_CLASSES must be set}
+      IDENTITY_LDAP_USER_FILTER: ${IDENTITY_LDAP_USER_FILTER:?IDENTITY_LDAP_USER_FILTER must be set}
+    volumes:
+      # Root-owned bind credential, mounted ONLY into the reconciliation
+      # component. Private mount => Z. Never a Compose environment value, an
+      # argv element, a log line, or an API response.
+      - ./secrets/identity_ldap_bind_password:/run/secrets/identity_ldap_bind_password:ro,Z
+    labels:
+      com.aigw.contract.selinux-generation: "1"
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP:?AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP must be set}

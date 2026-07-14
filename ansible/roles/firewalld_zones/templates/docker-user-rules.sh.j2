@@ -89,6 +89,10 @@ iptables-restore --wait 15 --noflush <<'AIGW_IPV4_RULES'
 {% if cribl_external_export_enabled | bool %}
 -A DOCKER-USER -i {{ _internal_net.bridge }} -s {{ alloy_internal_ip }}/32 -o {{ nic_internal }} -d {{ cribl_otlp_allowed_cidr }} -p tcp --dport {{ cribl_otlp_allowed_port }} -j RETURN
 {% endif %}
+{% if identity_ldap_enabled | bool %}
+# Keycloak alone may open LDAPS to the exact external directory address.
+-A DOCKER-USER -i {{ _internal_net.bridge }} -s {{ keycloak_internal_ip }}/32 -o {{ nic_internal }} -d {{ identity_ldap_directory_ip }}/32 -p tcp --dport 636 -j RETURN
+{% endif %}
 
 # Default-deny every original-direction flow from a Docker-style bridge to a
 # non-bridge interface. This covers all three supplied physical NICs plus any

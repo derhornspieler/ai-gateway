@@ -14,8 +14,12 @@ platform_dns="$(grep -E '^PLATFORM_AUTHORITATIVE_DNS_ENABLED=' "$STACK_DIR/.env"
 vault_ui_selector_count="$(grep -Ec '^VAULT_UI_ENABLED=' "$STACK_DIR/.env" || true)"
 [[ "$vault_ui_selector_count" == 1 ]] || { echo "expected exactly one VAULT_UI_ENABLED selector" >&2; exit 2; }
 vault_ui="$(grep -E '^VAULT_UI_ENABLED=' "$STACK_DIR/.env" | cut -d= -f2-)"
+identity_ldap_selector_count="$(grep -Ec '^IDENTITY_LDAP_ENABLED=' "$STACK_DIR/.env" || true)"
+[[ "$identity_ldap_selector_count" == 1 ]] || { echo "expected exactly one IDENTITY_LDAP_ENABLED selector" >&2; exit 2; }
+identity_ldap="$(grep -E '^IDENTITY_LDAP_ENABLED=' "$STACK_DIR/.env" | cut -d= -f2-)"
 [[ "$platform_dns" == true || "$platform_dns" == false ]] || { echo "invalid platform DNS selector" >&2; exit 2; }
 [[ "$vault_ui" == true || "$vault_ui" == false ]] || { echo "invalid Vault UI selector" >&2; exit 2; }
+[[ "$identity_ldap" == true || "$identity_ldap" == false ]] || { echo "invalid external identity selector" >&2; exit 2; }
 # Process environment has precedence over --env-file interpolation. Pin the
 # selector to the single reviewed file value so a caller cannot split the
 # service profile from Traefik's runtime router selector.
@@ -115,6 +119,11 @@ fi
 if [[ "$profile" == rocky9-lab ]]; then
   [[ -f "$STACK_DIR/docker-compose.lab.yml" ]] || { echo "lab identity overlay is missing" >&2; exit 1; }
   compose+=(-f "$STACK_DIR/docker-compose.lab.yml" --profile lab-ad)
+fi
+if [[ "$identity_ldap" == true ]]; then
+  [[ "$profile" != rocky9-lab ]] || { echo "external identity overlay conflicts with the lab profile" >&2; exit 2; }
+  [[ -f "$STACK_DIR/docker-compose.identity-ldap.yml" ]] || { echo "external identity overlay is missing" >&2; exit 1; }
+  compose+=(-f "$STACK_DIR/docker-compose.identity-ldap.yml")
 fi
 if [[ "$vault_ui" == true ]]; then
   compose+=(--profile vault-ui)

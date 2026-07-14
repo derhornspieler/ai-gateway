@@ -37,8 +37,32 @@ lab overlay adds two long-running services: Samba AD on the isolated
 identity bridge and an authoritative, non-recursive CoreDNS service on a
 dedicated bridge. Samba publishes no AD port; lab DNS publishes TCP/UDP 53 only
 on the exact ADM and internal host addresses, never egress. Samba is lab-only
-and is never a customer directory; a generic customer LDAP provider remains a
-separately reviewed integration rather than an automatic Ansible action.
+and is never a customer directory.
+
+An external customer Active Directory is supported for production over LDAPS
+only, driven entirely by inventory (`identity_ldap_*`) and off by default. It
+is mutually exclusive with the lab Samba overlay. Plaintext `ldap://` is
+refused by the controller preflight, `site.yml`, `docker_stack`, and the
+key-rotator's own settings. The bind credential is stored by the stdin-only
+`scripts/store-identity-ldap-bind-password.py` into a dedicated encrypted
+overlay and reaches the stack only as a root-owned file bind-mounted into
+key-rotator — never Compose environment, argv, logs, or `.env`. The
+inventory-supplied public CA bundle is validated (certificates-only) before it
+becomes Keycloak's LDAPS trust anchor, and hostname verification stays on. The
+provider is created READ_ONLY with `syncRegistrations=false` only after
+Keycloak proves the connection and the bind credential, so a wrong CA, a
+certificate that fails hostname verification, or wrong credentials leave no
+component behind. Reaching the directory over a physical NIC opens exactly one
+firewall allowance — Keycloak's fixed address to the directory's `/32` on
+tcp/636 — in both DOCKER-USER and the independent nftables `aigw_guard`;
+toggling `identity_ldap_enabled` therefore changes the firewall ABI and
+requires a full `site.yml`, not `deploy-stack-only.yml`. End-to-end behavior
+against a real directory (wrong CA, wrong hostname, wrong bind credentials,
+happy-path import) still requires validation on a directory-equipped
+environment; it is fixture- and unit-validated today. Those open claims are
+enumerated — never simulated — in `LIVE_VERIFICATION_REQUIRED` in
+`scripts/tests/test_identity_ldap_contract.py`, each with the exact live check
+that closes it.
 
 Docker Hardened Images (DHI) are used directly or as the final build stage for
 every catalog-supported component that passed compatibility and security review;

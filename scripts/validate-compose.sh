@@ -82,13 +82,25 @@ import re
 import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
-assert set(manifest) == {"base", "platform_dns", "lab_identity"}
+assert set(manifest) == {"base", "platform_dns", "lab_identity", "identity_ldap"}
 service_pattern = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 segment_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 assert set(manifest["base"]).isdisjoint(manifest["platform_dns"])
 assert set(manifest["base"]).isdisjoint(manifest["lab_identity"])
 assert set(manifest["platform_dns"]).isdisjoint(manifest["lab_identity"])
-for profile in ("base", "platform_dns", "lab_identity"):
+# The two identity sources are mutually exclusive, so their key-rotator entries
+# may collide; nothing else may. Keycloak's identity_ldap entry deliberately
+# re-states keycloak/realms because the overlay REPLACES the base source list.
+assert set(manifest["identity_ldap"]).isdisjoint(manifest["platform_dns"])
+assert set(manifest["identity_ldap"]) == {"keycloak", "key-rotator"}
+assert manifest["identity_ldap"]["keycloak"] == [
+    "keycloak/identity-ldap-ca.pem",
+    "keycloak/realms",
+]
+assert manifest["identity_ldap"]["key-rotator"] == [
+    "secrets/identity_ldap_bind_password"
+]
+for profile in ("base", "platform_dns", "lab_identity", "identity_ldap"):
     assert isinstance(manifest[profile], dict) and manifest[profile]
     for service, sources in manifest[profile].items():
         assert service_pattern.fullmatch(service), service
@@ -601,6 +613,8 @@ if ansible.is_file():
         "'/secrets/redis_users.acl'",
         "'/secrets/samba_ad_admin_password'",
         "'/secrets/samba_ad_bind_password'",
+        "'/keycloak/identity-ldap-ca.pem'",
+        "'/secrets/identity_ldap_bind_password'",
     ):
         assert required in selinux_boundary, required
     bind_manifest = json.loads(
@@ -608,7 +622,7 @@ if ansible.is_file():
     )
     manifest_sources = {
         path
-        for profile in ("base", "platform_dns", "lab_identity")
+        for profile in ("base", "platform_dns", "lab_identity", "identity_ldap")
         for paths in bind_manifest[profile].values()
         for path in paths
     }
@@ -706,8 +720,32 @@ if ansible.is_file():
         "Automatically unseal initialized Vault from controller inventory",
         "Require automatic unseal for every initialized Vault deployment",
         "Bound the Vault bootstrap health exception to fresh uninitialized state",
+        "Validate the external directory federation inventory contract",
+        "Require the external directory bind credential boundary",
+        "Materialize the external directory bind credential outside command and environment metadata",
+        "Require exact external directory secret-file ownership and mode",
+        "Materialize the external directory public CA bundle for Keycloak",
+        "Require a certificates-only external directory trust bundle",
+        "docker-compose.identity-ldap.yml",
+        "keycloak_internal_ip == '172.28.2.3'",
     ):
         assert required in source, required
+    # Plaintext LDAP must be refused at every layer that can still stop a
+    # converge, and the reserved lab provider name must stay unusable.
+    identity_ldap_contract = source.split(
+        "- name: Validate the external directory federation inventory contract", 1
+    )[1].split("- name: Validate per-gate oauth2-proxy cookie secret shapes", 1)[0]
+    assert '"^ldaps://' in identity_ldap_contract
+    assert "not (samba_lab_enabled | bool)" in identity_ldap_contract
+    assert "identity_ldap_provider_name != 'lab-samba-ad'" in identity_ldap_contract
+    identity_ldap_secret = source.split(
+        "- name: Materialize the external directory bind credential outside command "
+        "and environment metadata",
+        1,
+    )[1].split("- name: Inspect the external directory secret-file boundary", 1)[0]
+    assert "no_log: true" in identity_ldap_secret
+    assert 'group: "65532"' in identity_ldap_secret
+    assert 'mode: "0440"' in identity_ldap_secret
     assert (
         "      - vault\n"
         "      - status\n"
@@ -749,9 +787,63 @@ if ansible.is_file():
         "AVC,USER_AVC",
         "aigw_recent_selinux_denials.stdout | trim == ''",
         "aigw_recent_selinux_denials.stderr | trim == '<no matches>'",
+        "External directory LDAPS is pinned to the exact Keycloak identity",
+        "No external directory allowance exists while federation is disabled",
+        "keycloak/identity-ldap-ca.pem",
+        "secrets/identity_ldap_bind_password",
     ):
         assert required in verify_source, required
     assert 'stdin: "{{ grafana_admin_password }}"' not in verify_source
+
+    # Exactly one LDAPS allowance may exist, in both independent firewall
+    # backends, gated on the inventory flag and pinned to Keycloak's address.
+    firewall = ansible.parents[2] / "firewalld_zones/templates"
+    docker_user = (firewall / "docker-user-rules.sh.j2").read_text()
+    nft_guard = (firewall / "aigw-host-input-rules.sh.j2").read_text()
+    assert docker_user.count("--dport 636") == 1
+    assert nft_guard.count("tcp dport 636") == 1
+    assert docker_user.count("{% if identity_ldap_enabled | bool %}") == 1
+    assert nft_guard.count("{% if identity_ldap_enabled | bool %}") == 1
+    assert (
+        "-A DOCKER-USER -i {{ _internal_net.bridge }} -s {{ keycloak_internal_ip }}/32"
+        " -o {{ nic_internal }} -d {{ identity_ldap_directory_ip }}/32 -p tcp"
+        " --dport 636 -j RETURN"
+    ) in docker_user
+    assert (
+        'iifname "{{ _internal_net.bridge }}" oifname "{{ nic_internal }}"'
+        " ip saddr {{ keycloak_internal_ip }} ip daddr {{ identity_ldap_directory_ip }}"
+        " tcp dport 636 accept"
+    ) in nft_guard
+
+    # The bind credential is never rendered into .env and never becomes a
+    # Compose environment value.
+    env_template = ansible.parents[1] / "templates/env.j2"
+    env_source = env_template.read_text()
+    assert "IDENTITY_LDAP_ENABLED={{ identity_ldap_enabled | bool | lower }}" in env_source
+    # The bind credential is never interpolated into .env under any name.
+    assert "{{ identity_ldap_bind_password" not in env_source
+    assert "IDENTITY_LDAP_BIND_PASSWORD=" not in env_source
+    overlay = ansible.parents[3].parent / "compose/docker-compose.identity-ldap.yml"
+    overlay_source = overlay.read_text()
+    assert "ldap://" not in overlay_source
+    assert "IDENTITY_LDAP_BIND_PASSWORD:" not in overlay_source
+    assert "IDENTITY_LDAP_BIND_PASSWORD_FILE: /run/secrets/identity_ldap_bind_password" in overlay_source
+    assert "KC_TLS_HOSTNAME_VERIFIER: DEFAULT" in overlay_source
+    # Keycloak must verify the directory certificate's hostname. Disabling that
+    # would make the mounted CA bundle a meaningless trust anchor.
+    assert "KC_TLS_HOSTNAME_VERIFIER: ANY" not in overlay_source
+
+    wrapper = ansible.parents[3].parent / "scripts/aigw-compose.sh"
+    wrapper_source = wrapper.read_text()
+    assert "expected exactly one IDENTITY_LDAP_ENABLED selector" in wrapper_source
+    assert "external identity overlay conflicts with the lab profile" in wrapper_source
+
+    assert "not (identity_ldap_enabled | bool) or not (samba_lab_enabled | bool)" in site_source
+    assert (
+        "not (identity_ldap_enabled | bool) or identity_ldap_url is match('^ldaps://')"
+        in site_source
+    )
+    assert "Preflight — prove the external directory uses the internal physical leg" in site_source
 PY
 
 BUSYBOX_PIN='dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad'
@@ -881,6 +973,20 @@ env \
   AIGW_BIND_DIGEST_LAB_DNS=000000000000000000000000000000000000000000000000000000000000000f \
   AIGW_BIND_DIGEST_SAMBA_AD=0000000000000000000000000000000000000000000000000000000000000010 \
   AIGW_BIND_DIGEST_KEY_ROTATOR_LAB=0000000000000000000000000000000000000000000000000000000000000011 \
+  AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP=0000000000000000000000000000000000000000000000000000000000000012 \
+  KEYCLOAK_INTERNAL_IP=172.28.2.3 \
+  IDENTITY_LDAP_HOST=dc1.corp.example.com \
+  IDENTITY_LDAP_DIRECTORY_IP=10.20.5.10 \
+  IDENTITY_LDAP_PROVIDER_NAME=corp-ad \
+  IDENTITY_LDAP_URL=ldaps://dc1.corp.example.com:636 \
+  IDENTITY_LDAP_USERS_DN='OU=Users,DC=corp,DC=example,DC=com' \
+  IDENTITY_LDAP_BIND_DN='CN=svc-aigw-ldap,OU=Service Accounts,DC=corp,DC=example,DC=com' \
+  IDENTITY_LDAP_VENDOR=ad \
+  IDENTITY_LDAP_USERNAME_ATTRIBUTE=sAMAccountName \
+  IDENTITY_LDAP_RDN_ATTRIBUTE=cn \
+  IDENTITY_LDAP_UUID_ATTRIBUTE=objectGUID \
+  IDENTITY_LDAP_USER_OBJECT_CLASSES='person, organizationalPerson, user' \
+  IDENTITY_LDAP_USER_FILTER='(&(objectCategory=person)(objectClass=user)(!(sAMAccountName=svc-aigw-ldap)))' \
   PG_SUPER_PASSWORD=ValidationSuperPassword_0123456789 \
   PG_LITELLM_PASSWORD=ValidationLiteLLMPassword_0123456789 \
   PG_KEYCLOAK_PASSWORD=ValidationKeycloakPassword_0123456789 \
@@ -1501,6 +1607,116 @@ for name, service in config["services"].items():
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
       -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad --profile vault-ui config --format json |
       python3 -I "$1/scripts/validate-build-contract.py" "$1" lab
+    docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
+      -f "$2/docker-compose.identity-ldap.yml" config --format json |
+      python3 -I -c '\''
+import json
+import os
+from pathlib import Path
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+project_root = Path(sys.argv[2])
+config = json.load(sys.stdin)
+
+# The production directory overlay never brings the lab DC or Compose secrets.
+assert "samba-ad" not in config["services"]
+assert "secrets" not in config
+assert config["networks"]["net-internal"]["external"] is True
+
+keycloak = config["services"]["keycloak"]
+environment = keycloak["environment"]
+assert environment["KC_TRUSTSTORE_PATHS"] == "/etc/aigw/identity-ldap-ca.pem"
+# Hostname verification stays strict: a mounted CA is worthless without it.
+assert environment["KC_TLS_HOSTNAME_VERIFIER"] == "DEFAULT"
+assert environment["KC_TLS_HOSTNAME_VERIFIER"] != "ANY"
+
+# Compose renders extra_hosts as a mapping, a "name=address" list (v5), or a
+# legacy "name:address" list. Accept every form; assert the exact pin.
+extra_hosts = keycloak["extra_hosts"]
+if isinstance(extra_hosts, dict):
+    resolved_hosts = dict(extra_hosts)
+else:
+    resolved_hosts = {}
+    for entry in extra_hosts:
+        if "=" in entry:
+            name, address = entry.split("=", 1)
+        else:
+            name, address = entry.rsplit(":", 1)
+        resolved_hosts[name] = address
+assert resolved_hosts == {"dc1.corp.example.com": "10.20.5.10"}, resolved_hosts
+
+assert keycloak["networks"]["net-internal"]["ipv4_address"] == "172.28.2.3"
+ca_mount = next(
+    mount for mount in keycloak["volumes"]
+    if mount["target"] == "/etc/aigw/identity-ldap-ca.pem"
+)
+assert ca_mount["type"] == "bind"
+assert ca_mount["read_only"] is True
+assert ca_mount["bind"]["selinux"] == "Z"
+assert Path(ca_mount["source"]).name == "identity-ldap-ca.pem"
+
+rotator = config["services"]["key-rotator"]
+rotator_environment = rotator["environment"]
+assert rotator_environment["IDENTITY_LDAP_ENABLED"] == "true"
+for name, value in {
+    "IDENTITY_LDAP_PROVIDER_NAME": "corp-ad",
+    "IDENTITY_LDAP_URL": "ldaps://dc1.corp.example.com:636",
+    "IDENTITY_LDAP_USERS_DN": "OU=Users,DC=corp,DC=example,DC=com",
+    "IDENTITY_LDAP_BIND_DN": "CN=svc-aigw-ldap,OU=Service Accounts,DC=corp,DC=example,DC=com",
+    "IDENTITY_LDAP_VENDOR": "ad",
+    "IDENTITY_LDAP_USERNAME_ATTRIBUTE": "sAMAccountName",
+    "IDENTITY_LDAP_RDN_ATTRIBUTE": "cn",
+    "IDENTITY_LDAP_UUID_ATTRIBUTE": "objectGUID",
+    "IDENTITY_LDAP_USER_OBJECT_CLASSES": "person, organizationalPerson, user",
+    "IDENTITY_LDAP_USER_FILTER": "(&(objectCategory=person)(objectClass=user)(!(sAMAccountName=svc-aigw-ldap)))",
+    "IDENTITY_LDAP_BIND_PASSWORD_FILE": "/run/secrets/identity_ldap_bind_password",
+}.items():
+    assert rotator_environment[name] == value, name
+# The credential itself is a file, never Compose environment metadata, and the
+# lab federation inputs are absent from a production render.
+assert "IDENTITY_LDAP_BIND_PASSWORD" not in rotator_environment
+assert not any(name.startswith("LAB_SAMBA_") for name in rotator_environment)
+secret_mount = next(
+    mount for mount in rotator["volumes"]
+    if mount["target"] == "/run/secrets/identity_ldap_bind_password"
+)
+assert secret_mount["type"] == "bind"
+assert secret_mount["read_only"] is True
+assert secret_mount["bind"]["selinux"] == "Z"
+
+internal_members = {
+    name for name, service in config["services"].items()
+    if "net-internal" in (service.get("networks") or {})
+}
+assert internal_members == {"keycloak", "alloy", "cribl-mock"}, internal_members
+
+expected_bind_sources = dict(manifest["base"])
+expected_bind_sources.update(manifest["identity_ldap"])
+
+def project_bind_sources(service):
+    sources = set()
+    for mount in service.get("volumes", []):
+        if mount["type"] != "bind":
+            continue
+        source = Path(mount["source"])
+        if not source.is_absolute():
+            source = project_root / source
+        try:
+            sources.add(source.relative_to(project_root).as_posix())
+        except ValueError:
+            pass
+    return sources
+
+for name, service in config["services"].items():
+    assert project_bind_sources(service) == set(expected_bind_sources.get(name, [])), name
+assert keycloak["labels"]["com.aigw.contract.bind-source-digest"] == os.environ[
+    "AIGW_BIND_DIGEST_KEYCLOAK"
+]
+assert rotator["labels"]["com.aigw.contract.bind-source-digest"] == os.environ[
+    "AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP"
+]
+'\'' "$2/bind-source-digest-inputs.json" "$1"
   ' sh "$ROOT" "$COMPOSE_DIR"
 
 grep -Fq 'LAB_DNS_ADM_CIDR: ${LAB_DNS_ADM_CIDR:?LAB_DNS_ADM_CIDR must be set}' "$COMPOSE_DIR/docker-compose.platform-dns.yml"

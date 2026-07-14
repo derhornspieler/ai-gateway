@@ -20,6 +20,7 @@ import stat
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,7 +29,7 @@ import jwt
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
 
-from app.config import Settings
+from app.config import LAB_LDAP_PROVIDER_NAME, Settings
 from app.security import (
     path_segment,
     service_account_subject,
@@ -73,8 +74,79 @@ PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 BOOTSTRAP_IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
 FEDERATION_PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,127}")
 MANAGED_ROOT_ATTRIBUTE = "aigw.managed-root"
-LAB_LDAP_PROVIDER_NAME = "lab-samba-ad"
 BROKER_SUBJECT_MAPPER_NAME = "anthropic-stable-subject"
+# The lab federation's user filter, kept byte-identical to the representation
+# that existing lab components already carry. Changing it would make an
+# existing lab provider fail verification and be reprovisioned.
+LAB_LDAP_USER_FILTER = (
+    "(&(objectCategory=person)(objectClass=user)"
+    "(!(sAMAccountName=svc-keycloak-ldap)))"
+)
+
+
+@dataclass(frozen=True)
+class LdapFederationSpec:
+    """The one resolved directory federation source for this deployment."""
+
+    provider_name: str
+    connection_url: str
+    users_dn: str
+    bind_dn: str
+    bind_password_file: str
+    vendor: str
+    username_attribute: str
+    rdn_attribute: str
+    uuid_attribute: str
+    user_object_classes: str
+    user_filter: str
+    # Prove the directory, its trust chain, and the bind credential against
+    # Keycloak before persisting a provider. This guards an EXTERNAL customer
+    # directory, where a wrong CA bundle, a certificate that fails hostname
+    # verification, or wrong bind credentials must fail closed rather than
+    # leave a broken component behind. The lab DC is an in-stack,
+    # healthcheck-gated dependency with a published CA and is deliberately
+    # exempt: its creation path is unchanged, so a lab converge cannot regress.
+    prove_directory_before_create: bool
+
+
+def ldap_federation_spec(settings: Settings) -> LdapFederationSpec | None:
+    """Resolve the single enabled federation source, or None.
+
+    Settings already refuses to enable both sources at once. The lab branch
+    reproduces today's hardcoded lab representation exactly, so the existing
+    ``lab-samba-ad`` component keeps its id, name, and config across converges.
+    """
+    if settings.lab_samba_ldap_enabled:
+        return LdapFederationSpec(
+            provider_name=LAB_LDAP_PROVIDER_NAME,
+            connection_url=settings.lab_samba_ldap_url,
+            users_dn=settings.lab_samba_users_dn,
+            bind_dn=settings.lab_samba_bind_dn,
+            bind_password_file=settings.lab_samba_bind_password_file,
+            vendor="ad",
+            username_attribute="sAMAccountName",
+            rdn_attribute="cn",
+            uuid_attribute="objectGUID",
+            user_object_classes="person, organizationalPerson, user",
+            user_filter=LAB_LDAP_USER_FILTER,
+            prove_directory_before_create=False,
+        )
+    if settings.identity_ldap_enabled:
+        return LdapFederationSpec(
+            provider_name=settings.identity_ldap_provider_name,
+            connection_url=settings.identity_ldap_url,
+            users_dn=settings.identity_ldap_users_dn,
+            bind_dn=settings.identity_ldap_bind_dn,
+            bind_password_file=settings.identity_ldap_bind_password_file,
+            vendor=settings.identity_ldap_vendor,
+            username_attribute=settings.identity_ldap_username_attribute,
+            rdn_attribute=settings.identity_ldap_rdn_attribute,
+            uuid_attribute=settings.identity_ldap_uuid_attribute,
+            user_object_classes=settings.identity_ldap_user_object_classes,
+            user_filter=settings.identity_ldap_user_filter,
+            prove_directory_before_create=True,
+        )
+    return None
 
 
 class IdentityError(RuntimeError):
@@ -904,7 +976,7 @@ class KeycloakAdmin:
             before = await self._find_component(
                 self.settings.identity_realm, LAB_LDAP_PROVIDER_NAME, admin_token
             )
-            await self._ensure_lab_ldap(admin_token, self._lab_bind_password())
+            await self._ensure_ldap_federation(admin_token, self._ldap_bind_password())
             changed = changed or before is None
 
         resolved_identities: list[tuple[dict[str, str], str]] = []
@@ -1695,24 +1767,62 @@ class KeycloakAdmin:
             )
         return matches[0] if matches else None
 
-    async def _ensure_lab_ldap(
+    async def _prove_ldap_directory(
+        self, spec: LdapFederationSpec, admin_token: str, bind_password: str
+    ) -> None:
+        """Prove the directory, its trust chain, and the bind credential first.
+
+        Keycloak performs the real LDAPS handshake here, against the mounted
+        truststore and with hostname verification on.  A wrong CA bundle, a
+        certificate whose SANs do not cover the configured host, or a wrong
+        bind DN/password therefore fails *before* any provider is persisted,
+        instead of leaving a broken federation component behind.
+        """
+        probe = {
+            "action": "testConnection",
+            "connectionUrl": spec.connection_url,
+            "authType": "simple",
+            "bindDn": spec.bind_dn,
+            "bindCredential": bind_password,
+            "useTruststoreSpi": "always",
+            "startTls": "false",
+        }
+        safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        for action in ("testConnection", "testAuthentication"):
+            try:
+                await self._request(
+                    "POST",
+                    f"/admin/realms/{safe_realm}/testLDAPConnection",
+                    token=admin_token,
+                    json_body={**probe, "action": action},
+                    expected=(204,),
+                )
+            except IdentityError as exc:
+                raise IdentityConflict(
+                    "the directory connection or bind credential failed verification"
+                ) from exc
+
+    async def _ensure_ldap_federation(
         self, admin_token: str, bind_password: str | None
     ) -> str | None:
-        if not self.settings.lab_samba_ldap_enabled:
+        spec = ldap_federation_spec(self.settings)
+        if spec is None:
             return None
         existing = await self._find_component(
-            self.settings.identity_realm, LAB_LDAP_PROVIDER_NAME, admin_token
+            self.settings.identity_realm, spec.provider_name, admin_token
         )
         if existing is not None:
-            return self._verify_lab_ldap_component(existing)
+            return self._verify_ldap_component(existing)
         if (
             not isinstance(bind_password, str)
             or len(bind_password) < 16
             or len(bind_password) > 512
             or any(ord(ch) < 32 for ch in bind_password)
         ):
-            raise IdentityConflict("the lab Samba LDAP bind password is required")
+            raise IdentityConflict("the LDAP bind password is required")
         safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        if spec.prove_directory_before_create:
+            await self._prove_ldap_directory(spec, admin_token, bind_password)
         realm_response = await self._request(
             "GET",
             f"/admin/realms/{safe_realm}",
@@ -1725,7 +1835,7 @@ class KeycloakAdmin:
             label="realm UUID",
         )
         representation = {
-            "name": LAB_LDAP_PROVIDER_NAME,
+            "name": spec.provider_name,
             "providerId": "ldap",
             "providerType": "org.keycloak.storage.UserStorageProvider",
             "parentId": realm_id,
@@ -1736,20 +1846,23 @@ class KeycloakAdmin:
                 "changedSyncPeriod": ["-1"],
                 "cachePolicy": ["DEFAULT"],
                 "batchSizeForSync": ["1000"],
+                # This gateway never writes to a customer directory. READ_ONLY
+                # plus syncRegistrations=false are deliberately not tunable.
                 "editMode": ["READ_ONLY"],
                 "importEnabled": ["true"],
                 "syncRegistrations": ["false"],
-                "vendor": ["ad"],
-                "usernameLDAPAttribute": ["sAMAccountName"],
-                "rdnLDAPAttribute": ["cn"],
-                "uuidLDAPAttribute": ["objectGUID"],
-                "userObjectClasses": ["person, organizationalPerson, user"],
-                "connectionUrl": [self.settings.lab_samba_ldap_url],
-                "usersDn": [self.settings.lab_samba_users_dn],
+                "vendor": [spec.vendor],
+                "usernameLDAPAttribute": [spec.username_attribute],
+                "rdnLDAPAttribute": [spec.rdn_attribute],
+                "uuidLDAPAttribute": [spec.uuid_attribute],
+                "userObjectClasses": [spec.user_object_classes],
+                "connectionUrl": [spec.connection_url],
+                "usersDn": [spec.users_dn],
                 "authType": ["simple"],
-                "bindDn": [self.settings.lab_samba_bind_dn],
+                "bindDn": [spec.bind_dn],
                 "bindCredential": [bind_password],
                 "searchScope": ["2"],
+                # Use the mounted truststore and keep hostname verification on.
                 "useTruststoreSpi": ["always"],
                 "connectionPooling": ["true"],
                 "pagination": ["true"],
@@ -1758,10 +1871,7 @@ class KeycloakAdmin:
                 "readTimeout": ["10000"],
                 "allowKerberosAuthentication": ["false"],
                 "useKerberosForPasswordAuthentication": ["false"],
-                "customUserSearchFilter": [
-                    "(&(objectCategory=person)(objectClass=user)"
-                    "(!(sAMAccountName=svc-keycloak-ldap)))"
-                ],
+                "customUserSearchFilter": [spec.user_filter],
             },
         }
         await self._request(
@@ -1772,11 +1882,11 @@ class KeycloakAdmin:
             expected=(201, 204),
         )
         created = await self._find_component(
-            self.settings.identity_realm, LAB_LDAP_PROVIDER_NAME, admin_token
+            self.settings.identity_realm, spec.provider_name, admin_token
         )
         if created is None:
             raise IdentityError("Keycloak created LDAP federation but it was not found")
-        component_id = self._verify_lab_ldap_component(created)
+        component_id = self._verify_ldap_component(created)
         try:
             await self._request(
                 "POST",
@@ -1795,78 +1905,81 @@ class KeycloakAdmin:
             raise
         return component_id
 
-    def _verify_lab_ldap_component(self, component: dict[str, Any]) -> str:
-        """Fail closed if the fixed lab federation name points elsewhere.
+    def _verify_ldap_component(self, component: dict[str, Any]) -> str:
+        """Fail closed if the inventory-bound federation name points elsewhere.
 
         Bootstrap membership is trusted only when the user's federation link
-        resolves to this inventory-bound component.  Merely matching the
-        display name is insufficient: a restored or operator-created provider
-        could otherwise redirect authentication to a different directory.
-        Keycloak masks the bind credential on reads, so that one secret field
-        is deliberately excluded while every security-relevant non-secret
-        setting is checked exactly.
+        resolves to this inventory-bound LDAP federation component.  Merely
+        matching the display name is insufficient: a restored or
+        operator-created provider could otherwise redirect authentication to a
+        different directory.  Keycloak masks the bind credential on reads, so
+        that one secret field is deliberately excluded while every
+        security-relevant non-secret setting is checked exactly.
         """
 
+        spec = ldap_federation_spec(self.settings)
+        if spec is None:
+            raise IdentityConflict("the LDAP federation is not inventory-bound")
         if (
-            component.get("name") != LAB_LDAP_PROVIDER_NAME
+            component.get("name") != spec.provider_name
             or component.get("providerId") != "ldap"
             or component.get("providerType")
             != "org.keycloak.storage.UserStorageProvider"
         ):
-            raise IdentityConflict("the lab LDAP federation is not inventory-bound")
+            raise IdentityConflict("the LDAP federation is not inventory-bound")
         config = component.get("config")
         if not isinstance(config, dict):
-            raise IdentityConflict("the lab LDAP federation is not inventory-bound")
+            raise IdentityConflict("the LDAP federation is not inventory-bound")
         expected = {
             "enabled": "true",
+            # Security-critical values stay literal: a drifted provider that
+            # writes back to the directory or self-registers users is refused.
             "editMode": "READ_ONLY",
             "importEnabled": "true",
             "syncRegistrations": "false",
-            "vendor": "ad",
-            "usernameLDAPAttribute": "sAMAccountName",
-            "rdnLDAPAttribute": "cn",
-            "uuidLDAPAttribute": "objectGUID",
-            "userObjectClasses": "person, organizationalPerson, user",
-            "connectionUrl": self.settings.lab_samba_ldap_url,
-            "usersDn": self.settings.lab_samba_users_dn,
             "authType": "simple",
-            "bindDn": self.settings.lab_samba_bind_dn,
             "searchScope": "2",
             "useTruststoreSpi": "always",
             "startTls": "false",
             "allowKerberosAuthentication": "false",
             "useKerberosForPasswordAuthentication": "false",
-            "customUserSearchFilter": (
-                "(&(objectCategory=person)(objectClass=user)"
-                "(!(sAMAccountName=svc-keycloak-ldap)))"
-            ),
+            "vendor": spec.vendor,
+            "usernameLDAPAttribute": spec.username_attribute,
+            "rdnLDAPAttribute": spec.rdn_attribute,
+            "uuidLDAPAttribute": spec.uuid_attribute,
+            "userObjectClasses": spec.user_object_classes,
+            "connectionUrl": spec.connection_url,
+            "usersDn": spec.users_dn,
+            "bindDn": spec.bind_dn,
+            "customUserSearchFilter": spec.user_filter,
         }
         if any(config.get(name) != [value] for name, value in expected.items()):
-            raise IdentityConflict("the lab LDAP federation is not inventory-bound")
+            raise IdentityConflict("the LDAP federation is not inventory-bound")
         return path_segment(component.get("id"), label="LDAP provider UUID")
 
-    def _lab_bind_password(self) -> str | None:
-        if not self.settings.lab_samba_ldap_enabled:
+    def _ldap_bind_password(self) -> str | None:
+        spec = ldap_federation_spec(self.settings)
+        if spec is None:
             return None
-        path = self.settings.lab_samba_bind_password_file
+        path = spec.bind_password_file
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(path, flags)
             try:
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 513:
-                    raise IdentityConflict("the lab LDAP bind secret file is invalid")
+                    raise IdentityConflict("the LDAP bind secret file is invalid")
                 raw = os.read(descriptor, 514)
             finally:
                 os.close(descriptor)
         except IdentityError:
             raise
         except OSError as exc:
-            raise IdentityConflict("the lab LDAP bind secret is unavailable") from exc
+            raise IdentityConflict("the LDAP bind secret is unavailable") from exc
         try:
             return raw.decode("utf-8").rstrip("\r\n")
         except UnicodeDecodeError as exc:
-            raise IdentityConflict("the lab LDAP bind secret is invalid") from exc
+            raise IdentityConflict("the LDAP bind secret is invalid") from exc
 
     async def _root_group(
         self, admin_token: str, *, create: bool
@@ -2056,9 +2169,10 @@ class KeycloakAdmin:
                 root = await self._root_group(controller_token, create=True)
                 if root is None:
                     raise IdentityError("managed identity root group was not created")
-                federation_id = await self._ensure_lab_ldap(
-                    admin_token, self._lab_bind_password()
+                federation_id = await self._ensure_ldap_federation(
+                    admin_token, self._ldap_bind_password()
                 )
+                federation_spec = ldap_federation_spec(self.settings)
                 broker_key = await self._ensure_broker(admin_token)
                 state_doc = {
                     "schema_version": IDENTITY_STATE_SCHEMA,
@@ -2067,7 +2181,9 @@ class KeycloakAdmin:
                     ),
                     "federation_provider_id": federation_id or "",
                     "federation_provider_name": (
-                        LAB_LDAP_PROVIDER_NAME if federation_id else ""
+                        federation_spec.provider_name
+                        if (federation_id and federation_spec is not None)
+                        else ""
                     ),
                     "identity_controller_client_id": (
                         self.settings.identity_controller_client_id
@@ -2164,7 +2280,7 @@ class KeycloakAdmin:
         if not isinstance(doc, dict):
             raise IdentityConflict("identity setup has not been completed")
         path_segment(doc.get("managed_root_group_id"), label="managed root UUID")
-        if self.settings.lab_samba_ldap_enabled:
+        if ldap_federation_spec(self.settings) is not None:
             path_segment(doc.get("federation_provider_id"), label="LDAP provider UUID")
         return doc
 

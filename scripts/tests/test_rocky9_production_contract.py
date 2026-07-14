@@ -162,7 +162,7 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
             self.assertIn("SECTION 1 — non-secret host / interface / routing / DNS inputs", host_text)
             self.assertIn("SECTION 2 — generated encrypted application secrets", host_text)
             self.assertIn("SECTION 3 — operator-supplied vault_unseal_key", host_text)
-            self.assertIn("SECTION 4 — external AD / LDAPS inputs (placeholder)", host_text)
+            self.assertIn("SECTION 4 — external AD / LDAPS inputs (optional, ships disabled)", host_text)
             self.assertIn("SECTION 5 — PKI inputs (placeholder)", host_text)
             # SECTION 3 documents the real controller-custody machinery: the
             # dedicated inline-encrypted sibling overlay written by the
@@ -173,8 +173,17 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
             self.assertIn("group_vars/production_rocky9/vault-unseal.yml", host_text)
             self.assertIn("never to group_vars/all.yml", host_text)
             self.assertIn("production-rocky9.first-init.sh.example", host_text)
-            # LDAP placeholder references the parallel identity_ldap_* contract.
-            self.assertIn("identity_ldap_*", host_text)
+            # SECTION 4 carries the real, fail-closed external AD/LDAPS contract:
+            # shipped disabled, every conditional input present and empty, and
+            # the bind credential delegated to the stdin-only helper + overlay.
+            self.assertIn("identity_ldap_enabled: false", host_text)
+            for key in self.contract["conditional_feature_keys"]["identity_ldap"][
+                "required_nonsecret_keys"
+            ]:
+                self.assertIn(f"{key}:", host_text)
+            self.assertIn("store-identity-ldap-bind-password.py", host_text)
+            self.assertIn("group_vars/production_rocky9/identity-ldap.yml", host_text)
+            self.assertNotIn("identity_ldap_bind_password:", host_text)
 
             # No stack secret value or name appears in host_vars.
             for entry in self.contract["required_secret_keys"]:
@@ -205,32 +214,63 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
                 )
 
     def test_placeholder_sections_carry_no_active_keys(self) -> None:
-        """SECTIONS 3-5 stay comment-only until the owning workstreams land.
+        """SECTIONS 3 and 5 stay comment-only; SECTION 4 owns identity_ldap_*.
 
-        Workstream C (external AD/LDAPS) owns SECTION 4's identity_ldap_* keys;
-        workstream D (production TLS/PKI) owns SECTION 5's pki_* keys; the
+        Workstream C (external AD/LDAPS) has landed, so SECTION 4 now carries
+        exactly the conditional identity_ldap_* contract keys — shipped disabled
+        — and nothing else. The still-unowned sections stay comment-only:
+        workstream D (production TLS/PKI) owns SECTION 5's pki_* keys and the
         operator ceremony (store-vault-unseal-key.py) owns vault_unseal_key.
-        None of them may appear as an active key in the generated host_vars.
+        Neither may appear as an active key in the generated host_vars, and the
+        directory bind credential never appears in any section: it belongs to a
+        dedicated inline-encrypted overlay written from stdin.
         """
         module = _load_bootstrap_module()
         host_text = module.production_host_vars_document("customer-prod01")
         lines = host_text.splitlines()
-        marker = next(
-            index for index, line in enumerate(lines) if "SECTION 3 —" in line
-        )
-        active_lines = [
-            line
-            for line in lines[marker:]
-            if line.strip() and not line.lstrip().startswith("#")
+
+        def _marker(needle: str) -> int:
+            return next(index for index, line in enumerate(lines) if needle in line)
+
+        def _active(start: int, end: int | None = None) -> list[str]:
+            return [
+                line.strip()
+                for line in lines[start : end if end is not None else len(lines)]
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+
+        section_3 = _marker("SECTION 3 —")
+        section_4 = _marker("SECTION 4 —")
+        section_5 = _marker("SECTION 5 —")
+        self.assertLess(section_3, section_4)
+        self.assertLess(section_4, section_5)
+
+        # SECTION 3 (vault_unseal_key ceremony) and SECTION 5 (PKI) are still
+        # documentation only — no key may be invented ahead of its workstream.
+        self.assertEqual(_active(section_3, section_4), [])
+        self.assertEqual(_active(section_5), [])
+
+        # SECTION 4 carries exactly the contract's conditional feature keys plus
+        # its off-by-default flag, in the contract's own order.
+        expected = ["identity_ldap_enabled: false"] + [
+            key
+            for key in self.contract["conditional_feature_keys"]["identity_ldap"][
+                "required_nonsecret_keys"
+            ]
         ]
-        self.assertEqual(active_lines, [])
+        emitted = _active(section_4, section_5)
+        self.assertEqual(emitted[0], expected[0])
+        self.assertEqual([line.split(":", 1)[0] for line in emitted[1:]], expected[1:])
+
         for line in host_text.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            self.assertFalse(stripped.startswith("identity_ldap"), stripped)
             self.assertFalse(stripped.startswith("pki_"), stripped)
             self.assertFalse(stripped.startswith("vault_unseal_key"), stripped)
+            self.assertFalse(
+                stripped.startswith("identity_ldap_bind_password"), stripped
+            )
 
     def test_legacy_bootstrap_still_works_and_prints_deprecation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

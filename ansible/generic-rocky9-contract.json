@@ -31,7 +31,8 @@
     "require_preupgrade_backup",
     "platform_authoritative_dns_enabled",
     "aigw_vault_ui_enabled",
-    "aigw_edge_tls_mode"
+    "aigw_edge_tls_mode",
+    "identity_ldap_enabled"
   ],
   "required_secret_keys": [
     {"name": "pg_super_password", "min_length": 24, "alphabet": "safe"},
@@ -72,5 +73,31 @@
     "samba_user_lab_admin_password",
     "samba_user_lab_developer_password",
     "samba_user_lab_user_password"
-  ]
+  ],
+  "conditional_feature_keys": {
+    "identity_ldap": {
+      "enabled_by": "identity_ldap_enabled",
+      "required_nonsecret_keys": [
+        "identity_ldap_provider_name",
+        "identity_ldap_url",
+        "identity_ldap_users_dn",
+        "identity_ldap_bind_dn",
+        "identity_ldap_ca_bundle_src",
+        "identity_ldap_directory_ip",
+        "identity_ldap_vendor",
+        "identity_ldap_username_attribute",
+        "identity_ldap_rdn_attribute",
+        "identity_ldap_uuid_attribute",
+        "identity_ldap_user_object_classes",
+        "identity_ldap_user_filter"
+      ],
+      "operator_supplied_secret_keys": [
+        {
+          "name": "identity_ldap_bind_password",
+          "source": "customer-directory-bind-account",
+          "generated_by_inventory_bootstrap": false
+        }
+      ]
+    }
+  }
 }

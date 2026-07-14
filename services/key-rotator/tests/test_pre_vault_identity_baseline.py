@@ -408,11 +408,11 @@ def test_lab_ldap_provider_is_bound_to_exact_nonsecret_inventory_config() -> Non
     admin = KeycloakAdmin(settings(LAB_SAMBA_LDAP_ENABLED=True), None, None)
     component = lab_ldap_component(admin)
 
-    assert admin._verify_lab_ldap_component(component) == "ldap-uuid"
+    assert admin._verify_ldap_component(component) == "ldap-uuid"
 
     component["config"]["connectionUrl"] = ["ldaps://untrusted-directory:636"]
     with pytest.raises(IdentityConflict, match="inventory-bound"):
-        admin._verify_lab_ldap_component(component)
+        admin._verify_ldap_component(component)
 
 
 @pytest.mark.parametrize(
@@ -429,7 +429,7 @@ def test_lab_ldap_provider_refuses_wrong_component_identity(field, value) -> Non
     component[field] = value
 
     with pytest.raises(IdentityConflict, match="inventory-bound"):
-        admin._verify_lab_ldap_component(component)
+        admin._verify_ldap_component(component)
 
 
 @pytest.mark.asyncio
