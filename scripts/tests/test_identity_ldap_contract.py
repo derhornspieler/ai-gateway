@@ -316,6 +316,33 @@ class IdentityLdapTrustBoundaryTests(unittest.TestCase):
         self.assertIn("storeutl", block)
         self.assertIn("Total found: 0", block)
         self.assertIn("PRIVATE KEY", block)
+        # The bundle is validated on a private staged copy and only promoted to
+        # the live Keycloak trust anchor after validation passes (findings
+        # #8/#17). A bad, empty, or key-bearing controller-side bundle can
+        # therefore never destroy the known-good deployed anchor, and no
+        # private-key bytes are ever written to the mounted destination before
+        # the reject check.
+        stage = source.index("Stage the external directory public CA bundle")
+        validate = source.index(
+            "Require a certificates-only external directory trust bundle"
+        )
+        promote = source.index(
+            "Promote the validated external directory public CA bundle for Keycloak"
+        )
+        self.assertLess(stage, validate)
+        self.assertLess(validate, promote)
+        # The probe targets the STAGED copy, never the live trust anchor.
+        self.assertIn(
+            ".state/edge-tls-staging-identity-ca/identity-ldap-ca.pem", block
+        )
+        self.assertNotIn("keycloak/identity-ldap-ca.pem", block)
+        # Only the promotion writes the live anchor, atomically, from staging.
+        promote_block = source[promote : source.index("always:", promote)]
+        self.assertIn("keycloak/identity-ldap-ca.pem", promote_block)
+        self.assertIn("remote_src: true", promote_block)
+        self.assertIn(
+            ".state/edge-tls-staging-identity-ca/identity-ldap-ca.pem", promote_block
+        )
         preflight = PREFLIGHT.read_text(encoding="utf-8")
         self.assertIn("certificates_only_pem", preflight)
         self.assertIn("-----BEGIN CERTIFICATE-----", preflight)
@@ -388,6 +415,28 @@ class IdentityLdapFirewallTests(unittest.TestCase):
         )
         self.assertIn("check_workload_ip(\"keycloak_internal_ip\"", site)
         self.assertIn("identity_ldap_directory_ip ~ '/32'", site)
+
+    def test_site_rejects_martian_and_self_directory_addresses(self) -> None:
+        """The LDAPS /32 pin cannot target loopback/multicast/self (finding #11).
+
+        Before this, identity_ldap_directory_ip only had to be a syntactically
+        valid IPv4 — unlike the internal/egress resolvers, it received no
+        anti-martian filter and no not-self check, so the single firewall
+        allowance could be pinned to 127.0.0.1, a 224-239 multicast group,
+        169.254 link-local space, or one of the host's own NIC addresses.
+        """
+        site = OS_PREP.read_text(encoding="utf-8")
+        # Same anti-martian regex the resolver lists get, applied to the scalar.
+        self.assertIn(
+            r"identity_ldap_directory_ip is not match("
+            r"'^(127|169\\.254|22[4-9]|23[0-9])\\.')",
+            site,
+        )
+        # Plus an explicit reject of every one of this host's NIC addresses.
+        self.assertIn(
+            "identity_ldap_directory_ip not in [eth0_ip, eth1_ip, eth2_ip]",
+            site,
+        )
 
 
 class IdentityLdapMutualExclusionTests(unittest.TestCase):

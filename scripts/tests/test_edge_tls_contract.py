@@ -169,6 +169,31 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertIn("- vault-pki-intermediate.sh", source)
         self.assertNotIn("- sign-vault-intermediate.sh", source)
 
+    def test_docker_stack_gates_edge_removal_to_lab_and_asserts_before_deletion(self) -> None:
+        """Real-CA edge material is validated before any deletion (finding #1).
+
+        The removal task used to run in ALL modes and BEFORE the marker assert
+        and the customer-supplied install, so a domain change on a real-CA
+        profile deleted the live cert/key/chain and left certs/ empty for
+        Traefik's self-signed default to fill. The removal is now confined to
+        lab mode (free regeneration); on the real-CA modes the material is
+        never deleted — a vault-intermediate mismatch fails the assert first,
+        and customer-supplied is overwritten atomically only after validation.
+        """
+        source = DOCKER_STACK.read_text(encoding="utf-8")
+        marker = source.index("Inspect the vault-intermediate issuance marker")
+        refuse = source.index(
+            "Refuse to mask lost production edge material with a placeholder"
+        )
+        remove = source.index("Remove edge material that belongs to a different lab domain")
+        # Marker inspection and the hard-fail SAN assert both precede the removal.
+        self.assertLess(marker, refuse)
+        self.assertLess(refuse, remove)
+        # The removal only runs in lab mode; it never deletes real-CA material.
+        removal_block = source[remove : source.index("- name:", remove + 1)]
+        self.assertIn("aigw_edge_tls_mode == 'lab' and", removal_block)
+        self.assertIn("state: absent", removal_block)
+
     def test_docker_stack_separates_the_cribl_export_ca(self) -> None:
         source = DOCKER_STACK.read_text(encoding="utf-8")
         self.assertIn(
