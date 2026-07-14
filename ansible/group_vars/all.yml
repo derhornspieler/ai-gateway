@@ -5,7 +5,10 @@
 # --extra-vars, or through the AIGW_* controller environment shown below.
 # Empty lookups are deliberate: site.yml rejects them before the first role
 # can install packages, write firewall state, or add policy routes.
-deployment_profile: "{{ lookup('ansible.builtin.env', 'AIGW_DEPLOYMENT_PROFILE') | default('generic-rocky9', true) }}"
+# 'rocky9-production' is the canonical fail-closed customer profile;
+# 'generic-rocky9' remains a working DEPRECATED compatibility alias (all
+# fail-closed logic keys off the profile NOT being 'rocky9-lab').
+deployment_profile: "{{ lookup('ansible.builtin.env', 'AIGW_DEPLOYMENT_PROFILE') | default('rocky9-production', true) }}"
 nic_egress: "{{ lookup('ansible.builtin.env', 'AIGW_NIC_EGRESS') }}"
 nic_adm: "{{ lookup('ansible.builtin.env', 'AIGW_NIC_ADM') }}"
 nic_internal: "{{ lookup('ansible.builtin.env', 'AIGW_NIC_INTERNAL') }}"

@@ -1,8 +1,10 @@
 ---
 # SAFE TEMPLATE ONLY. This is the production/customer Rocky 9 input surface.
-# `generic-rocky9` is the backwards-compatible runtime profile identifier.
+# `rocky9-production` is the canonical profile (Ansible group
+# production_rocky9); `generic-rocky9` remains the backwards-compatible
+# DEPRECATED alias and keeps working for previously generated inventories.
 aigw_generic_inventory_alias: production-aigw01
-deployment_profile: generic-rocky9
+deployment_profile: rocky9-production
 
 ansible_host: "<ADM_INTERFACE_IP_OR_SSH_HOST>"
 ansible_user: ansible

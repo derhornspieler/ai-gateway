@@ -139,8 +139,10 @@ customer template.
 
 Committed name-only templates for both profiles live in
 `ansible/inventory/examples/`: `{rocky9-lab,production-rocky9}.host-vars.yml.example`
-and `.vault.yml.example` for the two input surfaces, and
-`{rocky9-lab,production-rocky9}.first-init.sh.example` for the runnable
+and `.vault.yml.example` for the two input surfaces,
+`production-rocky9.hosts.yml.example` for the canonical generated group
+hierarchy (`production_rocky9` as a child of the deprecated `generic_rocky9`),
+and `{rocky9-lab,production-rocky9}.first-init.sh.example` for the runnable
 first-converge/Vault-custody/second-converge sequence. They carry only
 placeholders — never real values — and are the starting point for a new
 deployment's inputs.
@@ -154,7 +156,7 @@ which also accepts a controller `AIGW_*` environment fallback:
 |---|---|---|
 | inventory `ansible_host` | `AIGW_ANSIBLE_HOST` | SSH target |
 | inventory `ansible_user` | `AIGW_ANSIBLE_USER` | sudo-capable SSH account (defaults to `ansible`) |
-| `deployment_profile` | `AIGW_DEPLOYMENT_PROFILE` | descriptive profile; generic default is `generic-rocky9` |
+| `deployment_profile` | `AIGW_DEPLOYMENT_PROFILE` | descriptive profile; canonical default is `rocky9-production` (`generic-rocky9` is a working DEPRECATED alias) |
 | `nic_egress` | `AIGW_NIC_EGRESS` | interface owning the only default route |
 | `nic_adm` | `AIGW_NIC_ADM` | administrator/VPN interface |
 | `nic_internal` | `AIGW_NIC_INTERNAL` | internal-user interface |
@@ -206,9 +208,10 @@ for direct Compose use; the exact keys are what the containers read. Secret
 values in the example are intentionally blank so Compose's `${VAR:?}` guards
 fail closed until each is populated.
 
-`DEPLOYMENT_PROFILE` selects the profile (`generic-rocky9` by default,
-`rocky9-lab` for the lab; `aigw-compose.sh` and `vault-bootstrap.sh`
-key off this exact value). `DOMAIN` is the base domain every router host is
+`DEPLOYMENT_PROFILE` selects the profile (`rocky9-production` by default,
+`rocky9-lab` for the lab, with `generic-rocky9` still accepted as a deprecated
+alias; `aigw-compose.sh` and `vault-bootstrap.sh` key off this exact value).
+`DOMAIN` is the base domain every router host is
 built from. `ETH1_IP` is the ADM leg that `traefik-adm` binds `:443` on, and
 `ETH2_IP` is the internal leg that `traefik-int` binds `:443` on — nothing
 binds the egress IP or `0.0.0.0`. Container resolvers are rendered per plane
@@ -310,18 +313,20 @@ values. The lab profile additionally requires five 16+ character secrets:
 - `samba_user_lab_developer_password`
 - `samba_user_lab_user_password`
 
-For a generic/customer deployment, generate the dedicated inventory and
-ciphertext-only overlay with `scripts/bootstrap-generic-rocky9.py` (it creates
+For a production/customer deployment, generate the dedicated inventory and
+ciphertext-only overlay with `scripts/bootstrap-rocky9-production.py` (it creates
 `ansible/inventory/generated/<alias>/` with `hosts.yml`,
-`host_vars/<alias>.yml`, and `group_vars/generic_rocky9/vault.yml`, encrypting
+`host_vars/<alias>.yml`, and `group_vars/production_rocky9/vault.yml`, encrypting
 every secret in memory under an explicit `--vault-id`), then validate it with
-the controller-only `ansible/preflight-generic-rocky9.yml` before ever
-contacting the target. The committed `inventory/group_vars/gateway/vault.yml`
+the controller-only `ansible/preflight-rocky9-production.yml` before ever
+contacting the target. The older `bootstrap-generic-rocky9.py` /
+`preflight-generic-rocky9.yml` / `group_vars/generic_rocky9/` names remain as
+DEPRECATED compatibility aliases. The committed `inventory/group_vars/gateway/vault.yml`
 overlay belongs to the lab profile. Edit an overlay only in place, without
 producing a plaintext working copy:
 
 ```bash
-ansible-vault edit ansible/inventory/generated/<alias>/group_vars/generic_rocky9/vault.yml
+ansible-vault edit ansible/inventory/generated/<alias>/group_vars/production_rocky9/vault.yml
 ```
 
 Do not print, diff, or commit decrypted values. The role renders
@@ -341,12 +346,13 @@ authentication sources are regular, single-link files with the exact private
 ownership above.
 
 One further secret, `vault_unseal_key`, is **operator-supplied rather than
-generated**. `bootstrap-generic-rocky9.py` never creates it, because it does
+generated**. The inventory bootstrap never creates it, because it does
 not exist until HashiCorp Vault is initialized. After the first Vault init
 returns its 1-of-1 Shamir share, store it with the stdin-only
 `scripts/store-vault-unseal-key.py` helper into a **dedicated sibling overlay**
-— `group_vars/generic_rocky9/vault-unseal.yml` for a generic/customer
-inventory, or `inventory/group_vars/gateway/vault-unseal.yml` for the lab. The
+— `group_vars/production_rocky9/vault-unseal.yml` for a canonical production
+inventory (`group_vars/generic_rocky9/vault-unseal.yml` for one generated under
+the deprecated alias), or `inventory/group_vars/gateway/vault-unseal.yml` for the lab. The
 helper reads the share only from stdin, writes just one inline-encrypted
 `!vault` value, refuses a whole-file-encrypted target, and will not overwrite
 an existing key. It must never appear as an active definition in

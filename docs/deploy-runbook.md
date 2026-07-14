@@ -90,11 +90,15 @@ One command creates a dedicated inventory for this customer/host, with every
 secret generated randomly and stored only in encrypted form:
 
 ```bash
-scripts/bootstrap-generic-rocky9.py \
+scripts/bootstrap-rocky9-production.py \
   --inventory-alias mygateway \
   --vault-id mygateway \
   --vault-password-file ~/.aigw-vault-pass
 ```
+
+(The older `scripts/bootstrap-generic-rocky9.py` still works as a DEPRECATED
+compatibility alias and prints a one-line notice pointing at this canonical
+command.)
 
 Pick your own short name instead of `mygateway` (letters, digits, dots,
 dashes). **You should see** it create three files under
@@ -133,7 +137,7 @@ This checks your folder for mistakes **without touching the VM at all**:
 
 ```bash
 ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
-  ansible/preflight-generic-rocky9.yml --limit mygateway \
+  ansible/preflight-rocky9-production.yml --limit mygateway \
   --vault-id mygateway@~/.aigw-vault-pass
 ```
 
@@ -211,7 +215,7 @@ sudo AIGW_ALLOW_INSECURE_VAULT_BOOTSTRAP=I_UNDERSTAND_THIS_IS_LAB_ONLY \
 
 > **Important:** this is the built-in **lab/test** Vault ceremony — one
 > unseal key, no TLS on the internal listener. The acknowledgement variable is
-> required because this pilot uses the customer `generic-rocky9` profile, and
+> required because this pilot uses the customer `rocky9-production` profile, and
 > the script refuses to run on that profile without it. It is acceptable for a
 > pilot; a production deployment replaces this whole step with the customer's
 > reviewed Vault ceremony (see [operations](operations.md)), driven by the
@@ -233,7 +237,7 @@ and writes only its encrypted form:
 ```bash
 read -rsp 'Vault unseal key from Step 7a: ' AIGW_UNSEAL_SHARE; printf '\n'
 printf '%s\n' "$AIGW_UNSEAL_SHARE" | python3 scripts/store-vault-unseal-key.py \
-  --vault-file ansible/inventory/generated/mygateway/group_vars/generic_rocky9/vault-unseal.yml \
+  --vault-file ansible/inventory/generated/mygateway/group_vars/production_rocky9/vault-unseal.yml \
   --vault-id mygateway \
   --vault-password-file ~/.aigw-vault-pass
 unset AIGW_UNSEAL_SHARE
@@ -299,7 +303,7 @@ printing it) and
 | First converge "waits only for core services" and mentions Vault | Not an error | Expected — do Part 7 |
 | A service is unhealthy after Part 7 | Vault sealed (e.g. after a reboot) | Re-run the Part 6 converge — it auto-unlocks Vault from the controller's stored key. For an immediate fix on the VM, pipe the stored unseal key into `sudo scripts/vault-unseal.sh` (see [operations](operations.md)) |
 | Step 7c stops: "initialized Vault requires vault_unseal_key" | You skipped Step 7b, so the controller has no stored unlock key | Do Step 7b (store the key), then rerun Step 7c |
-| You need to change a secret later | — | `ansible-vault edit ansible/inventory/generated/<alias>/group_vars/generic_rocky9/vault.yml --vault-id <alias>@<password-file>`, then rerun the converge |
+| You need to change a secret later | — | `ansible-vault edit ansible/inventory/generated/<alias>/group_vars/production_rocky9/vault.yml --vault-id <alias>@<password-file>`, then rerun the converge |
 
 ## Glossary
 

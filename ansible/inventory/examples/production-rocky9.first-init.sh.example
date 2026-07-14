@@ -8,12 +8,16 @@ set -euo pipefail
 : "${AIGW_VAULT_ID:?set to the Ansible Vault ID label}"
 : "${AIGW_VAULT_PASSWORD_FILE:?set to a private 0600 controller file}"
 
+# The custody overlay lives beside the generated vault.yml: canonical
+# rocky9-production inventories use group_vars/production_rocky9/, while
+# inventories generated under the DEPRECATED generic-rocky9 alias keep
+# group_vars/generic_rocky9/.
 read -rsp 'Vault unseal share: ' AIGW_UNSEAL_SHARE
 printf '\n'
 trap 'unset AIGW_UNSEAL_SHARE' EXIT HUP INT TERM
 printf '%s\n' "$AIGW_UNSEAL_SHARE" |
   python3 scripts/store-vault-unseal-key.py \
-    --vault-file "$(dirname "$AIGW_INVENTORY")/group_vars/generic_rocky9/vault-unseal.yml" \
+    --vault-file "$(dirname "$AIGW_INVENTORY")/group_vars/production_rocky9/vault-unseal.yml" \
     --vault-id "$AIGW_VAULT_ID" \
     --vault-password-file "$AIGW_VAULT_PASSWORD_FILE"
 unset AIGW_UNSEAL_SHARE

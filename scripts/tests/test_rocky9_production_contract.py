@@ -1,0 +1,520 @@
+"""Coverage for the canonical rocky9-production terminology and its shared use
+of the deprecated generic-rocky9 compatibility implementation."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+CONTRACT_PATH = ROOT / "ansible" / "generic-rocky9-contract.json"
+LEGACY_BOOTSTRAP = ROOT / "scripts" / "bootstrap-generic-rocky9.py"
+PROD_BOOTSTRAP = ROOT / "scripts" / "bootstrap-rocky9-production.py"
+LEGACY_PREFLIGHT = ROOT / "ansible" / "preflight-generic-rocky9.yml"
+PROD_PREFLIGHT = ROOT / "ansible" / "preflight-rocky9-production.yml"
+COMMITTED_INVENTORY = ROOT / "ansible" / "inventory" / "hosts.yml"
+PROD_GROUP_VARS = ROOT / "ansible" / "inventory" / "group_vars" / "production_rocky9.yml"
+GENERIC_GROUP_VARS = ROOT / "ansible" / "inventory" / "group_vars" / "generic_rocky9.yml"
+HOSTS_EXAMPLE = ROOT / "ansible" / "inventory" / "examples" / "production-rocky9.hosts.yml.example"
+
+FAKE_VAULT = """#!/usr/bin/env python3
+import sys
+
+arguments = sys.argv[1:]
+if arguments[:1] != ["encrypt_string"] or "--vault-id" not in arguments or "--stdin-name" not in arguments:
+    raise SystemExit(2)
+name = arguments[arguments.index("--stdin-name") + 1]
+if not sys.stdin.buffer.read():
+    raise SystemExit(3)
+print(f"{name}: !vault |")
+print("          $ANSIBLE_VAULT;1.2;AES256;test")
+print("          0123456789abcdef")
+"""
+
+
+def _write_fake_vault(root: Path) -> Path:
+    fake_vault = root / "fake-ansible-vault"
+    fake_vault.write_text(FAKE_VAULT, encoding="utf-8")
+    fake_vault.chmod(fake_vault.stat().st_mode | stat.S_IXUSR)
+    return fake_vault
+
+
+def _write_password_file(root: Path) -> Path:
+    password_file = root / "vault-password"
+    password_file.write_text("test-only-password\n", encoding="utf-8")
+    password_file.chmod(0o600)
+    return password_file
+
+
+def _load_bootstrap_module():
+    spec = importlib.util.spec_from_file_location("_aigw_bootstrap_under_test", LEGACY_BOOTSTRAP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Rocky9ProductionTerminologyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    # ── contract ────────────────────────────────────────────────────────
+    def test_contract_declares_canonical_and_compatibility_terminology(self) -> None:
+        # The pinned schema id and legacy profile are unchanged for consumers.
+        self.assertEqual(self.contract["schema"], "aigw.generic-rocky9/v1")
+        self.assertEqual(self.contract["profile"], "generic-rocky9")
+        # Canonical terminology is added additively.
+        self.assertEqual(self.contract["canonical_profile"], "rocky9-production")
+        self.assertEqual(self.contract["canonical_group"], "production_rocky9")
+        self.assertEqual(self.contract["compatibility_profile"], "generic-rocky9")
+        self.assertEqual(self.contract["compatibility_group"], "generic_rocky9")
+
+    # ── shared implementation, not fork ─────────────────────────────────
+    def test_entry_points_share_one_implementation(self) -> None:
+        prod_src = PROD_BOOTSTRAP.read_text(encoding="utf-8")
+        # The canonical generator is a thin shim over the shared module and
+        # defaults to the canonical profile — it never re-implements secret
+        # generation.
+        self.assertIn("bootstrap-generic-rocky9.py", prod_src)
+        self.assertIn('default_profile="rocky9-production"', prod_src)
+        self.assertNotIn("encrypt_string", prod_src)
+        self.assertNotIn("required_secret_keys", prod_src)
+        # The canonical preflight only imports the shared implementation.
+        prod_pf = PROD_PREFLIGHT.read_text(encoding="utf-8")
+        self.assertIn("import_playbook: preflight-generic-rocky9.yml", prod_pf)
+        self.assertNotIn("required_secret_keys", prod_pf)
+        self.assertNotIn("AIGW_GENERIC_PREFLIGHT", prod_pf)
+        # The shared implementation accepts both profile names, and its
+        # AIGW_GENERIC_PREFLIGHT receipt / aigw_generic_* fact names stay
+        # deliberately unrenamed (a pinned machine-readable interface).
+        legacy_pf = LEGACY_PREFLIGHT.read_text(encoding="utf-8")
+        self.assertIn("aigw_generic_rocky9_contract.canonical_profile", legacy_pf)
+        self.assertIn("AIGW_GENERIC_PREFLIGHT=", legacy_pf)
+        self.assertIn("deliberately unrenamed", legacy_pf)
+
+    # ── generator output ────────────────────────────────────────────────
+    def test_production_bootstrap_emits_canonical_layout_and_five_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            password_file = _write_password_file(root)
+            fake_vault = _write_fake_vault(root)
+            layout = root / "prod-inventory"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(PROD_BOOTSTRAP),
+                    "--inventory-dir",
+                    str(layout),
+                    "--inventory-alias",
+                    "customer-prod01",
+                    "--vault-id",
+                    "customer-prod",
+                    "--vault-password-file",
+                    str(password_file),
+                    "--ansible-vault",
+                    str(fake_vault),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # The canonical path is not deprecated.
+            self.assertNotIn("DEPRECATION", result.stderr)
+            self.assertNotIn("DEPRECATION", result.stdout)
+            self.assertIn("Created rocky9-production inventory", result.stdout)
+            # The canonical preflight and the two-phase Vault custody flow are
+            # printed with the production overlay path.
+            self.assertIn("ansible/preflight-rocky9-production.yml", result.stdout)
+            self.assertIn("TWO-PHASE DEPLOYMENT BOUNDARY", result.stdout)
+            self.assertIn("vault_unseal_key was NOT generated", result.stdout)
+            self.assertIn("store-vault-unseal-key.py", result.stdout)
+            self.assertIn("group_vars/production_rocky9/vault-unseal.yml", result.stdout)
+
+            inventory = (layout / "hosts.yml").read_text(encoding="utf-8")
+            host_vars = layout / "host_vars" / "customer-prod01.yml"
+            vault = layout / "group_vars" / "production_rocky9" / "vault.yml"
+            self.assertTrue(host_vars.is_file())
+            self.assertTrue(vault.is_file())
+            # production_rocky9 is a child of the deprecated generic_rocky9 group.
+            self.assertIn("generic_rocky9:", inventory)
+            self.assertIn("children:", inventory)
+            self.assertIn("production_rocky9:", inventory)
+            self.assertIn("customer-prod01:", inventory)
+            self.assertIn("gateway:\n      hosts: {}", inventory)
+
+            host_text = host_vars.read_text(encoding="utf-8")
+            self.assertIn("deployment_profile: rocky9-production", host_text)
+            self.assertIn("require_encrypted_state: true", host_text)
+            self.assertIn("aigw_vault_ui_enabled: false", host_text)
+            # Five clearly separated sections.
+            self.assertIn("SECTION 1 — non-secret host / interface / routing / DNS inputs", host_text)
+            self.assertIn("SECTION 2 — generated encrypted application secrets", host_text)
+            self.assertIn("SECTION 3 — operator-supplied vault_unseal_key", host_text)
+            self.assertIn("SECTION 4 — external AD / LDAPS inputs (placeholder)", host_text)
+            self.assertIn("SECTION 5 — PKI inputs (placeholder)", host_text)
+            # SECTION 3 documents the real controller-custody machinery: the
+            # dedicated inline-encrypted sibling overlay written by the
+            # stdin-only helper — never a randomly generated value.
+            self.assertIn("vault_unseal_key is the SOLE operator-supplied secret", host_text)
+            self.assertIn("NEVER randomly", host_text)
+            self.assertIn("store-vault-unseal-key.py", host_text)
+            self.assertIn("group_vars/production_rocky9/vault-unseal.yml", host_text)
+            self.assertIn("never to group_vars/all.yml", host_text)
+            self.assertIn("production-rocky9.first-init.sh.example", host_text)
+            # LDAP placeholder references the parallel identity_ldap_* contract.
+            self.assertIn("identity_ldap_*", host_text)
+
+            # No stack secret value or name appears in host_vars.
+            for entry in self.contract["required_secret_keys"]:
+                self.assertNotIn(entry["name"], host_text)
+
+            vault_text = vault.read_text(encoding="utf-8")
+            self.assertIn("$ANSIBLE_VAULT;", vault_text)
+            for entry in self.contract["required_secret_keys"]:
+                self.assertIn(f"{entry['name']}: !vault |", vault_text)
+
+            # The emitted host_vars is valid, loadable YAML (drop the ciphertext
+            # overlay so no decryption is attempted).
+            ansible_inventory = shutil.which("ansible-inventory")
+            if ansible_inventory is not None:
+                shutil.rmtree(layout / "group_vars")
+                dump = subprocess.run(
+                    [ansible_inventory, "-i", str(layout / "hosts.yml"), "--host", "customer-prod01"],
+                    cwd=ROOT,
+                    env={"PATH": os.environ["PATH"], "ANSIBLE_NOCOLOR": "1"},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(dump.returncode, 0, dump.stderr)
+                self.assertEqual(
+                    json.loads(dump.stdout)["deployment_profile"], "rocky9-production"
+                )
+
+    def test_placeholder_sections_carry_no_active_keys(self) -> None:
+        """SECTIONS 3-5 stay comment-only until the owning workstreams land.
+
+        Workstream C (external AD/LDAPS) owns SECTION 4's identity_ldap_* keys;
+        workstream D (production TLS/PKI) owns SECTION 5's pki_* keys; the
+        operator ceremony (store-vault-unseal-key.py) owns vault_unseal_key.
+        None of them may appear as an active key in the generated host_vars.
+        """
+        module = _load_bootstrap_module()
+        host_text = module.production_host_vars_document("customer-prod01")
+        lines = host_text.splitlines()
+        marker = next(
+            index for index, line in enumerate(lines) if "SECTION 3 —" in line
+        )
+        active_lines = [
+            line
+            for line in lines[marker:]
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(active_lines, [])
+        for line in host_text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            self.assertFalse(stripped.startswith("identity_ldap"), stripped)
+            self.assertFalse(stripped.startswith("pki_"), stripped)
+            self.assertFalse(stripped.startswith("vault_unseal_key"), stripped)
+
+    def test_legacy_bootstrap_still_works_and_prints_deprecation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            password_file = _write_password_file(root)
+            fake_vault = _write_fake_vault(root)
+            layout = root / "legacy-inventory"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(LEGACY_BOOTSTRAP),
+                    "--inventory-dir",
+                    str(layout),
+                    "--inventory-alias",
+                    "customer-aigw01",
+                    "--vault-id",
+                    "customer-prod",
+                    "--vault-password-file",
+                    str(password_file),
+                    "--ansible-vault",
+                    str(fake_vault),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # The one-line notice goes to stderr only; stdout stays
+            # byte-compatible with the pre-terminology tool.
+            self.assertIn("DEPRECATION", result.stderr)
+            self.assertIn("bootstrap-rocky9-production.py", result.stderr)
+            self.assertNotIn("DEPRECATION", result.stdout)
+            self.assertIn("Created production Rocky 9 inventory", result.stdout)
+            self.assertIn("ansible/preflight-generic-rocky9.yml", result.stdout)
+            self.assertIn("group_vars/generic_rocky9/vault-unseal.yml", result.stdout)
+            # The legacy layout is unchanged: generic_rocky9 group + profile.
+            self.assertTrue((layout / "group_vars" / "generic_rocky9" / "vault.yml").is_file())
+            host_text = (layout / "host_vars" / "customer-aigw01.yml").read_text(encoding="utf-8")
+            self.assertIn("deployment_profile: generic-rocky9", host_text)
+
+    # ── committed inventory ─────────────────────────────────────────────
+    def test_committed_inventory_uses_canonical_child_group(self) -> None:
+        self.assertIn("deployment_profile: rocky9-production", PROD_GROUP_VARS.read_text(encoding="utf-8"))
+        # The generic parent group_vars keep the deprecated profile name.
+        self.assertIn("deployment_profile: generic-rocky9", GENERIC_GROUP_VARS.read_text(encoding="utf-8"))
+        # The committed examples document the same canonical hierarchy.
+        hosts_example = HOSTS_EXAMPLE.read_text(encoding="utf-8")
+        self.assertIn("generic_rocky9:", hosts_example)
+        self.assertIn("production_rocky9:", hosts_example)
+        self.assertIn("bootstrap-rocky9-production.py", hosts_example)
+
+        ansible_inventory = shutil.which("ansible-inventory")
+        self.assertIsNotNone(ansible_inventory, "ansible-inventory is required")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "AIGW_ANSIBLE_HOST": "192.0.2.10",
+                "AIGW_ANSIBLE_USER": "ansible",
+                "ANSIBLE_NOCOLOR": "1",
+            }
+        )
+        graph = subprocess.run(
+            [str(ansible_inventory), "-i", str(COMMITTED_INVENTORY), "--graph"],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(graph.returncode, 0, graph.stderr)
+        # production_rocky9 is nested under generic_rocky9 (a child appears
+        # after its parent in the graph, and gateway keeps no children).
+        self.assertIn("@generic_rocky9:", graph.stdout)
+        self.assertIn("@production_rocky9:", graph.stdout)
+        self.assertLess(
+            graph.stdout.index("@generic_rocky9:"),
+            graph.stdout.index("@production_rocky9:"),
+        )
+
+        dump = subprocess.run(
+            [str(ansible_inventory), "-i", str(COMMITTED_INVENTORY), "--host", "aigw"],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(dump.returncode, 0, dump.stderr)
+        # A production host never loads the committed lab Vault overlay: no
+        # Vault password was supplied, so any decryption attempt would fail.
+        self.assertNotIn("Attempting to decrypt", dump.stderr)
+        resolved = json.loads(dump.stdout)
+        self.assertEqual(resolved["deployment_profile"], "rocky9-production")
+        self.assertTrue(resolved["require_encrypted_state"])
+
+    # ── preflight ───────────────────────────────────────────────────────
+    def test_both_preflight_entry_points_syntax_check(self) -> None:
+        ansible_playbook = shutil.which("ansible-playbook")
+        self.assertIsNotNone(ansible_playbook, "ansible-playbook is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "hosts.yml").write_text(_production_hosts_yaml(), encoding="utf-8")
+            for playbook in (LEGACY_PREFLIGHT, PROD_PREFLIGHT):
+                result = subprocess.run(
+                    [str(ansible_playbook), "-i", str(root / "hosts.yml"), str(playbook), "--syntax-check"],
+                    cwd=ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, f"{playbook.name}: {result.stderr}")
+
+    def test_production_preflight_accepts_canonical_and_rejects_unknown_profile(self) -> None:
+        ansible_playbook = shutil.which("ansible-playbook")
+        self.assertIsNotNone(ansible_playbook, "ansible-playbook is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "host_vars").mkdir()
+            (root / "hosts.yml").write_text(_production_hosts_yaml(), encoding="utf-8")
+            host_vars = root / "host_vars" / "prod-aigw01.yml"
+
+            def run(profile: str) -> subprocess.CompletedProcess[str]:
+                host_vars.write_text(_full_valid_host_vars(self.contract, profile), encoding="utf-8")
+                return subprocess.run(
+                    [str(ansible_playbook), "-i", str(root / "hosts.yml"), str(PROD_PREFLIGHT)],
+                    cwd=ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+
+            ok = run("rocky9-production")
+            combined = ok.stdout + ok.stderr
+            self.assertEqual(ok.returncode, 0, combined)
+            # The success receipt is emitted through ansible's debug callback,
+            # which renders the embedded JSON with escaped quotes; normalize
+            # backslashes before matching.
+            normalized = combined.replace("\\", "")
+            self.assertIn('"status": "ok"', normalized)
+            self.assertIn('"profile": "rocky9-production"', normalized)
+            # The canonical profile is not deprecated.
+            self.assertNotIn("DEPRECATION", combined)
+
+            rejected = run("not-a-real-profile")
+            self.assertNotEqual(rejected.returncode, 0)
+
+    def test_production_preflight_fails_before_mutation_on_missing_values(self) -> None:
+        ansible_playbook = shutil.which("ansible-playbook")
+        self.assertIsNotNone(ansible_playbook, "ansible-playbook is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "host_vars").mkdir()
+            (root / "hosts.yml").write_text(_production_hosts_yaml(), encoding="utf-8")
+            (root / "host_vars" / "prod-aigw01.yml").write_text(
+                _minimal_host_vars("rocky9-production"), encoding="utf-8"
+            )
+            result = subprocess.run(
+                [str(ansible_playbook), "-i", str(root / "hosts.yml"), str(PROD_PREFLIGHT)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            combined = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("AIGW_GENERIC_PREFLIGHT=", combined)
+            self.assertIn('"missing_secret": [', combined)
+            self.assertIn("pg_super_password", combined)
+            self.assertIn('"profile": "rocky9-production"', combined)
+            self.assertNotIn("DEPRECATION", combined)
+            self.assertNotIn("test-only-password", combined)
+
+    def test_legacy_profile_triggers_preflight_deprecation_notice(self) -> None:
+        ansible_playbook = shutil.which("ansible-playbook")
+        self.assertIsNotNone(ansible_playbook, "ansible-playbook is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "host_vars").mkdir()
+            (root / "hosts.yml").write_text(
+                """---
+all:
+  children:
+    generic_rocky9:
+      hosts:
+        customer-aigw01:
+""",
+                encoding="utf-8",
+            )
+            (root / "host_vars" / "customer-aigw01.yml").write_text(
+                _minimal_host_vars("generic-rocky9", alias="customer-aigw01"), encoding="utf-8"
+            )
+            result = subprocess.run(
+                [str(ansible_playbook), "-i", str(root / "hosts.yml"), str(LEGACY_PREFLIGHT)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            combined = result.stdout + result.stderr
+            self.assertIn("DEPRECATION", combined)
+            self.assertIn("rocky9-production", combined)
+            self.assertIn("AIGW_GENERIC_PREFLIGHT=", combined)
+
+
+def _production_hosts_yaml() -> str:
+    return """---
+all:
+  children:
+    generic_rocky9:
+      children:
+        production_rocky9:
+          hosts:
+            prod-aigw01:
+"""
+
+
+def _minimal_host_vars(profile: str, alias: str = "prod-aigw01") -> str:
+    return f"""---
+aigw_generic_inventory_alias: {alias}
+deployment_profile: {profile}
+require_encrypted_state: true
+samba_lab_enabled: false
+aigw_seed_test_users: false
+retain_bootstrap_admin_user: false
+aigw_prebootstrap_oidc_scope_reconciliation: false
+aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
+platform_authoritative_dns_enabled: false
+aigw_vault_ui_enabled: false
+aigw_lab_reset_handoff_drop_interfaces: []
+"""
+
+
+def _full_valid_host_vars(contract: dict, profile: str) -> str:
+    filler = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" * 3
+    lines = [
+        "---",
+        "aigw_generic_inventory_alias: prod-aigw01",
+        f"deployment_profile: {profile}",
+        'ansible_host: "192.0.2.10"',
+        "ansible_user: ansible",
+        "aigw_domain: aigw.example.internal",
+        'nic_egress: "eth0"',
+        'nic_adm: "eth1"',
+        'nic_internal: "eth2"',
+        'eth0_ip: "192.0.2.10"',
+        'eth0_gateway: "192.0.2.1"',
+        'eth1_ip: "198.51.100.10"',
+        'eth1_gateway: "198.51.100.1"',
+        'eth2_ip: "203.0.113.10"',
+        'eth2_gateway: "203.0.113.1"',
+        'vpn_client_cidr: "198.51.100.0/24"',
+        'internal_cidr: "203.0.113.0/24"',
+        'internal_dns_servers: ["203.0.113.53"]',
+        'egress_dns_servers: ["192.0.2.53"]',
+        "aigw_management_ssh_port: 22",
+        "manage_networking: true",
+        "pbr_tables: [{name: adm, id: 101}, {name: internal, id: 102}]",
+        "require_encrypted_state: true",
+        "require_preupgrade_backup: true",
+        "platform_authoritative_dns_enabled: false",
+        "aigw_vault_ui_enabled: false",
+        "samba_lab_enabled: false",
+        "aigw_seed_test_users: false",
+        "retain_bootstrap_admin_user: false",
+        "aigw_prebootstrap_oidc_scope_reconciliation: false",
+        'aigw_prebootstrap_oidc_scope_reconciliation_ack: ""',
+        "aigw_ssh_password_authentication: false",
+        "aigw_adm_socks_enabled: false",
+        "aigw_lab_reset_handoff_drop_interfaces: []",
+    ]
+    for index, entry in enumerate(contract["required_secret_keys"]):
+        length = entry.get("exact_length") or entry["min_length"]
+        value = (f"K{index:03d}" + filler)[:length]
+        lines.append(f"{entry['name']}: {value}")
+    return "\n".join(lines) + "\n"
+
+
+if __name__ == "__main__":
+    unittest.main()

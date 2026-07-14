@@ -1,7 +1,8 @@
 ---
 # SAFE NAME-ONLY TEMPLATE. Do not put real plaintext values in this file.
 # Generate a new value-level encrypted overlay with
-# scripts/bootstrap-generic-rocky9.py. Every value below must render as !vault.
+# scripts/bootstrap-rocky9-production.py (or its DEPRECATED alias
+# bootstrap-generic-rocky9.py). Every value below must render as !vault.
 pg_super_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
 pg_litellm_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
 pg_keycloak_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"

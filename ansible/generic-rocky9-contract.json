@@ -1,6 +1,10 @@
 {
   "schema": "aigw.generic-rocky9/v1",
   "profile": "generic-rocky9",
+  "canonical_profile": "rocky9-production",
+  "compatibility_profile": "generic-rocky9",
+  "canonical_group": "production_rocky9",
+  "compatibility_group": "generic_rocky9",
   "host_vars_filename": "{inventory_alias}.yml",
   "required_nonsecret_keys": [
     "aigw_generic_inventory_alias",
