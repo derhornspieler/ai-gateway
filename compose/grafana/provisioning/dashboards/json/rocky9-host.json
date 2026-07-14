@@ -40,12 +40,13 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"color": "red", "text": "Disabled"}, "1": {"color": "green", "text": "Enabled"}}, "type": "value"}], "unit": "short"}, "overrides": []},
+      "description": "Root filesystem utilisation. SELinux posture is deliberately not a panel here: Node Exporter runs containerised, selinuxfs is not mounted into its namespace, and --path.rootfs does not apply to that collector, so node_selinux_enabled is pinned at 0 and would render a false 'Disabled' on an Enforcing host. SELinux enforcement is gated by the Ansible verify role instead.",
+      "fieldConfig": {"defaults": {"max": 100, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 80}, {"color": "red", "value": 90}]}, "unit": "percent"}, "overrides": []},
       "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
       "id": 4,
-      "options": {"colorMode": "background", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-      "targets": [{"editorMode": "code", "expr": "max(node_selinux_enabled{job=\"node-exporter\"})", "instant": true, "legendFormat": "SELinux", "range": false, "refId": "A"}],
-      "title": "SELinux",
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"editorMode": "code", "expr": "100 * (1 - node_filesystem_avail_bytes{job=\"node-exporter\",mountpoint=\"/\"} / node_filesystem_size_bytes{job=\"node-exporter\",mountpoint=\"/\"})", "instant": true, "legendFormat": "Root FS", "range": false, "refId": "A"}],
+      "title": "Root Filesystem Used",
       "type": "stat"
     },
     {
