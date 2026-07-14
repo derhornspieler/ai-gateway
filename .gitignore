@@ -24,3 +24,10 @@ htmlcov/
 .aigw-vault-pass
 ansible/inventory/group_vars/gateway/vault.yml.predeploy-*
 ansible/inventory/generated/
+
+# Controller-held Vault unseal custody (encrypted, environment-specific — never in git)
+ansible/inventory/group_vars/*/vault-unseal.yml
+ansible/inventory/generated/
+
+# Claude Code agent worktrees
+.claude/worktrees/
