@@ -232,6 +232,14 @@ class EdgeTlsContractTests(unittest.TestCase):
             # the role is pinned to the promoted issuer, so a later default change
             # cannot silently move issuance back onto a stale CA
             'issuer_ref="$imported"',
+            # #18: the promotion proof reads the mount's DEFAULT issuer and asserts
+            # IT resolves to the customer cert. Re-reading pki_int/issuer/$imported
+            # was vacuous — set-signed already guarantees it — so it could not
+            # catch a `default=` write that silently did not take.
+            "vlt read -format=json pki_int/config/issuers",
+            'get("default")',
+            'pki_int/issuer/$default_issuer',
+            "could not read the mount default issuer after promotion",
             # promotion is proven, not assumed
             "the promoted Vault issuer is not the customer-signed intermediate",
             # set-signed is idempotent: a re-run imports nothing, so the issuer is
@@ -240,6 +248,12 @@ class EdgeTlsContractTests(unittest.TestCase):
             "Vault holds no issuer matching --signed-intermediate",
         ):
             self.assertIn(required, text)
+        # The vacuous re-read of the imported issuer as the promotion proof is
+        # gone: the fingerprint compare now reads whatever the DEFAULT resolves to.
+        self.assertNotIn(
+            'promoted_fp="$(vlt read -field=certificate "pki_int/issuer/$imported"',
+            text,
+        )
 
     def test_sign_script_is_offline_only_and_pins_the_intermediate_extensions(self) -> None:
         text = SIGN_SCRIPT.read_text(encoding="utf-8")

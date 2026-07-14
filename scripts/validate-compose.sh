@@ -239,6 +239,11 @@ for required in (
     "pki_int/config/issuers",
     "default_follows_latest_issuer=false",
     'issuer_ref="$imported"',
+    # The promotion proof reads the mount DEFAULT issuer (not the just-imported
+    # one, which set-signed already guarantees) and asserts it resolves to the
+    # customer-signed certificate -- catching a promotion that did not take.
+    "vlt read -format=json pki_int/config/issuers",
+    "could not read the mount default issuer after promotion",
     "the promoted Vault issuer is not the customer-signed intermediate",
     'allowed_domains="$DOMAIN" allow_subdomains=true allow_bare_domains=true',
     "AIGW_EDGE_TLS_MODE",

@@ -20,8 +20,26 @@ printf '%s\n' "$password_settings" \
 fqdn=${SAMBA_LDAPS_FQDN:-$(hostname).$(samba-tool domain info 127.0.0.1 2>/dev/null \
     | awk -F: '/^Forest[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print tolower($2)}')}
 test -n "$fqdn"
+
+# Choose the verification anchor deliberately. /var/lib/samba-public/ca.pem is
+# the DC's OWN published anchor: the entrypoint republishes into it whatever cert
+# the DC currently serves, so a self-signed fallback would verify against itself
+# and a silent downgrade would stay green. Once CA-issued material has been in
+# force (persistent marker written by the entrypoint), the trust path MUST be
+# load-bearing on the REAL customer chain — the delivered leaf+intermediate+root
+# in $tls_cert_src — not on that self-published anchor. This makes the
+# healthcheck FAIL if the DC ever serves a self-signed certificate while CA
+# material was expected.
+ca_material_marker=/var/lib/samba/.aigw-ca-material-in-force
+tls_cert_src=${SAMBA_TLS_CERT_FILE:-/run/secrets/samba_ad_tls_cert}
+if [ -f "$ca_material_marker" ]; then
+    test -s "$tls_cert_src"
+    verify_cafile=$tls_cert_src
+else
+    verify_cafile=/var/lib/samba-public/ca.pem
+fi
 timeout 5 openssl s_client \
     -connect 127.0.0.1:636 \
-    -CAfile /var/lib/samba-public/ca.pem \
+    -CAfile "$verify_cafile" \
     -verify_hostname "$fqdn" \
     -verify_return_error </dev/null >/dev/null 2>&1
