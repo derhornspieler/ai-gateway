@@ -633,7 +633,7 @@
         },
         {
           "editorMode": "code",
-          "expr": "sum(rate(otelcol_exporter_send_failed_log_records_total[$__rate_interval]))",
+          "expr": "sum(rate(otelcol_exporter_send_failed_log_records_total[$__rate_interval])) or vector(0)",
           "legendFormat": "OTel logs failed",
           "range": true,
           "refId": "B"

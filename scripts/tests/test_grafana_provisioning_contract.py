@@ -41,6 +41,28 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             self.assertTrue((DASHBOARD_ROOT.parent / directory).is_dir())
             self.assertTrue((DASHBOARD_ROOT.parent / directory / "empty.yml").is_file())
 
+    def test_dashboard_directory_holds_exactly_the_provisioned_files(self) -> None:
+        # Grafana's file provisioner reads *every* JSON file in this directory and
+        # keys dashboards by uid. A stray copy (e.g. a macOS "rocky9-host 2.json")
+        # therefore provisions a second dashboard under an already-claimed uid, and
+        # it is silently folded into the uid->title mapping asserted below. The
+        # duplicate is also hashed into AIGW_BIND_DIGEST_GRAFANA by
+        # compute-bind-source-digests.py, which walks grafana/provisioning
+        # recursively, so it perturbs the bind-source attestation of content that
+        # the docker_stack allow-list never actually deploys. Pin the file set.
+        self.assertEqual(
+            {path.name for path in self.dashboard_files},
+            {
+                "ai-gateway-live-logs.json",
+                "ai-gateway-overview.json",
+                "ai-gateway-request-audit.json",
+                "edge-identity-services.json",
+                "grafana-lgtm-stack.json",
+                "rocky9-host.json",
+            },
+        )
+        self.assertEqual(len(self.dashboards), 6)
+
     def test_exact_dashboard_inventory_is_deterministic(self) -> None:
         self.assertEqual(
             {dashboard["uid"]: dashboard["title"] for dashboard in self.dashboards},
@@ -136,7 +158,6 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
                 "node_cpu_seconds_total",
                 "node_memory_MemAvailable_bytes",
                 "node_memory_MemTotal_bytes",
-                "node_selinux_enabled",
                 "node_load1",
                 "node_load5",
                 "node_load15",
@@ -178,6 +199,13 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
                 self.assertIn(metric, expressions)
             self.assertNotIn("cadvisor", expressions.lower())
             self.assertNotIn("container_", expressions.lower())
+            # Node Exporter is containerised and selinuxfs is not mounted into its
+            # namespace; --path.rootfs does not apply to the selinux collector, which
+            # resolves the mount from its own /proc/self/mountinfo. node_selinux_enabled
+            # is therefore hard-pinned at 0 on this stack even though the host runs
+            # Enforcing, and a panel bound to it renders a false red "Disabled". Host
+            # SELinux state is gated by the Ansible verify role, not by Grafana.
+            self.assertNotIn("node_selinux", expressions)
         lgtm = next(item for item in self.dashboards if item["uid"] == "aigw-grafana-lgtm")
         lgtm_queries = "\n".join(
             target["expr"]
