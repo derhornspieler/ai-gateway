@@ -1,6 +1,6 @@
 {
   "base": {
-    "alloy": ["alloy/config.alloy", "certs/ca.pem"],
+    "alloy": ["alloy/config.alloy", "certs/cribl-ca.pem"],
     "cribl-mock": ["cribl-mock/config.yaml"],
     "grafana": ["grafana/provisioning"],
     "keycloak": ["keycloak/realms"],

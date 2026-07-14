@@ -462,11 +462,118 @@ requires its own local login. The portal admin page shows rotation and identity
 status but never displays internal tokens or private keys. See the [acceptance
 runbook](test-runbook.md) for the complete expected results.
 
+## Production edge TLS
+
+### Where TLS actually is (and is not)
+
+HTTPS terminates at the **two Traefik edges only** (`traefik-int` on the internal
+NIC, `traefik-adm` on the ADM NIC). Both read a single certificate store,
+`/opt/ai-gateway/certs/{int.crt,int.key}`. Behind them, container-to-container
+application traffic is **plain HTTP on segmented, internal-only Docker bridges** —
+that is a deliberate design choice, not an oversight, and the bridges plus
+DOCKER-USER/nftables rules are what constrain that traffic. **This platform does
+not do service-to-service mTLS. Do not claim that it does.**
+
+The only other TLS originators are:
+
+* **Envoy** — originates vendor TLS outbound with narrowed per-vendor CA bundles.
+* **Alloy → Cribl** — OTLP/TLS using a **dedicated** CA bundle at
+  `certs/cribl-ca.pem` (`cribl_otlp_ca_pem_file`). This is deliberately *not* the
+  edge CA: the authority that signs this gateway's edge certificate has no
+  business vouching for the customer's telemetry endpoint, and trusting it there
+  would silently widen the set of certificates Alloy accepts.
+
+Because every published vhost is a one-level subdomain of `aigw_domain`, one
+certificate with `SAN = DNS:*.<domain>, DNS:<domain>` covers both edges. The
+validator **requires** both the wildcard and the apex.
+
+### Choosing a mode
+
+`aigw_edge_tls_mode` is fail-closed — `site.yml` refuses to run without exactly
+one valid selection.
+
+| mode | who | how the edge key is produced |
+|---|---|---|
+| `vault-intermediate` | production **and** the lab | Vault generates the intermediate key **internally**, emits a CSR, the customer CA signs it **offline**, the signed cert + chain are imported back. Vault then issues the edge leaf. |
+| `customer-supplied` | production | The operator supplies an existing leaf + private key + complete chain as controller-local files. |
+| `lab` | `rocky9-lab` only | `vault-bootstrap.sh` mints a self-signed **TEST** root. No browser or customer trusts it. Fallback for a disposable lab with no real CA. |
+
+**The customer's root/issuing private key is never requested, transported, or
+stored by this platform.** In `vault-intermediate` the only thing that crosses
+the boundary is a CSR going out and a signed certificate coming back. The
+ceremony script that touches the root key (`scripts/sign-vault-intermediate.sh`)
+is deliberately **not** deployed to the gateway — a contract test asserts it is
+absent from the operational-script manifest.
+
+### Mode 2 ceremony (`vault-intermediate`)
+
+Run after the Vault init ceremony, from `/opt/ai-gateway` on the VM:
+
+```bash
+# 1. Vault generates the intermediate key internally and emits a CSR.
+read -rsp 'Vault token: ' TOK; printf '\n'
+printf '%s\n' "$TOK" | sudo scripts/vault-pki-intermediate.sh csr
+#    -> /opt/ai-gateway/secrets/aigw-intermediate.csr
+
+# 2. On the CA workstation (the ONLY machine holding the root key):
+scripts/sign-vault-intermediate.sh \
+    --csr       ./aigw-intermediate.csr \
+    --root-cert /path/to/root-ca.pem \
+    --root-key  /path/to/root-ca-key.pem \
+    --out-dir   ./signed
+#    -> signed/intermediate.pem, signed/chain.pem  (intermediate + root)
+#    The root key is read in place and never copied.
+
+# 3. Import the signed certificate + chain and issue the edge leaf.
+printf '%s\n' "$TOK" | sudo scripts/vault-pki-intermediate.sh install-signed \
+    --signed-intermediate /tmp/intermediate.pem --chain /tmp/chain.pem
+unset TOK
+```
+
+The intermediate is signed with exactly
+`basicConstraints=critical,CA:true,pathlen:0` and
+`keyUsage=critical,digitalSignature,cRLSign,keyCertSign`. `install-signed`
+validates everything *before* touching the live certificate store, then
+force-recreates the edge consumers. Then run the second `site.yml` converge.
+
+Leaf renewal later: `sudo scripts/vault-pki-intermediate.sh renew-leaf`.
+
+### Mode 1 (`customer-supplied`)
+
+Set the three controller-local paths (the key must be `0600`, and the chain file
+must contain the **complete** chain **including the self-signed root**). Ansible
+stages them with `no_log`, validates, and installs atomically on every converge.
+Renewal is: replace the files, rerun `site.yml`.
+
+### What is validated before anything goes live
+
+`scripts/edge-tls.py` runs every check **before** the first byte of `certs/` is
+touched; a failure leaves the previous certificates exactly as they were:
+
+* inputs are absolute, regular, non-symlink, single-hard-link files; the key is `0600`
+* the private key matches the leaf (public-key comparison)
+* SAN carries **both** `*.<domain>` and `<domain>`; EKU includes `serverAuth`; the leaf is not a CA
+* every chain member is a CA, a **self-signed root is present**, and the chain verifies with `-purpose sslserver`
+* the certificate verifies for a real vhost (`-verify_hostname portal.<domain>`)
+* leaf, intermediates, **and root** all outlive `aigw_edge_tls_min_days_remaining` (default 30)
+* a certificate input containing `PRIVATE KEY` is a hard refusal
+
+On production profiles the converge and `verify` additionally run
+`validate-installed --reject-self-signed`, which rejects the bootstrap
+placeholder. That matters because the SNI probe validates the leaf against
+`certs/ca.pem`, and a self-signed placeholder trivially satisfies that — it *is*
+its own CA bundle.
+
+> **Name constraints.** If the customer root carries `nameConstraints` (permitted
+> DNS subtrees), the gateway domain must fall inside a permitted subtree or
+> OpenSSL reports `permitted subtree violation` and the chain is refused. The
+> validator surfaces OpenSSL's message verbatim. This is a property of the CA,
+> not a bug — the domain has to move, not the check.
+
 ## Vault operations
 
 `scripts/vault-bootstrap.sh` is explicitly a lab/test initializer, run on the VM.
 It initializes file-backed Vault with 1-of-1 unseal, enables a file audit device,
-creates a test root and intermediate plus a 90-day wildcard edge certificate,
 installs the exact rotator/identity Vault policy and a 32-day periodic token,
 optionally seeds static provider keys, and writes only the rotator token into
 `.env` before recreating consumers. Its listener and seal-readiness probe uses
@@ -475,11 +582,20 @@ the static `aigw-health-probe http` binary against
 and its containerized `vault` CLI wrapper pins `VAULT_ADDR=http://127.0.0.1:8200`
 so the isolated plaintext listener does not trigger a false HTTPS attempt. (The
 explicit `vault status -address=... -format=json` seal-state probe belongs to
-the Ansible converge, not this script.) This is not
-production-safe merely because the listener is isolated: production needs a
-customer-rooted intermediate, TLS on the Vault listener, multiple custodians or
-an approved auto-unseal design, token-renewal monitoring, disk-alert
-notification, and an executable backup/restore drill.
+the Ansible converge, not this script.)
+
+**Edge PKI depends on `aigw_edge_tls_mode`.** When the mode is
+`vault-intermediate` (what the committed lab now uses), `vault-bootstrap.sh`
+deliberately creates **no** root mount, **no** test root, and **no** edge
+certificate — the customer CA owns the edge, and `vault-pki-intermediate.sh`
+performs the ceremony. Only the explicit `lab` fallback mints the self-signed
+test root plus a 90-day wildcard certificate.
+
+This is not production-safe merely because the listener is isolated: production
+still needs TLS on the Vault listener, multiple custodians or an approved
+auto-unseal design, token-renewal monitoring, disk-alert notification, and an
+executable backup/restore drill. (The customer-rooted intermediate that used to
+be listed here is now implemented — see **Production edge TLS** above.)
 
 `vault-bootstrap.sh` is forbidden on the restore path. It is valid only for an
 uninitialized fresh deployment with no restore marker; running it against a
@@ -493,9 +609,9 @@ streamed to the same stdin-only `vault-unseal.sh` under `no_log`, and never
 rendered into `.env` or the target. It is *not* a Vault-native seal such as a
 cloud-KMS or transit auto-unseal; the seal mechanism itself is unchanged, and
 the converge simply refuses to complete an initialized-but-sealed Vault. The
-production hardening above (listener TLS, customer-rooted intermediate, and
-either multiple custodians or a reviewed KMS auto-unseal) is still required
-before this single-share replay is treated as sufficient.
+production hardening above (listener TLS and either multiple custodians or a
+reviewed KMS auto-unseal) is still required before this single-share replay is
+treated as sufficient.
 
 Vault audit writes to `vault_audit`, and `aigw-vault-audit-rotate.timer` checks
 every 15 minutes. `scripts/rotate-vault-audit.sh` runs a locked, networkless,

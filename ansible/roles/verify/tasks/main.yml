@@ -1332,6 +1332,7 @@
             "certs/int.key": ("file", 0, 65532, 0o640),
             "certs/int.crt": ("file", 0, 0, 0o644),
             "certs/ca.pem": ("file", 0, 0, 0o644),
+            "certs/cribl-ca.pem": ("file", 0, 0, 0o644),
             "traefik/dynamic-int.yml": ("file", 0, 0, 0o644),
             "traefik/dynamic-adm.yml": ("file", 0, 0, 0o644),
             "grafana": ("dir", 0, 0, 0o755),
@@ -1422,6 +1423,34 @@
   loop_control:
     label: "{{ item }}"
   changed_when: false
+
+# The SNI probe below validates the edge leaf against certs/ca.pem, which a
+# self-signed placeholder trivially satisfies because it IS its own CA bundle.
+# This gate closes that hole: on any deployment that selected a real CA path,
+# the installed material must be CA-issued, in-window, and chain to a real root.
+# customer-supplied is enforced on every pass; vault-intermediate is enforced as
+# soon as Vault is initialized -- i.e. an operator who initializes Vault but
+# skips the PKI ceremony fails here rather than quietly serving a placeholder.
+- name: Reject placeholder, self-signed, or expiring edge certificates on real-CA profiles
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ stack_dir }}/scripts/edge-tls.py"
+      - validate-installed
+      - --certs-dir
+      - "{{ stack_dir }}/certs"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --min-days-remaining
+      - "{{ aigw_edge_tls_min_days_remaining }}"
+      - --reject-self-signed
+  changed_when: false
+  when: >-
+    aigw_edge_tls_mode == 'customer-supplied' or
+    (aigw_edge_tls_mode == 'vault-intermediate' and
+     vault_public_status is defined and
+     ((vault_public_status.stdout | from_json).initialized | bool))
 
 - name: Prove trusted TLS and SNI routing through the exact service-plane edge addresses
   ansible.builtin.command:

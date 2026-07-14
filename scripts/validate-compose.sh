@@ -179,6 +179,87 @@ assert "operator unseal" not in text
 assert "VAULT_UNSEAL_KEY" not in text
 PY
 grep -Fq 'common_name="*.$DOMAIN" alt_names="$DOMAIN"' "$ROOT/scripts/vault-bootstrap.sh"
+grep -Fq 'common_name="*.$DOMAIN" alt_names="$DOMAIN"' "$ROOT/scripts/vault-pki-intermediate.sh"
+
+# ── Edge TLS / PKI contract ─────────────────────────────────────────────────
+bash -n "$ROOT/scripts/vault-pki-intermediate.sh" "$ROOT/scripts/sign-vault-intermediate.sh"
+
+python3 -I - "$ROOT/scripts/vault-pki-intermediate.sh" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+for required in (
+    "pki_int/intermediate/generate/internal",
+    "pki_int/intermediate/set-signed certificate=-",
+    'allowed_domains="$DOMAIN" allow_subdomains=true allow_bare_domains=true',
+    "AIGW_EDGE_TLS_MODE",
+    "read -r VAULT_TOKEN",
+    "aigw-runtime-up.sh",
+    "edge-tls.py",
+    ".state/edge-tls-issued",
+    "certificate input contains private key material; the customer CA signing key must never be supplied",
+):
+    assert required in text, required
+# The mode-2 ceremony signs a CSR. It must never create a Vault ROOT CA, and it
+# must never accept the customer's root key by any channel.
+assert "pki/root/generate" not in text
+assert "pki/root/sign-intermediate" not in text
+assert "--token" not in text
+assert "--root-key" not in text
+PY
+
+python3 -I - "$ROOT/scripts/sign-vault-intermediate.sh" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+for required in (
+    "basicConstraints = critical,CA:true,pathlen:0",
+    "keyUsage = critical,digitalSignature,cRLSign,keyCertSign",
+    "certificate input contains private key material; the customer CA signing key must never be supplied",
+    "--root-key does not match --root-cert",
+    '"$OPENSSL" x509 -req',
+    # LibreSSL (macOS /usr/bin/openssl) handles these extensions differently;
+    # emitting a subtly wrong intermediate is worse than refusing to sign.
+    '"OpenSSL 3."*',
+):
+    assert required in text, required
+# The root key is read in place and never copied, exported, or transmitted.
+assert "scp" not in text.split("Next: copy ONLY these two files")[0]
+PY
+
+python3 -I - "$ROOT/scripts/edge-tls.py" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+compile(source, sys.argv[1], "exec")
+for required in (
+    "-purpose",
+    "sslserver",
+    "-verify_hostname",
+    'f"DNS:*.{domain}"',
+    "TLS Web Server Authentication",
+    "CA:TRUE",
+    "-checkend",
+    "os.replace",
+    "O_EXCL",
+    "edge-tls=changed",
+    "--reject-self-signed",
+    "DEFAULT_OPENSSL = \"/usr/bin/openssl\"",
+):
+    assert required in source, required
+# One subprocess idiom, no shell, and the private key never reaches a stream:
+# it is passed to openssl by path and copied to its destination as bytes.
+assert "shell=True" not in source
+assert "stdout=subprocess.PIPE" in source
+assert "check_output" not in source
+assert "os.system" not in source
+# `pkey -in KEY -text` would print the PRIVATE key. Strength is read from the
+# public half only.
+assert '"pkey", "-pubin", "-noout", "-text"' in source
+PY
 
 python3 -I - "$ROOT/scripts/validate-vault-config.sh" <<'PY'
 from pathlib import Path
@@ -376,6 +457,7 @@ if ansible.is_file():
         "aigw-compose.sh",
         "aigw-runtime-up.sh",
         "compute-bind-source-digests.py",
+        "edge-tls.py",
         "load-offline-image-seed.py",
         "plan-compose-builds.py",
         "preserve-compose-rollbacks.py",
@@ -395,6 +477,7 @@ if ansible.is_file():
         "validate-identity-policy.py",
         "validate-vault-config.sh",
         "vault-bootstrap.sh",
+        "vault-pki-intermediate.sh",
         "vault-unseal.sh",
         "verify-live-lab-identity.py",
     )
@@ -415,6 +498,12 @@ if ansible.is_file():
     # Evidence canonicalization is controller-side only: deploying it would
     # add production-host authority without any operational requirement.
     assert "safe-inventory-marker.py" not in deployed_scripts
+    # sign-vault-intermediate.sh is the OFFLINE CA-side ceremony: it is the only
+    # script that ever reads the customer's root signing key. Deploying it to the
+    # gateway would put root-CA tooling on the machine most exposed to the
+    # network, and would invite an operator to copy the root key there. It stays
+    # on the CA workstation.
+    assert "sign-vault-intermediate.sh" not in deployed_scripts
     assert re.search(
         r'(?m)^\s*src:\s*"?\{\{ playbook_dir \}\}/\.\./scripts/"?\s*$',
         source,
@@ -819,7 +908,7 @@ env \
   GRAFANA_ADMIN_PASSWORD=ValidationGrafanaAdmin_0123456789 \
   CRIBL_OTLP_ENDPOINT=cribl-mock:4317 \
   CRIBL_OTLP_INSECURE=true \
-  CRIBL_OTLP_CA_FILE=/etc/ssl/certs/aigw-ca.pem \
+  CRIBL_OTLP_CA_FILE=/etc/ssl/certs/aigw-cribl-ca.pem \
   CRIBL_OTLP_SERVER_NAME=cribl-mock \
   sh -eu -c '
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config -q
@@ -1014,6 +1103,23 @@ assert alloy["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
     "http://172.28.15.2:12345/-/ready", "--contains", "Alloy is ready.",
 ]
+# The Cribl export trusts a DEDICATED CA bundle. Alloy must not receive the edge
+# CA at all: mounting it would let any certificate the edge CA signs terminate
+# the telemetry export.
+alloy_binds = {
+    (mount["source"], mount["target"])
+    for mount in alloy["volumes"]
+    if mount["type"] == "bind"
+}
+assert any(
+    source.endswith("/certs/cribl-ca.pem")
+    and target == "/etc/ssl/certs/aigw-cribl-ca.pem"
+    for source, target in alloy_binds
+), alloy_binds
+assert not any(
+    source.endswith("/certs/ca.pem") for source, _ in alloy_binds
+), alloy_binds
+assert alloy["environment"]["CRIBL_OTLP_CA_FILE"] == "/etc/ssl/certs/aigw-cribl-ca.pem"
 assert services["node-exporter"]["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
     "http://127.0.0.1:9100/metrics", "--contains", "node_exporter_build_info",
