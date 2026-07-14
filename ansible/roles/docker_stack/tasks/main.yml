@@ -1245,7 +1245,7 @@
     force: false
   loop:
     - { filename: samba_ad_tls_cert, mode: '0644' }
-    - { filename: samba_ad_tls_key, mode: '0640' }
+    - { filename: samba_ad_tls_key, mode: '0600' }
   loop_control:
     label: "{{ item.filename }}"
   when: samba_lab_enabled | bool
@@ -1256,15 +1256,16 @@
     follow: false
   loop:
     - { filename: samba_ad_tls_cert, mode: '0644' }
-    - { filename: samba_ad_tls_key, mode: '0640' }
+    - { filename: samba_ad_tls_key, mode: '0600' }
   loop_control:
     label: "{{ item.filename }}"
   register: samba_tls_files
   when: samba_lab_enabled | bool
 
-# The private key must never be world-readable. Samba runs as root inside the
-# container, so root:root (cert 0644 public, key 0640 root-only) is sufficient
-# and correct; the ceremony writes exactly these modes.
+# The private key must be exactly 0600: Samba's CVE-2013-4476 guard rejects any
+# group/other bit on the LDAPS key and refuses to start the ldap server task.
+# root:root (cert 0644 public, key 0600 owner-only); the ceremony and the
+# container entrypoint both write exactly these modes.
 - name: Require exact Samba LDAPS certificate material ownership and modes
   ansible.builtin.assert:
     that:
@@ -1277,7 +1278,7 @@
     quiet: true
     fail_msg: >-
       Samba LDAPS certificate material must be a root:root regular single-link
-      file (cert 0644, key 0640): {{ item.item.filename }}
+      file (cert 0644, key 0600): {{ item.item.filename }}
   loop: "{{ samba_tls_files.results }}"
   loop_control:
     label: "{{ item.item.filename }}"
