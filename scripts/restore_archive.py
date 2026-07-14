@@ -46,6 +46,8 @@ POSTGRES_FILES = frozenset(
 STACK_REQUIRED_ROOTS = frozenset(
     {
         "docker-compose.yml",
+        "docker-compose.dns.yml",
+        "docker-compose.platform-dns.yml",
         ".env",
         "alloy",
         "cribl-mock",

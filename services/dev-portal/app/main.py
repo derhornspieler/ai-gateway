@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Form, HTTPException, Path as APIPath, Request
@@ -50,13 +50,40 @@ VENDOR_RE = re.compile(VENDOR_PATTERN)
 IDENTITY_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
 IDENTITY_ID_RE = re.compile(IDENTITY_ID_PATTERN)
 IDENTITY_CAPABILITIES = frozenset({"aigw-users", "aigw-developers", "aigw-admins"})
+PROVIDER_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+PROVIDER_IDENTIFIER_RE = re.compile(PROVIDER_IDENTIFIER_PATTERN)
+PROVIDER_STATES = frozenset(
+    {
+        "identity_bootstrap_required",
+        "awaiting_enrollment",
+        "configured",
+        "jwks_drift",
+        "revocation_pending",
+        "unavailable",
+    }
+)
 PROJECT_LOCK_STRIPES = 64
 AMBIGUOUS_GENERATE_CLEANUP_LIMIT = 8
 _project_locks = tuple(asyncio.Lock() for _ in range(PROJECT_LOCK_STRIPES))
+# A browser disconnect must not cancel a post-generation authorization check
+# halfway through and leave its plaintext-bearing response path in an
+# indeterminate state. Keep shielded tasks strongly referenced until they have
+# completed; asyncio itself retains only weak references to scheduled tasks.
+_post_generation_liveness_tasks: set[asyncio.Task[None]] = set()
 
 
 class ActiveProjectKeyExists(Exception):
     """Raised when an owner already has an active key for a portal project."""
+
+
+class VaultSealedAuthorizationUnavailable(HTTPException):
+    """A live-authorization failure proven to originate at sealed Vault."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=503,
+            detail="Current administrator authorization is unavailable while Vault is sealed.",
+        )
 
 
 def _audit(action: str, outcome: str, user: dict[str, Any], **fields: Any) -> None:
@@ -314,7 +341,10 @@ async def logout(request: Request):
 # Login/logout handlers are shared implementation, but each ASGI app resolves
 # callbacks against its own host, OIDC client, cookie, and session secret.
 admin_app.add_api_route(
-    "/login", login_page, methods=["GET"], response_class=HTMLResponse,
+    "/login",
+    login_page,
+    methods=["GET"],
+    response_class=HTMLResponse,
     name="login_page",
 )
 admin_app.add_api_route("/login/start", login_start, methods=["GET"])
@@ -347,55 +377,61 @@ def _project_lock(user_id: str, project_id: str) -> asyncio.Lock:
 
 
 def _key_metadata(entry: dict[str, Any]) -> dict[str, Any]:
+    """Decode LiteLLM metadata without turning malformed portal state into none.
+
+    The complete owner inventory controls whether another static bearer key
+    may be issued.  A malformed metadata field can belong to a previously
+    portal-created key, so silently treating it as an ordinary unmanaged key
+    would weaken the one-active-key invariant.
+    """
+
     raw = entry.get("metadata")
     if isinstance(raw, dict):
         return raw
-    if isinstance(raw, str) and len(raw) <= 64 * 1024:
+    if raw in (None, ""):
+        return {}
+    if isinstance(raw, str) and len(raw.encode("utf-8")) <= 64 * 1024:
         try:
             parsed = json.loads(raw)
-        except ValueError:
-            return {}
+        except (TypeError, ValueError) as exc:
+            raise litellm_client.LiteLLMError(
+                "key inventory metadata is not valid JSON"
+            ) from exc
         if isinstance(parsed, dict):
             return parsed
-    return {}
+    raise litellm_client.LiteLLMError("key inventory metadata is not a bounded object")
 
 
 def _entry_project_id(entry: dict[str, Any]) -> str | None:
-    """Derive one unambiguous stable project from a full LiteLLM key object."""
-    metadata = _key_metadata(entry)
-    metadata_project = metadata.get(litellm_client.PORTAL_PROJECT_METADATA_KEY)
-    native_project = entry.get("project_id")
+    """Return a project's ID only for a key minted by this portal.
 
-    if metadata_project is not None and (
-        not isinstance(metadata_project, str)
-        or litellm_client.PROJECT_ID_RE.fullmatch(metadata_project) is None
+    The dev portal holds a powerful LiteLLM control credential, but it must
+    only render, deactivate, or count keys whose immutable provenance it
+    created.  Native ``project_id`` and arbitrary metadata also occur on
+    operator-managed keys; treating either as portal provenance would let a
+    user deactivate another control-plane key merely because it shares an
+    owner/project label.
+    """
+
+    metadata = _key_metadata(entry)
+    if (
+        metadata.get(litellm_client.PORTAL_KEY_CREATOR_FIELD)
+        != litellm_client.PORTAL_KEY_CREATOR_VALUE
     ):
-        raise litellm_client.LiteLLMError(
-            "key inventory contains an invalid portal project identifier"
-        )
-    if native_project is not None and (
-        not isinstance(native_project, str)
-        or litellm_client.PROJECT_ID_RE.fullmatch(native_project) is None
+        return None
+
+    project_id = metadata.get(litellm_client.PORTAL_PROJECT_METADATA_KEY)
+    if (
+        not isinstance(project_id, str)
+        or litellm_client.PROJECT_ID_RE.fullmatch(project_id) is None
     ):
+        # A legacy/corrupted portal key cannot be assigned safely when a user
+        # may belong to multiple managed projects.  Fail closed instead of
+        # silently allowing a second active key or exposing its identifier.
         raise litellm_client.LiteLLMError(
-            "key inventory contains an invalid native project identifier"
+            "portal key has no unambiguous project identifier"
         )
-    if metadata_project and native_project and metadata_project != native_project:
-        raise litellm_client.LiteLLMError(
-            "key inventory contains conflicting project identifiers"
-        )
-    if isinstance(metadata_project, str) and metadata_project:
-        return metadata_project
-    if isinstance(native_project, str) and native_project:
-        return native_project
-    # A legacy portal key without a project cannot be assigned safely when a
-    # user may belong to multiple Keycloak project groups.  Fail the inventory
-    # closed instead of silently choosing a first project.
-    if metadata.get("created_via") == "dev-portal":
-        raise litellm_client.LiteLLMError(
-            "legacy portal key has no unambiguous project identifier"
-        )
-    return None
+    return project_id
 
 
 def _is_active_key(entry: dict[str, Any], *, now: datetime | None = None) -> bool:
@@ -489,8 +525,7 @@ def _concrete_key_ids(entries: list[Any]) -> frozenset[str]:
     return frozenset(
         concrete
         for entry in entries
-        if isinstance(entry, dict)
-        and (concrete := _entry_delete_id(entry)) is not None
+        if isinstance(entry, dict) and (concrete := _entry_delete_id(entry)) is not None
     )
 
 
@@ -680,6 +715,70 @@ async def _generate_project_key(
         return plaintext, after
 
 
+def _retain_post_generation_liveness_task(
+    task: asyncio.Task[None],
+) -> asyncio.Task[None]:
+    """Keep a shielded post-generation check alive after client cancellation."""
+
+    _post_generation_liveness_tasks.add(task)
+
+    def _complete(completed: asyncio.Task[None]) -> None:
+        _post_generation_liveness_tasks.discard(completed)
+        if completed.cancelled():
+            logger.error(
+                "post-generation membership verification was cancelled; "
+                "generated plaintext was not disclosed"
+            )
+            return
+        # Retrieve any exception even when the browser disconnected before the
+        # shielded waiter could observe it. The exception remains available to
+        # an active waiter, but this avoids an unobserved-task warning.
+        if completed.exception() is not None:
+            logger.warning(
+                "post-generation membership verification failed; generated "
+                "plaintext was not disclosed"
+            )
+
+    task.add_done_callback(_complete)
+    return task
+
+
+async def _deactivate_undisclosed_generated_key(key_value: str) -> None:
+    """Attempt bounded cleanup without ever logging the generated credential."""
+
+    try:
+        await litellm_client.key_deactivate(key_value)
+    except Exception:  # noqa: BLE001 - cleanup must not turn into disclosure
+        # The caller still fails closed. The identity controller's independent
+        # reconciliation will retry any static key that survives this bounded
+        # direct attempt, but the browser never receives its plaintext.
+        logger.error(
+            "could not deactivate a generated key after membership could not "
+            "be verified"
+        )
+
+
+async def _verify_post_generation_liveness(
+    request: Request,
+    user: dict[str, Any],
+    project_id: str,
+    key_value: str,
+) -> None:
+    """Prove membership again, revoking an undisclosed key on every failure."""
+
+    try:
+        projects = await _live_project_ids(request, user)
+    except Exception:  # noqa: BLE001 - HTTP 503/ambiguous membership is unsafe
+        await _deactivate_undisclosed_generated_key(key_value)
+        raise
+
+    if project_id not in projects:
+        await _deactivate_undisclosed_generated_key(key_value)
+        raise litellm_client.LiteLLMError(
+            "project membership changed during key generation"
+        )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(
     request: Request, user: dict[str, Any] = Depends(auth.require_developer)
@@ -744,13 +843,17 @@ async def create_key(
             user["sub"], clean_alias, clean_project, project_ids
         )
         # Close the normal group-removal race before the one-time plaintext is
-        # rendered. If membership changed during generation, revoke the new
-        # key and never disclose it.
-        if clean_project not in await _live_project_ids(request, user):
-            await litellm_client.key_deactivate(key_value)
-            raise litellm_client.LiteLLMError(
-                "project membership changed during key generation"
+        # rendered. The check is shielded so a browser disconnect cannot abort
+        # its revoke path; any revoked, unavailable, or ambiguous live decision
+        # leaves the key undisclosed.
+        post_generation_liveness = _retain_post_generation_liveness_task(
+            asyncio.create_task(
+                _verify_post_generation_liveness(
+                    request, user, clean_project, key_value
+                )
             )
+        )
+        await asyncio.shield(post_generation_liveness)
     except ActiveProjectKeyExists:
         _audit(
             "key.generate",
@@ -917,9 +1020,7 @@ async def _rotator_get(path: str) -> Any:
     return resp.json()
 
 
-async def _live_project_ids(
-    request: Request, user: dict[str, Any]
-) -> tuple[str, ...]:
+async def _live_project_ids(request: Request, user: dict[str, Any]) -> tuple[str, ...]:
     """Return a bounded, unambiguous live Keycloak project decision."""
     subject = user.get("sub")
     if not isinstance(subject, str) or IDENTITY_ID_RE.fullmatch(subject) is None:
@@ -1005,12 +1106,15 @@ async def _rotator_post(path: str, payload: dict[str, Any] | None = None) -> Any
     return resp.json() if resp.content else None
 
 
-async def _rotator_delete(path: str) -> Any:
+async def _rotator_delete(path: str, payload: dict[str, Any] | None = None) -> Any:
     url = settings.rotator_url.rstrip("/") + path
     async with httpx.AsyncClient(
         timeout=10, trust_env=False, follow_redirects=False
     ) as client:
-        resp = await client.delete(url, headers=_rotator_headers())
+        kwargs: dict[str, Any] = {"headers": _rotator_headers()}
+        if payload is not None:
+            kwargs["json"] = payload
+        resp = await client.delete(url, **kwargs)
     resp.raise_for_status()
     return resp.json() if resp.content else None
 
@@ -1034,15 +1138,15 @@ async def require_live_admin(
     try:
         decision = await _rotator_get(f"/identity/authorization/{subject}")
     except Exception as exc:  # noqa: BLE001 - fail closed without upstream detail
+        if _is_vault_sealed_authorization_error(exc):
+            raise VaultSealedAuthorizationUnavailable() from exc
         # The durable controller does not exist before the one-time bootstrap.
         # Permit only that exact recovery state (temporary bootstrap available,
         # durable controller not configured) to rely on the freshly validated
         # signed OIDC admin role.  Once configured, every request must pass the
         # live controller decision; outages fail closed.
         try:
-            status = _safe_identity_status(
-                await _rotator_get("/identity/status")
-            )
+            status = _safe_identity_status(await _rotator_get("/identity/status"))
         except Exception:  # noqa: BLE001
             status = None
         if not (
@@ -1060,6 +1164,21 @@ async def require_live_admin(
         request.session.clear()
         raise auth.NotAuthorized()
     return user
+
+
+def _is_vault_sealed_authorization_error(exc: Exception) -> bool:
+    """Recognize only the controller's exact, non-secret sealed error code."""
+
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    response = exc.response
+    if response.status_code != 423:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload == {"detail": "vault_sealed"}
 
 
 async def require_recent_live_admin(
@@ -1090,6 +1209,21 @@ def _safe_identity_status(raw: Any) -> dict[str, Any] | None:
         "controller_certificate_sha256": fingerprint("controller_certificate_sha256"),
         "broker_certificate_sha256": fingerprint("broker_certificate_sha256"),
     }
+
+
+async def _confirmed_vault_sealed() -> bool:
+    """Accept only the rotator's exact, public-data-only sealed state."""
+
+    try:
+        raw = await _rotator_get("/vault/public-status")
+    except Exception:  # noqa: BLE001 - every ambiguous state fails closed
+        return False
+    return (
+        isinstance(raw, dict)
+        and set(raw) == {"initialized", "sealed"}
+        and raw["initialized"] is True
+        and raw["sealed"] is True
+    )
 
 
 def _safe_identity_groups(raw: Any) -> list[dict[str, Any]]:
@@ -1162,22 +1296,191 @@ def _safe_identity_users(raw: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _safe_provider_status(raw: Any) -> dict[str, Any] | None:
+    """Allowlist the non-secret provider state rendered by the admin page.
+
+    The upstream rotator holds Vault access. A compromised or accidentally
+    broadened response must not turn this browser surface into a generic
+    secret viewer, so unknown fields are discarded and the public JWKS bundle
+    is rebuilt from a narrow schema.
+    """
+
+    if isinstance(raw, list):
+        matches = [
+            item
+            for item in raw
+            if isinstance(item, dict) and item.get("vendor") == "anthropic"
+        ]
+        if len(matches) != 1:
+            return None
+        raw = matches[0]
+    elif isinstance(raw, dict) and isinstance(raw.get("providers"), list):
+        return _safe_provider_status(raw["providers"])
+    if not isinstance(raw, dict) or raw.get("vendor") != "anthropic":
+        return None
+
+    state_value = raw.get("state")
+    state_name = state_value if state_value in PROVIDER_STATES else "unavailable"
+
+    def fingerprint(name: str) -> str:
+        value = raw.get(name)
+        if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value):
+            return value.lower()
+        return ""
+
+    identifiers: dict[str, str] = {}
+    raw_identifiers = raw.get("nonsecret_ids")
+    if isinstance(raw_identifiers, dict):
+        for name in (
+            "organization_id",
+            "service_account_id",
+            "federation_rule_id",
+            "workspace_id",
+        ):
+            value = raw_identifiers.get(name)
+            if (
+                isinstance(value, str)
+                and value
+                and PROVIDER_IDENTIFIER_RE.fullmatch(value)
+            ):
+                identifiers[name] = value
+
+    bundle: dict[str, Any] | None = None
+    raw_bundle = raw.get("setup_bundle")
+    if isinstance(raw_bundle, dict):
+        issuer = raw_bundle.get("issuer")
+        client_id = raw_bundle.get("client_id")
+        subject = raw_bundle.get("subject")
+        audience = raw_bundle.get("audience")
+        try:
+            parsed_issuer = urlsplit(issuer) if isinstance(issuer, str) else None
+        except ValueError:
+            parsed_issuer = None
+        public_text = (client_id, subject, audience)
+        if (
+            parsed_issuer is not None
+            and parsed_issuer.scheme == "https"
+            and parsed_issuer.hostname
+            and parsed_issuer.username is None
+            and parsed_issuer.password is None
+            and not parsed_issuer.query
+            and not parsed_issuer.fragment
+            and len(issuer) <= 512
+            and all(
+                isinstance(value, str)
+                and 0 < len(value) <= 512
+                and not any(ord(character) < 32 for character in value)
+                for value in public_text
+            )
+        ):
+            safe_keys: list[dict[str, str]] = []
+            raw_jwks = raw_bundle.get("jwks")
+            raw_keys = raw_jwks.get("keys") if isinstance(raw_jwks, dict) else None
+            if isinstance(raw_keys, list) and len(raw_keys) <= 16:
+                for raw_key in raw_keys:
+                    if not isinstance(raw_key, dict):
+                        safe_keys = []
+                        break
+                    safe_key: dict[str, str] = {}
+                    for field in (
+                        "kty",
+                        "use",
+                        "kid",
+                        "alg",
+                        "n",
+                        "e",
+                        "crv",
+                        "x",
+                        "y",
+                    ):
+                        value = raw_key.get(field)
+                        if isinstance(value, str) and 0 < len(value) <= 4096:
+                            safe_key[field] = value
+                    if "kty" not in safe_key or "kid" not in safe_key:
+                        safe_keys = []
+                        break
+                    safe_keys.append(safe_key)
+            if safe_keys:
+                bundle = {
+                    "issuer": issuer,
+                    "client_id": client_id,
+                    "subject": subject,
+                    "audience": audience,
+                    "jwks": {"keys": safe_keys},
+                    "jwks_json": json.dumps(
+                        {"keys": safe_keys},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                }
+
+    pending_until = raw.get("revocation_pending_until")
+    if (
+        not isinstance(pending_until, str)
+        or len(pending_until) > 64
+        or any(ord(character) < 32 for character in pending_until)
+    ):
+        pending_until = ""
+
+    return {
+        "vendor": "anthropic",
+        "state": state_name,
+        "configured": raw.get("configured") is True,
+        "enabled": raw.get("enabled") is True,
+        "private_key_jwt_ready": raw.get("private_key_jwt_ready") is True,
+        "nonsecret_ids": identifiers,
+        "client_certificate_sha256": fingerprint("client_certificate_sha256"),
+        "current_jwks_sha256": fingerprint("current_jwks_sha256"),
+        "approved_jwks_sha256": fingerprint("approved_jwks_sha256"),
+        "revocation_pending_until": pending_until,
+        "setup_bundle": bundle,
+    }
+
+
 @admin_app.get("/admin", response_class=HTMLResponse)
 async def admin_page(
-    request: Request, user: dict[str, Any] = Depends(require_live_admin)
+    request: Request, user: dict[str, Any] = Depends(auth.require_admin)
 ) -> HTMLResponse:
     # This page includes directory identities, group membership, credential-
     # rotation status/history, and active settings. A signed role snapshot is
     # not enough after revocation: require the same live Keycloak composite-
     # role decision used by mutations. Viewing does not require fresh step-up;
     # destructive identity changes still do.
+    try:
+        await require_live_admin(request, user)
+    except VaultSealedAuthorizationUnavailable:
+        # A sealed Vault prevents the durable identity controller from making
+        # its live authorization decision. A currently valid, signed OIDC
+        # admin session may see only this data-free maintenance page so the
+        # operator can proceed to the separately gated Vault UI and unseal.
+        # Role denial, expired/invalid cookies, and every non-Vault outage keep
+        # their existing fail-closed behavior. Mutations still depend directly
+        # on require_live_admin/require_recent_live_admin and never enter here.
+        if not await _confirmed_vault_sealed():
+            raise HTTPException(
+                status_code=503,
+                detail="Current administrator authorization could not be verified.",
+            )
+        return templates.TemplateResponse(
+            request,
+            "admin_maintenance.html",
+            {
+                "user": None,
+                "show_session_logout": True,
+                "admin_surface": True,
+                "flashes": [],
+            },
+        )
+
     status_data: Any = None
     vendors: list[dict[str, Any]] = []
     history: list[dict[str, Any]] = []
+    anthropic_provider: dict[str, Any] | None = None
     identity_status: dict[str, Any] | None = None
     identity_groups: list[dict[str, Any]] = []
     identity_users: list[dict[str, Any]] = []
     identity_members: list[dict[str, Any]] = []
+    selected_group: dict[str, Any] | None = None
     selected_group_id = request.query_params.get("group_id", "")
     if not IDENTITY_ID_RE.fullmatch(selected_group_id):
         selected_group_id = ""
@@ -1223,6 +1526,17 @@ async def admin_page(
         auth.flash(request, "Could not reach key-rotator for history.", "error")
 
     try:
+        anthropic_provider = _safe_provider_status(
+            await _rotator_get("/providers/anthropic")
+        )
+        if anthropic_provider is None:
+            raise ValueError("provider status was invalid")
+    except Exception:  # noqa: BLE001
+        auth.flash(
+            request, "Could not reach the provider enrollment controller.", "error"
+        )
+
+    try:
         identity_status = _safe_identity_status(await _rotator_get("/identity/status"))
         if identity_status and identity_status["configured"]:
             identity_groups = _safe_identity_groups(
@@ -1231,6 +1545,12 @@ async def admin_page(
             valid_group_ids = {group["id"] for group in identity_groups}
             if selected_group_id not in valid_group_ids:
                 selected_group_id = ""
+            else:
+                selected_group = next(
+                    group
+                    for group in identity_groups
+                    if group["id"] == selected_group_id
+                )
             identity_users = _safe_identity_users(
                 await _rotator_get(
                     "/identity/users?" + urlencode({"search": user_search})
@@ -1252,10 +1572,12 @@ async def admin_page(
             "status": status_data,
             "vendors": vendors,
             "history": history,
+            "anthropic_provider": anthropic_provider,
             "identity_status": identity_status,
             "identity_groups": identity_groups,
             "identity_users": identity_users,
             "identity_members": identity_members,
+            "selected_group": selected_group,
             "selected_group_id": selected_group_id,
             "user_search": user_search,
             "identity_capabilities": sorted(IDENTITY_CAPABILITIES),
@@ -1316,6 +1638,147 @@ async def admin_rotate_now(
         _audit("rotation.trigger", "failure", user, vendor=vendor)
         auth.flash(request, f"Could not trigger rotation for {vendor}.", "error")
 
+    return RedirectResponse("/admin", status_code=303)
+
+
+# --- admin / provider authentication enrollment ---------------------------
+
+
+@admin_app.post("/admin/providers/anthropic")
+async def admin_configure_anthropic_provider(
+    request: Request,
+    user: dict[str, Any] = Depends(require_recent_live_admin),
+    organization_id: str = Form(..., pattern=PROVIDER_IDENTIFIER_PATTERN),
+    service_account_id: str = Form(..., pattern=PROVIDER_IDENTIFIER_PATTERN),
+    federation_rule_id: str = Form(..., pattern=PROVIDER_IDENTIFIER_PATTERN),
+    workspace_id: str = Form(default="", max_length=128),
+    federation_jwks_sha256: str = Form(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"[0-9a-fA-F]{64}",
+    ),
+    enrollment_confirmation: str = Form(..., min_length=1, max_length=32),
+    csrf_token: str = Form(..., min_length=32, max_length=128),
+):
+    if not auth.verify_csrf(request, csrf_token):
+        auth.flash(request, "Your session expired — please try again.", "error")
+        return RedirectResponse("/admin", status_code=303)
+    if not secrets.compare_digest(enrollment_confirmation, "ENROLLED"):
+        auth.flash(
+            request,
+            "Complete the external Anthropic enrollment and type ENROLLED exactly.",
+            "error",
+        )
+        return RedirectResponse("/admin", status_code=303)
+    clean_workspace = workspace_id.strip()
+    if clean_workspace and PROVIDER_IDENTIFIER_RE.fullmatch(clean_workspace) is None:
+        auth.flash(request, "Workspace ID contains unsupported characters.", "error")
+        return RedirectResponse("/admin", status_code=303)
+    payload = {
+        "organization_id": organization_id,
+        "service_account_id": service_account_id,
+        "federation_rule_id": federation_rule_id,
+        "workspace_id": clean_workspace or None,
+        # Bind the operator's ENROLLED confirmation to the exact public JWKS
+        # copied from this rendered page. The rotator refetches and compares it
+        # before persisting any provider enrollment.
+        "federation_jwks_sha256": federation_jwks_sha256.lower(),
+        "enrollment_confirmation": enrollment_confirmation,
+    }
+    try:
+        result = await _rotator_put("/providers/anthropic", payload)
+        changed = isinstance(result, dict) and result.get("changed") is True
+        _audit(
+            "provider.anthropic.configure",
+            "success",
+            user,
+            changed=changed,
+        )
+        auth.flash(
+            request,
+            "Anthropic WIF enrollment saved. No private key material was returned.",
+            "success",
+        )
+    except Exception:  # noqa: BLE001 - upstream detail can contain identifiers
+        _audit("provider.anthropic.configure", "failure", user)
+        auth.flash(
+            request,
+            "Anthropic enrollment was not saved; existing provider state was preserved.",
+            "error",
+        )
+    return RedirectResponse("/admin", status_code=303)
+
+
+@admin_app.post("/admin/providers/anthropic/disable")
+async def admin_disable_anthropic_provider(
+    request: Request,
+    user: dict[str, Any] = Depends(require_recent_live_admin),
+    confirmation: str = Form(..., min_length=1, max_length=32),
+    csrf_token: str = Form(..., min_length=32, max_length=128),
+):
+    if not auth.verify_csrf(request, csrf_token):
+        auth.flash(request, "Your session expired — please try again.", "error")
+        return RedirectResponse("/admin", status_code=303)
+    if not secrets.compare_digest(confirmation, "DISABLE anthropic"):
+        auth.flash(
+            request,
+            "Type DISABLE anthropic exactly to stop token refresh.",
+            "error",
+        )
+        return RedirectResponse("/admin", status_code=303)
+    try:
+        result = await _rotator_post(
+            "/providers/anthropic/disable", {"confirmation": confirmation}
+        )
+        state_name = result.get("state") if isinstance(result, dict) else ""
+        _audit("provider.anthropic.disable", "success", user, state=state_name)
+        if state_name == "revocation_pending":
+            auth.flash(
+                request,
+                "Refresh stopped. Deletion remains blocked until the last short-lived token is provably expired.",
+                "info",
+            )
+        else:
+            auth.flash(request, "Anthropic token refresh is disabled.", "success")
+    except Exception:  # noqa: BLE001
+        _audit("provider.anthropic.disable", "failure", user)
+        auth.flash(
+            request,
+            "Could not prove a safe provider disable; no deletion was attempted.",
+            "error",
+        )
+    return RedirectResponse("/admin", status_code=303)
+
+
+@admin_app.post("/admin/providers/anthropic/delete")
+async def admin_delete_anthropic_provider(
+    request: Request,
+    user: dict[str, Any] = Depends(require_recent_live_admin),
+    confirmation: str = Form(..., min_length=1, max_length=32),
+    csrf_token: str = Form(..., min_length=32, max_length=128),
+):
+    if not auth.verify_csrf(request, csrf_token):
+        auth.flash(request, "Your session expired — please try again.", "error")
+        return RedirectResponse("/admin", status_code=303)
+    if not secrets.compare_digest(confirmation, "DELETE anthropic"):
+        auth.flash(
+            request,
+            "Type DELETE anthropic exactly to remove enrollment state.",
+            "error",
+        )
+        return RedirectResponse("/admin", status_code=303)
+    try:
+        await _rotator_delete("/providers/anthropic", {"confirmation": confirmation})
+        _audit("provider.anthropic.delete", "success", user)
+        auth.flash(request, "Anthropic enrollment state deleted.", "success")
+    except Exception:  # noqa: BLE001
+        _audit("provider.anthropic.delete", "failure", user)
+        auth.flash(
+            request,
+            "Provider state was retained because active-credential revocation or expiry could not be proven.",
+            "error",
+        )
     return RedirectResponse("/admin", status_code=303)
 
 

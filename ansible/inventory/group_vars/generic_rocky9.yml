@@ -1,0 +1,26 @@
+---
+# This child group makes the generic/customer profile explicit even when a
+# controller environment happens to carry a lab-oriented variable. The lab
+# inventory does not join this group.
+deployment_profile: generic-rocky9
+require_encrypted_state: true
+require_preupgrade_backup: true
+platform_authoritative_dns_enabled: false
+aigw_ssh_password_authentication: false
+aigw_adm_socks_enabled: false
+aigw_adm_socks_users: []
+aigw_adm_socks_groups: []
+aigw_adm_socks_source_cidrs: []
+aigw_adm_socks_group_test_users: {}
+aigw_adm_socks_trusted_operator_ack: ""
+samba_lab_enabled: false
+aigw_seed_test_users: false
+retain_bootstrap_admin_user: false
+aigw_prebootstrap_oidc_scope_reconciliation: false
+aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
+aigw_lab_reset_handoff_drop_interfaces: []
+offline_image_seed_enabled: false
+offline_image_seed_remote_path: ""
+offline_image_seed_sha256: ""
+offline_image_seed_manifest_remote_path: ""
+offline_image_seed_manifest_sha256: ""

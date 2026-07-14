@@ -1,10 +1,30 @@
 ---
+- name: Define the exact resolver and optional service Compose overlays
+  ansible.builtin.set_fact:
+    aigw_compose_files: >-
+      {{ ['docker-compose.yml', 'docker-compose.dns.yml']
+         + (['docker-compose.platform-dns.yml']
+            if (platform_authoritative_dns_enabled | bool) else [])
+         + (['docker-compose.lab.yml']
+            if (samba_lab_enabled | bool) else []) }}
+    aigw_compose_profiles: >-
+      {{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}
+    aigw_compose_cli_overlay_args: >-
+      {{ ['--file', 'docker-compose.yml', '--file', 'docker-compose.dns.yml']
+         + (['--file', 'docker-compose.platform-dns.yml']
+            if (platform_authoritative_dns_enabled | bool) else [])
+         + (['--file', 'docker-compose.lab.yml']
+            if (samba_lab_enabled | bool) else [])
+         + (['--profile', 'lab-ad']
+            if (samba_lab_enabled | bool) else []) }}
+
 - name: Validate fixed edge IP / trusted-proxy network ABI
   ansible.builtin.assert:
     that:
       - traefik_int_chat_ip == '172.28.3.2'
       - traefik_int_portal_ip == '172.28.4.2'
       - traefik_adm_admin_ip == '172.28.5.2'
+      - oauth2_proxy_litellm_ip == '172.28.5.3'
       - traefik_adm_grafana_ip == '172.28.6.2'
       - oauth2_proxy_grafana_ip == '172.28.6.3'
       - alloy_telemetry_ip == '172.28.13.2'
@@ -26,6 +46,18 @@
       Compose, Keycloak/oauth2-proxy/Uvicorn trust, and these assertions as one
       reviewed change; do not let callback reconstruction drift.
 
+- name: Validate the platform DNS administrative view selector
+  ansible.builtin.assert:
+    that:
+      - vpn_client_cidr is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[1-9]|[12][0-9]|3[0-2])$')
+      - vpn_client_cidr not in ['0.0.0.0/0', '10.8.0.0/24']
+      - vpn_client_cidr != internal_cidr
+    quiet: true
+    fail_msg: >-
+      Platform split DNS requires the already-validated, non-placeholder ADM/VPN
+      client CIDR and it must remain distinct from the internal-user CIDR.
+  when: platform_authoritative_dns_enabled | bool
+
 - name: Process optional offline external-image seed before Compose
   ansible.builtin.include_tasks: offline_image_seed.yml
 
@@ -36,6 +68,178 @@
     owner: root
     group: root
     mode: "0750"
+
+# Keycloak imports client secrets only while a realm is first created. The
+# post-bootstrap identity controller deliberately has no manage-clients role,
+# so changing a relying-party secret in .env first would restart applications
+# with credentials Keycloak does not know and take every affected SSO path
+# down. Treat those four credentials as immutable during ordinary converge.
+# A future rotation workflow must update Keycloak first with a separately
+# reviewed short-lived authority and only then atomically advance this state.
+- name: Inspect the existing stack environment before any deployment write
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/.env"
+    follow: false
+    get_checksum: false
+  register: aigw_existing_env_path
+  no_log: true
+
+- name: Require a private regular existing stack environment
+  ansible.builtin.assert:
+    that:
+      - aigw_existing_env_path.stat.isreg | default(false)
+      - not (aigw_existing_env_path.stat.islnk | default(false))
+      - aigw_existing_env_path.stat.uid == 0
+      - aigw_existing_env_path.stat.gid == 0
+      - aigw_existing_env_path.stat.mode == '0600'
+      - (aigw_existing_env_path.stat.nlink | int) == 1
+      - (aigw_existing_env_path.stat.size | int) > 0
+      - (aigw_existing_env_path.stat.size | int) <= 262144
+    quiet: true
+    fail_msg: Existing stack environment has an unsafe object, owner, or mode boundary.
+  when: aigw_existing_env_path.stat.exists
+  no_log: true
+
+- name: Inspect persistent Keycloak database state on the clean-state path
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - --host
+      - unix:///run/docker.sock
+      - volume
+      - inspect
+      - "{{ compose_project_name }}_pg_data"
+  register: aigw_clean_state_pg_volume
+  changed_when: false
+  failed_when: false
+  when: not aigw_existing_env_path.stat.exists
+
+- name: Permit no-environment bootstrap only when persistent identity state is absent
+  ansible.builtin.assert:
+    that:
+      - aigw_clean_state_pg_volume.rc == 1
+      - aigw_clean_state_pg_volume.stderr is search('(?i)no such volume')
+    quiet: true
+    fail_msg: >-
+      Refusing a new stack environment because persistent PostgreSQL/Keycloak
+      state already exists. Restore its matching root-only .env or use the
+      separately reviewed destructive clean-state rebuild procedure.
+  when: not aigw_existing_env_path.stat.exists
+
+- name: Read the existing stack environment for immutable OIDC comparison
+  ansible.builtin.slurp:
+    src: "{{ stack_dir }}/.env"
+  register: aigw_existing_env
+  when: aigw_existing_env_path.stat.exists
+  no_log: true
+
+- name: Reject ordinary converge when a Keycloak relying-party secret drifts
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import base64
+        import hmac
+        import json
+        import re
+        import sys
+
+        expected_keys = (
+            "WEBUI_OIDC_CLIENT_SECRET",
+            "PORTAL_OIDC_CLIENT_SECRET",
+            "ADMIN_PORTAL_OIDC_CLIENT_SECRET",
+            "OAUTH2_PROXY_CLIENT_SECRET",
+        )
+        try:
+            request = json.loads(sys.stdin.buffer.read(524289))
+            if not isinstance(request, dict) or set(request) != {
+                "deployed_b64",
+                "desired",
+            }:
+                raise ValueError
+            desired = request["desired"]
+            if not isinstance(desired, dict) or set(desired) != set(expected_keys):
+                raise ValueError
+            if any(
+                not isinstance(desired[key], str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{32,}", desired[key]) is None
+                for key in expected_keys
+            ):
+                raise ValueError
+            if len(set(desired.values())) != len(expected_keys):
+                raise ValueError
+
+            encoded = request["deployed_b64"]
+            if not isinstance(encoded, str) or len(encoded) > 350000:
+                raise ValueError
+            payload = base64.b64decode(encoded.encode("ascii", "strict"), validate=True)
+            if not payload or len(payload) > 262144:
+                raise ValueError
+            decoded = payload.decode("utf-8", "strict")
+            deployed = {}
+            for line in decoded.splitlines():
+                key, separator, value = line.partition("=")
+                if key not in expected_keys:
+                    if any(
+                        re.match(
+                            rf"^\s*(?:export\s+)?{re.escape(candidate)}(?:\s*=|\s*$)",
+                            line,
+                        )
+                        for candidate in expected_keys
+                    ):
+                        raise ValueError
+                    continue
+                if (
+                    separator != "="
+                    or key in deployed
+                    or re.fullmatch(r"[A-Za-z0-9_-]{32,}", value) is None
+                ):
+                    raise ValueError
+                deployed[key] = value
+            if set(deployed) != set(expected_keys):
+                raise ValueError
+            if len(set(deployed.values())) != len(expected_keys):
+                raise ValueError
+            if any(
+                not hmac.compare_digest(deployed[key], desired[key])
+                for key in expected_keys
+            ):
+                raise ValueError
+        except Exception:
+            raise SystemExit(1)
+  args:
+    stdin: >-
+      {{
+        {
+          'deployed_b64': aigw_existing_env.content,
+          'desired': {
+            'WEBUI_OIDC_CLIENT_SECRET': webui_oidc_client_secret | default(''),
+            'PORTAL_OIDC_CLIENT_SECRET': portal_oidc_client_secret | default(''),
+            'ADMIN_PORTAL_OIDC_CLIENT_SECRET': admin_portal_oidc_client_secret | default(''),
+            'OAUTH2_PROXY_CLIENT_SECRET': oauth2_proxy_client_secret | default('')
+          }
+        } | to_json
+      }}
+    stdin_add_newline: false
+  register: aigw_oidc_rp_secret_drift_check
+  changed_when: false
+  failed_when: false
+  when: aigw_existing_env_path.stat.exists
+  no_log: true
+
+- name: Fail closed before deploy when an OIDC relying-party secret changed
+  ansible.builtin.assert:
+    that:
+      - aigw_oidc_rp_secret_drift_check.rc == 0
+    quiet: true
+    fail_msg: >-
+      An existing Keycloak OIDC relying-party credential is missing, invalid,
+      reused, or differs from the requested deployment value. Ordinary
+      converge cannot rotate it; use a reviewed Keycloak-first rotation
+      procedure or a destructive clean-state rebuild.
+  when: aigw_existing_env_path.stat.exists
 
 # Deploy an explicit allow-list. A recursive copy of the working tree also
 # copied ignored local .env/private-key/secrets files; .gitignore is not an
@@ -78,6 +282,7 @@
   loop:
     - bind-source-digest-inputs.json
     - docker-compose.yml
+    - docker-compose.platform-dns.yml
     - docker-compose.lab.yml
     - alloy/config.alloy
     - cribl-mock/config.yaml
@@ -93,6 +298,27 @@
     - traefik/dynamic-adm.yml
     - tempo/config.yml
     - vault/config.hcl
+
+- name: Render plane-specific container resolver lists
+  ansible.builtin.template:
+    src: docker-compose.dns.yml.j2
+    dest: "{{ stack_dir }}/docker-compose.dns.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Render the environment-specific authoritative DNS views
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ stack_dir }}/services/lab-dns/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: Corefile.authoritative.j2, dest: Corefile }
+    - { src: db.aigw.internal.j2, dest: db.aigw.internal }
+    - { src: db.aigw.internal.adm.j2, dest: db.aigw.internal.adm }
+  when: platform_authoritative_dns_enabled | bool
 
 - name: Render mutually exclusive Cribl plaintext or verified-TLS client
   ansible.builtin.blockinfile:
@@ -195,7 +421,7 @@
   when:
     - item.state == 'file'
     - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.git|secrets)(/|$)')
-    - item.path is regex('(^|/)(Dockerfile|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem)|Corefile|db\.aigw\.internal)$')
+    - item.path is regex('(^|/)(Dockerfile(?:\.open-webui)?|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch)|upstream-provenance\.json|oauth-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
 
 - name: Find stale unsafe build-context artifacts from older recursive syncs
   ansible.builtin.find:
@@ -414,7 +640,8 @@
       #!/usr/bin/env bash
       set -euo pipefail
       export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
-      unset DOCKER_CONFIG DOCKER_CONTEXT DOCKER_HOST
+      unset DOCKER_CONFIG DOCKER_CONTEXT DOCKER_HOST \
+        HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy
       [[ $# -eq 0 ]] || { echo "arguments are not accepted" >&2; exit 2; }
       state_root={{ docker_data_root | quote }}
       root="$state_root/containers"
@@ -520,24 +747,26 @@
       require_access_acl "$root" r-x
       require_no_default_acl "$root"
 
+      # Docker CLI transitions into container_runtime_t. SELinux correctly
+      # rejects that transition once NoNewPrivileges is set on this systemd
+      # service, so query the same local Docker API through its Unix socket
+      # instead. This keeps the helper's NoNewPrivileges, AF_UNIX-only, and
+      # private-network boundaries intact while still validating the complete
+      # Compose ownership tuple before it touches a host ACL.
       project_ids=()
       if ! project_output=$(
-        /usr/bin/docker --host unix:///run/docker.sock ps -aq --no-trunc \
-          --filter 'label=com.docker.compose.project={{ compose_project_name }}'
+        /usr/bin/curl --unix-socket /run/docker.sock --noproxy '*' \
+          --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+          --max-filesize 1048576 --get \
+          --data-urlencode 'filters={"label":["com.docker.compose.project={{ compose_project_name }}"]}' \
+          'http://localhost/containers/json?all=1' |
+          /usr/bin/python3 -I -c 'import json,re,sys; project,stack_root=sys.argv[1:]; payload=sys.stdin.buffer.read(1048577); len(payload) <= 1048576 or (_ for _ in ()).throw(SystemExit("Docker returned an oversized container inventory")); containers=json.loads(payload); isinstance(containers,list) and len(containers) <= 64 or (_ for _ in ()).throw(SystemExit("Docker returned an invalid container inventory")); identifiers=[container.get("Id") if isinstance(container,dict) else None for container in containers]; valid=all(isinstance(container,dict) and isinstance(container.get("Labels"),dict) and isinstance(identifier,str) and re.fullmatch(r"[0-9a-f]{64}",identifier) and container["Labels"].get("com.docker.compose.project") == project and container["Labels"].get("com.docker.compose.project.working_dir") == stack_root and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}",container["Labels"].get("com.docker.compose.service", "")) and re.fullmatch(r"[0-9a-f]{64}",container["Labels"].get("com.docker.compose.config-hash", "")) for container,identifier in zip(containers,identifiers)); valid and len(set(identifiers)) == len(identifiers) or (_ for _ in ()).throw(SystemExit("Docker returned a container without the full AI Gateway Compose ownership tuple")); print("\n".join(identifiers))' {{ compose_project_name | quote }} "$stack_root"
       ); then
         echo "Docker failed to enumerate AI Gateway project containers" >&2
         exit 1
       fi
       if [[ -n "$project_output" ]]; then
         mapfile -t project_ids <<<"$project_output"
-        if ! trusted_project_output=$(
-          /usr/bin/docker --host unix:///run/docker.sock inspect "${project_ids[@]}" |
-            /usr/bin/python3 -I -c 'import json,re,sys; project,stack_root=sys.argv[1:]; containers=json.load(sys.stdin); labels=lambda container: (container.get("Config") or {}).get("Labels") or {}; bad=[container for container in containers if not (labels(container).get("com.docker.compose.project") == project and labels(container).get("com.docker.compose.project.working_dir") == stack_root and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", labels(container).get("com.docker.compose.service", "")) and re.fullmatch(r"[0-9a-f]{64}", labels(container).get("com.docker.compose.config-hash", "")))]; bad and (_ for _ in ()).throw(SystemExit("Docker returned a container without the full AI Gateway Compose ownership tuple")); print("\\n".join(container.get("Id", "") for container in containers))' {{ compose_project_name | quote }} "$stack_root"
-        ); then
-          echo "Docker failed to validate AI Gateway project container ownership" >&2
-          exit 1
-        fi
-        mapfile -t project_ids <<<"$trusted_project_output"
       fi
       project_dirs=()
       for identifier in "${project_ids[@]}"; do
@@ -630,19 +859,13 @@
       SystemCallArchitectures=native
       CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
       UMask=0077
-      BindReadOnlyPaths=/run/docker.sock
+      # Rocky SELinux denies systemd bind-mounting Docker's
+      # container_var_run_t Unix socket into a sandbox. A read-only bind would
+      # not restrict Unix-socket RPC writes in any case; retain the host
+      # namespace socket only for this root-owned, exact-project helper while
+      # the service remains network-isolated and AF_UNIX-only.
       ReadOnlyPaths={{ docker_data_root }}
       ReadWritePaths={{ docker_data_root }}/containers
-
-- name: Validate render-only Compose and restricted build-network contracts
-  ansible.builtin.command:
-    argv:
-      - "{{ stack_dir }}/scripts/validate-compose.sh"
-  environment:
-    # Non-secret pristine-host input for the identity callback check. Once
-    # .env exists, the validator requires this value and DOMAIN to agree.
-    AIGW_VALIDATION_DOMAIN: "{{ aigw_domain }}"
-  changed_when: false
 
 - name: Validate static Vault server configuration in an isolated container
   ansible.builtin.command:
@@ -650,18 +873,11 @@
       - "{{ stack_dir }}/scripts/validate-vault-config.sh"
   changed_when: false
 
-- name: Preserve rotator vault token across re-runs (vault-bootstrap writes it)
-  ansible.builtin.slurp:
-    src: "{{ stack_dir }}/.env"
-  register: existing_env
-  failed_when: false
-  no_log: true
-
 - name: Extract existing ROTATOR_VAULT_TOKEN
   ansible.builtin.set_fact:
-    rotator_vault_token: "{{ (existing_env.content | b64decode | regex_search('ROTATOR_VAULT_TOKEN=(.*)', '\\1') or ['']) | first }}"
+    rotator_vault_token: "{{ (aigw_existing_env.content | b64decode | regex_search('ROTATOR_VAULT_TOKEN=(.*)', '\\1') or ['']) | first }}"
   when:
-    - existing_env.content is defined
+    - aigw_existing_env.content is defined
     - rotator_vault_token | length == 0
   no_log: true
 
@@ -691,6 +907,10 @@
     - { name: portal_oidc_client_secret, min_length: 32 }
     - { name: admin_portal_oidc_client_secret, min_length: 32 }
     - { name: oauth2_proxy_client_secret, min_length: 32 }
+    - { name: oauth2_proxy_litellm_cookie_secret, min_length: 32 }
+    - { name: oauth2_proxy_grafana_cookie_secret, min_length: 32 }
+    - { name: oauth2_proxy_prometheus_cookie_secret, min_length: 32 }
+    - { name: oauth2_proxy_vault_cookie_secret, min_length: 32 }
     - { name: portal_session_secret, min_length: 32 }
     - { name: admin_portal_session_secret, min_length: 32 }
     - { name: rotator_internal_token, min_length: 32 }
@@ -706,6 +926,15 @@
       - portal_identity_token != rotator_internal_token
       - portal_session_secret != admin_portal_session_secret
       - >-
+        [oauth2_proxy_litellm_cookie_secret,
+         oauth2_proxy_grafana_cookie_secret,
+         oauth2_proxy_prometheus_cookie_secret,
+         oauth2_proxy_vault_cookie_secret] | unique | length == 4
+      - oauth2_proxy_litellm_cookie_secret not in [portal_session_secret, admin_portal_session_secret]
+      - oauth2_proxy_grafana_cookie_secret not in [portal_session_secret, admin_portal_session_secret]
+      - oauth2_proxy_prometheus_cookie_secret not in [portal_session_secret, admin_portal_session_secret]
+      - oauth2_proxy_vault_cookie_secret not in [portal_session_secret, admin_portal_session_secret]
+      - >-
         [webui_oidc_client_secret, portal_oidc_client_secret,
          admin_portal_oidc_client_secret,
          oauth2_proxy_client_secret] | unique | length == 4
@@ -718,6 +947,12 @@
     that:
       - lookup('vars', item, default='') | length >= 16
       - lookup('vars', item, default='') is regex('^[A-Za-z0-9_-]+$')
+      # Samba AD's default password policy requires three character classes.
+      # Prove that here, before a failed first bootstrap can leave a
+      # repeatedly-restarting directory container with no useful diagnostics.
+      - lookup('vars', item, default='') is regex('.*[A-Z].*')
+      - lookup('vars', item, default='') is regex('.*[a-z].*')
+      - lookup('vars', item, default='') is regex('.*[0-9].*')
       - lookup('vars', item, default='') | lower not in ['change_me', 'changeme', 'replace_me', 'password', 'secret']
     quiet: true
     fail_msg: >-
@@ -732,13 +967,32 @@
   when: samba_lab_enabled | bool
   no_log: true
 
-- name: Validate oauth2-proxy cookie secret shape
+- name: Require distinct Samba lab credentials
   ansible.builtin.assert:
     that:
-      - oauth2_proxy_cookie_secret is defined
-      - oauth2_proxy_cookie_secret is regex('^[A-Za-z0-9]{32}$')
+      - >-
+        [samba_ad_admin_password, samba_ad_bind_password,
+         samba_user_lab_admin_password, samba_user_lab_developer_password,
+         samba_user_lab_user_password] | unique | length == 5
     quiet: true
-    fail_msg: oauth2_proxy_cookie_secret must be exactly 32 alphanumeric bytes.
+    fail_msg: Samba administrator, bind, and seeded-user credentials must be distinct.
+  when: samba_lab_enabled | bool
+  no_log: true
+
+- name: Validate per-gate oauth2-proxy cookie secret shapes
+  ansible.builtin.assert:
+    that:
+      - lookup('vars', item, default='') is regex('^[A-Za-z0-9]{32}$')
+    quiet: true
+    fail_msg: Each oauth2-proxy cookie secret must be exactly 32 alphanumeric bytes.
+  loop:
+    - oauth2_proxy_litellm_cookie_secret
+    - oauth2_proxy_grafana_cookie_secret
+    - oauth2_proxy_prometheus_cookie_secret
+    - oauth2_proxy_vault_cookie_secret
+  loop_control:
+    label: "{{ item }}"
+  no_log: true
 
 - name: Refuse plaintext Cribl export except for the in-stack development mock
   ansible.builtin.assert:
@@ -1066,7 +1320,12 @@
         ((aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).base)
         |
         combine(
-          (aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).lab
+          (aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).platform_dns
+          if (platform_authoritative_dns_enabled | bool) else {}
+        )
+        |
+        combine(
+          (aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).lab_identity
           if (samba_lab_enabled | bool) else {}
         )
       }}
@@ -1106,6 +1365,20 @@
     dest: "{{ stack_dir }}/.env"
     mode: "0600"
   no_log: true
+
+# The deployed-layout validator deliberately parses the root-only .env for
+# Docker-root and identity consistency.  Run it only after that exact file and
+# every secret-backed bind source exist, but still before any SELinux relabel or
+# container creation can make the rendered Compose graph live.
+- name: Validate render-only Compose and restricted build-network contracts
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/validate-compose.sh"
+  environment:
+    # Non-secret pristine-host input for the identity callback check. Once
+    # .env exists, the validator requires this value and DOMAIN to agree.
+    AIGW_VALIDATION_DOMAIN: "{{ aigw_domain }}"
+  changed_when: false
 
 # Docker's SELinux integration assigns a unique MCS process/mount level when a
 # container is created. Persist a read-only content *type* for only the exact
@@ -1159,6 +1432,10 @@
         ([
           {'path': stack_dir ~ '/services/lab-dns/Corefile', 'recursive': false},
           {'path': stack_dir ~ '/services/lab-dns/db.aigw.internal', 'recursive': false},
+          {'path': stack_dir ~ '/services/lab-dns/db.aigw.internal.adm', 'recursive': false}
+        ] if (platform_authoritative_dns_enabled | bool) else [])
+        +
+        ([
           {'path': stack_dir ~ '/secrets/samba_ad_admin_password', 'recursive': false},
           {'path': stack_dir ~ '/secrets/samba_ad_bind_password', 'recursive': false},
           {'path': stack_dir ~ '/secrets/samba_user_lab-admin_password', 'recursive': false},
@@ -1288,10 +1565,8 @@
   ansible.builtin.command:
     argv: >-
       {{
-        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name,
-         '--file', 'docker-compose.yml']
-        + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
-           if (samba_lab_enabled | bool) else [])
+        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name]
+        + aigw_compose_cli_overlay_args
         + ['config', '--services']
       }}
   args:
@@ -1303,10 +1578,8 @@
   ansible.builtin.command:
     argv: >-
       {{
-        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name,
-         '--file', 'docker-compose.yml']
-        + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
-           if (samba_lab_enabled | bool) else [])
+        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name]
+        + aigw_compose_cli_overlay_args
         + ['config', '--hash', 'volume-init']
       }}
   args:
@@ -1352,6 +1625,7 @@
         project = sys.argv[1]
         expected = {
             "pg_data": (70, 70, 0o700),
+            "openwebui_data": (65532, 65532, 0o700),
             "vault_data": (1000, 1000, 0o700),
             "vault_audit": (1000, 473, 0o2750),
             "alloy_data": (473, 473, 0o700),
@@ -1398,10 +1672,8 @@
     validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
-    files: >-
-      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
-         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
-    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
     services: [volume-init]
     dependencies: false
     state: present
@@ -1445,6 +1717,7 @@
         project = sys.argv[1]
         expected = {
             "pg_data": (70, 70, 0o700),
+            "openwebui_data": (65532, 65532, 0o700),
             "vault_data": (1000, 1000, 0o700),
             "vault_audit": (1000, 473, 0o2750),
             "alloy_data": (473, 473, 0o700),
@@ -1488,10 +1761,8 @@
     validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
-    files: >-
-      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
-         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
-    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
     services: [postgres]
     dependencies: false
     state: present
@@ -1634,6 +1905,25 @@
     group: root
     mode: "0700"
 
+- name: Prove offline seed parity and local pins before any custom build
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - /usr/local/sbin/aigw-load-offline-image-seed
+      - verify-current
+      - "{{ offline_image_seed_remote_path }}"
+      - "{{ offline_image_seed_manifest_remote_path }}"
+      - "{{ offline_image_seed_manifest_sha256 }}"
+      - "{{ stack_dir }}"
+  register: offline_image_seed_current_verification
+  changed_when: false
+  failed_when: >-
+    offline_image_seed_current_verification.rc != 0
+    or offline_image_seed_current_verification.stdout
+       != 'VERIFIED ' ~ offline_image_seed_manifest_sha256
+  when: offline_image_seed_enabled | bool
+
 # `docker compose up --build` asks BuildKit to consider every local context on
 # every converge. Apart from making an unchanged run report build activity, a
 # changed shared probe context can update several image tags at once and make
@@ -1645,15 +1935,62 @@
   ansible.builtin.command:
     argv: >-
       {{
-        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name,
-         '--file', 'docker-compose.yml']
-        + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
-           if (samba_lab_enabled | bool) else [])
+        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name]
+        + aigw_compose_cli_overlay_args
         + ['config', '--format', 'json']
       }}
   args:
     chdir: "{{ stack_dir }}"
   register: effective_compose_model
+  changed_when: false
+  no_log: true
+
+- name: Prove the effective Compose model keeps resolver planes separate
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import sys
+
+        model = json.load(sys.stdin)["services"]
+        internal = json.loads(sys.argv[1])
+        egress = json.loads(sys.argv[2])
+        internal_services = set(json.loads(sys.argv[3]))
+        isolated_services = set(json.loads(sys.argv[4]))
+        errors = []
+        for name in internal_services:
+            if model.get(name, {}).get("dns") != internal:
+                errors.append(f"{name}:internal-resolver-drift")
+        for name in isolated_services:
+            if model.get(name, {}).get("dns") != ["127.0.0.1"]:
+                errors.append(f"{name}:service-discovery-only-resolver-drift")
+        if model.get("envoy-egress", {}).get("dns") != egress:
+            errors.append("envoy-egress:egress-resolver-drift")
+        if internal_services & isolated_services:
+            errors.append("internal-and-isolated-service-sets-overlap")
+        if set(internal) & set(egress):
+            errors.append("resolver-planes-overlap")
+        if errors:
+            raise SystemExit(";".join(errors))
+      - "{{ internal_dns_servers | to_json }}"
+      - "{{ egress_dns_servers | to_json }}"
+      - >-
+        {{ [
+          'traefik-int', 'traefik-adm', 'alloy', 'cribl-mock'
+        ] | to_json }}
+      - >-
+        {{ [
+          'oauth2-proxy', 'oauth2-proxy-grafana',
+          'oauth2-proxy-prometheus', 'oauth2-proxy-vault', 'litellm',
+          'open-webui', 'keycloak', 'dev-portal', 'admin-portal',
+          'key-rotator', 'vault', 'vault-ui-proxy', 'postgres', 'redis',
+          'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana'
+        ] | to_json }}
+    stdin: "{{ effective_compose_model.stdout }}"
+    stdin_add_newline: false
   changed_when: false
   no_log: true
 
@@ -1735,17 +2072,43 @@
   ansible.builtin.command:
     argv: >-
       {{
-        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name,
-         '--file', 'docker-compose.yml']
-        + (['--file', 'docker-compose.lab.yml', '--profile', 'lab-ad']
-           if (samba_lab_enabled | bool) else [])
-        + ['build']
+        ['docker', '--host', 'unix:///run/docker.sock', 'compose', '--project-name', compose_project_name]
+        + aigw_compose_cli_overlay_args
+        + ['build', '--pull=false']
         + compose_build_plan.services
       }}
   args:
     chdir: "{{ stack_dir }}"
   when: compose_build_plan.services | length > 0
   no_log: true
+
+- name: Inventory the pinned CoreDNS runtime plugins
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - run
+      - --rm
+      - --network
+      - none
+      - --read-only
+      - --cap-drop
+      - ALL
+      - ai-gateway/lab-dns:1.14.4
+      - -plugins
+  register: aigw_coredns_plugins
+  changed_when: false
+  when: platform_authoritative_dns_enabled | bool
+
+- name: Require every plugin used by authoritative split DNS
+  ansible.builtin.assert:
+    that:
+      - item in aigw_coredns_plugins.stdout_lines
+    quiet: true
+    fail_msg: "Pinned CoreDNS runtime is missing required plugin {{ item }}."
+  loop: [cache, errors, file, health, template, view]
+  when: platform_authoritative_dns_enabled | bool
 
 # Capture the tag's immutable image ID after builds. This also detects a later
 # manual retag or deletion even when source inputs have not changed.
@@ -1781,10 +2144,47 @@
   changed_when: false
   no_log: true
 
-# Install the marker only after every planned build succeeds. A failed build
-# therefore remains pending on the next converge instead of blessing stale
-# tags. The backup tooling already excludes `.state` from stateful archives.
-- name: Persist successful custom-image build-input manifest
+# A previous fresh realm import omitted explicit realm-role scope mappings.
+# The repair remains an inventory-bound one-time action: its temporary
+# Keycloak master-realm client is powerful until interactive bootstrap deletes
+# it, so it must never become a routine privileged converge.
+- name: Require explicit acknowledgement for pre-bootstrap OIDC scope reconciliation
+  ansible.builtin.assert:
+    that:
+      - aigw_prebootstrap_oidc_scope_reconciliation | bool
+      - aigw_prebootstrap_oidc_scope_reconciliation_ack == 'RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES'
+    quiet: true
+    fail_msg: >-
+      Pre-bootstrap OIDC role-scope reconciliation requires the exact
+      RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES inventory acknowledgement.
+  when: aigw_prebootstrap_oidc_scope_reconciliation | bool
+
+- name: Deploy stack without implicitly rebuilding custom images
+  community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
+    services: "{{ compose_long_running_services }}"
+    dependencies: false
+    state: present
+    # Builds are content-addressed and completed above. Keeping `up` in
+    # --no-build mode prevents an unchanged converge from retagging images or
+    # recreating/resealing Vault as a side effect of unrelated build contexts.
+    build: never
+    remove_orphans: true
+  no_log: true
+
+# A successful image build alone is not proof that its service ever deployed.
+# Keep the explicit first-build retry record through `compose up`, so a failed
+# initial deployment can retry without destructive state edits. Once Compose
+# has created the runtime graph, persist the receipt and retire that proof; a
+# later missing service container is then fail-closed. The backup tooling
+# already excludes `.state` from stateful archives.
+- name: Persist deployed custom-image build-input manifest
   ansible.builtin.copy:
     content: "{{ finalized_compose_build_manifest.stdout | from_json | to_nice_json }}\n"
     dest: "{{ stack_dir }}/.state/compose-build-inputs.json"
@@ -1792,11 +2192,7 @@
     group: root
     mode: "0600"
 
-# A first-build record authorizes retry only until this successful image marker
-# is durable. Retire that proof on every converge (including recovery from an
-# interruption immediately after the marker write) so a later deleted container
-# cannot be mistaken for a service that has never had a deployable generation.
-- name: Retire completed first-build rollback retry proofs
+- name: Retire deployed first-build rollback retry proofs
   ansible.builtin.command:
     argv:
       - python3
@@ -1813,27 +2209,6 @@
   changed_when: >-
     (retired_first_build_rollback_proofs.stdout |
      from_json).retired_services | length > 0
-
-- name: Deploy stack without implicitly rebuilding custom images
-  community.docker.docker_compose_v2:
-    docker_host: unix:///run/docker.sock
-    tls: false
-    validate_certs: false
-    project_src: "{{ stack_dir }}"
-    project_name: "{{ compose_project_name }}"
-    files: >-
-      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
-         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
-    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
-    services: "{{ compose_long_running_services }}"
-    dependencies: false
-    state: present
-    # Builds are content-addressed and completed above. Keeping `up` in
-    # --no-build mode prevents an unchanged converge from retagging images or
-    # recreating/resealing Vault as a side effect of unrelated build contexts.
-    build: never
-    remove_orphans: true
-  no_log: true
 
 - name: Reconcile scoped ACLs for newly-created Docker json logs
   ansible.builtin.systemd_service:
@@ -1883,6 +2258,73 @@
       The DHI Vault server must run as uid 1000 under no-new-privileges, have
       only IPC_LOCK in its bounding set, and drop all permitted/effective
       capabilities after locking memory.
+
+- name: Inspect the direct Vault UI proxy runtime after Compose start
+  community.docker.docker_container_info:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
+    name: "{{ compose_project_name }}-vault-ui-proxy-1"
+  register: vault_ui_proxy_startup
+  retries: 15
+  delay: 2
+  until: >-
+    vault_ui_proxy_startup.exists and
+    (vault_ui_proxy_startup.container.State.Running | bool)
+
+- name: Vault UI proxy directly replaces the dormant DHI Vault entrypoint
+  ansible.builtin.assert:
+    that:
+      - vault_ui_proxy_startup.container.Config.User == '1000:1000'
+      - vault_ui_proxy_startup.container.Path == '/usr/local/bin/vault-ui-proxy'
+      - vault_ui_proxy_startup.container.Args | length == 0
+      - vault_ui_proxy_startup.container.State.Pid | int > 0
+    quiet: true
+    fail_msg: >-
+      The Vault UI companion must run the reviewed proxy directly as uid 1000;
+      the DHI base Vault binary and its tini entrypoint must remain dormant.
+
+- name: Read the effective Vault UI proxy identity and executable
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      awk '/^(Uid|CapPrm|CapEff|CapBnd|NoNewPrivs):/' "/proc/{{ vault_ui_proxy_startup.container.State.Pid }}/status"
+      readlink "/proc/{{ vault_ui_proxy_startup.container.State.Pid }}/exe"
+    executable: /bin/bash
+  register: vault_ui_proxy_process_security
+  changed_when: false
+
+- name: Vault UI proxy is the non-root capability-free PID 1 executable
+  ansible.builtin.assert:
+    that:
+      - vault_ui_proxy_process_security.stdout is search('Uid:\\s+1000\\s+1000\\s+1000\\s+1000')
+      - vault_ui_proxy_process_security.stdout is search('CapPrm:\\s+0000000000000000')
+      - vault_ui_proxy_process_security.stdout is search('CapEff:\\s+0000000000000000')
+      - vault_ui_proxy_process_security.stdout is search('CapBnd:\\s+0000000000000000')
+      - vault_ui_proxy_process_security.stdout is search('NoNewPrivs:\\s+1')
+      - vault_ui_proxy_process_security.stdout_lines | last == '/usr/local/bin/vault-ui-proxy'
+    quiet: true
+    fail_msg: >-
+      The Vault UI proxy must be the direct uid-1000 executable with no Linux
+      capabilities and no-new-privileges enabled.
+
+- name: Prove the Vault UI proxy serves the reviewed UI and reaches only Vault
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - exec
+      - "{{ compose_project_name }}-vault-ui-proxy-1"
+      - /usr/local/bin/vault-ui-proxy
+      - check
+  register: vault_ui_proxy_contract
+  changed_when: false
+  # Compose permits a 15s start period plus twelve 10s health intervals and
+  # bounded probe time. Keep this acceptance window strictly larger.
+  retries: 42
+  delay: 5
+  until: vault_ui_proxy_contract.rc == 0
 
 - name: Inspect DHI Alloy after Compose start
   community.docker.docker_container_info:
@@ -2034,6 +2476,28 @@
   changed_when: false
   failed_when: vault_public_status.rc not in [0, 2]
 
+- name: Probe strict key-rotator dependency readiness after stack start
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - compose
+      - exec
+      - -T
+      - key-rotator
+      - python3
+      - -c
+      - >-
+        import urllib.request;
+        urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3).read()
+  args:
+    chdir: "{{ stack_dir }}"
+  register: key_rotator_strict_readiness
+  changed_when: false
+  failed_when: false
+  no_log: true
+
 - name: Bound the Vault bootstrap health exception to public sealed state
   ansible.builtin.assert:
     that:
@@ -2041,11 +2505,16 @@
         vault_strict_readiness.rc == 0 or
         not ((vault_public_status.stdout | from_json).initialized | bool) or
         ((vault_public_status.stdout | from_json).sealed | bool)
+      - >-
+        (vault_strict_readiness.rc == 0 and
+         key_rotator_strict_readiness.rc == 0) or
+        (vault_strict_readiness.rc != 0 and
+         key_rotator_strict_readiness.rc != 0)
     quiet: true
     fail_msg: >-
-      Vault is initialized and unsealed but its strict readiness probe failed.
-      This is not a bootstrap exception: fail closed and diagnose Vault rather
-      than allowing Vault/key-rotator health failures through verification.
+      Vault and key-rotator strict readiness disagree with the public seal
+      state. This is not a bootstrap exception: fail closed and diagnose the
+      dependency boundary instead of weakening Docker liveness.
 
 - name: Require restored Vault state instead of replacement initialization
   ansible.builtin.assert:
@@ -2058,6 +2527,270 @@
       and investigate the authenticated restore.
   when: restore_required_unseal_marker.stat.exists | default(false)
 
+# A sealed/fresh Vault must not make its own UI administratively unreachable.
+# This one-time bridge uses only the already-provisioned temporary Keycloak
+# bootstrap client. Its inventory input is a closed mutation set, it never
+# reads Vault, and a root-owned receipt prevents it from becoming a recurring
+# group lifecycle controller after normal bootstrap consumes that client.
+- name: Require an explicit pre-Vault managed-identity recovery contract
+  ansible.builtin.assert:
+    that:
+      - aigw_pre_vault_identity_baseline_reconciliation | bool
+      - >-
+        aigw_pre_vault_identity_baseline_reconciliation_ack ==
+        'RECONCILE_PRE_VAULT_MANAGED_IDENTITY_BASELINE'
+      - aigw_pre_vault_identity_baseline_groups is sequence
+      - aigw_pre_vault_identity_baseline_groups is not string
+      - aigw_pre_vault_identity_baseline_groups | length > 0
+      - aigw_pre_vault_identity_bootstrap_admin_identities is sequence
+      - aigw_pre_vault_identity_bootstrap_admin_identities is not string
+      - aigw_pre_vault_identity_bootstrap_admin_identities | length > 0
+      - >-
+        not (aigw_pre_vault_identity_ensure_lab_federation | bool) or
+        (deployment_profile == 'rocky9-lab' and samba_lab_enabled | bool)
+    quiet: true
+    fail_msg: >-
+      Pre-Vault identity recovery requires an exact acknowledgement and an
+      explicitly configured, non-empty group/admin set. Lab federation is
+      permitted only by the committed disposable Rocky 9 lab profile.
+  when: aigw_pre_vault_identity_baseline_reconciliation | bool
+
+- name: Build the exact pre-Vault managed-identity recovery specification
+  ansible.builtin.set_fact:
+    aigw_pre_vault_identity_baseline_spec: >-
+      {{
+        {
+          'schema': 1,
+          'ensure_lab_federation': aigw_pre_vault_identity_ensure_lab_federation | bool,
+          'groups': aigw_pre_vault_identity_baseline_groups,
+          'bootstrap_admin_identities': aigw_pre_vault_identity_bootstrap_admin_identities,
+        }
+      }}
+  when: aigw_pre_vault_identity_baseline_reconciliation | bool
+  no_log: true
+
+- name: Derive the pre-Vault managed-identity recovery receipt
+  ansible.builtin.set_fact:
+    aigw_pre_vault_identity_baseline_digest: >-
+      {{ aigw_pre_vault_identity_baseline_spec | to_json | hash('sha256') }}
+    aigw_pre_vault_identity_baseline_receipt_path: >-
+      {{ stack_dir }}/.state/pre-vault-identity-baseline.json
+  when: aigw_pre_vault_identity_baseline_reconciliation | bool
+  no_log: true
+
+- name: Inspect the pre-Vault managed-identity recovery receipt
+  ansible.builtin.stat:
+    path: "{{ aigw_pre_vault_identity_baseline_receipt_path }}"
+    follow: false
+  register: aigw_pre_vault_identity_baseline_receipt
+  when: aigw_pre_vault_identity_baseline_reconciliation | bool
+
+- name: Read the existing pre-Vault managed-identity recovery receipt
+  ansible.builtin.slurp:
+    src: "{{ aigw_pre_vault_identity_baseline_receipt_path }}"
+  register: aigw_pre_vault_identity_baseline_receipt_content
+  when:
+    - aigw_pre_vault_identity_baseline_reconciliation | bool
+    - aigw_pre_vault_identity_baseline_receipt.stat.exists | default(false)
+  no_log: true
+
+- name: Require the exact private pre-Vault managed-identity recovery receipt
+  ansible.builtin.assert:
+    that:
+      - aigw_pre_vault_identity_baseline_receipt.stat.isreg | default(false)
+      - not (aigw_pre_vault_identity_baseline_receipt.stat.islnk | default(false))
+      - aigw_pre_vault_identity_baseline_receipt.stat.uid == 0
+      - aigw_pre_vault_identity_baseline_receipt.stat.gid == 0
+      - aigw_pre_vault_identity_baseline_receipt.stat.mode == '0600'
+      - >-
+        (aigw_pre_vault_identity_baseline_receipt_content.content |
+         b64decode | from_json).schema == 1
+      - >-
+        (aigw_pre_vault_identity_baseline_receipt_content.content |
+         b64decode | from_json).spec_sha256 ==
+        aigw_pre_vault_identity_baseline_digest
+    quiet: true
+    fail_msg: >-
+      The pre-Vault identity recovery receipt is unsafe or its inventory
+      mutation set drifted. Refuse to reuse bootstrap authority implicitly.
+  when:
+    - aigw_pre_vault_identity_baseline_reconciliation | bool
+    - aigw_pre_vault_identity_baseline_receipt.stat.exists | default(false)
+  no_log: true
+
+- name: Wait for Keycloak before first pre-Vault identity recovery
+  community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
+    services: [keycloak]
+    dependencies: false
+    state: present
+    build: never
+    wait: true
+    wait_timeout: 600
+  when:
+    - aigw_pre_vault_identity_baseline_reconciliation | bool
+    - not (aigw_pre_vault_identity_baseline_receipt.stat.exists | default(false))
+  no_log: true
+
+- name: Apply the first pre-Vault managed-identity recovery baseline
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/aigw-compose.sh"
+      - run
+      - --rm
+      - --no-deps
+      - -T
+      - key-rotator
+      - /opt/venv/bin/python
+      - -m
+      - app.reconcile_pre_vault_identity
+      - --confirm
+      - RECONCILE_PRE_VAULT_MANAGED_IDENTITY_BASELINE
+  args:
+    chdir: "{{ stack_dir }}"
+    stdin: "{{ aigw_pre_vault_identity_baseline_spec | to_json }}"
+    stdin_add_newline: false
+  environment:
+    STACK_DIR: "{{ stack_dir }}"
+    COMPOSE_PROJECT_NAME: "{{ compose_project_name }}"
+  register: aigw_pre_vault_identity_baseline_result
+  changed_when: >-
+    'PRE_VAULT_IDENTITY_BASELINE_RECONCILIATION_APPLIED' in
+    aigw_pre_vault_identity_baseline_result.stdout
+  failed_when: >-
+    aigw_pre_vault_identity_baseline_result.rc != 0 or
+    not (
+      'PRE_VAULT_IDENTITY_BASELINE_RECONCILIATION_APPLIED' in
+      aigw_pre_vault_identity_baseline_result.stdout or
+      'PRE_VAULT_IDENTITY_BASELINE_RECONCILIATION_VERIFIED' in
+      aigw_pre_vault_identity_baseline_result.stdout
+    )
+  when:
+    - aigw_pre_vault_identity_baseline_reconciliation | bool
+    - not (aigw_pre_vault_identity_baseline_receipt.stat.exists | default(false))
+  no_log: true
+
+- name: Prove the pre-Vault managed-identity recovery is idempotent
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/aigw-compose.sh"
+      - run
+      - --rm
+      - --no-deps
+      - -T
+      - key-rotator
+      - /opt/venv/bin/python
+      - -m
+      - app.reconcile_pre_vault_identity
+      - --confirm
+      - RECONCILE_PRE_VAULT_MANAGED_IDENTITY_BASELINE
+  args:
+    chdir: "{{ stack_dir }}"
+    stdin: "{{ aigw_pre_vault_identity_baseline_spec | to_json }}"
+    stdin_add_newline: false
+  environment:
+    STACK_DIR: "{{ stack_dir }}"
+    COMPOSE_PROJECT_NAME: "{{ compose_project_name }}"
+  register: aigw_pre_vault_identity_baseline_idempotence
+  changed_when: false
+  failed_when: >-
+    aigw_pre_vault_identity_baseline_idempotence.rc != 0 or
+    'PRE_VAULT_IDENTITY_BASELINE_RECONCILIATION_VERIFIED' not in
+    aigw_pre_vault_identity_baseline_idempotence.stdout
+  when:
+    - aigw_pre_vault_identity_baseline_reconciliation | bool
+    - not (aigw_pre_vault_identity_baseline_receipt.stat.exists | default(false))
+  no_log: true
+
+- name: Seal the verified pre-Vault managed-identity recovery receipt
+  ansible.builtin.copy:
+    content: >-
+      {{
+        {
+          'schema': 1,
+          'spec_sha256': aigw_pre_vault_identity_baseline_digest,
+        } | to_nice_json
+      }}
+    dest: "{{ aigw_pre_vault_identity_baseline_receipt_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - aigw_pre_vault_identity_baseline_reconciliation | bool
+    - not (aigw_pre_vault_identity_baseline_receipt.stat.exists | default(false))
+  no_log: true
+
+# Do not make the legacy OIDC repair part of the fresh-Vault bootstrap path:
+# an uninitialized or sealed Vault intentionally prevents the rotator from
+# reading its durable identity state. The stack is already started above, so
+# wait only for Keycloak here when the public Vault state proves the one-shot
+# runner can safely perform its narrow state-gated action. A short-lived 403
+# from an edge before this point is availability-only; authorization remains
+# fail-closed.
+- name: Wait for Keycloak before applicable pre-bootstrap OIDC scope reconciliation
+  community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
+    services: [keycloak]
+    dependencies: false
+    state: present
+    build: never
+    wait: true
+    # Keep this individual Keycloak wait aligned with the reviewed longest
+    # Compose health window; a slow but healthy initial Keycloak migration
+    # must not be misclassified as an OIDC-repair failure.
+    wait_timeout: 600
+  when:
+    - aigw_prebootstrap_oidc_scope_reconciliation | bool
+    - vault_strict_readiness.rc == 0
+    - vault_public_status.rc == 0
+    - (vault_public_status.stdout | from_json).initialized | bool
+    - not ((vault_public_status.stdout | from_json).sealed | bool)
+  no_log: true
+
+- name: Reconcile only applicable pre-bootstrap Keycloak OIDC role scopes
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/aigw-compose.sh"
+      - run
+      - --rm
+      - --no-deps
+      - -T
+      - key-rotator
+      - /opt/venv/bin/python
+      - -m
+      - app.reconcile_oidc_role_scopes
+      - --confirm
+      - RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES
+  args:
+    chdir: "{{ stack_dir }}"
+  environment:
+    STACK_DIR: "{{ stack_dir }}"
+    COMPOSE_PROJECT_NAME: "{{ compose_project_name }}"
+  register: prebootstrap_oidc_scope_reconciliation
+  changed_when: >-
+    'OIDC_ROLE_SCOPE_PREBOOTSTRAP_RECONCILIATION_APPLIED' in
+    prebootstrap_oidc_scope_reconciliation.stdout
+  failed_when: prebootstrap_oidc_scope_reconciliation.rc != 0
+  when:
+    - aigw_prebootstrap_oidc_scope_reconciliation | bool
+    - vault_strict_readiness.rc == 0
+    - vault_public_status.rc == 0
+    - (vault_public_status.stdout | from_json).initialized | bool
+    - not ((vault_public_status.stdout | from_json).sealed | bool)
+  no_log: true
+
 - name: Wait for the complete post-bootstrap stack
   community.docker.docker_compose_v2:
     docker_host: unix:///run/docker.sock
@@ -2065,16 +2798,18 @@
     validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
-    files: >-
-      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
-         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
-    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
     services: "{{ compose_long_running_services }}"
     dependencies: false
     state: present
     build: never
     wait: true
-    wait_timeout: 300
+    # Open WebUI intentionally allows 90s of migration startup plus up to
+    # 24 15-second readiness attempts (450s worst case).  Leave a scheduling
+    # margin so a healthy clean-Rocky deployment is not failed by Compose
+    # before the service's own reviewed health window has elapsed.
+    wait_timeout: 600
   when: vault_strict_readiness.rc == 0
   no_log: true
 
@@ -2085,10 +2820,8 @@
     validate_certs: false
     project_src: "{{ stack_dir }}"
     project_name: "{{ compose_project_name }}"
-    files: >-
-      {{ ['docker-compose.yml', 'docker-compose.lab.yml']
-         if (samba_lab_enabled | bool) else ['docker-compose.yml'] }}
-    profiles: "{{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
     services:
       - postgres
       - redis
@@ -2097,6 +2830,7 @@
       - litellm
       - dev-portal
       - open-webui
+      - vault-ui-proxy
       - prometheus
       - grafana
       - traefik-int
@@ -2105,7 +2839,9 @@
     state: present
     build: never
     wait: true
-    wait_timeout: 300
+    # Keep the fresh-bootstrap core gate aligned with the full-stack wait:
+    # Open WebUI's reviewed readiness window can reach 450 seconds.
+    wait_timeout: 600
   when: vault_strict_readiness.rc != 0
   no_log: true
 
@@ -2348,7 +3084,7 @@
       - "{{ eth0_ip }}"
       - "{{ eth1_ip }}"
       - "{{ eth2_ip }}"
-      - "{{ lab_dns_enabled | bool | lower }}"
+      - "{{ platform_authoritative_dns_enabled | bool | lower }}"
   register: published_port_contract
   changed_when: false
 

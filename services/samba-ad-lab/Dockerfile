@@ -4,7 +4,7 @@ ARG SAMBA_DEBIAN_VERSION=2:4.22.10+dfsg-0+deb13u1
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-COPY policy-rc.d /usr/sbin/policy-rc.d
+COPY --chmod=0755 policy-rc.d /usr/sbin/policy-rc.d
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \

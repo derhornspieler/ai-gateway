@@ -45,12 +45,9 @@ x-hardening: &hardening
   # SELinux support to be recreated with an MCS process/mount label. A daemon
   # restart with live-restore does not retrofit labels onto existing objects.
   labels: *selinux-labels
-  # Never inherit the host resolver implicitly. Docker 29 sends inherited-DNS
-  # upstream traffic from dockerd's host namespace, bypassing DOCKER-USER.
-  # An explicit override keeps upstream DNS in the container network namespace;
-  # the host firewall permits it only for the fixed Envoy identity.
-  dns:
-    - ${CONTAINER_DNS_SERVER:?CONTAINER_DNS_SERVER must be set}
+  # Resolver planes are applied by Ansible's generated
+  # docker-compose.dns.yml. Keeping them out of this shared anchor prevents an
+  # Internet resolver from being inherited by internal/ADM workloads.
   security_opt:
     - no-new-privileges:true
   cap_drop: [ALL]
@@ -88,6 +85,7 @@ services:
     command:
       - |
         chown 70:70 /state/postgres && chmod 0700 /state/postgres
+        chown -hR 65532:65532 /state/openwebui && chmod 0700 /state/openwebui
         chown 1000:1000 /state/vault && chmod 0700 /state/vault
         chown 1000:473 /state/vault-audit && chmod 2750 /state/vault-audit
         chown 473:473 /state/alloy && chmod 0700 /state/alloy
@@ -97,6 +95,7 @@ services:
         chown 65532:65532 /state/grafana && chmod 0700 /state/grafana
     volumes:
       - pg_data:/state/postgres
+      - openwebui_data:/state/openwebui
       - vault_data:/state/vault
       - vault_audit:/state/vault-audit
       - alloy_data:/state/alloy
@@ -231,13 +230,18 @@ services:
       OAUTH2_PROXY_PROVIDER: oidc
       OAUTH2_PROXY_CLIENT_ID: admin-ui
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
-      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_LITELLM_COOKIE_SECRET:?OAUTH2_PROXY_LITELLM_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_NAME: _aigw_litellm_admin_oauth
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       # Re-run the Keycloak refresh flow frequently enough that logout and AD
       # group/role revocation are not hidden behind a week-long signed cookie.
       OAUTH2_PROXY_COOKIE_REFRESH: 5m
       OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      # Deliberately omit request URI, upstream URL, and free-form messages:
+      # OAuth callbacks carry one-time code/state values in the query string.
+      OAUTH2_PROXY_REQUEST_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} host={{.Host}} method={{.RequestMethod}} protocol={{.Protocol}} status={{.StatusCode}} bytes={{.ResponseSize}} duration={{.RequestDuration}}'
+      OAUTH2_PROXY_AUTH_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} status={{.Status}}'
       OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
@@ -252,7 +256,7 @@ services:
       # presents its own misleading 403/sign-in interstitial at every admin
       # surface, which was reported as a broken authorization redirect.
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
-      OAUTH2_PROXY_REDIRECT_URL: "https://admin.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      OAUTH2_PROXY_REDIRECT_URL: "https://litellm-admin.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
       OAUTH2_PROXY_UPSTREAMS: http://litellm:4000
       OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
       OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
@@ -266,7 +270,11 @@ services:
       OAUTH2_PROXY_LOGIN_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/protocol/openid-connect/auth"
       OAUTH2_PROXY_REDEEM_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/token"
       OAUTH2_PROXY_OIDC_JWKS_URL: "http://keycloak:8080/realms/aigw/protocol/openid-connect/certs"
-    networks: [net-admin-app]
+    networks:
+      net-admin-app:
+        # LiteLLM/Uvicorn trusts proxy scheme headers only from this exact
+        # fixed hop; the lower half of the bridge is reserved for fixed IPs.
+        ipv4_address: ${OAUTH2_PROXY_LITELLM_IP:?OAUTH2_PROXY_LITELLM_IP must be set}
     healthcheck:
       # /ready is oauth2-proxy's readiness contract (including configured
       # session-store connectivity), not merely a TCP/process existence test.
@@ -294,12 +302,14 @@ services:
       OAUTH2_PROXY_PROVIDER: oidc
       OAUTH2_PROXY_CLIENT_ID: admin-ui
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
-      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_GRAFANA_COOKIE_SECRET:?OAUTH2_PROXY_GRAFANA_COOKIE_SECRET must be set}
       OAUTH2_PROXY_COOKIE_NAME: _aigw_grafana_oauth
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       OAUTH2_PROXY_COOKIE_REFRESH: 5m
       OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_REQUEST_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} host={{.Host}} method={{.RequestMethod}} protocol={{.Protocol}} status={{.StatusCode}} bytes={{.ResponseSize}} duration={{.RequestDuration}}'
+      OAUTH2_PROXY_AUTH_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} status={{.Status}}'
       OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_GRAFANA_IP:?TRAEFIK_ADM_GRAFANA_IP must be set}/32
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
@@ -348,12 +358,14 @@ services:
       OAUTH2_PROXY_PROVIDER: oidc
       OAUTH2_PROXY_CLIENT_ID: admin-ui
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
-      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_PROMETHEUS_COOKIE_SECRET:?OAUTH2_PROXY_PROMETHEUS_COOKIE_SECRET must be set}
       OAUTH2_PROXY_COOKIE_NAME: _aigw_prometheus_oauth
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       OAUTH2_PROXY_COOKIE_REFRESH: 5m
       OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_REQUEST_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} host={{.Host}} method={{.RequestMethod}} protocol={{.Protocol}} status={{.StatusCode}} bytes={{.ResponseSize}} duration={{.RequestDuration}}'
+      OAUTH2_PROXY_AUTH_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} status={{.Status}}'
       OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
@@ -400,12 +412,14 @@ services:
       OAUTH2_PROXY_PROVIDER: oidc
       OAUTH2_PROXY_CLIENT_ID: admin-ui
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
-      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET must be set}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_VAULT_COOKIE_SECRET:?OAUTH2_PROXY_VAULT_COOKIE_SECRET must be set}
       OAUTH2_PROXY_COOKIE_NAME: _aigw_vault_oauth
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       OAUTH2_PROXY_COOKIE_REFRESH: 5m
       OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_REQUEST_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} host={{.Host}} method={{.RequestMethod}} protocol={{.Protocol}} status={{.StatusCode}} bytes={{.ResponseSize}} duration={{.RequestDuration}}'
+      OAUTH2_PROXY_AUTH_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} status={{.Status}}'
       OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
@@ -413,7 +427,10 @@ services:
       OAUTH2_PROXY_SCOPE: openid email profile
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_REDIRECT_URL: "https://vault.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
-      OAUTH2_PROXY_UPSTREAMS: http://vault:8200
+      # The DHI Vault binary deliberately omits HashiCorp's embedded UI. Keep
+      # OAuth in front of one same-origin, fixed-backend UI/API proxy: it serves
+      # reviewed static assets under /ui and forwards only /v1 to DHI Vault.
+      OAUTH2_PROXY_UPSTREAMS: http://vault-ui-proxy:8080
       OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
       OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
       OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
@@ -432,7 +449,7 @@ services:
       retries: 12
       start_period: 15s
     depends_on:
-      vault: { condition: service_started }
+      vault-ui-proxy: { condition: service_healthy }
 
   # ── core ────────────────────────────────────────────────────────────
   litellm:
@@ -460,6 +477,10 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_SERVICE_NAME: litellm
+      # Preserve HTTPS absolute redirects through the two reviewed proxy hops
+      # only. In particular, LiteLLM's /ui -> /ui/ redirect must not downgrade
+      # a completed oauth2-proxy callback to http://.
+      FORWARDED_ALLOW_IPS: ${OAUTH2_PROXY_LITELLM_IP:?OAUTH2_PROXY_LITELLM_IP must be set},${TRAEFIK_INT_CHAT_IP:?TRAEFIK_INT_CHAT_IP must be set}
       # Deliberate customer requirement (§9.7). Make capture explicit rather
       # than relying on LiteLLM's legacy callback default, which can change on
       # upgrade. SPAN_ONLY avoids duplicating every body as an OTel log event.
@@ -471,13 +492,16 @@ services:
       [net-chat, net-portal, net-admin-app, net-vendor, net-db-litellm,
        net-cache, net-telemetry]
     healthcheck:
+      # LiteLLM's historical /health/liveliness endpoint only proves that its
+      # worker is alive. Deployment gates need /health/readiness, which turns
+      # 503 when the configured PostgreSQL database is unavailable.
       test:
         - CMD
         - python3
         - -c
         - >-
           import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3).read()
+          urllib.request.urlopen('http://127.0.0.1:4000/health/readiness', timeout=3).read()
       interval: 10s
       timeout: 5s
       retries: 18
@@ -497,12 +521,17 @@ services:
     # back up openwebui_data before rolling this security upgrade out.
     build:
       context: ./services/dhi-health-probe
+      dockerfile: Dockerfile.open-webui
       network: none
       args:
         BASE_IMAGE: ghcr.io/open-webui/open-webui:v0.10.2@sha256:9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4
-    image: ai-gateway/open-webui:0.10.2-probe
-    # read_only intentionally NOT set: writes /app/backend/data (volume)
-    # plus embedding-model/cache dirs under $HOME and /tmp at startup.
+    image: ai-gateway/open-webui:0.10.2-aigw1
+    # The derivative fixes the runtime identity to uid/gid 65532. All required
+    # mutable application/cache state is on the initialized named volume or
+    # the bounded tmpfs; source code remains immutable at runtime.
+    user: "65532:65532"
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,mode=1777,size=256m"]
     deploy:
       resources:
         limits: { memory: 2G, cpus: "2.0", pids: 512 }
@@ -514,12 +543,33 @@ services:
       # application-signed value is invalidated. It is supplied by the
       # encrypted Ansible overlay, never generated by the container image.
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY must be set}
+      HOME: /app/backend/data
+      # Keep Python from importing user-writable site packages or writing
+      # bytecode into the persistent application-state volume.
+      PYTHONNOUSERSITE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      # Open WebUI writes packaged static assets at startup. Keep those
+      # ephemeral files on the bounded tmpfs so the application root stays
+      # read-only while its supported health/UI paths remain functional.
+      STATIC_DIR: /tmp/static
+      # Password/local-account creation stays disabled; only Keycloak OIDC may
+      # create an account, and the derivative enforces its role claim even for
+      # the first user instead of auto-promoting that account to local admin.
+      ENABLE_SIGNUP: "false"
       ENABLE_OAUTH_SIGNUP: "true"
       ENABLE_LOGIN_FORM: "false"
+      WEBUI_SESSION_COOKIE_SECURE: "true"
+      WEBUI_AUTH_COOKIE_SECURE: "true"
       OAUTH_CLIENT_ID: open-webui
       OAUTH_CLIENT_SECRET: ${WEBUI_OIDC_CLIENT_SECRET:?WEBUI_OIDC_CLIENT_SECRET must be set}
       OPENID_PROVIDER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/.well-known/openid-configuration"
       OAUTH_PROVIDER_NAME: "AIGW SSO"
+      # Lab Samba identities deliberately do not require a mail attribute.
+      # Open WebUI otherwise rejects an otherwise-valid signed OIDC identity
+      # before its role check. Use Keycloak's stable username claim for both
+      # fields, matching the oauth2-proxy identity contract above.
+      OAUTH_EMAIL_CLAIM: preferred_username
+      OAUTH_USERNAME_CLAIM: preferred_username
       ENABLE_OAUTH_ROLE_MANAGEMENT: "true"
       OAUTH_ROLES_CLAIM: "roles"
       OAUTH_ALLOWED_ROLES: "aigw-users,aigw-developers,aigw-admins"
@@ -544,6 +594,7 @@ services:
       retries: 24
       start_period: 90s
     depends_on:
+      volume-init: { condition: service_completed_successfully }
       litellm: { condition: service_healthy }
       keycloak: { condition: service_healthy }
 
@@ -733,7 +784,12 @@ services:
     depends_on:
       litellm: { condition: service_healthy }
       keycloak: { condition: service_healthy }
-      key-rotator: { condition: service_healthy }
+      # The admin app still fail-closes every sensitive operation on the
+      # identity controller. Requiring its health here would deadlock the
+      # fresh-Vault bootstrap: key-rotator correctly remains unready until
+      # Vault is initialized, while Compose would never start this service or
+      # return control to the approved bootstrap ceremony.
+      key-rotator: { condition: service_started }
 
   # ── egress (eth0) + rotation ────────────────────────────────────────
   envoy-egress:
@@ -806,13 +862,18 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
     networks: [net-portal, net-admin-app, net-vendor, net-vault, net-db-rotator, net-telemetry]
     healthcheck:
+      # Docker health is process liveness, not dependency readiness. A sealed
+      # or fresh Vault is an expected operator state and must not mark this
+      # otherwise-running image unusable for rollback preservation. Ansible
+      # independently probes /readyz and permits 503 only while the public
+      # Vault state proves it is fresh or sealed.
       test:
         - CMD
         - python3
         - -c
         - >-
           import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3).read()
+          urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()
       interval: 10s
       timeout: 5s
       retries: 18
@@ -820,11 +881,43 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       # First converge intentionally starts the rotator before Vault is
-      # initialized. Its /readyz stays unhealthy until the bootstrap script
-      # writes a valid token and recreates it; post-bootstrap deploys enforce
-      # full readiness.
+      # initialized. Strict /readyz remains 503 until the approved bootstrap
+      # or unseal ceremony; deployment verification enforces that separately.
       vault: { condition: service_started }
       envoy-egress: { condition: service_healthy }
+
+  vault-ui-proxy:
+    <<: *hardening
+    # The runtime reuses the same reviewed DHI Vault base but directly launches
+    # only a static Go proxy plus the reviewed Vault 2.0.3 UI assets. Startup
+    # asserts that the base's UI-less Vault binary is dormant. The Dockerfile
+    # pins every external build input and the shared build planner
+    # content-addresses this complete local source context.
+    build:
+      context: ./services/vault-ui-proxy
+      network: none
+    image: ai-gateway/dhi-vault-ui-proxy:2.0.3
+    user: "1000:1000"
+    read_only: true
+    pids_limit: 128
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: "0.5", pids: 128 }
+    # No environment variable or request field can select another upstream.
+    # This sole network contains the unchanged DHI Vault API backend and is
+    # not an edge or egress network.
+    networks: [net-vault]
+    healthcheck:
+      # Validates the non-stub UI, privacy-patched runtime config, and an
+      # authentic Vault health payload. Initialized+sealed and fresh,
+      # uninitialized states are reachable/legitimate and therefore healthy.
+      test: [CMD, /usr/local/bin/vault-ui-proxy, check]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    depends_on:
+      vault: { condition: service_started }
 
   vault:
     <<: *hardening
@@ -990,6 +1083,7 @@ services:
     # read-only service disables only its SELinux process label. Host ACLs and
     # the absence of the Docker socket remain the access boundary.
     security_opt: [no-new-privileges:true, label=disable]
+    user: "473:473"
     read_only: true
     # DHI Alloy runs uid/gid 473. Ansible grants that exact UID read/traverse
     # ACLs on Docker's read-only json-log tree; no DAC capability is added.
@@ -1102,12 +1196,16 @@ services:
         BASE_IMAGE: dhi.io/node-exporter:1.11.1@sha256:5b688b176c6d056570121078073e6998d7fa312277727a6513f6c9a5039123e8
     image: ai-gateway/dhi-node-exporter:1.11.1-probe
     # Docker explicitly warns never to apply `z`/`Z` to a system-directory
-    # bind such as `/`. Keep this second and final label-disable exception
-    # bounded by uid 65532, cap-drop ALL, a read-only rootfs/root mount, and
-    # the metrics-only network. It has no Docker socket or host PID namespace.
+    # bind such as `/`. This final label-disable exception is bounded by an
+    # explicit non-root UID, cap-drop ALL, a read-only rootfs/root mount, and
+    # the metrics-only network. A nested tmpfs masks host /run so the root
+    # filesystem bind can never expose /host/run/docker.sock to this process.
     security_opt: [no-new-privileges:true, label=disable]
+    user: "65532:65532"
     read_only: true
-    tmpfs: [/tmp]
+    tmpfs:
+      - /tmp
+      - /host/run:uid=65532,gid=65532,mode=0555,noexec,nosuid,nodev,size=1m
     pids_limit: 256
     deploy:
       resources:

@@ -66,6 +66,24 @@ static_resources:
                         # NO default route: anything not on the vendor
                         # allow-list gets 404. Add vendors here + a cluster.
                 http_filters:
+                  # This listener is reachable on both net-vendor and
+                  # net-metrics so Prometheus can scrape the separate :9902
+                  # listener. Authorize the vendor request plane by the direct
+                  # Docker peer address rather than an X-Forwarded-For value:
+                  # only LiteLLM and key-rotator share 172.28.7.0/24.
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: ALLOW
+                        policies:
+                          net_vendor_only:
+                            permissions:
+                              - any: true
+                            principals:
+                              - direct_remote_ip:
+                                  address_prefix: 172.28.7.0
+                                  prefix_len: 24
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

@@ -63,7 +63,13 @@ def _volume_tar(*, unsafe_link: bool = False, unsafe_sparse: bool = False) -> by
 def _stack_config_tar(*, unsafe_link: bool = False) -> bytes:
     entries: list[tuple[str, bytes | None, bytes]] = []
     for root in sorted(STACK_REQUIRED_ROOTS):
-        if root in {"docker-compose.yml", "bind-source-digest-inputs.json", ".env"}:
+        if root in {
+            "docker-compose.yml",
+            "docker-compose.dns.yml",
+            "docker-compose.platform-dns.yml",
+            "bind-source-digest-inputs.json",
+            ".env",
+        }:
             entries.append((root, f"{root}\n".encode(), tarfile.REGTYPE))
         else:
             entries.append((root, None, tarfile.DIRTYPE))
@@ -152,6 +158,8 @@ class RestoreArchiveTests(unittest.TestCase):
         extracted, config = self.prepare(_outer_backup())
         self.assertTrue((extracted / "manifest.json").is_file())
         self.assertTrue((config / "docker-compose.yml").is_file())
+        self.assertTrue((config / "docker-compose.dns.yml").is_file())
+        self.assertTrue((config / "docker-compose.platform-dns.yml").is_file())
         self.assertTrue((config / "scripts" / "placeholder").is_file())
 
     def test_extra_outer_member_is_rejected(self) -> None:

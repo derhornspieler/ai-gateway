@@ -1,0 +1,32 @@
+# Managed by Ansible. Only workloads with a real non-Internet route receive
+# the internal/ADM upstreams. Backends attached exclusively to Docker
+# `internal: true` networks retain the embedded 127.0.0.11 service-discovery resolver;
+# unresolved names go to container loopback, where no resolver exists. This keeps
+# them fail-closed instead of assigning an unreachable or daemon-host-bypassed
+# resolver. Envoy alone receives the Internet resolver plane.
+services:
+{% for service in [
+  'traefik-int', 'traefik-adm', 'alloy', 'cribl-mock'
+] %}
+  {{ service }}:
+    dns:
+{% for resolver in internal_dns_servers %}
+      - {{ resolver | to_json }}
+{% endfor %}
+{% endfor %}
+{% for service in [
+  'oauth2-proxy', 'oauth2-proxy-grafana', 'oauth2-proxy-prometheus',
+  'oauth2-proxy-vault', 'litellm', 'open-webui', 'keycloak', 'dev-portal',
+  'admin-portal', 'key-rotator', 'vault', 'postgres', 'redis',
+  'vault-ui-proxy', 'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana'
+] %}
+  {{ service }}:
+    # Docker still answers same-project service names through 127.0.0.11;
+    # only the upstream for names outside that graph is fail-closed.
+    dns: ["127.0.0.1"]
+{% endfor %}
+  envoy-egress:
+    dns:
+{% for resolver in egress_dns_servers %}
+      - {{ resolver | to_json }}
+{% endfor %}

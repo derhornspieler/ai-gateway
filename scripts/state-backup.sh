@@ -28,7 +28,7 @@ while (($#)); do
 done
 [[ "$recipient" =~ ^age1[0-9a-z]{58}$ ]] || { echo "only an age X25519 recipient is accepted" >&2; exit 2; }
 [[ "$output" = /* && "$output" == *.age ]] || { echo "--output must be an absolute .age path" >&2; exit 2; }
-[[ -d "$STACK_DIR" && -f "$STACK_DIR/docker-compose.yml" ]] || { echo "stack directory is not deployed" >&2; exit 1; }
+[[ -d "$STACK_DIR" && -f "$STACK_DIR/docker-compose.yml" && -f "$STACK_DIR/docker-compose.dns.yml" && -f "$STACK_DIR/docker-compose.platform-dns.yml" ]] || { echo "stack directory is not deployed" >&2; exit 1; }
 [[ -d "$(dirname "$output")" && ! -e "$output" && ! -L "$output" ]] || { echo "backup output must be new in an existing directory" >&2; exit 1; }
 for command in age age-inspect docker findmnt sha256sum tar python3; do
   command -v "$command" >/dev/null || { echo "required command missing: $command" >&2; exit 1; }
@@ -160,7 +160,7 @@ done
   echo "move/delete secrets/vault-init.json before backup; do not co-locate unseal material with Vault state" >&2
   exit 1
 }
-config_items=(docker-compose.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana keycloak litellm loki postgres prometheus tempo traefik services scripts certs)
+config_items=(docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana keycloak litellm loki postgres prometheus tempo traefik services scripts certs)
 [[ ! -f docker-compose.lab.yml ]] || config_items+=(docker-compose.lab.yml)
 [[ ! -d secrets ]] || config_items+=(secrets)
 tar --numeric-owner --exclude='.state' --exclude='.state-backup.*' \

@@ -5,9 +5,24 @@
 # docker_stack does not touch host networking, so it is safe in isolation.
 # Kept in the ansible/ project root so playbook-adjacent group_vars/all.yml loads.
 - name: AI Gateway — container stack only
-  hosts: gateway
+  hosts: gateway:generic_rocky9
   become: true
   pre_tasks:
+    - name: Preflight — require a bounded canonical lowercase deployment domain
+      ansible.builtin.assert:
+        that:
+          - >-
+            (aigw_domain | default('')) is string and
+            (aigw_domain | default('') | length <= 253) and
+            (aigw_domain | default('')) is match(
+              '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+            )
+        quiet: true
+        fail_msg: >-
+          Refusing stack-only mutation: aigw_domain must be a bounded canonical
+          lowercase FQDN.
+      no_log: true
+
     # Stack-only is deliberately unable to create/adopt a Docker host. Require
     # the exact marker promoted only after a successful full converge, and
     # refuse a host left in the pending state after a partial daemon-policy
@@ -85,7 +100,9 @@
           never recreate the graph under an unconfined daemon.
 
     - name: Preflight — capture the SELinux AVC audit window start
-      ansible.builtin.command: date +'%m/%d/%Y %H:%M:%S'
+      # ausearch under LC_ALL=C requires MM/DD/YY on Rocky 9; YYYY is a
+      # parser error and must never be mistaken for a clean audit window.
+      ansible.builtin.command: date +'%m/%d/%y %H:%M:%S'
       environment:
         LC_ALL: C
       register: aigw_selinux_audit_window_start
@@ -122,7 +139,7 @@
                 raise SystemExit("; ".join(errors))
           - "{{ encrypted_state_paths | to_json }}"
       changed_when: false
-      when: require_encrypted_state | bool
+      when: aigw_encrypted_state_preflight_required | bool
 
     - name: Preflight — read live DOCKER-USER policy
       ansible.builtin.command: iptables -S DOCKER-USER
@@ -152,12 +169,46 @@
       register: stack_only_host_input
       changed_when: false
 
+    - name: Preflight — require native internal-to-egress drops before reply allowance
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -c
+          - |
+            import sys
+
+            policy = sys.stdin.read()
+            marker = "chain container_forward {"
+            if policy.count(marker) != 1:
+                raise SystemExit("aigw_guard must contain exactly one container_forward chain")
+            forward = policy.split(marker, 1)[1]
+            reply = forward.find("ct state established,related ct direction reply accept")
+            if reply < 0:
+                raise SystemExit("container_forward has no explicit reply-only allowance")
+            errors = []
+            for ingress, egress in ((sys.argv[1], sys.argv[2]), (sys.argv[2], sys.argv[1])):
+                drop = f'iifname "{ingress}" oifname "{egress}" drop'
+                position = forward.find(drop)
+                if position < 0:
+                    errors.append(f"missing physical cross-plane drop: {drop}")
+                elif position > reply:
+                    errors.append(f"physical cross-plane drop occurs after reply allowance: {drop}")
+                if f'iifname "{ingress}" oifname "{egress}" accept' in forward:
+                    errors.append(f"physical cross-plane accept exists: {ingress}->{egress}")
+            if errors:
+                raise SystemExit("; ".join(errors))
+          - "{{ nic_internal }}"
+          - "{{ nic_egress }}"
+        stdin: "{{ stack_only_host_input.stdout }}"
+        stdin_add_newline: false
+      changed_when: false
+
     - name: Preflight — require every managed bridge to be denied new host connections
       ansible.builtin.assert:
         that:
           - "'chain container_forward' in stack_only_host_input.stdout"
           - "('ip saddr ' ~ envoy_egress_ip) in stack_only_host_input.stdout"
-          - "('ip daddr ' ~ container_dns_server) in stack_only_host_input.stdout"
           - "'ct status dnat' in stack_only_host_input.stdout"
           - "('ct original ip daddr ' ~ eth1_ip) in stack_only_host_input.stdout"
           - "('ct original ip daddr ' ~ eth2_ip) in stack_only_host_input.stdout"
@@ -167,6 +218,51 @@
       loop: "{{ docker_networks }}"
       loop_control:
         label: "{{ item.bridge }}"
+
+    - name: Preflight — require exact Envoy-only Internet DNS rules
+      ansible.builtin.assert:
+        that:
+          - "('ip saddr ' ~ envoy_egress_ip ~ ' ip daddr ' ~ item) in stack_only_host_input.stdout"
+          - "('oifname \"' ~ nic_egress ~ '\"') in stack_only_host_input.stdout"
+        fail_msg: "Internet resolver {{ item }} is not bound to Envoy and the egress NIC; run site.yml."
+      loop: "{{ egress_dns_servers }}"
+
+    - name: Preflight — require the current internal resolver firewall tuples
+      ansible.builtin.assert:
+        that:
+          - >-
+            (platform_authoritative_dns_enabled | bool) or
+            (('-d ' ~ item ~ '/32') in stack_only_du.stdout)
+          - >-
+            (platform_authoritative_dns_enabled | bool) or
+            (('ip daddr ' ~ item) in stack_only_host_input.stdout)
+          - >-
+            not (platform_authoritative_dns_enabled | bool) or
+            (('-i br-lab-dns' in stack_only_du.stdout) and
+             (('-s ' ~ lab_dns_ip ~ '/32') in stack_only_du.stdout) and
+             ('--sport 53' in stack_only_du.stdout) and
+             ('--ctdir REPLY' in stack_only_du.stdout))
+          - >-
+            not (platform_authoritative_dns_enabled | bool) or
+            (('iifname "br-lab-dns"' in stack_only_host_input.stdout) and
+             (('ip saddr ' ~ lab_dns_ip) in stack_only_host_input.stdout) and
+             ('sport 53' in stack_only_host_input.stdout) and
+             ('ct direction reply accept' in stack_only_host_input.stdout))
+          - >-
+            (platform_authoritative_dns_enabled | bool) or
+            not (('-i br-lab-dns' in stack_only_du.stdout) and
+                 ('--sport 53' in stack_only_du.stdout) and
+                 ('--ctdir REPLY' in stack_only_du.stdout))
+          - >-
+            (platform_authoritative_dns_enabled | bool) or
+            not (('iifname "br-lab-dns"' in stack_only_host_input.stdout) and
+                 ('sport 53' in stack_only_host_input.stdout) and
+                 ('ct direction reply accept' in stack_only_host_input.stdout))
+        fail_msg: >-
+          Internal resolver or authoritative platform-DNS firewall policy does
+          not match this inventory. Run the full site.yml converge before a
+          stack-only rollout.
+      loop: "{{ internal_dns_servers }}"
 
     - name: Preflight — require firewall services active
       ansible.builtin.command: >-

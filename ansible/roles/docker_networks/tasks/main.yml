@@ -46,6 +46,7 @@
       - |
         import json
         import ipaddress
+        import os
         import re
         import subprocess
         import sys
@@ -81,6 +82,158 @@
             ids = invoke("ps", "-aq", "--no-trunc").split()
             containers = json.loads(invoke("inspect", *ids)) if ids else []
             project_ids = set()
+            docker_socket_path = "/run/docker.sock"
+
+            def bind_exposes_docker_socket(mount, mounts, seen=frozenset()):
+                if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                    return False
+                if id(mount) in seen:
+                    return True
+                source = mount.get("Source")
+                destination = mount.get("Destination")
+                if (
+                    not isinstance(source, str) or not source.startswith("/")
+                    or not isinstance(destination, str) or not destination.startswith("/")
+                ):
+                    return True
+                try:
+                    source_path = os.path.realpath(source)
+                    if os.path.commonpath([source_path, docker_socket_path]) != source_path:
+                        return False
+                    relative_socket_path = os.path.relpath(
+                        docker_socket_path, source_path
+                    )
+                except (OSError, ValueError):
+                    # A malformed/indeterminate bind source is never assumed
+                    # harmless when it could expose the Docker control socket.
+                    return True
+                if relative_socket_path == ".." or relative_socket_path.startswith("../"):
+                    return False
+                container_socket_path = os.path.normpath(
+                    os.path.join(destination, relative_socket_path)
+                )
+                if not container_socket_path.startswith("/"):
+                    return True
+                masks = []
+                for candidate in mounts:
+                    if candidate is mount or not isinstance(candidate, dict):
+                        continue
+                    candidate_destination = candidate.get("Destination")
+                    if not isinstance(candidate_destination, str) or not candidate_destination.startswith("/"):
+                        continue
+                    try:
+                        if os.path.commonpath(
+                            [candidate_destination, container_socket_path]
+                        ) == candidate_destination:
+                            masks.append(candidate)
+                    except ValueError:
+                        return True
+                if not masks:
+                    return True
+                effective_mask = max(
+                    masks, key=lambda item: len(item.get("Destination", ""))
+                )
+                if effective_mask.get("Type") == "tmpfs":
+                    return False
+                if effective_mask.get("Type") != "bind":
+                    return True
+                return bind_exposes_docker_socket(
+                    effective_mask, mounts, seen | {id(mount)}
+                )
+
+            def normalized_container_mounts(container):
+                """Add Docker 29 HostConfig.Tmpfs entries missing from Mounts.
+
+                Docker Engine 29 reports configured tmpfs mounts under
+                HostConfig.Tmpfs but omits them from the top-level Mounts list.
+                The latter is otherwise the right source for bind provenance,
+                so synthesize only structurally valid tmpfs entries. A
+                conflicting non-tmpfs mount at the same destination is
+                ambiguous and must fail closed rather than masking a socket.
+                """
+                mounts = container.get("Mounts")
+                host_config = container.get("HostConfig")
+                if (
+                    not isinstance(mounts, list)
+                    or any(not isinstance(mount, dict) for mount in mounts)
+                    or not isinstance(host_config, dict)
+                ):
+                    return None
+                tmpfs = host_config.get("Tmpfs")
+                if tmpfs is None:
+                    return list(mounts)
+                if not isinstance(tmpfs, dict):
+                    return None
+                effective = list(mounts)
+                by_destination = {}
+                for mount in effective:
+                    destination = mount.get("Destination")
+                    if isinstance(destination, str):
+                        by_destination.setdefault(destination, []).append(mount)
+                for destination, options in tmpfs.items():
+                    if (
+                        not isinstance(destination, str)
+                        or not destination.startswith("/")
+                        or destination == "/"
+                        or os.path.normpath(destination) != destination
+                        or not isinstance(options, str)
+                    ):
+                        return None
+                    existing = by_destination.get(destination, [])
+                    if existing:
+                        if any(mount.get("Type") != "tmpfs" for mount in existing):
+                            return None
+                        continue
+                    tmpfs_mount = {
+                        "Type": "tmpfs",
+                        "Destination": destination,
+                    }
+                    effective.append(tmpfs_mount)
+                    by_destination[destination] = [tmpfs_mount]
+                return effective
+
+            def is_host_root_bind(mount):
+                if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                    return False
+                source = mount.get("Source")
+                if not isinstance(source, str) or not source.startswith("/"):
+                    return True
+                try:
+                    return os.path.realpath(source) == "/"
+                except OSError:
+                    return True
+
+            def has_approved_node_exporter_rootfs(container, mounts):
+                labels = (container.get("Config") or {}).get("Labels") or {}
+                if labels.get("com.docker.compose.service") != "node-exporter":
+                    return False
+                if (container.get("Config") or {}).get("User") != "65532:65532":
+                    return False
+                root_binds = [
+                    mount for mount in mounts
+                    if mount.get("Type") == "bind"
+                    and mount.get("Source") == "/"
+                    and mount.get("Destination") == "/host"
+                    and mount.get("RW") is False
+                    and mount.get("Propagation") == "rslave"
+                ]
+                all_host_root_binds = [
+                    mount for mount in mounts if is_host_root_bind(mount)
+                ]
+                run_masks = [
+                    mount for mount in mounts
+                    if mount.get("Type") == "tmpfs"
+                    and mount.get("Destination") == "/host/run"
+                ]
+                tmpfs = (container.get("HostConfig") or {}).get("Tmpfs")
+                return (
+                    len(root_binds) == 1
+                    and len(all_host_root_binds) == 1
+                    and len(run_masks) == 1
+                    and isinstance(tmpfs, dict)
+                    and "/host/run" in tmpfs
+                )
+
             for container in containers:
                 labels = (container.get("Config") or {}).get("Labels") or {}
                 identifier = container.get("Id", "")
@@ -94,6 +247,20 @@
                     project_ids.add(identifier)
                 else:
                     errors.append(f"foreign Docker container {identifier or '?'}")
+                mounts = normalized_container_mounts(container)
+                if mounts is None:
+                    errors.append(
+                        f"container {identifier or '?'} has malformed Docker mount metadata"
+                    )
+                    continue
+                if any(bind_exposes_docker_socket(mount, mounts) for mount in mounts):
+                    errors.append(
+                        f"container {identifier or '?'} bind-mounts the Docker Unix socket"
+                    )
+                if any(is_host_root_bind(mount) for mount in mounts) and not has_approved_node_exporter_rootfs(container, mounts):
+                    errors.append(
+                        f"container {identifier or '?'} has an unapproved host-root bind"
+                    )
 
             network_ids = invoke("network", "ls", "-q").split()
             networks = json.loads(invoke("network", "inspect", *network_ids)) if network_ids else []
@@ -218,7 +385,7 @@
         # the proxy/firewall ABI. Without a separate dynamic pool, concurrent
         # Compose startup can allocate .2/.3 to an ordinary service before its
         # fixed-IP owner attaches, producing a nondeterministic collision.
-        iprange: "{{ item.subnet | regex_replace('\\.0/24$', '.128/25') }}"
+        iprange: "{{ item.subnet | replace('.0/24', '.128/25') }}"
     driver_options:
       # stable bridge names -> referencable in firewall rules / debugging
       com.docker.network.bridge.name: "{{ item.bridge }}"

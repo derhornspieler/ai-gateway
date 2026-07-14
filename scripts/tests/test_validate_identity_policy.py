@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -65,6 +66,27 @@ class DeployedIdentityPolicyValidationTests(unittest.TestCase):
         result = self.run_validator("aigw.internal\nINJECTED=value")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("safe DNS name", result.stderr)
+
+    def test_rejects_missing_or_broadened_oidc_realm_role_scope_mapping(self) -> None:
+        realm_path = self.root / "keycloak" / "realms" / "aigw-realm.json"
+        realm = json.loads(realm_path.read_text())
+        realm["scopeMappings"] = [
+            {
+                "client": "open-webui",
+                "roles": [
+                    "aigw-admins",
+                    "aigw-developers",
+                    "aigw-users",
+                    "unexpected-role",
+                ],
+            }
+        ]
+        realm_path.write_text(json.dumps(realm))
+
+        result = self.run_validator("aigw.example.internal")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("scope mapping", result.stderr)
 
 
 if __name__ == "__main__":

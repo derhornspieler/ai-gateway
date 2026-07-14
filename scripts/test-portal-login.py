@@ -28,7 +28,7 @@ def main() -> int:
     parser.add_argument("--username", required=True)
     parser.add_argument(
         "--expect-path",
-        choices=("/", "/admin", "forbidden", "denied"),
+        choices=("/", "forbidden", "denied"),
         required=True,
     )
     parser.add_argument("--verify-admin", action="store_true")
@@ -57,7 +57,7 @@ def main() -> int:
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=context),
         urllib.request.HTTPCookieProcessor(cookies),
-        flow.RestrictedRedirects(),
+        flow.RestrictedRedirects(flow.PORTAL_ALLOWED_HOSTS),
     )
     final_url, html = flow.read_page(opener, flow.PORTAL_ORIGIN + "/login/start")
     forms = [
@@ -72,6 +72,7 @@ def main() -> int:
             final_url,
             forms[0],
             {"username": args.username, "password": password},
+            allowed_hosts=flow.PORTAL_ALLOWED_HOSTS,
         )
         actual_path = urllib.parse.urlsplit(final_url).path
     except urllib.error.HTTPError as exc:
@@ -94,12 +95,33 @@ def main() -> int:
         return 0
     if actual_path != args.expect_path:
         raise RuntimeError(f"unexpected post-login portal path: {actual_path}")
-    if not any(cookie.name == "session" for cookie in cookies):
+    if not any(cookie.name == "aigw_portal_session" for cookie in cookies):
         raise RuntimeError("portal OIDC callback did not establish a session")
     if args.verify_admin:
-        admin_url, _ = flow.read_page(opener, flow.PORTAL_ORIGIN + "/admin")
-        if urllib.parse.urlsplit(admin_url).path != "/admin":
+        admin_cookies = http.cookiejar.CookieJar()
+        admin_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=context),
+            urllib.request.HTTPCookieProcessor(admin_cookies),
+            flow.RestrictedRedirects(flow.ADMIN_PORTAL_ALLOWED_HOSTS),
+        )
+        admin_url, _ = flow.keycloak_login(
+            admin_opener,
+            flow.ADMIN_PORTAL_ORIGIN + "/login/start",
+            password,
+            allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
+            username=args.username,
+        )
+        parsed_admin = urllib.parse.urlsplit(admin_url)
+        if (
+            parsed_admin.hostname != "admin.aigw.internal"
+            or parsed_admin.path != "/admin"
+        ):
             raise RuntimeError("directory administrator could not access /admin")
+        if not any(
+            cookie.name == "aigw_admin_session" for cookie in admin_cookies
+        ):
+            raise RuntimeError("admin OIDC callback did not establish its own session")
         print(f"PORTAL_DIRECTORY_ADMIN_PASS username={args.username}")
     if args.logout:
         logout_url, logout_html = flow.read_page(opener, flow.PORTAL_ORIGIN + "/logout")
@@ -120,6 +142,7 @@ def main() -> int:
                 logout_url,
                 confirmation_forms[0],
                 {},
+                allowed_hosts=flow.PORTAL_ALLOWED_HOSTS,
             )
             parsed_logout = urllib.parse.urlsplit(logout_url)
         if parsed_logout.hostname != "portal.aigw.internal" or parsed_logout.path != "/login":
@@ -127,7 +150,7 @@ def main() -> int:
                 "portal logout did not complete the reviewed Keycloak redirect: "
                 f"host={parsed_logout.hostname} path={parsed_logout.path}"
             )
-        if any(cookie.name == "session" for cookie in cookies):
+        if any(cookie.name == "aigw_portal_session" for cookie in cookies):
             raise RuntimeError("portal session cookie survived logout")
         print(f"PORTAL_LOGOUT_PASS username={args.username}")
     print(f"PORTAL_SAMBA_LOGIN_PASS username={args.username} result={actual_path}")

@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "vault_version": "2.0.3",
+  "vault_commit": "7193f9a48ff6093ca61b3b627a8671e770428ba6",
+  "signed_checksums": {
+    "url": "https://releases.hashicorp.com/vault/2.0.3/vault_2.0.3_SHA256SUMS",
+    "sha256": "c361d1f6e5ff1f92f0285680b054a3079898f37c134e7d6ac6f30a8ad7bfc5b3",
+    "signature_url": "https://releases.hashicorp.com/vault/2.0.3/vault_2.0.3_SHA256SUMS.sig",
+    "signature_sha256": "b7f6664ccb3dce2ce7892c15c7a469dfbe79b7039c16a4f2848af7e3c0b90caf",
+    "signer_primary_fingerprint": "C874011F0AB405110D02105534365D9472D7468F",
+    "signing_subkey_fingerprint": "374EC75B485913604A831CC7C820C6D5CD27AB87"
+  },
+  "source_image": {
+    "reference": "hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54",
+    "index_digest": "sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54",
+    "platform_manifests": {
+      "linux/amd64": "sha256:db6a5f78749204d0a8d002be1cc6e9a2a6de53dffce41a894c4a06d309dca360",
+      "linux/arm64": "sha256:906332af79c036cddc35d1e256eec71d336fbcb8c3045932a7f432be691ebdf5"
+    }
+  },
+  "platforms": {
+    "linux/amd64": {
+      "archive": "vault_2.0.3_linux_amd64.zip",
+      "archive_size": 176199521,
+      "archive_sha256": "1e0ffb7a82491219c7242da6e05e2d756b05d1097c29799a42228661f229bc2a",
+      "binary_size": 536903029,
+      "binary_sha256": "7e8731db316124619ff2e64aee6957df6d54b824dfdc3494466193cb7bde0ac4",
+      "source_image_binary_byte_matches_signed_archive": true
+    },
+    "linux/arm64": {
+      "archive": "vault_2.0.3_linux_arm64.zip",
+      "archive_size": 163708119,
+      "archive_sha256": "9423a715aea0689f9e498fe7cc5ea692aa1eff282f8b9bc26af28cad69d6d841",
+      "binary_size": 507703909,
+      "binary_sha256": "8495a9215c20030c0f054699d52f6c1cf09dd3a663068bce57939adc193f564b",
+      "source_image_binary_byte_matches_signed_archive": true
+    }
+  },
+  "embedded_ui": {
+    "entries": 132,
+    "directories": 27,
+    "files": 105,
+    "bytes": 20549720,
+    "compiler_hashes_verified": 105,
+    "sorted_manifest_sha256": "7902aff69dccdea5096e05b7b6bdcfa218113ae6314f7574f955e417e9c34198"
+  }
+}

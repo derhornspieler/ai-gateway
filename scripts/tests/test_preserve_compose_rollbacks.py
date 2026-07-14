@@ -43,6 +43,8 @@ class FakeDocker:
         self.tag_calls: list[tuple[str, str]] = []
         self.break_tag_verification = False
         self.image_inspect_sequences: dict[str, list[str | None]] = {}
+        self.dependency_gate_proven = False
+        self.dependency_gate_calls: list[tuple[str, str]] = []
 
     def _container(self, identifier: str, image_id: str) -> dict[str, object]:
         return {
@@ -101,6 +103,18 @@ class FakeDocker:
             OTHER_IMAGE if self.break_tag_verification else source_image_id
         )
 
+    def prove_key_rotator_dependency_gate(
+        self,
+        project: str,
+        identifier: str,
+        container: dict[str, object],
+    ) -> bool:
+        assert project == "ai-gateway"
+        assert identifier == self.container["Id"]
+        assert container["Id"] == identifier
+        self.dependency_gate_calls.append((project, identifier))
+        return self.dependency_gate_proven
+
 
 class ComposeRollbackPreservationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -156,6 +170,15 @@ class ComposeRollbackPreservationTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def write_completed_build_receipt(self, payload: str | None = None) -> Path:
+        """Create the root-only marker written after a successful image build."""
+        if payload is None:
+            payload = json.dumps(self.plan["manifest"])
+        path = self.state / preserver.BUILD_INPUTS_NAME
+        path.write_text(payload)
+        path.chmod(0o600)
+        return path
+
     def test_running_immutable_image_is_tagged_and_manifested_atomically(self) -> None:
         docker = FakeDocker(self.image)
         result = self.preserve(docker)
@@ -197,6 +220,113 @@ class ComposeRollbackPreservationTests(unittest.TestCase):
         docker.container_lists = [[], []]
         with self.assertRaisesRegex(preserver.PreserveError, "build plan"):
             self.preserve(docker)
+
+    def test_clean_first_build_allows_exact_preseeded_planned_image(self) -> None:
+        # The clean Rocky reset seeds reviewed custom images so the first
+        # Compose build can run offline.  Before a successful-build receipt
+        # exists, that exact planned image is not evidence of an older runtime
+        # generation and must be represented as an explicit first build.
+        docker = FakeDocker(self.image)
+        docker.container_lists = [[], []]
+
+        result = self.preserve(docker)
+
+        record = result["services"]["key-rotator"]  # type: ignore[index]
+        self.assertEqual(record["status"], "first-build")
+        self.assertEqual(record["planned_image_id"], OLD_IMAGE)
+        self.assertIsNone(record["container_id"])
+        self.assertIsNone(record["source_image_id"])
+        self.assertIsNone(record["rollback_image"])
+        self.assertEqual(docker.tag_calls, [])
+
+    def test_completed_build_receipt_disallows_preseeded_image_without_container(self) -> None:
+        # Once Ansible has durably recorded a successful custom-image build,
+        # a missing service container must never be mistaken for first deploy.
+        self.write_completed_build_receipt()
+        docker = FakeDocker(self.image)
+        docker.container_lists = [[], []]
+
+        with self.assertRaisesRegex(
+            preserver.PreserveError, "no authoritative container"
+        ):
+            self.preserve(docker)
+        self.assertEqual(docker.tag_calls, [])
+
+    def test_new_service_can_start_after_valid_receipt_omits_it(self) -> None:
+        # A later-added service has no historical runtime merely because other
+        # services are present in a completed deployment receipt. An empty
+        # rollback inventory is normal after first-build proofs are retired.
+        self.write_manifest({})
+        self.write_completed_build_receipt(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "services": {
+                        "portal": {
+                            "digest": "f" * 64,
+                            "image": "ai-gateway-portal",
+                            "image_id": OTHER_IMAGE,
+                        }
+                    },
+                }
+            )
+        )
+        docker = FakeDocker(self.image)
+        docker.container_lists = [[], []]
+
+        result = self.preserve(docker)
+
+        self.assertEqual(
+            result["services"]["key-rotator"]["status"],  # type: ignore[index]
+            "first-build",
+        )
+
+    def test_existing_rollback_manifest_without_receipt_is_not_clean_deploy(self) -> None:
+        # A deleted build receipt must not reclassify a historical stack as a
+        # clean deployment. Normal completed first builds retain an empty
+        # rollback inventory after their retry proofs are retired.
+        self.write_manifest({})
+        docker = FakeDocker(self.image)
+        docker.container_lists = [[], []]
+
+        with self.assertRaisesRegex(
+            preserver.PreserveError, "no authoritative container"
+        ):
+            self.preserve(docker)
+        self.assertEqual(docker.tag_calls, [])
+
+    def test_malformed_completed_build_receipt_fails_before_docker(self) -> None:
+        self.write_completed_build_receipt("{}")
+        docker = FakeDocker(self.image)
+        docker.container_lists = [[], []]
+
+        with self.assertRaisesRegex(
+            preserver.PreserveError, "build-input receipt envelope"
+        ):
+            self.preserve(docker)
+        self.assertEqual(docker.ready_calls, 0)
+        self.assertEqual(docker.tag_calls, [])
+
+    def test_unsafe_completed_build_receipt_fails_closed(self) -> None:
+        receipt = self.state / preserver.BUILD_INPUTS_NAME
+        outside = self.stack / "untrusted-build-inputs.json"
+        outside.write_text("{}")
+
+        receipt.symlink_to(outside)
+        docker = FakeDocker(self.image)
+        docker.container_lists = [[], []]
+        with self.assertRaisesRegex(preserver.PreserveError, "build-input receipt"):
+            self.preserve(docker)
+        self.assertEqual(docker.tag_calls, [])
+
+        receipt.unlink()
+        self.write_completed_build_receipt()
+        receipt.chmod(0o644)
+        docker = FakeDocker(self.image)
+        docker.container_lists = [[], []]
+        with self.assertRaisesRegex(preserver.PreserveError, "build-input receipt"):
+            self.preserve(docker)
+        self.assertEqual(docker.tag_calls, [])
 
     def test_interrupted_first_build_with_committed_proof_is_retryable(self) -> None:
         self.plan["manifest"]["services"]["key-rotator"]["image_id"] = None  # type: ignore[index]
@@ -240,6 +370,10 @@ class ComposeRollbackPreservationTests(unittest.TestCase):
         persisted = json.loads((self.state / preserver.MANIFEST_NAME).read_text())
         self.assertEqual(persisted["services"], {})
 
+        # The real successful-build receipt is what closes the clean deploy
+        # window even after its first-build rollback proof has been retired.
+        self.write_completed_build_receipt(json.dumps(successful))
+
         # The stale initial-deployment proof can no longer authorize a future
         # no-container build merely because an image tag exists.
         self.plan["manifest"]["services"]["key-rotator"]["digest"] = "f" * 64  # type: ignore[index]
@@ -280,6 +414,38 @@ class ComposeRollbackPreservationTests(unittest.TestCase):
         del docker.container["State"]["Health"]  # type: ignore[index]
         with self.assertRaisesRegex(preserver.PreserveError, "not healthy"):
             self.preserve(docker)
+        self.assertEqual(docker.tag_calls, [])
+
+    def test_exact_sealed_vault_dependency_gate_can_preserve_rotator(self) -> None:
+        docker = FakeDocker(self.image)
+        docker.container["State"]["Health"]["Status"] = "unhealthy"  # type: ignore[index]
+        docker.dependency_gate_proven = True
+
+        result = self.preserve(docker)
+
+        self.assertEqual(
+            result["services"]["key-rotator"]["status"],  # type: ignore[index]
+            "preserved",
+        )
+        self.assertEqual(
+            docker.dependency_gate_calls,
+            [
+                ("ai-gateway", CONTAINER_ID),
+                ("ai-gateway", CONTAINER_ID),
+            ],
+        )
+
+    def test_unproven_unhealthy_rotator_is_never_preserved(self) -> None:
+        docker = FakeDocker(self.image)
+        docker.container["State"]["Health"]["Status"] = "unhealthy"  # type: ignore[index]
+
+        with self.assertRaisesRegex(preserver.PreserveError, "not healthy"):
+            self.preserve(docker)
+
+        self.assertEqual(
+            docker.dependency_gate_calls,
+            [("ai-gateway", CONTAINER_ID)],
+        )
         self.assertEqual(docker.tag_calls, [])
 
     def test_moved_tag_or_mismatched_container_reference_fails_closed(self) -> None:
@@ -688,6 +854,140 @@ class ComposeRollbackPreservationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(preserver.PreserveError, "ambiguous"):
             client.inspect_image(self.image)
+
+    def test_docker_client_proves_exact_rotator_sealed_vault_gate(self) -> None:
+        rotator = FakeDocker(self.image).container
+        rotator["Config"]["Healthcheck"] = {  # type: ignore[index]
+            "Test": preserver.KEY_ROTATOR_READINESS_HEALTHCHECK
+        }
+        vault = {
+            "Id": OTHER_CONTAINER_ID,
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "ai-gateway",
+                    "com.docker.compose.service": "vault",
+                    "com.docker.compose.oneoff": "False",
+                    "com.docker.compose.container-number": "1",
+                }
+            },
+            "State": {
+                "Running": True,
+                "Status": "running",
+                "Restarting": False,
+                "Dead": False,
+            },
+        }
+        responses = [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(OTHER_CONTAINER_ID + "\n").encode(),
+                stderr=b"",
+            ),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps([vault]).encode(),
+                stderr=b"",
+            ),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=2,
+                stdout=b'{"initialized":true,"sealed":true}',
+                stderr=b"",
+            ),
+        ]
+        runner = mock.Mock(side_effect=responses)
+        client = preserver.DockerClient("/usr/bin/docker", runner=runner)
+
+        self.assertTrue(
+            client.prove_key_rotator_dependency_gate(
+                "ai-gateway", CONTAINER_ID, rotator
+            )
+        )
+        self.assertEqual(
+            runner.call_args_list[0].args[0],
+            [
+                "/usr/bin/docker",
+                "--host",
+                "unix:///run/docker.sock",
+                "container",
+                "exec",
+                CONTAINER_ID,
+                "python3",
+                "-c",
+                preserver.KEY_ROTATOR_DEPENDENCY_PROBE,
+            ],
+        )
+        self.assertEqual(
+            runner.call_args_list[-1].args[0],
+            [
+                "/usr/bin/docker",
+                "--host",
+                "unix:///run/docker.sock",
+                "container",
+                "exec",
+                OTHER_CONTAINER_ID,
+                "vault",
+                "status",
+                "-address=http://127.0.0.1:8200",
+                "-format=json",
+            ],
+        )
+
+    def test_docker_client_rejects_unsealed_dependency_gate(self) -> None:
+        rotator = FakeDocker(self.image).container
+        rotator["Config"]["Healthcheck"] = {  # type: ignore[index]
+            "Test": preserver.KEY_ROTATOR_READINESS_HEALTHCHECK
+        }
+        vault = {
+            "Id": OTHER_CONTAINER_ID,
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "ai-gateway",
+                    "com.docker.compose.service": "vault",
+                    "com.docker.compose.oneoff": "False",
+                    "com.docker.compose.container-number": "1",
+                }
+            },
+            "State": {
+                "Running": True,
+                "Status": "running",
+                "Restarting": False,
+                "Dead": False,
+            },
+        }
+        responses = [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(OTHER_CONTAINER_ID + "\n").encode(),
+                stderr=b"",
+            ),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps([vault]).encode(),
+                stderr=b"",
+            ),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=b'{"initialized":true,"sealed":false}',
+                stderr=b"",
+            ),
+        ]
+        client = preserver.DockerClient(
+            "/usr/bin/docker", runner=mock.Mock(side_effect=responses)
+        )
+
+        self.assertFalse(
+            client.prove_key_rotator_dependency_gate(
+                "ai-gateway", CONTAINER_ID, rotator
+            )
+        )
 
 
 if __name__ == "__main__":

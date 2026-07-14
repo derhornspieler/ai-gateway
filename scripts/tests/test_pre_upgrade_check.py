@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,7 +30,8 @@ class PreUpgradeCheckTests(unittest.TestCase):
         for directory in (self.scripts, self.context, self.state, self.fakebin):
             directory.mkdir(parents=True, exist_ok=True)
 
-        shutil.copy2(PLANNER, self.scripts / PLANNER.name)
+        self.planner = self.scripts / PLANNER.name
+        shutil.copy2(PLANNER, self.planner)
         self.dockerfile = self.context / "Dockerfile"
         self.dockerfile.write_text("FROM scratch\n")
         self.model_path = self.stack / "model.json"
@@ -61,6 +63,10 @@ class PreUpgradeCheckTests(unittest.TestCase):
         fake_docker.write_text(
             """#!/usr/bin/env bash
 set -euo pipefail
+if [[ ${1:-} == --host ]]; then
+  [[ ${2:-} == unix:///run/docker.sock ]] || exit 64
+  shift 2
+fi
 if [[ ${1:-} == ps ]]; then
   service=""
   for argument in "$@"; do
@@ -78,14 +84,33 @@ if [[ ${1:-} == inspect ]]; then
   exit 0
 fi
 if [[ ${1:-} == image && ${2:-} == inspect ]]; then
-  [[ ${FAKE_IMAGE_PRESENT:-1} == 1 ]] || exit 1
-  printf '[{"Id":"%s"}]\n' "$FAKE_IMAGE_ID"
+  printf '[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n'
   exit 0
 fi
 exit 64
 """
         )
         fake_docker.chmod(0o755)
+
+        # Production code pins the root-owned Rocky Docker binary. Patch only
+        # the disposable copied test fixtures so the isolated subprocesses can
+        # exercise the same argv contract without depending on a local daemon.
+        self.planner.write_text(
+            self.planner.read_text(encoding="utf-8").replace(
+                'DOCKER_BINARY = "/usr/bin/docker"',
+                f"DOCKER_BINARY = {str(fake_docker)!r}",
+            ),
+            encoding="utf-8",
+        )
+        self.check = self.scripts / CHECK.name
+        self.check.write_text(
+            CHECK.read_text(encoding="utf-8").replace(
+                "docker_cmd=(docker --host unix:///run/docker.sock)",
+                f"docker_cmd=({shlex.quote(str(fake_docker))} --host unix:///run/docker.sock)",
+            ),
+            encoding="utf-8",
+        )
+        self.check.chmod(0o750)
 
         self.env = os.environ.copy()
         self.env.update(
@@ -106,7 +131,7 @@ exit 64
             [
                 sys.executable,
                 "-I",
-                str(self.scripts / PLANNER.name),
+                str(self.planner),
                 str(self.stack),
                 str(self.state / "compose-build-inputs.json"),
                 "ai-gateway",
@@ -148,7 +173,7 @@ exit 64
 
     def run_check(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(CHECK)],
+            ["bash", str(self.check)],
             text=True,
             capture_output=True,
             env=self.env,

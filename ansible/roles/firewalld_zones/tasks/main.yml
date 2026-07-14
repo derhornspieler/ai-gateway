@@ -64,8 +64,7 @@
         import sys
 
         zones = json.loads(sys.argv[1])
-        lab_dns_enabled = json.loads(sys.argv[2])
-        vpn_cidr, internal_cidr, adm_ip, internal_ip, management_port = sys.argv[3:]
+        vpn_cidr, internal_cidr, adm_ip, internal_ip, management_port = sys.argv[2:]
         managed = {zone["zone"]: zone for zone in zones}
 
         def invoke(scope, *arguments, allowed=(0,)):
@@ -83,14 +82,52 @@
                 )
             return result.returncode, result.stdout.strip()
 
+        def canonical_zone_target(target):
+            # `--list-all` preserves firewalld's special %%REJECT%% spelling,
+            # while permanent --get-target reports REJECT.  Canonicalize only
+            # values firewalld can legitimately use here; an arbitrary token
+            # is unsafe configuration drift, never a compatible alias.
+            known_targets = {
+                "default": "default",
+                "ACCEPT": "ACCEPT",
+                "DROP": "DROP",
+                "REJECT": "REJECT",
+                "%%REJECT%%": "REJECT",
+            }
+            try:
+                return known_targets[target]
+            except KeyError as error:
+                raise RuntimeError(f"unrecognized firewalld zone target {target!r}") from error
+
+        def runtime_zone_target(zone_text):
+            # Rocky Linux 9's firewalld exposes --get-target only for the
+            # permanent configuration.  Runtime --list-all includes the
+            # authoritative target line; accept exactly one well-formed line
+            # instead of treating an unavailable query as a benign default.
+            matches = re.findall(
+                r"(?m)^[ \t]*target:[ \t]*([^ \t\r\n]+)[ \t]*$", zone_text
+            )
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "runtime firewall-cmd --list-all output must contain exactly one target line"
+                )
+            return canonical_zone_target(matches[0])
+
+        def zone_target(scope, name):
+            if scope == "runtime":
+                _, zone_text = invoke(scope, f"--zone={name}", "--list-all")
+                return runtime_zone_target(zone_text)
+            _, target = invoke(scope, f"--zone={name}", "--get-target")
+            return canonical_zone_target(target)
+
         def words(value):
             return {word for word in value.split() if word}
 
         def normalize_rule(value):
             return " ".join(value.split())
 
-        # The normal desired rules plus the lab DNS rules are recognizable
-        # migration state.  Disabled lab DNS is reconciled away later; an
+        # The normal desired rules plus the platform DNS rules are recognizable
+        # migration state. Disabled platform DNS is reconciled away later; an
         # arbitrary rich rule is never accepted merely because it is in an
         # AIGW-named zone.
         allowed_rich = {
@@ -135,8 +172,8 @@
             for name, desired in managed.items():
                 if name not in existing:
                     continue
-                _, target = invoke(scope, f"--zone={name}", "--get-target")
-                allowed_targets = {"default", desired["target"].replace("%", "")}
+                target = zone_target(scope, name)
+                allowed_targets = {"default", canonical_zone_target(desired["target"])}
                 if target not in allowed_targets:
                     errors.append(f"{scope}:{name}: unsafe target {target!r}")
 
@@ -197,7 +234,6 @@
         if errors:
             raise SystemExit("; ".join(dict.fromkeys(errors)))
       - "{{ firewalld_zones | to_json }}"
-      - "{{ lab_dns_enabled | bool | to_json }}"
       - "{{ vpn_client_cidr }}"
       - "{{ internal_cidr }}"
       - "{{ eth1_ip }}"
@@ -208,14 +244,15 @@
   changed_when: false
 
 # The two container guards are flushed atomically by the managed templates
-# below. On an existing VM, do not erase a manually-owned nft/DOCKER-USER
-# policy merely because it uses the same shared host primitives. Only a
-# validated ownership marker or a separate explicit firewall-adoption
-# acknowledgement authorizes replacement; token-subset heuristics are not
-# sufficient to prove ownership of a packet filter.
-# firewall_preflight performs that ownership decision before these helpers are
-# rendered/applied. Re-check only authorized migrations here; on a clean host
-# the newly installed pre-firewalld guard is intentionally nonempty.
+# below. On an existing VM, never erase a manually-owned nft/DOCKER-USER
+# policy merely because it uses the same shared host primitives. A completed
+# AIGW marker, or a validated pending marker plus the narrow firewall adoption
+# acknowledgement checked by firewall_preflight, is the only accepted prior
+# ownership proof; no inventory flag authorizes replacement of an arbitrary
+# packet filter. firewall_preflight performs that fail-closed decision before
+# these helpers are rendered/applied.
+# On a clean host the newly installed pre-firewalld guard is intentionally
+# nonempty and this re-check is skipped until the final marker exists.
 - name: Preflight — reject unowned nftables and DOCKER-USER guard state
   ansible.builtin.command:
     argv:
@@ -228,7 +265,6 @@
         import sys
 
         has_marker = sys.argv[1] == "true"
-        explicit_adoption = sys.argv[2] == "true"
 
         def capture(command):
             result = subprocess.run(
@@ -250,29 +286,43 @@
         nft_body = re.sub(
             r"^\s*table\s+inet\s+aigw_guard\s*\{\s*|\s*\}\s*$", "", nft_text, flags=re.S
         ).strip()
-        if nft_body and not (has_marker or explicit_adoption):
+        if nft_body and not has_marker:
             errors.append("unowned inet/aigw_guard nftables policy")
 
         for binary, family in (("iptables", "IPv4"), ("ip6tables", "IPv6")):
             _, text = capture([binary, "-S", "DOCKER-USER"])
             rules = chain_rules(text)
-            if rules and not (has_marker or explicit_adoption):
+            if rules and not has_marker:
                 errors.append(f"unowned {family} DOCKER-USER policy")
 
         if errors:
             raise SystemExit("; ".join(errors))
       - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
-      - "{{ 'true' if (aigw_adopt_firewalld_state | bool) else 'false' }}"
   environment:
     LC_ALL: C
   changed_when: false
   when: >-
-    (aigw_host_marker_stat.exists | default(false)) or
-    (aigw_adopt_firewalld_state | bool)
+    aigw_host_marker_stat.exists | default(false)
 
 # NetworkManager owns the durable interface-to-zone relationship on Rocky 9.
 # A normal clean host may use the built-in `public` zone (or no saved zone),
 # but a customer-specific zone must not be silently replaced by this platform.
+- name: Preflight — derive the exact fail-closed Rocky 9 lab reset handoff
+  ansible.builtin.set_fact:
+    aigw_lab_reset_handoff_drop_bindings: >-
+      {{
+        [
+          {'interface': nic_egress, 'zone': 'aigw-egress'},
+          {'interface': nic_internal, 'zone': 'aigw-internal'}
+        ]
+        if (
+          (deployment_profile | default('')) == 'rocky9-lab'
+          and (aigw_lab_reset_handoff_drop_interfaces | default([]) | length) == 2
+          and (aigw_lab_reset_handoff_drop_interfaces | default([]) | sort) == ([nic_egress, nic_internal] | sort)
+        )
+        else []
+      }}
+
 - name: Preflight — read active NetworkManager profiles before zone ownership changes
   ansible.builtin.command:
     argv:
@@ -325,18 +375,22 @@
   register: aigw_preflight_saved_nm_zones
   changed_when: false
 
-- name: Preflight — reject customer-owned saved NetworkManager zones without adoption acknowledgement
+- name: Preflight — reject customer-owned saved NetworkManager zones
   ansible.builtin.assert:
     that:
       - >-
-        (item.stdout | trim) in ['', 'public', item.item.zone] or
-        (aigw_host_marker_stat.exists | default(false)) or
-        (aigw_adopt_firewalld_state | bool)
+        (item.stdout | trim) in ['', 'public', item.item.zone]
+        or (
+          (item.stdout | trim) == 'drop'
+          and {'interface': item.item.interface, 'zone': item.item.zone}
+              in aigw_lab_reset_handoff_drop_bindings
+        )
     quiet: true
     fail_msg: >-
       {{ item.item.interface }} is persistently assigned to customer-owned
-      zone {{ item.stdout | trim | default('<none>', true) }}. Set
-      aigw_adopt_firewalld_state=true only after approving that replacement.
+      zone {{ item.stdout | trim | default('<none>', true) }}. Remove or
+      explicitly migrate that customer-owned NetworkManager policy before
+      converging this dedicated gateway host.
   loop: "{{ aigw_preflight_saved_nm_zones.results }}"
   loop_control:
     label: "{{ item.item.interface }}"
@@ -350,18 +404,22 @@
   register: aigw_preflight_runtime_nm_zones
   changed_when: false
 
-- name: Preflight — reject customer-owned runtime interface zones without adoption acknowledgement
+- name: Preflight — reject customer-owned runtime interface zones
   ansible.builtin.assert:
     that:
       - >-
-        (item.stdout | trim) in ['', 'no zone', 'public', item.item.zone] or
-        (aigw_host_marker_stat.exists | default(false)) or
-        (aigw_adopt_firewalld_state | bool)
+        (item.stdout | trim) in ['', 'no zone', 'public', item.item.zone]
+        or (
+          (item.stdout | trim) == 'drop'
+          and {'interface': item.item.interface, 'zone': item.item.zone}
+              in aigw_lab_reset_handoff_drop_bindings
+        )
     quiet: true
     fail_msg: >-
       {{ item.item.interface }} is currently assigned to customer-owned zone
-      {{ item.stdout | trim | default('<none>', true) }}. Set
-      aigw_adopt_firewalld_state=true only after approving that replacement.
+      {{ item.stdout | trim | default('<none>', true) }}. Remove or explicitly
+      migrate that customer-owned firewalld policy before converging this
+      dedicated gateway host.
   loop: "{{ aigw_preflight_runtime_nm_zones.results }}"
   loop_control:
     label: "{{ item.item.interface }}"
@@ -541,7 +599,7 @@
     state: enabled
   loop: "{{ firewalld_zones | subelements('rich_rules') }}"
 
-- name: Reconcile lab-only source-scoped authoritative DNS rules before zone migration
+- name: Reconcile optional source-scoped authoritative DNS rules before zone migration
   ansible.posix.firewalld:
     zone: "{{ item.zone }}"
     rich_rule: >-
@@ -550,7 +608,7 @@
       protocol="{{ item.protocol }}" accept
     permanent: true
     immediate: true
-    state: "{{ 'enabled' if (lab_dns_enabled | bool) else 'disabled' }}"
+    state: "{{ 'enabled' if (platform_authoritative_dns_enabled | bool) else 'disabled' }}"
   loop:
     - { zone: aigw-adm, source: "{{ vpn_client_cidr }}", destination: "{{ eth1_ip }}", protocol: tcp }
     - { zone: aigw-adm, source: "{{ vpn_client_cidr }}", destination: "{{ eth1_ip }}", protocol: udp }

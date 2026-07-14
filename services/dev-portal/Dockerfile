@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # dev-portal — self-service LiteLLM virtual-key issuance + tool-config snippets
 # See docs/solution-map.md §1.4 for design context.
 

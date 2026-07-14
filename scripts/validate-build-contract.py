@@ -8,6 +8,21 @@ from pathlib import Path
 import sys
 
 
+DOCKERFILE_FRONTEND = (
+    "# syntax=docker/dockerfile:1.7@sha256:"
+    "a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+)
+FRONTEND_DOCKERFILES = {
+    "services/dev-portal/Dockerfile",
+    "services/dhi-health-probe/Dockerfile",
+    "services/dhi-health-probe/Dockerfile.open-webui",
+    "services/egress-proxy/Dockerfile",
+    "services/key-rotator/Dockerfile",
+    "services/lab-dns/Dockerfile",
+    "services/vault-ui-proxy/Dockerfile",
+}
+
+
 def main() -> None:
     if len(sys.argv) != 3 or sys.argv[2] not in {"base", "lab"}:
         raise SystemExit("usage: validate-build-contract.py ROOT base|lab")
@@ -15,6 +30,26 @@ def main() -> None:
     root = Path(sys.argv[1]).resolve()
     profile = sys.argv[2]
     services = json.load(sys.stdin)["services"]
+
+    dockerfiles = sorted((root / "services").glob("**/Dockerfile*"))
+    if not dockerfiles:
+        raise SystemExit("no service Dockerfiles found for frontend verification")
+    frontend_dockerfiles: set[str] = set()
+    for dockerfile in dockerfiles:
+        if not dockerfile.is_file():
+            raise SystemExit(f"unexpected Dockerfile object: {dockerfile}")
+        first_line = dockerfile.read_text(encoding="utf-8").splitlines()[0]
+        if first_line.startswith("# syntax="):
+            frontend_dockerfiles.add(str(dockerfile.relative_to(root)))
+        if first_line.startswith("# syntax=") and first_line != DOCKERFILE_FRONTEND:
+            raise SystemExit(
+                f"{dockerfile.relative_to(root)} has an unpinned Dockerfile frontend"
+            )
+    if frontend_dockerfiles != FRONTEND_DOCKERFILES:
+        raise SystemExit(
+            "Dockerfile frontend declarations changed: expected "
+            f"{sorted(FRONTEND_DOCKERFILES)}, got {sorted(frontend_dockerfiles)}"
+        )
 
     expected_contexts = {
         "traefik-int": root / "services/traefik",
@@ -30,6 +65,7 @@ def main() -> None:
         "open-webui": root / "services/dhi-health-probe",
         "keycloak": root / "services/dhi-health-probe",
         "vault": root / "services/dhi-health-probe",
+        "vault-ui-proxy": root / "services/vault-ui-proxy",
         "redis": root / "services/dhi-health-probe",
         "alloy": root / "services/dhi-health-probe",
         "prometheus": root / "services/dhi-health-probe",
@@ -88,10 +124,25 @@ def main() -> None:
 
     exact_contexts = {
         "services/traefik": {"*", "!Dockerfile"},
-        "services/dhi-health-probe": {"*", "!Dockerfile", "!go.mod", "!main.go", "!main_test.go"},
+        "services/dhi-health-probe": {
+            "*",
+            "!Dockerfile",
+            "!Dockerfile.open-webui",
+            "!go.mod",
+            "!main.go",
+            "!main_test.go",
+            "!patch_openwebui_oauth.py",
+            "!verify_openwebui_oauth.py",
+        },
         "services/egress-proxy": {
             "*", "!Dockerfile", "!go.mod", "!entrypoint.go", "!entrypoint_test.go",
             "!envoy.yaml", "!certs/", "!certs/*.pem",
+        },
+        "services/vault-ui-proxy": {
+            "*", "!Dockerfile", "!go.mod", "!main.go", "!main_test.go",
+            "!upstream-provenance.json",
+            "!cmd/", "!cmd/extract-ui/", "!cmd/extract-ui/main.go",
+            "!cmd/extract-ui/main_test.go",
         },
     }
     for relative, required in exact_contexts.items():

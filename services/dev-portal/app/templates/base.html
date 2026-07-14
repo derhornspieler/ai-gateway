@@ -100,7 +100,7 @@
 <body>
 <header>
   {% if admin_surface %}
-  <a href="/admin" class="brand">AI Gateway / admin-portal</a>
+  <a href="/admin" class="brand">AI Gateway / Admin Console</a>
   {% else %}
   <a href="/" class="brand">AI Gateway / dev-portal</a>
   {% endif %}
@@ -113,8 +113,10 @@
   {% endif %}
   {% endif %}
   <span class="spacer"></span>
+  {% if user or show_session_logout %}
   {% if user %}
   <span class="user">{{ user.name or user.email }}</span>
+  {% endif %}
   <a href="/logout" class="btn ghost">Log out</a>
   {% endif %}
 </header>
@@ -124,7 +126,7 @@
   {% endfor %}
   {% block content %}{% endblock %}
 </main>
-<footer>AI Gateway {{ 'admin-portal — ADM network only' if admin_surface else 'dev-portal — internal use only' }}</footer>
+<footer>AI Gateway {{ 'Admin Console — ADM network only' if admin_surface else 'dev-portal — internal use only' }}</footer>
 <script nonce="{{ csp_nonce }}">
 function copyToClipboard(id, btn) {
   var el = document.getElementById(id);

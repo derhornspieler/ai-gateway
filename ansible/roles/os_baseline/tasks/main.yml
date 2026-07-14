@@ -1,11 +1,12 @@
 ---
-- name: Preflight — prove controller key-only SSH and capture its transport tuple
+- name: Preflight — prove controller key-only SSH, passwordless become, and capture its transport tuple
   ansible.builtin.command:
     # Capture from the fresh OpenSSH process itself. Ansible's remote module
     # process is not guaranteed to retain SSH_CONNECTION (sudo/pipelining can
     # strip it), so reading that module environment is not an authoritative
-    # transport check.
-    argv: "{{ controller_key_only_ssh_argv + ['/usr/bin/printenv SSH_CONNECTION'] }}"
+    # transport check. OpenSSH joins all arguments after its destination, so
+    # the compound remote command must remain one argv element.
+    argv: "{{ controller_key_only_ssh_argv + ['/usr/bin/sudo -n /usr/bin/true && exec /usr/bin/printenv SSH_CONNECTION'] }}"
   vars:
     # Use the same non-default port and explicit identity as the inventory.
     # ansible_ssh_common_args is deliberately not shell-split here; sites that
@@ -61,6 +62,278 @@
   register: aigw_default_sshd_probe_source
   changed_when: false
 
+# The managed 00 fragment relies on Rocky's early Include ordering. A prior
+# global directive or a later unreviewed Match can otherwise retain a more
+# permissive effective policy for an account that our synthetic denied tuple
+# does not represent. Refuse ambiguity instead of claiming default-deny on an
+# existing customer SSH configuration.
+- name: Preflight — require a safe sshd include and forwarding precedence boundary
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import stat
+        import subprocess
+        import sys
+
+        main_path, fragment_dir, managed_name = sys.argv[1:]
+        protected = {
+            "authenticationmethods", "passwordauthentication", "permitrootlogin",
+            "disableforwarding", "allowtcpforwarding",
+            "allowstreamlocalforwarding", "allowagentforwarding", "permitopen",
+            "permitlisten", "gatewayports", "permittunnel", "x11forwarding",
+        }
+        crypto_policy_directives = {
+            "casignaturealgorithms", "ciphers", "gssapikeyexchange",
+            "gssapikexalgorithms",
+            "hostkeyalgorithms", "kexalgorithms", "macs",
+            "pubkeyacceptedalgorithms", "requiredrsasize",
+        }
+        crypto_policy_backend = "/etc/crypto-policies/back-ends/opensshserver.config"
+        crypto_policy_root = "/usr/share/crypto-policies"
+        errors = []
+
+        def read_safe(path):
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError:
+                errors.append(f"required sshd config path is missing: {path}")
+                return []
+            if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or
+                    metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022):
+                errors.append(f"unsafe sshd config boundary: {path}")
+                return []
+            try:
+                with open(path, encoding="utf-8", errors="replace") as source:
+                    return source.readlines()
+            except OSError as exc:
+                errors.append(f"cannot read sshd config {path}: {exc}")
+                return []
+
+        def active(line):
+            return line.split("#", 1)[0].strip()
+
+        def keyword(line):
+            text = active(line)
+            return text.split(None, 1)[0].lower() if text else ""
+
+        def read_verified_crypto_policy_backend(path):
+            """Read Rocky's policy backend without trusting arbitrary links.
+
+            ``update-crypto-policies`` intentionally installs the stock backend
+            as a root-owned link into /usr/share/crypto-policies.  A custom
+            local policy is a root-owned regular file instead.  In both cases
+            its content is restricted to the cryptographic directives that the
+            generated OpenSSH backend may contain; it cannot alter login or
+            forwarding policy.  A link is accepted only when its final target
+            is a pristine, RPM-owned crypto-policies file below that vendor
+            root.
+            """
+            try:
+                link_metadata = os.lstat(path)
+            except FileNotFoundError:
+                errors.append(f"required sshd config path is missing: {path}")
+                return []
+            if stat.S_ISREG(link_metadata.st_mode):
+                lines = read_safe(path)
+            else:
+                if (
+                    not stat.S_ISLNK(link_metadata.st_mode)
+                    or link_metadata.st_uid != 0
+                    or link_metadata.st_gid != 0
+                ):
+                    errors.append(f"unsafe crypto-policy sshd backend: {path}")
+                    return []
+                try:
+                    trusted_root = os.path.realpath(crypto_policy_root)
+                    resolved_path = os.path.realpath(path)
+                    inside_vendor_root = (
+                        os.path.commonpath([trusted_root, resolved_path])
+                        == trusted_root
+                    )
+                except (OSError, ValueError) as exc:
+                    errors.append(f"cannot resolve crypto-policy sshd backend {path}: {exc}")
+                    return []
+                if (
+                    not inside_vendor_root
+                    or os.path.basename(resolved_path) != "opensshserver.txt"
+                ):
+                    errors.append(f"unsafe crypto-policy sshd backend: {path}")
+                    return []
+                try:
+                    target_metadata = os.lstat(resolved_path)
+                except FileNotFoundError:
+                    errors.append(f"required sshd config path is missing: {path}")
+                    return []
+                if (
+                    not stat.S_ISREG(target_metadata.st_mode)
+                    or target_metadata.st_uid != 0
+                    or target_metadata.st_gid != 0
+                    or target_metadata.st_mode & 0o022
+                ):
+                    errors.append(f"unsafe crypto-policy sshd backend: {path}")
+                    return []
+                owner = subprocess.run(
+                    ["/usr/bin/rpm", "-qf", "--qf", "%{NAME}\\n", resolved_path],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                verified = subprocess.run(
+                    ["/usr/bin/rpm", "-Vf", resolved_path],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if (
+                    owner.returncode != 0
+                    or owner.stdout.strip() != "crypto-policies"
+                    or verified.returncode != 0
+                    or verified.stdout.strip()
+                ):
+                    errors.append(f"unverified crypto-policy sshd backend: {path}")
+                    return []
+                try:
+                    with open(resolved_path, encoding="utf-8", errors="replace") as source:
+                        lines = source.readlines()
+                except OSError as exc:
+                    errors.append(f"cannot read sshd config {path}: {exc}")
+                    return []
+            for candidate in lines:
+                key = keyword(candidate)
+                if key and key not in crypto_policy_directives:
+                    errors.append(
+                        f"unreviewed crypto-policy sshd directive {key!r}: {path}"
+                    )
+            return lines
+
+        def is_verified_late_redhat_fragment(entry, lines):
+            """Accept only Rocky's unmodified, later vendor X11 default.
+
+            Rocky 9 ships 50-redhat.conf with X11Forwarding yes.  The managed
+            00 fragment is parsed first and the post-write sshd -T probes
+            prove its deny value wins, so rejecting this RPM-owned default
+            would make a fresh supported host undeployable.  Keep the
+            exception intentionally narrow: no Match scope, no other
+            protected setting, and no include except the stock crypto-policy
+            backend after proving that backend cannot set an access control.
+            """
+            if entry.name != "50-redhat.conf" or entry.name <= managed_name:
+                return False
+            owner = subprocess.run(
+                ["/usr/bin/rpm", "-qf", "--qf", "%{NAME}\\n", entry.path],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            verified = subprocess.run(
+                ["/usr/bin/rpm", "-Vf", entry.path],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if (
+                owner.returncode != 0
+                or owner.stdout.strip() != "openssh-server"
+                or verified.returncode != 0
+                or verified.stdout.strip()
+            ):
+                return False
+            for line in lines:
+                text = active(line)
+                key = keyword(line)
+                if key == "match" or (key in protected and key != "x11forwarding"):
+                    return False
+                if key == "include":
+                    if text != "Include /etc/crypto-policies/back-ends/opensshserver.config":
+                        return False
+                    policy_lines = read_verified_crypto_policy_backend(
+                        crypto_policy_backend
+                    )
+                    if any(
+                        keyword(candidate) not in crypto_policy_directives | {""}
+                        for candidate in policy_lines
+                    ):
+                        return False
+            return True
+
+        main_lines = read_safe(main_path)
+        include_index = None
+        for index, line in enumerate(main_lines):
+            text = active(line)
+            if not text:
+                continue
+            pieces = text.split(None, 1)
+            if pieces[0].lower() == "include":
+                if len(pieces) != 2 or pieces[1].strip() != "/etc/ssh/sshd_config.d/*.conf":
+                    if include_index is None:
+                        errors.append("sshd has an unreviewed Include before the managed fragment directory")
+                    continue
+                include_index = index
+                break
+        if include_index is None:
+            errors.append("sshd_config must include /etc/ssh/sshd_config.d/*.conf before policy directives")
+        else:
+            for line in main_lines[:include_index]:
+                key = keyword(line)
+                if key == "match" or key in protected:
+                    errors.append(f"sshd directive {key!r} precedes the managed fragment Include")
+            in_match = False
+            for line in main_lines[include_index + 1:]:
+                key = keyword(line)
+                if key == "match":
+                    in_match = True
+                    continue
+                if in_match and key in protected:
+                    errors.append(f"sshd Match block after managed fragments sets {key!r}")
+
+        try:
+            directory_metadata = os.lstat(fragment_dir)
+        except FileNotFoundError:
+            errors.append(f"required sshd fragment directory is missing: {fragment_dir}")
+        else:
+            if (stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(directory_metadata.st_mode) or
+                    directory_metadata.st_uid != 0 or directory_metadata.st_gid != 0 or
+                    directory_metadata.st_mode & 0o022):
+                errors.append(f"unsafe sshd fragment directory: {fragment_dir}")
+            else:
+                for entry in sorted(os.scandir(fragment_dir), key=lambda item: item.name):
+                    if not entry.name.endswith(".conf") or entry.name == managed_name:
+                        continue
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        errors.append(f"uninspectable sshd fragment {entry.path}")
+                        continue
+                    if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or
+                            metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022):
+                        errors.append(f"unsafe sshd fragment {entry.path}")
+                        continue
+                    lines = read_safe(entry.path)
+                    verified_late_redhat = is_verified_late_redhat_fragment(entry, lines)
+                    for line in lines:
+                        key = keyword(line)
+                        if key == "match" and not verified_late_redhat:
+                            errors.append(f"unreviewed sshd fragment opens a Match scope: {entry.path}")
+                        if key == "include" and not verified_late_redhat:
+                            errors.append(f"unreviewed sshd fragment includes another file: {entry.path}")
+                        if key in protected:
+                            if not (verified_late_redhat and key == "x11forwarding"):
+                                errors.append(f"unreviewed sshd fragment sets protected directive {key!r}: {entry.path}")
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - /etc/ssh/sshd_config
+      - /etc/ssh/sshd_config.d
+      - 00-ai-gateway-hardening.conf
+  changed_when: false
+
 - name: Install default-deny SSH policy with explicit ADM SOCKS exceptions
   ansible.builtin.copy:
     dest: /etc/ssh/sshd_config.d/00-ai-gateway-hardening.conf
@@ -69,10 +342,10 @@
     mode: "0644"
     content: |
       # Managed by AI Gateway. The firewalld ADM rule limits all SSH ingress
-      # to vpn_client_cidr; password authentication is an explicit inventory
-      # choice while root login remains prohibited.
+      # to vpn_client_cidr; password authentication is a temporary rocky9-lab
+      # exception while root login remains prohibited.
       PubkeyAuthentication yes
-      PasswordAuthentication {{ 'yes' if (aigw_ssh_password_authentication | bool) else 'no' }}
+      PasswordAuthentication {{ 'yes' if ((deployment_profile | default('')) == 'rocky9-lab' and (aigw_ssh_password_authentication | bool)) else 'no' }}
       KbdInteractiveAuthentication no
       ChallengeResponseAuthentication no
       PermitEmptyPasswords no
@@ -95,24 +368,26 @@
       LoginGraceTime 30
       MaxSessions 4
       MaxStartups 10:30:30
-{% if aigw_adm_socks_enabled | bool %}
-      # SOCKS `ssh -D` is local TCP forwarding. It remains unavailable to
-      # every other account/source; remote forwarding, gateway binds, agent,
-      # stream-local, X11, and tunnels remain denied by the global policy.
-{% if aigw_adm_socks_users | length > 0 %}
+      {% if ((deployment_profile | default('')) == 'rocky9-lab') and (aigw_adm_socks_enabled | bool) %}
+      # Trusted ADM-operator SOCKS `ssh -D` is local TCP forwarding. The
+      # inventory acknowledgement records that PermitOpen any reaches every
+      # host-routable destination. It remains unavailable to every other
+      # account/source; remote forwarding, gateway binds, agent, stream-local,
+      # X11, and tunnels remain denied by the global policy.
+      {% if aigw_adm_socks_users | length > 0 %}
       Match User {{ aigw_adm_socks_users | join(',') }} Address {{ aigw_adm_socks_source_cidrs | join(',') }}
         DisableForwarding no
         AllowTcpForwarding local
         PermitOpen any
-{% endif %}
-{% if aigw_adm_socks_groups | length > 0 %}
+      {% endif %}
+      {% if aigw_adm_socks_groups | length > 0 %}
       Match Group {{ aigw_adm_socks_groups | join(',') }} Address {{ aigw_adm_socks_source_cidrs | join(',') }}
         DisableForwarding no
         AllowTcpForwarding local
         PermitOpen any
-{% endif %}
+      {% endif %}
       Match all
-{% endif %}
+      {% endif %}
     validate: /usr/sbin/sshd -t -f %s
   notify: reload sshd
 
@@ -145,7 +420,7 @@
       - >-
         effective_sshd_policy.stdout is search(
           '(?m)^passwordauthentication ' ~
-          ('yes' if (aigw_ssh_password_authentication | bool) else 'no') ~ '$'
+          ('yes' if ((deployment_profile | default('')) == 'rocky9-lab' and (aigw_ssh_password_authentication | bool)) else 'no') ~ '$'
         )
       - effective_sshd_policy.stdout is search('(?m)^kbdinteractiveauthentication no$')
       - effective_sshd_policy.stdout is search('(?m)^permitemptypasswords no$')
@@ -312,7 +587,9 @@
 
 - name: Postflight — prove a fresh key-only SSH connection and passwordless become
   ansible.builtin.command:
-    argv: "{{ controller_key_only_ssh_argv + ['sudo -n true'] }}"
+    # This is deliberately one remote-command argv element after the OpenSSH
+    # destination; do not split `sudo -n` into separate SSH arguments.
+    argv: "{{ controller_key_only_ssh_argv + ['/usr/bin/sudo -n /usr/bin/true'] }}"
   vars:
     controller_key_only_ssh_argv: >-
       {{
@@ -361,8 +638,12 @@
       - docker-compose-plugin
       - python3-requests          # community.docker API backend
       - python3-pip
+      # The SELinux-confined ACL reconciler queries Docker's local Unix API
+      # through curl so it can retain NoNewPrivileges (Docker CLI requires a
+      # prohibited runtime-domain transition under that boundary).
+      - curl
       - openssl                   # placeholder cert generation (docker_stack)
-      - bind-utils                # authoritative lab DNS UDP/TCP verification
+      - bind-utils                # authoritative platform DNS UDP/TCP verification
       - acl                       # least-privilege Alloy access to Docker logs
       - zstd                      # exact-verified offline Docker image seeds
     state: present
@@ -398,6 +679,43 @@
     owner: root
     group: root
     mode: "0750"
+
+- name: Inspect an existing pre-adoption daemon backup before takeover
+  ansible.builtin.stat:
+    path: "{{ aigw_docker_host_marker }}.pre-adoption-daemon.json"
+    follow: false
+    get_checksum: false
+  register: aigw_pre_adoption_daemon_backup_stat
+  changed_when: false
+  when: aigw_docker_daemon_adoption_required | default(false) | bool
+
+- name: Read an existing pre-adoption daemon backup without following links
+  ansible.builtin.slurp:
+    src: "{{ aigw_docker_host_marker }}.pre-adoption-daemon.json"
+  register: aigw_pre_adoption_daemon_backup_raw
+  no_log: true
+  when:
+    - aigw_docker_daemon_adoption_required | default(false) | bool
+    - aigw_pre_adoption_daemon_backup_stat.stat.exists | default(false)
+
+- name: Require a retained pre-adoption daemon backup to match the current daemon document
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (aigw_pre_adoption_daemon_backup_stat.stat.exists | default(false)) or
+        ((aigw_pre_adoption_daemon_backup_stat.stat.isreg | default(false)) and
+         not (aigw_pre_adoption_daemon_backup_stat.stat.islnk | default(false)) and
+         aigw_pre_adoption_daemon_backup_stat.stat.uid == 0 and
+         aigw_pre_adoption_daemon_backup_stat.stat.gid == 0 and
+         aigw_pre_adoption_daemon_backup_stat.stat.mode == '0600' and
+         aigw_pre_adoption_daemon_backup_raw.content == aigw_daemon_config_raw.content)
+    quiet: true
+    fail_msg: >-
+      Refusing daemon takeover: the retained pre-adoption daemon backup is
+      unsafe or does not byte-match the current /etc/docker/daemon.json. Move
+      it aside for review rather than silently preserving stale recovery data.
+  no_log: true
+  when: aigw_docker_daemon_adoption_required | default(false) | bool
 
 - name: Preserve the prior daemon configuration before explicit dedicated-host adoption
   ansible.builtin.copy:

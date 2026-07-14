@@ -7,8 +7,11 @@ import argparse
 import html
 import http.cookiejar
 import importlib.util
+import json
 import ssl
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -21,6 +24,8 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError("could not load portal acceptance helpers")
 flow = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(flow)
+
+API_ORIGIN = "https://api.aigw.internal"
 
 
 class OneTimeSecretParser(HTMLParser):
@@ -61,7 +66,7 @@ def exact_form(page_url: str, body: str, path: str):
 def submit(opener, page_url: str, form, fields: dict[str, str]):
     action = urllib.parse.urljoin(page_url, str(form["action"]))
     parsed = urllib.parse.urlsplit(action)
-    if parsed.scheme != "https" or parsed.hostname not in flow.ALLOWED_HOSTS:
+    if parsed.scheme != "https" or parsed.hostname not in flow.PORTAL_ALLOWED_HOSTS:
         raise RuntimeError("portal form action left the reviewed HTTPS hosts")
     values = dict(form["inputs"])
     values.update(fields)
@@ -101,6 +106,69 @@ def assert_not_retained(secret: str, body: str, cookies) -> None:
         raise RuntimeError("plaintext key was retained in a later response")
     if any(secret in cookie.value for cookie in cookies):
         raise RuntimeError("plaintext key was retained in a cookie")
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """The inference endpoint must never turn a bearer request into a redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("gateway API unexpectedly redirected a bearer request")
+
+
+def gateway_models_status(context: ssl.SSLContext, secret: str) -> tuple[int, bytes]:
+    """Make one bounded direct inference-plane request without exposing its key."""
+
+    request = urllib.request.Request(
+        API_ORIGIN + "/v1/models",
+        headers={
+            "Authorization": f"Bearer {secret}",
+            "Accept": "application/json",
+            "User-Agent": "aigw-key-acceptance/1",
+        },
+        method="GET",
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=context),
+        RejectRedirects(),
+    )
+    try:
+        with opener.open(request, timeout=20) as response:
+            body = response.read(1024 * 1024 + 1)
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        body = exc.read(1024 * 1024 + 1)
+        status = exc.code
+    if len(body) > 1024 * 1024:
+        raise RuntimeError("gateway model response exceeded 1 MiB")
+    return status, body
+
+
+def require_gateway_key_accepted(context: ssl.SSLContext, secret: str) -> None:
+    """Prove the one-time key actually authorizes the public inference route."""
+
+    status, body = gateway_models_status(context, secret)
+    if status != 200:
+        raise RuntimeError("new portal key was not accepted by the gateway API")
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("gateway /v1/models response was not JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise RuntimeError("gateway /v1/models response had an invalid schema")
+
+
+def require_gateway_key_revoked(context: ssl.SSLContext, secret: str) -> None:
+    """Allow a short database/cache convergence window, then require rejection."""
+
+    deadline = time.monotonic() + 15
+    while True:
+        status, _ = gateway_models_status(context, secret)
+        if status in {401, 403}:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError("deactivated portal key remained valid at the gateway API")
+        time.sleep(0.5)
 
 
 def generate(opener, page_url: str, body: str, alias: str):
@@ -157,7 +225,7 @@ def main() -> int:
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=context),
         urllib.request.HTTPCookieProcessor(cookies),
-        flow.RestrictedRedirects(),
+        flow.RestrictedRedirects(flow.PORTAL_ALLOWED_HOSTS),
     )
     page_url, body = flow.read_page(opener, flow.PORTAL_ORIGIN + "/login/start")
     login_forms = [
@@ -172,6 +240,7 @@ def main() -> int:
         page_url,
         login_forms[0],
         {"username": "lab-developer", "password": password},
+        allowed_hosts=flow.PORTAL_ALLOWED_HOSTS,
     )
     if urllib.parse.urlsplit(page_url).path != "/":
         raise RuntimeError("Samba developer login did not reach the key page")
@@ -180,6 +249,7 @@ def main() -> int:
     if first not in first_post:
         raise RuntimeError("new key was not present in its creation response")
     assert_not_retained(first, "", cookies)
+    require_gateway_key_accepted(context, first)
     print("PORTAL_ONE_TIME_KEY_POST_PASS")
 
     page_url, body = flow.read_page(opener, flow.PORTAL_ORIGIN + "/")
@@ -211,6 +281,7 @@ def main() -> int:
     print("PORTAL_ACTIVE_KEY_DENIAL_PASS")
 
     page_url, body = deactivate(opener, denied_url, denied)
+    require_gateway_key_revoked(context, first)
     assert_not_retained(first, body, cookies)
     second, _, second_post = generate(
         opener, page_url, body, "acceptance-regenerated"
@@ -218,6 +289,7 @@ def main() -> int:
     if second == first or second not in second_post:
         raise RuntimeError("regeneration did not produce a distinct one-time key")
     assert_not_retained(second, "", cookies)
+    require_gateway_key_accepted(context, second)
     page_url, body = flow.read_page(opener, flow.PORTAL_ORIGIN + "/")
     assert_not_retained(first, body, cookies)
     assert_not_retained(second, body, cookies)
@@ -227,6 +299,7 @@ def main() -> int:
     if "YOUR_KEY" not in snippets:
         raise RuntimeError("regenerated key appeared in later snippets")
     deactivate(opener, page_url, body)
+    require_gateway_key_revoked(context, second)
     print("PORTAL_DEACTIVATE_REGENERATE_PASS")
     return 0
 

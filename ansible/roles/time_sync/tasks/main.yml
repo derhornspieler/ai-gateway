@@ -1,0 +1,294 @@
+# TLS certificate validity, signed package metadata, and OIDC/JWT validation
+# all depend on a correct wall clock. Snapshot-restored VMs can resume with a
+# stale RTC even while chronyd is enabled. Require the stock Rocky 9 Chrony
+# client before any package or container mutation, then prove an accepted NTP
+# sample arrived *during this converge*. Existing Chrony sources remain
+# customer-owned; this role uses only Chrony's root-only local command socket.
+
+- name: Require preinstalled Chrony client before time-dependent mutation
+  ansible.builtin.command:
+    argv: [/usr/bin/test, -x, /usr/bin/chronyc]
+  changed_when: false
+  when: aigw_require_time_sync | bool
+
+- name: Enable the configured Chrony time source
+  ansible.builtin.systemd_service:
+    name: chronyd
+    enabled: true
+    state: started
+  when: aigw_require_time_sync | bool
+
+- name: Require Chrony's local command socket
+  ansible.builtin.command:
+    argv: [/usr/bin/test, -S, /var/run/chrony/chronyd.sock]
+  register: chrony_socket
+  changed_when: false
+  retries: 6
+  delay: 2
+  until: chrony_socket.rc == 0
+  when: aigw_require_time_sync | bool
+
+# A restored Chrony process can retain a selected source and a normal leap
+# status from the snapshot. Capture accepted-packet counters before requesting
+# a burst so later checks can distinguish retained state from a new sample.
+- name: Capture Chrony accepted-sample baseline
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import re
+        import subprocess
+        import sys
+
+        socket = sys.argv[1]
+        result = subprocess.run(
+            ["/usr/bin/chronyc", "-h", socket, "ntpdata"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise SystemExit("chronyc ntpdata failed")
+
+        counters = {}
+        for block in re.split(r"\n\s*\n", result.stdout.strip()):
+            remote = re.search(r"(?m)^Remote address\s*:\s*([^\s(]+)", block)
+            good_rx = re.search(r"(?m)^Total good RX\s*:\s*([0-9]+)$", block)
+            if remote is not None and good_rx is not None:
+                counters[remote.group(1)] = int(good_rx.group(1))
+        if not counters:
+            raise SystemExit("chronyc ntpdata did not report any accepted-sample counters")
+        print(json.dumps({"schema": 1, "good_rx": counters}, sort_keys=True))
+      - /var/run/chrony/chronyd.sock
+  register: chrony_rx_baseline
+  changed_when: false
+  retries: 15
+  delay: 2
+  until: chrony_rx_baseline.rc == 0
+  when: aigw_require_time_sync | bool
+
+# Chrony documents this sequence for a one-time large correction: arm the
+# next accepted update for stepping, then request several rapid measurements.
+# This control command is ephemeral and deliberately does not change a
+# customer-owned chrony.conf policy.
+- name: Arm one Chrony correction for the next accepted sample
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/chronyc
+      - -h
+      - /var/run/chrony/chronyd.sock
+      - makestep
+      - "0.1"
+      - "1"
+  register: chrony_arm_makestep
+  changed_when: false
+  retries: 6
+  delay: 2
+  until: chrony_arm_makestep.rc == 0
+  when: aigw_require_time_sync | bool
+
+- name: Request fresh Chrony samples before package or image operations
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/chronyc
+      - -h
+      - /var/run/chrony/chronyd.sock
+      - burst
+      - 4/4
+  register: chrony_burst
+  changed_when: false
+  retries: 6
+  delay: 2
+  until: chrony_burst.rc == 0
+  when: aigw_require_time_sync | bool
+
+# `waitsync` alone can pass against Chrony's retained snapshot state. Require
+# the currently selected source to have accepted a new NTP response after the
+# baseline was recorded. A source that appears only after the baseline fails
+# closed and is retried on the next converge rather than being assumed fresh.
+- name: Require a fresh accepted sample from Chrony's selected source
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import ipaddress
+        import json
+        import re
+        import subprocess
+        import sys
+
+        socket, baseline_text = sys.argv[1:]
+        try:
+            baseline = json.loads(baseline_text)
+            baseline_counters = baseline["good_rx"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit(f"invalid Chrony accepted-sample baseline: {error}")
+        if baseline.get("schema") != 1 or not isinstance(baseline_counters, dict):
+            raise SystemExit("invalid Chrony accepted-sample baseline schema")
+
+        def run_chronyc(*arguments):
+            result = subprocess.run(
+                ["/usr/bin/chronyc", "-h", socket, *arguments],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise SystemExit(f"chronyc {' '.join(arguments)} failed")
+            return result.stdout
+
+        sources = run_chronyc("-n", "sources")
+        selected_match = re.search(r"(?m)^\^\*\s+(\S+)\s", sources)
+        if selected_match is None:
+            raise SystemExit("Chrony has no selected NTP source")
+        selected = selected_match.group(1)
+        try:
+            if ipaddress.ip_address(selected).is_loopback:
+                raise SystemExit("Chrony selected a loopback source")
+        except ValueError as error:
+            raise SystemExit(f"Chrony selected source is not numeric: {selected!r}") from error
+
+        counters = {}
+        for block in re.split(r"\n\s*\n", run_chronyc("ntpdata").strip()):
+            remote = re.search(r"(?m)^Remote address\s*:\s*([^\s(]+)", block)
+            good_rx = re.search(r"(?m)^Total good RX\s*:\s*([0-9]+)$", block)
+            if remote is not None and good_rx is not None:
+                counters[remote.group(1)] = int(good_rx.group(1))
+        if selected not in baseline_counters or selected not in counters:
+            raise SystemExit("selected Chrony source was not present in the accepted-sample baseline")
+        if counters[selected] <= baseline_counters[selected]:
+            raise SystemExit("selected Chrony source has not accepted a fresh NTP sample")
+        print(
+            "Chrony selected-source freshness verified "
+            f"source={selected} good_rx={counters[selected]}"
+        )
+      - /var/run/chrony/chronyd.sock
+      - "{{ chrony_rx_baseline.stdout }}"
+  register: chrony_fresh_sample
+  changed_when: false
+  retries: 30
+  delay: 1
+  until: chrony_fresh_sample.rc == 0
+  when: aigw_require_time_sync | bool
+
+- name: Wait for a bounded Chrony synchronization result
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/chronyc
+      - -h
+      - /var/run/chrony/chronyd.sock
+      - waitsync
+      - "20"
+      - "{{ aigw_time_sync_max_offset_seconds | int | string }}"
+      - "1000"
+      - "1"
+  register: chrony_waitsync
+  changed_when: false
+  retries: 3
+  delay: 3
+  until: chrony_waitsync.rc == 0
+  when: aigw_require_time_sync | bool
+
+- name: Require Chrony to report a bounded externally synchronized wall clock
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import ipaddress
+        import json
+        import re
+        import subprocess
+        import sys
+
+        maximum_error = float(sys.argv[1])
+        try:
+            baseline = json.loads(sys.argv[2])
+            baseline_counters = baseline["good_rx"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit(f"invalid Chrony accepted-sample baseline: {error}")
+        if baseline.get("schema") != 1 or not isinstance(baseline_counters, dict):
+            raise SystemExit("invalid Chrony accepted-sample baseline schema")
+
+        def run_chronyc(*arguments):
+            result = subprocess.run(
+                ["/usr/bin/chronyc", "-h", "/var/run/chrony/chronyd.sock", *arguments],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise SystemExit(f"chronyc {' '.join(arguments)} failed")
+            return result.stdout
+
+        tracking = run_chronyc("tracking")
+        if not re.search(r"(?m)^Leap status\s*:\s*Normal$", tracking):
+            raise SystemExit("Chrony has not synchronized to a normal leap state")
+
+        def metric(name):
+            match = re.search(
+                rf"(?m)^{re.escape(name)}\s*:\s*([+-]?[0-9]+(?:\.[0-9]+)?)\s+seconds\b",
+                tracking,
+            )
+            if match is None:
+                raise SystemExit(f"Chrony tracking did not report {name.lower()}")
+            return float(match.group(1))
+
+        reference = re.search(r"(?m)^Reference ID\s*:\s*([0-9A-Fa-f]{8})\b", tracking)
+        if reference is None:
+            raise SystemExit("Chrony tracking did not report a reference ID")
+        if reference.group(1).upper() == "7F7F0101":
+            raise SystemExit("Chrony local reference mode is not an external synchronization source")
+
+        system_time = abs(metric("System time"))
+        root_delay = abs(metric("Root delay"))
+        root_dispersion = abs(metric("Root dispersion"))
+        estimated_error = system_time + root_dispersion + (0.5 * root_delay)
+        if estimated_error > maximum_error:
+            raise SystemExit(
+                f"Chrony estimated error {estimated_error:.6f}s exceeds {maximum_error:.6f}s"
+            )
+
+        sources = run_chronyc("-n", "sources")
+        selected_match = re.search(r"(?m)^\^\*\s+(\S+)\s", sources)
+        if selected_match is None:
+            raise SystemExit("Chrony has no selected NTP source after synchronization")
+        selected = selected_match.group(1)
+        try:
+            if ipaddress.ip_address(selected).is_loopback:
+                raise SystemExit("Chrony selected a loopback source after synchronization")
+        except ValueError as error:
+            raise SystemExit(f"Chrony selected source is not numeric: {selected!r}") from error
+
+        counters = {}
+        for block in re.split(r"\n\s*\n", run_chronyc("ntpdata").strip()):
+            remote = re.search(r"(?m)^Remote address\s*:\s*([^\s(]+)", block)
+            good_rx = re.search(r"(?m)^Total good RX\s*:\s*([0-9]+)$", block)
+            if remote is not None and good_rx is not None:
+                counters[remote.group(1)] = int(good_rx.group(1))
+        if selected not in baseline_counters or selected not in counters:
+            raise SystemExit("final selected Chrony source was not present in the accepted-sample baseline")
+        if counters[selected] <= baseline_counters[selected]:
+            raise SystemExit("final selected Chrony source has not accepted a fresh NTP sample")
+        print(
+            "Chrony external synchronization verified "
+            f"source={selected} estimated_error={estimated_error:.6f}s "
+            f"last_offset_metric={system_time:.6f}s"
+        )
+      - "{{ aigw_time_sync_max_offset_seconds | int | string }}"
+      - "{{ chrony_rx_baseline.stdout }}"
+  register: chrony_time_sync
+  changed_when: false
+  retries: 12
+  delay: 5
+  until: chrony_time_sync.rc == 0
+  when: aigw_require_time_sync | bool

@@ -1,0 +1,231 @@
+---
+# Controller-only input gate for a generated generic/customer inventory. It
+# never gathers remote facts, contacts the target, or changes host state.
+- name: AI Gateway generic Rocky 9 — inventory and Vault contract
+  hosts: generic_rocky9
+  gather_facts: false
+  become: false
+  connection: local
+  vars:
+    aigw_generic_rocky9_contract: >-
+      {{ lookup('ansible.builtin.file', playbook_dir ~ '/generic-rocky9-contract.json') | from_json }}
+  pre_tasks:
+    - name: Preflight — locate the alias-matched generated host-vars file
+      ansible.builtin.stat:
+        path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}.yml"
+        follow: false
+        get_checksum: false
+      delegate_to: localhost
+      register: aigw_generic_host_vars_file
+      changed_when: false
+
+    - name: Preflight — initialize generic contract result lists
+      ansible.builtin.set_fact:
+        aigw_generic_missing_nonsecret_keys: []
+        aigw_generic_missing_secret_keys: []
+      changed_when: false
+
+    - name: Preflight — collect missing generic non-secret inputs
+      ansible.builtin.set_fact:
+        aigw_generic_missing_nonsecret_keys: >-
+          {{ aigw_generic_missing_nonsecret_keys +
+             ([item] if (
+               ((lookup('vars', item, default='') is string) and
+                (lookup('vars', item, default='') | trim | length == 0)) or
+               ((lookup('vars', item, default='') is sequence) and
+                (lookup('vars', item, default='') is not string) and
+                (lookup('vars', item, default='') | length == 0))
+             ) else []) }}
+      loop: "{{ aigw_generic_rocky9_contract.required_nonsecret_keys }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+
+    - name: Preflight — collect missing generic Vault keys without emitting values
+      ansible.builtin.set_fact:
+        aigw_generic_missing_secret_keys: >-
+          {{ aigw_generic_missing_secret_keys +
+             ([item.name] if (lookup('vars', item.name, default='') | length == 0) else []) }}
+      loop: "{{ aigw_generic_rocky9_contract.required_secret_keys }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    # The domain is subsequently rendered into DNS, TLS, OIDC, Traefik, and
+    # environment files. Validate its complete grammar on the controller
+    # before any target play can consume it; never put the supplied value in
+    # the result.
+    - name: Preflight — validate generic canonical lowercase FQDN without emitting its value
+      ansible.builtin.assert:
+        that:
+          - >-
+            (aigw_domain | default('')) is string and
+            (aigw_domain | default('') | length <= 253) and
+            (aigw_domain | default('')) is match(
+              '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+            )
+        quiet: true
+        fail_msg: aigw_domain must be a bounded canonical lowercase FQDN
+      register: aigw_generic_domain_validation
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      no_log: true
+
+    - name: Preflight — collect invalid generic non-secret key classes only
+      ansible.builtin.set_fact:
+        aigw_generic_invalid_nonsecret: >-
+          {{ {} if not (aigw_generic_domain_validation.failed | default(false))
+             else {'aigw_domain': 'canonical_lowercase_fqdn'} }}
+      changed_when: false
+
+    - name: Preflight — validate generic Vault values without emitting values
+      ansible.builtin.assert:
+        that:
+          - >-
+            lookup('vars', item.name, default='') | length >=
+            (item.exact_length if item.exact_length is defined else item.min_length)
+          - >-
+            item.exact_length is not defined or
+            lookup('vars', item.name, default='') | length == item.exact_length
+          - >-
+            lookup('vars', item.name, default='') is regex(
+              '^[A-Za-z0-9]+$' if item.alphabet == 'alnum'
+              else '^[A-Za-z0-9_-]+$'
+            )
+          - >-
+            lookup('vars', item.name, default='') | lower not in
+            ['change_me', 'changeme', 'replace_me', 'password', 'secret']
+        quiet: true
+      loop: "{{ aigw_generic_rocky9_contract.required_secret_keys }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: aigw_generic_secret_validation
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      no_log: true
+
+    - name: Preflight — collect invalid generic Vault key names only
+      ansible.builtin.set_fact:
+        aigw_generic_invalid_secret_keys: >-
+          {{ aigw_generic_secret_validation.results
+             | selectattr('failed', 'equalto', true)
+             | map(attribute='item.name') | list }}
+      changed_when: false
+
+    - name: Preflight — require distinct generic portal trust-boundary secrets
+      ansible.builtin.assert:
+        that:
+          - portal_identity_token != rotator_internal_token
+        quiet: true
+      register: aigw_generic_identity_token_boundary
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      no_log: true
+
+    - name: Preflight — require distinct generic portal session secrets
+      ansible.builtin.assert:
+        that:
+          - portal_session_secret != admin_portal_session_secret
+        quiet: true
+      register: aigw_generic_session_secret_boundary
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      no_log: true
+
+    - name: Preflight — require distinct generic OIDC client secrets
+      ansible.builtin.assert:
+        that:
+          - >-
+            [webui_oidc_client_secret, portal_oidc_client_secret,
+             admin_portal_oidc_client_secret,
+             oauth2_proxy_client_secret] | unique | length == 4
+        quiet: true
+      register: aigw_generic_oidc_secret_boundary
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      no_log: true
+
+    - name: Preflight — collect duplicate generic trust-boundary labels only
+      ansible.builtin.set_fact:
+        aigw_generic_duplicate_secret_boundaries: >-
+          {{
+            ([] if not (aigw_generic_identity_token_boundary.failed | default(false))
+             else ['portal_identity_token,rotator_internal_token']) +
+            ([] if not (aigw_generic_session_secret_boundary.failed | default(false))
+             else ['portal_session_secret,admin_portal_session_secret']) +
+            ([] if not (aigw_generic_oidc_secret_boundary.failed | default(false))
+             else ['webui_oidc_client_secret,portal_oidc_client_secret,admin_portal_oidc_client_secret,oauth2_proxy_client_secret'])
+          }}
+      changed_when: false
+
+    - name: Preflight — reject lab-only feature paths from generic inventory
+      ansible.builtin.set_fact:
+        aigw_generic_forbidden_lab_options: >-
+          {{
+            ([] if not (samba_lab_enabled | default(false) | bool)
+             else ['samba_lab_enabled']) +
+            ([] if not (aigw_seed_test_users | default(false) | bool)
+             else ['aigw_seed_test_users']) +
+            ([] if not (retain_bootstrap_admin_user | default(false) | bool)
+             else ['retain_bootstrap_admin_user']) +
+            ([] if not (aigw_prebootstrap_oidc_scope_reconciliation | default(false) | bool)
+             else ['aigw_prebootstrap_oidc_scope_reconciliation']) +
+            ([] if not (aigw_prebootstrap_oidc_scope_reconciliation_ack | default('') | length > 0)
+             else ['aigw_prebootstrap_oidc_scope_reconciliation_ack']) +
+            ([] if not (aigw_ssh_password_authentication | default(false) | bool)
+             else ['aigw_ssh_password_authentication']) +
+            ([] if not (aigw_adm_socks_enabled | default(false) | bool)
+             else ['aigw_adm_socks_enabled']) +
+            ([] if (aigw_lab_reset_handoff_drop_interfaces | default([]) | length == 0)
+             else ['aigw_lab_reset_handoff_drop_interfaces']) +
+            ([] if (require_encrypted_state | default(true) | bool)
+             else ['require_encrypted_state=false'])
+          }}
+      changed_when: false
+
+    - name: Preflight — report a machine-readable generic inventory result
+      ansible.builtin.assert:
+        that:
+          - deployment_profile | default('') == aigw_generic_rocky9_contract.profile
+          - aigw_generic_inventory_alias | default('') == inventory_hostname
+          - aigw_generic_host_vars_file.stat.exists | default(false)
+          - aigw_generic_host_vars_file.stat.isreg | default(false)
+          - not (aigw_generic_host_vars_file.stat.islnk | default(false))
+          - aigw_generic_missing_nonsecret_keys | length == 0
+          - aigw_generic_invalid_nonsecret | length == 0
+          - aigw_generic_missing_secret_keys | length == 0
+          - aigw_generic_invalid_secret_keys | length == 0
+          - aigw_generic_duplicate_secret_boundaries | length == 0
+          - aigw_generic_forbidden_lab_options | length == 0
+        quiet: true
+        fail_msg: >-
+          AIGW_GENERIC_PREFLIGHT={{ {
+            'schema': 'aigw.generic-rocky9/preflight-v1',
+            'status': 'invalid',
+            'host': inventory_hostname,
+            'expected_host_vars': inventory_dir ~ '/host_vars/' ~ inventory_hostname ~ '.yml',
+            'profile': deployment_profile | default(''),
+            'missing_nonsecret': aigw_generic_missing_nonsecret_keys,
+            'invalid_nonsecret': aigw_generic_invalid_nonsecret,
+            'missing_secret': aigw_generic_missing_secret_keys,
+            'invalid_secret': aigw_generic_invalid_secret_keys,
+            'duplicate_secret_boundaries': aigw_generic_duplicate_secret_boundaries,
+            'forbidden_lab_options': aigw_generic_forbidden_lab_options
+          } | to_json }}
+
+    - name: Preflight — emit the successful machine-readable generic contract receipt
+      ansible.builtin.debug:
+        msg: >-
+          AIGW_GENERIC_PREFLIGHT={{ {
+            'schema': 'aigw.generic-rocky9/preflight-v1',
+            'status': 'ok',
+            'host': inventory_hostname,
+            'profile': deployment_profile,
+            'host_vars': inventory_dir ~ '/host_vars/' ~ inventory_hostname ~ '.yml',
+            'secret_key_count': aigw_generic_rocky9_contract.required_secret_keys | length
+          } | to_json }}

@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!go.mod
+!main.go
+!main_test.go
+!upstream-provenance.json
+!cmd/
+!cmd/extract-ui/
+!cmd/extract-ui/main.go
+!cmd/extract-ui/main_test.go

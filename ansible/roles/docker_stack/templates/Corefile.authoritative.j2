@@ -1,0 +1,28 @@
+# Authoritative-only split DNS. The ADM source CIDR receives the administration
+# view; every other source receives the restricted internal view. No forward
+# plugin is configured, so neither listener can become a recursive resolver.
+{{ aigw_domain }}:53 {
+    view adm {
+        expr incidr(client_ip(), '{$LAB_DNS_ADM_CIDR}')
+    }
+    errors
+    health 127.0.0.1:8080
+    file /etc/coredns/zones/db.aigw.internal.adm {{ aigw_domain }}
+    cache 30
+}
+
+{{ aigw_domain }}:53 {
+    view internal {
+        expr true
+    }
+    errors
+    file /etc/coredns/zones/db.aigw.internal {{ aigw_domain }}
+    cache 30
+}
+
+.:53 {
+    errors
+    template ANY ANY {
+        rcode NXDOMAIN
+    }
+}

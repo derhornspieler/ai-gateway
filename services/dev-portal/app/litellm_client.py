@@ -20,6 +20,8 @@ class LiteLLMError(Exception):
 
 KEY_LIST_PAGE_SIZE = 100
 KEY_LIST_MAX_PAGES = 10
+PORTAL_KEY_CREATOR_FIELD = "created_via"
+PORTAL_KEY_CREATOR_VALUE = "dev-portal"
 PORTAL_PROJECT_METADATA_KEY = "aigw_project_id"
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 
@@ -43,6 +45,22 @@ def _page_number(data: dict[str, Any], field: str) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
+
+
+def _declared_page_number(data: dict[str, Any], field: str) -> int | None:
+    """Read an optional pagination field without silently accepting garbage.
+
+    The owner-scoped inventory is an authorization input for the one-active-
+    key invariant.  Treating a malformed counter as "not supplied" would let
+    a partial LiteLLM page be mistaken for a complete inventory.
+    """
+
+    if field not in data:
+        return None
+    value = _page_number(data, field)
+    if value is None:
+        raise LiteLLMError(f"key/list returned an invalid {field}")
+    return value
 
 
 async def key_list(user_id: str) -> list[Any]:
@@ -80,13 +98,15 @@ async def key_list(user_id: str) -> list[Any]:
                     raise LiteLLMError(f"key/list failed: HTTP {resp.status_code}")
 
                 data = _response_json(resp, "key/list")
+                total_count: int | None = None
                 if isinstance(data, dict):
                     page_keys = data.get("keys")
                     if page_keys is None:
                         # Defensive compatibility with older response wrappers.
                         page_keys = data.get("data", [])
-                    current_page = _page_number(data, "current_page")
-                    total_pages = _page_number(data, "total_pages")
+                    current_page = _declared_page_number(data, "current_page")
+                    total_pages = _declared_page_number(data, "total_pages")
+                    total_count = _declared_page_number(data, "total_count")
                 elif isinstance(data, list):
                     page_keys = data
                     current_page = total_pages = None
@@ -95,6 +115,45 @@ async def key_list(user_id: str) -> list[Any]:
 
                 if not isinstance(page_keys, list):
                     raise LiteLLMError("key/list returned a non-list keys field")
+                if current_page is not None and current_page != page:
+                    raise LiteLLMError("key/list returned an unexpected page")
+                if total_pages is not None and total_pages < 0:
+                    raise LiteLLMError("key/list returned an invalid total_pages")
+                if total_count is not None and total_count < 0:
+                    raise LiteLLMError("key/list returned an invalid total_count")
+
+                # LiteLLM v1.91.3 supplies all of these counters.  Validate
+                # them when present so an empty/short non-final page cannot
+                # hide an active portal key and permit a second credential.
+                if total_count is not None:
+                    expected_total_pages = (
+                        total_count + KEY_LIST_PAGE_SIZE - 1
+                    ) // KEY_LIST_PAGE_SIZE
+                    if total_pages is not None and total_pages != expected_total_pages:
+                        raise LiteLLMError("key/list returned inconsistent page counters")
+                    total_pages = expected_total_pages
+
+                if total_pages is not None:
+                    if total_pages == 0:
+                        if page != 1 or page_keys:
+                            raise LiteLLMError(
+                                "key/list returned inconsistent page counters"
+                            )
+                    elif page > total_pages:
+                        raise LiteLLMError("key/list returned an unexpected page")
+                    elif total_count is not None:
+                        expected_items = min(
+                            KEY_LIST_PAGE_SIZE,
+                            total_count - ((page - 1) * KEY_LIST_PAGE_SIZE),
+                        )
+                        if len(page_keys) != expected_items:
+                            raise LiteLLMError(
+                                "key/list ended before its declared final page"
+                            )
+                    elif page < total_pages and len(page_keys) != KEY_LIST_PAGE_SIZE:
+                        raise LiteLLMError(
+                            "key/list ended before its declared final page"
+                        )
                 # Do not make the upstream filter the sole authorization
                 # boundary. v1.91.3 returns full key objects here; every one
                 # must independently attest the exact immutable owner that
@@ -109,15 +168,19 @@ async def key_list(user_id: str) -> list[Any]:
                     )
                 all_keys.extend(page_keys)
 
-                if (
-                    not page_keys
-                    or len(page_keys) < KEY_LIST_PAGE_SIZE
-                    or (
-                        current_page is not None
-                        and total_pages is not None
-                        and current_page >= total_pages
-                    )
-                ):
+                if total_pages is not None:
+                    if page >= total_pages:
+                        return all_keys
+                    # A counter-declared next page must be read even if this
+                    # response happens to be short. The validation above has
+                    # already rejected a short non-final page.
+                    continue
+
+                # Legacy LiteLLM responses without pagination counters can
+                # only be considered complete after a short page. The hard
+                # page cap below keeps a full-but-unbounded response fail
+                # closed rather than using a partial inventory for key minting.
+                if len(page_keys) < KEY_LIST_PAGE_SIZE:
                     return all_keys
 
             # A partial owner list is unsafe for authorization decisions and is

@@ -9,6 +9,8 @@ STACK_TASKS = ROOT / "ansible/roles/docker_stack/tasks/main.yml"
 VERIFY_TASKS = ROOT / "ansible/roles/verify/tasks/main.yml"
 ENV_TEMPLATE = ROOT / "ansible/roles/docker_stack/templates/env.j2"
 COMPOSE = ROOT / "compose/docker-compose.yml"
+FULL_SITE = ROOT / "ansible/site.yml"
+SELINUX_BASELINE = ROOT / "ansible/roles/selinux_baseline/tasks/main.yml"
 
 
 class SelinuxContractTests(unittest.TestCase):
@@ -20,7 +22,10 @@ class SelinuxContractTests(unittest.TestCase):
         )[1].split(
             "- name: Define the exact SELinux read-only bind-source boundary", 1
         )[0]
-        self.assertIn("docker\n      - ps\n      - -aq", inventory)
+        self.assertIn(
+            "docker\n      - --host\n      - unix:///run/docker.sock\n      - ps\n      - -aq",
+            inventory,
+        )
         self.assertNotIn("--filter", inventory)
 
         restore = source.split(
@@ -35,12 +40,60 @@ class SelinuxContractTests(unittest.TestCase):
     def test_live_verifier_checks_private_and_shared_bind_contexts(self) -> None:
         source = VERIFY_TASKS.read_text(encoding="utf-8")
         for required in (
-            'host.get("Binds") or []',
+            'container.get("Mounts")',
+            'mount.get("Type") != "bind"',
+            'mount.get("Mode")',
+            'mount.get("RW") is not False',
             'relabel == {"Z"}',
             'expected_context = mount_label',
             "private bind MCS drift",
             "shared bind context drift",
             "bind-objects=",
+        ):
+            self.assertIn(required, source)
+
+    def test_full_verify_requires_active_docker_selinux_and_live_mcs_labels(self) -> None:
+        source = VERIFY_TASKS.read_text(encoding="utf-8")
+        for required in (
+            "DockerRootDir == docker_data_root",
+            "'name=selinux' in (docker_info_json.stdout | from_json).SecurityOptions",
+            "missing container_t MCS ProcessLabel",
+            "missing container_file_t MCS MountLabel",
+            "live process label differs from Docker metadata",
+            'proc_label != "system_u:system_r:spc_t:s0"',
+            "bounded spc_t MountLabel metadata drift",
+            "mount_label and not mount_pattern.fullmatch(mount_label)",
+            "label-disable bind requested relabel",
+            "label-disable bind must be absolute and read-only",
+            "HostConfig.Binds",
+            "aigw_recent_selinux_denials.stdout | trim == ''",
+            "aigw_recent_selinux_denials.stderr | trim == '<no matches>'",
+        ):
+            self.assertIn(required, source)
+
+    def test_live_verifier_preserves_openwebui_nonroot_readonly_boundary(self) -> None:
+        source = VERIFY_TASKS.read_text(encoding="utf-8")
+        for required in (
+            "def normalized_container_mounts(container):",
+            "HostConfig.Tmpfs but omits them from the top-level Mounts list",
+            '"open-webui": "65532:65532"',
+            '"open-webui": "65532"',
+            'host.get("ReadonlyRootfs") is not True',
+            'tmpfs.get("/tmp")',
+            '"/app/backend/data"',
+            '"PYTHONNOUSERSITE": "1"',
+            '"STATIC_DIR": "/tmp/static"',
+            "node-exporter: malformed Docker mount metadata",
+            "open-webui: malformed Docker mount metadata",
+        ):
+            self.assertIn(required, source)
+
+    def test_live_verifier_rejects_extra_host_root_binds_for_node_exporter(self) -> None:
+        source = VERIFY_TASKS.read_text(encoding="utf-8")
+        for required in (
+            "def is_host_root_bind(mount):",
+            "all_host_root_binds",
+            "len(all_host_root_binds) != 1",
         ):
             self.assertIn(required, source)
 
@@ -159,10 +212,53 @@ class SelinuxContractTests(unittest.TestCase):
             "'name=selinux' in (stack_only_docker_info.stdout | from_json).SecurityOptions",
             "DockerRootDir == docker_data_root",
             "aigw_selinux_audit_window_start",
+            "date +'%m/%d/%y %H:%M:%S'",
         ):
             self.assertIn(required, preflight)
         roles = source.split("  roles:", 1)[1]
         self.assertLess(roles.index("role: docker_stack"), roles.index("role: verify"))
+
+    def test_full_converge_delegates_and_enforces_the_selinux_runtime_contract(self) -> None:
+        site = FULL_SITE.read_text(encoding="utf-8")
+        role = SELINUX_BASELINE.read_text(encoding="utf-8")
+
+        for required in (
+            "aigw_selinux_policy == 'targeted'",
+            "aigw_selinux_state == 'enforcing'",
+            "- role: selinux_baseline",
+            "- role: network_routing",
+            "- role: firewalld_zones",
+            "- role: os_baseline",
+            "- role: docker_stack",
+            "- role: verify",
+        ):
+            self.assertIn(required, site)
+        self.assertLess(
+            site.index("- role: selinux_baseline"),
+            site.index("- role: network_routing"),
+        )
+        self.assertLess(
+            site.index("- role: selinux_baseline"),
+            site.index("- role: firewalld_zones"),
+        )
+        self.assertLess(
+            site.index("- role: selinux_baseline"),
+            site.index("- role: os_baseline"),
+        )
+        for required in (
+            "ansible.builtin.command: getenforce",
+            "ansible.posix.selinux",
+            'policy: "{{ aigw_selinux_policy }}"',
+            'state: "{{ aigw_selinux_state }}"',
+            "ansible_facts.selinux.status | default('disabled') == 'enabled'",
+            "ansible_facts.selinux.mode | default('') == aigw_selinux_state",
+            "ansible_facts.selinux.type | default('') == aigw_selinux_policy",
+            "aigw_selinux_mode_after.stdout | trim == 'Enforcing'",
+            "aigw_selinux_audit_window_start",
+            "date +'%m/%d/%y %H:%M:%S'",
+            "SELinux did not reach the required targeted/enforcing runtime state",
+        ):
+            self.assertIn(required, role)
 
 
 if __name__ == "__main__":

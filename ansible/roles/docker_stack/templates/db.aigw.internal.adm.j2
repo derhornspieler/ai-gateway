@@ -1,0 +1,20 @@
+$ORIGIN {{ aigw_domain }}.
+$TTL 60
+
+@       IN SOA  dns.{{ aigw_domain }}. hostmaster.{{ aigw_domain }}. (
+                    2026071402 3600 900 604800 60
+                )
+        IN NS   dns.{{ aigw_domain }}.
+        IN A    {{ eth1_ip }}
+
+dns          IN A {{ eth1_ip }}
+admin        IN A {{ eth1_ip }}
+admin-portal IN A {{ eth1_ip }}
+litellm-admin IN A {{ eth1_ip }}
+grafana      IN A {{ eth1_ip }}
+prometheus   IN A {{ eth1_ip }}
+vault        IN A {{ eth1_ip }}
+auth         IN A {{ eth1_ip }}
+chat         IN A {{ eth1_ip }}
+api          IN A {{ eth2_ip }}
+portal       IN A {{ eth2_ip }}

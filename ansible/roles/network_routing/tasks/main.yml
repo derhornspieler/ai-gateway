@@ -91,7 +91,11 @@
 
 - name: Prove a fresh key-only controller SSH path after policy-routing change
   ansible.builtin.command:
-    argv: "{{ aigw_post_pbr_ssh_argv + ['/usr/bin/bash', '-c', 'sudo -n true && exec /usr/bin/printenv SSH_CONNECTION'] }}"
+    # OpenSSH joins every argument after the destination into the remote shell
+    # command without retaining argv boundaries.  Keep the compound probe in
+    # one argument so `-n` is passed to sudo and SSH_CONNECTION remains from
+    # the unprivileged SSH session.
+    argv: "{{ aigw_post_pbr_ssh_argv + ['/usr/bin/sudo -n /usr/bin/true && exec /usr/bin/printenv SSH_CONNECTION'] }}"
   vars:
     aigw_post_pbr_ssh_argv: >-
       {{

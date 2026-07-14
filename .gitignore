@@ -23,3 +23,4 @@ htmlcov/
 *.retry
 .aigw-vault-pass
 ansible/inventory/group_vars/gateway/vault.yml.predeploy-*
+ansible/inventory/generated/

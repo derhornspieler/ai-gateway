@@ -233,7 +233,9 @@
       Docker and the AI Gateway stack will not be changed.
 
 - name: SELinux baseline — capture the AVC audit window start
-  ansible.builtin.command: date +'%m/%d/%Y %H:%M:%S'
+  # ausearch under LC_ALL=C accepts the documented two-digit year form
+  # (MM/DD/YY), while a four-digit year is parsed as an error on Rocky 9.
+  ansible.builtin.command: date +'%m/%d/%y %H:%M:%S'
   environment:
     LC_ALL: C
   register: aigw_selinux_audit_window_start

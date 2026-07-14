@@ -1,32 +1,63 @@
 ---
 # Concrete Rocky 9 lab wiring (verified read-only on the live VM).
-# This applies only to the lab-aigw01 alias in inventory/lab.yml.
-deployment_profile: rocky9-lab
+# This applies only to the lab-aigw01 alias in inventory/lab.yml. Its
+# profile and encryption exception intentionally live in the inventory entry
+# so stack-only runs do not depend on host_vars discovery.
 aigw_domain: aigw.internal
-# Disposable local validation VM only. Customer/generic profiles retain
-# require_encrypted_state=true and must mount Docker + stack state on LUKS.
-require_encrypted_state: false
-require_preupgrade_backup: false
+# Lab-only greenfield convenience. Generic/customer inventories inherit the
+# key-only default from group_vars and must opt in deliberately if required.
+aigw_ssh_password_authentication: true
+# This disposable lab deliberately grants its trusted automation/operator
+# account a browser SOCKS path from the ADM VPN range. Generic/customer
+# profiles remain default-deny and must provide their own explicit review.
+aigw_adm_socks_enabled: true
+aigw_adm_socks_users: [ansible]
+aigw_adm_socks_source_cidrs: ["{{ vpn_client_cidr }}"]
+aigw_adm_socks_trusted_operator_ack: I_UNDERSTAND_SOCKS_REACHES_ALL_HOST_ROUTES
 # This clean-room lab lacks dhi.io credentials. The operator must pre-stage
 # this exact secret-free arm64 archive as root:root 0600 before the converge.
 # The role validates its digest and loads it before any Compose build. Generic
 # inventory remains disabled/pathless and does not inherit this lab exception.
 offline_image_seed_enabled: true
-offline_image_seed_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260713.docker.tar.zst
-offline_image_seed_sha256: e418ac9299351254412028b3a1481eccaf8791a4847e931d724a4882de2defde
-offline_image_seed_manifest_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260713.manifest.json
-offline_image_seed_manifest_sha256: ebde9dd8a2f8053666414e665be03acbfcf3b841af94d9e7b26e3da9ed6b5515
+offline_image_seed_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260713-vaultui.docker.tar.zst
+offline_image_seed_sha256: 73e565c2c1bf849bd1fc8e5815a06bc64a233b22c8ac3319a2a532294e9f310f
+offline_image_seed_manifest_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260713-vaultui.manifest.json
+offline_image_seed_manifest_sha256: 87857a76881bf70cb9cd12e37f736a73bb0128554c9b55aa1463c25783c38682
 # One Keycloak-local administrator is required only to enter the portal before
 # Samba federation exists. After assigning lab-admin to an aigw-admins managed
 # group, remove this disposable bootstrap identity through Keycloak recovery
 # administration. Its password remains encrypted in the inventory overlay.
 aigw_seed_test_users: true
-# The disposable lab keeps one vaulted, ADM-only Keycloak console recovery
-# operator. Generic/customer profiles delete all bootstrap principals.
-retain_bootstrap_admin_user: true
+# Keycloak v26 marks its master-realm bootstrap administrator as temporary and
+# does not permit converting it into a durable recovery account. The lab uses
+# the federated `lab-admin` identity through the ADM-only portal, so delete
+# both temporary bootstrap principals after verified controller setup.
+retain_bootstrap_admin_user: false
+# One-time repair for the existing lab realm, which predates the explicit
+# first-party OIDC role scope mappings. The runner itself additionally proves
+# configured=false, controller_usable=false, and bootstrap_available=true.
+aigw_prebootstrap_oidc_scope_reconciliation: true
+aigw_prebootstrap_oidc_scope_reconciliation_ack: RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES
+# Establish only the minimum directory-backed administrator path needed to
+# cross the existing oauth2-proxy gate and unseal Vault. The normal identity
+# controller owns all subsequent project/group/user lifecycle.
+aigw_pre_vault_identity_baseline_reconciliation: true
+aigw_pre_vault_identity_baseline_reconciliation_ack: RECONCILE_PRE_VAULT_MANAGED_IDENTITY_BASELINE
+aigw_pre_vault_identity_ensure_lab_federation: true
+aigw_pre_vault_identity_baseline_groups:
+  - { name: lab-admins, roles: [aigw-admins] }
+  - { name: lab-developers, roles: [aigw-developers] }
+  - { name: lab-users, roles: [aigw-users] }
+aigw_pre_vault_identity_bootstrap_admin_identities:
+  - username: lab-admin
+    group: lab-admins
+    federation_provider: lab-samba-ad
 nic_egress: enp0s5
 nic_adm: enp0s7
 nic_internal: enp0s8
+# reset-rocky9-lab.yml deliberately leaves only these non-management planes
+# in the built-in fail-closed ``drop`` zone before the next site.yml converge.
+aigw_lab_reset_handoff_drop_interfaces: ["{{ nic_egress }}", "{{ nic_internal }}"]
 
 eth0_ip: "10.211.55.3"
 eth0_gateway: "10.211.55.1"
@@ -47,5 +78,12 @@ pbr_tables:
 vpn_client_cidr: "10.8.10.0/24"
 internal_cidr: "10.20.0.0/24"
 
-# Lab shared-network resolver; explicit container DNS is firewall-visible.
-container_dns_server: "10.211.55.1"
+# Lab resolver planes. Internal/ADM containers use the gateway's
+# authoritative-only split DNS listeners; only Envoy may query the Parallels
+# shared-network Internet resolver over the egress NIC.
+internal_dns_servers:
+  - "{{ eth1_ip }}"
+  - "{{ eth2_ip }}"
+egress_dns_servers:
+  - "10.211.55.1"
+platform_authoritative_dns_enabled: true

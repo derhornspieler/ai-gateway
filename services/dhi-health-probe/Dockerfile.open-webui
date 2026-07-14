@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+ARG BASE_IMAGE
+
+FROM dhi.io/golang:1.25.12-alpine-dev@sha256:4411028e8461d5a111cdbf0aa172db17342557590f7727a4dd4649440bb411c2 AS probe-builder
+WORKDIR /src
+COPY go.mod main.go main_test.go ./
+RUN --network=none go test ./... \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/aigw-health-probe ./
+
+FROM ${BASE_IMAGE}
+# The immutable upstream image contains Python and this exact module. The
+# patcher verifies both complete source hashes and both narrow promotion
+# snippets before changing bytes; the verifier executes the patched role method
+# against rejected, user, and admin claims. Any drift fails the offline build.
+RUN --network=none \
+    --mount=type=bind,source=patch_openwebui_oauth.py,target=/tmp/patch_openwebui_oauth.py \
+    --mount=type=bind,source=verify_openwebui_oauth.py,target=/tmp/verify_openwebui_oauth.py \
+    python3 -I /tmp/patch_openwebui_oauth.py \
+      /app/backend/open_webui/utils/oauth.py \
+    && python3 -I /tmp/verify_openwebui_oauth.py \
+      /app/backend/open_webui/utils/oauth.py \
+    && mkdir -p /app/backend/data/cache \
+    && chown -R 65532:65532 /app/backend/data \
+    && chmod 0700 /app/backend/data
+COPY --from=probe-builder --chmod=0555 /out/aigw-health-probe /usr/local/bin/aigw-health-probe
+# Drop privileges in the image as well as Compose so a direct image run cannot
+# silently bypass the reviewed application identity.
+USER 65532:65532

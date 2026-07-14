@@ -15,13 +15,15 @@
     "traefik-int": ["traefik/traefik-int.yml", "traefik/dynamic-int.yml", "certs"],
     "vault": ["vault/config.hcl"]
   },
-  "lab": {
-    "key-rotator": ["secrets/samba_ad_bind_password"],
+  "platform_dns": {
     "lab-dns": [
       "services/lab-dns/Corefile",
       "services/lab-dns/db.aigw.internal",
       "services/lab-dns/db.aigw.internal.adm"
-    ],
+    ]
+  },
+  "lab_identity": {
+    "key-rotator": ["secrets/samba_ad_bind_password"],
     "samba-ad": [
       "secrets/samba_ad_admin_password",
       "secrets/samba_ad_bind_password",

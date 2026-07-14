@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Maintenance — AI Gateway Administration{% endblock %}
+{% block content %}
+<h1>AI Gateway administration</h1>
+<div class="card">
+  <h2>Vault is sealed</h2>
+  <p>The administrative control plane is intentionally unavailable until an authorized operator unseals Vault.</p>
+  <p class="muted">No identities, membership data, provider configuration, rotation history, secrets, or administrative actions are exposed in this state.</p>
+</div>
+<div class="card">
+  <h2>Managed groups</h2>
+  <p class="muted">Project and group controls are unavailable while Vault is sealed.</p>
+  <button type="button" disabled aria-disabled="true">Create project group unavailable</button>
+</div>
+<div class="card">
+  <h2>Directory-user assignment</h2>
+  <p class="muted">User assignment and removal controls are unavailable while Vault is sealed.</p>
+  <button type="button" disabled aria-disabled="true">Manage group members unavailable</button>
+</div>
+<div class="card">
+  <h2>Anthropic WIF</h2>
+  <p><strong>State:</strong> unavailable</p>
+  <p class="muted">Provider enrollment and lifecycle controls require the unsealed control plane.</p>
+  <button type="button" disabled aria-disabled="true">Configure Anthropic unavailable</button>
+</div>
+{% endblock %}

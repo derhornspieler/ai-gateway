@@ -243,6 +243,18 @@ class Settings(BaseSettings):
         default=3600, alias="OPENAI_ORPHAN_CLEANUP_INTERVAL_SECONDS"
     )
 
+    # Direct Keycloak ADM-console mutations are intentionally possible for
+    # break-glass administration.  Reconcile portal-issued static LiteLLM
+    # keys against live managed-project membership on this bounded cadence so
+    # an out-of-band removal is eventually revoked without trusting a stale
+    # browser/OIDC claim.
+    portal_key_reconcile_interval_seconds: int = Field(
+        default=60,
+        ge=60,
+        le=86400,
+        alias="PORTAL_KEY_RECONCILE_INTERVAL_SECONDS",
+    )
+
     # OTel collector (Grafana Alloy) — OTLP HTTP/protobuf, docs/solution-map.md §1.8.
     otel_exporter_otlp_endpoint: str = Field(
         default="http://alloy:4318", alias="OTEL_EXPORTER_OTLP_ENDPOINT"
@@ -407,7 +419,11 @@ class Settings(BaseSettings):
             self.admin_portal_oidc_client_secret,
             self.oauth2_proxy_client_secret,
         )
-        return all(self._token_ok(value) and len(value.strip()) >= 32 for value in values)
+        normalized = tuple(value.strip() for value in values)
+        return (
+            len(set(normalized)) == len(normalized)
+            and all(self._token_ok(value) and len(value) >= 32 for value in normalized)
+        )
 
     def validated_keycloak_token_url(self, value: str) -> str:
         """Return a Vault-provided Keycloak token URL only if it is confined

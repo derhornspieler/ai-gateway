@@ -24,6 +24,12 @@ table inet aigw_guard {
 {% for net in docker_networks %}
     iifname "{{ net.bridge }}" ct state established,related ct direction reply accept
 {% endfor %}
+{% if platform_authoritative_dns_enabled | bool %}
+{% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
+    iifname "{{ net.bridge }}" ip daddr { {{ eth1_ip }}, {{ eth2_ip }} } udp dport 53 accept
+    iifname "{{ net.bridge }}" ip daddr { {{ eth1_ip }}, {{ eth2_ip }} } tcp dport 53 accept
+{% endfor %}
+{% endif %}
     # Docker's default bridge is docker0 and user-defined bridges generated
     # outside this inventory use the br-<id> prefix. Do not let either reach a
     # host listener merely because it was created after the initial converge.
@@ -47,14 +53,27 @@ table inet aigw_guard {
 {% for net in docker_networks %}
     iifname "{{ net.bridge }}" oifname "{{ net.bridge }}" accept
 {% endfor %}
-    iifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } drop
-
-    # Never make the host a generic ADM/internal-to-egress router.  These
-    # explicit cross-plane drops are deliberately before the broad reply
-    # allowance, so a flow opened during a prior policy gap cannot preserve
-    # lateral movement. SSH -D is host-originated OUTPUT and is unaffected.
+    # Never make the host a generic ADM/internal-to-egress router. Keep these
+    # physical cross-plane drops before *every* reply allowance, including the
+    # exact platform-DNS cross-bridge replies below, so a flow opened during a
+    # prior policy gap cannot preserve lateral movement.
     iifname "{{ nic_internal }}" oifname "{{ nic_egress }}" drop
     iifname "{{ nic_egress }}" oifname "{{ nic_internal }}" drop
+
+{% if platform_authoritative_dns_enabled | bool %}
+{% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
+    iifname "{{ net.bridge }}" oifname "br-lab-dns" ip daddr {{ lab_dns_ip }} udp dport 53 accept
+    iifname "{{ net.bridge }}" oifname "br-lab-dns" ip daddr {{ lab_dns_ip }} tcp dport 53 accept
+{% endfor %}
+    # The cross-bridge drop below is deliberately before the broad reply
+    # allowance. Add only the reply half of the exact platform-DNS flow so a
+    # DNS answer is usable without preserving unrelated stale connections.
+{% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
+    iifname "br-lab-dns" oifname "{{ net.bridge }}" ip saddr {{ lab_dns_ip }} udp sport 53 ct state established,related ct direction reply accept
+    iifname "br-lab-dns" oifname "{{ net.bridge }}" ip saddr {{ lab_dns_ip }} tcp sport 53 ct state established,related ct direction reply accept
+{% endfor %}
+{% endif %}
+    iifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } drop
 
     # Cross-plane flows are evaluated before this reply allowance, so a flow
     # opened during a prior policy gap cannot preserve lateral movement.
@@ -64,7 +83,7 @@ table inet aigw_guard {
     # router. Accept only a real Docker DNAT whose original destination was the
     # exact published host address and whose translated output is managed.
     iifname "{{ nic_adm }}" oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 443 tcp dport 443 accept
-{% if lab_dns_enabled | bool %}
+{% if platform_authoritative_dns_enabled | bool %}
     # Lab-only published authoritative DNS. These are FORWARD rules for the
     # DNAT path; the host INPUT chain remains closed to container traffic.
     iifname "{{ nic_adm }}" oifname "br-lab-dns" ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 53 udp dport 53 accept
@@ -75,8 +94,16 @@ table inet aigw_guard {
     iifname "{{ nic_internal }}" oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 443 tcp dport 443 accept
     iifname { "{{ nic_egress }}", "{{ nic_adm }}", "{{ nic_internal }}" } drop
 
-    iifname "{{ _egress_net.bridge }}" ip saddr {{ envoy_egress_ip }} ip daddr {{ container_dns_server }} udp dport 53 accept
-    iifname "{{ _egress_net.bridge }}" ip saddr {{ envoy_egress_ip }} ip daddr {{ container_dns_server }} tcp dport 53 accept
+{% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
+{% for resolver in internal_dns_servers %}
+    iifname "{{ net.bridge }}" oifname { "{{ nic_adm }}", "{{ nic_internal }}" } ip daddr {{ resolver }} udp dport 53 accept
+    iifname "{{ net.bridge }}" oifname { "{{ nic_adm }}", "{{ nic_internal }}" } ip daddr {{ resolver }} tcp dport 53 accept
+{% endfor %}
+{% endfor %}
+{% for resolver in egress_dns_servers %}
+    iifname "{{ _egress_net.bridge }}" oifname "{{ nic_egress }}" ip saddr {{ envoy_egress_ip }} ip daddr {{ resolver }} udp dport 53 accept
+    iifname "{{ _egress_net.bridge }}" oifname "{{ nic_egress }}" ip saddr {{ envoy_egress_ip }} ip daddr {{ resolver }} tcp dport 53 accept
+{% endfor %}
     iifname "{{ _egress_net.bridge }}" oifname "{{ nic_egress }}" ip saddr {{ envoy_egress_ip }} tcp dport 443 accept
 {% if cribl_external_export_enabled | bool %}
     iifname "{{ _internal_net.bridge }}" oifname "{{ nic_internal }}" ip saddr {{ alloy_internal_ip }} ip daddr {{ cribl_otlp_allowed_cidr }} tcp dport {{ cribl_otlp_allowed_port }} accept
@@ -87,6 +114,10 @@ table inet aigw_guard {
 {% for net in docker_networks %}
     iifname "{{ net.bridge }}" drop
 {% endfor %}
+    # Match Docker's default bridge and any future unmanaged user-defined
+    # bridge during a DOCKER-USER/firewalld reload gap as well.
+    iifname "docker0" drop
+    iifname "br-*" drop
   }
 }
 AIGW_HOST_INPUT_RULES

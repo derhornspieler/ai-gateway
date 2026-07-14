@@ -17,14 +17,27 @@ from html.parser import HTMLParser
 
 
 PORTAL_ORIGIN = "https://portal.aigw.internal"
+ADMIN_PORTAL_ORIGIN = "https://admin.aigw.internal"
 AUTH_HOST = "auth.aigw.internal"
-ALLOWED_HOSTS = {"portal.aigw.internal", AUTH_HOST}
+PORTAL_ALLOWED_HOSTS = frozenset({"portal.aigw.internal", AUTH_HOST})
+ADMIN_PORTAL_ALLOWED_HOSTS = frozenset(
+    {"admin.aigw.internal", AUTH_HOST}
+)
+REVIEWED_HOST_SETS = frozenset(
+    {PORTAL_ALLOWED_HOSTS, ADMIN_PORTAL_ALLOWED_HOSTS}
+)
 
 
 class RestrictedRedirects(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allowed_hosts: frozenset[str]) -> None:
+        super().__init__()
+        if allowed_hosts not in REVIEWED_HOST_SETS:
+            raise ValueError("redirect hosts must match one reviewed portal boundary")
+        self.allowed_hosts = allowed_hosts
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         parsed = urllib.parse.urlsplit(newurl)
-        if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
+        if parsed.scheme != "https" or parsed.hostname not in self.allowed_hosts:
             raise RuntimeError("OIDC redirect left the reviewed portal/Keycloak hosts")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -70,10 +83,19 @@ def parse_forms(html: str) -> list[dict[str, object]]:
     return parser.forms
 
 
-def post_form(opener, base_url: str, form: dict[str, object], fields: dict[str, str]):
+def post_form(
+    opener,
+    base_url: str,
+    form: dict[str, object],
+    fields: dict[str, str],
+    *,
+    allowed_hosts: frozenset[str],
+):
+    if allowed_hosts not in REVIEWED_HOST_SETS:
+        raise ValueError("form hosts must match one reviewed portal boundary")
     action = urllib.parse.urljoin(base_url, str(form["action"]))
     parsed = urllib.parse.urlsplit(action)
-    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
+    if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
         raise RuntimeError("form action left the reviewed portal/Keycloak hosts")
     values = dict(form["inputs"])
     values.update(fields)
@@ -95,7 +117,14 @@ def post_form(opener, base_url: str, form: dict[str, object], fields: dict[str, 
     return final_url, body.decode("utf-8", errors="strict")
 
 
-def keycloak_login(opener, start_url: str, password: str) -> tuple[str, str]:
+def keycloak_login(
+    opener,
+    start_url: str,
+    password: str,
+    *,
+    allowed_hosts: frozenset[str],
+    username: str = "testadmin",
+) -> tuple[str, str]:
     final_url, html = read_page(opener, start_url)
     forms = [
         form
@@ -108,40 +137,40 @@ def keycloak_login(opener, start_url: str, password: str) -> tuple[str, str]:
         opener,
         final_url,
         forms[0],
-        {"username": "testadmin", "password": password},
+        {"username": username, "password": password},
+        allowed_hosts=allowed_hosts,
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ca", required=True)
-    args = parser.parse_args()
-    if sys.stdin.isatty():
-        raise SystemExit("pipe the disposable lab password on stdin")
-    raw_password = sys.stdin.buffer.read(513)
-    if not raw_password or len(raw_password) > 512:
-        raise SystemExit("invalid lab password length")
-    try:
-        password = raw_password.strip().decode("utf-8")
-    except UnicodeDecodeError:
-        raise SystemExit("lab password is not UTF-8") from None
-
-    context = ssl.create_default_context(cafile=args.ca)
-    cookies = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        urllib.request.HTTPSHandler(context=context),
-        urllib.request.HTTPCookieProcessor(cookies),
-        RestrictedRedirects(),
+def identity_flow(portal_opener, admin_opener, password: str) -> None:
+    # A fresh deployment deliberately fails closed for developer-project
+    # lookups until the one-time identity controller has been initialized.
+    # Bootstrap through the separate administrator application first; testing
+    # a normal developer landing page before that would correctly produce a
+    # 503 rather than test the OIDC callback.
+    #
+    # The administrator application has its own OIDC client, signing key, and
+    # cookie name. Establish that independent session before requesting its
+    # prompt=login/max_age=0 step-up route.
+    final_url, _ = keycloak_login(
+        admin_opener,
+        ADMIN_PORTAL_ORIGIN + "/login/start",
+        password,
+        allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
     )
+    parsed = urllib.parse.urlsplit(final_url)
+    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
+        raise RuntimeError("ordinary admin OIDC login did not reach /admin")
+    print("ADMIN_PORTAL_OIDC_LOGIN_PASS")
 
-    final_url, _ = keycloak_login(opener, PORTAL_ORIGIN + "/login/start", password)
-    if urllib.parse.urlsplit(final_url).hostname != "portal.aigw.internal":
-        raise RuntimeError("ordinary OIDC login did not return to the portal")
-    print("PORTAL_OIDC_LOGIN_PASS")
-
-    final_url, html = keycloak_login(opener, PORTAL_ORIGIN + "/admin/reauth", password)
-    if urllib.parse.urlsplit(final_url).path != "/admin":
+    final_url, html = keycloak_login(
+        admin_opener,
+        ADMIN_PORTAL_ORIGIN + "/admin/reauth",
+        password,
+        allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
+    )
+    parsed = urllib.parse.urlsplit(final_url)
+    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
         raise RuntimeError("forced OIDC reauthentication did not return to /admin")
     print("PORTAL_FORCED_REAUTH_PASS")
 
@@ -159,16 +188,61 @@ def main() -> int:
     if len(csrf) < 32:
         raise RuntimeError("portal INITIALIZE form had no valid CSRF token")
     final_url, html = post_form(
-        opener,
+        admin_opener,
         final_url,
         bootstrap_forms[0],
         {"confirmation": "INITIALIZE", "csrf_token": csrf},
+        allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
     )
-    if urllib.parse.urlsplit(final_url).path != "/admin":
-        raise RuntimeError("INITIALIZE did not return to /admin")
+    parsed = urllib.parse.urlsplit(final_url)
+    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
+        raise RuntimeError("INITIALIZE did not return to the admin portal")
     if "Keycloak identity setup completed." not in html:
         raise RuntimeError("portal did not report successful identity setup")
     print("PORTAL_IDENTITY_INITIALIZE_PASS")
+
+    # Only after the controller state is durable should the developer portal
+    # be expected to perform its fail-closed live project-membership lookup.
+    final_url, _ = keycloak_login(
+        portal_opener,
+        PORTAL_ORIGIN + "/login/start",
+        password,
+        allowed_hosts=PORTAL_ALLOWED_HOSTS,
+    )
+    parsed = urllib.parse.urlsplit(final_url)
+    if parsed.hostname != "portal.aigw.internal" or parsed.path != "/":
+        raise RuntimeError("ordinary OIDC login did not reach the portal home page")
+    print("PORTAL_OIDC_LOGIN_PASS")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ca", required=True)
+    args = parser.parse_args()
+    if sys.stdin.isatty():
+        raise SystemExit("pipe the disposable lab password on stdin")
+    raw_password = sys.stdin.buffer.read(513)
+    if not raw_password or len(raw_password) > 512:
+        raise SystemExit("invalid lab password length")
+    try:
+        password = raw_password.strip().decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit("lab password is not UTF-8") from None
+
+    context = ssl.create_default_context(cafile=args.ca)
+    portal_opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=context),
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+        RestrictedRedirects(PORTAL_ALLOWED_HOSTS),
+    )
+    admin_opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=context),
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+        RestrictedRedirects(ADMIN_PORTAL_ALLOWED_HOSTS),
+    )
+    identity_flow(portal_opener, admin_opener, password)
     return 0
 
 

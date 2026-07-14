@@ -19,6 +19,7 @@ import secrets
 import stat
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,10 +29,22 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
 
 from app.config import Settings
-from app.security import path_segment, service_account_subject, validate_wif_token_claims
+from app.security import (
+    path_segment,
+    service_account_subject,
+    validate_wif_token_claims,
+)
 
-CAPABILITY_ROLES = frozenset(
-    {"aigw-users", "aigw-developers", "aigw-admins"}
+CAPABILITY_ROLES = frozenset({"aigw-users", "aigw-developers", "aigw-admins"})
+# These are the only browser-facing OIDC clients managed by this controller.
+# Keep this explicit rather than deriving it from a Keycloak search result: a
+# temporary bootstrap administrator is intentionally powerful, so a recovery
+# reconciliation must never broaden to an operator-created client.
+RELYING_PARTY_CLIENT_IDS = (
+    "open-webui",
+    "dev-portal",
+    "admin-portal",
+    "admin-ui",
 )
 CONTROLLER_ADMIN_ROLES = (
     "manage-users",
@@ -49,11 +62,16 @@ MAX_KEYSTORE_BYTES = 1024 * 1024
 MAX_KEY_PEM_BYTES = 32 * 1024
 MAX_PAGE_COUNT = 100
 PAGE_SIZE = 100
+PRE_VAULT_IDENTITY_SCHEMA = 1
+MAX_PRE_VAULT_BASELINE_GROUPS = 32
+MAX_PRE_VAULT_BOOTSTRAP_IDENTITIES = 16
 # A managed Keycloak group is the project security boundary.  Its direct-child
 # name is therefore the canonical project identifier copied into LiteLLM key
 # metadata and audit records.  Lowercase-only prevents case-fold collisions
 # across Keycloak, PostgreSQL, log queries, and filesystem/tool configuration.
 PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+BOOTSTRAP_IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
+FEDERATION_PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,127}")
 MANAGED_ROOT_ATTRIBUTE = "aigw.managed-root"
 LAB_LDAP_PROVIDER_NAME = "lab-samba-ad"
 BROKER_SUBJECT_MAPPER_NAME = "anthropic-stable-subject"
@@ -71,6 +89,9 @@ class IdentityConflict(IdentityError):
     pass
 
 
+PortalKeyRevoker = Callable[[str, str], Awaitable[None]]
+
+
 class KeycloakAdmin:
     def __init__(
         self,
@@ -79,11 +100,19 @@ class KeycloakAdmin:
         db: Any,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        portal_key_revoker: PortalKeyRevoker | None = None,
     ) -> None:
         self.settings = settings
         self.vault = vault
         self.db = db
         self._transport = transport
+        # LiteLLM virtual keys are static bearer credentials.  The identity
+        # controller is therefore the authoritative removal path and must
+        # prove revocation before it removes a managed-project membership.
+        # Production wires this to LiteLLMClient.revoke_portal_project_keys;
+        # retaining an optional constructor parameter keeps the HTTP boundary
+        # testable without smuggling the LiteLLM master key into this module.
+        self._portal_key_revoker = portal_key_revoker
         self._bootstrap_lock = asyncio.Lock()
         # One topology lock covers every managed-group mutation. Protecting
         # only removal left a last-admin TOCTOU: an empty admin group could be
@@ -166,7 +195,9 @@ class KeycloakAdmin:
     ) -> str:
         pem = key_doc.get("private_key_pem")
         if not isinstance(pem, str) or not pem or len(pem.encode()) > MAX_KEY_PEM_BYTES:
-            raise IdentityError("the private_key_jwt key in Vault is missing or invalid")
+            raise IdentityError(
+                "the private_key_jwt key in Vault is missing or invalid"
+            )
         now = int(time.time())
         headers: dict[str, str] = {}
         kid = key_doc.get("kid")
@@ -214,9 +245,7 @@ class KeycloakAdmin:
 
     async def _controller_token(self) -> str:
         try:
-            key_doc = self.vault.read(
-                self.settings.identity_controller_key_vault_path
-            )
+            key_doc = self.vault.read(self.settings.identity_controller_key_vault_path)
         except Exception as exc:  # noqa: BLE001
             raise IdentityError("could not read the identity controller key") from exc
         if not isinstance(key_doc, dict):
@@ -241,7 +270,9 @@ class KeycloakAdmin:
         payload = self._json(response, "client lookup")
         if not isinstance(payload, list):
             raise IdentityError("Keycloak client lookup was not a list")
-        matches = [c for c in payload if isinstance(c, dict) and c.get("clientId") == client_id]
+        matches = [
+            c for c in payload if isinstance(c, dict) and c.get("clientId") == client_id
+        ]
         if len(matches) > 1:
             raise IdentityConflict(f"multiple Keycloak clients are named {client_id}")
         return matches[0] if matches else None
@@ -261,7 +292,9 @@ class KeycloakAdmin:
             realm, str(representation["clientId"]), admin_token
         )
         if found is None:
-            raise IdentityError("Keycloak created a client but it could not be resolved")
+            raise IdentityError(
+                "Keycloak created a client but it could not be resolved"
+            )
         return found
 
     async def _put_client(
@@ -316,11 +349,677 @@ class KeycloakAdmin:
             },
         }
 
+    @classmethod
+    def _verify_realm_roles_mapper(cls, client: dict[str, Any], client_id: str) -> None:
+        """Require exactly the managed role mapper after a Keycloak PUT.
+
+        Keycloak accepts a client update with a 204 even when it normalizes or
+        drops protocol mappers.  The mapper is the only reviewed path from the
+        narrowly scoped realm roles to the browser-facing ``roles`` claim, so
+        treating the client PUT as sufficient could leave every login
+        successful but unauthorized.  Keycloak may add representation metadata
+        such as ``id``; all security-relevant mapper fields must still match
+        exactly and no second mapper may remain.
+        """
+
+        mappers = client.get("protocolMappers")
+        expected = cls._realm_roles_mapper()
+        if not isinstance(mappers, list) or len(mappers) != 1:
+            raise IdentityError(
+                f"Keycloak did not verify OIDC client {client_id} role mapper"
+            )
+        mapper = mappers[0]
+        if not isinstance(mapper, dict) or any(
+            mapper.get(field) != expected[field]
+            for field in ("name", "protocol", "protocolMapper", "config")
+        ):
+            raise IdentityError(
+                f"Keycloak did not verify OIDC client {client_id} role mapper"
+            )
+
+    async def _capability_role_representations(
+        self, realm: str, admin_token: str
+    ) -> list[dict[str, Any]]:
+        """Resolve the exact realm-role representations accepted by Keycloak.
+
+        The scope-mapping API validates both the role name and the internal
+        role ID.  Fetching the representations first avoids guessing IDs or
+        sending a partial role object that a Keycloak upgrade could reject.
+        """
+
+        safe_realm = path_segment(realm, label="Keycloak realm")
+        roles: list[dict[str, Any]] = []
+        for role_name in sorted(CAPABILITY_ROLES):
+            response = await self._request(
+                "GET",
+                f"/admin/realms/{safe_realm}/roles/{path_segment(role_name, label='capability role')}",
+                token=admin_token,
+                expected=(200,),
+            )
+            role = self._json(response, "capability role")
+            if not isinstance(role, dict) or role.get("name") != role_name:
+                raise IdentityError(f"capability role {role_name} is missing")
+            # An ID-less object cannot be safely submitted to Keycloak's
+            # mapping endpoint.  ``path_segment`` also bounds/control-checks
+            # the server-returned value before it can be echoed elsewhere.
+            path_segment(role.get("id"), label="capability role UUID")
+            roles.append(role)
+        return roles
+
+    async def _client_realm_role_scope_mappings(
+        self, realm: str, client: dict[str, Any], admin_token: str
+    ) -> list[dict[str, Any]]:
+        """Read and validate direct realm-role scope mappings for one client."""
+
+        safe_realm = path_segment(realm, label="Keycloak realm")
+        client_uuid = path_segment(client.get("id"), label="Keycloak client UUID")
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{safe_realm}/clients/{client_uuid}/scope-mappings/realm",
+            token=admin_token,
+            expected=(200,),
+        )
+        payload = self._json(response, "OIDC client realm-role scope mappings")
+        if not isinstance(payload, list):
+            raise IdentityError("Keycloak OIDC client scope mappings were invalid")
+        roles: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        for role in payload:
+            name = role.get("name") if isinstance(role, dict) else None
+            if not isinstance(name, str) or not name or name in seen_names:
+                raise IdentityError("Keycloak OIDC client scope mappings were invalid")
+            # A response is later used as the DELETE representation. Refuse a
+            # partial/malformed role rather than reflecting it into a mutation.
+            path_segment(role.get("id"), label="scoped realm role UUID")
+            seen_names.add(name)
+            roles.append(role)
+        return roles
+
+    async def _reconcile_client_realm_role_scope_mappings(
+        self,
+        realm: str,
+        client: dict[str, Any],
+        desired_roles: list[dict[str, Any]],
+        admin_token: str,
+        *,
+        remove_extras: bool = True,
+    ) -> bool:
+        """Converge one OIDC client to only the three capability roles.
+
+        ``fullScopeAllowed`` remains disabled, so Keycloak emits role claims
+        only for explicit direct scope mappings.  Delete unexpected mappings
+        before adding missing ones: a transient API failure then fails closed
+        (temporary loss of a claim) rather than retaining an over-broad claim.
+        """
+
+        safe_realm = path_segment(realm, label="Keycloak realm")
+        client_uuid = path_segment(client.get("id"), label="Keycloak client UUID")
+        client_id = client.get("clientId")
+        if client_id not in RELYING_PARTY_CLIENT_IDS:
+            raise IdentityError("refusing to reconcile an unapproved OIDC client")
+        if client.get("fullScopeAllowed") is not False:
+            raise IdentityConflict(
+                f"OIDC client {client_id} must retain fullScopeAllowed=false"
+            )
+
+        desired_by_name: dict[str, dict[str, Any]] = {}
+        for role in desired_roles:
+            name = role.get("name") if isinstance(role, dict) else None
+            if not isinstance(name, str) or name not in CAPABILITY_ROLES:
+                raise IdentityError(
+                    "Keycloak capability role representation was invalid"
+                )
+            path_segment(role.get("id"), label="capability role UUID")
+            if name in desired_by_name:
+                raise IdentityError(
+                    "Keycloak capability role representation was invalid"
+                )
+            desired_by_name[name] = role
+        if set(desired_by_name) != CAPABILITY_ROLES:
+            raise IdentityError(
+                "Keycloak capability role representation was incomplete"
+            )
+
+        current_roles = await self._client_realm_role_scope_mappings(
+            realm, client, admin_token
+        )
+        current_names = {str(role["name"]) for role in current_roles}
+        endpoint = (
+            f"/admin/realms/{safe_realm}/clients/{client_uuid}/scope-mappings/realm"
+        )
+        extras = [
+            role for role in current_roles if str(role["name"]) not in CAPABILITY_ROLES
+        ]
+        changed = False
+        if extras:
+            if not remove_extras:
+                raise IdentityConflict(
+                    f"OIDC client {client_id} has unmanaged realm-role scope mappings"
+                )
+            await self._request(
+                "DELETE",
+                endpoint,
+                token=admin_token,
+                json_body=extras,
+                expected=(204,),
+            )
+            changed = True
+        missing = [
+            desired_by_name[name]
+            for name in sorted(CAPABILITY_ROLES)
+            if name not in current_names
+        ]
+        if missing:
+            await self._request(
+                "POST",
+                endpoint,
+                token=admin_token,
+                json_body=missing,
+                expected=(204,),
+            )
+            changed = True
+
+        verified_roles = await self._client_realm_role_scope_mappings(
+            realm, client, admin_token
+        )
+        verified_by_name = {str(role["name"]): role for role in verified_roles}
+        if (
+            len(verified_roles) != len(CAPABILITY_ROLES)
+            or set(verified_by_name) != CAPABILITY_ROLES
+            or any(
+                verified_by_name[name].get("id") != desired_by_name[name].get("id")
+                for name in CAPABILITY_ROLES
+            )
+        ):
+            raise IdentityError(
+                f"Keycloak did not verify OIDC client {client_id} role scope mappings"
+            )
+        return changed
+
+    async def reconcile_prebootstrap_relying_party_role_scopes(self) -> bool:
+        """Repair only RP role scopes before the interactive identity bootstrap.
+
+        This is deliberately narrower than :meth:`bootstrap`: it never writes
+        Vault, creates a controller, mutates client settings, or deletes the
+        temporary master-realm bootstrap client.  It is usable only while the
+        exact pre-bootstrap state is positively observed, preventing an
+        Ansible migration helper from becoming a recurring privileged client
+        reconciler after normal identity setup has completed.
+        """
+
+        status = await self.status()
+        if not (
+            # ``configured`` deliberately includes a controller-token probe so
+            # the admin UI can report a broken durable controller.  It is not
+            # by itself proof that bootstrap never progressed: an existing
+            # state document plus a transiently unusable controller also
+            # reports configured=false.  This privileged recovery bridge is
+            # allowed only before that document has ever been written.
+            status.get("identity_state_absent") is True
+            and status.get("configured") is False
+            and status.get("controller_usable") is False
+            and status.get("bootstrap_available") is True
+        ):
+            return False
+
+        admin_token = await self._bootstrap_token()
+        realm = self.settings.identity_realm
+        desired_roles = await self._capability_role_representations(realm, admin_token)
+        for client_id in RELYING_PARTY_CLIENT_IDS:
+            found = await self._find_client(realm, client_id, admin_token)
+            if found is None:
+                raise IdentityError(f"OIDC client {client_id} is missing")
+            client = await self._get_client(realm, found, admin_token)
+            if client.get("fullScopeAllowed") is not False:
+                raise IdentityConflict(
+                    f"OIDC client {client_id} must retain fullScopeAllowed=false"
+                )
+            await self._reconcile_client_realm_role_scope_mappings(
+                realm, client, desired_roles, admin_token
+            )
+            verified = await self._get_client(realm, client, admin_token)
+            if verified.get("fullScopeAllowed") is not False:
+                raise IdentityConflict(
+                    f"OIDC client {client_id} must retain fullScopeAllowed=false"
+                )
+            self._verify_realm_roles_mapper(verified, client_id)
+        return True
+
+    @staticmethod
+    def _validate_pre_vault_identity_spec(
+        spec: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]], bool]:
+        """Validate the complete, inventory-owned pre-Vault mutation set.
+
+        The temporary master-realm client is intentionally powerful.  This
+        parser therefore rejects unknown fields and non-canonical values
+        before obtaining its token.  It never derives groups or users from a
+        Keycloak search result: every writable object must be named in the
+        root-owned Ansible input.
+        """
+
+        if not isinstance(spec, dict) or set(spec) != {
+            "schema",
+            "ensure_lab_federation",
+            "groups",
+            "bootstrap_admin_identities",
+        }:
+            raise IdentityConflict("pre-Vault identity specification is invalid")
+        if spec.get("schema") != PRE_VAULT_IDENTITY_SCHEMA:
+            raise IdentityConflict("pre-Vault identity specification schema is invalid")
+        ensure_lab_federation = spec.get("ensure_lab_federation")
+        if not isinstance(ensure_lab_federation, bool):
+            raise IdentityConflict("pre-Vault federation policy is invalid")
+
+        raw_groups = spec.get("groups")
+        if (
+            not isinstance(raw_groups, list)
+            or not raw_groups
+            or len(raw_groups) > MAX_PRE_VAULT_BASELINE_GROUPS
+        ):
+            raise IdentityConflict("pre-Vault baseline groups are invalid")
+        groups: list[dict[str, Any]] = []
+        group_roles: dict[str, frozenset[str]] = {}
+        for raw in raw_groups:
+            if not isinstance(raw, dict) or set(raw) != {"name", "roles"}:
+                raise IdentityConflict("pre-Vault baseline group is invalid")
+            name = raw.get("name")
+            roles = raw.get("roles")
+            if (
+                not isinstance(name, str)
+                or PROJECT_ID_RE.fullmatch(name) is None
+                or name in group_roles
+                or not isinstance(roles, list)
+                or not roles
+                or roles != sorted(set(roles))
+                or not set(roles) <= CAPABILITY_ROLES
+            ):
+                raise IdentityConflict("pre-Vault baseline group is invalid")
+            role_set = frozenset(roles)
+            group_roles[name] = role_set
+            groups.append({"name": name, "roles": list(roles)})
+
+        raw_identities = spec.get("bootstrap_admin_identities")
+        if (
+            not isinstance(raw_identities, list)
+            or not raw_identities
+            or len(raw_identities) > MAX_PRE_VAULT_BOOTSTRAP_IDENTITIES
+        ):
+            raise IdentityConflict("pre-Vault bootstrap identities are invalid")
+        identities: list[dict[str, str]] = []
+        seen_users: set[str] = set()
+        for raw in raw_identities:
+            if not isinstance(raw, dict) or set(raw) != {
+                "username",
+                "group",
+                "federation_provider",
+            }:
+                raise IdentityConflict("pre-Vault bootstrap identity is invalid")
+            username = raw.get("username")
+            group = raw.get("group")
+            provider = raw.get("federation_provider")
+            if (
+                not isinstance(username, str)
+                or BOOTSTRAP_IDENTITY_RE.fullmatch(username) is None
+                or username in seen_users
+                or not isinstance(group, str)
+                or group not in group_roles
+                or group_roles[group] != frozenset({"aigw-admins"})
+                or not isinstance(provider, str)
+                or FEDERATION_PROVIDER_RE.fullmatch(provider) is None
+            ):
+                raise IdentityConflict("pre-Vault bootstrap identity is invalid")
+            seen_users.add(username)
+            identities.append(
+                {
+                    "username": username,
+                    "group": group,
+                    "federation_provider": provider,
+                }
+            )
+        if ensure_lab_federation and {
+            identity["federation_provider"] for identity in identities
+        } != {LAB_LDAP_PROVIDER_NAME}:
+            raise IdentityConflict("lab federation bootstrap identity is invalid")
+        return groups, identities, ensure_lab_federation
+
+    async def _pre_vault_direct_child(
+        self, root_id: str, group_name: str, admin_token: str
+    ) -> dict[str, Any] | None:
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        safe_root = path_segment(root_id, label="managed root UUID")
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}/groups/{safe_root}/children",
+            token=admin_token,
+            params={
+                "search": group_name,
+                "exact": "true",
+                "first": 0,
+                "max": 20,
+                "briefRepresentation": "false",
+            },
+            expected=(200,),
+        )
+        payload = self._json(response, "pre-Vault managed group lookup")
+        if not isinstance(payload, list):
+            raise IdentityError("pre-Vault managed group lookup was invalid")
+        expected_path = f"/{self.settings.identity_managed_root_group}/{group_name}"
+        matches = [
+            group
+            for group in payload
+            if isinstance(group, dict)
+            and group.get("name") == group_name
+            and group.get("path") in (None, expected_path)
+        ]
+        if len(matches) > 1:
+            raise IdentityConflict("multiple pre-Vault managed groups exist")
+        return matches[0] if matches else None
+
+    async def _pre_vault_require_leaf_group(
+        self, group: dict[str, Any], admin_token: str
+    ) -> None:
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        group_id = path_segment(group.get("id"), label="managed group UUID")
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}/groups/{group_id}/children",
+            token=admin_token,
+            params={"first": 0, "max": 1, "briefRepresentation": "true"},
+            expected=(200,),
+        )
+        children = self._json(response, "pre-Vault managed group children")
+        if not isinstance(children, list) or children:
+            raise IdentityConflict("pre-Vault managed baseline group is not a leaf")
+
+    async def _pre_vault_group_roles(
+        self, group_id: str, admin_token: str
+    ) -> list[dict[str, Any]]:
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        safe_group = path_segment(group_id, label="managed group UUID")
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}/groups/{safe_group}/role-mappings/realm",
+            token=admin_token,
+            expected=(200,),
+        )
+        payload = self._json(response, "pre-Vault managed group role mappings")
+        if not isinstance(payload, list):
+            raise IdentityError("pre-Vault managed group role mappings were invalid")
+        roles: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for role in payload:
+            name = role.get("name") if isinstance(role, dict) else None
+            if not isinstance(name, str) or not name or name in seen:
+                raise IdentityError(
+                    "pre-Vault managed group role mappings were invalid"
+                )
+            path_segment(role.get("id"), label="managed group realm role UUID")
+            seen.add(name)
+            roles.append(role)
+        return roles
+
+    async def _pre_vault_federated_user(
+        self,
+        username: str,
+        federation_provider: str,
+        admin_token: str,
+    ) -> dict[str, Any]:
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        provider = await self._find_component(
+            self.settings.identity_realm, federation_provider, admin_token
+        )
+        if provider is None:
+            raise IdentityError("configured pre-Vault federation provider is missing")
+        provider_id = path_segment(provider.get("id"), label="federation provider UUID")
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}/users",
+            token=admin_token,
+            params={
+                "username": username,
+                "exact": "true",
+                "first": 0,
+                "max": 20,
+                "briefRepresentation": "false",
+            },
+            expected=(200,),
+        )
+        payload = self._json(response, "pre-Vault bootstrap identity lookup")
+        if not isinstance(payload, list):
+            raise IdentityError("pre-Vault bootstrap identity lookup was invalid")
+        matches = [
+            user
+            for user in payload
+            if isinstance(user, dict) and user.get("username") == username
+        ]
+        if len(matches) != 1:
+            raise IdentityConflict("pre-Vault bootstrap identity was not unique")
+        user = matches[0]
+        if user.get("enabled") is not True or user.get("federationLink") != provider_id:
+            raise IdentityConflict(
+                "pre-Vault bootstrap identity is not an enabled federated user"
+            )
+        path_segment(user.get("id"), label="bootstrap identity UUID")
+        return user
+
+    async def _pre_vault_user_has_group(
+        self,
+        user_id: str,
+        group_id: str,
+        group_name: str,
+        admin_token: str,
+    ) -> bool:
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        safe_user = path_segment(user_id, label="bootstrap identity UUID")
+        safe_group = path_segment(group_id, label="managed group UUID")
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}/users/{safe_user}/groups",
+            token=admin_token,
+            params={
+                "search": group_name,
+                "exact": "true",
+                "first": 0,
+                "max": 20,
+                "briefRepresentation": "true",
+            },
+            expected=(200,),
+        )
+        payload = self._json(response, "pre-Vault bootstrap group membership")
+        if not isinstance(payload, list):
+            raise IdentityError("pre-Vault bootstrap group membership was invalid")
+        matches = [
+            group
+            for group in payload
+            if isinstance(group, dict)
+            and group.get("id") == safe_group
+            and group.get("name") == group_name
+        ]
+        if len(matches) > 1:
+            raise IdentityConflict("pre-Vault bootstrap group membership was ambiguous")
+        return len(matches) == 1
+
+    async def _pre_vault_group_members(
+        self, group_id: str, admin_token: str
+    ) -> list[dict[str, Any]]:
+        """Return the complete bounded member set for one baseline admin group."""
+
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        safe_group = path_segment(group_id, label="managed group UUID")
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}/groups/{safe_group}/members",
+            token=admin_token,
+            params={
+                "first": 0,
+                "max": MAX_PRE_VAULT_BOOTSTRAP_IDENTITIES + 1,
+                "briefRepresentation": "false",
+            },
+            expected=(200,),
+        )
+        payload = self._json(response, "pre-Vault managed admin membership")
+        if (
+            not isinstance(payload, list)
+            or len(payload) > MAX_PRE_VAULT_BOOTSTRAP_IDENTITIES
+        ):
+            raise IdentityConflict("pre-Vault managed admin membership is unbounded")
+        members: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for member in payload:
+            member_id = member.get("id") if isinstance(member, dict) else None
+            safe_member = path_segment(member_id, label="bootstrap identity UUID")
+            if safe_member in seen:
+                raise IdentityConflict(
+                    "pre-Vault managed admin membership is ambiguous"
+                )
+            seen.add(safe_member)
+            members.append(member)
+        return members
+
+    async def reconcile_pre_vault_identity_baseline(self, spec: dict[str, Any]) -> bool:
+        """Create only the inventory-declared recovery group memberships.
+
+        This path deliberately does not read or write HashiCorp Vault, create
+        the durable identity controller, delete any Keycloak object, or infer
+        users/groups from existing state.  Its sole purpose is to make an
+        explicitly named federated administrator able to cross the existing
+        OAuth gate while Vault is sealed.  Normal lifecycle ownership remains
+        with the durable controller after the regular bootstrap completes.
+        """
+
+        groups, identities, ensure_lab_federation = (
+            self._validate_pre_vault_identity_spec(spec)
+        )
+        if ensure_lab_federation and not self.settings.lab_samba_ldap_enabled:
+            raise IdentityConflict("lab federation bootstrap is not enabled")
+
+        admin_token = await self._bootstrap_token()
+        changed = False
+        changed = (
+            await self._ensure_relying_parties(admin_token, preserve_unmanaged=True)
+            or changed
+        )
+        if ensure_lab_federation:
+            before = await self._find_component(
+                self.settings.identity_realm, LAB_LDAP_PROVIDER_NAME, admin_token
+            )
+            await self._ensure_lab_ldap(admin_token, self._lab_bind_password())
+            changed = changed or before is None
+
+        resolved_identities: list[tuple[dict[str, str], str]] = []
+        expected_members: dict[str, set[str]] = {}
+        for identity in identities:
+            user = await self._pre_vault_federated_user(
+                identity["username"],
+                identity["federation_provider"],
+                admin_token,
+            )
+            user_id = path_segment(user.get("id"), label="bootstrap identity UUID")
+            resolved_identities.append((identity, user_id))
+            expected_members.setdefault(identity["group"], set()).add(user_id)
+
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        desired_roles = await self._capability_role_representations(realm, admin_token)
+        desired_by_name = {str(role["name"]): role for role in desired_roles}
+
+        root = await self._root_group(admin_token, create=False)
+        if root is None:
+            root = await self._root_group(admin_token, create=True)
+            changed = True
+        if root is None:
+            raise IdentityError("managed identity root group was not created")
+        root_id = path_segment(root.get("id"), label="managed root group UUID")
+
+        groups_by_name: dict[str, dict[str, Any]] = {}
+        for group_spec in groups:
+            name = str(group_spec["name"])
+            group = await self._pre_vault_direct_child(root_id, name, admin_token)
+            if group is None:
+                await self._request(
+                    "POST",
+                    f"/admin/realms/{realm}/groups/{root_id}/children",
+                    token=admin_token,
+                    json_body={"name": name},
+                    expected=(201, 204),
+                )
+                group = await self._pre_vault_direct_child(root_id, name, admin_token)
+                changed = True
+            if group is None:
+                raise IdentityError("pre-Vault managed group was not created")
+            await self._pre_vault_require_leaf_group(group, admin_token)
+            group_id = path_segment(group.get("id"), label="managed group UUID")
+            current_members = await self._pre_vault_group_members(group_id, admin_token)
+            current_member_ids = {str(member["id"]) for member in current_members}
+            if not current_member_ids <= expected_members.get(name, set()):
+                raise IdentityConflict(
+                    "pre-Vault managed baseline group has undeclared members"
+                )
+            current_roles = await self._pre_vault_group_roles(group_id, admin_token)
+            current_names = {str(role["name"]) for role in current_roles}
+            desired_names = set(group_spec["roles"])
+            if not current_names <= desired_names:
+                raise IdentityConflict(
+                    "pre-Vault managed group has undeclared realm-role mappings"
+                )
+            missing = [
+                desired_by_name[name] for name in sorted(desired_names - current_names)
+            ]
+            if missing:
+                await self._request(
+                    "POST",
+                    f"/admin/realms/{realm}/groups/{group_id}/role-mappings/realm",
+                    token=admin_token,
+                    json_body=missing,
+                    expected=(204,),
+                )
+                changed = True
+            verified_roles = await self._pre_vault_group_roles(group_id, admin_token)
+            if {str(role["name"]) for role in verified_roles} != desired_names:
+                raise IdentityError(
+                    "Keycloak did not verify pre-Vault managed group role mappings"
+                )
+            groups_by_name[name] = group
+
+        for identity, user_id in resolved_identities:
+            group = groups_by_name[identity["group"]]
+            group_id = path_segment(group.get("id"), label="managed group UUID")
+            has_group = await self._pre_vault_user_has_group(
+                user_id, group_id, identity["group"], admin_token
+            )
+            if not has_group:
+                await self._request(
+                    "PUT",
+                    f"/admin/realms/{realm}/users/{user_id}/groups/{group_id}",
+                    token=admin_token,
+                    expected=(204,),
+                )
+                changed = True
+            if not await self._pre_vault_user_has_group(
+                user_id, group_id, identity["group"], admin_token
+            ):
+                raise IdentityError(
+                    "Keycloak did not verify pre-Vault bootstrap membership"
+                )
+
+        for group_name, group in groups_by_name.items():
+            group_id = path_segment(group.get("id"), label="managed group UUID")
+            verified_members = await self._pre_vault_group_members(
+                group_id, admin_token
+            )
+            if {str(member["id"]) for member in verified_members} != (
+                expected_members.get(group_name, set())
+            ):
+                raise IdentityError(
+                    "Keycloak did not verify exact pre-Vault baseline membership"
+                )
+        return changed
+
     def _relying_party_specs(self) -> list[dict[str, Any]]:
         """Exact first-party OIDC clients required by the deployed edges."""
         if not self.settings.relying_party_secrets_ok():
             raise IdentityConflict(
-                "OIDC relying-party secrets are missing, weak, or placeholders"
+                "OIDC relying-party secrets are missing, weak, reused, or placeholders"
             )
         domain = self.settings.aigw_domain
 
@@ -335,9 +1034,7 @@ class KeycloakAdmin:
         ) -> dict[str, Any]:
             attributes: dict[str, str] = {}
             if logout_redirects:
-                attributes["post.logout.redirect.uris"] = "##".join(
-                    logout_redirects
-                )
+                attributes["post.logout.redirect.uris"] = "##".join(logout_redirects)
             return {
                 "clientId": client_id,
                 "name": name,
@@ -377,22 +1074,22 @@ class KeycloakAdmin:
                 "admin-portal",
                 "AI Gateway identity administration portal",
                 self.settings.admin_portal_oidc_client_secret,
-                [f"https://admin-portal.{domain}/auth/callback"],
-                [f"https://admin-portal.{domain}"],
-                logout_redirects=[f"https://admin-portal.{domain}/login"],
+                [f"https://admin.{domain}/auth/callback"],
+                [f"https://admin.{domain}"],
+                logout_redirects=[f"https://admin.{domain}/login"],
             ),
             client(
                 "admin-ui",
                 "ADM reverse-proxy OIDC gates",
                 self.settings.oauth2_proxy_client_secret,
                 [
-                    f"https://admin.{domain}/oauth2/callback",
+                    f"https://litellm-admin.{domain}/oauth2/callback",
                     f"https://grafana.{domain}/oauth2/callback",
                     f"https://prometheus.{domain}/oauth2/callback",
                     f"https://vault.{domain}/oauth2/callback",
                 ],
                 [
-                    f"https://admin.{domain}",
+                    f"https://litellm-admin.{domain}",
                     f"https://grafana.{domain}",
                     f"https://prometheus.{domain}",
                     f"https://vault.{domain}",
@@ -400,7 +1097,9 @@ class KeycloakAdmin:
             ),
         ]
 
-    async def _ensure_relying_parties(self, admin_token: str) -> None:
+    async def _ensure_relying_parties(
+        self, admin_token: str, *, preserve_unmanaged: bool = False
+    ) -> bool:
         """Create/update and verify exact OIDC clients on restored realms.
 
         ``start --import-realm`` intentionally skips an existing realm, so a
@@ -410,13 +1109,54 @@ class KeycloakAdmin:
         """
         realm = self.settings.identity_realm
         safe_realm = path_segment(realm, label="Keycloak realm")
+        desired_scope_roles = await self._capability_role_representations(
+            realm, admin_token
+        )
+        changed = False
         for desired in self._relying_party_specs():
             found = await self._find_client(
                 realm, str(desired["clientId"]), admin_token
             )
             if found is None:
                 found = await self._create_client(realm, desired, admin_token)
+                changed = True
             current = await self._get_client(realm, found, admin_token)
+            expected_mapper = self._realm_roles_mapper()
+            current_mappers = current.get("protocolMappers")
+            if preserve_unmanaged:
+                if current_mappers is None:
+                    current_mappers = []
+                if not isinstance(current_mappers, list):
+                    raise IdentityError(
+                        f"OIDC client {desired['clientId']} protocol mappers are invalid"
+                    )
+                unmanaged_mappers = [
+                    mapper
+                    for mapper in current_mappers
+                    if not isinstance(mapper, dict)
+                    or mapper.get("name") != expected_mapper["name"]
+                ]
+                if unmanaged_mappers or len(current_mappers) > 1:
+                    raise IdentityConflict(
+                        f"OIDC client {desired['clientId']} has unmanaged protocol mappers"
+                    )
+
+            client_uuid = path_segment(current.get("id"), label="Keycloak client UUID")
+            secret_response = await self._request(
+                "GET",
+                f"/admin/realms/{safe_realm}/clients/{client_uuid}/client-secret",
+                token=admin_token,
+                expected=(200,),
+            )
+            secret_doc = self._json(secret_response, "OIDC client secret")
+            actual_secret = (
+                secret_doc.get("value") if isinstance(secret_doc, dict) else None
+            )
+            secret_matches = isinstance(actual_secret, str) and hmac.compare_digest(
+                actual_secret.encode(), str(desired["secret"]).encode()
+            )
+
+            needs_update = False
             for field in (
                 "clientId",
                 "name",
@@ -424,19 +1164,51 @@ class KeycloakAdmin:
                 "protocol",
                 "publicClient",
                 "clientAuthenticatorType",
-                "secret",
                 "standardFlowEnabled",
                 "implicitFlowEnabled",
                 "directAccessGrantsEnabled",
                 "serviceAccountsEnabled",
                 "fullScopeAllowed",
-                "redirectUris",
-                "webOrigins",
-                "attributes",
-                "protocolMappers",
             ):
-                current[field] = desired[field]
-            await self._put_client(realm, current, admin_token)
+                if current.get(field) != desired[field]:
+                    current[field] = desired[field]
+                    needs_update = True
+            # Keycloak does not preserve the caller's ordering for these
+            # set-like URL allow-lists.  Compare their complete sorted forms
+            # so a harmless response-order normalization cannot turn this
+            # recovery bridge into a recurring privileged client PUT.  A
+            # duplicate or genuinely different URL still changes the sorted
+            # list and is reconciled.
+            for field in ("redirectUris", "webOrigins"):
+                current_urls = current.get(field)
+                if not isinstance(current_urls, list) or sorted(current_urls) != sorted(
+                    desired[field]
+                ):
+                    current[field] = desired[field]
+                    needs_update = True
+            desired_attributes = desired["attributes"]
+            if preserve_unmanaged:
+                current_attributes = current.get("attributes")
+                if not isinstance(current_attributes, dict):
+                    current_attributes = {}
+                merged_attributes = dict(current_attributes)
+                merged_attributes.update(desired_attributes)
+            else:
+                merged_attributes = dict(desired_attributes)
+            if current.get("attributes") != merged_attributes:
+                current["attributes"] = merged_attributes
+                needs_update = True
+            try:
+                self._verify_realm_roles_mapper(current, str(desired["clientId"]))
+            except IdentityError:
+                current["protocolMappers"] = [expected_mapper]
+                needs_update = True
+            if not secret_matches:
+                current["secret"] = desired["secret"]
+                needs_update = True
+            if needs_update:
+                await self._put_client(realm, current, admin_token)
+                changed = True
 
             verified = await self._get_client(realm, current, admin_token)
             for field in (
@@ -463,9 +1235,25 @@ class KeycloakAdmin:
                 raise IdentityError(
                     f"Keycloak did not verify OIDC client {desired['clientId']} URLs"
                 )
-            client_uuid = path_segment(
-                verified.get("id"), label="Keycloak client UUID"
-            )
+            self._verify_realm_roles_mapper(verified, str(desired["clientId"]))
+            # Keycloak accepts the update as a 204 even when a realm policy or
+            # version-specific attribute normalization drops the RP-initiated
+            # logout allow-list.  Without this read-back, portal logout
+            # appears to succeed locally then Keycloak rejects the requested
+            # post_logout_redirect_uri as invalid.  Verify only the managed
+            # attributes so unrelated Keycloak defaults do not cause churn.
+            verified_attributes = verified.get("attributes")
+            if desired_attributes and (
+                not isinstance(verified_attributes, dict)
+                or any(
+                    verified_attributes.get(name) != value
+                    for name, value in desired_attributes.items()
+                )
+            ):
+                raise IdentityError(
+                    f"Keycloak did not verify OIDC client {desired['clientId']} logout URLs"
+                )
+            client_uuid = path_segment(verified.get("id"), label="Keycloak client UUID")
             secret_response = await self._request(
                 "GET",
                 f"/admin/realms/{safe_realm}/clients/{client_uuid}/client-secret",
@@ -482,6 +1270,21 @@ class KeycloakAdmin:
                 raise IdentityError(
                     f"Keycloak did not verify OIDC client {desired['clientId']} secret"
                 )
+            if preserve_unmanaged:
+                scope_changed = await self._reconcile_client_realm_role_scope_mappings(
+                    realm,
+                    verified,
+                    desired_scope_roles,
+                    admin_token,
+                    remove_extras=False,
+                )
+            else:
+                scope_changed = await self._reconcile_client_realm_role_scope_mappings(
+                    realm, verified, desired_scope_roles, admin_token
+                )
+            if scope_changed is True:
+                changed = True
+        return changed
 
     async def _generate_client_key(
         self,
@@ -526,7 +1329,9 @@ class KeycloakAdmin:
                 response.content, store_password.encode()
             )
         except (TypeError, ValueError) as exc:
-            raise IdentityError("Keycloak returned an unreadable private-key archive") from exc
+            raise IdentityError(
+                "Keycloak returned an unreadable private-key archive"
+            ) from exc
         finally:
             # Python strings/bytes cannot be reliably zeroized. Bound their
             # lifetime and never persist the one-use archive passwords.
@@ -712,7 +1517,9 @@ class KeycloakAdmin:
             )
         except Exception:
             controller["enabled"] = False
-            await self._put_client(self.settings.identity_realm, controller, admin_token)
+            await self._put_client(
+                self.settings.identity_realm, controller, admin_token
+            )
             raise
         return key_doc
 
@@ -723,7 +1530,9 @@ class KeycloakAdmin:
             admin_token,
         )
         if broker is None:
-            raise IdentityNotFound("the imported Anthropic WIF broker client is missing")
+            raise IdentityNotFound(
+                "the imported Anthropic WIF broker client is missing"
+            )
         safe_realm = self.settings.wif_realm
         try:
             existing_key = self.vault.read(
@@ -801,10 +1610,7 @@ class KeycloakAdmin:
         client_uuid = path_segment(broker.get("id"), label="WIF broker UUID")
         response = await self._request(
             "GET",
-            (
-                f"/admin/realms/{realm}/clients/{client_uuid}"
-                "/protocol-mappers/models"
-            ),
+            (f"/admin/realms/{realm}/clients/{client_uuid}/protocol-mappers/models"),
             token=admin_token,
             expected=(200,),
         )
@@ -845,10 +1651,7 @@ class KeycloakAdmin:
             },
         }
         existing = subject_mappers[0] if subject_mappers else None
-        base = (
-            f"/admin/realms/{realm}/clients/{client_uuid}"
-            "/protocol-mappers/models"
-        )
+        base = f"/admin/realms/{realm}/clients/{client_uuid}/protocol-mappers/models"
         if existing is None:
             await self._request(
                 "POST",
@@ -887,7 +1690,9 @@ class KeycloakAdmin:
             raise IdentityError("Keycloak component lookup was not a list")
         matches = [c for c in payload if isinstance(c, dict) and c.get("name") == name]
         if len(matches) > 1:
-            raise IdentityConflict(f"multiple user federation providers are named {name}")
+            raise IdentityConflict(
+                f"multiple user federation providers are named {name}"
+            )
         return matches[0] if matches else None
 
     async def _ensure_lab_ldap(
@@ -899,7 +1704,7 @@ class KeycloakAdmin:
             self.settings.identity_realm, LAB_LDAP_PROVIDER_NAME, admin_token
         )
         if existing is not None:
-            return path_segment(existing.get("id"), label="LDAP provider UUID")
+            return self._verify_lab_ldap_component(existing)
         if (
             not isinstance(bind_password, str)
             or len(bind_password) < 16
@@ -907,9 +1712,7 @@ class KeycloakAdmin:
             or any(ord(ch) < 32 for ch in bind_password)
         ):
             raise IdentityConflict("the lab Samba LDAP bind password is required")
-        safe_realm = path_segment(
-            self.settings.identity_realm, label="Keycloak realm"
-        )
+        safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         realm_response = await self._request(
             "GET",
             f"/admin/realms/{safe_realm}",
@@ -973,7 +1776,7 @@ class KeycloakAdmin:
         )
         if created is None:
             raise IdentityError("Keycloak created LDAP federation but it was not found")
-        component_id = path_segment(created.get("id"), label="LDAP provider UUID")
+        component_id = self._verify_lab_ldap_component(created)
         try:
             await self._request(
                 "POST",
@@ -991,6 +1794,56 @@ class KeycloakAdmin:
             )
             raise
         return component_id
+
+    def _verify_lab_ldap_component(self, component: dict[str, Any]) -> str:
+        """Fail closed if the fixed lab federation name points elsewhere.
+
+        Bootstrap membership is trusted only when the user's federation link
+        resolves to this inventory-bound component.  Merely matching the
+        display name is insufficient: a restored or operator-created provider
+        could otherwise redirect authentication to a different directory.
+        Keycloak masks the bind credential on reads, so that one secret field
+        is deliberately excluded while every security-relevant non-secret
+        setting is checked exactly.
+        """
+
+        if (
+            component.get("name") != LAB_LDAP_PROVIDER_NAME
+            or component.get("providerId") != "ldap"
+            or component.get("providerType")
+            != "org.keycloak.storage.UserStorageProvider"
+        ):
+            raise IdentityConflict("the lab LDAP federation is not inventory-bound")
+        config = component.get("config")
+        if not isinstance(config, dict):
+            raise IdentityConflict("the lab LDAP federation is not inventory-bound")
+        expected = {
+            "enabled": "true",
+            "editMode": "READ_ONLY",
+            "importEnabled": "true",
+            "syncRegistrations": "false",
+            "vendor": "ad",
+            "usernameLDAPAttribute": "sAMAccountName",
+            "rdnLDAPAttribute": "cn",
+            "uuidLDAPAttribute": "objectGUID",
+            "userObjectClasses": "person, organizationalPerson, user",
+            "connectionUrl": self.settings.lab_samba_ldap_url,
+            "usersDn": self.settings.lab_samba_users_dn,
+            "authType": "simple",
+            "bindDn": self.settings.lab_samba_bind_dn,
+            "searchScope": "2",
+            "useTruststoreSpi": "always",
+            "startTls": "false",
+            "allowKerberosAuthentication": "false",
+            "useKerberosForPasswordAuthentication": "false",
+            "customUserSearchFilter": (
+                "(&(objectCategory=person)(objectClass=user)"
+                "(!(sAMAccountName=svc-keycloak-ldap)))"
+            ),
+        }
+        if any(config.get(name) != [value] for name, value in expected.items()):
+            raise IdentityConflict("the lab LDAP federation is not inventory-bound")
+        return path_segment(component.get("id"), label="LDAP provider UUID")
 
     def _lab_bind_password(self) -> str | None:
         if not self.settings.lab_samba_ldap_enabled:
@@ -1095,8 +1948,7 @@ class KeycloakAdmin:
             user
             for user in users
             if isinstance(user, dict)
-            and user.get("username")
-            == self.settings.keycloak_bootstrap_admin_username
+            and user.get("username") == self.settings.keycloak_bootstrap_admin_username
         ]
         if len(matches) > 1:
             raise IdentityConflict("multiple bootstrap administrator users exist")
@@ -1106,9 +1958,7 @@ class KeycloakAdmin:
                 raise IdentityConflict(
                     "refusing to delete an unmarked master-realm administrator"
                 )
-            user_id = path_segment(
-                matches[0].get("id"), label="bootstrap user UUID"
-            )
+            user_id = path_segment(matches[0].get("id"), label="bootstrap user UUID")
             if self.settings.retain_bootstrap_admin_user:
                 user = dict(matches[0])
                 updated_attributes = dict(attributes)
@@ -1128,9 +1978,7 @@ class KeycloakAdmin:
                     token=admin_token,
                     expected=(200,),
                 )
-                verified_user = self._json(
-                    verified_response, "lab recovery operator"
-                )
+                verified_user = self._json(verified_response, "lab recovery operator")
                 verified_attributes = (
                     verified_user.get("attributes")
                     if isinstance(verified_user, dict)
@@ -1167,13 +2015,13 @@ class KeycloakAdmin:
             expected=(200,),
         )
         full_client = self._json(client_response, "bootstrap client")
-        attributes = full_client.get("attributes") if isinstance(full_client, dict) else {}
+        attributes = (
+            full_client.get("attributes") if isinstance(full_client, dict) else {}
+        )
         if not isinstance(attributes, dict) or attributes.get(
             "is_temporary_admin"
         ) not in ("true", ["true"]):
-            raise IdentityConflict(
-                "refusing to delete an unmarked master-realm client"
-            )
+            raise IdentityConflict("refusing to delete an unmarked master-realm client")
         await self._request(
             "DELETE",
             f"/admin/realms/master/clients/{client_uuid}",
@@ -1285,12 +2133,16 @@ class KeycloakAdmin:
         configured = isinstance(state_doc, dict) and controller_usable
         return {
             "configured": configured,
+            # Keep the raw presence test separate from ``configured``.  The
+            # one-time pre-bootstrap OIDC scope repair must fail closed after
+            # *any* durable identity-state write, even if the controller
+            # credential is temporarily unavailable.
+            "identity_state_absent": state_doc is None,
             "controller_usable": controller_usable,
             "bootstrap_available": bootstrap_available,
             "bootstrap_cleanup_required": configured and bootstrap_available,
             "ldap_configured": bool(
-                isinstance(state_doc, dict)
-                and state_doc.get("federation_provider_id")
+                isinstance(state_doc, dict) and state_doc.get("federation_provider_id")
             ),
             "controller_certificate_sha256": (
                 controller_key.get("certificate_sha256", "")
@@ -1316,9 +2168,7 @@ class KeycloakAdmin:
             path_segment(doc.get("federation_provider_id"), label="LDAP provider UUID")
         return doc
 
-    async def _managed_group(
-        self, group_id: str, token: str
-    ) -> dict[str, Any]:
+    async def _managed_group(self, group_id: str, token: str) -> dict[str, Any]:
         state_doc = self._identity_state()
         safe_group = path_segment(group_id, label="group UUID")
         if safe_group == state_doc["managed_root_group_id"]:
@@ -1338,11 +2188,45 @@ class KeycloakAdmin:
         prefix = f"/{self.settings.identity_managed_root_group}/"
         if not isinstance(path, str) or not path.startswith(prefix):
             raise IdentityConflict("group is outside the managed authorization tree")
+        self._managed_project_id(group)
         return group
 
-    async def _group_capabilities(
-        self, group_id: str, token: str
-    ) -> list[str]:
+    def _managed_project_id(self, group: dict[str, Any]) -> str:
+        """Return the canonical direct-child project ID for a managed group.
+
+        Managed groups are also the authorization binding carried by portal
+        virtual keys.  Accepting nested groups here would make a membership
+        mutation impossible to map unambiguously to the credential project,
+        so reject it before any mutation is attempted.
+        """
+
+        path = group.get("path")
+        prefix = f"/{self.settings.identity_managed_root_group}/"
+        if not isinstance(path, str) or not path.startswith(prefix):
+            raise IdentityConflict("group is outside the managed authorization tree")
+        project_id = path.removeprefix(prefix)
+        if "/" in project_id or PROJECT_ID_RE.fullmatch(project_id) is None:
+            raise IdentityConflict(
+                "managed group is nested or has an invalid project ID"
+            )
+        return project_id
+
+    async def _revoke_portal_project_keys(self, user_id: str, project_id: str) -> None:
+        """Fail closed unless LiteLLM confirms portal-key revocation.
+
+        This deliberately converts every control-plane failure into a safe,
+        non-secret identity error.  Removing group membership while a static
+        bearer key may still be active would create an authorization bypass.
+        """
+
+        if self._portal_key_revoker is None:
+            raise IdentityError("portal-key revocation control is unavailable")
+        try:
+            await self._portal_key_revoker(user_id, project_id)
+        except Exception as exc:  # noqa: BLE001
+            raise IdentityError("could not verify portal-key revocation") from exc
+
+    async def _group_capabilities(self, group_id: str, token: str) -> list[str]:
         realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         safe_group = path_segment(group_id, label="group UUID")
         response = await self._request(
@@ -1433,10 +2317,7 @@ class KeycloakAdmin:
 
         roles_response = await self._request(
             "GET",
-            (
-                f"/admin/realms/{realm}/users/{safe_user}"
-                "/role-mappings/realm/composite"
-            ),
+            (f"/admin/realms/{realm}/users/{safe_user}/role-mappings/realm/composite"),
             token=token,
             expected=(200, 404),
         )
@@ -1528,9 +2409,7 @@ class KeycloakAdmin:
                     "managed project membership is nested or has an invalid ID"
                 )
             group_id = path_segment(group.get("id"), label="project group UUID")
-            if "aigw-developers" not in await self._group_capabilities(
-                group_id, token
-            ):
+            if "aigw-developers" not in await self._group_capabilities(group_id, token):
                 continue
             previous = projects.get(project_id)
             if previous is not None and previous != group_id:
@@ -1594,9 +2473,7 @@ class KeycloakAdmin:
                     {
                         "id": group_id,
                         "name": str(group.get("name") or ""),
-                        "capabilities": await self._group_capabilities(
-                            group_id, token
-                        ),
+                        "capabilities": await self._group_capabilities(group_id, token),
                         "member_count": len(members),
                     }
                 )
@@ -1645,9 +2522,7 @@ class KeycloakAdmin:
             if member.get("federationLink") == provider_id
         ]
 
-    async def create_group(
-        self, name: str, capabilities: list[str]
-    ) -> dict[str, Any]:
+    async def create_group(self, name: str, capabilities: list[str]) -> dict[str, Any]:
         async with self._group_topology_lock:
             return await self._create_group_locked(name, capabilities)
 
@@ -1752,7 +2627,11 @@ class KeycloakAdmin:
         """Add a federated user while the managed topology lock is held."""
         token = await self._controller_token()
         await self._managed_group(group_id, token)
-        await self._federated_user(user_id, token)
+        user = await self._federated_user(user_id, token)
+        if user.get("enabled") is not True:
+            raise IdentityConflict(
+                "only an enabled federated user may be assigned to a managed group"
+            )
         realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         safe_group = path_segment(group_id, label="group UUID")
         safe_user = path_segment(user_id, label="user UUID")
@@ -1775,23 +2654,98 @@ class KeycloakAdmin:
         excluded_group_id: str = "",
         excluded_user_id: str = "",
     ) -> set[str]:
+        state_doc = self._identity_state()
+        provider_id = state_doc.get("federation_provider_id")
+        if not isinstance(provider_id, str) or not provider_id:
+            raise IdentityConflict("no LDAP federation provider is configured")
         admin_users: set[str] = set()
         for group in await self.list_groups():
             if "aigw-admins" not in group["capabilities"]:
                 continue
             for member in await self._members(group["id"], token):
                 member_id = member.get("id")
-                if isinstance(member_id, str) and member_id:
-                    # Model the prospective removal from only this group. A
-                    # user who remains in another managed admin group still
-                    # provides a valid recovery administrator.
-                    if (
-                        group["id"] == excluded_group_id
-                        and member_id == excluded_user_id
-                    ):
-                        continue
+                if not isinstance(member_id, str) or not member_id:
+                    continue
+                # Model the prospective removal from only this group. A user
+                # who remains in another managed admin group still provides a
+                # valid recovery administrator, but a disabled, stale, or local
+                # Keycloak principal does not. Counting those identities could
+                # authorize removal of the final usable directory admin.
+                if (
+                    group["id"] == excluded_group_id
+                    and member_id == excluded_user_id
+                ):
+                    continue
+                if await self._is_current_enabled_federated_admin(
+                    member_id,
+                    token,
+                    provider_id,
+                ):
                     admin_users.add(member_id)
         return admin_users
+
+    async def _is_current_enabled_federated_admin(
+        self,
+        user_id: str,
+        token: str,
+        provider_id: str,
+    ) -> bool:
+        """Resolve a recovery-admin candidate from fresh Keycloak state.
+
+        Group-member representations are snapshots and can retain a stale
+        principal reference.  Count a candidate only when Keycloak currently
+        resolves it as enabled, links it to the inventory-bound federation,
+        and reports the composite administrator role.  A definite 404 is a
+        stale/non-current candidate; malformed or unreachable state raises so
+        the caller refuses the last-admin mutation rather than guessing.
+
+        This proves the current Keycloak federated-principal view.  It does
+        not claim to authenticate the user's upstream directory password.
+        """
+
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        safe_user = path_segment(user_id, label="user UUID")
+        user_response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}/users/{safe_user}",
+            token=token,
+            expected=(200, 404),
+        )
+        if user_response.status_code == 404:
+            return False
+        user = self._json(user_response, "managed administrator candidate")
+        if not isinstance(user, dict):
+            raise IdentityError(
+                "Keycloak managed administrator candidate was invalid"
+            )
+        if (
+            user.get("enabled") is not True
+            or user.get("federationLink") != provider_id
+        ):
+            return False
+
+        roles_response = await self._request(
+            "GET",
+            (
+                f"/admin/realms/{realm}/users/{safe_user}"
+                "/role-mappings/realm/composite"
+            ),
+            token=token,
+            expected=(200, 404),
+        )
+        if roles_response.status_code == 404:
+            return False
+        roles = self._json(
+            roles_response,
+            "managed administrator candidate composite roles",
+        )
+        if not isinstance(roles, list) or any(
+            not isinstance(role, dict) for role in roles
+        ):
+            raise IdentityError(
+                "Keycloak managed administrator composite roles were invalid"
+            )
+        return any(role.get("name") == "aigw-admins" for role in roles)
 
     async def remove_member(self, group_id: str, user_id: str) -> None:
         async with self._group_topology_lock:
@@ -1800,7 +2754,8 @@ class KeycloakAdmin:
     async def _remove_member_locked(self, group_id: str, user_id: str) -> None:
         """Check last-admin state and remove while the topology lock is held."""
         token = await self._controller_token()
-        await self._managed_group(group_id, token)
+        group = await self._managed_group(group_id, token)
+        project_id = self._managed_project_id(group)
         await self._federated_user(user_id, token)
         capabilities = await self._group_capabilities(group_id, token)
         safe_user = path_segment(user_id, label="user UUID")
@@ -1819,22 +2774,66 @@ class KeycloakAdmin:
                 raise IdentityConflict(
                     "refusing to remove the last managed administrator"
                 )
+
+        # LiteLLM accepts virtual keys as static bearer credentials and does
+        # not consult Keycloak on inference requests. Revoke first so a
+        # successful membership mutation cannot leave a known portal key
+        # usable; repeat after the mutation to close a concurrent generation
+        # window. The revoker inventories and verifies both passes.
+        await self._revoke_portal_project_keys(safe_user, project_id)
         realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         safe_group = path_segment(group_id, label="group UUID")
-        await self._request(
-            "DELETE",
-            f"/admin/realms/{realm}/users/{safe_user}/groups/{safe_group}",
-            token=token,
-            expected=(204,),
-        )
-        # A successful group removal must also invalidate the target's
-        # Keycloak sessions so a role-bearing IdP session is not silently
-        # reused.  The portal independently performs a live composite-role
-        # check on every mutation, closing its stateless-cookie window even
-        # if another relying party caches an older OIDC claim set.
-        await self._logout_user_sessions(safe_user, token)
+        delete_error: Exception | None = None
+        post_revoke_error: Exception | None = None
+        logout_error: Exception | None = None
+        try:
+            await self._request(
+                "DELETE",
+                f"/admin/realms/{realm}/users/{safe_user}/groups/{safe_group}",
+                token=token,
+                expected=(204,),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A timeout or error response can arrive after Keycloak committed
+            # the mutation. Do not mistake that ambiguous transport outcome for
+            # proof that the membership — and a concurrently minted static key
+            # — are still intact.
+            delete_error = exc
+        finally:
+            try:
+                # Run this even after an ambiguous DELETE. It both closes the
+                # mint/removal race and verifies that a static bearer key is no
+                # longer active before an error is returned to the caller.
+                await self._revoke_portal_project_keys(safe_user, project_id)
+            except Exception as exc:  # noqa: BLE001
+                post_revoke_error = exc
+            try:
+                # The DELETE may have committed even when its response was
+                # lost, so logging the subject out is the safe outcome here as
+                # well. A failed/unknown deletion only forces a fresh login;
+                # it never preserves a stale role-bearing session.
+                await self._logout_user_sessions(safe_user, token)
+            except Exception as exc:  # noqa: BLE001
+                logout_error = exc
+
+        if delete_error is not None:
+            if post_revoke_error is not None:
+                raise IdentityError(
+                    "could not verify portal-key revocation after membership removal"
+                ) from post_revoke_error
+            raise IdentityError(
+                "could not verify Keycloak membership removal"
+            ) from delete_error
+        if post_revoke_error is not None:
+            raise IdentityError(
+                "could not verify portal-key revocation after membership removal"
+            ) from post_revoke_error
+        if logout_error is not None:
+            raise IdentityError(
+                "could not invalidate Keycloak user sessions"
+            ) from logout_error
         await self._audit(
             "group_member_remove",
             "success",
-            {"group_id": safe_group, "user_id": safe_user},
+            {"group_id": safe_group, "user_id": safe_user, "project": project_id},
         )

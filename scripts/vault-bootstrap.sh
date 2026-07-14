@@ -96,10 +96,114 @@ done
   || { echo "FATAL: Vault listener did not become reachable" >&2; exit 1; }
 
 # ── 1+2: init & unseal ───────────────────────────────────────────────────
-if [ ! -f secrets/vault-init.json ]; then
-  echo ">> initializing vault (TEST: 1 key share — use 5/3 in production)"
-  vlt operator init -key-shares=1 -key-threshold=1 -format=json > secrets/vault-init.json
+# `vault status` exits 2 for both an uninitialized Vault and an initialized,
+# sealed Vault.  Its JSON body is the authoritative distinction.  Refuse every
+# initialized state here: this script is only the first-initialization ceremony;
+# an existing Vault must use the separately held unseal shares instead.
+if vault_status_json="$(vlt status -format=json)"; then
+  vault_status_rc=0
+else
+  vault_status_rc=$?
 fi
+if [[ "$vault_status_rc" -ne 0 && "$vault_status_rc" -ne 2 ]]; then
+  echo "FATAL: could not read Vault initialization status; refusing bootstrap" >&2
+  exit 1
+fi
+if ! vault_status_state="$(printf '%s' "$vault_status_json" | python3 -c '
+import json
+import sys
+
+try:
+    status = json.load(sys.stdin)
+except (TypeError, ValueError):
+    raise SystemExit("Vault status was not valid JSON") from None
+initialized = status.get("initialized") if isinstance(status, dict) else None
+sealed = status.get("sealed") if isinstance(status, dict) else None
+if type(initialized) is not bool or type(sealed) is not bool:
+    raise SystemExit("Vault status omitted initialized/sealed booleans")
+print(f"{str(initialized).lower()} {str(sealed).lower()}")
+')"; then
+  echo "FATAL: Vault returned an invalid initialization status; refusing bootstrap" >&2
+  exit 1
+fi
+read -r vault_initialized vault_sealed <<<"$vault_status_state"
+case "$vault_initialized:$vault_sealed" in
+  false:true)
+    ;;
+  true:*)
+    echo "FATAL: Vault is already initialized; do not run vault-bootstrap.sh. Use scripts/vault-unseal.sh with the separately held existing unseal share." >&2
+    exit 1
+    ;;
+  *)
+    echo "FATAL: Vault reported an impossible initialization/seal state; refusing bootstrap" >&2
+    exit 1
+    ;;
+esac
+
+# A previously interrupted or manually supplied init response must never be
+# trusted to drive a new ceremony. The response below is written only to a
+# private same-directory temporary file and atomically renamed after validation.
+if [[ -e secrets/vault-init.json || -L secrets/vault-init.json ]]; then
+  echo "FATAL: Vault is uninitialized but secrets/vault-init.json already exists; preserve it for review and resolve the inconsistency before bootstrap." >&2
+  exit 1
+fi
+vault_init_tmp=""
+cleanup_vault_init_tmp() {
+  if [[ -n "${vault_init_tmp:-}" ]]; then
+    rm -f -- "$vault_init_tmp" || true
+  fi
+}
+abort_vault_init_tmp() {
+  cleanup_vault_init_tmp
+  exit 1
+}
+trap cleanup_vault_init_tmp EXIT
+trap abort_vault_init_tmp HUP INT TERM
+vault_init_tmp="$(mktemp "secrets/.vault-init.json.XXXXXX")"
+chmod 600 "$vault_init_tmp"
+echo ">> initializing vault (TEST: 1 key share — use 5/3 in production)"
+if ! vlt operator init -key-shares=1 -key-threshold=1 -format=json > "$vault_init_tmp"; then
+  echo "FATAL: Vault initialization failed; no init response was retained" >&2
+  exit 1
+fi
+if ! python3 - "$vault_init_tmp" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        response = json.load(source)
+except (OSError, TypeError, ValueError):
+    raise SystemExit("Vault init response was not valid JSON") from None
+
+keys = response.get("unseal_keys_b64") if isinstance(response, dict) else None
+root_token = response.get("root_token") if isinstance(response, dict) else None
+if (
+    not isinstance(keys, list)
+    or len(keys) != 1
+    or not isinstance(keys[0], str)
+    or not keys[0]
+    or not isinstance(root_token, str)
+    or not root_token
+):
+    raise SystemExit("Vault init response was incomplete")
+PY
+then
+  echo "FATAL: Vault initialization returned an incomplete response; no init response was retained" >&2
+  exit 1
+fi
+# Recheck immediately before the same-directory rename. The stack directory is
+# root-owned, and this prevents silently overwriting any response that appeared
+# while the init command was running.
+if [[ -e secrets/vault-init.json || -L secrets/vault-init.json ]]; then
+  echo "FATAL: secrets/vault-init.json appeared during initialization; refusing to overwrite it" >&2
+  exit 1
+fi
+if ! mv -f -- "$vault_init_tmp" secrets/vault-init.json; then
+  echo "FATAL: could not atomically commit the Vault init response" >&2
+  exit 1
+fi
+vault_init_tmp=""
 chmod 600 secrets/vault-init.json
 UNSEAL_KEY="$(python3 -c 'import json;print(json.load(open("secrets/vault-init.json"))["unseal_keys_b64"][0])')"
 ROOT_TOKEN="$(python3 -c 'import json;print(json.load(open("secrets/vault-init.json"))["root_token"])')"
@@ -183,8 +287,14 @@ rm -f secrets/edge-cert.json  # plaintext key copy written by older versions
 
 # ── 5: rotator policy + token ────────────────────────────────────────────
 vlt policy write rotator - <<HCL
+# The typed provider-auth adapter owns this exact enrollment document. It can
+# neither choose a Vault path nor enumerate neighboring secrets. Metadata
+# deletion is separate in KV v2 and is required only after the adapter proves
+# that refresh is disabled and the last short-lived token has expired.
+path "kv/data/ai-gateway/anthropic-wif" { capabilities = ["create", "read", "update", "delete"] }
+path "kv/metadata/ai-gateway/anthropic-wif" { capabilities = ["read", "delete"] }
+
 # Read-only inputs.
-path "kv/data/ai-gateway/anthropic-wif" { capabilities = ["read"] }
 path "kv/data/ai-gateway/openai-admin" { capabilities = ["read"] }
 path "kv/data/ai-gateway/vendors/anthropic" { capabilities = ["read"] }
 
@@ -235,7 +345,9 @@ chmod 600 .env
 # This is phase two of deployment. Unlike the first Ansible converge, Vault is
 # now initialized/unsealed and the rotator token has been installed, so every
 # strict healthcheck must pass before bootstrap is reported complete.
-"$STACK_DIR/scripts/aigw-runtime-up.sh" -d --wait --wait-timeout 300
+# Open WebUI's conservative migration/readiness budget is 450 seconds; retain
+# a scheduling margin so this final bootstrap gate does not preempt it.
+"$STACK_DIR/scripts/aigw-runtime-up.sh" -d --wait --wait-timeout 600
 
 cat <<EOF
 

@@ -24,7 +24,9 @@ def exact_form(html: str, path: str):
         form
         for form in flow.parse_forms(html)
         if urllib.parse.urlsplit(
-            urllib.parse.urljoin(flow.PORTAL_ORIGIN + "/admin", str(form["action"]))
+            urllib.parse.urljoin(
+                flow.ADMIN_PORTAL_ORIGIN + "/admin", str(form["action"])
+            )
         ).path
         == path
     ]
@@ -74,13 +76,22 @@ def main() -> int:
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=context),
         urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
-        flow.RestrictedRedirects(),
+        flow.RestrictedRedirects(flow.ADMIN_PORTAL_ALLOWED_HOSTS),
     )
-    flow.keycloak_login(opener, flow.PORTAL_ORIGIN + "/login/start", password)
+    flow.keycloak_login(
+        opener,
+        flow.ADMIN_PORTAL_ORIGIN + "/login/start",
+        password,
+        allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
+    )
     final_url, html = flow.keycloak_login(
-        opener, flow.PORTAL_ORIGIN + "/admin/reauth", password
+        opener,
+        flow.ADMIN_PORTAL_ORIGIN + "/admin/reauth",
+        password,
+        allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
     )
-    if urllib.parse.urlsplit(final_url).path != "/admin":
+    parsed = urllib.parse.urlsplit(final_url)
+    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
         raise RuntimeError("portal step-up did not return to /admin")
 
     group_pattern = re.compile(
@@ -95,7 +106,7 @@ def main() -> int:
         group_id = match.group(1)
         selected_url, html = flow.read_page(
             opener,
-            flow.PORTAL_ORIGIN
+            flow.ADMIN_PORTAL_ORIGIN
             + "/admin?"
             + urllib.parse.urlencode({"group_id": group_id}),
         )
@@ -116,10 +127,13 @@ def main() -> int:
             selected_url,
             remove_forms[0],
             {"csrf_token": csrf},
+            allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
         )
         if "User removed from the group." not in html:
             raise RuntimeError("portal did not report member removal")
-        admin_url, html = flow.read_page(opener, flow.PORTAL_ORIGIN + "/admin")
+        admin_url, html = flow.read_page(
+            opener, flow.ADMIN_PORTAL_ORIGIN + "/admin"
+        )
         delete_path = f"/admin/identity/groups/{group_id}/delete"
         delete = exact_form(html, delete_path)
         csrf = str(delete["inputs"].get("csrf_token", ""))
@@ -128,6 +142,7 @@ def main() -> int:
             admin_url,
             delete,
             {"csrf_token": csrf},
+            allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
         )
         if "Authorization group deleted." not in html:
             raise RuntimeError("portal did not report empty group deletion")
@@ -145,6 +160,7 @@ def main() -> int:
             "capabilities": args.capability,
             "csrf_token": csrf,
         },
+        allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     if "Authorization group created." not in html:
         raise RuntimeError("portal did not report group creation")
@@ -154,7 +170,7 @@ def main() -> int:
         raise RuntimeError("created group was not rendered by the portal")
     group_id = match.group(1)
     selected_url = (
-        flow.PORTAL_ORIGIN
+        flow.ADMIN_PORTAL_ORIGIN
         + "/admin?"
         + urllib.parse.urlencode(
             {"group_id": group_id, "user_search": args.directory_user}
@@ -177,6 +193,7 @@ def main() -> int:
         selected_url,
         assign,
         {"user_id": user_id, "csrf_token": csrf},
+        allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     if "User assigned to the group." not in html:
         raise RuntimeError("portal did not report user assignment")
@@ -191,6 +208,7 @@ def main() -> int:
             selected_url,
             remove,
             {"csrf_token": csrf},
+            allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
         )
         if args.expect_last_admin_protection:
             if "the last administrator is protected" not in html:
@@ -199,7 +217,9 @@ def main() -> int:
             return 0
         if "User removed from the group." not in html:
             raise RuntimeError("portal did not report member removal")
-        admin_url, html = flow.read_page(opener, flow.PORTAL_ORIGIN + "/admin")
+        admin_url, html = flow.read_page(
+            opener, flow.ADMIN_PORTAL_ORIGIN + "/admin"
+        )
         delete_path = f"/admin/identity/groups/{group_id}/delete"
         delete = exact_form(html, delete_path)
         csrf = str(delete["inputs"].get("csrf_token", ""))
@@ -208,6 +228,7 @@ def main() -> int:
             admin_url,
             delete,
             {"csrf_token": csrf},
+            allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
         )
         if "Authorization group deleted." not in html:
             raise RuntimeError("portal did not report empty group deletion")

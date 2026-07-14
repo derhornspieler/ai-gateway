@@ -1,5 +1,8 @@
 *
 !Dockerfile
+!Dockerfile.open-webui
 !go.mod
 !main.go
 !main_test.go
+!patch_openwebui_oauth.py
+!verify_openwebui_oauth.py

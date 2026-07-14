@@ -3,6 +3,23 @@
 # This script never starts containers and never needs access to the Ansible
 # Vault overlay; compose/.env.example intentionally remains fail-closed.
 set -euo pipefail
+# This validator runs from both the controller source tree and the deployed
+# root-owned stack. Never let a persisted Docker context redirect even its
+# render-only Compose or isolated validation containers; retain DOCKER_CONFIG
+# so a DHI credential remains available when Docker consults it.
+unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+
+# This render gate is also used from the macOS controller. Select only the
+# platform's conventional local Unix Docker socket; never fall back to an
+# inherited context, DOCKER_HOST, or a TCP endpoint. The deployed Rocky 9
+# path remains /run/docker.sock, while Docker Desktop exposes its user socket
+# at /var/run/docker.sock on Darwin.
+case "$(uname -s)" in
+  Linux) docker_local_host=unix:///run/docker.sock ;;
+  Darwin) docker_local_host=unix:///var/run/docker.sock ;;
+  *) echo "unsupported OS for local-only Docker Compose validation" >&2; exit 1 ;;
+esac
+export AIGW_LOCAL_DOCKER_HOST="$docker_local_host"
 
 # Assertions are release gates in the validation helpers. Isolated mode ignores
 # PYTHONOPTIMIZE/PYTHONPATH/PYTHONHOME so an ambient controller environment
@@ -17,6 +34,46 @@ if [[ ! -f "$COMPOSE_DIR/docker-compose.yml" ]]; then
   # at /opt/ai-gateway while retaining services/ and scripts/ beneath it.
   COMPOSE_DIR="$ROOT"
 fi
+# Compose files live under compose/ in the controller checkout but services/
+# remains a sibling in both controller and deployed layouts.  Do not derive a
+# service source path from COMPOSE_DIR or source validation will inspect a
+# nonexistent compose/services tree.
+SERVICES_DIR="$ROOT/services"
+
+# Controller-source validation has no rendered .env, so retain the reviewed
+# default. A deployed stack must instead validate the exact root that Ansible
+# configured for Docker; never assume /var/lib/docker when the daemon owns a
+# custom data-root. Parse only this non-secret key without sourcing .env.
+docker_data_root=/var/lib/docker
+if [[ "$COMPOSE_DIR" == "$ROOT" ]]; then
+  docker_data_root="$(python3 -I - "$ROOT/.env" <<'PY'
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+path = Path(sys.argv[1])
+metadata = path.lstat()
+if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or
+        metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o077):
+    raise SystemExit("deployed .env must be a root-owned non-group-readable regular file")
+values = []
+for line in path.read_text(encoding="utf-8").splitlines():
+    if line.startswith("DOCKER_DATA_ROOT="):
+        values.append(line.split("=", 1)[1])
+if len(values) != 1:
+    raise SystemExit("deployed .env must define exactly one DOCKER_DATA_ROOT")
+value = values[0]
+if re.fullmatch(
+    r"/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}",
+    value,
+) is None:
+    raise SystemExit("deployed DOCKER_DATA_ROOT is not canonical")
+print(value)
+PY
+)"
+fi
 
 python3 -I - "$COMPOSE_DIR/bind-source-digest-inputs.json" <<'PY'
 import json
@@ -25,11 +82,13 @@ import re
 import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
-assert set(manifest) == {"base", "lab"}
+assert set(manifest) == {"base", "platform_dns", "lab_identity"}
 service_pattern = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 segment_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-assert set(manifest["base"]).isdisjoint(manifest["lab"])
-for profile in ("base", "lab"):
+assert set(manifest["base"]).isdisjoint(manifest["platform_dns"])
+assert set(manifest["base"]).isdisjoint(manifest["lab_identity"])
+assert set(manifest["platform_dns"]).isdisjoint(manifest["lab_identity"])
+for profile in ("base", "platform_dns", "lab_identity"):
     assert isinstance(manifest[profile], dict) and manifest[profile]
     for service, sources in manifest[profile].items():
         assert service_pattern.fullmatch(service), service
@@ -89,7 +148,8 @@ import sys
 
 text = Path(sys.argv[1]).read_text()
 for required in (
-    "docker run --rm -i",
+    'docker_cmd=(docker --host unix:///run/docker.sock)',
+    'exec "${docker_cmd[@]}" run --rm -i',
     "--network net-vault",
     "--user 65532:65532",
     "--read-only",
@@ -194,7 +254,8 @@ rollback = Path(sys.argv[3]).read_text()
 compile(planner, sys.argv[1], "exec")
 compile(rollback, sys.argv[3], "exec")
 for required in (
-    '["docker", "image", "inspect", image]',
+    'DOCKER_BINARY = "/usr/bin/docker"',
+    '[DOCKER_BINARY, "--host", LOCAL_DOCKER_HOST, "image", "inspect", image]',
     'canonical_build["context"] = f"services/{relative_context.as_posix()}"',
     'b"aigw-compose-build-input/v2\\0"',
     'digest.update(struct.pack(">IQ", mode, size))',
@@ -205,6 +266,7 @@ for required in (
 assert 'scripts/plan-compose-builds.py' in gate
 for required in (
     'MANIFEST_NAME = "compose-build-rollbacks.json"',
+    'BUILD_INPUTS_NAME = "compose-build-inputs.json"',
     'ROLLBACK_SCHEMA = 2',
     'MAX_SERVICES = 256',
     'LOCAL_DOCKER_HOST = "unix:///run/docker.sock"',
@@ -213,9 +275,15 @@ for required in (
     'source_image_id = _container_image(',
     'labels.get("com.docker.compose.container-number") != "1"',
     'restart_count = container.get("RestartCount")',
-    'health.get("Status") != "healthy"',
+    'health.get("Status") == "healthy"',
+    'docker.prove_key_rotator_dependency_gate(',
+    'KEY_ROTATOR_READINESS_HEALTHCHECK',
+    'and (not initialized or sealed)',
     '"status": "first-build"',
-    'existing_records = _load_existing_manifest(manifest_path, project)',
+    'rollback_manifest_exists, existing_records = _load_existing_manifest_with_presence(',
+    '_load_completed_build_inputs(build_inputs_path, project)',
+    'os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW',
+    'existing build-input receipt must be owned by root:root',
     'stack path must be owned by root:root',
     'stack path mode must be 0750',
     'source_digest = source_image_id.removeprefix("sha256:")',
@@ -269,18 +337,21 @@ if ansible.is_file():
     build_task = source.index(
         "- name: Build only missing or build-input-changed custom images"
     )
+    marker_task = source.index(
+        "- name: Persist deployed custom-image build-input manifest"
+    )
     retire_task = source.index(
-        "- name: Retire completed first-build rollback retry proofs"
+        "- name: Retire deployed first-build rollback retry proofs"
     )
     deploy_task = source.index(
         "- name: Deploy stack without implicitly rebuilding custom images"
     )
     assert preserve_task < build_task
-    assert build_task < retire_task < deploy_task
+    assert build_task < deploy_task < marker_task < retire_task
     assert "compose-build-rollbacks.json" in source[preserve_task:build_task]
     assert ").schema == 2" in source[preserve_task:build_task]
-    assert "--retire-first-builds" in source[retire_task:deploy_task]
-    assert "retired_services | length > 0" in source[retire_task:deploy_task]
+    assert "--retire-first-builds" in source[retire_task:]
+    assert "retired_services | length > 0" in source[retire_task:]
     assert "compose_build_plan.services | length > 0" in source[preserve_task:build_task]
     assert ").updated_services |" in source[preserve_task:build_task]
     assert "difference((compose_rollback_preservation.stdout | from_json).services.keys()" in source[preserve_task:build_task]
@@ -344,15 +415,47 @@ if ansible.is_file():
     # vendor names before adding the project block.
     site = ansible.parents[3] / "site.yml"
     site_source = site.read_text()
+    # Full converge delegates the runtime SELinux transition to a dedicated
+    # role, rather than duplicating its gates in site.yml.  Keep the static
+    # release contract anchored to both the caller's desired state and the
+    # role's effective-runtime proof.  Merely setting inventory variables must
+    # never let Docker run while SELinux is disabled, permissive, or non-targeted.
     for required in (
-        "ansible_facts.selinux.status == 'enabled'",
-        "ansible_facts.selinux.mode == 'enforcing'",
-        "ansible_facts.selinux.type == 'targeted'",
-        "preflight_selinux_mode.stdout | trim == 'Enforcing'",
-        "aigw_selinux_audit_window_start",
+        "aigw_selinux_policy == 'targeted'",
+        "aigw_selinux_state == 'enforcing'",
+        "- role: selinux_baseline",
+        "- role: network_routing",
+        "- role: firewalld_zones",
+        "- role: os_baseline",
+        "- role: docker_stack",
+        "- role: verify",
     ):
         assert required in site_source, required
-    assert "ansible.builtin.command: getenforce" in site_source
+    assert site_source.index("- role: selinux_baseline") < site_source.index(
+        "- role: network_routing"
+    )
+    assert site_source.index("- role: selinux_baseline") < site_source.index(
+        "- role: firewalld_zones"
+    )
+    assert site_source.index("- role: selinux_baseline") < site_source.index(
+        "- role: os_baseline"
+    )
+    selinux_baseline = ansible.parents[2] / "selinux_baseline/tasks/main.yml"
+    selinux_baseline_source = selinux_baseline.read_text()
+    for required in (
+        "ansible.builtin.command: getenforce",
+        "ansible.posix.selinux",
+        "policy: \"{{ aigw_selinux_policy }}\"",
+        "state: \"{{ aigw_selinux_state }}\"",
+        "ansible_facts.selinux.status | default('disabled') == 'enabled'",
+        "ansible_facts.selinux.mode | default('') == aigw_selinux_state",
+        "ansible_facts.selinux.type | default('') == aigw_selinux_policy",
+        "aigw_selinux_mode_after.stdout | trim == 'Enforcing'",
+        "aigw_selinux_audit_window_start",
+        "date +'%m/%d/%y %H:%M:%S'",
+        "SELinux did not reach the required targeted/enforcing runtime state",
+    ):
+        assert required in selinux_baseline_source, required
 
     stack_only_source = (site.parent / "deploy-stack-only.yml").read_text()
     for required in (
@@ -363,6 +466,7 @@ if ansible.is_file():
         "'name=selinux' in (stack_only_docker_info.stdout | from_json).SecurityOptions",
         "DockerRootDir == docker_data_root",
         "aigw_selinux_audit_window_start",
+        "date +'%m/%d/%y %H:%M:%S'",
         "- role: verify",
     ):
         assert required in stack_only_source, required
@@ -379,7 +483,7 @@ if ansible.is_file():
         '"selinux-enabled": true',
         "validate: /usr/bin/dockerd --validate --config-file %s",
         "Read whether Docker was already active before daemon configuration",
-        "Restart only an already-active Docker daemon after config change",
+        "Restart an already-active Docker daemon after config change or missing SELinux support",
     ):
         assert required in baseline_source, required
 
@@ -402,7 +506,7 @@ if ansible.is_file():
     )
     manifest_sources = {
         path
-        for profile in ("base", "lab")
+        for profile in ("base", "platform_dns", "lab_identity")
         for paths in bind_manifest[profile].values()
         for path in paths
     }
@@ -452,7 +556,7 @@ if ansible.is_file():
     )[1].split(
         "- name: Define the exact SELinux read-only bind-source boundary", 1
     )[0]
-    assert "docker\n      - ps\n      - -aq" in selinux_inventory
+    assert "docker\n      - --host\n      - unix:///run/docker.sock\n      - ps\n      - -aq" in selinux_inventory
     assert "--filter" not in selinux_inventory
     restore_task = source.split(
         "- name: Apply the reviewed read-only container contexts before Compose", 1
@@ -465,12 +569,17 @@ if ansible.is_file():
     vault_validator = ansible.parents[3].parent / "scripts/validate-vault-config.sh"
     assert ":/vault/config/aigw.hcl:ro,Z" in vault_validator.read_text()
     canonical_path = r"^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}$"
-    assert site_source.count(canonical_path) == 2
+    # stack_dir, docker_data_root, and the durable host marker are all
+    # operator-provided absolute paths. Keep their canonical path validation
+    # explicit so an existing-host converge cannot write an arbitrary marker.
+    assert site_source.count(canonical_path) == 3
     assert "stack_dir | length <= 192" in site_source
     assert "docker_data_root | length <= 192" in site_source
     assert "stack_dir != docker_data_root" in site_source
     assert "not stack_dir.startswith(docker_data_root ~ '/')" in site_source
     assert "not docker_data_root.startswith(stack_dir ~ '/')" in site_source
+    assert "aigw_docker_host_marker | length <= 192" in site_source
+    assert "aigw_docker_host_marker is match(" in site_source
     assert "compose_project_name is match('^[a-z0-9][a-z0-9_-]{0,62}$')" in site_source
     assert site_source.index("stack_dir is match(") < site_source.index("  roles:")
     assert "/usr/share/iproute2/rt_tables" in site_source
@@ -511,7 +620,11 @@ if ansible.is_file():
         '{ address: "{{ traefik_int_chat_ip }}", hostname: "api.',
         '{ address: "{{ traefik_adm_admin_ip }}", hostname: "admin.',
         '{ address: "{{ traefik_adm_admin_ip }}", hostname: "admin-portal.',
-        'hostname: "admin.{{ aigw_domain }}", path: /, status: "302"',
+        '{ address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.',
+        'hostname: "admin.{{ aigw_domain }}", path: /, status: "303"',
+        'hostname: "admin-portal.{{ aigw_domain }}", path: /healthz, status: "301"',
+        'hostname: "litellm-admin.{{ aigw_domain }}", path: /, status: "302"',
+        'hostname: "litellm-admin.{{ aigw_domain }}", path: /ui, status: "302"',
         "Host-origin traffic to",
         "a physical published address is deliberately denied",
         "register: grafana_datasource_graph",
@@ -530,7 +643,8 @@ if ansible.is_file():
         "shared bind context drift",
         "bind-objects=",
         "AVC,USER_AVC",
-        "aigw_recent_selinux_denials.stderr is search('(?i)<no matches>')",
+        "aigw_recent_selinux_denials.stdout | trim == ''",
+        "aigw_recent_selinux_denials.stderr | trim == '<no matches>'",
     ):
         assert required in verify_source, required
     assert 'stdin: "{{ grafana_admin_password }}"' not in verify_source
@@ -553,7 +667,7 @@ import sys
 
 text = Path(sys.argv[1]).read_text()
 assert 'running_containers+=("${service_containers[@]}")' in text
-assert text.count('docker start "${running_containers[@]}"') == 2
+assert text.count('"${docker_cmd[@]}" start "${running_containers[@]}"') == 2
 assert '"${compose[@]}" start "${running[@]}"' not in text
 assert 'if [[ "$logical" == openwebui_data ]]' in text
 assert 'volume_tar_args=(--numeric-owner --exclude ./cache -czf - -C /source)' in text
@@ -627,12 +741,13 @@ PY
 
 env \
   DOMAIN=aigw.internal \
+  DOCKER_DATA_ROOT="$docker_data_root" \
   ETH1_IP=10.8.10.10 \
   ETH2_IP=10.20.0.10 \
-  CONTAINER_DNS_SERVER=10.211.55.1 \
   TRAEFIK_INT_CHAT_IP=172.28.3.2 \
   TRAEFIK_INT_PORTAL_IP=172.28.4.2 \
   TRAEFIK_ADM_ADMIN_IP=172.28.5.2 \
+  OAUTH2_PROXY_LITELLM_IP=172.28.5.3 \
   TRAEFIK_ADM_GRAFANA_IP=172.28.6.2 \
   OAUTH2_PROXY_GRAFANA_IP=172.28.6.3 \
   ENVOY_EGRESS_IP=172.28.0.2 \
@@ -642,6 +757,7 @@ env \
   PROMETHEUS_OBSERVABILITY_IP=172.28.15.3 \
   TEMPO_INGEST_IP=172.28.16.2 \
   LAB_DNS_IP=172.28.18.2 \
+  LAB_DNS_ADM_CIDR=10.8.10.0/24 \
   AIGW_BIND_DIGEST_TRAEFIK_INT=0000000000000000000000000000000000000000000000000000000000000001 \
   AIGW_BIND_DIGEST_TRAEFIK_ADM=0000000000000000000000000000000000000000000000000000000000000002 \
   AIGW_BIND_DIGEST_LITELLM=0000000000000000000000000000000000000000000000000000000000000003 \
@@ -674,7 +790,10 @@ env \
   PORTAL_OIDC_CLIENT_SECRET=ValidationPortalOIDCSecret0123456789AB \
   ADMIN_PORTAL_OIDC_CLIENT_SECRET=ValidationAdminPortalOIDC0123456789AB \
   OAUTH2_PROXY_CLIENT_SECRET=ValidationOauth2ClientSecret0123456789A \
-  OAUTH2_PROXY_COOKIE_SECRET=ValidationCookieSecret0123456789 \
+  OAUTH2_PROXY_LITELLM_COOKIE_SECRET=LitellmCookie0123456789ABCDEFGHI \
+  OAUTH2_PROXY_GRAFANA_COOKIE_SECRET=GrafanaCookie0123456789ABCDEFGHI \
+  OAUTH2_PROXY_PROMETHEUS_COOKIE_SECRET=PromCookie0123456789ABCDEFGHIJKL \
+  OAUTH2_PROXY_VAULT_COOKIE_SECRET=VaultCookie0123456789ABCDEFGHIJK \
   PORTAL_SESSION_SECRET=ValidationPortalSession0123456789ABCDE \
   ADMIN_PORTAL_SESSION_SECRET=ValidationAdminPortalSession0123456789 \
   ROTATOR_INTERNAL_TOKEN=ValidationRotatorInternal0123456789ABCDE \
@@ -686,17 +805,17 @@ env \
   CRIBL_OTLP_CA_FILE=/etc/ssl/certs/aigw-ca.pem \
   CRIBL_OTLP_SERVER_NAME=cribl-mock \
   sh -eu -c '
-    docker compose --project-directory "$1" -f "$2/docker-compose.yml" config -q
-    redis_hash_before="$(docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash redis)"
-    vault_hash_before="$(docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash vault)"
-    initializer_hash_before="$(docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash volume-init)"
-    redis_hash_after="$(AIGW_BIND_DIGEST_REDIS=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash redis)"
-    vault_hash_after="$(AIGW_BIND_DIGEST_REDIS=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash vault)"
-    initializer_hash_after="$(AIGW_BIND_DIGEST_REDIS=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash volume-init)"
+    docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config -q
+    redis_hash_before="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash redis)"
+    vault_hash_before="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash vault)"
+    initializer_hash_before="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash volume-init)"
+    redis_hash_after="$(AIGW_BIND_DIGEST_REDIS=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash redis)"
+    vault_hash_after="$(AIGW_BIND_DIGEST_REDIS=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash vault)"
+    initializer_hash_after="$(AIGW_BIND_DIGEST_REDIS=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash volume-init)"
     test "$redis_hash_before" != "$redis_hash_after"
     test "$vault_hash_before" = "$vault_hash_after"
     test "$initializer_hash_before" = "$initializer_hash_after"
-    docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
+    docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
       python3 -I -c '\''
 import json
 import os
@@ -705,6 +824,7 @@ import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 project_root = Path(sys.argv[2])
+docker_data_root = Path(os.environ["DOCKER_DATA_ROOT"]).resolve(strict=False)
 services = json.load(sys.stdin)["services"]
 assert "lab-dns" not in services
 for name in (
@@ -718,6 +838,14 @@ for name in (
     assert env["OAUTH2_PROXY_OIDC_EMAIL_CLAIM"] == "preferred_username", name
     assert env["OAUTH2_PROXY_SKIP_PROVIDER_BUTTON"] == "true", name
     assert env["OAUTH2_PROXY_OIDC_GROUPS_CLAIM"] == "roles", name
+litellm_admin_proxy = services["oauth2-proxy"]["environment"]
+assert litellm_admin_proxy["OAUTH2_PROXY_REDIRECT_URL"] == (
+    "https://litellm-admin.aigw.internal/oauth2/callback"
+)
+assert litellm_admin_proxy["OAUTH2_PROXY_COOKIE_NAME"] == (
+    "_aigw_litellm_admin_oauth"
+)
+assert litellm_admin_proxy["OAUTH2_PROXY_UPSTREAMS"] == "http://litellm:4000"
 internal_edge = services["traefik-int"]
 assert "net-int-edge" in internal_edge["networks"]
 assert [name for name, service in services.items() if "net-int-edge" in service.get("networks", {})] == ["traefik-int"]
@@ -733,6 +861,22 @@ assert vault["ulimits"]["memlock"] == {"soft": -1, "hard": -1}
 config_mount = next(v for v in vault["volumes"] if v["target"] == "/vault/config/aigw.hcl")
 assert config_mount["type"] == "bind"
 assert config_mount["read_only"] is True
+vault_ui_proxy = services["vault-ui-proxy"]
+assert vault_ui_proxy["image"] == "ai-gateway/dhi-vault-ui-proxy:2.0.3"
+assert vault_ui_proxy["user"] == "1000:1000"
+assert vault_ui_proxy["read_only"] is True
+assert set(vault_ui_proxy["networks"]) == {"net-vault"}
+assert "ports" not in vault_ui_proxy
+assert "environment" not in vault_ui_proxy
+assert vault_ui_proxy["depends_on"] == {
+    "vault": {"condition": "service_started", "required": True}
+}
+assert services["oauth2-proxy-vault"]["environment"]["OAUTH2_PROXY_UPSTREAMS"] == (
+    "http://vault-ui-proxy:8080"
+)
+assert services["oauth2-proxy-vault"]["depends_on"] == {
+    "vault-ui-proxy": {"condition": "service_healthy", "required": True}
+}
 assert services["envoy-egress"]["healthcheck"]["test"] == ["CMD", "/usr/local/bin/aigw-envoy-entrypoint", "health"]
 for edge in ("traefik-int", "traefik-adm"):
     assert services[edge]["user"] == "65532:65532"
@@ -749,8 +893,45 @@ assert services["open-webui"]["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
     "http://127.0.0.1:8080/health",
 ]
+assert services["vault-ui-proxy"]["healthcheck"]["test"] == [
+    "CMD", "/usr/local/bin/vault-ui-proxy", "check",
+]
+litellm_probe = services["litellm"]["healthcheck"]["test"]
+assert litellm_probe[:3] == ["CMD", "python3", "-c"]
+assert len(litellm_probe) == 4
+assert "http://127.0.0.1:4000/health/readiness" in litellm_probe[3]
+assert "/health/liveliness" not in litellm_probe[3]
+assert services["open-webui"]["build"]["dockerfile"] == "Dockerfile.open-webui"
+assert services["open-webui"]["image"] == "ai-gateway/open-webui:0.10.2-aigw1"
+assert services["open-webui"]["build"]["args"]["BASE_IMAGE"] == (
+    "ghcr.io/open-webui/open-webui:v0.10.2@sha256:"
+    "9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4"
+)
 assert services["open-webui"]["environment"]["WEBUI_SECRET_KEY"] == "ValidationStableWebuiSecret_0123456789ABC"
 assert services["open-webui"]["environment"]["SSL_CERT_FILE"] == "/etc/ssl/certs/aigw-ca.pem"
+assert services["open-webui"]["environment"]["WEBUI_SESSION_COOKIE_SECURE"] == "true"
+assert services["open-webui"]["environment"]["WEBUI_AUTH_COOKIE_SECURE"] == "true"
+open_webui = services["open-webui"]
+assert open_webui["user"] == "65532:65532"
+assert open_webui["read_only"] is True
+assert open_webui["tmpfs"] == ["/tmp:rw,noexec,nosuid,nodev,mode=1777,size=256m"]
+assert open_webui["environment"]["HOME"] == "/app/backend/data"
+assert open_webui["environment"]["PYTHONNOUSERSITE"] == "1"
+assert open_webui["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
+assert open_webui["environment"]["STATIC_DIR"] == "/tmp/static"
+assert open_webui["depends_on"]["volume-init"]["condition"] == "service_completed_successfully"
+openwebui_mounts = {mount["target"]: mount for mount in open_webui["volumes"]}
+assert openwebui_mounts["/app/backend/data"] == {
+    "type": "volume", "source": "openwebui_data", "target": "/app/backend/data",
+    "volume": {},
+}
+volume_init = services["volume-init"]
+volume_init_mounts = {mount["target"]: mount for mount in volume_init["volumes"]}
+assert volume_init_mounts["/state/openwebui"] == {
+    "type": "volume", "source": "openwebui_data", "target": "/state/openwebui",
+    "volume": {},
+}
+assert "chown -hR 65532:65532 /state/openwebui && chmod 0700 /state/openwebui" in volume_init["command"][0]
 redis = services["redis"]
 assert redis["user"] == "65532:65532"
 assert "REDIS_PASSWORD" not in redis.get("environment", {})
@@ -776,7 +957,7 @@ assert redis["healthcheck"]["test"] == [
 prometheus_probe = services["prometheus"]["healthcheck"]["test"]
 assert prometheus_probe == ["CMD", "/usr/local/bin/aigw-health-probe", "http", "--url", "http://172.28.15.3:9090/-/ready"]
 alloy = services["alloy"]
-assert "user" not in alloy
+assert alloy["user"] == "473:473"
 assert alloy["cap_drop"] == ["ALL"]
 assert alloy["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
@@ -786,6 +967,17 @@ assert services["node-exporter"]["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
     "http://127.0.0.1:9100/metrics", "--contains", "node_exporter_build_info",
 ]
+node_exporter = services["node-exporter"]
+assert node_exporter["user"] == "65532:65532"
+assert node_exporter["read_only"] is True
+assert node_exporter["tmpfs"] == [
+    "/tmp",
+    "/host/run:uid=65532,gid=65532,mode=0555,noexec,nosuid,nodev,size=1m",
+]
+assert node_exporter["volumes"] == [{
+    "type": "bind", "source": "/", "target": "/host", "read_only": True,
+    "bind": {"propagation": "rslave"},
+}]
 assert services["loki"]["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
     "http://127.0.0.1:3100/ready",
@@ -863,6 +1055,12 @@ label_disabled = {
     if "label=disable" in service.get("security_opt", [])
 }
 assert label_disabled == {"alloy", "node-exporter"}, label_disabled
+assert services["alloy"]["user"] == "473:473"
+assert services["node-exporter"]["user"] == "65532:65532"
+assert services["node-exporter"]["tmpfs"] == [
+    "/tmp",
+    "/host/run:uid=65532,gid=65532,mode=0555,noexec,nosuid,nodev,size=1m",
+]
 for name, service in services.items():
     for mount in service.get("volumes", []):
         if mount["type"] != "bind":
@@ -872,9 +1070,14 @@ for name, service in services.items():
         if name in label_disabled:
             assert relabel is None, (name, source, relabel)
             continue
-        assert source != "/" and not source.startswith("/var/lib/docker"), (
-            name, source
-        )
+        source_path = Path(source)
+        assert source_path.is_absolute() and source_path != Path("/"), (name, source)
+        try:
+            source_path.resolve(strict=False).relative_to(docker_data_root)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((name, source, "Docker runtime bind requested relabel"))
         assert relabel in {"z", "Z"}, (name, source, relabel)
 postgres = services["postgres"]
 assert postgres["image"].startswith("dhi.io/postgres:16.14@sha256:")
@@ -887,6 +1090,7 @@ assert volume_init["cap_drop"] == ["ALL"]
 expected_dhi = {
     "oauth2-proxy", "oauth2-proxy-grafana", "oauth2-proxy-prometheus",
     "oauth2-proxy-vault", "keycloak", "vault", "postgres",
+    "vault-ui-proxy",
     "redis", "alloy", "prometheus", "node-exporter", "loki", "tempo",
     "grafana", "cribl-mock",
 }
@@ -914,10 +1118,10 @@ assert portal["environment"]["ROTATOR_INTERNAL_TOKEN"] == "ValidationPortalIdent
 assert set(admin_portal["networks"]) == {"net-admin-app", "net-telemetry"}
 assert set(portal["networks"]) == {"net-portal", "net-telemetry"}
 '\'' "$2/bind-source-digest-inputs.json" "$1"
-    docker compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
+    docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
       python3 -I "$1/scripts/validate-build-contract.py" "$1" base
-    docker compose --project-directory "$1" -f "$2/docker-compose.yml" \
-      -f "$2/docker-compose.lab.yml" --profile lab-ad config --format json |
+    docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
+      -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad config --format json |
       python3 -I -c '\''
 import json
 import os
@@ -926,6 +1130,7 @@ import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 project_root = Path(sys.argv[2])
+docker_data_root = Path(os.environ["DOCKER_DATA_ROOT"]).resolve(strict=False)
 config = json.load(sys.stdin)
 assert "secrets" not in config
 dns = config["services"]["lab-dns"]
@@ -938,6 +1143,7 @@ assert dns["security_opt"] == ["no-new-privileges:true"]
 assert list(dns["networks"]) == ["net-lab-dns"]
 assert dns["build"]["network"] == "none"
 assert dns["healthcheck"]["test"] == ["CMD", "/dns-healthcheck"]
+assert dns["environment"] == {"LAB_DNS_ADM_CIDR": "10.8.10.0/24"}
 ports = {(p.get("host_ip"), int(p["published"]), p["protocol"], int(p["target"])) for p in dns["ports"]}
 assert ports == {
     ("10.8.10.10", 53, "tcp", 53),
@@ -947,6 +1153,14 @@ assert ports == {
 }
 assert config["networks"]["net-lab-dns"]["external"] is True
 assert all(v["read_only"] for v in dns["volumes"])
+adm_zone = next(
+    mount for mount in dns["volumes"]
+    if mount["target"] == "/etc/coredns/zones/db.aigw.internal.adm"
+)
+assert adm_zone["type"] == "bind"
+assert adm_zone["read_only"] is True
+assert adm_zone["bind"]["selinux"] == "Z"
+assert Path(adm_zone["source"]).name == "db.aigw.internal.adm"
 samba = config["services"]["samba-ad"]
 assert samba["healthcheck"]["test"] == ["CMD", "/usr/local/sbin/samba-ad-healthcheck"]
 assert samba.get("labels", {}).get(
@@ -979,7 +1193,8 @@ bind_digest_services = {
     "grafana", "cribl-mock", "lab-dns", "samba-ad", "key-rotator",
 }
 expected_bind_sources = dict(manifest["base"])
-expected_bind_sources.update(manifest["lab"])
+expected_bind_sources.update(manifest["platform_dns"])
+expected_bind_sources.update(manifest["lab_identity"])
 assert bind_digest_services == set(expected_bind_sources)
 bind_digest_environment = {
     "traefik-int": "AIGW_BIND_DIGEST_TRAEFIK_INT",
@@ -1032,6 +1247,18 @@ label_disabled = {
     if "label=disable" in service.get("security_opt", [])
 }
 assert label_disabled == {"alloy", "node-exporter"}, label_disabled
+assert config["services"]["alloy"]["user"] == "473:473"
+node_exporter = config["services"]["node-exporter"]
+assert node_exporter["user"] == "65532:65532"
+assert node_exporter["read_only"] is True
+assert node_exporter["tmpfs"] == [
+    "/tmp",
+    "/host/run:uid=65532,gid=65532,mode=0555,noexec,nosuid,nodev,size=1m",
+]
+assert node_exporter["volumes"] == [{
+    "type": "bind", "source": "/", "target": "/host", "read_only": True,
+    "bind": {"propagation": "rslave"},
+}]
 for name, service in config["services"].items():
     if name != "volume-init":
         assert service.get("labels", {}).get(
@@ -1046,9 +1273,14 @@ for name, service in config["services"].items():
         if name in label_disabled:
             assert relabel is None, (name, source, relabel)
             continue
-        assert source != "/" and not source.startswith("/var/lib/docker"), (
-            name, source
-        )
+        source_path = Path(source)
+        assert source_path.is_absolute() and source_path != Path("/"), (name, source)
+        try:
+            source_path.resolve(strict=False).relative_to(docker_data_root)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((name, source, "Docker runtime bind requested relabel"))
         assert relabel in {"z", "Z"}, (name, source, relabel)
 for name, service in config["services"].items():
     if name == "volume-init":
@@ -1056,10 +1288,23 @@ for name, service in config["services"].items():
     assert "healthcheck" in service, name
     assert service["healthcheck"]["test"][0] == "CMD", name
 '\'' "$2/bind-source-digest-inputs.json" "$1"
-    docker compose --project-directory "$1" -f "$2/docker-compose.yml" \
-      -f "$2/docker-compose.lab.yml" --profile lab-ad config --format json |
+    docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
+      -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad config --format json |
       python3 -I "$1/scripts/validate-build-contract.py" "$1" lab
   ' sh "$ROOT" "$COMPOSE_DIR"
+
+grep -Fq 'LAB_DNS_ADM_CIDR: ${LAB_DNS_ADM_CIDR:?LAB_DNS_ADM_CIDR must be set}' "$COMPOSE_DIR/docker-compose.platform-dns.yml"
+python3 -I - "$SERVICES_DIR/lab-dns/Corefile" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+corefile = Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "view adm {" in corefile
+assert "expr incidr(client_ip(), '{$LAB_DNS_ADM_CIDR}')" in corefile
+assert "db.aigw.internal.adm" in corefile
+assert re.search(r"(?m)^\s*forward(?:\s|$)", corefile) is None
+PY
 
 for config in "$COMPOSE_DIR/traefik/traefik-int.yml" "$COMPOSE_DIR/traefik/traefik-adm.yml"; do
   [[ "$(grep -Fc 'checkNewVersion: false' "$config")" -eq 1 ]]
@@ -1187,15 +1432,21 @@ if [[ ! -f "$acl_source" ]]; then
   acl_unit=/etc/systemd/system/aigw-docker-log-acl.service
   acl_mode=deployed
 fi
-python3 -I - "$acl_source" "$acl_mode" "$acl_unit" <<'PY'
+python3 -I - "$acl_source" "$acl_mode" "$acl_unit" "$docker_data_root" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 text = Path(sys.argv[1]).read_text()
 mode = sys.argv[2]
+docker_data_root = sys.argv[4]
+assert re.fullmatch(
+    r"/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}",
+    docker_data_root,
+), docker_data_root
 if mode == "source":
-    acl_section = text.split("# DHI Alloy runs as uid 473", 1)[1].split(
-        "- name: Gate stateful image upgrades", 1
+    acl_section = text.split("- name: Install scoped Docker json-log ACL reconciler", 1)[1].split(
+        "- name: Install scoped Docker json-log ACL reconciliation service", 1
     )[0]
     assert "recursive: true\n" not in acl_section
     assert text.count("name: aigw-docker-log-acl.service") == 2
@@ -1227,33 +1478,38 @@ else:
         "ExecStart=/usr/local/sbin/aigw-docker-log-acl",
         "NoNewPrivileges=true",
         "ProtectSystem=strict",
-        "ReadOnlyPaths=/var/lib/docker",
-        "ReadWritePaths=/var/lib/docker/containers",
-        "BindReadOnlyPaths=/run/docker.sock",
+        f"ReadOnlyPaths={docker_data_root}",
+        f"ReadWritePaths={docker_data_root}/containers",
         "RestrictAddressFamilies=AF_UNIX",
     ):
         assert required in unit
+    assert "BindReadOnlyPaths=/run/docker.sock" not in unit
 for command in (
-    "/usr/bin/setfacl -m u:473:r-x \"$root\"",
-    "/usr/bin/setfacl -m d:u:473:--x,d:o:r-x \"$root\"",
     "require_access_acl \"$state_root\" --x",
     "require_access_acl \"$root\" r-x",
-    "require_default_acl \"$root\" user 473 --x",
-    "-exec /usr/bin/setfacl -m u:473:r-x {} +",
-    "-exec /usr/bin/setfacl -x d:u:473 {} +",
-    "-type f ! -name '*-json.log*'",
-    "-exec /usr/bin/setfacl -m u:473:--- {} +",
-    "-type f -name '*-json.log*'",
-    "-exec /usr/bin/setfacl -m u:473:r-- {} +",
-    "\\( ! -type d -o ! -uid 0 -o ! -gid 0 \\)",
-    "-type f \\( ! -uid 0 -o ! -gid 0 \\)",
-    "-type l -name '*-json.log*'",
-    "if ! alloy_output=$(",
-    "/usr/bin/docker --host unix:///run/docker.sock ps --no-trunc -q",
-    "--filter 'label=com.docker.compose.service=alloy'",
-    "for runtime_file in hosts hostname resolv.conf",
+    "require_no_default_acl \"$root\"",
+    "/usr/bin/setfacl -k -- \"$project_dir\"",
+    "/usr/bin/setfacl -m u:473:r-x \"$project_dir\"",
+    "/usr/bin/setfacl -m u:473:--- \"$candidate\"",
+    "/usr/bin/setfacl -m u:473:r-- \"$candidate\"",
+    "/usr/bin/curl --unix-socket /run/docker.sock --noproxy '*'",
+    "--connect-timeout 5 --max-time 10",
+    "--max-filesize 1048576",
+    "http://localhost/containers/json?all=1",
+    "filters={\"label\":[\"com.docker.compose.project=",
+    "com.docker.compose.project.working_dir",
+    "com.docker.compose.config-hash",
+    "/usr/bin/find \"$project_dir\" -xdev -mindepth 1 -maxdepth 1 -print0",
 ):
     assert command in text
+for forbidden in (
+    "require_default_acl",
+    "-m d:",
+    "com.docker.compose.service=alloy",
+    "-exec /usr/bin/setfacl",
+    "/usr/bin/docker --host",
+):
+    assert forbidden not in text
 PY
 
 firewall_role="$ROOT/ansible/roles/firewalld_zones/tasks/main.yml"

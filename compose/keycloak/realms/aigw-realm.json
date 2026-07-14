@@ -96,10 +96,10 @@
       "secret": "${ADMIN_PORTAL_OIDC_CLIENT_SECRET}",
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
-      "redirectUris": ["https://admin-portal.aigw.example.internal/auth/callback"],
-      "webOrigins": ["https://admin-portal.aigw.example.internal"],
+      "redirectUris": ["https://admin.aigw.example.internal/auth/callback"],
+      "webOrigins": ["https://admin.aigw.example.internal"],
       "attributes": {
-        "post.logout.redirect.uris": "https://admin-portal.aigw.example.internal/login"
+        "post.logout.redirect.uris": "https://admin.aigw.example.internal/login"
       },
       "protocolMappers": [
         {
@@ -129,13 +129,13 @@
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "redirectUris": [
-        "https://admin.aigw.example.internal/oauth2/callback",
+        "https://litellm-admin.aigw.example.internal/oauth2/callback",
         "https://grafana.aigw.example.internal/oauth2/callback",
         "https://prometheus.aigw.example.internal/oauth2/callback",
         "https://vault.aigw.example.internal/oauth2/callback"
       ],
       "webOrigins": [
-        "https://admin.aigw.example.internal",
+        "https://litellm-admin.aigw.example.internal",
         "https://grafana.aigw.example.internal",
         "https://prometheus.aigw.example.internal",
         "https://vault.aigw.example.internal"
@@ -155,6 +155,24 @@
           }
         }
       ]
+    }
+  ],
+  "scopeMappings": [
+    {
+      "client": "open-webui",
+      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+    },
+    {
+      "client": "dev-portal",
+      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+    },
+    {
+      "client": "admin-portal",
+      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+    },
+    {
+      "client": "admin-ui",
+      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
     }
   ]
 }

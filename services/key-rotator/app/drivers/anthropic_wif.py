@@ -47,6 +47,11 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from app import health
 from app.drivers.base import BaseDriver, DriverContext, RotationResult
+from app.provider_state import (
+    CREDENTIAL_ISSUED,
+    CREDENTIAL_LIFECYCLE_FIELD,
+    CREDENTIAL_PROMOTION_PENDING,
+)
 from app.security import validate_wif_token_claims
 from app.vault_client import VaultError, mask_secret
 
@@ -110,9 +115,17 @@ class AnthropicWifDriver(BaseDriver):
             return await self._handle_failure(ctx, state, exc)
 
         try:
+            # Persist an indeterminate marker before handing a newly minted
+            # credential to LiteLLM.  A successful promotion followed by a
+            # lost/failed state write must never leave an older expired
+            # timestamp that provider deletion could mistake for proof that
+            # the active credential is gone.
+            state[CREDENTIAL_LIFECYCLE_FIELD] = CREDENTIAL_PROMOTION_PENDING
+            await self._persist_state(ctx, state)
             await ctx.litellm.upsert_credential("anthropic-primary", {"api_key": access_token})
 
             now = time.time()
+            state[CREDENTIAL_LIFECYCLE_FIELD] = CREDENTIAL_ISSUED
             state["_last_issued_at"] = now
             state["_last_expires_in"] = expires_in
             state["_fail_count"] = 0

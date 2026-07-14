@@ -6,7 +6,11 @@
 
 - name: Preflight — prove a fresh key-only controller SSH path before firewall mutation
   ansible.builtin.command:
-    argv: "{{ aigw_controller_ssh_argv + ['/usr/bin/bash', '-c', 'sudo -n true && exec /usr/bin/printenv SSH_CONNECTION'] }}"
+    # OpenSSH joins every argument after the destination into the remote shell
+    # command without retaining argv boundaries.  Keep this entire compound
+    # probe as one argument so `-n` remains a sudo option, then read
+    # SSH_CONNECTION from the unprivileged SSH session after sudo succeeds.
+    argv: "{{ aigw_controller_ssh_argv + ['/usr/bin/sudo -n /usr/bin/true && exec /usr/bin/printenv SSH_CONNECTION'] }}"
   vars:
     aigw_controller_ssh_argv: >-
       {{
@@ -82,65 +86,293 @@
   changed_when: false
   failed_when: false
 
-- name: Preflight — inspect Docker daemon state without starting it
+- name: Preflight — resolve the discovered Docker CLI to its canonical filesystem path
   ansible.builtin.command:
-    argv:
-      - /usr/bin/env
-      - -u
-      - DOCKER_CONFIG
-      - -u
-      - DOCKER_CONTEXT
-      - -u
-      - DOCKER_HOST
-      - "{{ aigw_docker_cli.stdout | trim }}"
-      - --host
-      - unix:///run/docker.sock
-      - info
-      - --format=json
-  register: aigw_docker_info
+    argv: [/usr/bin/readlink, -f, "{{ aigw_docker_cli.stdout | trim }}"]
+  register: aigw_docker_cli_resolved
   changed_when: false
   failed_when: false
   when: aigw_docker_cli.rc == 0
 
-- name: Preflight — record whether the local Docker daemon is active
-  ansible.builtin.set_fact:
-    aigw_docker_daemon_active: >-
-      {{ (aigw_docker_cli.rc == 0) and (aigw_docker_info.rc | default(1) == 0) }}
-
-# Docker plugins are daemon-wide code/configuration. A dedicated gateway host
-# models no plugins, so even a disabled retained plugin is an adoption hazard
-# rather than harmless empty Docker state.
-- name: Preflight — inventory installed Docker plugins on the local daemon
-  ansible.builtin.command:
-    argv:
-      - /usr/bin/env
-      - -u
-      - DOCKER_CONFIG
-      - -u
-      - DOCKER_CONTEXT
-      - -u
-      - DOCKER_HOST
-      - "{{ aigw_docker_cli.stdout | trim }}"
-      - --host
-      - unix:///run/docker.sock
-      - plugin
-      - ls
-      - --format
-      - "{{ '{{json .}}' }}"
-  register: aigw_docker_plugins
+- name: Preflight — inspect the canonical Docker CLI boundary without following links
+  ansible.builtin.stat:
+    path: /usr/bin/docker
+    follow: false
+    get_checksum: false
+  register: aigw_docker_cli_boundary
   changed_when: false
-  when: aigw_docker_daemon_active | bool
 
-- name: Preflight — require the dedicated Docker host to have no plugins
+- name: Preflight — require an existing Docker CLI to be the canonical root-owned binary
   ansible.builtin.assert:
     that:
-      - aigw_docker_plugins.stdout_lines | reject('equalto', '') | list | length == 0
+      - >-
+        aigw_docker_cli.rc != 0 or
+        ((aigw_docker_cli_resolved.rc | default(1) == 0) and
+         (aigw_docker_cli_resolved.stdout | trim) == '/usr/bin/docker' and
+         (aigw_docker_cli_boundary.stat.exists | default(false)) and
+         (aigw_docker_cli_boundary.stat.isreg | default(false)) and
+         not (aigw_docker_cli_boundary.stat.islnk | default(false)) and
+         aigw_docker_cli_boundary.stat.uid == 0 and
+         aigw_docker_cli_boundary.stat.gid == 0 and
+         aigw_docker_cli_boundary.stat.mode == '0755')
     quiet: true
     fail_msg: >-
-      Refusing existing-host adoption: the dedicated AI Gateway Docker host
-      must not retain Docker plugins. Remove/review every plugin before this
-      platform takes ownership of daemon-wide Docker policy.
-  when: aigw_docker_daemon_active | bool
+      Refusing existing-host adoption: Docker CLI resolution must be the
+      canonical root-owned /usr/bin/docker binary, never a PATH-selected or
+      writable/symlinked executable.
+
+# A manually started dockerd can use a nonstandard Unix socket or a TCP
+# listener, so the canonical `/run/docker.sock` client probe above cannot be
+# its only discovery mechanism.  Verify the native process provenance directly
+# against the systemd service rather than trusting its listener or arguments.
+- name: Preflight — reject dockerd processes not owned by the reviewed Docker service
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import subprocess
+
+        def run(command):
+            return subprocess.run(
+                command, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+
+        service_result = run([
+            "systemctl", "show", "docker.service", "--no-pager",
+            "--property=LoadState", "--property=ActiveState",
+            "--property=MainPID", "--property=ControlGroup",
+        ])
+        service = {}
+        if service_result.returncode == 0:
+            for line in service_result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if separator:
+                    service[key] = value
+
+        errors = []
+        dockerd = []
+        try:
+            entries = list(os.scandir("/proc"))
+        except OSError as error:
+            raise SystemExit("cannot inspect /proc for dockerd: " + str(error)) from error
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                pid = int(entry.name)
+                with open(
+                    f"/proc/{pid}/comm", "r", encoding="utf-8",
+                    errors="replace",
+                ) as stream:
+                    comm = stream.read().strip()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                errors.append(f"cannot inspect process {pid}: {error}")
+                continue
+            try:
+                executable = os.readlink(f"/proc/{pid}/exe")
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                if comm == "dockerd":
+                    errors.append(f"cannot inspect dockerd executable for PID {pid}: {error}")
+                continue
+            canonical_executable = os.path.realpath(executable)
+            if comm != "dockerd" and canonical_executable != "/usr/bin/dockerd":
+                continue
+            try:
+                with open(
+                    f"/proc/{pid}/status", "r", encoding="utf-8",
+                    errors="replace",
+                ) as stream:
+                    status = stream.read()
+                with open(
+                    f"/proc/{pid}/cgroup", "r", encoding="utf-8",
+                    errors="replace",
+                ) as stream:
+                    cgroup_paths = [
+                        line.rpartition(":")[2]
+                        for line in stream.read().splitlines()
+                        if ":" in line
+                    ]
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                errors.append(f"cannot inspect dockerd process {pid}: {error}")
+                continue
+            uid_line = next(
+                (line for line in status.splitlines() if line.startswith("Uid:")),
+                "",
+            )
+            try:
+                uid = int(uid_line.split()[1])
+            except (IndexError, ValueError):
+                errors.append(f"cannot determine dockerd UID for PID {pid}")
+                continue
+            dockerd.append({
+                "pid": pid,
+                "uid": uid,
+                "comm": comm,
+                "executable": executable,
+                "cgroups": cgroup_paths,
+            })
+
+        active = service.get("ActiveState") == "active"
+        try:
+            main_pid = int(service.get("MainPID", "0"))
+        except ValueError:
+            errors.append("docker.service returned a malformed MainPID")
+            main_pid = 0
+        control_group = service.get("ControlGroup", "")
+        if dockerd:
+            if service_result.returncode != 0 or service.get("LoadState") != "loaded":
+                errors.append("dockerd exists but docker.service is not inspectable")
+            if not active:
+                errors.append("dockerd exists while docker.service is not active")
+            if main_pid <= 0:
+                errors.append("dockerd exists but docker.service has no MainPID")
+            if control_group != "/system.slice/docker.service":
+                errors.append("dockerd has an unexpected docker.service cgroup")
+            if len(dockerd) != 1:
+                errors.append("multiple dockerd processes exist")
+            for process in dockerd:
+                if process["pid"] != main_pid:
+                    errors.append(
+                        f"dockerd PID {process['pid']} is not docker.service MainPID"
+                    )
+                if process["uid"] != 0:
+                    errors.append(f"dockerd PID {process['pid']} is not root-owned")
+                if os.path.realpath(process["executable"]) != "/usr/bin/dockerd":
+                    errors.append(
+                        f"dockerd PID {process['pid']} is not the canonical binary"
+                    )
+                if control_group not in process["cgroups"]:
+                    errors.append(
+                        f"dockerd PID {process['pid']} is outside docker.service cgroup"
+                    )
+        elif active or main_pid > 0:
+            errors.append(
+                "docker.service is active but no inspectable canonical dockerd process exists"
+            )
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+  changed_when: false
+# Docker's root daemon is not the only container runtime that can publish a
+# port or retain firewall state. A dedicated gateway VM refuses active rootless
+# Docker/Podman plumbing, root Podman containers, and non-moby containerd
+# containers before it changes host-wide forwarding/firewalld policy.
+- name: Preflight — reject active non-Docker container workloads on a dedicated host
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import shutil
+        import subprocess
+
+        errors = []
+        checker_pid = os.getpid()
+        processes = subprocess.run(
+            ["ps", "-eo", "pid=,user=,comm=,args="], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if processes.returncode:
+            raise SystemExit("cannot inventory local container runtime processes")
+        for line in processes.stdout.splitlines():
+            fields = line.split(None, 3)
+            if len(fields) < 3:
+                errors.append("cannot parse local container runtime process inventory")
+                continue
+            try:
+                process_pid = int(fields[0])
+            except ValueError:
+                errors.append("cannot parse local container runtime process PID")
+                continue
+
+            # This inline Python checker is launched with its source in argv.
+            # Its own argv therefore contains the runtime marker literals below;
+            # inspect every *other* process, but never classify the checker
+            # itself as an active rootless runtime.
+            if process_pid == checker_pid:
+                continue
+
+            command = fields[2]
+            lowered = " ".join(fields[2:]).lower()
+            if any(marker in lowered for marker in (
+                "rootlesskit", "slirp4netns", "dockerd-rootless", "podman system service",
+            )):
+                # Do not relay argv: command lines can carry credentials. The
+                # PID and executable name are sufficient for remediation.
+                errors.append(
+                    f"active rootless/container runtime process: PID {process_pid} ({command})"
+                )
+
+            # A normal Docker CLI invocation may transiently reference the
+            # reviewed local socket. Every other long-lived host process that
+            # does so is incompatible with a dedicated gateway host: common
+            # TCP-to-Unix forwarders (socat, systemd-socket-proxyd, nginx
+            # launch wrappers, and ad-hoc scripts) otherwise bypass the
+            # docker.socket listener contract above. This intentionally runs
+            # before any Docker API request and ignores only this checker.
+            if (
+                ("/run/docker.sock" in lowered or "/var/run/docker.sock" in lowered)
+                and command not in {"docker", "dockerd"}
+            ):
+                errors.append(
+                    f"active process references the Docker Unix socket: PID {process_pid} ({command})"
+                )
+
+        podman = shutil.which("podman", path="/usr/sbin:/usr/bin:/sbin:/bin")
+        if podman:
+            result = subprocess.run(
+                [podman, "ps", "-a", "--format", "json"], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            if result.returncode == 0:
+                try:
+                    containers = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    errors.append("root Podman returned invalid container inventory")
+                else:
+                    if not isinstance(containers, list):
+                        errors.append("root Podman returned a non-list container inventory")
+                    elif containers:
+                        errors.append("root Podman retains containers on a dedicated Docker host")
+            elif "not found" not in result.stderr.lower() and "connection refused" not in result.stderr.lower():
+                errors.append("cannot safely inventory root Podman state")
+
+        ctr = shutil.which("ctr", path="/usr/sbin:/usr/bin:/sbin:/bin")
+        if ctr:
+            namespaces = subprocess.run(
+                [ctr, "namespaces", "list", "--quiet"], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            if namespaces.returncode == 0:
+                for namespace in filter(None, namespaces.stdout.splitlines()):
+                    if namespace in {"moby", "plugins.moby"}:
+                        continue
+                    inventory = subprocess.run(
+                        [ctr, "--namespace", namespace, "containers", "list", "--quiet"],
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                    )
+                    if inventory.returncode == 0 and inventory.stdout.strip():
+                        errors.append(
+                            f"non-Docker containerd namespace {namespace!r} retains containers"
+                        )
+            elif os.path.exists("/run/containerd/containerd.sock"):
+                errors.append("cannot safely inventory active containerd namespaces")
+
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+  changed_when: false
 
 - name: Preflight — determine whether a Docker systemd unit exists without starting it
   ansible.builtin.command:
@@ -160,6 +392,132 @@
       {{ (aigw_docker_systemd_load_state.rc | default(1) == 0) and
          (aigw_docker_systemd_load_state.stdout | trim == 'loaded') }}
 
+- name: Preflight — determine whether Docker's socket unit exists without starting it
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - docker.socket
+      - --property=LoadState
+      - --value
+  register: aigw_docker_socket_load_state
+  changed_when: false
+  failed_when: false
+
+- name: Preflight — record whether Docker's socket unit is installed
+  ansible.builtin.set_fact:
+    aigw_docker_socket_unit_installed: >-
+      {{ (aigw_docker_socket_load_state.rc | default(1) == 0) and
+         (aigw_docker_socket_load_state.stdout | trim == 'loaded') }}
+
+# With `dockerd -H fd://`, every systemd socket unit that triggers
+# docker.service is an API-listener boundary.  Refuse any auxiliary socket,
+# even if it is currently disabled, rather than silently retaining a dormant
+# TCP activation path on a dedicated gateway host.
+- name: Preflight — reject auxiliary systemd sockets that can trigger Docker
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import subprocess
+
+        def run(command):
+            return subprocess.run(
+                command, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+
+        def valid_unit_name(name):
+            return (
+                name.endswith(".socket") and not name.endswith("@.socket")
+                and len(name) <= 255 and "/" not in name
+                and all(33 <= ord(character) <= 126 for character in name)
+            )
+
+        # On a clean Rocky host Docker is not installed yet. Discover only
+        # loaded/installed socket units rather than treating a nonexistent
+        # vendor docker.socket as a failed inspection; once Docker CE is
+        # installed its unit is included by list-unit-files below.
+        unit_names = set()
+        errors = []
+        for command in (
+            ["systemctl", "list-unit-files", "--type=socket", "--all", "--no-legend", "--no-pager"],
+            ["systemctl", "list-units", "--type=socket", "--all", "--no-legend", "--plain", "--no-pager"],
+        ):
+            result = run(command)
+            if result.returncode:
+                errors.append("cannot enumerate systemd socket units")
+                continue
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if not fields or not fields[0].endswith(".socket"):
+                    continue
+                # A template (`name@.socket`) has no listener until an
+                # instantiated unit exists; systemctl show cannot inspect a
+                # template by itself. Any active instance is listed and
+                # remains subject to the check below.
+                if fields[0].endswith("@.socket"):
+                    continue
+                if not valid_unit_name(fields[0]):
+                    errors.append("cannot safely parse a systemd socket unit name")
+                    continue
+                unit_names.add(fields[0])
+
+        for unit_name in sorted(unit_names):
+            result = run([
+                "systemctl", "show", "--all", "--no-pager", unit_name,
+                "--property=Id", "--property=LoadState",
+                "--property=ActiveState", "--property=Triggers",
+            ])
+            if result.returncode:
+                errors.append("cannot inspect systemd socket unit " + unit_name)
+                continue
+            properties = {}
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if separator:
+                    properties[key] = value
+            if properties.get("LoadState") != "loaded":
+                continue
+            triggers = set(properties.get("Triggers", "").split())
+            unit_id = properties.get("Id", "")
+            if not valid_unit_name(unit_id):
+                errors.append("cannot establish canonical socket identity for " + unit_name)
+                continue
+            if unit_id == "docker.socket":
+                if triggers != {"docker.service"}:
+                    errors.append("docker.socket does not exclusively trigger docker.service")
+                continue
+            if "docker.service" not in triggers:
+                continue
+            # A disabled socket can still be started manually or by another
+            # unit.  Retaining any loaded alternate fd:// activation path is
+            # therefore incompatible with this dedicated-host contract.
+            errors.append(
+                "unreviewed socket unit can activate docker.service: " + unit_id
+            )
+
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+  changed_when: false
+- name: Preflight — inspect active Docker systemd ownership without starting units
+  ansible.builtin.command:
+    argv: [systemctl, is-active, --quiet, docker.service]
+  register: aigw_docker_systemd_service_active
+  changed_when: false
+  failed_when: false
+  when: aigw_docker_systemd_unit_installed | bool
+
+- name: Preflight — inspect active Docker socket ownership without starting units
+  ansible.builtin.command:
+    argv: [systemctl, is-active, --quiet, docker.socket]
+  register: aigw_docker_systemd_socket_active
+  changed_when: false
+  failed_when: false
+  when: aigw_docker_socket_unit_installed | bool
+
 - name: Preflight — reject local or transient Docker systemd overrides before adoption
   ansible.builtin.command:
     argv:
@@ -171,43 +529,46 @@
         import stat
 
         errors = []
-        for unit_path in (
-            "/etc/systemd/system/docker.service",
-            "/run/systemd/system/docker.service",
-        ):
-            try:
-                metadata = os.lstat(unit_path)
-            except FileNotFoundError:
-                continue
-            if stat.S_ISLNK(metadata.st_mode):
-                errors.append(f"unsafe Docker systemd unit override {unit_path}")
-            else:
-                errors.append(f"unreviewed Docker systemd unit override {unit_path}")
-
-        for directory in (
-            "/etc/systemd/system/docker.service.d",
-            "/run/systemd/system/docker.service.d",
-        ):
-            try:
-                metadata = os.lstat(directory)
-            except FileNotFoundError:
-                continue
-            if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or
-                    metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022):
-                errors.append(f"unsafe Docker systemd drop-in directory {directory}")
-                continue
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    try:
-                        child = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        errors.append(f"uninspectable Docker systemd drop-in {entry.path}")
-                        continue
-                    if (stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or
-                            child.st_uid != 0 or child.st_gid != 0 or child.st_mode & 0o022):
-                        errors.append(f"unsafe Docker systemd drop-in {entry.path}")
+        for unit_name in ("docker.service", "docker.socket"):
+            # `/usr/local/lib/systemd/system` precedes the vendor unit path on
+            # Rocky 9, so it is administrator-controlled configuration just
+            # like /etc and /run rather than a trusted package location.
+            for root in (
+                "/etc/systemd/system", "/run/systemd/system",
+                "/usr/local/lib/systemd/system",
+            ):
+                unit_path = os.path.join(root, unit_name)
+                try:
+                    metadata = os.lstat(unit_path)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if stat.S_ISLNK(metadata.st_mode):
+                        errors.append(f"unsafe Docker systemd unit override {unit_path}")
                     else:
-                        errors.append(f"unreviewed Docker systemd drop-in {entry.path}")
+                        errors.append(f"unreviewed Docker systemd unit override {unit_path}")
+
+                directory = unit_path + ".d"
+                try:
+                    metadata = os.lstat(directory)
+                except FileNotFoundError:
+                    continue
+                if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or
+                        metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022):
+                    errors.append(f"unsafe Docker systemd drop-in directory {directory}")
+                    continue
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            child = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            errors.append(f"uninspectable Docker systemd drop-in {entry.path}")
+                            continue
+                        if (stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or
+                                child.st_uid != 0 or child.st_gid != 0 or child.st_mode & 0o022):
+                            errors.append(f"unsafe Docker systemd drop-in {entry.path}")
+                        else:
+                            errors.append(f"unreviewed Docker systemd drop-in {entry.path}")
         if errors:
             raise SystemExit("; ".join(dict.fromkeys(errors)))
   changed_when: false
@@ -237,11 +598,50 @@
       - --property=ExecStart
       - --property=Environment
       - --property=EnvironmentFiles
+      - --property=MainPID
+      - --property=FragmentPath
+      - --property=DropInPaths
+      - --property=Requires
+      - --property=TriggeredBy
   register: aigw_docker_systemd_show
   changed_when: false
   failed_when: false
   no_log: true
   when: aigw_docker_systemd_unit_installed | bool
+
+- name: Preflight — inspect Docker socket unit and drop-ins without mutation
+  ansible.builtin.command:
+    argv: [systemctl, cat, docker.socket]
+  register: aigw_docker_socket_unit
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: aigw_docker_socket_unit_installed | bool
+
+- name: Preflight — inspect resolved Docker socket listener metadata without mutation
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - docker.socket
+      - --no-pager
+      - --property=Listen
+      - --property=ListenStream
+      - --property=Id
+      - --property=Triggers
+      - --property=Accept
+      - --property=SocketMode
+      - --property=SocketUser
+      - --property=SocketGroup
+      - --property=DirectoryMode
+      - --property=FragmentPath
+      - --property=DropInPaths
+      - --property=RequiredBy
+  register: aigw_docker_socket_show
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: aigw_docker_socket_unit_installed | bool
 
 - name: Preflight — reject daemon flags hidden in Docker systemd environment files
   ansible.builtin.command:
@@ -263,7 +663,8 @@
             r"(?<![A-Za-z0-9_-])(?:"
             r"--(?:data-root|iptables|ip6tables|log-driver|log-opt|"
             r"selinux-enabled|firewall-backend|bip|fixed-cidr|"
-            r"default-address-pool|bridge|config-file)(?:=|\s|$)|"
+            r"default-address-pool|bridge|config-file|tls|tlsverify|"
+            r"metrics-addr|debug)(?:=|\s|$)|"
             r"-g(?:=|\s|$)"
             r")"
         )
@@ -304,9 +705,12 @@
             for source in sources
             for match in pattern.finditer(source)
         })
-        # Refuse indirection even when the current value does not match our
-        # small flag list: an ExecStart that consumes these variables makes
-        # the unit contract dependent on an unreviewed environment file.
+        # The endpoint flags (-H/--host) are checked by the dedicated
+        # service/socket endpoint validator below, which permits the reviewed
+        # Rocky `-H fd://` contract and rejects all other listeners. Refuse
+        # indirection even when the current value does not match this small
+        # daemon-policy flag list: an ExecStart that consumes these variables
+        # makes the unit contract dependent on an unreviewed environment file.
         indirect = sorted({
             name
             for source in sources
@@ -327,6 +731,241 @@
     - aigw_docker_systemd_show.rc | default(1) == 0
   no_log: true
 
+- name: Preflight — require Docker service and socket to expose only the local Unix endpoint
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import re
+        import sys
+
+        payload = json.load(sys.stdin)
+        service_unit = payload.get("service_unit", "")
+        service_show = payload.get("service_show", "")
+        socket_unit = payload.get("socket_unit", "")
+        socket_show = payload.get("socket_show", "")
+        errors = []
+        service_text = service_unit + "\n" + service_show
+
+        def show_properties(text):
+            properties = {}
+            for line in text.splitlines():
+                key, separator, value = line.partition("=")
+                if separator:
+                    properties[key] = value
+            return properties
+
+        service_properties = show_properties(service_show)
+        socket_properties = show_properties(socket_show)
+        if service_properties.get("FragmentPath") != "/usr/lib/systemd/system/docker.service":
+            errors.append("Docker service does not use the reviewed vendor fragment")
+        if service_properties.get("DropInPaths", ""):
+            errors.append("Docker service has unreviewed drop-ins")
+        if "docker.socket" not in set(service_properties.get("Requires", "").split()):
+            errors.append("Docker service does not require docker.socket")
+        if set(service_properties.get("TriggeredBy", "").split()) != {"docker.socket"}:
+            errors.append("Docker service is not exclusively triggered by docker.socket")
+        if not re.search(
+            r"(?m)^ExecStart=\{ path=/usr/bin/dockerd ; argv\[\]=/usr/bin/dockerd(?:\s|;)",
+            service_show,
+        ):
+            errors.append("Docker service does not execute the canonical dockerd binary")
+
+        # Docker CE's reviewed Rocky unit uses -H fd:// and its reviewed
+        # socket owns /run/docker.sock. A missing/unknown endpoint is not
+        # assumed safe: a daemon can otherwise retain a TCP API listener.
+        hosts = []
+        host_patterns = (
+            r"(?:^|\s)--host(?:=|\s+)([^\s;,\"]+)",
+            r"(?:^|\s)-H(?:=|\s+)([^\s;,\"]+)",
+            r"(?:^|\s)-H([A-Za-z][A-Za-z0-9+.-]*://[^\s;,\"]+)",
+        )
+        for pattern in host_patterns:
+            hosts.extend(re.findall(pattern, service_text))
+        normalized_hosts = {value.rstrip("'\"") for value in hosts}
+        if normalized_hosts != {"fd://"}:
+            errors.append("Docker service must use exactly the reviewed fd:// endpoint")
+
+        # Inspect only actual [Socket] listener directives.  Unit metadata can
+        # legitimately include documentation URLs (for example Docker CE's
+        # `Documentation=https://docs.docker.com`), which are not a daemon
+        # listener and must not be confused with one.  Any additional
+        # Listen* directive, including a TCP/IP listener, is rejected.
+        socket_section = re.search(
+            r"(?ms)^\[Socket\]\s*$\n(.*?)(?=^\[|\Z)", socket_unit
+        )
+        listener_directives = (
+            re.findall(
+                r"(?m)^\s*(Listen[A-Za-z]+)\s*=\s*([^\s#]+)",
+                socket_section.group(1),
+            )
+            if socket_section
+            else []
+        )
+        if listener_directives != [("ListenStream", "/run/docker.sock")]:
+            errors.append("Docker socket must define exactly ListenStream=/run/docker.sock")
+
+        # `systemctl cat` is input text; confirm systemd's resolved listener
+        # metadata too, so a source/runtime discrepancy cannot be adopted.
+        resolved_listeners = [
+            line.partition("=")[2].strip()
+            for line in socket_show.splitlines()
+            if line.startswith("Listen=")
+        ]
+        if resolved_listeners != ["/run/docker.sock (Stream)"]:
+            errors.append("Docker socket resolved listener is not exactly /run/docker.sock (Stream)")
+        if socket_properties.get("Id") != "docker.socket":
+            errors.append("Docker socket identity is not canonical")
+        if set(socket_properties.get("Triggers", "").split()) != {"docker.service"}:
+            errors.append("Docker socket does not exclusively trigger docker.service")
+        if "docker.service" not in set(socket_properties.get("RequiredBy", "").split()):
+            errors.append("Docker socket is not required by docker.service")
+        if socket_properties.get("Accept") != "no":
+            errors.append("Docker socket must not accept per-connection services")
+        if socket_properties.get("SocketUser") != "root":
+            errors.append("Docker socket user is not root")
+        if socket_properties.get("SocketGroup") != "docker":
+            errors.append("Docker socket group is not docker")
+        if socket_properties.get("SocketMode") != "0660":
+            errors.append("Docker socket mode is not 0660")
+        if socket_properties.get("DirectoryMode") != "0755":
+            errors.append("Docker socket directory mode is not 0755")
+        if socket_properties.get("FragmentPath") != "/usr/lib/systemd/system/docker.socket":
+            errors.append("Docker socket does not use the reviewed vendor fragment")
+        if socket_properties.get("DropInPaths", ""):
+            errors.append("Docker socket has unreviewed drop-ins")
+
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+    # Keep systemd show output off the process argv: it can include
+    # environment values, whereas this validator only needs a private input
+    # channel.
+    stdin: >-
+      {{ {
+           'service_unit': aigw_docker_systemd_unit.stdout | default(''),
+           'service_show': aigw_docker_systemd_show.stdout | default(''),
+           'socket_unit': aigw_docker_socket_unit.stdout | default(''),
+           'socket_show': aigw_docker_socket_show.stdout | default('')
+         } | to_json }}
+    stdin_add_newline: false
+  changed_when: false
+  when:
+    - aigw_docker_systemd_unit_installed | bool
+    - aigw_docker_socket_unit_installed | bool
+    - aigw_docker_systemd_unit.rc | default(1) == 0
+    - aigw_docker_systemd_show.rc | default(1) == 0
+    - aigw_docker_socket_unit.rc | default(1) == 0
+    - aigw_docker_socket_show.rc | default(1) == 0
+  no_log: true
+
+- name: Preflight — enforce the Docker Unix-socket privilege boundary
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import errno
+        import grp
+        import os
+        import pwd
+        import shutil
+        import stat
+        import subprocess
+        import sys
+
+        socket_active = sys.argv[1] == "true"
+        errors = []
+        try:
+            docker_group = grp.getgrnam("docker")
+        except KeyError:
+            raise SystemExit("Docker socket group does not exist")
+
+        nonroot_members = sorted(
+            member for member in docker_group.gr_mem if member != "root"
+        )
+        primary_members = sorted(
+            account.pw_name
+            for account in pwd.getpwall()
+            if account.pw_gid == docker_group.gr_gid and account.pw_uid != 0
+        )
+        if nonroot_members or primary_members:
+            errors.append("Docker group grants daemon access to non-root local accounts")
+
+        socket_path = "/run/docker.sock"
+        try:
+            metadata = os.lstat(socket_path)
+        except FileNotFoundError:
+            if socket_active:
+                errors.append("docker.socket is active but /run/docker.sock is absent")
+        except OSError as error:
+            errors.append("cannot inspect /run/docker.sock: " + str(error))
+        else:
+            if not socket_active:
+                errors.append("/run/docker.sock exists while docker.socket is inactive")
+            if not stat.S_ISSOCK(metadata.st_mode):
+                errors.append("/run/docker.sock is not a Unix socket")
+            if metadata.st_uid != 0 or metadata.st_gid != docker_group.gr_gid:
+                errors.append("/run/docker.sock is not owned by root:docker")
+            if stat.S_IMODE(metadata.st_mode) != 0o660:
+                errors.append("/run/docker.sock mode is not 0660")
+            matchpathcon = shutil.which("matchpathcon", path="/usr/sbin:/usr/bin:/sbin:/bin")
+            if not matchpathcon:
+                errors.append("cannot inspect Docker socket SELinux context")
+            else:
+                expected_context = subprocess.run(
+                    [matchpathcon, "-n", socket_path],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+                try:
+                    actual_context = os.getxattr(
+                        socket_path, "security.selinux", follow_symlinks=False,
+                    ).decode("utf-8", errors="strict").rstrip("\x00")
+                except OSError as error:
+                    errors.append("cannot read Docker socket SELinux context: " + str(error))
+                else:
+                    if expected_context.returncode or actual_context != expected_context.stdout.strip():
+                        errors.append("/run/docker.sock has an unexpected SELinux context")
+            try:
+                os.getxattr(
+                    socket_path, "system.posix_acl_access", follow_symlinks=False,
+                )
+            except OSError as error:
+                if error.errno not in {errno.ENODATA, errno.ENOTSUP}:
+                    errors.append("cannot inspect Docker socket POSIX ACL: " + str(error))
+            else:
+                errors.append("/run/docker.sock has an unreviewed POSIX ACL")
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - "{{ 'true' if (aigw_docker_systemd_socket_active.rc | default(1) == 0) else 'false' }}"
+  changed_when: false
+  when: aigw_docker_socket_unit_installed | bool
+
+- name: Preflight — require an active Docker service to be owned by the reviewed local systemd endpoint
+  ansible.builtin.assert:
+    that:
+      - >-
+        not ((aigw_docker_systemd_service_active.rc | default(1)) == 0) or
+        (
+          (aigw_docker_systemd_unit_installed | bool) and
+          (aigw_docker_socket_unit_installed | bool) and
+          (aigw_docker_systemd_service_active.rc | default(1) == 0) and
+          (aigw_docker_systemd_socket_active.rc | default(1) == 0) and
+          (aigw_docker_systemd_unit.rc | default(1) == 0) and
+          (aigw_docker_systemd_show.rc | default(1) == 0) and
+          (aigw_docker_socket_unit.rc | default(1) == 0) and
+          (aigw_docker_socket_show.rc | default(1) == 0)
+        )
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: a local Docker service is active but is
+      not demonstrably owned by the reviewed docker.service/docker.socket
+      local-Unix-endpoint contract. Stop manually launched/unknown daemons and
+      remove unreviewed endpoint state before this dedicated host converge.
+
 - name: Preflight — record conflicting Docker systemd flags
   ansible.builtin.set_fact:
     aigw_docker_systemd_conflicts: >-
@@ -346,6 +985,9 @@
     that:
       - not (aigw_docker_systemd_unit_installed | bool) or aigw_docker_systemd_unit.rc == 0
       - not (aigw_docker_systemd_unit_installed | bool) or aigw_docker_systemd_show.rc == 0
+      - not (aigw_docker_systemd_unit_installed | bool) or aigw_docker_socket_unit_installed | bool
+      - not (aigw_docker_socket_unit_installed | bool) or aigw_docker_socket_unit.rc == 0
+      - not (aigw_docker_socket_unit_installed | bool) or aigw_docker_socket_show.rc == 0
       - aigw_docker_systemd_conflicts.errors | length == 0
       - aigw_docker_systemd_conflicts.flags | length == 0
       - aigw_docker_systemd_conflicts.indirect | length == 0
@@ -355,6 +997,90 @@
       daemon settings that conflict with the reviewed data-root, firewall,
       logging, address-pool, or SELinux contract, or an unreviewed DOCKER_OPTS
       indirection.
+
+# Do not connect to /run/docker.sock until the systemd provenance, endpoint,
+# Unix-socket privilege, and daemon-option checks above have passed.  A Docker
+# CLI request can otherwise socket-activate an unreviewed daemon merely by
+# trying to determine whether it is running.
+- name: Preflight — inspect an already-active reviewed Docker daemon without socket activation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/env
+      - -u
+      - DOCKER_CONFIG
+      - -u
+      - DOCKER_CONTEXT
+      - -u
+      - DOCKER_HOST
+      - "{{ aigw_docker_cli_resolved.stdout | trim }}"
+      - --host
+      - unix:///run/docker.sock
+      - info
+      - --format=json
+  register: aigw_docker_info
+  changed_when: false
+  failed_when: false
+  when:
+    - aigw_docker_cli.rc == 0
+    - aigw_docker_systemd_service_active.rc | default(1) == 0
+  no_log: true
+
+- name: Preflight — record whether the reviewed Docker daemon is active
+  ansible.builtin.set_fact:
+    aigw_docker_daemon_active: >-
+      {{
+        (aigw_docker_cli.rc == 0) and
+        (aigw_docker_systemd_service_active.rc | default(1) == 0) and
+        (aigw_docker_info.rc | default(1) == 0)
+      }}
+
+- name: Preflight — require an already-active reviewed Docker service to answer the local API
+  ansible.builtin.assert:
+    that:
+      - >-
+        (aigw_docker_systemd_service_active.rc | default(1) != 0) or
+        (aigw_docker_info.rc | default(1) == 0)
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: docker.service was already active but
+      the reviewed local Unix API could not be inspected. Do not classify a
+      live daemon as inactive or change its configuration blindly.
+
+# Docker plugins are daemon-wide code/configuration. A dedicated gateway host
+# models no plugins, so even a disabled retained plugin is an adoption hazard
+# rather than harmless empty Docker state.
+- name: Preflight — inventory installed Docker plugins on the reviewed local daemon
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/env
+      - -u
+      - DOCKER_CONFIG
+      - -u
+      - DOCKER_CONTEXT
+      - -u
+      - DOCKER_HOST
+      - "{{ aigw_docker_cli_resolved.stdout | trim }}"
+      - --host
+      - unix:///run/docker.sock
+      - plugin
+      - ls
+      - --format
+      - "{{ '{{json .}}' }}"
+  register: aigw_docker_plugins
+  changed_when: false
+  when: aigw_docker_daemon_active | bool
+  no_log: true
+
+- name: Preflight — require the dedicated Docker host to have no plugins
+  ansible.builtin.assert:
+    that:
+      - aigw_docker_plugins.stdout_lines | reject('equalto', '') | list | length == 0
+    quiet: true
+    fail_msg: >-
+      Refusing existing-host adoption: the dedicated AI Gateway Docker host
+      must not retain Docker plugins. Remove/review every plugin before this
+      platform takes ownership of daemon-wide Docker policy.
+  when: aigw_docker_daemon_active | bool
 
 - name: Preflight — reject unsafe existing ancestors for mutable host paths
   ansible.builtin.command:
@@ -638,12 +1364,24 @@
     fail_msg: >-
       A previous host converge stopped after Docker policy changed but before
       verification promoted its pending marker. Inspect the VM and re-run with
-      aigw_adopt_dedicated_docker_host=true and
-      aigw_adopt_firewalld_state=true to resume deliberately. If the retained
-      managed sshd fragment is present, also set aigw_adopt_ssh_state=true.
-      These acknowledgements are intentionally separate because a partial run
-      may have already written Docker, packet-filter, and SSH host policy.
+      aigw_adopt_dedicated_docker_host=true to resume deliberately after
+      removing/reviewing any retained packet-filter state. If the retained
+      state includes exact AI Gateway firewalld/nftables/DOCKER-USER artifacts,
+      also set aigw_adopt_firewalld_state=true; if the managed sshd fragment
+      is present, also set aigw_adopt_ssh_state=true. These acknowledgements
+      are intentionally separate because a partial run may have already
+      written Docker, firewall, and SSH host policy; arbitrary firewall policy
+      is never silently adopted.
   when: aigw_host_pending_marker_stat.exists | default(false)
+
+# This fact is deliberately set only after the pending marker's ownership,
+# shape, and exact content have been checked and its Docker takeover has been
+# explicitly acknowledged above. Downstream read-only preflights may use it to
+# distinguish this interrupted converge from arbitrary unmarked host state.
+- name: Preflight — record a validated incomplete host ownership contract
+  ansible.builtin.set_fact:
+    aigw_host_pending_marker_valid: >-
+      {{ aigw_host_pending_marker_stat.exists | default(false) | bool }}
 
 - name: Preflight — read an existing Docker daemon configuration without following links
   ansible.builtin.slurp:
@@ -770,7 +1508,7 @@
     aigw_expected_docker_networks: >-
       {{
         aigw_expected_docker_networks +
-        [item | combine({'iprange': item.subnet | regex_replace('\\.0/24$', '.128/25')})]
+        [item | combine({'iprange': item.subnet | replace('.0/24', '.128/25')})]
       }}
   loop: "{{ docker_networks }}"
   loop_control:
@@ -840,6 +1578,7 @@
       - |
         import json
         import ipaddress
+        import os
         import re
         import subprocess
         import sys
@@ -863,6 +1602,169 @@
             containers = json.loads(invoke("inspect", *ids)) if ids else []
             project_ids = set()
             foreign_containers = []
+            docker_socket_mounts = []
+            unapproved_host_root_mounts = []
+            docker_socket_path = "/run/docker.sock"
+
+            def bind_exposes_docker_socket(mount, mounts, seen=frozenset()):
+                if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                    return False
+                if id(mount) in seen:
+                    # A cyclic/malformed nested-mount model cannot be assumed
+                    # to mask the Docker control socket safely.
+                    return True
+                source = mount.get("Source")
+                destination = mount.get("Destination")
+                if (
+                    not isinstance(source, str) or not source.startswith("/")
+                    or not isinstance(destination, str) or not destination.startswith("/")
+                ):
+                    return True
+                # A bind of the exact socket, an alias such as /var/run, or
+                # any parent directory (including /) gives the container
+                # Docker-root-equivalent access. Resolve only the host source
+                # string returned by Docker, never a container-controlled
+                # destination path.
+                try:
+                    source_path = os.path.realpath(source)
+                    if os.path.commonpath([source_path, docker_socket_path]) != source_path:
+                        return False
+                    relative_socket_path = os.path.relpath(
+                        docker_socket_path, source_path
+                    )
+                except (OSError, ValueError):
+                    return True
+                if relative_socket_path == ".." or relative_socket_path.startswith("../"):
+                    return False
+                container_socket_path = os.path.normpath(
+                    os.path.join(destination, relative_socket_path)
+                )
+                if not container_socket_path.startswith("/"):
+                    return True
+                masks = []
+                for candidate in mounts:
+                    if candidate is mount or not isinstance(candidate, dict):
+                        continue
+                    candidate_destination = candidate.get("Destination")
+                    if not isinstance(candidate_destination, str) or not candidate_destination.startswith("/"):
+                        continue
+                    try:
+                        if os.path.commonpath(
+                            [candidate_destination, container_socket_path]
+                        ) == candidate_destination:
+                            masks.append(candidate)
+                    except ValueError:
+                        return True
+                if not masks:
+                    return True
+                # Docker resolves the deepest nested mount. Only tmpfs is a
+                # safe mask here: a named volume can itself be a local bind of
+                # /run, while a nested bind is checked recursively so rebinding
+                # /run cannot evade this gate.
+                effective_mask = max(
+                    masks, key=lambda item: len(item.get("Destination", ""))
+                )
+                if effective_mask.get("Type") == "tmpfs":
+                    return False
+                if effective_mask.get("Type") != "bind":
+                    return True
+                return bind_exposes_docker_socket(
+                    effective_mask, mounts, seen | {id(mount)}
+                )
+
+            def normalized_container_mounts(container):
+                """Add Docker 29 HostConfig.Tmpfs entries missing from Mounts.
+
+                Docker Engine 29 reports configured tmpfs mounts under
+                HostConfig.Tmpfs but omits them from the top-level Mounts list.
+                The latter is otherwise the right source for bind provenance,
+                so synthesize only structurally valid tmpfs entries. A
+                conflicting non-tmpfs mount at the same destination is
+                ambiguous and must fail closed rather than masking a socket.
+                """
+                mounts = container.get("Mounts")
+                host_config = container.get("HostConfig")
+                if (
+                    not isinstance(mounts, list)
+                    or any(not isinstance(mount, dict) for mount in mounts)
+                    or not isinstance(host_config, dict)
+                ):
+                    return None
+                tmpfs = host_config.get("Tmpfs")
+                if tmpfs is None:
+                    return list(mounts)
+                if not isinstance(tmpfs, dict):
+                    return None
+                effective = list(mounts)
+                by_destination = {}
+                for mount in effective:
+                    destination = mount.get("Destination")
+                    if isinstance(destination, str):
+                        by_destination.setdefault(destination, []).append(mount)
+                for destination, options in tmpfs.items():
+                    if (
+                        not isinstance(destination, str)
+                        or not destination.startswith("/")
+                        or destination == "/"
+                        or os.path.normpath(destination) != destination
+                        or not isinstance(options, str)
+                    ):
+                        return None
+                    existing = by_destination.get(destination, [])
+                    if existing:
+                        if any(mount.get("Type") != "tmpfs" for mount in existing):
+                            return None
+                        continue
+                    tmpfs_mount = {
+                        "Type": "tmpfs",
+                        "Destination": destination,
+                    }
+                    effective.append(tmpfs_mount)
+                    by_destination[destination] = [tmpfs_mount]
+                return effective
+
+            def is_host_root_bind(mount):
+                if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                    return False
+                source = mount.get("Source")
+                if not isinstance(source, str) or not source.startswith("/"):
+                    return True
+                try:
+                    return os.path.realpath(source) == "/"
+                except OSError:
+                    return True
+
+            def has_approved_node_exporter_rootfs(container, mounts):
+                labels = (container.get("Config") or {}).get("Labels") or {}
+                if labels.get("com.docker.compose.service") != "node-exporter":
+                    return False
+                if (container.get("Config") or {}).get("User") != "65532:65532":
+                    return False
+                root_binds = [
+                    mount for mount in mounts
+                    if mount.get("Type") == "bind"
+                    and mount.get("Source") == "/"
+                    and mount.get("Destination") == "/host"
+                    and mount.get("RW") is False
+                    and mount.get("Propagation") == "rslave"
+                ]
+                all_host_root_binds = [
+                    mount for mount in mounts if is_host_root_bind(mount)
+                ]
+                run_masks = [
+                    mount for mount in mounts
+                    if mount.get("Type") == "tmpfs"
+                    and mount.get("Destination") == "/host/run"
+                ]
+                tmpfs = (container.get("HostConfig") or {}).get("Tmpfs")
+                return (
+                    len(root_binds) == 1
+                    and len(all_host_root_binds) == 1
+                    and len(run_masks) == 1
+                    and isinstance(tmpfs, dict)
+                    and "/host/run" in tmpfs
+                )
+
             for container in containers:
                 labels = (container.get("Config") or {}).get("Labels") or {}
                 container_id = container.get("Id", "")
@@ -876,6 +1778,18 @@
                     project_ids.add(container_id)
                 else:
                     foreign_containers.append(container_id)
+                mounts = normalized_container_mounts(container)
+                if mounts is None:
+                    # Docker supplied an ambiguous mount model. Treat it as a
+                    # control-socket/root-bind boundary failure rather than
+                    # assuming a malformed entry is harmless.
+                    docker_socket_mounts.append(container_id or "?")
+                    unapproved_host_root_mounts.append(container_id or "?")
+                    continue
+                if any(bind_exposes_docker_socket(mount, mounts) for mount in mounts):
+                    docker_socket_mounts.append(container_id or "?")
+                if any(is_host_root_bind(mount) for mount in mounts) and not has_approved_node_exporter_rootfs(container, mounts):
+                    unapproved_host_root_mounts.append(container_id or "?")
 
             network_ids = invoke("network", "ls", "-q").split()
             networks = json.loads(invoke("network", "inspect", *network_ids)) if network_ids else []
@@ -993,6 +1907,8 @@
                 "swarm_state": (info.get("Swarm") or {}).get("LocalNodeState", "inactive"),
                 "container_count": len(containers),
                 "foreign_containers": sorted(foreign_containers),
+                "docker_socket_mounts": sorted(docker_socket_mounts),
+                "unapproved_host_root_mounts": sorted(unapproved_host_root_mounts),
                 "foreign_networks": foreign_networks,
                 "foreign_volumes": sorted(foreign_volumes),
                 "volume_mismatch": sorted(volume_mismatch),
@@ -1006,13 +1922,14 @@
             print(json.dumps({
                 "error": str(exc), "docker_root": "", "container_count": 0,
                 "selinux_enabled": False, "swarm_state": "unknown",
-                "foreign_containers": [], "foreign_networks": [],
+                "foreign_containers": [], "docker_socket_mounts": [],
+                "unapproved_host_root_mounts": [], "foreign_networks": [],
                 "foreign_volumes": [], "volume_mismatch": [], "retained_expected_volumes": [],
                 "network_mismatch": [], "attached_foreign": [],
                 "bridge_collisions": [],
                 "default_bridge_overlap": [],
             }, sort_keys=True))
-      - "{{ aigw_docker_cli.stdout | trim }}"
+      - "{{ aigw_docker_cli_resolved.stdout | trim }}"
       - "{{ compose_project_name }}"
       - "{{ docker_data_root }}"
       - "{{ stack_dir }}"
@@ -1032,7 +1949,8 @@
         if (aigw_docker_cli.rc == 0 and aigw_docker_info.rc | default(1) == 0)
         else {'error': '', 'docker_root': '', 'container_count': 0,
               'selinux_enabled': false, 'swarm_state': 'inactive',
-              'foreign_containers': [], 'foreign_networks': [],
+              'foreign_containers': [], 'docker_socket_mounts': [],
+              'unapproved_host_root_mounts': [], 'foreign_networks': [],
               'foreign_volumes': [], 'volume_mismatch': [], 'retained_expected_volumes': [],
               'network_mismatch': [], 'attached_foreign': [],
               'bridge_collisions': [],
@@ -1086,6 +2004,8 @@
       - aigw_live_docker_boundary.error | length == 0
       - aigw_live_docker_boundary.docker_root == docker_data_root
       - aigw_live_docker_boundary.foreign_containers | length == 0
+      - aigw_live_docker_boundary.docker_socket_mounts | length == 0
+      - aigw_live_docker_boundary.unapproved_host_root_mounts | length == 0
       - aigw_live_docker_boundary.foreign_networks | length == 0
       - aigw_live_docker_boundary.foreign_volumes | length == 0
       - aigw_live_docker_boundary.volume_mismatch | length == 0

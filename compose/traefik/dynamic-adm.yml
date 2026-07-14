@@ -12,14 +12,39 @@ http:
     admin:
       rule: 'Host(`admin.{{ env "DOMAIN" }}`)'
       entryPoints: [websecure]
-      service: oauth2-proxy    # OIDC gate (role aigw-admins) -> LiteLLM Admin UI
+      # The first-party console owns its OIDC session, performs a live
+      # aigw-admins decision, and requires step-up authentication for writes.
+      service: admin-portal
       tls: {}
     admin-portal:
       rule: 'Host(`admin-portal.{{ env "DOMAIN" }}`)'
       entryPoints: [websecure]
-      # The separate ASGI application performs OIDC, live admin-role checks,
-      # and step-up reauthentication for identity mutations.
+      # Compatibility only. Never establish a second cookie/OIDC origin for
+      # the same console; preserve the path while moving to the canonical host.
+      middlewares: [admin-portal-canonical]
       service: admin-portal
+      tls: {}
+    litellm-admin-docs-deny:
+      rule: 'Host(`litellm-admin.{{ env "DOMAIN" }}`) && (Path(`/openapi.json`) || Path(`/openapi.json/`) || Path(`/docs`) || Path(`/docs/`) || Path(`/redoc`) || Path(`/redoc/`))'
+      priority: 120
+      entryPoints: [websecure]
+      middlewares: [deny-all]
+      service: oauth2-proxy # unreachable — deny-all rejects before the OIDC gate
+      tls: {}
+    litellm-admin-root:
+      rule: 'Host(`litellm-admin.{{ env "DOMAIN" }}`) && Path(`/`)'
+      priority: 110
+      entryPoints: [websecure]
+      middlewares: [litellm-admin-root]
+      service: oauth2-proxy
+      tls: {}
+    litellm-admin:
+      rule: 'Host(`litellm-admin.{{ env "DOMAIN" }}`)'
+      priority: 100
+      entryPoints: [websecure]
+      # LiteLLM's native UI and its supporting control APIs remain behind an
+      # independent Keycloak OIDC gate with the exact aigw-admins role.
+      service: oauth2-proxy
       tls: {}
     grafana:
       rule: 'Host(`grafana.{{ env "DOMAIN" }}`)'
@@ -46,6 +71,21 @@ http:
       entryPoints: [websecure]
       service: keycloak
       tls: {}
+
+  middlewares:
+    deny-all:
+      ipAllowList:
+        sourceRange: ["0.0.0.0/32"]
+    admin-portal-canonical:
+      redirectRegex:
+        regex: '^https://admin-portal\.[^/]+/(.*)$'
+        replacement: 'https://admin.{{ env "DOMAIN" }}/${1}'
+        permanent: true
+    litellm-admin-root:
+      redirectRegex:
+        regex: '^https://litellm-admin\.[^/]+/$'
+        replacement: 'https://litellm-admin.{{ env "DOMAIN" }}/ui'
+        permanent: false
 
   services:
     open-webui:

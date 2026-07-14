@@ -20,6 +20,24 @@ iptables-restore --wait 15 --noflush <<'AIGW_IPV4_RULES'
 {% for net in docker_networks %}
 -A DOCKER-USER -i {{ net.bridge }} -o {{ net.bridge }} -j RETURN
 {% endfor %}
+{% if platform_authoritative_dns_enabled | bool %}
+# Only the three ordinary ADM/internal edge bridges have a route to an
+# upstream resolver. Isolated application bridges are service-discovery-only;
+# excluding net-vendor/net-metrics also prevents multi-homed Envoy from
+# reaching the internal resolver plane through one of its side networks.
+{% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
+-A DOCKER-USER -i {{ net.bridge }} -o br-lab-dns -d {{ lab_dns_ip }}/32 -p udp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ net.bridge }} -o br-lab-dns -d {{ lab_dns_ip }}/32 -p tcp --dport 53 -j RETURN
+{% endfor %}
+# Cross-bridge default-deny below intentionally precedes the generic reply
+# allowance. Preserve that stale-flow protection while admitting only replies
+# to the exact DNS requests allowed above; otherwise the request reaches
+# CoreDNS but every answer is dropped on br-lab-dns -> application bridge.
+{% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
+-A DOCKER-USER -i br-lab-dns -o {{ net.bridge }} -s {{ lab_dns_ip }}/32 -p udp --sport 53 -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+-A DOCKER-USER -i br-lab-dns -o {{ net.bridge }} -s {{ lab_dns_ip }}/32 -p tcp --sport 53 -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+{% endfor %}
+{% endif %}
 {% for net in docker_networks %}
 -A DOCKER-USER -i {{ net.bridge }} -o br+ -j DROP
 -A DOCKER-USER -i br+ -o {{ net.bridge }} -j DROP
@@ -38,7 +56,7 @@ iptables-restore --wait 15 --noflush <<'AIGW_IPV4_RULES'
 # routed transit traffic. Require a managed bridge output plus conntrack's
 # original destination tuple and DNAT state before accepting the flow.
 -A DOCKER-USER -i {{ nic_adm }} -o br+ -s {{ vpn_client_cidr }} -p tcp --dport 443 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth1_ip }}/32 --ctorigdstport 443 -j RETURN
-{% if lab_dns_enabled | bool %}
+{% if platform_authoritative_dns_enabled | bool %}
 -A DOCKER-USER -i {{ nic_adm }} -o br+ -s {{ vpn_client_cidr }} -p udp --dport 53 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth1_ip }}/32 --ctorigdstport 53 -j RETURN
 -A DOCKER-USER -i {{ nic_adm }} -o br+ -s {{ vpn_client_cidr }} -p tcp --dport 53 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth1_ip }}/32 --ctorigdstport 53 -j RETURN
 -A DOCKER-USER -i {{ nic_internal }} -o br+ -s {{ internal_cidr }} -p udp --dport 53 -m conntrack --ctdir ORIGINAL --ctstate DNAT --ctorigdst {{ eth2_ip }}/32 --ctorigdstport 53 -j RETURN
@@ -49,10 +67,24 @@ iptables-restore --wait 15 --noflush <<'AIGW_IPV4_RULES'
 -A DOCKER-USER -i {{ nic_adm }} -j DROP
 -A DOCKER-USER -i {{ nic_internal }} -j DROP
 
-# Original-direction physical egress is identity-pinned. Authorizing the whole
-# 172.28.0.0/24 bridge meant any later attachment inherited internet access.
--A DOCKER-USER -i {{ _egress_net.bridge }} -s {{ envoy_egress_ip }}/32 -d {{ container_dns_server }}/32 -p udp --dport 53 -j RETURN
--A DOCKER-USER -i {{ _egress_net.bridge }} -s {{ envoy_egress_ip }}/32 -d {{ container_dns_server }}/32 -p tcp --dport 53 -j RETURN
+# Routable internal/ADM edge workloads may query only the exact supplied
+# corporate resolver addresses and only through an internal physical leg.
+# Isolated backends never receive an upstream resolver in Compose.
+{% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
+{% for resolver in internal_dns_servers %}
+-A DOCKER-USER -i {{ net.bridge }} -d {{ resolver }}/32 -o {{ nic_adm }} -p udp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ net.bridge }} -d {{ resolver }}/32 -o {{ nic_adm }} -p tcp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ net.bridge }} -d {{ resolver }}/32 -o {{ nic_internal }} -p udp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ net.bridge }} -d {{ resolver }}/32 -o {{ nic_internal }} -p tcp --dport 53 -j RETURN
+{% endfor %}
+{% endfor %}
+
+# Original-direction Internet egress is identity-pinned. No other container
+# may query an Internet resolver or open vendor HTTPS.
+{% for resolver in egress_dns_servers %}
+-A DOCKER-USER -i {{ _egress_net.bridge }} -s {{ envoy_egress_ip }}/32 -d {{ resolver }}/32 -o {{ nic_egress }} -p udp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ _egress_net.bridge }} -s {{ envoy_egress_ip }}/32 -d {{ resolver }}/32 -o {{ nic_egress }} -p tcp --dport 53 -j RETURN
+{% endfor %}
 -A DOCKER-USER -i {{ _egress_net.bridge }} -s {{ envoy_egress_ip }}/32 -o {{ nic_egress }} -p tcp --dport 443 -j RETURN
 {% if cribl_external_export_enabled | bool %}
 -A DOCKER-USER -i {{ _internal_net.bridge }} -s {{ alloy_internal_ip }}/32 -o {{ nic_internal }} -d {{ cribl_otlp_allowed_cidr }} -p tcp --dport {{ cribl_otlp_allowed_port }} -j RETURN

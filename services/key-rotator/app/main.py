@@ -11,6 +11,7 @@ the middleware fails closed regardless. Segmented network placement
 (docs/solution-map.md §3; consumed by the dev-portal admin UI, §1.4/§1.7)
 is defense-in-depth on top of that, not a substitute.
 """
+
 from __future__ import annotations
 
 import hmac
@@ -21,7 +22,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app import health
 from app.config import Settings, get_settings
@@ -37,10 +38,20 @@ from app.identity import (
     KeycloakAdmin,
 )
 from app.otel import setup_otel
+from app.provider_auth import (
+    AnthropicWifEnrollment,
+    ProviderConflict,
+    ProviderError,
+    ProviderNotFound,
+    ProviderRegistry,
+    ProviderUnavailable,
+)
 from app.scheduler import RotationScheduler
-from app.vault_client import VaultClient
+from app.vault_client import VaultClient, VaultError
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
 logger = logging.getLogger("key_rotator.main")
 
 app = FastAPI(title="key-rotator", version="1.0.0")
@@ -84,6 +95,12 @@ class IdentityGroupCreate(BaseModel):
     capabilities: list[str] = Field(min_length=1, max_length=3)
 
 
+class ProviderLifecycleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation: str = Field(min_length=1, max_length=64)
+
+
 def _identity_http_error(exc: IdentityError) -> HTTPException:
     if isinstance(exc, IdentityNotFound):
         return HTTPException(status_code=404, detail=str(exc))
@@ -92,6 +109,18 @@ def _identity_http_error(exc: IdentityError) -> HTTPException:
     # IdentityError messages are deliberately redacted at their Keycloak and
     # Vault boundaries. Treat upstream/control-plane failures as Bad Gateway.
     return HTTPException(status_code=502, detail=str(exc))
+
+
+def _provider_http_error(exc: ProviderError) -> HTTPException:
+    if isinstance(exc, ProviderNotFound):
+        return HTTPException(status_code=404, detail="provider is not supported")
+    if isinstance(exc, ProviderConflict):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ProviderUnavailable):
+        return HTTPException(
+            status_code=502, detail="provider control plane unavailable"
+        )
+    return HTTPException(status_code=502, detail="provider operation failed")
 
 
 @app.middleware("http")
@@ -114,7 +143,9 @@ async def internal_auth_middleware(request: Request, call_next):
     ):
         return JSONResponse(
             status_code=503,
-            content={"detail": "service auth not configured (ROTATOR_INTERNAL_TOKEN unset/placeholder)"},
+            content={
+                "detail": "service auth not configured (ROTATOR_INTERNAL_TOKEN unset/placeholder)"
+            },
             headers={"Cache-Control": "no-store"},
         )
 
@@ -167,10 +198,17 @@ async def on_startup() -> None:
     await vault.connect_with_retry(max_wait_seconds=60)
     state["vault"] = vault
 
-    state["identity"] = KeycloakAdmin(settings, vault, db)
-
     litellm = LiteLLMClient(settings)
     state["litellm"] = litellm
+
+    # Group removal must revoke static LiteLLM portal keys at the authoritative
+    # identity mutation boundary, not only in the browser admin portal.
+    state["identity"] = KeycloakAdmin(
+        settings,
+        vault,
+        db,
+        portal_key_revoker=litellm.revoke_portal_project_keys,
+    )
 
     setup_otel(settings, app)
 
@@ -182,9 +220,21 @@ async def on_startup() -> None:
     }
     state["drivers"] = drivers
 
-    scheduler = RotationScheduler(settings, db, vault, litellm, drivers)
+    scheduler = RotationScheduler(
+        settings,
+        db,
+        vault,
+        litellm,
+        drivers,
+        identity=state["identity"],
+    )
     state["scheduler"] = scheduler
     await scheduler.reload()
+    state["provider_registry"] = ProviderRegistry(settings, vault, db, scheduler)
+
+    # Seed this before the immediate reconciliation job is armed so health
+    # cannot report green before its first authoritative Keycloak/LiteLLM pass.
+    health.register_pending("identity.portal_key_reconciliation")
     scheduler.start()
 
     # Seed expected health subsystems in a "pending" (ok=False) state so
@@ -243,6 +293,21 @@ async def readyz() -> JSONResponse:
     return JSONResponse(status_code=200 if ready else 503, content={"ready": ready})
 
 
+@app.get("/vault/public-status")
+async def vault_public_status() -> dict[str, bool]:
+    """Expose only exact public Vault seal state to the admin application."""
+
+    vault: Optional[VaultClient] = state.get("vault")
+    if vault is None:
+        raise HTTPException(status_code=503, detail="Vault public status unavailable")
+    try:
+        return vault.public_status()
+    except VaultError as exc:
+        raise HTTPException(
+            status_code=503, detail="Vault public status unavailable"
+        ) from exc
+
+
 @app.get("/status")
 async def get_status() -> list[dict[str, Any]]:
     """Per-vendor summary: enabled, interval, last rotation (from
@@ -299,14 +364,46 @@ async def put_settings(vendor: str, body: SettingsUpdate) -> dict[str, Any]:
     if vendor not in drivers:
         raise HTTPException(status_code=404, detail=f"unknown vendor '{vendor}'")
 
-    await db.upsert_settings(
-        vendor,
-        enabled=body.enabled,
-        interval_seconds=body.interval_seconds,
-        grace_seconds=body.grace_seconds,
-        config=body.config,
-    )
-    await scheduler.reload()
+    async def persist_settings() -> None:
+        await db.upsert_settings(
+            vendor,
+            enabled=body.enabled,
+            interval_seconds=body.interval_seconds,
+            grace_seconds=body.grace_seconds,
+            config=body.config,
+        )
+        await scheduler.reload()
+
+    if vendor == "anthropic":
+        # Anthropic WIF has a typed lifecycle API. The legacy generic settings
+        # route may tune cadence only; it must not bypass explicit enrollment,
+        # disable confirmation, or the adapter's fixed Vault/network inputs.
+        async with db.rotation_lock(vendor) as acquired:
+            if not acquired:
+                raise HTTPException(
+                    status_code=409,
+                    detail="another Anthropic credential lifecycle operation is active",
+                )
+            current = await db.get_settings(vendor)
+            if not isinstance(current, dict) or not isinstance(
+                current.get("enabled"), bool
+            ):
+                raise HTTPException(
+                    status_code=502, detail="provider control plane unavailable"
+                )
+            if body.config is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Anthropic WIF configuration is managed by /providers/anthropic",
+                )
+            if body.enabled is not current["enabled"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Anthropic WIF enable/disable is managed by /providers/anthropic",
+                )
+            await persist_settings()
+    else:
+        await persist_settings()
     # Audit the control-plane change without copying arbitrary config values
     # (which may be secrets) into a second durable store.
     audit_detail = json.dumps(
@@ -335,17 +432,87 @@ async def rotate_now(vendor: str) -> dict[str, Any]:
     if vendor not in drivers:
         raise HTTPException(status_code=404, detail=f"unknown vendor '{vendor}'")
 
+    if vendor == "anthropic":
+        db: Database = state["db"]
+        row = await db.get_settings(vendor)
+        if not isinstance(row, dict) or row.get("enabled") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail="Anthropic WIF refresh is disabled",
+            )
+        registry: ProviderRegistry = state["provider_registry"]
+        try:
+            provider = await registry.status(vendor)
+        except ProviderError as exc:
+            raise _provider_http_error(exc) from exc
+        if not isinstance(provider, dict) or provider.get("state") != "configured":
+            raise HTTPException(
+                status_code=409,
+                detail="Anthropic WIF enrollment is not ready for rotation",
+            )
+
     if not await scheduler.trigger_now(vendor):
         raise HTTPException(
-            status_code=409, detail=f"rotation already in progress for vendor '{vendor}'"
+            status_code=409,
+            detail=f"rotation already in progress for vendor '{vendor}'",
         )
     return {"accepted": True, "vendor": vendor}
 
 
 @app.get("/history")
-async def get_history(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+async def get_history(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     db: Database = state["db"]
     return await db.history(limit=limit)
+
+
+# --- Provider authentication control plane --------------------------------
+# The only registered adapter is Anthropic WIF. These routes intentionally do
+# not expose a generic provider/config surface: callers cannot choose network
+# destinations, Vault paths, private keys, or arbitrary configuration fields.
+
+
+@app.get("/providers/anthropic")
+async def anthropic_provider_status() -> dict[str, Any]:
+    registry: ProviderRegistry = state["provider_registry"]
+    try:
+        return await registry.status("anthropic")
+    except ProviderError as exc:
+        raise _provider_http_error(exc) from exc
+
+
+@app.put("/providers/anthropic")
+async def configure_anthropic_provider(
+    body: AnthropicWifEnrollment,
+) -> dict[str, Any]:
+    registry: ProviderRegistry = state["provider_registry"]
+    try:
+        return await registry.configure("anthropic", body)
+    except ProviderError as exc:
+        raise _provider_http_error(exc) from exc
+
+
+@app.post("/providers/anthropic/disable")
+async def disable_anthropic_provider(
+    body: ProviderLifecycleRequest,
+) -> dict[str, Any]:
+    registry: ProviderRegistry = state["provider_registry"]
+    try:
+        return await registry.disable("anthropic", body.confirmation)
+    except ProviderError as exc:
+        raise _provider_http_error(exc) from exc
+
+
+@app.delete("/providers/anthropic")
+async def delete_anthropic_provider(
+    body: ProviderLifecycleRequest,
+) -> dict[str, Any]:
+    registry: ProviderRegistry = state["provider_registry"]
+    try:
+        return await registry.delete("anthropic", body.confirmation)
+    except ProviderError as exc:
+        raise _provider_http_error(exc) from exc
 
 
 # --- Keycloak identity control plane ---------------------------------------
@@ -374,6 +541,18 @@ async def identity_authorization(user_id: str) -> dict[str, bool]:
     try:
         return {"admin": await identity.user_has_admin_role(user_id)}
     except IdentityError as exc:
+        vault: Optional[VaultClient] = state.get("vault")
+        if vault is not None:
+            try:
+                vault_status = vault.public_status()
+            except VaultError:
+                vault_status = None
+            if vault_status == {"initialized": True, "sealed": True}:
+                # This route reads its controller credential from Vault before
+                # it can contact Keycloak. An exact sealed state therefore
+                # identifies the blocking boundary without exposing the
+                # wrapped Vault or identity diagnostic.
+                raise HTTPException(status_code=423, detail="vault_sealed") from exc
         raise _identity_http_error(exc) from exc
 
 

@@ -11,9 +11,11 @@ atomically records one active generation per service in a root-only,
 non-secret rollback manifest.  A failed multi-service operation can leave only
 additional immutable tags; it can never move a tag named by the prior manifest.
 
-No shell is used.  A first build is represented explicitly and is accepted
-only when neither a service container, desired image, nor stale rollback tag
-exists.  An unchanged converge never calls this helper.
+No shell is used. A first build is represented explicitly. A clean initial
+deployment may begin from an exact plan-matching preseeded image, but only
+before a completed build-input receipt exists and without a prior rollback
+manifest. Once a service is recorded in that receipt, a missing authoritative
+container remains fail-closed. An unchanged converge never calls this helper.
 """
 
 from __future__ import annotations
@@ -48,7 +50,29 @@ FIXED_DOCKER_ENV = {
     "PATH": FIXED_PATH,
 }
 MANIFEST_NAME = "compose-build-rollbacks.json"
+BUILD_INPUTS_NAME = "compose-build-inputs.json"
 ROLLBACK_SCHEMA = 2
+BUILD_INPUTS_SCHEMA = 1
+KEY_ROTATOR_SERVICE = "key-rotator"
+VAULT_SERVICE = "vault"
+KEY_ROTATOR_READINESS_HEALTHCHECK = [
+    "CMD",
+    "python3",
+    "-c",
+    (
+        "import urllib.request; "
+        "urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3).read()"
+    ),
+]
+KEY_ROTATOR_DEPENDENCY_PROBE = (
+    "import json,urllib.error,urllib.request;"
+    "h=urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3);"
+    "d=json.loads(h.read(4097));"
+    "assert h.status==200 and d.get('ok') is True;"
+    "\ntry: urllib.request.urlopen('http://127.0.0.1:8080/readyz',timeout=3)\n"
+    "except urllib.error.HTTPError as e: assert e.code==503\n"
+    "else: raise AssertionError('key-rotator unexpectedly ready')"
+)
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -285,6 +309,94 @@ class DockerClient:
         if result.returncode != 0:
             raise PreserveError(f"Docker failed to create rollback tag {target_reference}")
 
+    def prove_key_rotator_dependency_gate(
+        self,
+        project: str,
+        identifier: str,
+        container: dict[str, Any],
+    ) -> bool:
+        """Prove the sole accepted unhealthy source is blocked by sealed Vault.
+
+        Older deployments used strict ``/readyz`` as Docker health for the
+        rotator, so an intentionally sealed Vault made a sound running image
+        impossible to preserve before an upgrade.  This migration exception
+        accepts only that exact historical probe, proves rotator liveness and
+        expected unready status from inside the container, then independently
+        proves the one Compose-owned Vault is either fresh or sealed.  No
+        caller-controlled command, service, URL, or status is accepted.
+        """
+
+        config = container.get("Config")
+        healthcheck = config.get("Healthcheck") if isinstance(config, dict) else None
+        if (
+            not isinstance(healthcheck, dict)
+            or healthcheck.get("Test") != KEY_ROTATOR_READINESS_HEALTHCHECK
+        ):
+            return False
+        rotator_probe = self._run(
+            [
+                "container",
+                "exec",
+                identifier,
+                "python3",
+                "-c",
+                KEY_ROTATOR_DEPENDENCY_PROBE,
+            ]
+        )
+        if rotator_probe.returncode != 0 or rotator_probe.stdout.strip():
+            return False
+
+        vault_identifiers = self.list_service_containers(project, VAULT_SERVICE)
+        if len(vault_identifiers) != 1:
+            return False
+        vault_id = vault_identifiers[0]
+        vault = self.inspect_container(vault_id)
+        vault_config = vault.get("Config")
+        vault_labels = (
+            vault_config.get("Labels") if isinstance(vault_config, dict) else None
+        )
+        vault_state = vault.get("State")
+        if (
+            vault.get("Id") != vault_id
+            or not isinstance(vault_labels, dict)
+            or vault_labels.get("com.docker.compose.project") != project
+            or vault_labels.get("com.docker.compose.service") != VAULT_SERVICE
+            or vault_labels.get("com.docker.compose.oneoff") != "False"
+            or vault_labels.get("com.docker.compose.container-number") != "1"
+            or not isinstance(vault_state, dict)
+            or vault_state.get("Running") is not True
+            or vault_state.get("Status") != "running"
+            or vault_state.get("Restarting") is True
+            or vault_state.get("Dead") is True
+        ):
+            return False
+        status = self._run(
+            [
+                "container",
+                "exec",
+                vault_id,
+                "vault",
+                "status",
+                "-address=http://127.0.0.1:8200",
+                "-format=json",
+            ]
+        )
+        if status.returncode not in (0, 2) or len(status.stdout) > 64 * 1024:
+            return False
+        try:
+            document = json.loads(status.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(document, dict):
+            return False
+        initialized = document.get("initialized")
+        sealed = document.get("sealed")
+        return (
+            isinstance(initialized, bool)
+            and isinstance(sealed, bool)
+            and (not initialized or sealed)
+        )
+
 
 def _validate_state_directory(stack: Path) -> Path:
     if not stack.is_absolute():
@@ -331,6 +443,29 @@ def _validate_existing_manifest(path: Path) -> os.stat_result | None:
         raise PreserveError("existing rollback manifest mode must be 0600")
     if metadata.st_size > MAX_MANIFEST_BYTES:
         raise PreserveError("existing rollback manifest exceeds the 4 MiB bound")
+    return metadata
+
+
+def _validate_existing_build_inputs(path: Path) -> os.stat_result | None:
+    """Validate the successful-build receipt inode before it is trusted."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise PreserveError(
+            "existing build-input receipt must be a single-link regular file"
+        )
+    if (metadata.st_uid, metadata.st_gid) != (ROOT_UID, ROOT_GID):
+        raise PreserveError("existing build-input receipt must be owned by root:root")
+    if _mode(metadata) != MANIFEST_MODE:
+        raise PreserveError("existing build-input receipt mode must be 0600")
+    if metadata.st_size > MAX_MANIFEST_BYTES:
+        raise PreserveError("existing build-input receipt exceeds the 4 MiB bound")
     return metadata
 
 
@@ -398,11 +533,13 @@ def _validated_manifest_record(
     return dict(raw_record)
 
 
-def _load_existing_manifest(path: Path, project: str) -> dict[str, dict[str, object]]:
-    """Read and validate the whole prior per-service generation before mutation."""
+def _load_existing_manifest_with_presence(
+    path: Path, project: str
+) -> tuple[bool, dict[str, dict[str, object]]]:
+    """Read the whole prior rollback inventory and retain its presence bit."""
     metadata = _validate_existing_manifest(path)
     if metadata is None:
-        return {}
+        return False, {}
 
     descriptor: int | None = None
     try:
@@ -457,7 +594,98 @@ def _load_existing_manifest(path: Path, project: str) -> dict[str, dict[str, obj
                 raise PreserveError("existing rollback manifest reuses a rollback reference")
             rollback_references.add(rollback_image)
         records[service] = record
-    return records
+    return True, records
+
+
+def _load_existing_manifest(path: Path, project: str) -> dict[str, dict[str, object]]:
+    """Read and validate the whole prior per-service generation before mutation."""
+    return _load_existing_manifest_with_presence(path, project)[1]
+
+
+def _load_completed_build_inputs(
+    path: Path, project: str
+) -> tuple[bool, dict[str, dict[str, str | None]]]:
+    """Read the root-only finalized build receipt used to close first deploy.
+
+    The planner intentionally treats a missing or malformed prior input receipt
+    as an empty hint so it can plan a repair. This preservation boundary is
+    different: it must distinguish a clean first deploy from historical state,
+    so any present receipt is a strict security input and is never repaired or
+    treated as absent.
+    """
+    metadata = _validate_existing_build_inputs(path)
+    if metadata is None:
+        return False, {}
+
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or opened.st_nlink != 1
+            or not stat.S_ISREG(opened.st_mode)
+            or (opened.st_uid, opened.st_gid) != (ROOT_UID, ROOT_GID)
+            or _mode(opened) != MANIFEST_MODE
+            or opened.st_size > MAX_MANIFEST_BYTES
+        ):
+            raise PreserveError("build-input receipt changed while it was opened")
+        payload = b""
+        while len(payload) <= MAX_MANIFEST_BYTES:
+            chunk = os.read(
+                descriptor, min(65536, MAX_MANIFEST_BYTES + 1 - len(payload))
+            )
+            if not chunk:
+                break
+            payload += chunk
+        if len(payload) > MAX_MANIFEST_BYTES:
+            raise PreserveError("existing build-input receipt exceeds the 4 MiB bound")
+    except OSError as exc:
+        raise PreserveError(
+            f"cannot safely read existing build-input receipt: {exc}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    try:
+        decoded = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PreserveError(
+            "existing build-input receipt is not valid UTF-8 JSON"
+        ) from exc
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {"schema", "services"}
+        or decoded.get("schema") != BUILD_INPUTS_SCHEMA
+        or not isinstance(decoded.get("services"), dict)
+        or len(decoded["services"]) > MAX_SERVICES
+    ):
+        raise PreserveError("existing build-input receipt envelope is invalid")
+
+    if not decoded["services"]:
+        return True, {}
+
+    try:
+        records = validate_plan(
+            {
+                "manifest": decoded,
+                "services": sorted(decoded["services"]),
+            },
+            project,
+        )
+    except PreserveError as exc:
+        raise PreserveError(
+            f"existing build-input receipt records are invalid: {exc}"
+        ) from exc
+    completed: dict[str, dict[str, str | None]] = {}
+    for record in records:
+        if record["planned_image_id"] is None:
+            raise PreserveError(
+                "existing build-input receipt contains a missing image ID"
+            )
+        completed[str(record["service"])] = record
+    return True, completed
 
 
 def _require_recorded_rollback_tags(
@@ -554,7 +782,16 @@ def _container_image(
     ):
         raise PreserveError(f"service={service} container has restarted")
     health = state.get("Health")
-    if not isinstance(health, dict) or health.get("Status") != "healthy":
+    healthy = isinstance(health, dict) and health.get("Status") == "healthy"
+    dependency_gated = (
+        service == KEY_ROTATOR_SERVICE
+        and isinstance(health, dict)
+        and health.get("Status") == "unhealthy"
+        and docker.prove_key_rotator_dependency_gate(
+            project, identifier, container
+        )
+    )
+    if not healthy and not dependency_gated:
         raise PreserveError(f"service={service} container is not healthy")
     image_id = container.get("Image")
     if not isinstance(image_id, str) or IMAGE_ID_RE.fullmatch(image_id) is None:
@@ -573,10 +810,17 @@ def preserve_rollbacks(
     planned = validate_plan(raw_plan, project)
     state_dir = _validate_state_directory(stack)
     manifest_path = state_dir / MANIFEST_NAME
+    build_inputs_path = state_dir / BUILD_INPUTS_NAME
     # This validates the destination inode and every retained record before a
     # Docker tag is created. An unsafe or malformed prior file is never repaired
     # by overwriting it as a side effect of an image mutation.
-    existing_records = _load_existing_manifest(manifest_path, project)
+    rollback_manifest_exists, existing_records = _load_existing_manifest_with_presence(
+        manifest_path, project
+    )
+    (
+        completed_build_inputs_exist,
+        completed_builds,
+    ) = _load_completed_build_inputs(build_inputs_path, project)
     docker.ensure_ready()
 
     # The file is an inventory of one generation per service, not merely the
@@ -606,16 +850,34 @@ def preserve_rollbacks(
                 existing_record is not None
                 and existing_record["status"] == "first-build"
                 and existing_record["desired_image"] == desired_image
+                and service not in completed_builds
             )
             if desired_id != planned_id:
                 raise PreserveError(
                     f"service={service} desired tag no longer matches its build plan"
                 )
-            if not is_first_build_retry and (
-                existing_record is not None
-                or planned_id is not None
-                or desired_id is not None
-            ):
+            # Offline clean deploys seed reviewed custom images before the
+            # first Compose build. An exact planned tag alone is not proof of
+            # an old runtime generation in that narrow state. Once a completed
+            # receipt exists, only a newly introduced service omitted from that
+            # receipt can begin its first build. If the receipt is absent, an
+            # existing rollback manifest (even empty) proves this is not a
+            # clean deployment unless its explicit first-build retry record
+            # above still authorizes the retry.
+            may_begin_first_build = (
+                existing_record is None
+                and (
+                    (
+                        not completed_build_inputs_exist
+                        and not rollback_manifest_exists
+                    )
+                    or (
+                        completed_build_inputs_exist
+                        and service not in completed_builds
+                    )
+                )
+            )
+            if not is_first_build_retry and not may_begin_first_build:
                 raise PreserveError(
                     f"service={service} has image state but no authoritative container"
                 )

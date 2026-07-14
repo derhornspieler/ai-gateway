@@ -2,7 +2,7 @@ $ORIGIN aigw.internal.
 $TTL 60
 
 @       IN SOA  dns.aigw.internal. hostmaster.aigw.internal. (
-                    2026071302 ; serial
+                    2026071303 ; serial
                     3600       ; refresh
                     900        ; retry
                     604800     ; expire
@@ -15,6 +15,7 @@ $TTL 60
 dns          IN A 10.8.10.10
 admin        IN A 10.8.10.10
 admin-portal IN A 10.8.10.10
+litellm-admin IN A 10.8.10.10
 grafana      IN A 10.8.10.10
 prometheus   IN A 10.8.10.10
 vault        IN A 10.8.10.10

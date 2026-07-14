@@ -4,6 +4,22 @@
 # configuration and a host can retain nft/DOCKER-USER state after a previous
 # service; neither may be implicitly claimed by the AI Gateway converge.
 
+- name: Preflight — derive the exact fail-closed Rocky 9 lab reset handoff
+  ansible.builtin.set_fact:
+    aigw_lab_reset_handoff_drop_bindings: >-
+      {{
+        [
+          {'interface': nic_egress, 'zone': 'aigw-egress'},
+          {'interface': nic_internal, 'zone': 'aigw-internal'}
+        ]
+        if (
+          (deployment_profile | default('')) == 'rocky9-lab'
+          and (aigw_lab_reset_handoff_drop_interfaces | default([]) | length) == 2
+          and (aigw_lab_reset_handoff_drop_interfaces | default([]) | sort) == ([nic_egress, nic_internal] | sort)
+        )
+        else []
+      }}
+
 - name: Preflight — establish firewalld, NetworkManager, and packet-filter ownership before host mutation
   ansible.builtin.command:
     argv:
@@ -12,23 +28,51 @@
       - -c
       - |
         import json
+        import hashlib
         import os
         import re
         import shutil
         import stat
         import subprocess
         import sys
+        import xml.etree.ElementTree as ET
 
         zones = json.loads(sys.argv[1])
         has_marker = sys.argv[2] == "true"
-        explicit_adoption = sys.argv[3] == "true"
-        authorized = has_marker or explicit_adoption
+        has_valid_pending_marker = sys.argv[3] == "true"
+        firewall_adoption = sys.argv[4] == "true"
+        reset_drop_bindings = json.loads(sys.argv[5])
         managed_zones = {entry["zone"] for entry in zones}
         interfaces = {
             interface: entry["zone"]
             for entry in zones
             for interface in entry.get("interfaces", [])
         }
+        if (
+            not isinstance(reset_drop_bindings, list)
+            or any(
+                not isinstance(entry, dict)
+                or set(entry) != {"interface", "zone"}
+                or not isinstance(entry["interface"], str)
+                or not isinstance(entry["zone"], str)
+                for entry in reset_drop_bindings
+            )
+        ):
+            raise SystemExit("invalid lab reset drop-zone handoff contract")
+        allowed_reset_drop_bindings = {
+            (entry["interface"], entry["zone"])
+            for entry in reset_drop_bindings
+        }
+        expected_reset_drop_bindings = {
+            (interface, zone)
+            for interface, zone in interfaces.items()
+            if zone in {"aigw-egress", "aigw-internal"}
+        }
+        if allowed_reset_drop_bindings and (
+            allowed_reset_drop_bindings != expected_reset_drop_bindings
+            or len(allowed_reset_drop_bindings) != 2
+        ):
+            raise SystemExit("lab reset drop-zone handoff does not match reviewed interfaces")
         errors = []
 
         def run(command, allowed=(0,)):
@@ -44,14 +88,327 @@
             return result.returncode, result.stdout.strip()
 
         def unowned(message):
-            if not authorized:
+            # Explicit adoption never grants blanket permission to retain
+            # arbitrary firewall policy: this role does not model or remove
+            # it safely. Operators must clean it up before the converge.
+            errors.append(message)
+
+        def has_reviewed_aigw_firewall_ownership(
+            completed_marker, pending_marker, explicit_firewall_adoption,
+        ):
+            """Return true only for a completed or explicitly resumed converge.
+
+            The pending value is supplied by host_preflight only after it has
+            verified the exact root-owned pending ownership marker and required
+            the separate dedicated-Docker-host adoption acknowledgement. The
+            firewall acknowledgement remains separate: it authorizes only the
+            exact generated AIGW artifacts checked below, never arbitrary
+            firewalld, direct-rule, nftables, or NetworkManager policy.
+            """
+            return completed_marker or (
+                pending_marker and explicit_firewall_adoption
+            )
+
+        reviewed_aigw_firewall_ownership = has_reviewed_aigw_firewall_ownership(
+            has_marker, has_valid_pending_marker, firewall_adoption,
+        )
+
+        def require_reviewed_aigw_firewall_ownership(message):
+            if not reviewed_aigw_firewall_ownership:
                 errors.append(message)
 
+        def is_pristine_firewalld_package_default(path, metadata):
+            """Accept only the one RPM-verified firewalld default in /etc.
+
+            Rocky ships its default lockdown whitelist under ``/etc`` rather
+            than ``/usr/lib``.  It is neither administrator policy nor an
+            AIGW artifact, but blindly accepting any file at that path would
+            create a bypass for an altered whitelist.  Bind it to the owning
+            firewalld RPM's exact filename, SHA-256 digest, mode, and root
+            ownership instead.  A missing/broken RPM query fails closed.
+            """
+            if path != "/etc/firewalld/lockdown-whitelist.xml":
+                return False
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_size > 65536
+            ):
+                return False
+            rpm = shutil.which("rpm", path="/usr/sbin:/usr/bin:/sbin:/bin")
+            if not rpm:
+                return False
+            owner = subprocess.run(
+                [rpm, "-qf", "--qf", "%{NAME}\\n", "--", path],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if owner.returncode != 0 or owner.stdout.strip() != "firewalld":
+                return False
+            query = subprocess.run(
+                [
+                    rpm,
+                    "-q",
+                    "--qf",
+                    "[%{FILENAMES}\\t%{FILEDIGESTS}\\t%{FILEMODES:perms}"
+                    "\\t%{FILEUSERNAME}\\t%{FILEGROUPNAME}\\n]",
+                    "firewalld",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if query.returncode != 0:
+                return False
+            records = [line.split("\t") for line in query.stdout.splitlines()]
+            matches = [record for record in records if record and record[0] == path]
+            if len(matches) != 1 or len(matches[0]) != 5:
+                return False
+            _, digest, mode, owner_name, group_name = matches[0]
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or mode != stat.filemode(metadata.st_mode)
+                or owner_name != "root"
+                or group_name != "root"
+            ):
+                return False
+            try:
+                with open(path, "rb") as source:
+                    content = source.read(65537)
+            except OSError:
+                return False
+            if len(content) > 65536:
+                return False
+            actual = hashlib.sha256(content).hexdigest()
+            return actual == digest
+
+        # Docker Engine 29 creates this administrator-directory zone while
+        # managing its bridge firewall integration. It is not an AIGW policy,
+        # but accepting it by filename or target alone would turn the exception
+        # into a custom-policy bypass. Keep the exact byte-level Docker 29
+        # artifact, ownership, and mode contract here; a future Docker change
+        # deliberately fails closed for review.
+        docker_firewalld_zone_path = "/etc/firewalld/zones/docker.xml"
+        docker_firewalld_zone_content = (
+            b'<?xml version="1.0" encoding="utf-8"?>\n'
+            b'<zone version="1.0" target="ACCEPT">\n'
+            b'  <short>docker</short>\n'
+            b'  <description>zone for docker bridge network interfaces</description>\n'
+            b'  <forward/>\n'
+            b'</zone>\n'
+        )
+
+        def is_exact_docker_firewalld_zone(path, metadata):
+            if (
+                path != docker_firewalld_zone_path
+                or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o644
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_size != len(docker_firewalld_zone_content)
+            ):
+                return False
+            try:
+                with open(path, "rb") as source:
+                    content = source.read(len(docker_firewalld_zone_content) + 1)
+            except OSError:
+                return False
+            if content != docker_firewalld_zone_content:
+                return False
+            # Parse the accepted bytes as XML as an additional guard against a
+            # future literal edit that accidentally stops describing a zone.
+            try:
+                root = ET.fromstring(content)
+            except ET.ParseError:
+                return False
+            return (
+                root.tag == "zone"
+                and root.attrib == {"version": "1.0", "target": "ACCEPT"}
+                and [child.tag for child in root] == ["short", "description", "forward"]
+                and root[0].text == "docker"
+                and root[1].text == "zone for docker bridge network interfaces"
+                and root[2].attrib == {}
+                and len(root[2]) == 0
+                and (root[2].text or "").strip() == ""
+            )
+
+        # Docker Engine 29 also persists this policy alongside its ``docker``
+        # zone.  It is required for Docker bridge forwarding but must not turn
+        # a filename-only exception into a way to retain arbitrary permanent
+        # firewalld policy.  Treat a changed Engine artifact as unreviewed so a
+        # Docker upgrade changes this contract deliberately.
+        docker_firewalld_policy_path = "/etc/firewalld/policies/docker-forwarding.xml"
+        docker_firewalld_policy_content = (
+            b'<?xml version="1.0" encoding="utf-8"?>\n'
+            b'<policy version="1.0" target="ACCEPT">\n'
+            b'  <description>allow forwarding to the docker zone</description>\n'
+            b'  <ingress-zone name="ANY"/>\n'
+            b'  <egress-zone name="docker"/>\n'
+            b'</policy>\n'
+        )
+
+        def is_exact_docker_firewalld_policy(path, metadata):
+            if (
+                path != docker_firewalld_policy_path
+                or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o644
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_size != len(docker_firewalld_policy_content)
+            ):
+                return False
+            try:
+                with open(path, "rb") as source:
+                    content = source.read(len(docker_firewalld_policy_content) + 1)
+            except OSError:
+                return False
+            if content != docker_firewalld_policy_content:
+                return False
+            try:
+                root = ET.fromstring(content)
+            except ET.ParseError:
+                return False
+            return (
+                root.tag == "policy"
+                and root.attrib == {"version": "1.0", "target": "ACCEPT"}
+                and [child.tag for child in root] == [
+                    "description", "ingress-zone", "egress-zone",
+                ]
+                and root[0].text == "allow forwarding to the docker zone"
+                and root[1].attrib == {"name": "ANY"}
+                and root[2].attrib == {"name": "docker"}
+                and len(root[1]) == 0
+                and len(root[2]) == 0
+                and (root[1].text or "").strip() == ""
+                and (root[2].text or "").strip() == ""
+            )
+
+        def canonical_xml_tree(element):
+            """Return the policy-relevant XML tree, excluding formatting."""
+            return (
+                element.tag,
+                tuple(sorted(element.attrib.items())),
+                (element.text or "").strip(),
+                tuple(canonical_xml_tree(child) for child in element),
+            )
+
+        def is_generated_aigw_zone_backup(
+            path, metadata, zone_directory="/etc/firewalld/zones", lstat=os.lstat,
+        ):
+            """Recognize only firewalld's paired ``<managed>.xml.old`` backup.
+
+            firewalld writes this backup while it rewrites a permanent zone to
+            add an interface.  It is not loaded policy, but a normal converge
+            leaves it behind; treating every ``.old`` as foreign makes the
+            next idempotent converge fail.  The backup is accepted only when
+            it is root-owned/mode 0644 and its parsed tree is exactly the
+            current managed zone with precisely the expected direct interface
+            children removed.  A malformed, stale, unrelated, or policy-
+            bearing backup remains unreviewed below.
+            """
+            backup_suffix = ".xml.old"
+            if (
+                os.path.dirname(path) != zone_directory
+                or not path.endswith(backup_suffix)
+                or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o644
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_size <= 0
+                or metadata.st_size > 65536
+            ):
+                return False
+            filename = os.path.basename(path)
+            zone_name = filename[:-len(backup_suffix)]
+            current_path = os.path.join(zone_directory, zone_name + ".xml")
+            if (
+                zone_name not in managed_zones
+                or path != current_path + ".old"
+            ):
+                return False
+            try:
+                current_metadata = os.lstat(current_path)
+            except OSError:
+                return False
+            if (
+                stat.S_ISLNK(current_metadata.st_mode)
+                or not stat.S_ISREG(current_metadata.st_mode)
+                or stat.S_IMODE(current_metadata.st_mode) != 0o644
+                or current_metadata.st_uid != 0
+                or current_metadata.st_gid != 0
+                or current_metadata.st_size <= 0
+                or current_metadata.st_size > 65536
+            ):
+                return False
+            try:
+                with open(path, "rb") as source:
+                    backup_content = source.read(65537)
+                with open(current_path, "rb") as source:
+                    current_content = source.read(65537)
+            except OSError:
+                return False
+            if len(backup_content) > 65536 or len(current_content) > 65536:
+                return False
+            try:
+                backup_root = ET.fromstring(backup_content)
+                current_root = ET.fromstring(current_content)
+            except ET.ParseError:
+                return False
+            if (
+                backup_root.tag != "zone"
+                or current_root.tag != "zone"
+                or backup_root.attrib != current_root.attrib
+                or any(child.tag == "interface" for child in backup_root)
+            ):
+                return False
+            expected_interfaces = sorted(
+                interface
+                for interface, mapped_zone in interfaces.items()
+                if mapped_zone == zone_name
+            )
+            current_interfaces = [
+                child for child in current_root if child.tag == "interface"
+            ]
+            if (
+                len(current_interfaces) != len(expected_interfaces)
+                or sorted(child.attrib.get("name", "") for child in current_interfaces)
+                    != expected_interfaces
+                or any(
+                    child.attrib != {"name": child.attrib.get("name", "")}
+                    or not child.attrib.get("name")
+                    or len(child) != 0
+                    or (child.text or "").strip()
+                    for child in current_interfaces
+                )
+            ):
+                return False
+            current_without_interfaces = (
+                current_root.tag,
+                tuple(sorted(current_root.attrib.items())),
+                (current_root.text or "").strip(),
+                tuple(
+                    canonical_xml_tree(child)
+                    for child in current_root
+                    if child.tag != "interface"
+                ),
+            )
+            return canonical_xml_tree(backup_root) == current_without_interfaces
+
         # Inspect only administrator-owned /etc firewalld files. Vendor rules
-        # live under /usr/lib and are not an adoption signal. Every component
-        # is lstat'ed so a symlink cannot make this read-only check inspect a
-        # controller-selected path.
+        # live under /usr/lib and are not an adoption signal. Rocky's one
+        # RPM-owned default whitelist is accepted only through the exact
+        # verification helper above. Every component is lstat'ed so a symlink
+        # cannot make this read-only check inspect a controller-selected path.
         custom_firewalld_paths = []
+        managed_zone_backup_files = []
         for root in (
             "/etc/firewalld/zones", "/etc/firewalld/policies",
             "/etc/firewalld/services", "/etc/firewalld/icmptypes",
@@ -69,6 +426,14 @@
                     continue
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
                     custom_firewalld_paths.append(entry.path)
+                elif entry.path == docker_firewalld_zone_path:
+                    if not is_exact_docker_firewalld_zone(entry.path, metadata):
+                        custom_firewalld_paths.append(entry.path)
+                elif entry.path == docker_firewalld_policy_path:
+                    if not is_exact_docker_firewalld_policy(entry.path, metadata):
+                        custom_firewalld_paths.append(entry.path)
+                elif is_generated_aigw_zone_backup(entry.path, metadata):
+                    managed_zone_backup_files.append(entry.path)
                 elif metadata.st_size:
                     custom_firewalld_paths.append(entry.path)
         for path in (
@@ -79,12 +444,35 @@
                 metadata = os.lstat(path)
             except FileNotFoundError:
                 continue
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size:
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size
+            ) and not is_pristine_firewalld_package_default(path, metadata):
                 custom_firewalld_paths.append(path)
-        if custom_firewalld_paths:
+        managed_zone_paths = {
+            f"/etc/firewalld/zones/{name}.xml" for name in managed_zones
+        }
+        managed_zone_files = sorted(
+            path for path in set(custom_firewalld_paths) if path in managed_zone_paths
+        )
+        unreviewed_firewalld_files = sorted(
+            path for path in set(custom_firewalld_paths) if path not in managed_zone_paths
+        )
+        if unreviewed_firewalld_files:
             unowned(
-                "unreviewed /etc firewalld policy exists: " +
-                ", ".join(sorted(set(custom_firewalld_paths)))
+                "unreviewed /etc firewalld policy exists; remove it before converge: " +
+                ", ".join(unreviewed_firewalld_files)
+            )
+        if managed_zone_files:
+            require_reviewed_aigw_firewall_ownership(
+                "unmarked existing AI Gateway firewalld zone files require a completed prior converge or a validated pending marker plus aigw_adopt_firewalld_state=true: " +
+                ", ".join(managed_zone_files)
+            )
+        if managed_zone_backup_files:
+            require_reviewed_aigw_firewall_ownership(
+                "unmarked generated AI Gateway firewalld zone backup files require a completed prior converge or a validated pending marker plus aigw_adopt_firewalld_state=true: " +
+                ", ".join(sorted(set(managed_zone_backup_files)))
             )
 
         firewalld_loaded = False
@@ -112,9 +500,21 @@
                 _, zone_text = run(["firewall-cmd", "--get-zones"])
                 active_zones = set(zone_text.split())
                 project_zones = sorted(name for name in active_zones if name.startswith("aigw-"))
-                if project_zones and not authorized:
-                    errors.append(
-                        "unowned active AI Gateway firewalld zones: " + ", ".join(project_zones)
+                unexpected_project_zones = sorted(
+                    set(project_zones) - managed_zones
+                )
+                if unexpected_project_zones:
+                    unowned(
+                        "unexpected active AI Gateway firewalld zones: " +
+                        ", ".join(unexpected_project_zones)
+                    )
+                recognized_project_zones = sorted(
+                    set(project_zones) & managed_zones
+                )
+                if recognized_project_zones:
+                    require_reviewed_aigw_firewall_ownership(
+                        "unowned active AI Gateway firewalld zones: " +
+                        ", ".join(recognized_project_zones)
                     )
                 # A later firewalld reload can discard runtime-only direct
                 # chains/rules/passthroughs. They are not represented by the
@@ -131,10 +531,10 @@
                         direct_state.append(label)
                 if direct_state:
                     unowned(
-                        "unowned active firewalld direct runtime state: " +
+                        "active firewalld direct runtime state must be removed before converge: " +
                         ", ".join(direct_state)
                     )
-        elif firewalld_loaded and custom_firewalld_paths:
+        elif firewalld_loaded and unreviewed_firewalld_files:
             # This is deliberately redundant with the generic custom-policy
             # gate above: make clear that starting a stopped daemon needs an
             # explicit ownership decision when durable policy is present.
@@ -160,7 +560,11 @@
                     ["nmcli", "--get-values", "connection.zone", "connection", "show", "uuid", uuid],
                 )
                 saved_zone = saved_zone.strip()
-                if saved_zone not in {"", "public", expected_zone}:
+                is_reset_drop_handoff = (
+                    saved_zone == "drop"
+                    and (interface, expected_zone) in allowed_reset_drop_bindings
+                )
+                if saved_zone not in {"", "public", expected_zone} and not is_reset_drop_handoff:
                     unowned(
                         f"{interface} persists unowned NetworkManager zone {saved_zone!r}"
                     )
@@ -170,7 +574,11 @@
                         allowed=(0, 1),
                     )
                     runtime_zone = runtime_zone.strip()
-                    if runtime_zone not in {"", "no zone", "public", expected_zone}:
+                    is_reset_drop_handoff = (
+                        runtime_zone == "drop"
+                        and (interface, expected_zone) in allowed_reset_drop_bindings
+                    )
+                    if runtime_zone not in {"", "no zone", "public", expected_zone} and not is_reset_drop_handoff:
                         unowned(
                             f"{interface} is assigned to unowned runtime zone {runtime_zone!r}"
                         )
@@ -189,17 +597,19 @@
             r"^\s*table\s+inet\s+aigw_guard\s*\{\s*|\s*\}\s*$", "", nft_text, flags=re.S
         ).strip()
         if nft_body:
-            unowned("unowned inet/aigw_guard nftables policy")
+            require_reviewed_aigw_firewall_ownership("unmarked inet/aigw_guard nftables policy")
         for binary, family in (("iptables", "IPv4"), ("ip6tables", "IPv6")):
             text = capture_optional([binary, "-S", "DOCKER-USER"])
             if any(line.startswith("-A DOCKER-USER ") for line in text.splitlines()):
-                unowned(f"unowned {family} DOCKER-USER policy")
+                require_reviewed_aigw_firewall_ownership(f"unmarked {family} DOCKER-USER policy")
 
         if errors:
             raise SystemExit("; ".join(dict.fromkeys(errors)))
       - "{{ firewalld_zones | to_json }}"
       - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
+      - "{{ 'true' if (aigw_host_pending_marker_valid | default(false) | bool) else 'false' }}"
       - "{{ 'true' if (aigw_adopt_firewalld_state | bool) else 'false' }}"
+      - "{{ aigw_lab_reset_handoff_drop_bindings | to_json }}"
   environment:
     LC_ALL: C
   changed_when: false

@@ -12,6 +12,7 @@ error.
 
 No secret value is ever logged in full — see `mask_secret`.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -30,6 +31,7 @@ logger = logging.getLogger("key_rotator.vault")
 MOUNT_POINT = "kv"
 TOKEN_CHECK_INTERVAL_SECONDS = 3600
 TOKEN_RENEW_BEFORE_SECONDS = 7 * 86400
+PUBLIC_HEALTH_STATUSES = {200, 429, 472, 473, 501, 503}
 
 
 class VaultError(Exception):
@@ -118,7 +120,9 @@ class VaultClient:
             # Retry authentication on the very next operation rather than
             # caching a failed probe for an hour.
             self._next_token_check = 0.0
-            raise VaultError(f"Vault token authentication/renewal failed: {exc}") from exc
+            raise VaultError(
+                f"Vault token authentication/renewal failed: {exc}"
+            ) from exc
 
     async def connect_with_retry(self, max_wait_seconds: int = 60) -> bool:
         """Best-effort readiness probe with backoff, capped at
@@ -140,7 +144,10 @@ class VaultClient:
             await asyncio.sleep(delay)
             waited += delay
             delay = min(delay * 2, 10.0)
-        logger.error("vault still unreachable after %ss; continuing in degraded mode", max_wait_seconds)
+        logger.error(
+            "vault still unreachable after %ss; continuing in degraded mode",
+            max_wait_seconds,
+        )
         return False
 
     def read(self, path: str) -> Optional[dict[str, Any]]:
@@ -158,7 +165,9 @@ class VaultClient:
         self._ensure_authenticated()
         try:
             client = self._get_client()
-            resp = client.secrets.kv.v2.read_secret_version(path=path, mount_point=MOUNT_POINT)
+            resp = client.secrets.kv.v2.read_secret_version(
+                path=path, mount_point=MOUNT_POINT
+            )
             return resp.get("data", {}).get("data")
         except InvalidPath:
             return None
@@ -177,17 +186,23 @@ class VaultClient:
         try:
             self._ensure_authenticated()
         except VaultError as exc:
-            logger.warning("vault write authentication failed for path=%s: %s", path, exc)
+            logger.warning(
+                "vault write authentication failed for path=%s: %s", path, exc
+            )
             return False
         try:
             client = self._get_client()
-            client.secrets.kv.v2.create_or_update_secret(path=path, secret=data, mount_point=MOUNT_POINT)
+            client.secrets.kv.v2.create_or_update_secret(
+                path=path, secret=data, mount_point=MOUNT_POINT
+            )
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("vault write failed for path=%s: %s", path, exc)
             return False
 
-    def write_verified(self, path: str, data: dict[str, Any], attempts: int = 3) -> bool:
+    def write_verified(
+        self, path: str, data: dict[str, Any], attempts: int = 3
+    ) -> bool:
         """Durably write `data`, then read it back to confirm it landed,
         retrying up to `attempts` times.
 
@@ -221,7 +236,9 @@ class VaultClient:
                     exc,
                 )
                 continue
-            if readback is not None and all(readback.get(k) == v for k, v in data.items()):
+            if readback is not None and all(
+                readback.get(k) == v for k, v in data.items()
+            ):
                 return True
             last_problem = "read-back did not match written data"
             logger.warning(
@@ -230,7 +247,55 @@ class VaultClient:
                 attempt,
                 attempts,
             )
-        logger.error("vault write_verified: giving up on path=%s (%s)", path, last_problem)
+        logger.error(
+            "vault write_verified: giving up on path=%s (%s)", path, last_problem
+        )
+        return False
+
+    def delete_verified(self, path: str, attempts: int = 3) -> bool:
+        """Permanently delete a KV v2 document and verify it is absent.
+
+        Provider enrollment deletion is a security lifecycle transition, not
+        a recoverable edit.  Remove metadata and every version so an old
+        enrollment cannot be undeleted later, then prove a normal read sees a
+        missing path.  As with :meth:`write_verified`, callers must treat a
+        ``False`` result as a failed transition.
+        """
+        last_problem = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                self._ensure_authenticated()
+                client = self._get_client()
+                client.secrets.kv.v2.delete_metadata_and_all_versions(
+                    path=path, mount_point=MOUNT_POINT
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_problem = f"delete error: {exc}"
+                logger.warning(
+                    "vault delete_verified: delete failed for path=%s (attempt %s/%s): %s",
+                    path,
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                continue
+            try:
+                if self.read(path) is None:
+                    return True
+                last_problem = "read-back still found the deleted path"
+            except VaultError as exc:
+                # An unavailable/auth-failed read cannot prove deletion.
+                last_problem = f"read-back error: {exc}"
+            logger.warning(
+                "vault delete_verified: deletion not verified for path=%s "
+                "(attempt %s/%s)",
+                path,
+                attempt,
+                attempts,
+            )
+        logger.error(
+            "vault delete_verified: giving up on path=%s (%s)", path, last_problem
+        )
         return False
 
     def ready(self) -> bool:
@@ -249,6 +314,53 @@ class VaultClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("vault readiness probe failed: %s", exc)
             return False
+
+    def public_status(self) -> dict[str, bool]:
+        """Return only Vault's authenticated-data-free initialization state.
+
+        This deliberately uses the public ``sys/health`` response without the
+        rotator token.  The admin portal consumes it only to render a bounded
+        sealed-maintenance page when the live identity decision is impossible;
+        every other transport, status, or payload inconsistency fails closed.
+        """
+
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            response = session.get(
+                self._settings.vault_addr.rstrip("/") + "/v1/sys/health",
+                params={"standbyok": "true", "perfstandbyok": "true"},
+                headers={"User-Agent": "aigw-key-rotator-vault-status"},
+                allow_redirects=False,
+                timeout=5,
+            )
+        except requests.RequestException as exc:
+            raise VaultError("Vault public status unavailable") from exc
+        finally:
+            session.close()
+
+        if response.status_code not in PUBLIC_HEALTH_STATUSES:
+            raise VaultError("Vault public status unavailable")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise VaultError("Vault public status unavailable") from exc
+        if not isinstance(payload, dict):
+            raise VaultError("Vault public status unavailable")
+        initialized = payload.get("initialized")
+        sealed = payload.get("sealed")
+        if not isinstance(initialized, bool) or not isinstance(sealed, bool):
+            raise VaultError("Vault public status unavailable")
+
+        if response.status_code == 501:
+            valid = not initialized and sealed
+        elif response.status_code == 503:
+            valid = initialized and sealed
+        else:
+            valid = initialized and not sealed
+        if not valid:
+            raise VaultError("Vault public status unavailable")
+        return {"initialized": initialized, "sealed": sealed}
 
     def close(self) -> None:
         """Close the underlying requests session without revoking the token."""

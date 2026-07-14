@@ -115,7 +115,7 @@ done
 # roots, so a pre-existing symlink cannot redirect a privileged copy outside
 # STACK_DIR, then install the root-owned staged tree without interpreting tar.
 config_roots=(
-  docker-compose.yml docker-compose.lab.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana
+  docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml docker-compose.lab.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana
   keycloak litellm loki postgres prometheus tempo traefik services scripts
   certs secrets
 )
@@ -153,6 +153,6 @@ cat >&2 <<'EOF'
 Restore complete; the captured graph is intentionally stopped.
 1. Run the full current-source Ansible converge while ingress stays closed.
 2. Unseal restored Vault with the separately held threshold shares.
-3. Run: scripts/aigw-runtime-up.sh -d --wait --wait-timeout 300
+3. Run: scripts/aigw-runtime-up.sh -d --wait --wait-timeout 600
 4. Verify applications/data, then remove .state/restore-required-unseal.
 EOF

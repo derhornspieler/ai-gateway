@@ -35,6 +35,7 @@
         disabled = set(json.loads(sys.argv[3]))
         expected_bind_digests = json.loads(sys.argv[4])
         allowed_unhealthy = set(json.loads(sys.argv[5]))
+        docker_data_root = Path(sys.argv[6]).resolve(strict=False)
         ids = subprocess.check_output(
             ["docker", "--host", "unix:///run/docker.sock", "ps", "-q", "--filter", f"label=com.docker.compose.project={project}"],
             text=True,
@@ -127,6 +128,66 @@
                 nonlocal_checked += 1
             return nonlocal_checked
 
+        def is_host_root_bind(mount):
+            if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                return False
+            source = mount.get("Source")
+            if not isinstance(source, str) or not source.startswith("/"):
+                return True
+            try:
+                return os.path.realpath(source) == "/"
+            except OSError:
+                return True
+
+        def normalized_container_mounts(container):
+            """Add Docker 29 HostConfig.Tmpfs entries missing from Mounts.
+
+            Docker Engine 29 reports configured tmpfs mounts under
+            HostConfig.Tmpfs but omits them from the top-level Mounts list.
+            A conflicting non-tmpfs mount at the same destination is
+            ambiguous and must fail closed rather than masking a boundary.
+            """
+            mounts = container.get("Mounts")
+            host_config = container.get("HostConfig")
+            if (
+                not isinstance(mounts, list)
+                or any(not isinstance(mount, dict) for mount in mounts)
+                or not isinstance(host_config, dict)
+            ):
+                return None
+            tmpfs = host_config.get("Tmpfs")
+            if tmpfs is None:
+                return list(mounts)
+            if not isinstance(tmpfs, dict):
+                return None
+            effective = list(mounts)
+            by_destination = {}
+            for mount in effective:
+                destination = mount.get("Destination")
+                if isinstance(destination, str):
+                    by_destination.setdefault(destination, []).append(mount)
+            for destination, options in tmpfs.items():
+                if (
+                    not isinstance(destination, str)
+                    or not destination.startswith("/")
+                    or destination == "/"
+                    or os.path.normpath(destination) != destination
+                    or not isinstance(options, str)
+                ):
+                    return None
+                existing = by_destination.get(destination, [])
+                if existing:
+                    if any(mount.get("Type") != "tmpfs" for mount in existing):
+                        return None
+                    continue
+                tmpfs_mount = {
+                    "Type": "tmpfs",
+                    "Destination": destination,
+                }
+                effective.append(tmpfs_mount)
+                by_destination[destination] = [tmpfs_mount]
+            return effective
+
         for service, container in sorted(actual.items()):
             labels = container["Config"]["Labels"]
             if labels.get("com.aigw.contract.selinux-generation") != "1":
@@ -175,8 +236,52 @@
                     for option in options
                 ):
                     raise SystemExit(f"{service}: label-disable option drift")
-                if process_label or mount_label or proc_label != "system_u:system_r:spc_t:s0":
+                # Docker Engine 29 retains a generated MCS MountLabel in
+                # inspect metadata even when label=disable makes the live
+                # process run as spc_t.  This is metadata only here: these
+                # bounded exceptions use no :z/:Z bind and therefore never
+                # apply it to a host source.  Require it to remain a normal
+                # container-file MCS label when present, while continuing to
+                # reject any process-label override or non-spc_t process.
+                if process_label or proc_label != "system_u:system_r:spc_t:s0":
                     raise SystemExit(f"{service}: bounded spc_t exception drift")
+                if mount_label and not mount_pattern.fullmatch(mount_label):
+                    raise SystemExit(
+                        f"{service}: bounded spc_t MountLabel metadata drift"
+                    )
+                # A generated MountLabel must never turn into a relabel of a
+                # host-owned source for either bounded spc_t exception. Use
+                # Docker's effective Mounts metadata rather than
+                # HostConfig.Binds: Engine 29 also puts named volumes in the
+                # latter, and a volume is not a host bind source.
+                mounts = container.get("Mounts")
+                if not isinstance(mounts, list) or any(
+                    not isinstance(mount, dict) for mount in mounts
+                ):
+                    raise SystemExit(
+                        f"{service}: malformed Docker mount metadata"
+                    )
+                for mount in mounts:
+                    if mount.get("Type") != "bind":
+                        continue
+                    source = mount.get("Source")
+                    destination = mount.get("Destination")
+                    mode = mount.get("Mode")
+                    if (
+                        not isinstance(source, str)
+                        or not source.startswith("/")
+                        or not isinstance(destination, str)
+                        or not destination.startswith("/")
+                        or mount.get("RW") is not False
+                        or not isinstance(mode, str)
+                    ):
+                        raise SystemExit(
+                            f"{service}: label-disable bind must be absolute and read-only"
+                        )
+                    if {"z", "Z"} & set(mode.split(",")):
+                        raise SystemExit(
+                            f"{service}: label-disable bind requested relabel"
+                        )
             else:
                 if "label=disable" in options or any(
                     option.startswith("label=") for option in options
@@ -189,25 +294,131 @@
                 if proc_label != process_label:
                     raise SystemExit(f"{service}: live process label differs from Docker metadata")
 
-                # Prove the host side of each bind remains readable at this
-                # container's exact MCS level. This catches an unconditional
+                # Prove the host side of each *effective bind mount* remains
+                # readable at this container's exact MCS level. Docker Engine
+                # 29 includes named volumes in HostConfig.Binds, so iterating
+                # it here mistakes approved RW state volumes for unsafe host
+                # bind sources. Mounts identifies the actual mount type and
+                # exposes the effective mode. This catches an unconditional
                 # restorecon on a repeated converge: Compose retains an
                 # unchanged container and therefore does not reapply `Z`.
-                for bind in host.get("Binds") or []:
-                    fields = bind.split(":")
-                    if len(fields) != 3:
-                        raise SystemExit(f"{service}: noncanonical bind: {bind}")
-                    source, _target, option_text = fields
+                mounts = container.get("Mounts")
+                if not isinstance(mounts, list) or any(
+                    not isinstance(mount, dict) for mount in mounts
+                ):
+                    raise SystemExit(f"{service}: malformed Docker mount metadata")
+                for mount in mounts:
+                    if mount.get("Type") != "bind":
+                        continue
+                    source = mount.get("Source")
+                    destination = mount.get("Destination")
+                    option_text = mount.get("Mode")
+                    if (
+                        not isinstance(source, str)
+                        or not source.startswith("/")
+                        or not isinstance(destination, str)
+                        or not destination.startswith("/")
+                        or not isinstance(option_text, str)
+                    ):
+                        raise SystemExit(
+                            f"{service}: malformed effective bind metadata"
+                        )
                     options_set = set(option_text.split(","))
                     relabel = options_set & {"z", "Z"}
-                    if "ro" not in options_set or len(relabel) != 1:
-                        raise SystemExit(f"{service}: unsafe bind options: {bind}")
-                    if source == "/" or source.startswith("/var/lib/docker"):
+                    if mount.get("RW") is not False or "ro" not in options_set or len(relabel) != 1:
+                        raise SystemExit(
+                            f"{service}: unsafe effective bind options: {source}"
+                        )
+                    source_path = Path(source)
+                    if not source_path.is_absolute():
+                        raise SystemExit(f"{service}: non-absolute bind source: {source}")
+                    try:
+                        source_path.resolve(strict=False).relative_to(docker_data_root)
+                    except ValueError:
+                        source_is_docker_runtime = False
+                    else:
+                        source_is_docker_runtime = True
+                    if source_path == Path("/") or source_is_docker_runtime:
                         raise SystemExit(f"{service}: system path requested relabel: {source}")
                     expected_context = mount_label if relabel == {"Z"} else "shared"
                     checked_bind_objects += require_bind_context(
                         source, expected_context
                     )
+
+            expected_user = {
+                "alloy": "473:473",
+                "node-exporter": "65532:65532",
+                "open-webui": "65532:65532",
+            }.get(service)
+            if expected_user is not None and (container.get("Config") or {}).get("User") != expected_user:
+                raise SystemExit(f"{service}: configured non-root user drift")
+            if service == "node-exporter":
+                mounts = normalized_container_mounts(container)
+                if mounts is None:
+                    raise SystemExit("node-exporter: malformed Docker mount metadata")
+                root_binds = [
+                    mount for mount in mounts
+                    if mount.get("Type") == "bind"
+                    and mount.get("Source") == "/"
+                    and mount.get("Destination") == "/host"
+                    and mount.get("RW") is False
+                    and mount.get("Propagation") == "rslave"
+                ]
+                all_host_root_binds = [
+                    mount for mount in mounts if is_host_root_bind(mount)
+                ]
+                run_masks = [
+                    mount for mount in mounts
+                    if mount.get("Type") == "tmpfs"
+                    and mount.get("Destination") == "/host/run"
+                ]
+                if (
+                    len(root_binds) != 1
+                    or len(all_host_root_binds) != 1
+                    or len(run_masks) != 1
+                ):
+                    raise SystemExit("node-exporter: exact rootfs and /run mask mounts are required")
+                tmpfs = host.get("Tmpfs") or {}
+                if "/host/run" not in tmpfs:
+                    raise SystemExit("node-exporter: /host/run tmpfs contract is missing")
+                if Path(f"/proc/{pid}/root/host/run/docker.sock").exists():
+                    raise SystemExit("node-exporter: Docker socket is visible below the host root bind")
+            if service == "open-webui":
+                if host.get("ReadonlyRootfs") is not True:
+                    raise SystemExit("open-webui: read-only root filesystem is required")
+                tmpfs = host.get("Tmpfs") or {}
+                tmpfs_options = set((tmpfs.get("/tmp") or "").split(","))
+                if not {"rw", "noexec", "nosuid", "nodev", "mode=1777", "size=256m"} <= tmpfs_options:
+                    raise SystemExit("open-webui: bounded hardened /tmp tmpfs contract is missing")
+                mounts = normalized_container_mounts(container)
+                if mounts is None:
+                    raise SystemExit("open-webui: malformed Docker mount metadata")
+                tmpfs_mounts = [
+                    mount for mount in mounts
+                    if mount.get("Type") == "tmpfs" and mount.get("Destination") == "/tmp"
+                ]
+                data_volumes = [
+                    mount for mount in mounts
+                    if mount.get("Type") == "volume"
+                    and mount.get("Name") == f"{project}_openwebui_data"
+                    and mount.get("Destination") == "/app/backend/data"
+                    and mount.get("RW") is True
+                ]
+                if len(tmpfs_mounts) != 1 or len(data_volumes) != 1:
+                    raise SystemExit("open-webui: exact temporary and persistent mount contract is required")
+                environment = {
+                    entry.split("=", 1)[0]: entry.split("=", 1)[1]
+                    for entry in (container.get("Config") or {}).get("Env") or []
+                    if "=" in entry
+                }
+                required_environment = {
+                    "HOME": "/app/backend/data",
+                    "PYTHONNOUSERSITE": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "STATIC_DIR": "/tmp/static",
+                }
+                if any(environment.get(key) != value for key, value in required_environment.items()):
+                    raise SystemExit("open-webui: hardened runtime environment contract drift")
 
             status = {}
             for line in Path(f"/proc/{pid}/status").read_text().splitlines():
@@ -216,6 +427,15 @@
                     status[key] = value.strip().split()[0]
             if status.get("NoNewPrivs") != "1" or status.get("Seccomp") != "2":
                 raise SystemExit(f"{service}: live NNP/seccomp contract drift")
+            expected_uid = {
+                "alloy": "473",
+                "node-exporter": "65532",
+                "open-webui": "65532",
+            }.get(service)
+            if expected_uid is not None and (
+                status.get("Uid") != expected_uid or status.get("Gid") != expected_uid
+            ):
+                raise SystemExit(f"{service}: live non-root identity drift")
             cap_eff = int(status.get("CapEff", "-1"), 16)
             cap_bnd = int(status.get("CapBnd", "-1"), 16)
             if cap_eff != effective_caps.get(service, 0):
@@ -233,12 +453,15 @@
           ([
             'traefik-int', 'traefik-adm', 'oauth2-proxy',
             'oauth2-proxy-grafana', 'oauth2-proxy-prometheus',
-            'oauth2-proxy-vault', 'litellm', 'open-webui', 'keycloak',
+            'oauth2-proxy-vault', 'vault-ui-proxy',
+            'litellm', 'open-webui', 'keycloak',
             'dev-portal', 'admin-portal',
             'envoy-egress', 'key-rotator', 'vault', 'postgres', 'redis',
             'alloy', 'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana',
             'cribl-mock'
-          ] + (['lab-dns', 'samba-ad'] if (samba_lab_enabled | bool) else []))
+          ]
+          + (['lab-dns'] if (platform_authoritative_dns_enabled | bool) else [])
+          + (['samba-ad'] if (samba_lab_enabled | bool) else []))
           | to_json
         }}
       - "{{ ['alloy', 'node-exporter'] | to_json }}"
@@ -250,6 +473,7 @@
            else [])
           | to_json
         }}
+      - "{{ docker_data_root }}"
   register: selinux_runtime_contract
   changed_when: false
   retries: 24
@@ -296,12 +520,16 @@
   ansible.builtin.assert:
     that:
       - aigw_recent_selinux_denials.rc == 1
-      - aigw_recent_selinux_denials.stderr is search('(?i)<no matches>')
+      # Rocky 9 ausearch with LC_ALL=C reports a clean no-match query on
+      # stderr. Require its exact documented stream layout so a parser or
+      # audit-query error cannot be mistaken for a clean window.
+      - aigw_recent_selinux_denials.stdout | trim == ''
+      - aigw_recent_selinux_denials.stderr | trim == '<no matches>'
     quiet: true
     fail_msg: >-
-      SELinux recorded an AVC/USER_AVC after the preflight checkpoint. Review
-      the audit record and narrow the mount/policy contract; never disable
-      labeling on another service as a generic workaround.
+      SELinux AVC audit verification did not prove a clean converge window.
+      Review the audit record or query error and narrow the mount/policy
+      contract; never disable labeling on another service as a workaround.
 
 - name: Read each dedicated PBR rule
   ansible.builtin.command: "ip -4 rule show priority {{ item.priority }}"
@@ -442,7 +670,7 @@
     '--ctdir REPLY -j RETURN' not in du.stdout or
     '-i br+ ! -o br+ -j DROP' not in du.stdout
 
-- name: Lab DNS DNAT is source-scoped in DOCKER-USER
+- name: Platform DNS DNAT is source-scoped in DOCKER-USER
   ansible.builtin.assert:
     that:
       # iptables canonicalizes source before the interfaces and emits the
@@ -451,9 +679,12 @@
       - "du.stdout is search('(?m).* -s ' ~ (vpn_client_cidr | regex_escape) ~ ' -i ' ~ (nic_adm | regex_escape) ~ ' -o br\\+ -p tcp .*--dport 53.*--ctstate DNAT.*--ctorigdst ' ~ (eth1_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 53.*--ctdir ORIGINAL.*RETURN')"
       - "du.stdout is search('(?m).* -s ' ~ (internal_cidr | regex_escape) ~ ' -i ' ~ (nic_internal | regex_escape) ~ ' -o br\\+ -p udp .*--dport 53.*--ctstate DNAT.*--ctorigdst ' ~ (eth2_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 53.*--ctdir ORIGINAL.*RETURN')"
       - "du.stdout is search('(?m).* -s ' ~ (internal_cidr | regex_escape) ~ ' -i ' ~ (nic_internal | regex_escape) ~ ' -o br\\+ -p tcp .*--dport 53.*--ctstate DNAT.*--ctorigdst ' ~ (eth2_ip | regex_escape) ~ '(?:/32)?.*--ctorigdstport 53.*--ctdir ORIGINAL.*RETURN')"
-      - "du.stdout is not search('(?m).*' ~ (nic_egress | regex_escape) ~ '.*--dport 53.*RETURN')"
-    fail_msg: Lab DNS TCP/UDP 53 is not source-scoped before the ADM drop.
-  when: lab_dns_enabled | bool
+      # Envoy legitimately reaches its Internet resolvers with `-o
+      # {{ nic_egress }}`. Reject only DNS that entered from the physical
+      # egress leg and was DNATed toward a container bridge.
+      - "du.stdout is not search('(?m).* -i ' ~ (nic_egress | regex_escape) ~ ' -o br\\+ -p (?:udp|tcp) .*--dport 53.*--ctstate DNAT.*RETURN')"
+    fail_msg: Platform DNS TCP/UDP 53 is not source-scoped before the ADM drop.
+  when: platform_authoritative_dns_enabled | bool
 
 - name: Physical ingress is restricted to exact Docker DNAT tuples
   ansible.builtin.assert:
@@ -470,12 +701,46 @@
   register: host_input_guard
   changed_when: false
 
+- name: Independent nft guard denies internal-to-egress routing before reply allowance
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import sys
+
+        policy = sys.stdin.read()
+        marker = "chain container_forward {"
+        if policy.count(marker) != 1:
+            raise SystemExit("aigw_guard must contain exactly one container_forward chain")
+        forward = policy.split(marker, 1)[1]
+        reply = forward.find("ct state established,related ct direction reply accept")
+        if reply < 0:
+            raise SystemExit("container_forward has no explicit reply-only allowance")
+        errors = []
+        for ingress, egress in ((sys.argv[1], sys.argv[2]), (sys.argv[2], sys.argv[1])):
+            drop = f'iifname "{ingress}" oifname "{egress}" drop'
+            position = forward.find(drop)
+            if position < 0:
+                errors.append(f"missing physical cross-plane drop: {drop}")
+            elif position > reply:
+                errors.append(f"physical cross-plane drop occurs after reply allowance: {drop}")
+            if f'iifname "{ingress}" oifname "{egress}" accept' in forward:
+                errors.append(f"physical cross-plane accept exists: {ingress}->{egress}")
+        if errors:
+            raise SystemExit("; ".join(errors))
+      - "{{ nic_internal }}"
+      - "{{ nic_egress }}"
+    stdin: "{{ host_input_guard.stdout }}"
+    stdin_add_newline: false
+  changed_when: false
+
 - name: Every managed bridge denies new container-to-host connections
   ansible.builtin.assert:
     that:
       - "'chain container_forward' in host_input_guard.stdout"
       - "('ip saddr ' ~ envoy_egress_ip) in host_input_guard.stdout"
-      - "('ip daddr ' ~ container_dns_server) in host_input_guard.stdout"
       - "('iifname \"' ~ item.bridge ~ '\" drop') in host_input_guard.stdout"
       - "('iifname \"' ~ item.bridge ~ '\" ct state established,related ct direction reply accept') in host_input_guard.stdout"
     fail_msg: "Missing host INPUT boundary for {{ item.bridge }}."
@@ -483,11 +748,19 @@
   loop_control:
     label: "{{ item.bridge }}"
 
+- name: Every Internet resolver is pinned to the Envoy egress identity
+  ansible.builtin.assert:
+    that:
+      - "('ip saddr ' ~ envoy_egress_ip ~ ' ip daddr ' ~ item) in host_input_guard.stdout"
+      - "('oifname \"' ~ nic_egress ~ '\"') in host_input_guard.stdout"
+    fail_msg: "Internet resolver {{ item }} is not identity- and egress-pinned."
+  loop: "{{ egress_dns_servers }}"
+
 - name: Docker default and future bridge names deny new container-to-host connections
   ansible.builtin.assert:
     that:
-      - "'iifname \"docker0\" drop' in host_input_guard.stdout"
-      - "'iifname \"br-*\" drop' in host_input_guard.stdout"
+      - "host_input_guard.stdout.count('iifname \"docker0\" drop') == 2"
+      - "host_input_guard.stdout.count('iifname \"br-*\" drop') == 2"
       - "'iifname \"docker0\" ct state established,related ct direction reply accept' in host_input_guard.stdout"
       - "'iifname \"br-*\" ct state established,related ct direction reply accept' in host_input_guard.stdout"
     quiet: true
@@ -495,7 +768,7 @@
       The nft INPUT guard does not cover Docker's docker0/default generated
       br-* bridge names; a future container could reach a host listener.
 
-- name: Lab DNS DNAT is source-scoped in the independent nft guard
+- name: Platform DNS DNAT is source-scoped in the independent nft guard
   ansible.builtin.assert:
     that:
       - "host_input_guard.stdout is search('iifname \\\"' ~ (nic_adm | regex_escape) ~ '\\\".*ip saddr ' ~ (vpn_client_cidr | regex_escape) ~ '.*udp dport 53 accept')"
@@ -503,8 +776,8 @@
       - "host_input_guard.stdout is search('iifname \\\"' ~ (nic_internal | regex_escape) ~ '\\\".*ip saddr ' ~ (internal_cidr | regex_escape) ~ '.*udp dport 53 accept')"
       - "host_input_guard.stdout is search('iifname \\\"' ~ (nic_internal | regex_escape) ~ '\\\".*ip saddr ' ~ (internal_cidr | regex_escape) ~ '.*tcp dport 53 accept')"
       - "host_input_guard.stdout is not search('iifname \\\"' ~ (nic_egress | regex_escape) ~ '\\\".*dport 53 accept')"
-    fail_msg: Lab DNS TCP/UDP 53 is absent from the persistent native guard.
-  when: lab_dns_enabled | bool
+    fail_msg: Platform DNS TCP/UDP 53 is absent from the persistent native guard.
+  when: platform_authoritative_dns_enabled | bool
 
 - name: Independent nft guard restricts physical ingress to exact DNAT tuples
   ansible.builtin.assert:
@@ -584,7 +857,7 @@
       writable, or attached outside net-identity.
   when: samba_lab_enabled | bool
 
-- name: Wait for the authoritative lab DNS health contract
+- name: Wait for the authoritative platform DNS health contract
   ansible.builtin.command:
     argv:
       - docker
@@ -599,9 +872,9 @@
   until: >-
     lab_dns_inspect.rc == 0 and
     ((((lab_dns_inspect.stdout | from_json | first).State.Health | default({})).Status) | default('')) == 'healthy'
-  when: lab_dns_enabled | bool
+  when: platform_authoritative_dns_enabled | bool
 
-- name: Lab DNS runtime matches the reviewed isolation boundary
+- name: Platform DNS runtime matches the reviewed isolation boundary
   ansible.builtin.assert:
     that:
       - not ((lab_dns_inspect.stdout | from_json | first).HostConfig.Privileged | bool)
@@ -616,11 +889,114 @@
       - eth0_ip not in ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/tcp'] | map(attribute='HostIp') | list)
       - eth0_ip not in ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/udp'] | map(attribute='HostIp') | list)
     fail_msg: >-
-      Lab DNS is unhealthy, privileged, writable, over-capable, attached to an
+      Platform DNS is unhealthy, privileged, writable, over-capable, attached to an
       application plane, or published outside TCP/UDP 53.
-  when: lab_dns_enabled | bool
+  when: platform_authoritative_dns_enabled | bool
 
-- name: Query authoritative lab DNS over UDP and TCP from the host bridge
+- name: Verify live containers retain their exact resolver modes
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import subprocess
+        import sys
+
+        project = sys.argv[1]
+        internal = json.loads(sys.argv[2])
+        egress = json.loads(sys.argv[3])
+        internal_services = json.loads(sys.argv[4])
+        isolated_services = json.loads(sys.argv[5])
+        errors = []
+        for name in internal_services + isolated_services + ["envoy-egress"]:
+            raw = subprocess.check_output(
+                ["docker", "--host", "unix:///run/docker.sock", "inspect",
+                 f"{project}-{name}-1"], text=True
+            )
+            configured = json.loads(raw)[0]["HostConfig"].get("Dns") or []
+            expected = (
+                egress if name == "envoy-egress"
+                else internal if name in internal_services
+                else ["127.0.0.1"]
+            )
+            if configured != expected:
+                errors.append(f"{name}:resolver-mode-drift")
+        if errors:
+            raise SystemExit(";".join(errors))
+      - "{{ compose_project_name }}"
+      - "{{ internal_dns_servers | to_json }}"
+      - "{{ egress_dns_servers | to_json }}"
+      - >-
+        {{ ['traefik-int', 'traefik-adm', 'alloy', 'cribl-mock'] | to_json }}
+      - >-
+        {{ [
+          'oauth2-proxy', 'oauth2-proxy-grafana',
+          'oauth2-proxy-prometheus', 'oauth2-proxy-vault', 'litellm',
+          'open-webui', 'keycloak', 'dev-portal', 'admin-portal',
+          'key-rotator', 'vault', 'vault-ui-proxy', 'postgres', 'redis',
+          'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana'
+        ] | to_json }}
+  changed_when: false
+
+- name: Preserve embedded service discovery for an upstream-DNS-isolated backend
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - exec
+      - "{{ compose_project_name }}-litellm-1"
+      - python3
+      - -I
+      - -c
+      - |
+        import socket
+
+        if not socket.getaddrinfo(
+            "postgres", 5432, socket.AF_INET, socket.SOCK_STREAM
+        ):
+            raise SystemExit("embedded Docker service discovery returned no address")
+  changed_when: false
+
+- name: Resolve the authoritative zone from each routable edge resolver path
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import subprocess
+        import sys
+
+        project, service, resolver, hostname, expected = sys.argv[1:]
+        raw = subprocess.check_output(
+            ["docker", "--host", "unix:///run/docker.sock", "inspect",
+             f"{project}-{service}-1"], text=True
+        )
+        pid = json.loads(raw)[0]["State"]["Pid"]
+        result = subprocess.run(
+            ["nsenter", "--target", str(pid), "--net", "dig",
+             f"@{resolver}", hostname, "A", "+short", "+time=2", "+tries=1"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode or result.stdout.strip() != expected:
+            raise SystemExit("edge resolver path did not return the restricted view")
+      - "{{ compose_project_name }}"
+      - "{{ item.0 }}"
+      - "{{ item.1 }}"
+      - "dns.{{ aigw_domain }}"
+      - "{{ eth2_ip }}"
+  loop: "{{ ['traefik-int', 'traefik-adm'] | product(internal_dns_servers) | list }}"
+  loop_control:
+    label: "{{ item.0 }}"
+  changed_when: false
+  when: platform_authoritative_dns_enabled | bool
+
+- name: Query the restricted platform DNS view over UDP and TCP from the host bridge
   ansible.builtin.command:
     argv:
       - dig
@@ -630,24 +1006,118 @@
       - +short
       - "{{ item.transport }}"
   loop:
-    - { name: portal.aigw.internal, transport: +notcp }
-    - { name: auth.aigw.internal, transport: +tcp }
-    - { name: admin.aigw.internal, transport: +tcp }
-    - { name: admin-portal.aigw.internal, transport: +notcp }
-    - { name: grafana.aigw.internal, transport: +notcp }
-    - { name: prometheus.aigw.internal, transport: +tcp }
-    - { name: vault.aigw.internal, transport: +notcp }
-  register: lab_dns_queries
+    - { name: "portal.{{ aigw_domain }}", transport: +notcp }
+    - { name: "auth.{{ aigw_domain }}", transport: +tcp }
+    - { name: "api.{{ aigw_domain }}", transport: +notcp }
+  register: lab_dns_restricted_queries
   changed_when: false
   failed_when: >-
-    lab_dns_queries.rc != 0 or
-    (item.name in ['portal.aigw.internal'] and
-     lab_dns_queries.stdout | trim != eth2_ip) or
-    (item.name not in ['portal.aigw.internal'] and
-     lab_dns_queries.stdout | trim != eth1_ip)
-  when: lab_dns_enabled | bool
+    lab_dns_restricted_queries.rc != 0 or
+    lab_dns_restricted_queries.stdout | trim != eth2_ip
+  when: platform_authoritative_dns_enabled | bool
 
-- name: Prove the lab DNS process cannot originate DNS, TCP, or ICMP egress
+# The host reaches the isolated DNS bridge from its Docker address, which is
+# deliberately outside LAB_DNS_ADM_CIDR.  It can therefore exercise the
+# fail-closed/default view, but must never be used to assert ADM-only names.
+- name: Verify the restricted platform DNS view does not disclose ADM-only names
+  ansible.builtin.command:
+    argv:
+      - dig
+      - "@{{ (lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-lab-dns'].IPAddress }}"
+      - "{{ item.name }}"
+      - A
+      - +noall
+      - +comments
+      - "{{ item.transport }}"
+  loop:
+    - { name: "admin.{{ aigw_domain }}", transport: +notcp }
+    - { name: "admin-portal.{{ aigw_domain }}", transport: +tcp }
+    - { name: "litellm-admin.{{ aigw_domain }}", transport: +notcp }
+    - { name: "grafana.{{ aigw_domain }}", transport: +notcp }
+    - { name: "prometheus.{{ aigw_domain }}", transport: +tcp }
+    - { name: "vault.{{ aigw_domain }}", transport: +notcp }
+  register: lab_dns_restricted_negative_queries
+  changed_when: false
+  failed_when: >-
+    lab_dns_restricted_negative_queries.rc != 0 or
+    'status: NXDOMAIN' not in lab_dns_restricted_negative_queries.stdout
+  when: platform_authoritative_dns_enabled | bool
+
+- name: Prove the restricted DNS view cannot recurse public names
+  ansible.builtin.command:
+    argv:
+      - dig
+      - "@{{ (lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-lab-dns'].IPAddress }}"
+      - www.example.com
+      - A
+      - +noall
+      - +comments
+      - +time=2
+      - +tries=1
+  register: internal_public_dns_denial
+  changed_when: false
+  failed_when: >-
+    internal_public_dns_denial.rc != 0 or
+    'status: NXDOMAIN' not in internal_public_dns_denial.stdout
+  when: platform_authoritative_dns_enabled | bool
+
+# The controller's exact source/ADM path is proven before any host mutation.
+# Query through the published ADM listener from that controller so CoreDNS sees
+# a real ADM client address.  Do not bind the host's ADM address while querying
+# the bridge: source-policy routing correctly sends that traffic to the ADM
+# gateway rather than the Docker subnet.
+- name: Query the published ADM platform DNS view over UDP and TCP from the controller
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - "@{{ eth1_ip }}"
+      - "{{ item.name }}"
+      - A
+      - +short
+      - "{{ item.transport }}"
+      - +time=5
+      - +tries=1
+  loop:
+    - { name: "auth.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
+    - { name: "admin.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
+    - { name: "admin-portal.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
+    - { name: "litellm-admin.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
+    - { name: "grafana.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
+    - { name: "prometheus.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
+    - { name: "vault.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
+    - { name: "chat.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
+    - { name: "api.{{ aigw_domain }}", expected: "{{ eth2_ip }}", transport: +tcp }
+    - { name: "portal.{{ aigw_domain }}", expected: "{{ eth2_ip }}", transport: +notcp }
+  register: lab_dns_adm_queries
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: >-
+    lab_dns_adm_queries.rc != 0 or
+    lab_dns_adm_queries.stdout | trim != item.expected
+  when: platform_authoritative_dns_enabled | bool
+
+- name: Prove the ADM DNS listener cannot recurse public names
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - "@{{ eth1_ip }}"
+      - www.example.com
+      - A
+      - +noall
+      - +comments
+      - +time=5
+      - +tries=1
+  register: adm_public_dns_denial
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: >-
+    adm_public_dns_denial.rc != 0 or
+    'status: NXDOMAIN' not in adm_public_dns_denial.stdout
+  when: platform_authoritative_dns_enabled | bool
+
+- name: Prove the platform DNS process cannot originate DNS, TCP, or ICMP egress
   ansible.builtin.command:
     argv:
       - docker
@@ -657,9 +1127,9 @@
       - "{{ compose_project_name }}-lab-dns-1"
       - /dns-healthcheck
       - --assert-no-egress
-      - "{{ container_dns_server }}"
+      - "{{ egress_dns_servers | first }}"
   changed_when: false
-  when: lab_dns_enabled | bool
+  when: platform_authoritative_dns_enabled | bool
 
 - name: Samba lab directory database is internally consistent
   ansible.builtin.command:
@@ -845,8 +1315,15 @@
     - { address: "{{ traefik_int_portal_ip }}", hostname: "portal.{{ aigw_domain }}", path: /healthz, status: "200" }
     - { address: "{{ traefik_int_portal_ip }}", hostname: "auth.{{ aigw_domain }}", path: /realms/aigw/.well-known/openid-configuration, status: "200" }
     - { address: "{{ traefik_int_chat_ip }}", hostname: "api.{{ aigw_domain }}", path: /ui, status: "403" }
-    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin.{{ aigw_domain }}", path: /, status: "302" }
-    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin-portal.{{ aigw_domain }}", path: /healthz, status: "200" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin.{{ aigw_domain }}", path: /, status: "303" }
+    # Traefik v3 RedirectRegex emits 301 for permanent redirects and 302 for
+    # temporary redirects. Verify the implementation's actual contract.
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin-portal.{{ aigw_domain }}", path: /healthz, status: "301" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /, status: "302" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /ui, status: "302" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /openapi.json, status: "403" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /docs/, status: "403" }
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /redoc, status: "403" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "grafana.{{ aigw_domain }}", path: /, status: "302" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "prometheus.{{ aigw_domain }}", path: /, status: "302" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "vault.{{ aigw_domain }}", path: /, status: "302" }

@@ -8,8 +8,6 @@
 networks:
   net-identity:
     external: true
-  net-lab-dns:
-    external: true
 
 volumes:
   samba_ad_config:
@@ -17,62 +15,6 @@ volumes:
   samba_ad_public:
 
 services:
-  # Authoritative, non-recursive DNS for the Mac's scoped aigw.internal
-  # resolver. The dedicated bridge has no application-plane adjacency;
-  # DOCKER-USER/native firewall default-deny rules block its egress while
-  # allowing these exact ADM-bound published ports to function.
-  lab-dns:
-    profiles: [lab-ad]
-    build:
-      context: ./services/lab-dns
-      network: none
-    image: ai-gateway/lab-dns:1.14.4
-    command: [-conf, /etc/coredns/Corefile]
-    restart: unless-stopped
-    privileged: false
-    user: "65532:65532"
-    read_only: true
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    # The official image carries this file capability on /coredns; retaining
-    # only the matching bounding capability is required for exec and :53.
-    cap_add: [NET_BIND_SERVICE]
-    pids_limit: 64
-    labels:
-      com.aigw.contract.selinux-generation: "1"
-      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_LAB_DNS:?AIGW_BIND_DIGEST_LAB_DNS must be set}
-    deploy:
-      resources:
-        limits: { memory: 64M, cpus: "0.25", pids: 64 }
-    environment:
-      # Select the administrative split-DNS view only for queries whose original
-      # client address belongs to the explicit ADM/VPN client CIDR.
-      LAB_DNS_ADM_CIDR: ${LAB_DNS_ADM_CIDR:?LAB_DNS_ADM_CIDR must be set}
-    ports:
-      - "${ETH1_IP:?ETH1_IP must be set}:53:53/tcp"
-      - "${ETH1_IP:?ETH1_IP must be set}:53:53/udp"
-      - "${ETH2_IP:?ETH2_IP must be set}:53:53/tcp"
-      - "${ETH2_IP:?ETH2_IP must be set}:53:53/udp"
-    volumes:
-      - ./services/lab-dns/Corefile:/etc/coredns/Corefile:ro,Z
-      - ./services/lab-dns/db.aigw.internal:/etc/coredns/zones/db.aigw.internal:ro,Z
-      - ./services/lab-dns/db.aigw.internal.adm:/etc/coredns/zones/db.aigw.internal.adm:ro,Z
-    networks:
-      net-lab-dns:
-        ipv4_address: ${LAB_DNS_IP:?LAB_DNS_IP must be set}
-    healthcheck:
-      test: [CMD, /dns-healthcheck]
-      interval: 10s
-      timeout: 2s
-      retries: 3
-      start_period: 5s
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
-        labels: "com.docker.compose.project,com.docker.compose.service"
-
   samba-ad:
     profiles: [lab-ad]
     build:

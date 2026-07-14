@@ -4,9 +4,10 @@ http:
     # api.$DOMAIN — explicit allow-list of LiteLLM's INFERENCE surface only.
     # The management API (/key, /user, /team, /model, /config, /global, ...)
     # and the Admin UI (/ui, /sso, /login) must never be reachable on the
-    # internal edge: the admin path is admin.$DOMAIN on traefik-adm, behind
-    # oauth2-proxy + the aigw-admins role. Anything not matched here falls
-    # through to api-deny below.
+    # internal edge: the native LiteLLM UI is litellm-admin.$DOMAIN on
+    # traefik-adm behind oauth2-proxy + the aigw-admins role, while the
+    # separate custom platform console is admin.$DOMAIN. Anything not matched
+    # here falls through to api-deny below.
     api:
       # Never use a blanket /v1 prefix here. LiteLLM also places management
       # and control-plane handlers below /v1 (for example /v1/model/info,

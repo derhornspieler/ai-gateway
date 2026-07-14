@@ -10,6 +10,7 @@ from apscheduler.triggers.date import DateTrigger
 from pydantic import ValidationError
 
 from app import health
+from app import vault_client as vault_client_module
 from app.config import Settings
 from app.db import Database
 from app.drivers.anthropic_wif import AnthropicWifDriver
@@ -19,7 +20,13 @@ from app.drivers.openai_svcacct import (
     OpenAISvcAcctDriver,
 )
 from app.drivers.static_seed import StaticSeedDriver, VAULT_RETRY_SECONDS
+from app.identity import IdentityError
 from app.main import SettingsUpdate, app, readyz, state
+from app.provider_state import (
+    CREDENTIAL_ISSUED,
+    CREDENTIAL_LIFECYCLE_FIELD,
+    CREDENTIAL_PROMOTION_PENDING,
+)
 from app.security import path_segment
 from app.scheduler import RotationScheduler
 from app.vault_client import VaultClient, VaultError, mask_secret
@@ -80,7 +87,9 @@ def test_service_urls_reject_ambiguous_or_credentialed_values() -> None:
 
 def test_keycloak_bootstrap_url_is_same_origin_and_canonical() -> None:
     cfg = settings(KEYCLOAK_URL="https://keycloak.internal:8443")
-    valid = "https://keycloak.internal:8443/realms/anthropic/protocol/openid-connect/token"
+    valid = (
+        "https://keycloak.internal:8443/realms/anthropic/protocol/openid-connect/token"
+    )
     assert cfg.validated_keycloak_token_url(valid) == valid
 
     for invalid in (
@@ -102,9 +111,7 @@ def test_keycloak_assertion_audiences_follow_each_realm_frontend() -> None:
     assert cfg.keycloak_assertion_audience("aigw") == (
         "https://auth.aigw.internal/realms/aigw/protocol/openid-connect/token"
     )
-    internal = (
-        "http://keycloak:8080/realms/anthropic-wif/protocol/openid-connect/token"
-    )
+    internal = "http://keycloak:8080/realms/anthropic-wif/protocol/openid-connect/token"
     assert cfg.keycloak_assertion_audience_for_token_url(internal) == (
         "https://idp.wif-a.example.invalid/realms/anthropic-wif/"
         "protocol/openid-connect/token"
@@ -140,6 +147,205 @@ def test_vault_transport_ignores_ambient_proxies_and_redirects() -> None:
 
 
 @pytest.mark.asyncio
+async def test_vault_public_status_route_is_admin_internal_only_and_bounded() -> None:
+    old_state = dict(state)
+
+    class PublicVault:
+        def public_status(self):
+            return {"initialized": True, "sealed": True}
+
+    try:
+        cfg = settings()
+        state.clear()
+        state.update({"settings": cfg, "vault": PublicVault()})
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rotator"
+        ) as client:
+            assert (await client.get("/vault/public-status")).status_code == 401
+            portal = await client.get(
+                "/vault/public-status",
+                headers={"X-Internal-Auth": cfg.portal_identity_token},
+            )
+            assert portal.status_code == 401
+
+            admin = await client.get(
+                "/vault/public-status",
+                headers={"X-Internal-Auth": cfg.rotator_internal_token},
+            )
+            assert admin.status_code == 200
+            assert admin.json() == {"initialized": True, "sealed": True}
+            assert admin.headers["cache-control"] == "no-store"
+    finally:
+        state.clear()
+        state.update(old_state)
+
+
+@pytest.mark.asyncio
+async def test_vault_public_status_route_sanitizes_upstream_failure() -> None:
+    old_state = dict(state)
+
+    class BrokenVault:
+        def public_status(self):
+            raise VaultError("sensitive upstream diagnostic")
+
+    try:
+        cfg = settings()
+        state.clear()
+        state.update({"settings": cfg, "vault": BrokenVault()})
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rotator"
+        ) as client:
+            response = await client.get(
+                "/vault/public-status",
+                headers={"X-Internal-Auth": cfg.rotator_internal_token},
+            )
+            assert response.status_code == 503
+            assert response.json() == {"detail": "Vault public status unavailable"}
+            assert "sensitive" not in response.text
+    finally:
+        state.clear()
+        state.update(old_state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("vault_status", "expected"),
+    [
+        ({"initialized": True, "sealed": True}, 423),
+        ({"initialized": True, "sealed": False}, 502),
+        ({"initialized": False, "sealed": True}, 502),
+    ],
+)
+async def test_identity_authorization_emits_typed_error_only_for_exact_sealed_vault(
+    vault_status, expected
+) -> None:
+    old_state = dict(state)
+
+    class BrokenIdentity:
+        async def user_has_admin_role(self, _user_id):
+            raise IdentityError("wrapped authorization failure")
+
+    class PublicVault:
+        def public_status(self):
+            return vault_status
+
+    try:
+        cfg = settings()
+        state.clear()
+        state.update(
+            {
+                "settings": cfg,
+                "identity": BrokenIdentity(),
+                "vault": PublicVault(),
+            }
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rotator"
+        ) as client:
+            response = await client.get(
+                "/identity/authorization/user-1",
+                headers={"X-Internal-Auth": cfg.rotator_internal_token},
+            )
+        assert response.status_code == expected
+        if expected == 423:
+            assert response.json() == {"detail": "vault_sealed"}
+        else:
+            assert "vault_sealed" not in response.text
+    finally:
+        state.clear()
+        state.update(old_state)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload", "expected"),
+    [
+        (200, {"initialized": True, "sealed": False}, {"initialized": True, "sealed": False}),
+        (429, {"initialized": True, "sealed": False}, {"initialized": True, "sealed": False}),
+        (472, {"initialized": True, "sealed": False}, {"initialized": True, "sealed": False}),
+        (473, {"initialized": True, "sealed": False}, {"initialized": True, "sealed": False}),
+        (503, {"initialized": True, "sealed": True}, {"initialized": True, "sealed": True}),
+        (501, {"initialized": False, "sealed": True}, {"initialized": False, "sealed": True}),
+    ],
+)
+def test_vault_public_status_accepts_only_status_consistent_boolean_state(
+    monkeypatch, status_code, payload, expected
+) -> None:
+    calls: list[dict] = []
+
+    class Response:
+        def __init__(self):
+            self.status_code = status_code
+
+        def json(self):
+            return payload
+
+    class Session:
+        def __init__(self):
+            self.trust_env = True
+
+        def get(self, url, **kwargs):
+            calls.append({"url": url, "trust_env": self.trust_env, **kwargs})
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(vault_client_module.requests, "Session", Session)
+    result = VaultClient(settings(VAULT_ADDR="http://vault:8200")).public_status()
+
+    assert result == expected
+    assert calls == [
+        {
+            "url": "http://vault:8200/v1/sys/health",
+            "trust_env": False,
+            "params": {"standbyok": "true", "perfstandbyok": "true"},
+            "headers": {"User-Agent": "aigw-key-rotator-vault-status"},
+            "allow_redirects": False,
+            "timeout": 5,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload"),
+    [
+        (501, {"initialized": False, "sealed": False}),
+        (501, {"initialized": True, "sealed": True}),
+        (503, {"initialized": True, "sealed": False}),
+        (200, {"initialized": True, "sealed": True}),
+        (302, {"initialized": True, "sealed": False}),
+        (501, {"initialized": "false", "sealed": True}),
+    ],
+)
+def test_vault_public_status_rejects_impossible_or_ambiguous_health(
+    monkeypatch, status_code, payload
+) -> None:
+    class Response:
+        def __init__(self):
+            self.status_code = status_code
+
+        def json(self):
+            return payload
+
+    class Session:
+        trust_env = True
+
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(vault_client_module.requests, "Session", Session)
+
+    with pytest.raises(VaultError, match="public status unavailable"):
+        VaultClient(settings()).public_status()
+
+
+@pytest.mark.asyncio
 async def test_auth_fails_closed_and_public_health_redacts_details() -> None:
     old_state = dict(state)
     old_flags = health.snapshot()
@@ -151,7 +357,9 @@ async def test_auth_fails_closed_and_public_health_redacts_details() -> None:
             "vault=http://vault:8200 account=svcacct_sensitive internal-only detail",
         )
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://rotator") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rotator"
+        ) as client:
             health_response = await client.get("/healthz")
             assert health_response.status_code == 200
             assert health_response.json() == {"ok": True, "alerts_ok": False}
@@ -353,6 +561,37 @@ async def test_scheduler_reload_does_not_cancel_accepted_manual_job() -> None:
     assert scheduler._scheduler.get_job("rotate_openai") is not None
 
 
+@pytest.mark.asyncio
+async def test_queued_anthropic_manual_rotation_rechecks_confirmed_disable() -> None:
+    vendor = "anthropic"
+    db = SchedulerDB(
+        {
+            "vendor": vendor,
+            "enabled": False,
+            "interval_seconds": 3000,
+            "grace_seconds": 300,
+            "config": {},
+        }
+    )
+    driver = SequenceDriver(RotationResult(status="success", detail="rotated"))
+    scheduler = RotationScheduler(
+        settings(), db, SchedulerVault(ready=True), object(), {vendor: driver}
+    )
+
+    result = await scheduler.run_rotation(vendor)
+
+    assert result.status == "skipped"
+    assert driver.calls == 0
+    assert db.history == [
+        (
+            vendor,
+            "rotate",
+            "skipped",
+            "Anthropic WIF refresh is disabled; rotation skipped",
+        )
+    ]
+
+
 class SchedulerVault:
     def __init__(self, ready: bool) -> None:
         self.is_ready = ready
@@ -466,7 +705,9 @@ async def test_zero_interval_defers_while_vault_sealed_then_runs_once() -> None:
     deferred = scheduler._scheduler.get_job(f"rotate_{vendor}")
     assert deferred is not None
     assert isinstance(deferred.trigger, DateTrigger)
-    assert deferred.trigger.run_date >= datetime.now(timezone.utc) + timedelta(seconds=25)
+    assert deferred.trigger.run_date >= datetime.now(timezone.utc) + timedelta(
+        seconds=25
+    )
 
     vault.is_ready = True
     remove_canonical_job(scheduler, vendor)
@@ -517,7 +758,9 @@ async def test_zero_interval_generic_failure_does_not_retry_forever() -> None:
     vendor = "static-openai"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=True)
-    driver = SequenceDriver(RotationResult(status="failed", detail="permanent auth error"))
+    driver = SequenceDriver(
+        RotationResult(status="failed", detail="permanent auth error")
+    )
     scheduler = RotationScheduler(settings(), db, vault, object(), {vendor: driver})
 
     await scheduler.reload()
@@ -643,7 +886,9 @@ async def test_self_disable_settings_read_loss_defers_gated_reconciliation() -> 
     assert vendor in scheduler._oneshot_scheduled
     deferred = scheduler._scheduler.get_job(f"rotate_{vendor}")
     assert deferred is not None
-    assert deferred.trigger.run_date >= datetime.now(timezone.utc) + timedelta(seconds=25)
+    assert deferred.trigger.run_date >= datetime.now(timezone.utc) + timedelta(
+        seconds=25
+    )
 
     # The gated recheck sees the still-disabled row and clears the lifecycle
     # without a second driver invocation or history row.
@@ -673,7 +918,9 @@ async def test_zero_interval_dynamic_result_recreates_removed_date_trigger() -> 
     assert dynamic is not None
     assert isinstance(dynamic.trigger, DateTrigger)
     assert dynamic.func == scheduler._run_oneshot
-    assert dynamic.trigger.run_date >= datetime.now(timezone.utc) + timedelta(seconds=115)
+    assert dynamic.trigger.run_date >= datetime.now(timezone.utc) + timedelta(
+        seconds=115
+    )
 
 
 @pytest.mark.asyncio
@@ -691,7 +938,9 @@ async def test_dynamic_rearm_survives_transient_latest_settings_failure() -> Non
     deferred = scheduler._scheduler.get_job(f"rotate_{vendor}")
     assert deferred is not None
     assert deferred.func == scheduler._run_oneshot
-    assert deferred.trigger.run_date >= datetime.now(timezone.utc) + timedelta(seconds=115)
+    assert deferred.trigger.run_date >= datetime.now(timezone.utc) + timedelta(
+        seconds=115
+    )
     assert db.history == []
 
     remove_canonical_job(scheduler, vendor)
@@ -830,6 +1079,115 @@ async def test_database_writers_own_disjoint_settings_columns(monkeypatch) -> No
 class FailingStateDB(FakeDB):
     async def update_settings_config(self, vendor, config):
         raise RuntimeError("postgres unavailable")
+
+
+class DeterministicAnthropicDriver(AnthropicWifDriver):
+    async def _get_keycloak_jwt(self, ctx, bootstrap):
+        return "keycloak-assertion"
+
+    async def _exchange_anthropic_token(self, ctx, bootstrap, assertion):
+        assert assertion == "keycloak-assertion"
+        return "short-lived-anthropic-token", 3600
+
+
+class AnthropicLifecycleDB(FakeDB):
+    def __init__(self, events, *, fail_issued=False) -> None:
+        super().__init__()
+        self.events = events
+        self.fail_issued = fail_issued
+        self.durable_config = {}
+
+    async def update_settings_config(self, vendor, config):
+        assert vendor == "anthropic"
+        lifecycle = config.get(CREDENTIAL_LIFECYCLE_FIELD)
+        self.events.append(("state", lifecycle))
+        if self.fail_issued and lifecycle == CREDENTIAL_ISSUED:
+            raise RuntimeError("issued-state persistence failed")
+        self.durable_config = copy.deepcopy(config)
+
+
+class AnthropicLifecycleLiteLLM:
+    def __init__(self, events, db) -> None:
+        self.events = events
+        self.db = db
+
+    async def upsert_credential(self, name, values):
+        assert name == "anthropic-primary"
+        assert values == {"api_key": "short-lived-anthropic-token"}
+        assert (
+            self.db.durable_config.get(CREDENTIAL_LIFECYCLE_FIELD)
+            == CREDENTIAL_PROMOTION_PENDING
+        )
+        self.events.append(("promotion", name))
+
+
+def anthropic_lifecycle_context(db, litellm) -> DriverContext:
+    vault = FakeVault()
+    vault.docs["ai-gateway/anthropic-wif"] = {
+        "kc_token_url": (
+            "http://keycloak:8080/realms/anthropic-wif/"
+            "protocol/openid-connect/token"
+        ),
+        "kc_client_id": "anthropic-token-broker",
+        "federation_rule_id": "fed_123",
+        "organization_id": "org_123",
+        "service_account_id": "svc_123",
+    }
+    return DriverContext(
+        settings=settings(),
+        vault=vault,
+        litellm=litellm,
+        db=db,
+        vendor_settings={
+            "enabled": True,
+            "interval_seconds": 3000,
+            "config": {
+                CREDENTIAL_LIFECYCLE_FIELD: CREDENTIAL_ISSUED,
+                "_last_issued_at": 1,
+                "_last_expires_in": 1,
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_persists_pending_before_promotion_then_issued() -> None:
+    events: list[tuple[str, object]] = []
+    db = AnthropicLifecycleDB(events)
+    litellm = AnthropicLifecycleLiteLLM(events, db)
+
+    result = await DeterministicAnthropicDriver().rotate(
+        anthropic_lifecycle_context(db, litellm)
+    )
+
+    assert result.status == "success"
+    assert events == [
+        ("state", CREDENTIAL_PROMOTION_PENDING),
+        ("promotion", "anthropic-primary"),
+        ("state", CREDENTIAL_ISSUED),
+    ]
+    assert db.durable_config[CREDENTIAL_LIFECYCLE_FIELD] == CREDENTIAL_ISSUED
+    assert db.durable_config["_last_expires_in"] == 3600
+
+
+@pytest.mark.asyncio
+async def test_anthropic_promotion_state_failure_remains_durably_pending() -> None:
+    events: list[tuple[str, object]] = []
+    db = AnthropicLifecycleDB(events, fail_issued=True)
+    litellm = AnthropicLifecycleLiteLLM(events, db)
+
+    result = await DeterministicAnthropicDriver().rotate(
+        anthropic_lifecycle_context(db, litellm)
+    )
+
+    assert result.status == "failed"
+    assert ("promotion", "anthropic-primary") in events
+    assert db.durable_config[CREDENTIAL_LIFECYCLE_FIELD] == (
+        CREDENTIAL_PROMOTION_PENDING
+    )
+    # Both the post-promotion proof write and the failure-state retry reject;
+    # neither can overwrite the durable pre-promotion ambiguity marker.
+    assert events.count(("state", CREDENTIAL_ISSUED)) == 2
 
 
 @pytest.mark.asyncio

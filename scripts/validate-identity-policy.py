@@ -30,6 +30,13 @@ KEYCLOAK_POLICY = {
     "maxFailureWaitSeconds": 900,
     "maxDeltaTimeSeconds": 43200,
 }
+CAPABILITY_ROLE_SCOPE = ["aigw-admins", "aigw-developers", "aigw-users"]
+FIRST_PARTY_OIDC_CLIENTS = {
+    "open-webui",
+    "dev-portal",
+    "admin-portal",
+    "admin-ui",
+}
 
 
 def require_keycloak_policy(path: pathlib.Path, *, template: bool) -> None:
@@ -62,7 +69,7 @@ static_realm = json.loads((realm_dir / "aigw-realm.json").read_text())
 if source_layout:
     domain = "aigw.example.internal"
     realm_template = (SOURCE_TEMPLATES / "aigw-realm.json.j2").read_text()
-    for hostname in ("portal", "admin-portal"):
+    for hostname in ("portal", "admin"):
         assert realm_template.count(
             f'"post.logout.redirect.uris": "https://{hostname}.{{{{ aigw_domain }}}}/login"'
         ) == 1
@@ -100,9 +107,9 @@ clients = static_realm.get("clients", [])
 assert isinstance(clients, list)
 clients_by_id = {client.get("clientId"): client for client in clients}
 assert len(clients_by_id) == len(clients), "duplicate OIDC client id"
-assert set(clients_by_id) == {
-    "open-webui", "dev-portal", "admin-portal", "admin-ui"
-}, "first-party OIDC client allow-list drifted"
+assert set(clients_by_id) == FIRST_PARTY_OIDC_CLIENTS, (
+    "first-party OIDC client allow-list drifted"
+)
 
 expected = {
     "open-webui": {
@@ -115,19 +122,19 @@ expected = {
         "logout": f"https://portal.{domain}/login",
     },
     "admin-portal": {
-        "redirectUris": [f"https://admin-portal.{domain}/auth/callback"],
-        "webOrigins": [f"https://admin-portal.{domain}"],
-        "logout": f"https://admin-portal.{domain}/login",
+        "redirectUris": [f"https://admin.{domain}/auth/callback"],
+        "webOrigins": [f"https://admin.{domain}"],
+        "logout": f"https://admin.{domain}/login",
     },
     "admin-ui": {
         "redirectUris": [
-            f"https://admin.{domain}/oauth2/callback",
+            f"https://litellm-admin.{domain}/oauth2/callback",
             f"https://grafana.{domain}/oauth2/callback",
             f"https://prometheus.{domain}/oauth2/callback",
             f"https://vault.{domain}/oauth2/callback",
         ],
         "webOrigins": [
-            f"https://admin.{domain}",
+            f"https://litellm-admin.{domain}",
             f"https://grafana.{domain}",
             f"https://prometheus.{domain}",
             f"https://vault.{domain}",
@@ -140,6 +147,7 @@ for client_id, contract in expected.items():
     assert client.get("webOrigins") == contract["webOrigins"], client_id
     assert client.get("standardFlowEnabled") is True, client_id
     assert client.get("directAccessGrantsEnabled") is False, client_id
+    assert client.get("fullScopeAllowed") is False, client_id
     if "logout" in contract:
         assert (
             client.get("attributes", {}).get("post.logout.redirect.uris")
@@ -147,6 +155,41 @@ for client_id, contract in expected.items():
         ), client_id
     mappers = client.get("protocolMappers", [])
     assert len(mappers) == 1 and mappers[0].get("config", {}).get("claim.name") == "roles", client_id
+
+scope_mappings = static_realm.get("scopeMappings")
+assert isinstance(scope_mappings, list), "OIDC realm-role scope mappings are missing"
+scope_mappings_by_client = {
+    mapping.get("client"): mapping
+    for mapping in scope_mappings
+    if isinstance(mapping, dict)
+}
+assert len(scope_mappings_by_client) == len(scope_mappings), (
+    "duplicate or invalid OIDC realm-role scope mapping"
+)
+assert set(scope_mappings_by_client) == FIRST_PARTY_OIDC_CLIENTS, (
+    "OIDC realm-role scope mapping allow-list drifted"
+)
+for client_id in sorted(FIRST_PARTY_OIDC_CLIENTS):
+    assert scope_mappings_by_client[client_id].get("roles") == CAPABILITY_ROLE_SCOPE, (
+        f"{client_id}: OIDC realm-role scope mapping drifted"
+    )
+
+if source_layout:
+    assert realm_template.count('"scopeMappings"') == 1, (
+        "realm template must have one OIDC realm-role scope mapping block"
+    )
+    assert len(re.findall(r'"client"\s*:', realm_template)) == len(
+        FIRST_PARTY_OIDC_CLIENTS
+    ), "realm template OIDC realm-role scope mappings drifted"
+    for client_id in FIRST_PARTY_OIDC_CLIENTS:
+        pattern = (
+            rf'"client"\s*:\s*"{re.escape(client_id)}"\s*,\s*'
+            r'"roles"\s*:\s*\[\s*"aigw-admins"\s*,\s*'
+            r'"aigw-developers"\s*,\s*"aigw-users"\s*\]'
+        )
+        assert len(re.findall(pattern, realm_template, flags=re.DOTALL)) == 1, (
+            f"realm template scope mapping drifted for {client_id}"
+        )
 
 entrypoint = (ROOT / "services/samba-ad-lab/samba-ad-entrypoint").read_text()
 for assignment in (

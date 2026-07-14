@@ -61,7 +61,7 @@ def set_session(client: TestClient):
 
 @pytest.fixture
 def admin_client() -> TestClient:
-    return TestClient(admin_app, base_url="https://admin-portal.test")
+    return TestClient(admin_app, base_url="https://admin.test")
 
 
 @pytest.fixture

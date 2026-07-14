@@ -6,7 +6,7 @@
 # may be deferred to end-of-play handlers, or containers would run unlocked
 # and verify would assert against unpopulated state.
 - name: AI Gateway host — full converge
-  hosts: gateway
+  hosts: gateway:generic_rocky9
   become: true
   pre_tasks:
     # These checks intentionally run before os_baseline. A stale NIC mapping
@@ -15,6 +15,12 @@
       ansible.builtin.assert:
         that:
           - deployment_profile | length > 0
+          - >-
+            (aigw_domain | default('')) is string and
+            (aigw_domain | default('') | length <= 253) and
+            (aigw_domain | default('')) is match(
+              '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+            )
           - stack_dir is string
           - stack_dir | length <= 192
           - stack_dir is match('^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}$')
@@ -46,10 +52,30 @@
           - aigw_docker_host_marker is match('^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}$')
           - aigw_selinux_policy == 'targeted'
           - aigw_selinux_state == 'enforcing'
-          - container_dns_server is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
-          - not container_dns_server.startswith('127.')
-          - not container_dns_server.startswith('169.254.')
-          - not container_dns_server.startswith('224.')
+          - aigw_require_time_sync is boolean
+          - >-
+            not (aigw_require_time_sync | bool) or
+            (aigw_time_sync_max_offset_seconds | int >= 1 and
+             aigw_time_sync_max_offset_seconds | int <= 300)
+          - internal_dns_servers is sequence
+          - internal_dns_servers is not string
+          - internal_dns_servers | length >= 1
+          - internal_dns_servers | length <= 3
+          - internal_dns_servers | unique | length == internal_dns_servers | length
+          - internal_dns_servers | select('match', '^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$') | list | length == internal_dns_servers | length
+          - internal_dns_servers | select('match', '^(127|169\\.254|22[4-9]|23[0-9])\\.') | list | length == 0
+          - egress_dns_servers is sequence
+          - egress_dns_servers is not string
+          - egress_dns_servers | length >= 1
+          - egress_dns_servers | length <= 3
+          - egress_dns_servers | unique | length == egress_dns_servers | length
+          - egress_dns_servers | select('match', '^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$') | list | length == egress_dns_servers | length
+          - egress_dns_servers | select('match', '^(127|169\\.254|22[4-9]|23[0-9])\\.') | list | length == 0
+          - internal_dns_servers | intersect(egress_dns_servers) | length == 0
+          - platform_authoritative_dns_enabled is boolean
+          - >-
+            not (platform_authoritative_dns_enabled | bool) or
+            (internal_dns_servers | sort == [eth1_ip, eth2_ip] | sort)
           - envoy_egress_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - alloy_internal_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - lab_dns_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
@@ -66,11 +92,29 @@
           - pbr_tables | map(attribute='priority') | unique | length == pbr_tables | length
           - aigw_ssh_password_authentication is boolean
           - aigw_adm_socks_enabled is boolean
+          - aigw_adm_socks_trusted_operator_ack is string
         fail_msg: >-
-          Refusing to mutate host: supply canonical bounded stack/Docker paths,
-          a safe Compose project name, the three NIC names, three existing IPv4
-          addresses, three gateways, and ADM/internal source CIDRs via an
-          environment inventory, --extra-vars, or documented AIGW_* variables.
+          Refusing to mutate host: supply a bounded canonical lowercase FQDN,
+          canonical bounded stack/Docker paths, a safe Compose project name,
+          the three NIC names, three existing IPv4 addresses, three gateways,
+          ADM/internal source CIDRs, and distinct internal/egress resolver lists
+          via an environment inventory, --extra-vars, or the AIGW_* controller
+          environment.
+
+    - name: Preflight — restrict SSH password and SOCKS exceptions to rocky9-lab
+      ansible.builtin.assert:
+        that:
+          - >-
+            (deployment_profile | default('')) == 'rocky9-lab' or
+            not (aigw_ssh_password_authentication | bool)
+          - >-
+            (deployment_profile | default('')) == 'rocky9-lab' or
+            not (aigw_adm_socks_enabled | bool)
+        quiet: true
+        fail_msg: >-
+          Password SSH authentication and trusted-operator SOCKS forwarding
+          are temporary rocky9-lab-only access exceptions. Generic/customer
+          inventories must keep both disabled.
 
     # SOCKS uses SSH local/dynamic forwarding, not host packet forwarding.  It
     # is therefore an explicit, source-scoped sshd Match exception rather than
@@ -88,14 +132,27 @@
             import re
             import sys
 
-            enabled = sys.argv[1] == "true"
-            users = json.loads(sys.argv[2])
-            groups = json.loads(sys.argv[3])
-            source_cidrs = json.loads(sys.argv[4])
-            group_test_users = json.loads(sys.argv[5])
-            vpn_network = ipaddress.ip_network(sys.argv[6], strict=True)
+            deployment_profile = sys.argv[1]
+            password_authentication = sys.argv[2] == "true"
+            enabled = sys.argv[3] == "true"
+            users = json.loads(sys.argv[4])
+            groups = json.loads(sys.argv[5])
+            source_cidrs = json.loads(sys.argv[6])
+            group_test_users = json.loads(sys.argv[7])
+            trusted_operator_ack = sys.argv[8]
+            vpn_network = ipaddress.ip_network(sys.argv[9], strict=True)
             errors = []
             safe_principal = re.compile(r"[a-z_][a-z0-9_-]{0,31}$")
+
+            if deployment_profile != "rocky9-lab":
+                if password_authentication:
+                    errors.append(
+                        "password SSH authentication is allowed only in deployment_profile=rocky9-lab"
+                    )
+                if enabled:
+                    errors.append(
+                        "SSH SOCKS is allowed only in deployment_profile=rocky9-lab"
+                    )
 
             if not isinstance(users, list) or not isinstance(groups, list):
                 errors.append("aigw_adm_socks_users/groups must be lists")
@@ -145,16 +202,25 @@
                     errors.append("enabled SSH SOCKS requires an ADM source CIDR")
                 if not users and not groups:
                     errors.append("enabled SSH SOCKS requires an approved user or group")
-            elif users or groups or source_cidrs or group_test_users:
-                errors.append("disabled SSH SOCKS must not retain approved principals or source CIDRs")
+                if trusted_operator_ack != "I_UNDERSTAND_SOCKS_REACHES_ALL_HOST_ROUTES":
+                    errors.append(
+                        "enabled SSH SOCKS requires the trusted-operator acknowledgement because PermitOpen any reaches every host-routable destination"
+                    )
+            elif users or groups or source_cidrs or group_test_users or trusted_operator_ack:
+                errors.append(
+                    "disabled SSH SOCKS must not retain approved principals, source CIDRs, or a trusted-operator acknowledgement"
+                )
 
             if errors:
                 raise SystemExit("; ".join(dict.fromkeys(errors)))
+          - "{{ deployment_profile | default('') }}"
+          - "{{ 'true' if (aigw_ssh_password_authentication | bool) else 'false' }}"
           - "{{ 'true' if (aigw_adm_socks_enabled | bool) else 'false' }}"
           - "{{ aigw_adm_socks_users | to_json }}"
           - "{{ aigw_adm_socks_groups | to_json }}"
           - "{{ aigw_adm_socks_source_cidrs | to_json }}"
           - "{{ aigw_adm_socks_group_test_users | to_json }}"
+          - "{{ aigw_adm_socks_trusted_operator_ack }}"
           - "{{ vpn_client_cidr }}"
       changed_when: false
 
@@ -416,7 +482,9 @@
           - "{{ docker_networks | to_json }}"
           - "{{ preflight_main_routes_json.stdout }}"
           - >-
-            {{ ([vpn_client_cidr, internal_cidr, container_dns_server ~ '/32']
+            {{ ([vpn_client_cidr, internal_cidr]
+                + ((internal_dns_servers + egress_dns_servers)
+                   | map('regex_replace', '$', '/32') | list)
                 + ([cribl_otlp_allowed_cidr] if (cribl_external_export_enabled | bool) else [])) | to_json }}
           - "{{ envoy_egress_ip }}"
           - "{{ alloy_internal_ip }}"
@@ -424,22 +492,32 @@
           - "{{ net_egress_subnet }}"
       changed_when: false
 
-    - name: Preflight — resolve the approved container DNS route
+    - name: Preflight — require corporate DNS to use only ADM/internal routing
       ansible.builtin.command:
-        argv: [ip, -4, route, get, "{{ container_dns_server }}"]
-      register: preflight_container_dns_route
+        argv: [ip, -4, route, get, "{{ item }}"]
+      loop: "{{ internal_dns_servers }}"
+      register: preflight_internal_dns_routes
       changed_when: false
+      failed_when: >-
+        preflight_internal_dns_routes.rc != 0 or
+        ((platform_authoritative_dns_enabled | bool) and
+         item not in [eth1_ip, eth2_ip]) or
+        (not (platform_authoritative_dns_enabled | bool) and
+         not (preflight_internal_dns_routes.stdout is search(
+           'dev (' ~ ([nic_adm, nic_internal] | map('regex_escape') | join('|')) ~ ')( |$)'
+         )))
 
-    - name: Preflight — require container DNS to use a supplied physical leg
-      ansible.builtin.assert:
-        that:
-          - >-
-            preflight_container_dns_route.stdout is search(
-              'dev (' ~ ([nic_egress, nic_adm, nic_internal] | map('regex_escape') | join('|')) ~ ')( |$)'
-            )
-        fail_msg: >-
-          The approved container resolver {{ container_dns_server }} is not
-          reachable through any supplied physical NIC.
+    - name: Preflight — require Internet DNS to use only the egress routing leg
+      ansible.builtin.command:
+        argv: [ip, -4, route, get, "{{ item }}"]
+      loop: "{{ egress_dns_servers }}"
+      register: preflight_egress_dns_routes
+      changed_when: false
+      failed_when: >-
+        preflight_egress_dns_routes.rc != 0 or
+        not (preflight_egress_dns_routes.stdout is search(
+          'dev ' ~ (nic_egress | regex_escape) ~ '( |$)'
+        ))
 
     - name: Preflight — bind an external Cribl endpoint to its exact firewall tuple
       ansible.builtin.command:
@@ -657,9 +735,41 @@
                 source = table["src"]
                 gateway = table["gw"]
                 existing = invoke("-j", "-4", "route", "show", "table", str(table_id))
-                main_links = invoke("-j", "-4", "route", "show", "table", "main", "dev", device, "scope", "link")
-                allowed_link_destinations = {
-                    (route.get("dst"), route.get("dev")) for route in main_links
+                def canonical_link_signature(route):
+                    # Do not let an arbitrary route sharing only a destination
+                    # and device pass as the kernel-connected route that the
+                    # applicator copies.  `prefsrc` is named `src` by some
+                    # iproute2 JSON versions, so normalize that one spelling.
+                    if (
+                        route.get("scope") != "link"
+                        or route.get("gateway") is not None
+                        or route.get("via") is not None
+                        or route.get("type", "unicast") != "unicast"
+                        or route.get("nexthops")
+                    ):
+                        return None
+                    return (
+                        route.get("dst"),
+                        route.get("dev"),
+                        route.get("protocol"),
+                        route.get("scope"),
+                        route.get("prefsrc") or route.get("src"),
+                        route.get("metric"),
+                    )
+
+                # iproute2 omits the selected `dev` field from JSON when the
+                # command itself is constrained with `dev <device>`.  Query
+                # the full main table, then explicitly retain only canonical
+                # kernel-connected routes on this device.  This permits only
+                # the exact link routes the applicator copies and rejects a
+                # foreign route that merely shares a destination/device.
+                main_routes = invoke("-j", "-4", "route", "show", "table", "main")
+                allowed_link_signatures = {
+                    signature
+                    for route in main_routes
+                    if route.get("dev") == device
+                    for signature in [canonical_link_signature(route)]
+                    if signature is not None
                 }
                 for route in existing:
                     destination = route.get("dst", "default")
@@ -671,7 +781,7 @@
                             and route_source == source
                         ):
                             errors.append(f"table {table_id} has a non-AIGW default route")
-                    elif (route.get("dst"), route.get("dev")) not in allowed_link_destinations:
+                    elif canonical_link_signature(route) not in allowed_link_signatures:
                         errors.append(f"table {table_id} has a non-AIGW route {destination!r}")
 
                 same_priority = [rule for rule in rules if int(rule.get("priority", -1)) == priority]
@@ -787,16 +897,17 @@
                 raise SystemExit("; ".join(errors))
           - "{{ encrypted_state_paths | to_json }}"
       changed_when: false
-      when: require_encrypted_state | bool
+      when: aigw_encrypted_state_preflight_required | bool
   roles:
     # These roles are intentionally first. They perform read-only controller,
-    # Docker, and packet-filter ownership gates before SELinux can install
-    # policy packages or reboot the host; only then establish the required
-    # SELinux runtime state before routing, firewalld, or Docker can mutate an
-    # existing Rocky host.
+    # Docker, and packet-filter ownership gates, then prove a synchronized
+    # clock before SELinux or Docker can install signed packages or build
+    # images. Only then establish the required SELinux runtime state before
+    # routing, firewalld, or Docker can mutate an existing Rocky host.
     - role: host_preflight
     - role: firewall_preflight
       when: manage_firewalld | bool
+    - role: time_sync
     - role: selinux_baseline
     - role: network_routing
       when: manage_networking | bool

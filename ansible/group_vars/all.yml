@@ -17,11 +17,18 @@ eth2_ip: "{{ lookup('ansible.builtin.env', 'AIGW_INTERNAL_IP') }}"
 eth2_gateway: "{{ lookup('ansible.builtin.env', 'AIGW_INTERNAL_GATEWAY') }}"
 vpn_client_cidr: "{{ lookup('ansible.builtin.env', 'AIGW_VPN_CLIENT_CIDR') }}"
 internal_cidr: "{{ lookup('ansible.builtin.env', 'AIGW_INTERNAL_CIDR') }}"
-# A real, non-loopback resolver address. Compose passes it as an explicit DNS
-# override so Docker 29 forwards queries from the container namespace where
-# DOCKER-USER can enforce them; inherited host resolvers are dialed by dockerd
-# from the host namespace and bypass FORWARD entirely.
-container_dns_server: "{{ lookup('ansible.builtin.env', 'AIGW_CONTAINER_DNS_SERVER') }}"
+# Resolver planes are deliberately distinct. Internal/ADM workloads use only
+# the customer-supplied corporate resolver set; the sole Internet-facing
+# Envoy workload uses only the separately supplied egress resolver set. Values
+# are lists in inventory, or comma-separated IPv4 literals in the controller
+# environment. site.yml rejects empty, duplicate, overlapping, loopback,
+# link-local, multicast, or incorrectly routed resolver sets before mutation.
+internal_dns_servers: >-
+  {{ lookup('ansible.builtin.env', 'AIGW_INTERNAL_DNS_SERVERS').split(',')
+     | map('trim') | reject('equalto', '') | list }}
+egress_dns_servers: >-
+  {{ lookup('ansible.builtin.env', 'AIGW_EGRESS_DNS_SERVERS').split(',')
+     | map('trim') | reject('equalto', '') | list }}
 
 # The full converge changes the ADM-zone SSH policy.  A controller must prove
 # it can reconnect through this exact port on the ADM interface before any
@@ -40,9 +47,11 @@ aigw_docker_host_mode: dedicated
 aigw_adopt_dedicated_docker_host: false
 aigw_docker_host_marker: /etc/ai-gateway/dedicated-docker-host-v1
 aigw_docker_host_pending_marker: "{{ aigw_docker_host_marker }}.pending"
-# Replacing existing host firewall/NM policy is separate authority from Docker
-# adoption. It is required only when a pre-existing nonempty guard/profile is
-# not already covered by the trusted AIGW host marker.
+# Kept only as a narrow acknowledgement for exact generated AIGW artifacts
+# while resuming a validated pending converge. It never authorizes arbitrary
+# firewalld, direct-rule, nftables, or NetworkManager policy on an existing
+# VM; that policy must be removed/reviewed before this dedicated host takes
+# ownership.
 aigw_adopt_firewalld_state: false
 # The managed sshd fragment is host-security state too.  Do not overwrite an
 # existing AIGW fragment on a customer VM unless the operator acknowledges the
@@ -50,11 +59,10 @@ aigw_adopt_firewalld_state: false
 aigw_adopt_ssh_state: false
 
 # SSH stays reachable only through the ADM interface/CIDR firewalld rule.  The
-# platform deliberately keeps password authentication enabled during this
-# greenfield phase; switching this explicit boolean to false is the supported
-# future hardening transition. Root login and all forwarding remain denied by
-# default regardless of this setting.
-aigw_ssh_password_authentication: true
+# generic/customer profile defaults to key-only. A lab inventory can enable
+# password authentication explicitly during greenfield access setup; root
+# login and all forwarding remain denied by default regardless of this setting.
+aigw_ssh_password_authentication: false
 
 # Dynamic SSH SOCKS forwarding is off by default.  Enabling it requires both
 # an approved local user and/or group and one or more source CIDRs contained
@@ -66,6 +74,11 @@ aigw_adm_socks_users: []
 aigw_adm_socks_groups: []
 aigw_adm_socks_source_cidrs: []
 aigw_adm_socks_group_test_users: {}
+# `PermitOpen any` is necessary for a true browser SOCKS proxy, but it lets a
+# named approved operator reach every destination routable by the host. Keep
+# the feature disabled unless the environment inventory explicitly records
+# this trusted-operator acknowledgement.
+aigw_adm_socks_trusted_operator_ack: ""
 
 # Configure the Rocky SELinux desired state before Docker is installed or
 # restarted.  Enabling a disabled policy requires a reboot, which remains an
@@ -77,6 +90,14 @@ aigw_allow_selinux_reboot: false
 # Switching a live Docker host from permissive to enforcing can surface prior
 # label/permission defects immediately. Require a maintenance acknowledgement.
 aigw_allow_active_selinux_enforcement: false
+
+# TLS, OIDC/JWT validation, signed package metadata, and certificate issuance
+# all rely on a trustworthy wall clock. Require a preinstalled Rocky 9 Chrony
+# client and use the host's reviewed Chrony source configuration; the role
+# refuses to build or start the stack until a fresh accepted source sample
+# proves the estimated clock error is within this bounded tolerance.
+aigw_require_time_sync: true
+aigw_time_sync_max_offset_seconds: 5
 
 # Observability export target. Plaintext is permitted only for the in-stack
 # development mock; docker_stack asserts that any real target uses validated
@@ -148,6 +169,10 @@ cribl_otlp_allowed_port: 4317
 traefik_int_chat_ip: 172.28.3.2
 traefik_int_portal_ip: 172.28.4.2
 traefik_adm_admin_ip: 172.28.5.2
+# LiteLLM must trust only the exact oauth2-proxy hop that fronts its native
+# admin UI. Uvicorn otherwise ignores X-Forwarded-Proto and emits an insecure
+# absolute http:// redirect for /ui -> /ui/ after a successful OIDC callback.
+oauth2_proxy_litellm_ip: 172.28.5.3
 traefik_adm_grafana_ip: 172.28.6.2
 oauth2_proxy_grafana_ip: 172.28.6.3
 alloy_telemetry_ip: 172.28.13.2
@@ -184,9 +209,19 @@ firewalld_zones:
     rich_rules:
       - 'rule family="ipv4" source address="{{ internal_cidr }}" port port="443" protocol="tcp" accept'
 
+# A clean-reset handoff leaves the lab egress and internal NICs in firewalld's
+# built-in fail-closed ``drop`` zone until the next full converge. Generic and
+# customer profiles never inherit this exception; the roles additionally bind
+# it to this exact two-interface lab contract before accepting it.
+aigw_lab_reset_handoff_drop_interfaces: []
+
 # ── Feature flags (set false for a reduced local test VM) ──────────────
 manage_firewalld: true       # zones + DOCKER-USER
-lab_dns_enabled: "{{ deployment_profile == 'rocky9-lab' }}"
+# Optional authoritative-only split DNS for the gateway zone. It never
+# forwards arbitrary names. The lab enables it; a generic deployment may opt
+# in explicitly when clients should point their ADM/internal interfaces at the
+# corresponding gateway address.
+platform_authoritative_dns_enabled: "{{ deployment_profile == 'rocky9-lab' }}"
 
 # ── Stack ───────────────────────────────────────────────────────────────
 stack_dir: /opt/ai-gateway
@@ -207,6 +242,14 @@ offline_image_seed_marker_dir: "{{ docker_data_root }}/.aigw-image-seeds"
 # fail before mutation unless both resolve through a dm-crypt/LUKS ancestor.
 # The explicit lab profile opts out because it is disposable local test.
 require_encrypted_state: true
+# This is deliberately stricter than the raw switch: an unencrypted-state
+# exception is valid only when the selected profile is the committed disposable
+# Rocky 9 lab *and* that lab explicitly sets require_encrypted_state=false.
+# Generic/customer profiles therefore remain fail-closed even if a stray
+# inventory override supplies false.
+aigw_encrypted_state_preflight_required: >-
+  {{ (deployment_profile | default('')) != 'rocky9-lab' or
+     (require_encrypted_state | bool) }}
 require_preupgrade_backup: true
 encrypted_state_paths:
   - "{{ docker_data_root }}"
@@ -215,6 +258,20 @@ compose_project_name: ai-gateway
 aigw_domain: aigw.example.internal
 samba_lab_enabled: "{{ deployment_profile == 'rocky9-lab' }}"
 retain_bootstrap_admin_user: false
+# A narrowly scoped recovery bridge for a realm created before explicit OIDC
+# role scope mappings were imported. It is deliberately off for generic and
+# customer inventories: it uses Keycloak's temporary bootstrap authority but
+# refuses to run unless no durable identity controller is configured.
+aigw_prebootstrap_oidc_scope_reconciliation: false
+aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
+# Optional pre-Vault recovery bridge. Generic/customer inventories inherit no
+# users, groups, federation choice, or acknowledgement: enabling it without an
+# explicit inventory-owned mutation set fails before Keycloak is contacted.
+aigw_pre_vault_identity_baseline_reconciliation: false
+aigw_pre_vault_identity_baseline_reconciliation_ack: ""
+aigw_pre_vault_identity_ensure_lab_federation: false
+aigw_pre_vault_identity_baseline_groups: []
+aigw_pre_vault_identity_bootstrap_admin_identities: []
 samba_lab_seed_users:
   - lab-admin
   - lab-developer
@@ -232,8 +289,10 @@ aigw_seed_test_users: false
 # ── Stack secrets ───────────────────────────────────────────────────────
 # NO secret defaults ship in git. Every credential below is intentionally
 # UNDEFINED here and MUST be supplied by an Ansible-Vault/SOPS-encrypted
-# overlay, e.g.:
-#   ansible-vault create inventory/group_vars/gateway/vault.yml
+# overlay. `inventory/group_vars/gateway/vault.yml` is selected only by the
+# committed lab inventory. Generic/customer operators must use the separate
+# layout generated by `scripts/bootstrap-generic-rocky9.py`, whose overlay is
+# `group_vars/generic_rocky9/vault.yml` beside that generated inventory.
 # env.j2 and the Keycloak realm templates wrap each of these in
 # `| mandatory(...)`, so a deploy WITHOUT the overlay ABORTS with a clear
 # message instead of silently coming up with a known-weak, git-published
@@ -244,7 +303,7 @@ aigw_seed_test_users: false
 # docker_stack validates every stack secret before rendering: 24/32+ chars as
 # appropriate and only [A-Za-z0-9_-]. This avoids Compose `$` interpolation,
 # newline/comment injection, and URI delimiter ambiguity in DATABASE_URL.
-# oauth2_proxy_cookie_secret is stricter: exactly 32 alphanumeric bytes.
+# Each oauth2_proxy_*_cookie_secret is stricter: exactly 32 alphanumeric bytes.
 #
 # ── Overlay MUST define ALL of these ────────────────────────────────────
 #   pg_super_password         pg_litellm_password        pg_keycloak_password
@@ -253,7 +312,9 @@ aigw_seed_test_users: false
 #   webui_secret_key          webui_oidc_client_secret
 #   portal_oidc_client_secret admin_portal_oidc_client_secret
 #   oauth2_proxy_client_secret
-#   oauth2_proxy_cookie_secret portal_session_secret admin_portal_session_secret
+#   oauth2_proxy_litellm_cookie_secret oauth2_proxy_grafana_cookie_secret
+#   oauth2_proxy_prometheus_cookie_secret oauth2_proxy_vault_cookie_secret
+#   portal_session_secret admin_portal_session_secret
 #   rotator_internal_token portal_identity_token grafana_admin_password
 #   kc_bootstrap_admin_client_secret
 # The rocky9-lab profile additionally requires:
@@ -281,10 +342,10 @@ aigw_seed_test_users: false
 # portal_oidc_client_secret:  <vault overlay only>  # alphanumeric only
 # admin_portal_oidc_client_secret: <vault overlay only>  # alphanumeric only
 # oauth2_proxy_client_secret: <vault overlay only>  # alphanumeric only
-# oauth2_proxy_cookie_secret: <vault overlay only>  # STABLE 32-char alphanumeric
-#     (16/24/32 bytes for AES). Was regenerated every ansible run via a
-#     /dev/null password lookup, which invalidated every admin session on each
-#     redeploy — it is now a stable overlay var. Alphanumeric only.
+# oauth2_proxy_litellm_cookie_secret: <vault overlay only>  # STABLE 32-char alphanumeric
+# oauth2_proxy_grafana_cookie_secret: <vault overlay only>  # STABLE 32-char alphanumeric
+# oauth2_proxy_prometheus_cookie_secret: <vault overlay only> # STABLE 32-char alphanumeric
+# oauth2_proxy_vault_cookie_secret: <vault overlay only>     # STABLE 32-char alphanumeric
 # portal_session_secret:      <vault overlay only>
 # admin_portal_session_secret: <vault overlay only>
 # rotator_internal_token:     <vault overlay only>

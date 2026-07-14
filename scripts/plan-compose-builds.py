@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+DOCKER_BINARY = "/usr/bin/docker"
 LOCAL_DOCKER_HOST = "unix:///run/docker.sock"
 FIXED_DOCKER_ENV = {
     "HOME": "/",
@@ -43,7 +44,7 @@ def inspect_image(image: str) -> str | None:
     # environment and pins the local UNIX socket, so root's persisted Docker
     # context cannot inspect an unrelated remote daemon.
     result = subprocess.run(  # nosec B603 B607
-        ["docker", "--host", LOCAL_DOCKER_HOST, "image", "inspect", image],
+        [DOCKER_BINARY, "--host", LOCAL_DOCKER_HOST, "image", "inspect", image],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

@@ -86,6 +86,51 @@ async def test_key_list_fails_closed_instead_of_authorizing_from_partial_pages(
 
 
 @pytest.mark.asyncio
+async def test_key_list_rejects_short_counter_declared_nonfinal_page(monkeypatch):
+    """A hidden page must not make an existing active key look absent."""
+
+    requests = 0
+
+    def handler(request: httpx.Request):
+        nonlocal requests
+        requests += 1
+        assert request.url.params["page"] == "1"
+        return httpx.Response(
+            200,
+            json={
+                "keys": [],
+                "current_page": 1,
+                "total_pages": 2,
+            },
+        )
+
+    _mock_client(monkeypatch, handler)
+
+    with pytest.raises(litellm_client.LiteLLMError, match="declared final page"):
+        await litellm_client.key_list("oidc-subject")
+    assert requests == 1
+
+
+@pytest.mark.asyncio
+async def test_key_list_rejects_inconsistent_counted_page(monkeypatch):
+    def handler(_request: httpx.Request):
+        return httpx.Response(
+            200,
+            json={
+                "keys": [{"token": "hash-1", "user_id": "oidc-subject"}],
+                "current_page": 1,
+                "total_pages": 1,
+                "total_count": 2,
+            },
+        )
+
+    _mock_client(monkeypatch, handler)
+
+    with pytest.raises(litellm_client.LiteLLMError, match="declared final page"):
+        await litellm_client.key_list("oidc-subject")
+
+
+@pytest.mark.asyncio
 async def test_key_list_rejects_cross_owner_or_unattributed_results(monkeypatch):
     for returned in (
         [{"token": "victim-hash", "user_id": "victim"}],
