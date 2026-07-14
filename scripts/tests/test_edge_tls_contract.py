@@ -3,7 +3,8 @@
 Two halves:
 
 * Exact-string pins prove the reviewed wiring stays in place across the
-  contract JSON, site.yml, the preflight, the docker_stack cert block ordering,
+  contract JSON, os-prep.yml (site.yml host-prep phase), the preflight, the
+  docker_stack cert block ordering,
   the verify gate, the compose model, and the three PKI scripts.
 * Functional tests drive scripts/edge-tls.py against a real OpenSSL-built PKI
   (root -> intermediate -> leaf) and assert every accept/reject decision, that
@@ -32,7 +33,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = ROOT / "ansible" / "generic-rocky9-contract.json"
 GROUP_VARS = ROOT / "ansible" / "group_vars" / "all.yml"
-SITE = ROOT / "ansible" / "site.yml"
+OS_PREP = ROOT / "ansible" / "os-prep.yml"
 PREFLIGHT = ROOT / "ansible" / "preflight-generic-rocky9.yml"
 DOCKER_STACK = ROOT / "ansible" / "roles" / "docker_stack" / "tasks" / "main.yml"
 VERIFY = ROOT / "ansible" / "roles" / "verify" / "tasks" / "main.yml"
@@ -111,7 +112,7 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertIn("aigw_edge_tls_mode: vault-intermediate", LAB_VARS.read_text(encoding="utf-8"))
 
     def test_site_gate_is_fail_closed_and_lab_may_use_the_real_ca_path(self) -> None:
-        site = SITE.read_text(encoding="utf-8")
+        site = OS_PREP.read_text(encoding="utf-8")
         self.assertIn("Preflight — require exactly one reviewed edge TLS mode", site)
         self.assertIn(
             "(deployment_profile == 'rocky9-lab' and\n"

@@ -10,6 +10,8 @@ VERIFY_TASKS = ROOT / "ansible/roles/verify/tasks/main.yml"
 ENV_TEMPLATE = ROOT / "ansible/roles/docker_stack/templates/env.j2"
 COMPOSE = ROOT / "compose/docker-compose.yml"
 FULL_SITE = ROOT / "ansible/site.yml"
+OS_PREP = ROOT / "ansible/os-prep.yml"
+STACK_ONLY_PLAYBOOK = ROOT / "ansible/deploy-stack-only.yml"
 SELINUX_BASELINE = ROOT / "ansible/roles/selinux_baseline/tasks/main.yml"
 
 
@@ -226,8 +228,18 @@ class SelinuxContractTests(unittest.TestCase):
 
     def test_full_converge_delegates_and_enforces_the_selinux_runtime_contract(self) -> None:
         site = FULL_SITE.read_text(encoding="utf-8")
+        os_prep = OS_PREP.read_text(encoding="utf-8")
+        stack_only = STACK_ONLY_PLAYBOOK.read_text(encoding="utf-8")
         role = SELINUX_BASELINE.read_text(encoding="utf-8")
 
+        # site.yml is the exact host-prep-then-stack composition; the SELinux
+        # runtime transition therefore always precedes any container start.
+        self.assertIn("- import_playbook: os-prep.yml", site)
+        self.assertIn("- import_playbook: deploy-stack-only.yml", site)
+        self.assertLess(
+            site.index("- import_playbook: os-prep.yml"),
+            site.index("- import_playbook: deploy-stack-only.yml"),
+        )
         for required in (
             "aigw_selinux_policy == 'targeted'",
             "aigw_selinux_state == 'enforcing'",
@@ -235,21 +247,26 @@ class SelinuxContractTests(unittest.TestCase):
             "- role: network_routing",
             "- role: firewalld_zones",
             "- role: os_baseline",
+        ):
+            self.assertIn(required, os_prep)
+        for required in (
             "- role: docker_stack",
             "- role: verify",
+            "- role: host_finalize",
         ):
-            self.assertIn(required, site)
+            self.assertIn(required, stack_only)
+            self.assertNotIn(required, os_prep)
         self.assertLess(
-            site.index("- role: selinux_baseline"),
-            site.index("- role: network_routing"),
+            os_prep.index("- role: selinux_baseline"),
+            os_prep.index("- role: network_routing"),
         )
         self.assertLess(
-            site.index("- role: selinux_baseline"),
-            site.index("- role: firewalld_zones"),
+            os_prep.index("- role: selinux_baseline"),
+            os_prep.index("- role: firewalld_zones"),
         )
         self.assertLess(
-            site.index("- role: selinux_baseline"),
-            site.index("- role: os_baseline"),
+            os_prep.index("- role: selinux_baseline"),
+            os_prep.index("- role: os_baseline"),
         )
         for required in (
             "ansible.builtin.command: getenforce",

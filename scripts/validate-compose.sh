@@ -569,8 +569,16 @@ if ansible.is_file():
     # vendor names before adding the project block.
     site = ansible.parents[3] / "site.yml"
     site_source = site.read_text()
-    # Full converge delegates the runtime SELinux transition to a dedicated
-    # role, rather than duplicating its gates in site.yml.  Keep the static
+    # The full converge is the exact host-prep-then-stack composition; the
+    # SELinux runtime transition therefore always precedes any container
+    # start, in this order, with no third entrypoint.
+    assert site_source.index("- import_playbook: os-prep.yml") < site_source.index(
+        "- import_playbook: deploy-stack-only.yml"
+    )
+    assert site_source.count("- import_playbook:") == 2
+    os_prep_source = (site.parent / "os-prep.yml").read_text()
+    # Host preparation delegates the runtime SELinux transition to a dedicated
+    # role, rather than duplicating its gates in os-prep.yml.  Keep the static
     # release contract anchored to both the caller's desired state and the
     # role's effective-runtime proof.  Merely setting inventory variables must
     # never let Docker run while SELinux is disabled, permissive, or non-targeted.
@@ -581,17 +589,20 @@ if ansible.is_file():
         "- role: network_routing",
         "- role: firewalld_zones",
         "- role: os_baseline",
-        "- role: docker_stack",
-        "- role: verify",
+        "- role: docker_networks",
     ):
-        assert required in site_source, required
-    assert site_source.index("- role: selinux_baseline") < site_source.index(
+        assert required in os_prep_source, required
+    # Host prep stops at the Docker bridges; the stack roles live only in
+    # deploy-stack-only.yml, which site.yml imports afterwards.
+    for stack_only_role in ("- role: docker_stack", "- role: verify", "- role: host_finalize"):
+        assert stack_only_role not in os_prep_source, stack_only_role
+    assert os_prep_source.index("- role: selinux_baseline") < os_prep_source.index(
         "- role: network_routing"
     )
-    assert site_source.index("- role: selinux_baseline") < site_source.index(
+    assert os_prep_source.index("- role: selinux_baseline") < os_prep_source.index(
         "- role: firewalld_zones"
     )
-    assert site_source.index("- role: selinux_baseline") < site_source.index(
+    assert os_prep_source.index("- role: selinux_baseline") < os_prep_source.index(
         "- role: os_baseline"
     )
     selinux_baseline = ansible.parents[2] / "selinux_baseline/tasks/main.yml"
@@ -622,10 +633,15 @@ if ansible.is_file():
         "aigw_selinux_audit_window_start",
         "date +'%m/%d/%y %H:%M:%S'",
         "- role: verify",
+        "- role: host_finalize",
+        "Preflight — require an exact completed or host-prep dedicated-host marker",
     ):
         assert required in stack_only_source, required
     assert stack_only_source.index("- role: docker_stack") < stack_only_source.index(
         "- role: verify"
+    )
+    assert stack_only_source.index("- role: verify") < stack_only_source.index(
+        "- role: host_finalize"
     )
 
     baseline = ansible.parents[2] / "os_baseline/tasks/main.yml"
@@ -730,19 +746,19 @@ if ansible.is_file():
     # stack_dir, docker_data_root, and the durable host marker are all
     # operator-provided absolute paths. Keep their canonical path validation
     # explicit so an existing-host converge cannot write an arbitrary marker.
-    assert site_source.count(canonical_path) == 3
-    assert "stack_dir | length <= 192" in site_source
-    assert "docker_data_root | length <= 192" in site_source
-    assert "stack_dir != docker_data_root" in site_source
-    assert "not stack_dir.startswith(docker_data_root ~ '/')" in site_source
-    assert "not docker_data_root.startswith(stack_dir ~ '/')" in site_source
-    assert "aigw_docker_host_marker | length <= 192" in site_source
-    assert "aigw_docker_host_marker is match(" in site_source
-    assert "compose_project_name is match('^[a-z0-9][a-z0-9_-]{0,62}$')" in site_source
-    assert site_source.index("stack_dir is match(") < site_source.index("  roles:")
-    assert "/usr/share/iproute2/rt_tables" in site_source
-    assert "preflight_rt_tables.content | b64decode" in site_source
-    assert "argv: [cat, /etc/iproute2/rt_tables]" not in site_source
+    assert os_prep_source.count(canonical_path) == 3
+    assert "stack_dir | length <= 192" in os_prep_source
+    assert "docker_data_root | length <= 192" in os_prep_source
+    assert "stack_dir != docker_data_root" in os_prep_source
+    assert "not stack_dir.startswith(docker_data_root ~ '/')" in os_prep_source
+    assert "not docker_data_root.startswith(stack_dir ~ '/')" in os_prep_source
+    assert "aigw_docker_host_marker | length <= 192" in os_prep_source
+    assert "aigw_docker_host_marker is match(" in os_prep_source
+    assert "compose_project_name is match('^[a-z0-9][a-z0-9_-]{0,62}$')" in os_prep_source
+    assert os_prep_source.index("stack_dir is match(") < os_prep_source.index("  roles:")
+    assert "/usr/share/iproute2/rt_tables" in os_prep_source
+    assert "preflight_rt_tables.content | b64decode" in os_prep_source
+    assert "argv: [cat, /etc/iproute2/rt_tables]" not in os_prep_source
     routing = ansible.parents[2] / "network_routing/tasks/main.yml"
     routing_source = routing.read_text()
     assert "Seed the administrator registry from the Rocky vendor registry" in routing_source
@@ -880,12 +896,12 @@ if ansible.is_file():
     assert "expected exactly one IDENTITY_LDAP_ENABLED selector" in wrapper_source
     assert "external identity overlay conflicts with the lab profile" in wrapper_source
 
-    assert "not (identity_ldap_enabled | bool) or not (samba_lab_enabled | bool)" in site_source
+    assert "not (identity_ldap_enabled | bool) or not (samba_lab_enabled | bool)" in os_prep_source
     assert (
         "not (identity_ldap_enabled | bool) or identity_ldap_url is match('^ldaps://')"
-        in site_source
+        in os_prep_source
     )
-    assert "Preflight — prove the external directory uses the internal physical leg" in site_source
+    assert "Preflight — prove the external directory uses the internal physical leg" in os_prep_source
 PY
 
 BUSYBOX_PIN='dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad'

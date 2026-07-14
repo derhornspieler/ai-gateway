@@ -50,11 +50,14 @@ otherwise reads the vendor file. The routing role then seeds a missing `/etc`
 override from that vendor registry before adding the bounded project block,
 preserving standard table names instead of shadowing them.
 
-Ansible orchestrates the host through the ordered roles in `ansible/site.yml`:
+Ansible orchestrates the host through eleven ordered roles. `ansible/site.yml`
+is the full converge, composed of `ansible/os-prep.yml` (host preparation:
 `host_preflight`, `firewall_preflight`, `time_sync`, `selinux_baseline`,
-`network_routing`, `firewalld_zones`, `os_baseline`, `docker_networks`,
-`docker_stack`, `verify`, and `host_finalize`. `ansible/deploy-stack-only.yml` performs an
-app-only rollout and refuses to run against a stale firewall or network ABI.
+`network_routing`, `firewalld_zones`, `os_baseline`, `docker_networks`) then
+`ansible/deploy-stack-only.yml` (stack phase: `docker_stack`, `verify`,
+`host_finalize`). `os-prep.yml` runs standalone for host-prep-only converges;
+`deploy-stack-only.yml` runs standalone for app-only rollouts and refuses an
+unprepared host or a stale firewall or network ABI.
 The inventory ships a generic `inventory/hosts.yml` and an explicit lab
 `inventory/lab.yml`. See [deploy-guide.md](deploy-guide.md).
 

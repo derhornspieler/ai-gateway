@@ -278,11 +278,18 @@ class VaultAnsibleUnsealContractTests(unittest.TestCase):
 
     def test_lab_and_generic_inventory_paths_share_the_same_role_contract(self) -> None:
         site = SITE.read_text(encoding="utf-8")
+        os_prep = (ROOT / "ansible/os-prep.yml").read_text(encoding="utf-8")
+        stack_only = (ROOT / "ansible/deploy-stack-only.yml").read_text(
+            encoding="utf-8"
+        )
         lab = LAB_INVENTORY.read_text(encoding="utf-8")
         generic = GENERIC_INVENTORY.read_text(encoding="utf-8")
-        self.assertIn("hosts: gateway:generic_rocky9", site)
-        self.assertIn("- role: docker_stack", site)
-        self.assertIn("- role: verify", site)
+        self.assertIn("- import_playbook: os-prep.yml", site)
+        self.assertIn("- import_playbook: deploy-stack-only.yml", site)
+        self.assertIn("hosts: gateway:generic_rocky9", os_prep)
+        self.assertIn("hosts: gateway:generic_rocky9", stack_only)
+        self.assertIn("- role: docker_stack", stack_only)
+        self.assertIn("- role: verify", stack_only)
         self.assertIn("gateway:", lab)
         self.assertIn("deployment_profile: rocky9-lab", lab)
         self.assertIn("generic_rocky9:", generic)

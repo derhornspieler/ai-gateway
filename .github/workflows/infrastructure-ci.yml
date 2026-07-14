@@ -47,8 +47,9 @@ jobs:
         run: |
           inventory="$RUNNER_TEMP/ci-inventory.ini"
           printf '[gateway]\nlocalhost ansible_connection=local\n[generic_rocky9]\n' > "$inventory"
-          ansible-playbook -i "$inventory" ansible/site.yml --syntax-check
+          ansible-playbook -i "$inventory" ansible/os-prep.yml --syntax-check
           ansible-playbook -i "$inventory" ansible/deploy-stack-only.yml --syntax-check
+          ansible-playbook -i "$inventory" ansible/site.yml --syntax-check
 
       - name: Render and validate base and lab Compose contracts
         run: bash scripts/validate-compose.sh

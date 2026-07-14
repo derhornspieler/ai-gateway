@@ -7,7 +7,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SITE = ROOT / "ansible" / "site.yml"
+OS_PREP = ROOT / "ansible" / "os-prep.yml"
 DEFAULTS = ROOT / "ansible" / "group_vars" / "all.yml"
 TIME_SYNC = ROOT / "ansible" / "roles" / "time_sync" / "tasks" / "main.yml"
 
@@ -72,7 +72,7 @@ class TimeSyncContractTests(unittest.TestCase):
 
     def test_clock_policy_is_enabled_by_default_and_checked_before_mutation(self) -> None:
         defaults = DEFAULTS.read_text(encoding="utf-8")
-        site = SITE.read_text(encoding="utf-8")
+        site = OS_PREP.read_text(encoding="utf-8")
         self.assertIn("aigw_require_time_sync: true", defaults)
         self.assertIn("aigw_time_sync_max_offset_seconds: 5", defaults)
         self.assertIn("aigw_require_time_sync is boolean", site)

@@ -452,7 +452,15 @@ ansible-playbook -i ansible/inventory/hosts.yml ansible/site.yml \
   -e @/secure/customer-topology.yml --ask-vault-pass
 ```
 
-The role order in `site.yml` is deliberate:
+`site.yml` is a pure composition of two playbooks that can also run
+separately with the same inventory arguments: `ansible/os-prep.yml` (host
+preparation only — the read-only input/topology validation plus roles
+`host_preflight` through `docker_networks`; it starts no containers and stops
+after the Docker bridges) followed by `ansible/deploy-stack-only.yml`
+(`docker_stack`, `verify`, `host_finalize`). Running the two halves
+back-to-back converges exactly what one `site.yml` run converges, which
+decouples OS host preparation from stack rollout. The role order across the
+composition is deliberate:
 
 1. preflight requires Rocky `targeted` SELinux to be enabled and enforcing,
    then validates topology, collision constraints, and encrypted backing for
@@ -678,21 +686,44 @@ update or a destructive empty-database reimport.
 When bootstrap is complete, run the acceptance checks in
 [test-runbook.md](test-runbook.md) before treating the deployment as usable.
 
+## Host-prep-only converge
+
+To prepare (or re-converge) the host without touching the container stack —
+for example when a host/OS team readies the VM ahead of the application
+rollout, or after host-level inventory changes — run the host-preparation
+half on its own:
+
+```bash
+ansible-playbook -i <inventory> ansible/os-prep.yml \
+  --ask-vault-pass
+```
+
+It performs the full read-only input/topology validation and runs
+`host_preflight` through `docker_networks`, leaving routing, firewall, SELinux,
+Docker, and all 20 bridges live but starting no containers. On a first
+converge it leaves the pending dedicated-Docker-host ownership marker
+(`/etc/ai-gateway/dedicated-docker-host-v1.pending`) as the host-prep-done
+signal that `deploy-stack-only.yml` requires.
+
 ## Stack-only rollout
 
-After a successful full converge, application/config updates can use the
-app-only playbook:
+After host preparation (first deploy) or a successful full converge
+(redeploy), application/config updates use the stack playbook:
 
 ```bash
 ansible-playbook -i <inventory> ansible/deploy-stack-only.yml \
   --ask-vault-pass
 ```
 
-It runs only `docker_stack` and `verify`, and refuses to proceed unless the live
-`DOCKER-USER` identity pin, native container-to-host guard, Docker SELinux state
-on the reviewed data root, and every external Docker network match the declared
-firewall/network ABI in `group_vars`. If it refuses, run the full `site.yml`; do
-not bypass the check or recreate networks manually. For a planned custom build
+It runs `docker_stack`, `verify`, and `host_finalize` (which promotes the
+completed dedicated-Docker-host marker after verification), and refuses to
+proceed unless the host carries the exact completed or pending
+dedicated-Docker-host ownership marker AND the live `DOCKER-USER` identity
+pin, native container-to-host guard, Docker SELinux state on the reviewed
+data root, and every external Docker network match the declared
+firewall/network ABI in `group_vars`. A host that never ran `os-prep.yml` (or
+`site.yml`) is always refused. If it refuses, run the full `site.yml`; do not
+bypass the check or recreate networks manually. For a planned custom build
 with an existing service, current source also requires successful retention of
 the exact healthy running image under an immutable
 project/service/source-digest rollback reference and a private schema-2 atomic

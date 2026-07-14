@@ -224,6 +224,9 @@ flowchart LR
 
 The converge is a gated pipeline: each stage validates its contract and the
 run stops at the first failure, before later stages can mutate the host.
+Stages R1–R6 are `ansible/os-prep.yml` (host preparation, runs standalone and
+starts no containers); R7–R9 are `ansible/deploy-stack-only.yml` (stack
+phase); `ansible/site.yml` composes the two in this exact order.
 
 ```mermaid
 flowchart TD

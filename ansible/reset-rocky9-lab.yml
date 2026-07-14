@@ -1922,5 +1922,6 @@
       ansible.builtin.debug:
         msg: >-
           Legacy lab reset completed. Docker remains stopped with no data root;
-          run the full site.yml converge next, never deploy-stack-only.
+          run the full site.yml converge next (or os-prep.yml followed by
+          deploy-stack-only.yml), never deploy-stack-only alone.
       changed_when: false

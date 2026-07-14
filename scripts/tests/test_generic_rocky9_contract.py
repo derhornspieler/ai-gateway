@@ -25,6 +25,7 @@ LAB_INVENTORY = ROOT / "ansible" / "inventory" / "lab.yml"
 LAB_VAULT = ROOT / "ansible" / "inventory" / "group_vars" / "gateway" / "vault.yml"
 STACK_ONLY = ROOT / "ansible" / "deploy-stack-only.yml"
 SITE = ROOT / "ansible" / "site.yml"
+OS_PREP = ROOT / "ansible" / "os-prep.yml"
 STACK_TASKS = ROOT / "ansible" / "roles" / "docker_stack" / "tasks" / "main.yml"
 
 
@@ -124,7 +125,7 @@ class GenericRocky9ContractTests(unittest.TestCase):
         self.assertIn("aigw_encrypted_state_preflight_required:", defaults)
         self.assertIn("(deployment_profile | default('')) != 'rocky9-lab'", defaults)
         self.assertIn("(require_encrypted_state | bool)", defaults)
-        for source in (STACK_ONLY, SITE):
+        for source in (STACK_ONLY, OS_PREP):
             self.assertIn(
                 "when: aigw_encrypted_state_preflight_required | bool",
                 source.read_text(encoding="utf-8"),
@@ -382,7 +383,7 @@ print("          0123456789abcdef")
         self.assertIn("aigw_seed_test_users", source)
         self.assertIn("aigw_prebootstrap_oidc_scope_reconciliation", source)
         self.assertNotIn("roles:", source)
-        for mutation_entrypoint in (SITE, STACK_ONLY):
+        for mutation_entrypoint in (OS_PREP, STACK_ONLY):
             entrypoint_source = mutation_entrypoint.read_text(encoding="utf-8")
             self.assertIn("bounded canonical lowercase", entrypoint_source)
             self.assertIn("(?=.{1,253}$)", entrypoint_source)

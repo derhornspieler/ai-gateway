@@ -148,7 +148,12 @@ files):
 
 The VM is a dedicated Docker host for this stack, recorded by a marker at
 `/etc/ai-gateway/dedicated-docker-host-v1` that is promoted only after a
-fully verified converge. The read-only preflight refuses, among other
+fully verified converge. During host preparation (`os-prep.yml`, or the
+host-prep phase of `site.yml`), `os_baseline` first records the same contract
+at `/etc/ai-gateway/dedicated-docker-host-v1.pending`; that pending marker is
+the host-prep-done ownership signal `deploy-stack-only.yml` accepts for a
+first stack deploy, and `host_finalize` replaces it with the completed marker
+once `verify` passes. The read-only preflight refuses, among other
 conditions: a controller connection that does not already traverse the
 future ADM firewall rule; conflicting Docker daemon flags or environment
 indirection in systemd drop-ins; unsafe (symlinked, group-writable,
