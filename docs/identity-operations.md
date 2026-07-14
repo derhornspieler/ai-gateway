@@ -209,6 +209,46 @@ whole initialization fails closed and the affected durable client stays
 disabled; the operation is idempotent, so reauthenticating and running
 **Initialize identity control** again reuses proven state and retries.
 
+## Domain migration on an existing realm
+
+Changing `aigw_domain` after the realm database already exists (for example
+migrating `aigw.internal` to `aigw.aegisgroup.ch`) does **not** re-key the
+first-party OIDC clients on its own: Keycloak imports realm JSON only into an
+empty database, so `admin-portal`, `dev-portal`, `open-webui`, and the four
+`admin-ui` oauth2-proxy callbacks keep their old `redirectUris`/`webOrigins`.
+Every browser login then fails with Keycloak `400 "Invalid parameter:
+redirect_uri"`, because the edge correctly emits the new-domain callback that is
+no longer on the client's allow-list.
+
+**While the identity bootstrap window is still open** — that is, before anyone
+has run the interactive **Initialize identity control** ceremony, so the
+temporary master-realm client `aigw-bootstrap-controller` still exists — a
+converge repairs this automatically. The `docker_stack` role runs
+`app.reconcile_oidc_redirect_uris` through the key-rotator service; it uses only
+that already-reviewed bootstrap credential to realign the four managed clients'
+`redirectUris`, `webOrigins`, and the two managed `post.logout.redirect.uris`
+allow-lists to the configured `aigw_domain`. It touches nothing else — not
+client secrets, flows, protocol mappers, realm-role scopes, the durable
+controller, the WIF broker, or the `account`/`security-admin-console`/`broker`
+built-ins — reads them back to verify, and never contacts Vault. Re-run the
+lab/host converge after a domain change and browser SSO recovers with no manual
+Keycloak edits. Reconciliation is idempotent, so ordinary converges after the
+migration report the callbacks already correct.
+
+**After the ceremony has completed** (`aigw-bootstrap-controller` deleted), the
+durable `aigw-identity-controller` deliberately holds no `manage-clients` role,
+so a converge cannot rewrite client callbacks. The reconciliation detects this
+state and fails closed *loudly but without failing the converge*: it prints
+`OIDC_REDIRECT_URI_PREBOOTSTRAP_RECONCILIATION_REBOOTSTRAP_REQUIRED` and the
+converge surfaces a note that a domain change now requires re-running the
+identity bootstrap ceremony. To repair callbacks on such a host, restore the
+temporary bootstrap client through your reviewed break-glass process (it is
+recreated on a realm re-seed into an empty database) and run **Initialize
+identity control** again — step 2 of that ceremony reconciles and verifies the
+same four clients. Never grant the durable controller a standing
+`manage-clients` role to avoid the ceremony; that is the security boundary this
+design preserves.
+
 ## Creating groups and assigning users
 
 Every mutation below requires a still-valid five-minute step-up and a valid CSRF

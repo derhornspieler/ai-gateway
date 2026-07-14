@@ -928,7 +928,13 @@ services to broader networks by hand.
 For OIDC callback or issuer errors, check split DNS, the browser-visible
 `https://auth.<domain>` issuer, the exact redirect URI, internal CA trust, and
 Keycloak's proxy-trusted addresses; realm imports do not update an existing
-database, so reconcile changed callbacks and secrets in Keycloak explicitly. When
+database, so reconcile changed callbacks and secrets in Keycloak explicitly. A
+`400 "Invalid parameter: redirect_uri"` on every login after an `aigw_domain`
+change is this exact case: while the identity bootstrap window is open a
+converge realigns the managed clients' callbacks automatically, and after the
+ceremony it requires re-running the bootstrap ceremony — see
+[identity operations](identity-operations.md#domain-migration-on-an-existing-realm).
+When
 vendor calls fail, check Envoy's startup-gate output, narrowed CA expiry or issuer
 changes, exact SAN, resolver reachability, the fixed `172.28.0.2` attachment,
 firewall counters, and the physical egress route; never "fix" an outage by using

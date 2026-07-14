@@ -3563,6 +3563,95 @@
     - not ((vault_public_status.stdout | from_json).sealed | bool)
   no_log: true
 
+# A domain migration on an already-seeded realm (e.g. aigw.internal ->
+# aigw.aegisgroup.ch) cannot be repaired by re-importing the realm JSON:
+# Keycloak imports realm JSON only into an empty database, so every managed
+# first-party client keeps its stale callback allow-list and browser SSO fails
+# with "Invalid parameter: redirect_uri". While the temporary master-realm
+# bootstrap client still exists (the interactive identity bootstrap has not yet
+# deleted it), realign only the four managed clients' redirectUris/webOrigins
+# (and the two RP-initiated logout allow-lists) to the configured aigw_domain
+# using that already-reviewed credential. This is deliberately safe to run on
+# every initialized converge: it touches only the domain-derived callbacks —
+# never client secrets, flows, mappers, realm-role scopes, the controller, or
+# the broker — never contacts Vault, and self-disables the moment the
+# interactive bootstrap consumes the client, reporting that a domain change
+# then needs the re-bootstrap ceremony rather than granting the durable
+# controller any manage-clients authority.
+- name: Wait for Keycloak before managed OIDC redirect-URI reconciliation
+  community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
+    services: [keycloak]
+    dependencies: false
+    state: present
+    build: never
+    wait: true
+    wait_timeout: 600
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
+  when:
+    - vault_strict_readiness.rc == 0
+    - vault_public_status.rc == 0
+    - (vault_public_status.stdout | from_json).initialized | bool
+    - not ((vault_public_status.stdout | from_json).sealed | bool)
+  no_log: true
+
+- name: Reconcile managed OIDC client redirect URIs to the configured domain
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/aigw-compose.sh"
+      - run
+      - --rm
+      - --no-deps
+      - -T
+      - key-rotator
+      - /opt/venv/bin/python
+      - -m
+      - app.reconcile_oidc_redirect_uris
+      - --confirm
+      - RECONCILE_PREBOOTSTRAP_OIDC_REDIRECT_URIS
+  args:
+    chdir: "{{ stack_dir }}"
+  environment:
+    STACK_DIR: "{{ stack_dir }}"
+    COMPOSE_PROJECT_NAME: "{{ compose_project_name }}"
+  register: managed_oidc_redirect_reconciliation
+  changed_when: >-
+    'OIDC_REDIRECT_URI_PREBOOTSTRAP_RECONCILIATION_APPLIED' in
+    managed_oidc_redirect_reconciliation.stdout
+  failed_when: managed_oidc_redirect_reconciliation.rc != 0
+  when:
+    - vault_strict_readiness.rc == 0
+    - vault_public_status.rc == 0
+    - (vault_public_status.stdout | from_json).initialized | bool
+    - not ((vault_public_status.stdout | from_json).sealed | bool)
+  no_log: true
+
+# Post-bootstrap hosts (temporary client already consumed) return the
+# rebootstrap-required marker with rc 0, so the converge does not fail; surface
+# it loudly so a silent domain change cannot leave SSO broken unnoticed.
+- name: Report when an OIDC domain migration needs the identity bootstrap ceremony
+  ansible.builtin.debug:
+    msg: >-
+      Managed OIDC redirect-URI reconciliation is unavailable: the temporary
+      master-realm bootstrap client has been consumed by the interactive
+      identity bootstrap, and the durable controller holds no manage-clients
+      role. If the deployment domain changed, browser SSO stays broken until an
+      operator re-runs the identity bootstrap ceremony — see
+      docs/identity-operations.md, "Domain migration on an existing realm".
+  when:
+    - managed_oidc_redirect_reconciliation is defined
+    - >-
+      'OIDC_REDIRECT_URI_PREBOOTSTRAP_RECONCILIATION_REBOOTSTRAP_REQUIRED' in
+      (managed_oidc_redirect_reconciliation.stdout | default(''))
+
 - name: Wait for the complete post-bootstrap stack
   community.docker.docker_compose_v2:
     docker_host: unix:///run/docker.sock
