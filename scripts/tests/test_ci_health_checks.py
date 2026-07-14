@@ -58,7 +58,10 @@ class RuntimeCanaryMatchesTheVerifyRole(unittest.TestCase):
     """The canary must predict exactly the assertions the converge will make."""
 
     def test_open_webui_tmpfs_tokens_match_the_verify_role(self) -> None:
-        required = literal_set(r"if not (\{[^}]*\}) <= tmpfs_options:", VERIFY)
+        required = literal_set(
+            r"not (\{[^}]*\}) <= tmpfs_options\s*\n\s*or \"ro\" in tmpfs_options",
+            VERIFY,
+        )
         self.assertEqual(CANARY.OPEN_WEBUI_REQUIRED_TOKENS, required)
 
     def test_grafana_plugin_tmpfs_tokens_match_the_verify_role(self) -> None:
@@ -67,14 +70,24 @@ class RuntimeCanaryMatchesTheVerifyRole(unittest.TestCase):
         )
         self.assertEqual(CANARY.GRAFANA_REQUIRED_TOKENS, required)
 
+    def test_verify_role_proves_writability_by_the_absence_of_ro(self) -> None:
+        # A tmpfs is read-write unless "ro" is present. The verify role must
+        # never require a literal "rw" (an Engine may not normalize it in) and
+        # must reject "ro" — which also catches a pathological "rw,ro", where
+        # the kernel honours the last token and mounts read-only.
+        self.assertIn('or "ro" in tmpfs_options', VERIFY)
+        self.assertIn('or "ro" in plugin_options', VERIFY)
+        self.assertEqual(CANARY.FORBIDDEN_TMPFS_TOKEN, "ro")
+        self.assertNotIn("rw", CANARY.GRAFANA_REQUIRED_TOKENS)
+        self.assertNotIn("rw", CANARY.OPEN_WEBUI_REQUIRED_TOKENS)
+
     def test_canary_replays_the_real_compose_tmpfs_specs(self) -> None:
-        # The grafana spec deliberately omits `rw`: the whole point is that the
-        # engine used to add it implicitly. Replaying the spec verbatim is what
-        # makes the canary able to detect that it stopped.
+        # The grafana spec deliberately omits `rw`: older engines added it
+        # implicitly. Replaying the spec verbatim is what makes the canary able
+        # to detect a change in what the Engine materialises.
         self.assertIn(f'tmpfs: ["{CANARY.OPEN_WEBUI_TMPFS_SPEC}"]', COMPOSE)
         self.assertIn(f"- {CANARY.GRAFANA_TMPFS_SPEC}", COMPOSE)
         self.assertNotIn("rw", CANARY.GRAFANA_TMPFS_SPEC)
-        self.assertIn("rw", CANARY.GRAFANA_REQUIRED_TOKENS)
 
     def test_canary_exercises_the_joined_profile_exec_contract(self) -> None:
         # Contract A: the emptied-COMPOSE_PROFILES trap that broke exec-style

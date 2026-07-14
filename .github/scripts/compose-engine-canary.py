@@ -51,7 +51,6 @@ from pathlib import Path
 # fails if the verify role and this canary ever disagree.
 OPEN_WEBUI_TMPFS_SPEC = "/tmp:rw,noexec,nosuid,nodev,mode=1777,size=256m"
 OPEN_WEBUI_REQUIRED_TOKENS = {
-    "rw",
     "noexec",
     "nosuid",
     "nodev",
@@ -62,7 +61,6 @@ GRAFANA_TMPFS_SPEC = (
     "/var/lib/grafana/plugins:uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev"
 )
 GRAFANA_REQUIRED_TOKENS = {
-    "rw",
     "noexec",
     "nosuid",
     "nodev",
@@ -70,6 +68,11 @@ GRAFANA_REQUIRED_TOKENS = {
     "gid=65532",
     "mode=0700",
 }
+# A tmpfs is read-write unless "ro" is present, so writability is proven by the
+# absence of "ro" rather than by a literal "rw" the Engine may or may not
+# normalize in. This also rejects a pathological "rw,ro" (the kernel honours the
+# last token), which a literal-"rw" requirement would have accepted.
+FORBIDDEN_TMPFS_TOKEN = "ro"
 
 PROBE_IMAGE = "aigw-ci-compose-canary:local"
 PROJECT = "aigw-canary"
@@ -367,6 +370,14 @@ def main() -> int:
                         f"{sorted(required)} for the {label} service "
                         f"(compose spec {spec!r}), so a converge fails at the verify "
                         "role with the stack already live."
+                    )
+                if FORBIDDEN_TMPFS_TOKEN in observed:
+                    failures.append(
+                        f"CONTRACT B BROKEN: HostConfig.Tmpfs[{destination!r}] now "
+                        f"reports {FORBIDDEN_TMPFS_TOKEN!r} on this Docker/Compose. "
+                        f"ansible/roles/verify/tasks/main.yml proves the {label} tmpfs "
+                        "is writable by that token's absence, so a converge fails at "
+                        "the verify role with the stack already live."
                     )
 
             mounts = inspected.get("Mounts")

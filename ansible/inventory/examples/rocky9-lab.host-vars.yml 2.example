@@ -1,0 +1,36 @@
+---
+# SAFE TEMPLATE ONLY. Values are examples for a disposable three-interface lab.
+deployment_profile: rocky9-lab
+ansible_host: "<LAB_ADM_INTERFACE_IP>"
+ansible_user: ansible
+ansible_become: true
+aigw_domain: aigw.internal
+aigw_management_ssh_port: 22
+
+nic_egress: "<LAB_EGRESS_INTERFACE>"
+nic_adm: "<LAB_ADM_INTERFACE>"
+nic_internal: "<LAB_INTERNAL_INTERFACE>"
+eth0_ip: "<LAB_EGRESS_STATIC_IP>"
+eth0_gateway: "<LAB_EGRESS_GATEWAY>"
+eth1_ip: "<LAB_ADM_STATIC_IP>"
+eth1_gateway: "<LAB_ADM_GATEWAY>"
+eth2_ip: "<LAB_INTERNAL_STATIC_IP>"
+eth2_gateway: "<LAB_INTERNAL_GATEWAY>"
+vpn_client_cidr: "<LAB_ADM_ALLOWED_CIDR>"
+internal_cidr: "<LAB_INTERNAL_ALLOWED_CIDR>"
+
+internal_dns_servers:
+  - "<LAB_INTERNAL_RECURSIVE_DNS>"
+egress_dns_servers:
+  - "<LAB_INTERNET_RECURSIVE_DNS>"
+platform_authoritative_dns_enabled: true
+aigw_vault_ui_enabled: true
+
+manage_networking: true
+require_encrypted_state: false
+require_preupgrade_backup: false
+aigw_ssh_password_authentication: true
+samba_lab_enabled: true
+aigw_seed_test_users: true
+retain_bootstrap_admin_user: true
+
