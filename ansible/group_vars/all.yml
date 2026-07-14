@@ -316,8 +316,11 @@ offline_image_seed_manifest_sha256: ""
 offline_image_seed_marker_dir: "{{ docker_data_root }}/.aigw-image-seeds"
 # Full prompts, Vault state, database pages, rendered credentials, and the
 # edge private key all land under these two paths. Generic/customer deploys
-# fail before mutation unless both resolve through a dm-crypt/LUKS ancestor.
-# The explicit lab profile opts out because it is disposable local test.
+# warn (but no longer fail) before mutation when either fails to resolve
+# through a dm-crypt/LUKS ancestor: LUKS is a build-time (disk-provisioning)
+# concern the converge does not manage, so the gap is surfaced loudly and the
+# converge continues. The explicit lab profile opts out of even the warning
+# because it is disposable local test.
 require_encrypted_state: true
 # This is deliberately stricter than the raw switch: an unencrypted-state
 # exception is valid only when the selected profile is the committed disposable

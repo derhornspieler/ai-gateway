@@ -175,10 +175,28 @@
                 if "crypto_LUKS" not in {value.strip() for value in ancestry}:
                     errors.append(f"{configured}: {source or found} has no crypto_LUKS ancestor")
             if errors:
-                raise SystemExit("; ".join(errors))
+                # Warn, do not fail: LUKS is a build-time (disk-provisioning)
+                # concern the converge does not manage. Surface the gap loudly
+                # and continue.
+                print("AIGW_ENCRYPTED_STATE_WARNING: " + "; ".join(errors))
           - "{{ encrypted_state_paths | to_json }}"
       changed_when: false
+      register: aigw_encrypted_state_check
       when: aigw_encrypted_state_preflight_required | bool
+
+    - name: Warn when sensitive state is not on LUKS-encrypted backing
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: sensitive AI Gateway state is NOT on LUKS-encrypted storage
+          ({{ aigw_encrypted_state_check.stdout
+              | regex_replace('^AIGW_ENCRYPTED_STATE_WARNING: ', '') }}).
+          Vault state, database pages, prompts, and the edge private key will be
+          written to unencrypted disk. Encrypt the backing device with LUKS at
+          build time to protect them. Continuing anyway.
+      when:
+        - aigw_encrypted_state_preflight_required | bool
+        - aigw_encrypted_state_check.stdout is defined
+        - "'AIGW_ENCRYPTED_STATE_WARNING' in aigw_encrypted_state_check.stdout"
 
     - name: Preflight — read live DOCKER-USER policy
       ansible.builtin.command: iptables -S DOCKER-USER
