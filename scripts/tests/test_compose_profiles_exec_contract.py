@@ -70,6 +70,7 @@ STACK_EMPTY_PROFILE_TASKS = (
     "Deploy stack without implicitly rebuilding custom images",
     "Wait for Keycloak before first pre-Vault identity recovery",
     "Wait for Keycloak before applicable pre-bootstrap OIDC scope reconciliation",
+    "Wait for Keycloak before managed OIDC redirect-URI reconciliation",
     "Wait for the complete post-bootstrap stack",
     "Wait only for bootstrap-independent core on first converge",
 )

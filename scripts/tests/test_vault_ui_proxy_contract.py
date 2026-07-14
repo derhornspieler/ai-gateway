@@ -263,7 +263,7 @@ class VaultUIProxyContractTests(unittest.TestCase):
         # tasks keep an empty ambient profile set; every raw live-project
         # exec/query carries the reviewed joined profile set instead
         # (test_compose_profiles_exec_contract.py pins the full split).
-        self.assertEqual(STACK.count('COMPOSE_PROFILES: ""'), 12)
+        self.assertEqual(STACK.count('COMPOSE_PROFILES: ""'), 13)
         self.assertIn(
             "Prove disabled Vault browser-surface containers are absent, not stopped",
             VERIFY,
