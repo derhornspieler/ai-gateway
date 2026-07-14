@@ -31,3 +31,10 @@ ansible/inventory/generated/
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# macOS/Finder duplicate-file artifacts (never source)
+*[[:space:]]2.json
+*[[:space:]]2.example
+*[[:space:]]2.py
+*[[:space:]]2.yml
+*[[:space:]]2.sh
