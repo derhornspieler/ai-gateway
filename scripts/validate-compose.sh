@@ -974,10 +974,23 @@ assert node_exporter["tmpfs"] == [
     "/tmp",
     "/host/run:uid=65532,gid=65532,mode=0555,noexec,nosuid,nodev,size=1m",
 ]
-assert node_exporter["volumes"] == [{
+assert len(node_exporter["volumes"]) == 1
+node_exporter_root = node_exporter["volumes"][0]
+assert set(node_exporter_root) == {
+    "type", "source", "target", "read_only", "bind",
+}
+assert node_exporter_root | {"bind": {}} == {
     "type": "bind", "source": "/", "target": "/host", "read_only": True,
-    "bind": {"propagation": "rslave"},
-}]
+    "bind": {},
+}
+node_exporter_bind = node_exporter_root["bind"]
+# Compose v2 emits create_host_path for short bind syntax while Compose v5
+# omits that default. The source is `/` (necessarily present), so either
+# representation has the same security boundary; keep every other bind field
+# forbidden and continue requiring rslave explicitly.
+assert set(node_exporter_bind) <= {"propagation", "create_host_path"}
+assert node_exporter_bind["propagation"] == "rslave"
+assert node_exporter_bind.get("create_host_path") in (None, True)
 assert services["loki"]["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
     "http://127.0.0.1:3100/ready",
@@ -1255,10 +1268,19 @@ assert node_exporter["tmpfs"] == [
     "/tmp",
     "/host/run:uid=65532,gid=65532,mode=0555,noexec,nosuid,nodev,size=1m",
 ]
-assert node_exporter["volumes"] == [{
+assert len(node_exporter["volumes"]) == 1
+node_exporter_root = node_exporter["volumes"][0]
+assert set(node_exporter_root) == {
+    "type", "source", "target", "read_only", "bind",
+}
+assert node_exporter_root | {"bind": {}} == {
     "type": "bind", "source": "/", "target": "/host", "read_only": True,
-    "bind": {"propagation": "rslave"},
-}]
+    "bind": {},
+}
+node_exporter_bind = node_exporter_root["bind"]
+assert set(node_exporter_bind) <= {"propagation", "create_host_path"}
+assert node_exporter_bind["propagation"] == "rslave"
+assert node_exporter_bind.get("create_host_path") in (None, True)
 for name, service in config["services"].items():
     if name != "volume-init":
         assert service.get("labels", {}).get(
