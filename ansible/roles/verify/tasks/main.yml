@@ -1249,6 +1249,11 @@
   changed_when: false
   when: platform_authoritative_dns_enabled | bool
 
+# This raw `docker compose exec` resolves the project from the deployed .env
+# (COMPOSE_FILE includes the lab overlay here) plus this process environment.
+# Modern Compose validates the whole project model even for exec, so the
+# reviewed profile set from docker_stack must stay active or the profile-gated
+# samba-ad service is excluded and the project is rejected as invalid.
 - name: Samba lab directory database is internally consistent
   ansible.builtin.command:
     argv:
@@ -1264,6 +1269,9 @@
       - --cross-ncs
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   changed_when: false
   when: samba_lab_enabled | bool
 

@@ -1951,6 +1951,17 @@
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   no_log: true
 
+# Raw `docker compose exec`-style tasks resolve the project from the deployed
+# .env (COMPOSE_FILE) plus this process environment only. Modern Compose
+# validates the complete project model even for exec and live-project queries,
+# so emptying COMPOSE_PROFILES while the lab overlay is loaded leaves the
+# overlay's keycloak depends_on pointing at the excluded profile-gated
+# samba-ad service and rejects the whole project. Live-project exec/queries
+# therefore carry the exact reviewed profile set; an empty ambient
+# COMPOSE_PROFILES stays reserved for tasks that pass files and profiles
+# explicitly (module `profiles:` or aigw_compose_cli_overlay_args) and for the
+# Vault UI removal reconciliation, where profile-gated services must remain
+# removable orphans.
 - name: Wait for PostgreSQL local-socket readiness
   ansible.builtin.command:
     argv:
@@ -1969,7 +1980,7 @@
   args:
     chdir: "{{ stack_dir }}"
   environment:
-    COMPOSE_PROFILES: ""
+    COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: postgres_ready
   changed_when: false
@@ -1995,7 +2006,7 @@
   args:
     chdir: "{{ stack_dir }}"
   environment:
-    COMPOSE_PROFILES: ""
+    COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: postgres_reconcile
   changed_when: "'AIGW_POSTGRES_CHANGED' in postgres_reconcile.stdout"
@@ -2051,7 +2062,7 @@
   args:
     chdir: "{{ stack_dir }}"
   environment:
-    COMPOSE_PROFILES: ""
+    COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: postgres_connect_matrix
   changed_when: false
@@ -2631,7 +2642,7 @@
   args:
     chdir: "{{ stack_dir }}"
   environment:
-    COMPOSE_PROFILES: ""
+    COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: vault_strict_readiness
   changed_when: false
@@ -2682,7 +2693,7 @@
   args:
     chdir: "{{ stack_dir }}"
   environment:
-    COMPOSE_PROFILES: ""
+    COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: vault_public_status
   changed_when: false
@@ -2706,7 +2717,7 @@
   args:
     chdir: "{{ stack_dir }}"
   environment:
-    COMPOSE_PROFILES: ""
+    COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: key_rotator_strict_readiness
   changed_when: false
