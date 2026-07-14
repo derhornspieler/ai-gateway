@@ -39,10 +39,10 @@ flowchart LR
   USR[Internal users and AI tools] -->|internal IP :443| TI
   ADM[VPN administrators] -->|ADM IP :443| TA
 
-  TI --> OW & DP
+  TI --> DP
   TI -->|aigw realm| KC
   TI -->|inference paths| LL
-  TA --> AP
+  TA --> AP & OW
   TA -->|auth host| KC
   OW --> LL
   DP --> KR
@@ -85,19 +85,20 @@ Read these in order for a deployment:
 1. [Architecture and trust boundaries](docs/solution-map.md)
 2. [Technical diagrams](docs/architecture-diagrams.md)
 3. [Network architecture and enforcement](docs/network-security.md)
-4. [Operating system security baseline](docs/os-security.md)
-5. [Container platform security](docs/docker-security.md)
-6. [Ansible deployment runbook](docs/deploy-runbook.md)
-7. [Generic Rocky 9 and lab deployment reference](docs/deploy-guide.md)
-8. [Offline external-image seed](docs/offline-image-seed.md)
-9. [Identity, Samba AD lab, and group administration](docs/identity-operations.md)
-10. [Anthropic WIF and `private_key_jwt`](docs/anthropic-wif-bootstrap.md)
-11. [Operations, recovery, upgrades, and troubleshooting](docs/operations.md)
-12. [Sensitive telemetry and retention](docs/observability-operations.md)
-13. [LiteLLM capacity and scaling design](docs/litellm-scaling.md)
-14. [Scaling and high-availability posture](docs/high-availability.md)
-15. [Acceptance test runbook](docs/test-runbook.md)
-16. [Project status and open items](docs/project-status.md)
+4. [Service FQDN inventory and DNS design](docs/fqdn-inventory.md)
+5. [Operating system security baseline](docs/os-security.md)
+6. [Container platform security](docs/docker-security.md)
+7. [Ansible deployment runbook](docs/deploy-runbook.md)
+8. [Generic Rocky 9 and lab deployment reference](docs/deploy-guide.md)
+9. [Offline external-image seed](docs/offline-image-seed.md)
+10. [Identity, Samba AD lab, and group administration](docs/identity-operations.md)
+11. [Anthropic WIF and `private_key_jwt`](docs/anthropic-wif-bootstrap.md)
+12. [Operations, recovery, upgrades, and troubleshooting](docs/operations.md)
+13. [Sensitive telemetry and retention](docs/observability-operations.md)
+14. [LiteLLM capacity and scaling design](docs/litellm-scaling.md)
+15. [Scaling and high-availability posture](docs/high-availability.md)
+16. [Acceptance test runbook](docs/test-runbook.md)
+17. [Project status and open items](docs/project-status.md)
 
 The original
 [architecture skeleton](docs/archive/architecture-skeleton.md) is archived as

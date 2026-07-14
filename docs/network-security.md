@@ -157,6 +157,8 @@ platform runs its own authoritative DNS
 (`platform_authoritative_dns_enabled`, default on only for the lab profile),
 the `docker-compose.platform-dns.yml` overlay adds the CoreDNS service,
 which then publishes port 53 on the exact ADM and internal host addresses.
+The complete hostname inventory and per-audience resolution design are in the
+[FQDN inventory](fqdn-inventory.md).
 
 ## 6. Kernel settings
 

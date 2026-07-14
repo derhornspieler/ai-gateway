@@ -158,8 +158,12 @@ them are hostnames under your base domain:
 
 | Hostname | Points to | Who uses it |
 |---|---|---|
-| `chat.<domain>`, `portal.<domain>`, `api.<domain>`, `auth.<domain>` | the **internal** interface IP | users and developers |
-| `admin.<domain>`, `admin-portal.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, `vault.<domain>` | the **ADM** interface IP | administrators only |
+| `portal.<domain>`, `api.<domain>`, `auth.<domain>` | the **internal** interface IP | users and developers |
+| `chat.<domain>`, `admin.<domain>`, `admin-portal.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, `vault.<domain>` | the **ADM** interface IP | chat and administration (ADM leg) |
+
+The complete name inventory, per-audience resolution expectations, and the
+internal-vs-internet DNS design are in the
+[FQDN inventory](fqdn-inventory.md).
 
 ## Part 6 — Run the converge (30–90 minutes)
 
@@ -223,8 +227,10 @@ time Vault is ready, so it waits for — and verifies — the complete system.
 2. From an administrator machine (on the ADM network), open
    `https://admin.<domain>` and `https://grafana.<domain>` — both should
    redirect you to a login page and let the administrator in.
-3. From a user machine (on the internal network), open
-   `https://chat.<domain>` — you should reach the chat login.
+3. From a machine on the ADM network, open `https://chat.<domain>` — you
+   should reach the chat login. From a user machine (on the internal
+   network), open `https://portal.<domain>` — you should reach the
+   developer portal login.
 4. Enroll the AI vendor credential (Anthropic) following
    [anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md).
 5. Before opening access to real users, run the applicable sections of the

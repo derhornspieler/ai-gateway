@@ -80,12 +80,12 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  U[User browser] -->|chat.DOMAIN| TI[traefik-int]
+  U[User browser] -->|chat.DOMAIN, ADM leg| TA
   T[AI tool with gateway key] -->|api.DOMAIN /v1| TI
   D[Developer browser] -->|portal.DOMAIN| TI
   A[Administrator browser] -->|admin hosts on ADM leg| TA[traefik-adm]
 
-  TI --> OW[Open WebUI] --> LL[LiteLLM]
+  TA --> OW[Open WebUI] --> LL[LiteLLM]
   TI -->|inference allow-list| LL
   TI --> DP[dev-portal]
   TI -->|aigw realm only| KC[Keycloak]
