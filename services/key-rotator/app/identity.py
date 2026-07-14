@@ -954,7 +954,12 @@ class KeycloakAdmin:
         )
         if provider is None:
             raise IdentityError("configured pre-Vault federation provider is missing")
-        provider_id = path_segment(provider.get("id"), label="federation provider UUID")
+        # Bind the provider by the same inventory identity contract the reconcile
+        # path uses, not by display name alone. A restored or operator-created
+        # provider that merely reuses the configured name (pointing at a
+        # different directory, or carrying a write-back mapper) must not be able
+        # to redirect this pre-Vault admin's federation link.
+        provider_id = await self._verify_bound_ldap_component(provider, admin_token)
         response = await self._request(
             "GET",
             f"/admin/realms/{realm}/users",
@@ -1913,6 +1918,16 @@ class KeycloakAdmin:
                     "the directory connection or bind credential failed verification"
                 ) from exc
 
+    def _require_ldap_bind_password(self, bind_password: str | None) -> str:
+        if (
+            not isinstance(bind_password, str)
+            or len(bind_password) < 16
+            or len(bind_password) > 512
+            or any(ord(ch) < 32 for ch in bind_password)
+        ):
+            raise IdentityConflict("the LDAP bind password is required")
+        return bind_password
+
     async def _ensure_ldap_federation(
         self, admin_token: str, bind_password: str | None
     ) -> str | None:
@@ -1923,14 +1938,25 @@ class KeycloakAdmin:
             self.settings.identity_realm, spec.provider_name, admin_token
         )
         if existing is not None:
-            return self._verify_ldap_component(existing)
-        if (
-            not isinstance(bind_password, str)
-            or len(bind_password) < 16
-            or len(bind_password) > 512
-            or any(ord(ch) < 32 for ch in bind_password)
-        ):
-            raise IdentityConflict("the LDAP bind password is required")
+            component_id = await self._verify_bound_ldap_component(
+                existing, admin_token
+            )
+            # An EXISTING external provider whose top-level config still equals
+            # the inventory contract is NOT proof that a login will succeed: a
+            # rotated DC certificate, a swapped/wrong CA truststore, or a
+            # rotated bind credential all keep the persisted config identical
+            # while breaking the live LDAPS handshake or bind. Re-exercise the
+            # read-only, idempotent live proof on every reconcile so the
+            # converge fails closed here instead of converging green and
+            # failing at first login. The in-stack lab DC is deliberately
+            # exempt (prove_directory_before_create=False), so a lab converge
+            # is unchanged.
+            if spec.prove_directory_before_create:
+                await self._prove_ldap_directory(
+                    spec, admin_token, self._require_ldap_bind_password(bind_password)
+                )
+            return component_id
+        bind_password = self._require_ldap_bind_password(bind_password)
         safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         if spec.prove_directory_before_create:
             await self._prove_ldap_directory(spec, admin_token, bind_password)
@@ -1997,7 +2023,7 @@ class KeycloakAdmin:
         )
         if created is None:
             raise IdentityError("Keycloak created LDAP federation but it was not found")
-        component_id = self._verify_ldap_component(created)
+        component_id = await self._verify_bound_ldap_component(created, admin_token)
         try:
             await self._request(
                 "POST",
@@ -2007,12 +2033,25 @@ class KeycloakAdmin:
                 expected=(200,),
             )
         except Exception:
-            await self._request(
-                "DELETE",
-                f"/admin/realms/{safe_realm}/components/{component_id}",
-                token=admin_token,
-                expected=(204,),
-            )
+            # The just-created component already holds the bind credential.
+            # If the compensating delete also fails we must NOT swallow the
+            # error and converge green: that would strand a credentialed,
+            # unproven provider. Raise a clear fatal that names the component
+            # and the realm so an operator can remove it by hand before retry.
+            try:
+                await self._request(
+                    "DELETE",
+                    f"/admin/realms/{safe_realm}/components/{component_id}",
+                    token=admin_token,
+                    expected=(204,),
+                )
+            except Exception as cleanup_exc:
+                raise IdentityError(
+                    "the new LDAP federation failed its initial sync and the "
+                    f"compensating delete also failed; remove Keycloak component "
+                    f"{component_id} from realm {self.settings.identity_realm} "
+                    "manually before retrying"
+                ) from cleanup_exc
             raise
         return component_id
 
@@ -2067,6 +2106,80 @@ class KeycloakAdmin:
         if any(config.get(name) != [value] for name, value in expected.items()):
             raise IdentityConflict("the LDAP federation is not inventory-bound")
         return path_segment(component.get("id"), label="LDAP provider UUID")
+
+    @staticmethod
+    def _ldap_mapper_scalar(value: Any) -> Any:
+        """Return the single value of a Keycloak MultivaluedHashMap entry.
+
+        Component config is serialized as ``{"read.only": ["true"]}``.  A
+        malformed multi-valued entry is returned unchanged so the caller
+        compares it against the expected scalar and fails closed.
+        """
+        if isinstance(value, list):
+            return value[0] if len(value) == 1 else value
+        return value
+
+    async def _verify_ldap_mappers(self, component_id: str, admin_token: str) -> None:
+        """Refuse any LDAP mapper sub-component that can write to the directory.
+
+        :meth:`_verify_ldap_component` proves the top-level READ_ONLY /
+        syncRegistrations=false posture, but that check does not cover the
+        provider's mapper sub-components.  A user-attribute or full-name mapper
+        with ``read.only`` disabled writes attribute changes back to the
+        customer directory, and a group- or role-ldap-mapper whose ``mode`` is
+        anything other than ``READ_ONLY`` writes membership back regardless of
+        editMode.  Enumerate the provider's mappers and fail closed on any that
+        introduces write-back beyond the reviewed read-only managed set.  The
+        Keycloak defaults for a READ_ONLY provider carry ``read.only=true`` (or
+        no ``read.only`` at all) and no ``mode``, so this does not churn a
+        correctly provisioned federation.
+        """
+
+        safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        safe_component = path_segment(component_id, label="LDAP provider UUID")
+        mapper_type = "org.keycloak.storage.ldap.mappers.LDAPStorageMapper"
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{safe_realm}/components",
+            token=admin_token,
+            params={"parent": safe_component, "type": mapper_type},
+            expected=(200,),
+        )
+        payload = self._json(response, "LDAP federation mappers")
+        if not isinstance(payload, list):
+            raise IdentityError("Keycloak LDAP federation mappers were invalid")
+        for mapper in payload:
+            if not isinstance(mapper, dict):
+                raise IdentityConflict("the LDAP federation has a write-capable mapper")
+            # A server-side parent/type filter is requested above; re-check it
+            # locally so a lax response cannot smuggle a foreign-parented or
+            # non-mapper component through this gate.
+            if mapper.get("providerType") != mapper_type:
+                continue
+            if mapper.get("parentId") not in (None, safe_component):
+                continue
+            config = mapper.get("config")
+            config = config if isinstance(config, dict) else {}
+            read_only = self._ldap_mapper_scalar(config.get("read.only"))
+            mode = self._ldap_mapper_scalar(config.get("mode"))
+            if (read_only is not None and read_only != "true") or (
+                mode is not None and mode != "READ_ONLY"
+            ):
+                raise IdentityConflict("the LDAP federation has a write-capable mapper")
+
+    async def _verify_bound_ldap_component(
+        self, component: dict[str, Any], admin_token: str
+    ) -> str:
+        """Bind a federation component to the full inventory identity contract.
+
+        Combines the non-secret top-level configuration check with the live
+        enumeration of the provider's mapper sub-components, so no reconcile,
+        recovery, or pre-Vault path can adopt a provider whose top-level
+        posture matches while a write-back mapper hides underneath it.
+        """
+        component_id = self._verify_ldap_component(component)
+        await self._verify_ldap_mappers(component_id, admin_token)
+        return component_id
 
     def _ldap_bind_password(self) -> str | None:
         spec = ldap_federation_spec(self.settings)

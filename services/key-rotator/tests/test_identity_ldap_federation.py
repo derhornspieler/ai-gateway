@@ -27,6 +27,7 @@ from app.config import LAB_LDAP_PROVIDER_NAME, Settings
 from app.identity import (
     LAB_LDAP_USER_FILTER,
     IdentityConflict,
+    IdentityError,
     KeycloakAdmin,
     LdapFederationSpec,
     ldap_federation_spec,
@@ -212,16 +213,22 @@ async def test_creating_the_lab_provider_issues_no_new_admin_call() -> None:
 class RecordingKeycloak:
     """Minimal Keycloak admin API with configurable LDAP-probe behavior."""
 
+    MAPPER_TYPE = "org.keycloak.storage.ldap.mappers.LDAPStorageMapper"
+
     def __init__(
         self,
         *,
         probe_status: int = 204,
         sync_status: int = 200,
+        delete_status: int = 204,
         existing: dict | None = None,
+        mappers: list[dict] | None = None,
     ) -> None:
         self.probe_status = probe_status
         self.sync_status = sync_status
+        self.delete_status = delete_status
         self.existing = existing
+        self.mappers = mappers or []
         self.calls: list[tuple[str, str]] = []
         self.probe_actions: list[str] = []
         self.created: dict | None = None
@@ -238,6 +245,10 @@ class RecordingKeycloak:
                 return httpx.Response(self.probe_status, json={"error": "denied"})
             return httpx.Response(204)
         if request.method == "GET" and path.endswith("/components"):
+            # The mapper enumeration is a parent+type filtered lookup; keep it
+            # separate from the provider lookup so both can be asserted.
+            if request.url.params.get("type") == self.MAPPER_TYPE:
+                return httpx.Response(200, json=self.mappers)
             if self.created is not None:
                 return httpx.Response(200, json=[self.created])
             return httpx.Response(200, json=[self.existing] if self.existing else [])
@@ -259,7 +270,7 @@ class RecordingKeycloak:
             return httpx.Response(self.sync_status)
         if request.method == "DELETE" and "/components/" in path:
             self.deleted.append(path.rsplit("/", 1)[-1])
-            return httpx.Response(204)
+            return httpx.Response(self.delete_status)
         raise AssertionError(f"unexpected call: {request.method} {path}")
 
 
@@ -322,10 +333,8 @@ async def test_wrong_ca_hostname_or_credentials_persist_no_provider(
     assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
 
 
-@pytest.mark.asyncio
-async def test_an_existing_provider_is_verified_and_not_rewritten() -> None:
-    resolved = generic_settings()
-    existing = {
+def _existing_generic_component() -> dict:
+    return {
         "id": "existing-uuid",
         "name": "corp-ad",
         "providerId": "ldap",
@@ -358,12 +367,135 @@ async def test_an_existing_provider_is_verified_and_not_rewritten() -> None:
             ],
         },
     }
-    keycloak = RecordingKeycloak(existing=existing)
+
+
+# The Keycloak defaults a READ_ONLY provider carries (verified against the live
+# lab directory): every user-attribute / full-name mapper is read.only=true, and
+# there is no group/role mapper carrying a write-back ``mode``.
+KEYCLOAK_DEFAULT_READONLY_MAPPERS = [
+    {
+        "id": f"{name}-uuid",
+        "name": name,
+        "providerId": provider_id,
+        "providerType": "org.keycloak.storage.ldap.mappers.LDAPStorageMapper",
+        "parentId": "existing-uuid",
+        "config": config,
+    }
+    for name, provider_id, config in (
+        ("username", "user-attribute-ldap-mapper", {"read.only": ["true"]}),
+        ("email", "user-attribute-ldap-mapper", {"read.only": ["true"]}),
+        ("last name", "user-attribute-ldap-mapper", {"read.only": ["true"]}),
+        ("full name", "full-name-ldap-mapper", {"read.only": ["true"]}),
+        # Keycloak does not emit a read.only for these; absence must be accepted.
+        ("MSAD account controls", "msad-user-account-control-mapper", {}),
+        ("Kerberos principal", "kerberos-principal-attribute-mapper", {}),
+    )
+]
+
+
+@pytest.mark.asyncio
+async def test_an_existing_production_provider_is_reproved_and_not_rewritten() -> None:
+    """An EXISTING external provider must still re-exercise the live LDAPS
+    proof on reconcile; matching config is not proof a login will succeed."""
+    keycloak = RecordingKeycloak(
+        existing=_existing_generic_component(),
+        mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS,
+    )
+    admin = admin_for(keycloak, generic_settings())
+
+    assert (
+        await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
+        == "existing-uuid"
+    )
+    # The read-only live proof runs against the EXISTING provider ...
+    assert keycloak.probe_actions == ["testConnection", "testAuthentication"]
+    # ... and the component is adopted, never rewritten.
+    assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+    assert keycloak.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_an_existing_production_provider_requires_a_bind_password() -> None:
+    """The existing-path live proof cannot run without a bind credential, so a
+    reconcile that never supplies one must fail closed rather than skip it."""
+    keycloak = RecordingKeycloak(
+        existing=_existing_generic_component(),
+        mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS,
+    )
+    admin = admin_for(keycloak, generic_settings())
+
+    with pytest.raises(IdentityConflict, match="bind password is required"):
+        await admin._ensure_ldap_federation("bootstrap-token", None)
+
+    assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+
+
+@pytest.mark.parametrize("probe_status", [400, 401, 500])
+@pytest.mark.asyncio
+async def test_an_existing_provider_with_a_rotated_cert_fails_closed(
+    probe_status,
+) -> None:
+    """The core #3 scenario: the persisted config still equals the inventory
+    contract, but the live LDAPS handshake / CA / bind now fails. The converge
+    must fail here instead of converging green and failing at first login."""
+    keycloak = RecordingKeycloak(
+        probe_status=probe_status,
+        existing=_existing_generic_component(),
+        mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS,
+    )
+    admin = admin_for(keycloak, generic_settings())
+
+    with pytest.raises(IdentityConflict, match="failed verification"):
+        await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
+
+    assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+    assert keycloak.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_an_existing_lab_provider_is_not_reproved() -> None:
+    """Preserve the lab byte-for-byte: the in-stack DC stays exempt from the
+    live proof on the existing path, exactly as on its creation path."""
+    resolved = settings(LAB_SAMBA_LDAP_ENABLED=True)
+    existing = {
+        "id": "existing-uuid",
+        "name": LAB_LDAP_PROVIDER_NAME,
+        "providerId": "ldap",
+        "providerType": "org.keycloak.storage.UserStorageProvider",
+        "config": {
+            "enabled": ["true"],
+            "editMode": ["READ_ONLY"],
+            "importEnabled": ["true"],
+            "syncRegistrations": ["false"],
+            "authType": ["simple"],
+            "searchScope": ["2"],
+            "useTruststoreSpi": ["always"],
+            "startTls": ["false"],
+            "allowKerberosAuthentication": ["false"],
+            "useKerberosForPasswordAuthentication": ["false"],
+            "vendor": ["ad"],
+            "usernameLDAPAttribute": ["sAMAccountName"],
+            "rdnLDAPAttribute": ["cn"],
+            "uuidLDAPAttribute": ["objectGUID"],
+            "userObjectClasses": ["person, organizationalPerson, user"],
+            "connectionUrl": [resolved.lab_samba_ldap_url],
+            "usersDn": [resolved.lab_samba_users_dn],
+            "bindDn": [resolved.lab_samba_bind_dn],
+            "bindCredential": ["**********"],
+            "customUserSearchFilter": [
+                "(&(objectCategory=person)(objectClass=user)"
+                "(!(sAMAccountName=svc-keycloak-ldap)))"
+            ],
+        },
+    }
+    keycloak = RecordingKeycloak(
+        existing=existing, mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS
+    )
     admin = admin_for(keycloak, resolved)
 
-    # No bind password is needed to adopt an already-verified component.
     assert await admin._ensure_ldap_federation("bootstrap-token", None) == "existing-uuid"
     assert keycloak.probe_actions == []
+    assert not any(path.endswith("/testLDAPConnection") for _, path in keycloak.calls)
     assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
 
 
@@ -429,6 +561,162 @@ async def test_a_failed_full_sync_removes_the_new_component() -> None:
         await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
 
     assert keycloak.deleted == ["component-uuid"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_sync_and_failed_cleanup_raises_a_stranded_fatal() -> None:
+    """#14: if the compensating delete ALSO fails, the just-created (already
+    credentialed) provider must not be left behind on a green converge. Raise a
+    clear fatal naming the component and the realm for manual removal."""
+    keycloak = RecordingKeycloak(sync_status=500, delete_status=500)
+    admin = admin_for(keycloak, generic_settings())
+
+    with pytest.raises(IdentityError) as excinfo:
+        await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
+
+    message = str(excinfo.value)
+    assert "component-uuid" in message
+    assert "manually" in message
+    # The delete was attempted (and failed) rather than silently skipped.
+    assert keycloak.deleted == ["component-uuid"]
+
+
+# ── LDAP mapper sub-component write-back gate (#6) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verify_ldap_mappers_accepts_the_keycloak_default_readonly_set() -> None:
+    """The live-lab default mapper set (read.only=true, no write-back mode)
+    must pass, so the gate is not vacuous and does not churn a real provider."""
+    keycloak = RecordingKeycloak(mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS)
+    admin = admin_for(keycloak, generic_settings())
+
+    await admin._verify_ldap_mappers("existing-uuid", "bootstrap-token")
+
+
+@pytest.mark.parametrize(
+    "writable_mapper",
+    [
+        {
+            "id": "email-uuid",
+            "name": "email",
+            "providerId": "user-attribute-ldap-mapper",
+            "providerType": "org.keycloak.storage.ldap.mappers.LDAPStorageMapper",
+            "parentId": "existing-uuid",
+            "config": {"read.only": ["false"]},
+        },
+        {
+            "id": "groups-uuid",
+            "name": "groups",
+            "providerId": "group-ldap-mapper",
+            "providerType": "org.keycloak.storage.ldap.mappers.LDAPStorageMapper",
+            "parentId": "existing-uuid",
+            "config": {"mode": ["LDAP_ONLY"]},
+        },
+        {
+            "id": "roles-uuid",
+            "name": "roles",
+            "providerId": "role-ldap-mapper",
+            "providerType": "org.keycloak.storage.ldap.mappers.LDAPStorageMapper",
+            "parentId": "existing-uuid",
+            "config": {"mode": ["IMPORT"]},
+        },
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_write_capable_mapper_is_refused(writable_mapper) -> None:
+    """A mapper added out-of-band that writes back to the directory (a writable
+    user-attribute mapper, or a group/role mapper whose mode is not READ_ONLY)
+    must be refused even though the top-level provider config is untouched."""
+    keycloak = RecordingKeycloak(mappers=[*KEYCLOAK_DEFAULT_READONLY_MAPPERS, writable_mapper])
+    admin = admin_for(keycloak, generic_settings())
+
+    with pytest.raises(IdentityConflict, match="write-capable mapper"):
+        await admin._verify_ldap_mappers("existing-uuid", "bootstrap-token")
+
+
+@pytest.mark.asyncio
+async def test_an_existing_provider_with_a_writable_mapper_is_refused() -> None:
+    """End-to-end: the reconcile of an existing provider whose top-level config
+    matches the inventory contract still fails if a writable mapper hides under
+    it, and the failure occurs before the live directory probe."""
+    writable = {
+        "id": "email-uuid",
+        "name": "email",
+        "providerId": "user-attribute-ldap-mapper",
+        "providerType": "org.keycloak.storage.ldap.mappers.LDAPStorageMapper",
+        "parentId": "existing-uuid",
+        "config": {"read.only": ["false"]},
+    }
+    keycloak = RecordingKeycloak(
+        existing=_existing_generic_component(),
+        mappers=[*KEYCLOAK_DEFAULT_READONLY_MAPPERS, writable],
+    )
+    admin = admin_for(keycloak, generic_settings())
+
+    with pytest.raises(IdentityConflict, match="write-capable mapper"):
+        await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
+
+    assert keycloak.probe_actions == []
+    assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+
+
+# ── Pre-Vault federation binding (#13) ─────────────────────────────────────
+
+
+def _pre_vault_admin(component: dict, user: dict) -> KeycloakAdmin:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/components"):
+            if request.url.params.get("type") == RecordingKeycloak.MAPPER_TYPE:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[component])
+        if request.method == "GET" and path == "/admin/realms/aigw/users":
+            return httpx.Response(200, json=[user])
+        raise AssertionError(f"unexpected call: {request.method} {path}")
+
+    return KeycloakAdmin(
+        generic_settings(), None, None, transport=httpx.MockTransport(handler)
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_vault_federated_user_binds_by_inventory_contract() -> None:
+    """The inventory-bound provider resolves and its enabled federated user is
+    returned — the positive baseline the negative case is measured against."""
+    user = {
+        "id": "user-uuid",
+        "username": "corp-user",
+        "enabled": True,
+        "federationLink": "existing-uuid",
+    }
+    admin = _pre_vault_admin(_existing_generic_component(), user)
+
+    resolved = await admin._pre_vault_federated_user(
+        "corp-user", "corp-ad", "bootstrap-token"
+    )
+    assert resolved["id"] == "user-uuid"
+
+
+@pytest.mark.asyncio
+async def test_pre_vault_federated_user_refuses_a_spoofed_same_name_provider() -> None:
+    """#13: a provider that merely reuses the configured display name but points
+    at a different directory must be refused, not resolved by name alone. A
+    federated user linked to that spoofed provider must not cross the gate."""
+    component = _existing_generic_component()
+    component["config"]["connectionUrl"] = ["ldaps://attacker.corp.example.com:636"]
+    user = {
+        "id": "user-uuid",
+        "username": "corp-user",
+        "enabled": True,
+        "federationLink": "existing-uuid",
+    }
+    admin = _pre_vault_admin(component, user)
+
+    with pytest.raises(IdentityConflict, match="inventory-bound"):
+        await admin._pre_vault_federated_user(
+            "corp-user", "corp-ad", "bootstrap-token"
+        )
 
 
 @pytest.mark.asyncio
