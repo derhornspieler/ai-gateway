@@ -200,11 +200,13 @@ issue_and_install_samba_leaf() {
   [[ "$profile" == rocky9-lab ]] \
     || die "samba-tls is a lab-only ceremony (DEPLOYMENT_PROFILE must be rocky9-lab)"
 
-  local staging
+  local staging cert_dst key_dst
+  cert_dst="$STACK_DIR/secrets/samba_ad_tls_cert"
+  key_dst="$STACK_DIR/secrets/samba_ad_tls_key"
   staging="$(mktemp -d "$STACK_DIR/.state/samba-tls-staging.XXXXXX")"
   chmod 700 "$staging"
   # shellcheck disable=SC2064
-  trap "rm -rf -- '$staging'" EXIT HUP INT TERM
+  trap "rm -rf -- '$staging'; rm -f -- '$cert_dst.tmp' '$key_dst.tmp'" EXIT HUP INT TERM
 
   # The reviewed edge chain (intermediate + self-signed customer root), written
   # by install-signed, is the ONLY complete chain: Vault's ca_chain returns the
@@ -238,11 +240,23 @@ os.close(key_fd)
     || die "issued leaf does not certify samba-ad.$DOMAIN"
   openssl pkey -in "$staging/tls.key" -noout >/dev/null 2>&1 \
     || die "issued private key is unreadable"
+  # Prove the leaf and key are a MATCHING pair (public-key compare) before either
+  # is written. Installing a cert against a non-matching key is exactly the
+  # partial/invalid window the DC must never silently self-sign over.
+  cert_pubkey="$(openssl x509 -in "$staging/tls.crt" -noout -pubkey)"
+  key_pubkey="$(openssl pkey -in "$staging/tls.key" -pubout 2>/dev/null)"
+  [[ -n "$cert_pubkey" && "$cert_pubkey" == "$key_pubkey" ]] \
+    || die "issued leaf and private key do not match (public-key mismatch)"
 
-  # Atomic, root-owned install. Key is 0600 root:root: Samba's CVE-2013-4476
-  # guard rejects any group/other bit on the LDAPS private key.
-  install -m 0644 -- "$staging/tls.crt" "$STACK_DIR/secrets/samba_ad_tls_cert"
-  install -m 0600 -- "$staging/tls.key" "$STACK_DIR/secrets/samba_ad_tls_key"
+  # Atomic, root-owned install. Stage each file under a temp name in the SAME
+  # destination directory, then rename: a rename within one directory is atomic
+  # on the local filesystem, so a crash never pairs a new cert with a stale key
+  # (the partial window that fed the silent self-signed downgrade). Key is 0600
+  # root:root: Samba's CVE-2013-4476 guard rejects any group/other bit on it.
+  install -m 0600 -- "$staging/tls.key" "$key_dst.tmp"
+  install -m 0644 -- "$staging/tls.crt" "$cert_dst.tmp"
+  mv -f -- "$key_dst.tmp" "$key_dst"
+  mv -f -- "$cert_dst.tmp" "$cert_dst"
 
   rm -rf -- "$staging"
   trap - EXIT HUP INT TERM
@@ -349,8 +363,16 @@ EOF
         default="$imported" default_follows_latest_issuer=false >/dev/null
 
     # Fail closed if the mount would still sign with anything but the certificate
-    # the customer CA just signed.
-    promoted_fp="$(vlt read -field=certificate "pki_int/issuer/$imported" \
+    # the customer CA just signed. Re-reading pki_int/issuer/$imported would be
+    # VACUOUS -- set-signed already guarantees that issuer resolves to the
+    # supplied cert, so it can never catch a `default=` write that silently did
+    # not take. Instead read the mount's configured DEFAULT issuer and prove IT
+    # resolves to the customer-signed certificate.
+    default_issuer="$(vlt read -format=json pki_int/config/issuers \
+      | python3 -I -c 'import json,sys; print((json.load(sys.stdin)["data"] or {}).get("default") or "")')"
+    [[ -n "$default_issuer" ]] \
+      || die "could not read the mount default issuer after promotion"
+    promoted_fp="$(vlt read -field=certificate "pki_int/issuer/$default_issuer" \
       | openssl x509 -noout -fingerprint -sha256)"
     [[ "$promoted_fp" == "$supplied_fp" ]] \
       || die "the promoted Vault issuer is not the customer-signed intermediate"

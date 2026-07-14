@@ -154,14 +154,49 @@ IFS=$old_ifs
 mkdir -p "$TLS_DIR" "$PUBLIC_DIR"
 realm_fqdn=$(printf '%s.%s' "$hostname_short" "$realm" | tr '[:upper:]' '[:lower:]')
 
+# Persistent record that CA-issued LDAPS material has been in force. Once set, a
+# later start that finds the delivered material missing OR invalid is a
+# regression — never a first-converge bootstrap — so the guards below fail loud
+# instead of silently self-signing. The healthcheck reads the same marker to
+# anchor LDAPS verification on the REAL customer chain rather than on the DC's
+# own self-published anchor.
+CA_MATERIAL_MARKER=/var/lib/samba/.aigw-ca-material-in-force
+
+# Distinguish two states that must never be conflated:
+#   * ca_material_present — the ceremony delivered *something* (either secret is
+#     non-empty). On a genuine first converge both are empty placeholders, so
+#     this stays false and a self-signed bootstrap is legitimate.
+#   * use_ca_material — the delivered leaf+key parse, are a matching pair, and
+#     actually certify this LDAPS FQDN.
+ca_material_present=false
+if [ -s "$tls_cert_src" ] || [ -s "$tls_key_src" ]; then
+    ca_material_present=true
+fi
+
 use_ca_material=false
 if [ -s "$tls_cert_src" ] && [ -s "$tls_key_src" ] \
     && openssl x509 -in "$tls_cert_src" -noout >/dev/null 2>&1 \
     && openssl pkey -in "$tls_key_src" -noout >/dev/null 2>&1 \
+    && [ "$(openssl x509 -in "$tls_cert_src" -noout -pubkey 2>/dev/null)" \
+       = "$(openssl pkey -in "$tls_key_src" -pubout 2>/dev/null)" ] \
     && openssl x509 -in "$tls_cert_src" -noout -checkhost "$ldaps_fqdn" >/dev/null 2>&1; then
-    # Only adopt delivered material that actually certifies this LDAPS FQDN; a
-    # mismatched or partial file must never silently displace a working cert.
+    # Only adopt delivered material that parses, whose private key matches the
+    # certificate, and that actually certifies this LDAPS FQDN; a mismatched or
+    # partial file must never silently displace a working cert.
     use_ca_material=true
+fi
+
+# LOUD, greppable refusal to silently self-sign. If CA material was delivered but
+# is partial/truncated/mismatched/wrong-FQDN, or was in force before and has now
+# vanished, self-signing over it is exactly the downgrade that defeats "the lab
+# exercises the real production trust path": converge, verify, and the
+# healthcheck would all stay green while the DC quietly served a self-signed
+# cert. Fail closed and make the operator re-run the ceremony.
+if [ "$use_ca_material" != true ] && [ "$ca_material_present" = true ]; then
+    die "TLS-DOWNGRADE-REFUSED: delivered LDAPS material for $ldaps_fqdn is partial/invalid/mismatched; refusing to self-sign over it. Re-run: scripts/vault-pki-intermediate.sh samba-tls"
+fi
+if [ "$use_ca_material" != true ] && [ -f "$CA_MATERIAL_MARKER" ]; then
+    die "TLS-DOWNGRADE-REFUSED: CA-issued LDAPS material for $ldaps_fqdn was in force but is now missing; refusing a silent self-signed downgrade. Re-run: scripts/vault-pki-intermediate.sh samba-tls"
 fi
 
 if [ "$use_ca_material" = true ]; then
@@ -174,10 +209,16 @@ if [ "$use_ca_material" = true ]; then
     # Samba presents a complete chain. Keycloak still anchors on certs/ca.pem.
     cp "$tls_cert_src" "$TLS_DIR/ca.pem"
     chmod 0644 "$TLS_DIR/ca.pem"
+    # Record that CA material is now in force, so the guards above fire on any
+    # later missing/invalid delivery.
+    : > "$CA_MATERIAL_MARKER"
 elif [ ! -s "$TLS_DIR/key.pem" ] || [ ! -s "$TLS_DIR/cert.pem" ] \
     || ! openssl x509 -in "$TLS_DIR/cert.pem" -noout -checkhost "$ldaps_fqdn" >/dev/null 2>&1; then
-    # (Re)issue the self-signed fallback when none exists, or when an existing
-    # one predates this FQDN (e.g. a lab volume from before the CA cutover).
+    # Genuine first-converge bootstrap ONLY: the guards above have already failed
+    # closed if CA material was delivered-but-invalid or was previously in force,
+    # so reaching here means no CA material has ever been delivered. (Re)issue the
+    # self-signed fallback when none exists, or when an existing one predates this
+    # FQDN (e.g. a lab volume from before the CA cutover).
     openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 825 \
         -subj "/CN=$ldaps_fqdn" \
         -addext "subjectAltName=DNS:$ldaps_fqdn,DNS:$hostname_short,DNS:$realm_fqdn" \
