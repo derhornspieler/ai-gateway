@@ -194,7 +194,13 @@ grep -Fq 'common_name="*.$DOMAIN" alt_names="$DOMAIN"' "$ROOT/scripts/vault-boot
 grep -Fq 'common_name="*.$DOMAIN" alt_names="$DOMAIN"' "$ROOT/scripts/vault-pki-intermediate.sh"
 
 # ── Edge TLS / PKI contract ─────────────────────────────────────────────────
-bash -n "$ROOT/scripts/vault-pki-intermediate.sh" "$ROOT/scripts/sign-vault-intermediate.sh"
+# vault-pki-intermediate.sh runs ON the gateway host and is in the deployed
+# script manifest. sign-vault-intermediate.sh is the OFFLINE CA-side ceremony
+# and is deliberately NEVER deployed (asserted in the deployed-script manifest
+# check below), so it exists only in a controller checkout. Its source checks
+# are therefore guarded: running this validator from the deployed stack root
+# must not demand a file the deployment contract forbids shipping.
+bash -n "$ROOT/scripts/vault-pki-intermediate.sh"
 
 python3 -I - "$ROOT/scripts/vault-pki-intermediate.sh" <<'PY'
 from pathlib import Path
@@ -221,7 +227,10 @@ assert "--token" not in text
 assert "--root-key" not in text
 PY
 
-python3 -I - "$ROOT/scripts/sign-vault-intermediate.sh" <<'PY'
+SIGN_INTERMEDIATE="$ROOT/scripts/sign-vault-intermediate.sh"
+if [[ -f "$SIGN_INTERMEDIATE" ]]; then
+bash -n "$SIGN_INTERMEDIATE"
+python3 -I - "$SIGN_INTERMEDIATE" <<'PY'
 from pathlib import Path
 import sys
 
@@ -240,6 +249,7 @@ for required in (
 # The root key is read in place and never copied, exported, or transmitted.
 assert "scp" not in text.split("Next: copy ONLY these two files")[0]
 PY
+fi
 
 python3 -I - "$ROOT/scripts/edge-tls.py" <<'PY'
 from pathlib import Path
