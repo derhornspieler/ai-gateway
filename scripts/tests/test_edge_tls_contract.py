@@ -202,7 +202,7 @@ class EdgeTlsContractTests(unittest.TestCase):
         subprocess.run(["bash", "-n", str(VAULT_PKI)], check=True)
         for required in (
             "pki_int/intermediate/generate/internal",
-            "pki_int/intermediate/set-signed certificate=-",
+            "pki_int/intermediate/set-signed",
             'allowed_domains="$DOMAIN" allow_subdomains=true allow_bare_domains=true',
             "AIGW_EDGE_TLS_MODE",
             "read -r VAULT_TOKEN",
@@ -214,6 +214,31 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertNotIn("pki/root/sign-intermediate", text)
         self.assertNotIn("--token", text)
         self.assertNotIn("--root-key", text)
+
+    def test_the_customer_signed_issuer_is_promoted_not_merely_imported(self) -> None:
+        # set-signed only IMPORTS an issuer. A mount previously bootstrapped with
+        # the self-signed TEST root -- the brownfield case, an existing deployment
+        # migrating onto the customer CA -- already holds issuers, and Vault's
+        # default_follows_latest_issuer is false. Without an explicit promotion the
+        # mount keeps signing leaves with the OLD test intermediate while the
+        # customer-signed issuer sits unused, and every leaf chains to the test
+        # root. Observed on the live lab before this was fixed.
+        text = VAULT_PKI.read_text(encoding="utf-8")
+        for required in (
+            "imported_issuers",
+            "pki_int/config/issuers",
+            "default_follows_latest_issuer=false",
+            # the role is pinned to the promoted issuer, so a later default change
+            # cannot silently move issuance back onto a stale CA
+            'issuer_ref="$imported"',
+            # promotion is proven, not assumed
+            "the promoted Vault issuer is not the customer-signed intermediate",
+            # set-signed is idempotent: a re-run imports nothing, so the issuer is
+            # resolved by certificate identity and the ceremony stays re-runnable
+            "pki_int/issuers",
+            "Vault holds no issuer matching --signed-intermediate",
+        ):
+            self.assertIn(required, text)
 
     def test_sign_script_is_offline_only_and_pins_the_intermediate_extensions(self) -> None:
         text = SIGN_SCRIPT.read_text(encoding="utf-8")

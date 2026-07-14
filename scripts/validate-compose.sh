@@ -209,7 +209,17 @@ import sys
 text = Path(sys.argv[1]).read_text()
 for required in (
     "pki_int/intermediate/generate/internal",
-    "pki_int/intermediate/set-signed certificate=-",
+    "pki_int/intermediate/set-signed",
+    # set-signed only IMPORTS an issuer. On a mount previously bootstrapped with
+    # the self-signed TEST root (the brownfield migration onto a customer CA),
+    # Vault keeps issuing from the OLD intermediate unless the imported one is
+    # promoted, so every leaf would chain to the test root. Promotion, the
+    # fingerprint proof, and the role pin are all load-bearing.
+    "imported_issuers",
+    "pki_int/config/issuers",
+    "default_follows_latest_issuer=false",
+    'issuer_ref="$imported"',
+    "the promoted Vault issuer is not the customer-signed intermediate",
     'allowed_domains="$DOMAIN" allow_subdomains=true allow_bare_domains=true',
     "AIGW_EDGE_TLS_MODE",
     "read -r VAULT_TOKEN",

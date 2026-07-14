@@ -243,9 +243,52 @@ EOF
 
     # Vault itself enforces that this certificate matches the intermediate key it
     # generated internally. A certificate for any other key is rejected here.
-    vlt write pki_int/intermediate/set-signed certificate=- < "$SIGNED_INTERMEDIATE" >/dev/null
+    #
+    # set-signed IMPORTS an issuer; it does not make it the one that signs. A
+    # mount that was previously bootstrapped with the self-signed TEST root (the
+    # brownfield case: an existing deployment migrating onto the customer CA)
+    # already holds issuers, and Vault's default_follows_latest_issuer is false,
+    # so the mount keeps issuing from the OLD test intermediate. Every leaf would
+    # then chain to the test root and fail edge-tls.py's verification -- with the
+    # customer-signed issuer sitting unused in the mount. Promote the imported
+    # issuer explicitly, and prove the promotion took.
+    imported="$(vlt write -format=json pki_int/intermediate/set-signed \
+        certificate=- < "$SIGNED_INTERMEDIATE" \
+        | python3 -I -c 'import json,sys; ids=(json.load(sys.stdin)["data"] or {}).get("imported_issuers") or []; print(ids[0] if ids else "")')"
 
+    supplied_fp="$(openssl x509 -in "$SIGNED_INTERMEDIATE" -noout -fingerprint -sha256)"
+
+    # set-signed is idempotent: re-running the ceremony with a certificate Vault
+    # already holds imports nothing and returns an empty list. The ceremony must
+    # stay re-runnable, so resolve the issuer by certificate identity rather than
+    # by "was it new" -- then promotion below is correct on both paths.
+    if [[ -z "$imported" ]]; then
+      for candidate in $(vlt list -format=json pki_int/issuers \
+          | python3 -I -c 'import json,sys; [print(i) for i in json.load(sys.stdin)]'); do
+        if [[ "$(vlt read -field=certificate "pki_int/issuer/$candidate" \
+                 | openssl x509 -noout -fingerprint -sha256)" == "$supplied_fp" ]]; then
+          imported="$candidate"
+          break
+        fi
+      done
+    fi
+    [[ -n "$imported" ]] \
+      || die "Vault holds no issuer matching --signed-intermediate; refusing to leave the mount issuing from a stale CA"
+
+    vlt write pki_int/config/issuers \
+        default="$imported" default_follows_latest_issuer=false >/dev/null
+
+    # Fail closed if the mount would still sign with anything but the certificate
+    # the customer CA just signed.
+    promoted_fp="$(vlt read -field=certificate "pki_int/issuer/$imported" \
+      | openssl x509 -noout -fingerprint -sha256)"
+    [[ "$promoted_fp" == "$supplied_fp" ]] \
+      || die "the promoted Vault issuer is not the customer-signed intermediate"
+
+    # Pin the role to the promoted issuer so a later default change cannot
+    # silently move leaf issuance back onto a stale CA.
     vlt write pki_int/roles/aigw \
+        issuer_ref="$imported" \
         allowed_domains="$DOMAIN" allow_subdomains=true allow_bare_domains=true \
         max_ttl=2160h >/dev/null
 
