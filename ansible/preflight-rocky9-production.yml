@@ -1,0 +1,8 @@
+---
+# Canonical controller-only input gate for a generated rocky9-production
+# inventory. This is a thin entry point: it imports the shared implementation in
+# preflight-generic-rocky9.yml verbatim (do NOT fork it). The shared play targets
+# the compatibility parent group generic_rocky9, of which production_rocky9 is a
+# child, so a canonical production host is selected here without any duplication.
+- name: AI Gateway rocky9-production — inventory and Vault contract (canonical entry)
+  ansible.builtin.import_playbook: preflight-generic-rocky9.yml

@@ -5,10 +5,17 @@ The helper deliberately never reads an existing vault and never writes a
 plaintext secret file.  It creates a new inventory layout, with the host-vars
 file named exactly for the requested inventory alias, and encrypts each
 required stack secret directly from process memory with ``ansible-vault``.
-The historical ``generic_rocky9`` Ansible group/profile name remains the
-compatibility identifier for production deployments; it is not a lab profile.
 The HashiCorp Vault unseal share is never randomly generated here because it
 does not exist until ``vault operator init`` completes.
+
+This is the shared implementation for both the canonical ``rocky9-production``
+profile (Ansible group ``production_rocky9``) and the DEPRECATED compatibility
+``generic-rocky9`` profile (group ``generic_rocky9``); neither is a lab
+profile. The canonical entry point is ``scripts/bootstrap-rocky9-production.py``;
+invoking this file directly keeps the legacy layout byte-identical but prints a
+one-line deprecation notice on stderr. Both entry points run this exact module
+— the profile only selects the Ansible group name and the generated
+inventory/host-vars layout, never a separate code path.
 """
 
 from __future__ import annotations
@@ -43,12 +50,23 @@ def fail(message: str) -> NoReturn:
     raise BootstrapError(message)
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(
+    argv: list[str] | None = None, *, default_profile: str = "generic-rocky9"
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a new production Rocky 9 inventory and encrypted Ansible Vault "
             "without a plaintext secret file."
         )
+    )
+    parser.add_argument(
+        "--deployment-profile",
+        choices=sorted(PROFILES),
+        default=default_profile,
+        help=(
+            "deployment profile to generate: 'rocky9-production' (canonical) or "
+            "'generic-rocky9' (deprecated compatibility alias). Default: %(default)s"
+        ),
     )
     parser.add_argument(
         "--inventory-dir",
@@ -79,7 +97,7 @@ def parse_arguments() -> argparse.Namespace:
         default="ansible-vault",
         help="ansible-vault executable (default: ansible-vault from PATH)",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def load_contract() -> dict[str, Any]:
@@ -268,6 +286,172 @@ offline_image_seed_manifest_sha256: ""
 """
 
 
+def production_inventory_document(alias: str) -> str:
+    return f"""---
+# Generated rocky9-production inventory (canonical profile). Keep this separate
+# from the committed lab inventory. Its host-specific non-secret values live in
+# host_vars/{alias}.yml.
+all:
+  children:
+    # Empty selector group: the production host below is deliberately not a
+    # gateway member, so a lab-only Vault cannot be inherited.
+    gateway:
+      hosts: {{}}
+    # 'generic_rocky9' is the DEPRECATED compatibility parent group. The
+    # canonical 'production_rocky9' child carries this host, so both the legacy
+    # and canonical play host patterns (and the preflight) select it while the
+    # generated Vault overlay lives under group_vars/production_rocky9/.
+    generic_rocky9:
+      children:
+        production_rocky9:
+    production_rocky9:
+      hosts:
+        {alias}:
+"""
+
+
+def production_host_vars_document(alias: str) -> str:
+    return f"""---
+# Generated rocky9-production host contract (canonical profile). Fill every
+# empty value in SECTION 1 before the non-mutating preflight; the encrypted
+# Vault is intentionally in group_vars/production_rocky9/vault.yml beside this
+# file. SECTIONS 3-5 are inputs added later in the deployment lifecycle; leave
+# them exactly as-is until the referenced step.
+aigw_generic_inventory_alias: {alias}
+deployment_profile: rocky9-production
+
+# ── SECTION 1 — non-secret host / interface / routing / DNS inputs ───────
+# Controller connection and public names.
+ansible_host: ""
+ansible_user: ansible
+ansible_become: true
+aigw_domain: ""
+aigw_management_ssh_port: 22
+
+# Existing three-plane Rocky 9 topology.
+nic_egress: ""
+nic_adm: ""
+nic_internal: ""
+eth0_ip: ""
+eth0_gateway: ""
+eth1_ip: ""
+eth1_gateway: ""
+eth2_ip: ""
+eth2_gateway: ""
+vpn_client_cidr: ""
+internal_cidr: ""
+
+# Keep corporate/internal and Internet egress resolver planes distinct.
+#
+# Mode A -- use existing corporate DNS:
+#   internal_dns_servers: ["<resolver reachable through ADM/internal>"]
+#   platform_authoritative_dns_enabled: false
+#
+# Mode B -- let this gateway answer only its own aigw_domain (no recursion):
+#   internal_dns_servers: ["{{{{ eth1_ip }}}}", "{{{{ eth2_ip }}}}"]
+#   platform_authoritative_dns_enabled: true
+# Configure a conditional/split resolver for aigw_domain: ADM clients use
+# eth1_ip and internal clients use eth2_ip. This authoritative service returns
+# NXDOMAIN for every other zone, so it must not replace a client's general
+# recursive resolver. In both modes, egress_dns_servers must contain a distinct
+# recursive Internet resolver routed only through nic_egress; only Envoy gets
+# it. Backends on isolated Docker networks keep service discovery but have no
+# upstream DNS; the routable ADM/internal edge services use the internal list.
+internal_dns_servers: []
+egress_dns_servers: []
+platform_authoritative_dns_enabled: false
+
+# Optional ADM-only Vault browser surface. The internal Vault API remains
+# deployed for platform consumers when this stays false.
+aigw_vault_ui_enabled: false
+
+# Source-policy routes are enabled for the ADM and internal interfaces.
+manage_networking: true
+pbr_tables: []
+# Populate exactly two entries after filling the interfaces/addresses above:
+#   - {{ name: adm, id: 101, priority: 10101, dev: "{{{{ nic_adm }}}}",
+#       gw: "{{{{ eth1_gateway }}}}", src: "{{{{ eth1_ip }}}}" }}
+#   - {{ name: internal, id: 102, priority: 10102, dev: "{{{{ nic_internal }}}}",
+#       gw: "{{{{ eth2_gateway }}}}", src: "{{{{ eth2_ip }}}}" }}
+
+# Production profiles stay outside all lab-only exceptions.
+require_encrypted_state: true
+require_preupgrade_backup: true
+aigw_ssh_password_authentication: false
+aigw_adm_socks_enabled: false
+aigw_adm_socks_users: []
+aigw_adm_socks_groups: []
+aigw_adm_socks_source_cidrs: []
+aigw_adm_socks_group_test_users: {{}}
+aigw_adm_socks_trusted_operator_ack: ""
+samba_lab_enabled: false
+aigw_seed_test_users: false
+retain_bootstrap_admin_user: false
+aigw_prebootstrap_oidc_scope_reconciliation: false
+aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
+aigw_lab_reset_handoff_drop_interfaces: []
+offline_image_seed_enabled: false
+offline_image_seed_remote_path: ""
+offline_image_seed_sha256: ""
+offline_image_seed_manifest_remote_path: ""
+offline_image_seed_manifest_sha256: ""
+
+# ── SECTION 2 — generated encrypted application secrets ──────────────────
+# Every stack credential was generated with high entropy and written ONLY in
+# ciphertext to the sibling overlay group_vars/production_rocky9/vault.yml under
+# your explicit --vault-id. No plaintext secret is ever written to this file.
+# Edit that overlay in place with `ansible-vault edit`; never paste a decrypted
+# value into this host_vars file.
+
+# ── SECTION 3 — operator-supplied vault_unseal_key (post-initialization) ─
+# vault_unseal_key is the SOLE operator-supplied secret and is NEVER randomly
+# generated by this tool: it cannot exist until `vault operator init` runs on
+# the target during the two-pass converge. After the reviewed production init
+# ceremony returns its 1-of-1 Shamir share, pipe it (stdin only, never argv or
+# environment) into scripts/store-vault-unseal-key.py, which writes exactly one
+# inline-encrypted value to the dedicated sibling overlay
+# group_vars/production_rocky9/vault-unseal.yml — never to group_vars/all.yml,
+# never in plaintext, never into this file. Until that overlay exists, later
+# converges leave an initialized Vault sealed by design; once present, every
+# converge auto-unseals from the encrypted controller custody. See
+# ansible/inventory/examples/production-rocky9.first-init.sh.example for the
+# exact runnable sequence.
+
+# ── SECTION 4 — external AD / LDAPS inputs (placeholder) ─────────────────
+# Reserved for the identity workstream. The identity_ldap_* variables that bind
+# this gateway's Keycloak to an external Active Directory / LDAPS directory are
+# defined by a parallel change; do not invent keys here yet. Leave this section
+# empty until that contract lands.
+
+# ── SECTION 5 — PKI inputs (placeholder) ─────────────────────────────────
+# Reserved for the production TLS / PKI workstream (customer-supplied leaf chain
+# or a CA-signed Vault intermediate). Its variables are defined by a parallel
+# change; do not invent keys here yet. Leave this section empty until that
+# contract lands.
+"""
+
+
+# Both entry points run this single module. A profile only selects the Ansible
+# group name, the generated inventory/host-vars layout, and the canonical
+# preflight entry-point name printed at the end — never a separate code path.
+PROFILES: dict[str, dict[str, Any]] = {
+    "generic-rocky9": {
+        "group": "generic_rocky9",
+        "legacy": True,
+        "inventory_document": inventory_document,
+        "host_vars_document": host_vars_document,
+        "preflight": "ansible/preflight-generic-rocky9.yml",
+    },
+    "rocky9-production": {
+        "group": "production_rocky9",
+        "legacy": False,
+        "inventory_document": production_inventory_document,
+        "host_vars_document": production_host_vars_document,
+        "preflight": "ansible/preflight-rocky9-production.yml",
+    },
+}
+
+
 def random_secret(entry: dict[str, Any], seen: set[str]) -> str:
     exact_length = entry.get("exact_length")
     minimum_length = entry.get("min_length")
@@ -355,19 +539,23 @@ def vault_document(args: argparse.Namespace, password_file: Path, contract: dict
 
 def create_layout(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     contract = load_contract()
+    profile = PROFILES[args.deployment_profile]
+    group = profile["group"]
+    build_inventory = profile["inventory_document"]
+    build_host_vars = profile["host_vars_document"]
     destination, password_file = validate_inputs(args)
     stage = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     os.chmod(stage, 0o700)
     try:
         host_vars = stage / "host_vars"
-        vault_dir = stage / "group_vars" / "generic_rocky9"
+        vault_dir = stage / "group_vars" / group
         host_vars.mkdir(mode=0o700)
         vault_dir.mkdir(parents=True, mode=0o700)
         inventory_path = stage / "hosts.yml"
         host_path = host_vars / f"{args.inventory_alias}.yml"
         vault_path = vault_dir / "vault.yml"
-        write_text(inventory_path, inventory_document(args.inventory_alias), 0o600)
-        write_text(host_path, host_vars_document(args.inventory_alias), 0o600)
+        write_text(inventory_path, build_inventory(args.inventory_alias), 0o600)
+        write_text(host_path, build_host_vars(args.inventory_alias), 0o600)
         write_text(vault_path, vault_document(args, password_file, contract), 0o600)
         if destination.exists() or destination.is_symlink():
             fail(f"refusing to overwrite existing inventory directory: {destination}")
@@ -375,29 +563,41 @@ def create_layout(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         return (
             destination / "hosts.yml",
             destination / "host_vars" / f"{args.inventory_alias}.yml",
-            destination / "group_vars" / "generic_rocky9" / "vault.yml",
+            destination / "group_vars" / group / "vault.yml",
         )
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
         raise
 
 
-def main() -> int:
+def main(argv: list[str] | None = None, *, default_profile: str = "generic-rocky9") -> int:
     try:
-        args = parse_arguments()
+        args = parse_arguments(argv, default_profile=default_profile)
+        profile = PROFILES[args.deployment_profile]
+        if profile["legacy"]:
+            print(
+                "DEPRECATION: 'generic-rocky9' is a compatibility alias; new "
+                "deployments should use scripts/bootstrap-rocky9-production.py "
+                "(profile rocky9-production, Ansible group production_rocky9).",
+                file=sys.stderr,
+            )
         inventory_path, host_path, vault_path = create_layout(args)
     except BootstrapError as exc:
         print(f"FATAL: {exc}", file=sys.stderr)
         return 2
 
     vault_reference = f"{args.vault_id}@{args.vault_password_file.expanduser()}"
-    print(f"Created production Rocky 9 inventory: {inventory_path}")
+    if profile["legacy"]:
+        # Byte-identical legacy stdout; only stderr carries the deprecation.
+        print(f"Created production Rocky 9 inventory: {inventory_path}")
+    else:
+        print(f"Created {args.deployment_profile} inventory: {inventory_path}")
     print(f"Fill non-secret topology in: {host_path}")
     print(f"Created encrypted Vault only: {vault_path}")
     custody_path = vault_path.with_name("vault-unseal.yml")
     preflight_command = (
         "ansible-playbook"
-        f" -i {inventory_path} ansible/preflight-generic-rocky9.yml"
+        f" -i {inventory_path} {profile['preflight']}"
         f" --limit {args.inventory_alias} --vault-id {vault_reference}"
     )
     deploy_command = (

@@ -112,15 +112,20 @@ then converge:
 
 ```bash
 ansible-galaxy collection install -r ansible/requirements.yml
-scripts/bootstrap-generic-rocky9.py --inventory-alias <alias> \
+scripts/bootstrap-rocky9-production.py --inventory-alias <alias> \
   --vault-id <vault-id> --vault-password-file <password-file>
 # edit ansible/inventory/generated/<alias>/host_vars/<alias>.yml
 ansible-playbook -i ansible/inventory/generated/<alias>/hosts.yml \
-  ansible/preflight-generic-rocky9.yml --limit <alias> \
+  ansible/preflight-rocky9-production.yml --limit <alias> \
   --vault-id <vault-id>@<password-file>
 ansible-playbook -i ansible/inventory/generated/<alias>/hosts.yml \
   ansible/site.yml --limit <alias> --vault-id <vault-id>@<password-file>
 ```
+
+The canonical profile is `rocky9-production` (Ansible group `production_rocky9`).
+The older `bootstrap-generic-rocky9.py` / `preflight-generic-rocky9.yml` /
+`generic-rocky9` names still work as DEPRECATED compatibility aliases and print a
+one-line deprecation notice pointing here.
 
 For the explicit lab only:
 

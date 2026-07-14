@@ -267,7 +267,7 @@ class VaultCustodyContractTests(unittest.TestCase):
         production_host = (
             EXAMPLES / "production-rocky9.host-vars.yml.example"
         ).read_text(encoding="utf-8")
-        self.assertIn("deployment_profile: generic-rocky9", production_host)
+        self.assertIn("deployment_profile: rocky9-production", production_host)
         self.assertIn("backwards-compatible", production_host)
         lab_host = (EXAMPLES / "rocky9-lab.host-vars.yml.example").read_text(
             encoding="utf-8"

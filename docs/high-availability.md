@@ -1,7 +1,8 @@
 # Scaling and High Availability Posture
 
-The implemented `generic-rocky9` and `rocky9-lab` profiles run one Docker
-Compose project on one Rocky Linux 9 VM. This deployment is **not highly
+The implemented `rocky9-production` (deprecated alias `generic-rocky9`) and
+`rocky9-lab` profiles run one Docker Compose project on one Rocky Linux 9 VM.
+This deployment is **not highly
 available**, and building HA on Docker Compose is **not recommended or
 supported**: the host, Docker daemon, kernel, storage, firewalls, physical
 interfaces, and power are one failure domain, and host-local Compose bridges

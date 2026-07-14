@@ -18,8 +18,9 @@ accepted, highly available, or ready for access reopening.
 ## What is implemented
 
 The hardened control-plane drop (July 2026) added: a generated per-customer
-inventory flow (`scripts/bootstrap-generic-rocky9.py` plus the controller-only
-`ansible/preflight-generic-rocky9.yml` gate), three new converge roles
+inventory flow (`scripts/bootstrap-rocky9-production.py` plus the controller-only
+`ansible/preflight-rocky9-production.yml` gate, with the `generic-rocky9` names
+kept as deprecated aliases), three new converge roles
 (`firewall_preflight`, `time_sync`, `host_finalize`), split internal/egress
 DNS resolver planes replacing the shared container resolver, four per-gate
 OAuth cookie secrets, an optional extracted-asset Vault browser UI

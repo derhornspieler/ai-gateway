@@ -1,0 +1,29 @@
+---
+# SAFE TEMPLATE ONLY. Canonical rocky9-production inventory SHAPE.
+#
+# Real deployments do not hand-write this file: run
+#   scripts/bootstrap-rocky9-production.py --inventory-alias <alias> \
+#     --vault-id <alias> --vault-password-file <file>
+# which generates ansible/inventory/generated/<alias>/ with this exact group
+# hierarchy, a host_vars/<alias>.yml to fill in, a ciphertext-only
+# group_vars/production_rocky9/vault.yml, and (after the Vault init ceremony)
+# the sibling custody overlay group_vars/production_rocky9/vault-unseal.yml.
+# This example just documents the canonical structure the generator emits.
+#
+# 'production_rocky9' is the canonical group; it is a child of the DEPRECATED
+# compatibility group 'generic_rocky9', so both the site.yml play pattern
+# (gateway:generic_rocky9) and the shared preflight (hosts: generic_rocky9)
+# select a production host with zero duplication. Do NOT make it a child of
+# 'gateway': that name selects the committed lab-only Vault overlay.
+all:
+  children:
+    gateway:
+      hosts: {}
+    generic_rocky9:
+      children:
+        production_rocky9:
+          hosts:
+            production-aigw01:
+              ansible_host: "<ADM_INTERFACE_IP_OR_SSH_HOST>"
+              ansible_user: ansible
+              ansible_become: true

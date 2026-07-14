@@ -36,6 +36,12 @@ class GenericRocky9ContractTests(unittest.TestCase):
     def test_contract_is_the_complete_generic_secret_key_manifest(self) -> None:
         self.assertEqual(self.contract["schema"], "aigw.generic-rocky9/v1")
         self.assertEqual(self.contract["profile"], "generic-rocky9")
+        # The pinned schema id and legacy "profile" are unchanged so existing
+        # consumers keep working; the canonical terminology is added additively.
+        self.assertEqual(self.contract["canonical_profile"], "rocky9-production")
+        self.assertEqual(self.contract["compatibility_profile"], "generic-rocky9")
+        self.assertEqual(self.contract["canonical_group"], "production_rocky9")
+        self.assertEqual(self.contract["compatibility_group"], "generic_rocky9")
         self.assertEqual(self.contract["host_vars_filename"], "{inventory_alias}.yml")
         names = [entry["name"] for entry in self.contract["required_secret_keys"]]
         self.assertEqual(len(names), len(set(names)))
