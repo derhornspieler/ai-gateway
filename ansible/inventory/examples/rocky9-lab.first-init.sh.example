@@ -8,6 +8,18 @@ set -euo pipefail
 : "${AIGW_VAULT_ID:?set to the Ansible Vault ID label}"
 : "${AIGW_VAULT_PASSWORD_FILE:?set to a private 0600 controller file}"
 
+# Pipelining is a confidentiality control, not a speed tweak: the automatic
+# Vault-unseal and LDAP bind tasks pass their secret on the module stdin under
+# no_log, and only pipelining keeps that stdin out of the AnsiballZ payload
+# Ansible writes to ~/.ansible/tmp on the target. Running from the repository
+# root loads the committed ./ansible.cfg, which turns pipelining on. Fail closed.
+if ! ansible-config dump 2>/dev/null | grep -Eq 'PIPELINING.*= True'; then
+  printf '%s\n' \
+    'refusing to converge: Ansible connection pipelining is OFF.' \
+    'Run from the repository root (loads ./ansible.cfg) or export ANSIBLE_PIPELINING=True.' >&2
+  exit 1
+fi
+
 # The first ordinary converge deploys a fresh, deliberately uninitialized
 # Vault. It is a staging phase, not a completed deployment.
 ansible-playbook -i "$AIGW_INVENTORY" ansible/site.yml \

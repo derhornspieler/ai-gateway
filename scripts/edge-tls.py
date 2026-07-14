@@ -35,6 +35,12 @@ DEFAULT_OPENSSL = "/usr/bin/openssl"
 BEGIN_CERT = "-----BEGIN CERTIFICATE-----"
 END_CERT = "-----END CERTIFICATE-----"
 
+# The NIST prime curves the public web PKI issues for TLS leaves. P-521 is a
+# stronger key than P-256, not a weaker one -- its 521-bit field must never be
+# compared against the 2048-bit RSA minimum. Curves outside this set (P-192,
+# P-224, or any non-NIST curve) are refused as genuinely weak.
+STRONG_EC_CURVES = frozenset({"p-256", "p-384", "p-521"})
+
 # Pinned refusal. The mode-2 ceremony signs a CSR; the customer's root/issuing
 # private key must never be requested, transported, or stored by this platform.
 PRIVATE_KEY_IN_CERT_FATAL = (
@@ -231,7 +237,13 @@ def check_key_matches_leaf(openssl: OpenSSL, key_path: Path, leaf_pem: str) -> s
 
 
 def check_key_strength(openssl: OpenSSL, public_key_pem: str) -> None:
-    """Inspect the PUBLIC half only: `pkey -in <key> -text` would print the private key."""
+    """Inspect the PUBLIC half only: `pkey -in <key> -text` would print the private key.
+
+    An EC key is judged by its named curve, never by an RSA bit threshold. All
+    three NIST prime curves the web PKI issues -- P-256, P-384, P-521 -- are
+    strong; P-521 reports 521 "bits" and must NOT be refused for failing a
+    2048-bit RSA rule. RSA keys must carry a >= 2048-bit modulus.
+    """
     text = openssl.run(
         "pkey", "-pubin", "-noout", "-text", stdin=public_key_pem, check_name="key-strength"
     )
@@ -242,15 +254,20 @@ def check_key_strength(openssl: OpenSSL, public_key_pem: str) -> None:
     else:
         bits = 0
     lowered = text.lower()
-    if "rsa" in lowered:
-        if bits < 2048:
-            fail("key-strength", f"RSA key is {bits} bits; 2048 is the minimum")
-        return
-    if "nist curve: p-256" in lowered or "nist curve: p-384" in lowered:
-        return
-    if bits >= 2048:
-        return
-    fail("key-strength", "key must be RSA >= 2048 bits or EC P-256/P-384")
+    if "nist curve:" in lowered:
+        # EC key. Accept only the strong NIST prime curves; a weaker curve
+        # (P-192/P-224) or any non-NIST curve is a genuinely weak key.
+        curve = lowered.split("nist curve:", 1)[1].splitlines()[0].strip()
+        if curve in STRONG_EC_CURVES:
+            return
+        fail(
+            "key-strength",
+            f"EC key uses unsupported curve {curve or '(unnamed)'}; the edge key "
+            "must use NIST curve P-256, P-384, or P-521",
+        )
+    # RSA (or any non-EC key without a NIST curve): require a >= 2048-bit modulus.
+    if bits < 2048:
+        fail("key-strength", f"RSA key is {bits} bits; 2048 is the minimum")
 
 
 def check_san(text: str, domain: str) -> None:
