@@ -384,10 +384,59 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
             self.assertNotIn("BEGIN RSA PRIVATE KEY", stream)
             self.assertNotIn("BEGIN EC PRIVATE KEY", stream)
 
+    def mint_leaf(self, name: str, keygen: list[str]) -> tuple[Path, Path]:
+        """Issue a *.domain leaf with a caller-chosen key type off the fixture
+        intermediate, with a valid SAN/EKU/basic-constraints so the ONLY thing
+        under test is the key-strength decision. Returns (cert, key)."""
+        work = self.workspace
+        csr = work / f"{name}.csr"
+        key = work / f"{name}.key"
+        cert = work / f"{name}.pem"
+        self._ossl(
+            "req", "-new", *keygen, "-nodes",
+            "-subj", f"/CN=*.{self.domain}", "-keyout", str(key), "-out", str(csr),
+        )
+        os.chmod(key, 0o600)
+        ext = work / f"{name}.ext"
+        ext.write_text(
+            f"subjectAltName=DNS:*.{self.domain},DNS:{self.domain}\n"
+            "extendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n",
+            encoding="utf-8",
+        )
+        self._ossl(
+            "x509", "-req", "-in", str(csr), "-CA", str(self.intermediate),
+            "-CAkey", str(self.workspace / "intermediate.key"), "-CAcreateserial",
+            "-days", "90", "-extfile", str(ext), "-out", str(cert),
+        )
+        return cert, key
+
     def test_valid_material_passes(self) -> None:
         result = self.validate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("edge-tls=valid", result.stdout)
+        self.assert_no_key_bytes(result)
+
+    def test_strong_p521_ec_leaf_passes(self) -> None:
+        # A NIST P-521 leaf is a STRONGER key than P-256, not a weaker one. The
+        # pre-fix strength rule compared its 521-bit field against the 2048-bit
+        # RSA floor and refused a perfectly valid customer EC leaf (finding #10).
+        # This asserts the false-negative is gone.
+        cert, key = self.mint_leaf(
+            "p521", ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:secp521r1"]
+        )
+        result = self.validate(**{"--leaf": str(cert), "--key": str(key)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("edge-tls=valid", result.stdout)
+        self.assert_no_key_bytes(result)
+
+    def test_weak_rsa1024_leaf_still_rejected(self) -> None:
+        # The EC fix must not weaken the genuine floor: a 1024-bit RSA leaf is
+        # still refused by the key-strength check.
+        cert, key = self.mint_leaf("rsa1024", ["-newkey", "rsa:1024"])
+        result = self.validate(**{"--leaf": str(cert), "--key": str(key)})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("key-strength", result.stderr)
+        self.assertIn("1024 bits", result.stderr)
         self.assert_no_key_bytes(result)
 
     def test_wrong_key_rejected(self) -> None:

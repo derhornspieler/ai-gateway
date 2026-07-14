@@ -81,6 +81,8 @@ ansible-playbook -i ansible/inventory/generated/<alias>/hosts.yml ansible/site.y
 
 Lab profile instead: `ansible-playbook -i ansible/inventory/lab.yml ansible/site.yml --ask-vault-pass` (lab uses `--ask-vault-pass`; generated inventories use `--vault-id`).
 
+**Run converges from the repo root with pipelining ON — it is a confidentiality control.** The automatic Vault-unseal task and the LDAP bind task pass their decrypted secret on the command module's `stdin` under `no_log`. `no_log` only suppresses Ansible's own logging; with pipelining **off** Ansible still base64-embeds that stdin in the AnsiballZ module payload it writes to `~/.ansible/tmp` on the **target**. Pipelining streams the module over the SSH session so the secret never lands on remote disk. Ansible only auto-loads `./ansible.cfg` from the current directory, so the committed **repo-root `ansible.cfg`** (a mirror of `ansible/ansible.cfg`, both set `pipelining = True` in `[defaults]`) is what makes `ansible-playbook … ansible/site.yml` from the repo root safe. Verify before a converge: `ansible-config dump | grep PIPELINING` must show `= True`, never `(default) = False`. Invoking from another directory requires `ANSIBLE_PIPELINING=True` (or `ANSIBLE_CONFIG=$PWD/ansible/ansible.cfg`). The two `ansible.cfg` files are pinned in sync by `scripts/tests/test_vault_ansible_unseal_contract.py`.
+
 **Three playbooks, one converge.** `ansible/site.yml` is a pure composition — `import_playbook: os-prep.yml` then `import_playbook: deploy-stack-only.yml` — and all three accept the same inventory/vault arguments:
 
 - `ansible/site.yml` — the full converge (host prep + stack). First deploys and whenever unsure.

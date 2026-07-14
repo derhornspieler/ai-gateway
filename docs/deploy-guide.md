@@ -452,6 +452,25 @@ ansible-playbook -i ansible/inventory/hosts.yml ansible/site.yml \
   -e @/secure/customer-topology.yml --ask-vault-pass
 ```
 
+> **Run converges from the repository root with pipelining ON.** Connection
+> pipelining is a confidentiality control here, not a performance tweak: the
+> automatic Vault-unseal task and the LDAP bind task pass their decrypted secret
+> on the module's stdin under `no_log`. `no_log` only hides the value from
+> Ansible's own output — with pipelining OFF, Ansible still base64-embeds that
+> stdin in the AnsiballZ module payload it writes to `~/.ansible/tmp` on the
+> **target**. Pipelining streams the module over the SSH session instead, so the
+> secret never touches remote disk. The committed repo-root `ansible.cfg` (a
+> mirror of `ansible/ansible.cfg`) sets `pipelining = True` and is what Ansible
+> auto-discovers when you run `ansible-playbook … ansible/site.yml` from the
+> repository root. Confirm it is active before the first converge:
+>
+> ```bash
+> ansible-config dump | grep PIPELINING   # must report = True, not (default) = False
+> ```
+>
+> If you invoke Ansible from another directory, export `ANSIBLE_PIPELINING=True`
+> (or `ANSIBLE_CONFIG=$PWD/ansible/ansible.cfg`) so the control still applies.
+
 `site.yml` is a pure composition of two playbooks that can also run
 separately with the same inventory arguments: `ansible/os-prep.yml` (host
 preparation only — the read-only input/topology validation plus roles

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import configparser
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -20,6 +22,8 @@ COMPOSE = ROOT / "compose/docker-compose.yml"
 SITE = ROOT / "ansible/site.yml"
 LAB_INVENTORY = ROOT / "ansible/inventory/lab.yml"
 GENERIC_INVENTORY = ROOT / "ansible/inventory/hosts.yml"
+REPO_ROOT_ANSIBLE_CFG = ROOT / "ansible.cfg"
+ANSIBLE_DIR_CFG = ROOT / "ansible" / "ansible.cfg"
 
 
 def task_block(source: str, name: str, next_name: str) -> str:
@@ -314,6 +318,87 @@ class VaultAnsibleUnsealContractTests(unittest.TestCase):
         self.assertIn("not ((vault_public_status.stdout | from_json).initialized | bool)", allowed)
         self.assertNotIn("vault_strict_readiness.rc != 0", allowed)
         self.assertNotIn(".sealed | bool", allowed)
+
+
+class AnsiblePipeliningContractTests(unittest.TestCase):
+    """Pipelining is the confidentiality control the unseal task relies on.
+
+    The `Automatically unseal initialized Vault from controller inventory` task
+    passes the decrypted 1-of-1 Shamir share on the command module's stdin under
+    no_log (as does the LDAP bind task). no_log only suppresses Ansible's own
+    logging; it does NOT stop Ansible from base64-embedding that stdin in the
+    AnsiballZ module payload it writes to ~/.ansible/tmp on the TARGET when
+    pipelining is off. Only connection pipelining streams the module + stdin over
+    the SSH session so the secret never lands on the remote disk.
+
+    The documented converge commands run `ansible-playbook -i ... ansible/site.yml`
+    from the REPOSITORY ROOT, where Ansible auto-discovers ./ansible.cfg, not
+    ansible/ansible.cfg. These contracts prove a repo-root ansible.cfg exists and
+    turns pipelining on regardless of the working directory.
+    """
+
+    def test_both_configs_declare_pipelining_true(self) -> None:
+        for label, cfg in (
+            ("repo-root ansible.cfg", REPO_ROOT_ANSIBLE_CFG),
+            ("ansible/ansible.cfg", ANSIBLE_DIR_CFG),
+        ):
+            self.assertTrue(cfg.is_file(), f"{label} must exist at {cfg}")
+            parser = configparser.ConfigParser()
+            parser.read(cfg)
+            # [defaults] is load-bearing: the global ANSIBLE_PIPELINING reads
+            # [defaults]/[connection], never [ssh_connection], so an
+            # [ssh_connection]-only value leaves `ansible-config dump` reporting
+            # the misleading default of False.
+            self.assertTrue(
+                parser.getboolean("defaults", "pipelining", fallback=False),
+                f"{label} must set [defaults] pipelining = True",
+            )
+            self.assertTrue(
+                parser.getboolean("ssh_connection", "pipelining", fallback=False),
+                f"{label} must set [ssh_connection] pipelining = True",
+            )
+
+    def test_repo_root_config_paths_point_into_the_ansible_dir(self) -> None:
+        # Relative paths in an ansible.cfg resolve against the file's own
+        # directory. A repo-root config must therefore prefix ansible/ so a
+        # repo-root invocation still resolves roles and inventory.
+        self.assertTrue(REPO_ROOT_ANSIBLE_CFG.is_file())
+        parser = configparser.ConfigParser()
+        parser.read(REPO_ROOT_ANSIBLE_CFG)
+        self.assertEqual(parser.get("defaults", "roles_path"), "ansible/roles")
+        self.assertEqual(
+            parser.get("defaults", "inventory"), "ansible/inventory/hosts.yml"
+        )
+
+    def test_ansible_config_dump_from_repo_root_reports_pipelining_true(self) -> None:
+        ansible_config = shutil.which("ansible-config")
+        self.assertIsNotNone(ansible_config, "ansible-config is required")
+        # Discover ./ansible.cfg from the repo root exactly as a documented
+        # converge would; do not let an inherited ANSIBLE_CONFIG mask the bug.
+        env = {key: value for key, value in os.environ.items() if key != "ANSIBLE_CONFIG"}
+        proc = subprocess.run(
+            [str(ansible_config), "dump"],
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pipelining = [line.strip() for line in proc.stdout.splitlines() if "PIPELINING" in line]
+        self.assertTrue(pipelining, f"no PIPELINING setting in dump:\n{proc.stdout}")
+        # DEFAULT_PIPELINING / ANSIBLE_PIPELINING must resolve to True and be
+        # sourced from a config file (parenthetical is a path, never "(default)").
+        self.assertTrue(
+            any(line.endswith("= True") for line in pipelining),
+            "pipelining is not True from the repo root:\n" + "\n".join(pipelining),
+        )
+        self.assertFalse(
+            any("(default)" in line for line in pipelining),
+            "pipelining resolved to its built-in default from the repo root; the "
+            "repo-root ansible.cfg was not loaded:\n" + "\n".join(pipelining),
+        )
 
 
 if __name__ == "__main__":
