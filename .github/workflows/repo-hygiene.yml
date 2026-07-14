@@ -1,0 +1,113 @@
+name: Repository hygiene
+
+# Cheap gates for defect classes the existing workflows do not look for:
+#
+#   * ShellCheck. The repo had none — `bash -n scripts/*.sh` plus contract tests
+#     were the entire shell gate, and `bash -n` proves only parseability. These
+#     scripts run as root on the customer VM and handle Vault unseal material.
+#   * JSON encoding and duplicate keys. Every JSON asset is already *parsed*
+#     somewhere, but `json.loads` is silent about a duplicate key (last one wins)
+#     and about a BOM, and these are hand-edited security artefacts.
+#   * Contract-test drift. Advisory only — a reviewer prompt, never a veto.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-hygiene-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: ShellCheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Blocking. The reviewed shell is clean at this level today, so anything
+      # that lands here is a genuine defect a reviewer should never wave through.
+      - name: Reject shell errors
+        run: bash .github/scripts/run-shellcheck.sh error
+
+      # Advisory. Sixteen pre-existing findings live at info/style, most of them
+      # SC2016 on deliberately single-quoted Python and jq programs. They are
+      # reported, never enforced: mass-rewriting working root-level scripts to
+      # satisfy a new linter is how a linter causes the outage it was meant to
+      # prevent. Tighten the blocking severity above as they are retired.
+      - name: Report shell warnings and style findings
+        run: |
+          set +e
+          findings="$(bash .github/scripts/run-shellcheck.sh info)"
+          code=$?
+          set -e
+          if [[ $code -eq 0 ]]; then
+            echo "No ShellCheck findings at info severity." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## ShellCheck (advisory, info severity)"
+            echo
+            echo '```'
+            echo "$findings"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r finding; do
+            [[ -n "$finding" ]] && echo "::warning title=ShellCheck::$finding"
+          done <<< "$findings"
+
+  json:
+    name: JSON assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Reject duplicate keys and encoding defects
+        run: python3 -I .github/scripts/validate-json-assets.py
+
+  contract-drift:
+    name: Contract-test drift guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Read the changed paths from the API rather than fetching full history:
+      # the guard needs filenames, not blobs.
+      - name: Report reviewed surfaces changed without a contract update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --paginate \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[].filename' \
+            | python3 -I .github/scripts/contract-drift-guard.py --summary "$GITHUB_STEP_SUMMARY"
