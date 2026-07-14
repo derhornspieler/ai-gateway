@@ -182,8 +182,11 @@ class SambaTlsCeremonyTests(unittest.TestCase):
             'install -m 0644 -- "$staging/tls.crt" "$STACK_DIR/secrets/samba_ad_tls_cert"',
             self.ceremony,
         )
+        # Samba's CVE-2013-4476 guard rejects any group/other bit on the LDAPS
+        # private key, so the ceremony must install it 0600 — matching the
+        # entrypoint's CA-adoption and self-signed-fallback paths.
         self.assertIn(
-            'install -m 0640 -- "$staging/tls.key" "$STACK_DIR/secrets/samba_ad_tls_key"',
+            'install -m 0600 -- "$staging/tls.key" "$STACK_DIR/secrets/samba_ad_tls_key"',
             self.ceremony,
         )
 

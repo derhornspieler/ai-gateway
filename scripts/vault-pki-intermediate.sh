@@ -223,7 +223,7 @@ for cert in chain:
 cert_fd = os.open(os.path.join(staging, "tls.crt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
 os.write(cert_fd, bundle.encode())
 os.close(cert_fd)
-key_fd = os.open(os.path.join(staging, "tls.key"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+key_fd = os.open(os.path.join(staging, "tls.key"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 os.write(key_fd, (data["private_key"].rstrip("\n") + "\n").encode())
 os.close(key_fd)
 '
@@ -234,9 +234,10 @@ os.close(key_fd)
   openssl pkey -in "$staging/tls.key" -noout >/dev/null 2>&1 \
     || die "issued private key is unreadable"
 
-  # Atomic, root-owned install. Key stays 0640 root:root (never world-readable).
+  # Atomic, root-owned install. Key is 0600 root:root: Samba's CVE-2013-4476
+  # guard rejects any group/other bit on the LDAPS private key.
   install -m 0644 -- "$staging/tls.crt" "$STACK_DIR/secrets/samba_ad_tls_cert"
-  install -m 0640 -- "$staging/tls.key" "$STACK_DIR/secrets/samba_ad_tls_key"
+  install -m 0600 -- "$staging/tls.key" "$STACK_DIR/secrets/samba_ad_tls_key"
 
   rm -rf -- "$staging"
   trap - EXIT HUP INT TERM

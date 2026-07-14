@@ -165,7 +165,10 @@ if [ -s "$tls_cert_src" ] && [ -s "$tls_key_src" ] \
 fi
 
 if [ "$use_ca_material" = true ]; then
-    install -m 0640 "$tls_key_src" "$TLS_DIR/key.pem"
+    # Samba's CVE-2013-4476 guard refuses to start LDAPS unless the TLS private
+    # key is exactly 0600 (owner-only) — a 0640 group bit is rejected. This must
+    # match the self-signed fallback path below.
+    install -m 0600 "$tls_key_src" "$TLS_DIR/key.pem"
     install -m 0644 "$tls_cert_src" "$TLS_DIR/cert.pem"
     # The delivered file is leaf + issuing chain; use it as the cafile too so
     # Samba presents a complete chain. Keycloak still anchors on certs/ca.pem.

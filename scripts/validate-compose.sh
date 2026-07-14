@@ -1507,7 +1507,8 @@ expected_samba_relabels = {
     "/run/secrets/samba_ad_bind_password": "z",
     # The CA-issued LDAPS leaf + key are private to this DC (never shared with a
     # peer), so a private-category Z relabel is correct. The key is delivered
-    # root:root 0640 on the host and is never world-readable.
+    # root:root 0600 on the host: the Samba CVE-2013-4476 guard rejects any
+    # group or other permission bit on the LDAPS private key.
     "/run/secrets/samba_ad_tls_cert": "Z",
     "/run/secrets/samba_ad_tls_key": "Z",
     "/run/secrets/samba_user_lab-admin_password": "Z",
