@@ -251,8 +251,13 @@ class Settings(BaseSettings):
     lab_samba_ldap_enabled: bool = Field(
         default=False, alias="LAB_SAMBA_LDAP_ENABLED"
     )
+    # FQDN, never the bare `samba-ad` container name: the lab DC's LDAPS leaf is
+    # issued from the customer (Aegis) CA, whose critical name constraints
+    # forbid a bare-hostname SAN, so hostname verification is only meaningful
+    # against samba-ad.<lab-domain>. The committed lab domain is
+    # aigw.aegisgroup.ch; the Compose lab overlay renders this from ${DOMAIN}.
     lab_samba_ldap_url: str = Field(
-        default="ldaps://samba-ad:636", alias="LAB_SAMBA_LDAP_URL"
+        default="ldaps://samba-ad.aigw.aegisgroup.ch:636", alias="LAB_SAMBA_LDAP_URL"
     )
     lab_samba_users_dn: str = Field(
         # Human lab identities live in a dedicated OU.  Using AD's broad

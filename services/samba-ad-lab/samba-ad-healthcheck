@@ -13,8 +13,12 @@ printf '%s\n' "$password_settings" \
     | grep -Eq '^Account lockout duration \(mins\):[[:space:]]+15$'
 printf '%s\n' "$password_settings" \
     | grep -Eq '^Reset account lockout after \(mins\):[[:space:]]+15$'
-fqdn=$(hostname).$(samba-tool domain info 127.0.0.1 2>/dev/null \
-    | awk -F: '/^Forest[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print tolower($2)}')
+# Verify LDAPS against the exact FQDN the endpoint is addressed by
+# (ldaps://samba-ad.$DOMAIN:636) — the only name the customer-CA-signed leaf
+# bears. Falls back to <host>.<forest> for a bare docker run. This exercises
+# hostname verification, not merely that a socket answers on 636.
+fqdn=${SAMBA_LDAPS_FQDN:-$(hostname).$(samba-tool domain info 127.0.0.1 2>/dev/null \
+    | awk -F: '/^Forest[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print tolower($2)}')}
 test -n "$fqdn"
 timeout 5 openssl s_client \
     -connect 127.0.0.1:636 \

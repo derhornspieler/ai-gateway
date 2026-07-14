@@ -182,6 +182,70 @@ restart_edge_consumers() {
   "$STACK_DIR/scripts/aigw-runtime-up.sh" -d --wait --wait-timeout 600
 }
 
+# Issue the lab Samba AD LDAPS leaf from the SAME customer-CA-signed
+# intermediate that signs the edge certificates, then deliver it to the lab DC
+# as root-owned files and recreate the container so it serves it. This makes
+# Keycloak exercise the real production trust path (Aegis chain in certs/ca.pem)
+# instead of trusting a self-signed lab certificate.
+#
+# The certificate's ONLY SAN is the FQDN samba-ad.$DOMAIN. A bare-hostname SAN
+# (`samba-ad`) is deliberately NOT requested: the Aegis root CA carries critical
+# name constraints (permitted DNS aegisgroup.ch/cluster.local), so a bare host
+# label would poison the leaf -> `openssl verify` error 47 (permitted subtree
+# violation). Vault's `aigw` role is allowed_domains=$DOMAIN allow_subdomains,
+# so samba-ad.$DOMAIN is issuable and constraint-clean.
+issue_and_install_samba_leaf() {
+  local profile
+  profile="$(env_value DEPLOYMENT_PROFILE)"
+  [[ "$profile" == rocky9-lab ]] \
+    || die "samba-tls is a lab-only ceremony (DEPLOYMENT_PROFILE must be rocky9-lab)"
+
+  local staging
+  staging="$(mktemp -d "$STACK_DIR/.state/samba-tls-staging.XXXXXX")"
+  chmod 700 "$staging"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$staging'" EXIT HUP INT TERM
+
+  echo ">> issuing samba-ad.$DOMAIN from the customer-CA-signed intermediate"
+  vlt write -format=json pki_int/issue/aigw \
+      common_name="samba-ad.$DOMAIN" ttl=2160h \
+  | STAGING="$staging" python3 -I -c '
+import json, os, sys
+staging = os.environ["STAGING"]
+data = json.load(sys.stdin)["data"]
+# Serve the full chain: leaf followed by the issuing CA chain (intermediate +
+# root). Keycloak still anchors on certs/ca.pem, but presenting the chain keeps
+# the handshake robust for any client.
+chain = data.get("ca_chain") or ([data["issuing_ca"]] if data.get("issuing_ca") else [])
+bundle = data["certificate"].rstrip("\n") + "\n"
+for cert in chain:
+    bundle += cert.rstrip("\n") + "\n"
+cert_fd = os.open(os.path.join(staging, "tls.crt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+os.write(cert_fd, bundle.encode())
+os.close(cert_fd)
+key_fd = os.open(os.path.join(staging, "tls.key"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+os.write(key_fd, (data["private_key"].rstrip("\n") + "\n").encode())
+os.close(key_fd)
+'
+  # Prove the leaf certifies exactly the FQDN before it is installed, so a wrong
+  # or truncated response never displaces the working (self-signed) material.
+  openssl x509 -in "$staging/tls.crt" -noout -checkhost "samba-ad.$DOMAIN" >/dev/null \
+    || die "issued leaf does not certify samba-ad.$DOMAIN"
+  openssl pkey -in "$staging/tls.key" -noout >/dev/null 2>&1 \
+    || die "issued private key is unreadable"
+
+  # Atomic, root-owned install. Key stays 0640 root:root (never world-readable).
+  install -m 0644 -- "$staging/tls.crt" "$STACK_DIR/secrets/samba_ad_tls_cert"
+  install -m 0640 -- "$staging/tls.key" "$STACK_DIR/secrets/samba_ad_tls_key"
+
+  rm -rf -- "$staging"
+  trap - EXIT HUP INT TERM
+
+  # Recreate the DC so its entrypoint adopts the CA-issued material now. A later
+  # converge re-digests the new bytes and reconciles the same recreation.
+  "${compose[@]}" up -d --no-deps --force-recreate samba-ad
+}
+
 case "$SUBCOMMAND" in
   csr)
     if [[ -e "$MARKER" && "$REGENERATE" != true ]]; then
@@ -314,7 +378,13 @@ EOF
     echo ">> edge leaf renewed."
     ;;
 
+  samba-tls)
+    [[ -e "$MARKER" ]] || die "no customer-CA-signed intermediate is installed; run the csr + install-signed ceremony first"
+    issue_and_install_samba_leaf
+    echo ">> lab Samba AD now serves ldaps://samba-ad.$DOMAIN:636 with a customer-CA-signed certificate."
+    ;;
+
   *)
-    die "usage: vault-pki-intermediate.sh {csr|install-signed --signed-intermediate FILE --chain FILE|renew-leaf}"
+    die "usage: vault-pki-intermediate.sh {csr|install-signed --signed-intermediate FILE --chain FILE|renew-leaf|samba-tls}"
     ;;
 esac
