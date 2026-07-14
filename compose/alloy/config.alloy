@@ -28,8 +28,8 @@ otelcol.processor.memory_limiter "default" {
   spike_limit    = "64MiB"
   output {
     traces  = [otelcol.processor.transform.aigw_correlation.input]
-    logs    = [otelcol.processor.batch.default.input]
-    metrics = [otelcol.processor.batch.default.input]
+    logs    = [otelcol.processor.transform.aigw_sensitive_attributes.input]
+    metrics = [otelcol.processor.transform.aigw_sensitive_attributes.input]
   }
 }
 
@@ -48,17 +48,163 @@ otelcol.processor.transform "aigw_correlation" {
     statements = [
       `set(attributes["aigw.user.id"], attributes["metadata.user_api_key_user_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_user_id"]) and IsMatch(attributes["metadata.user_api_key_user_id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
       `set(attributes["aigw.api_key.id"], attributes["metadata.user_api_key_hash"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_hash"]) and IsMatch(attributes["metadata.user_api_key_hash"], "^[0-9a-f]{64}$")`,
-      `set(attributes["aigw.api_key.alias"], attributes["metadata.user_api_key_alias"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_alias"]) and IsMatch(attributes["metadata.user_api_key_alias"], "^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")`,
       `set(attributes["aigw.request.id"], attributes["litellm.call_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["litellm.call_id"]) and IsMatch(attributes["litellm.call_id"], "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")`,
-      `set(attributes["aigw.project.id"], ExtractPatterns(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")["project"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_auth_metadata"]) and IsMatch(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")`,
+      `set(attributes["aigw.project.id"], attributes["metadata.user_api_key_project_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_project_id"]) and IsMatch(attributes["metadata.user_api_key_project_id"], "^[a-z0-9][a-z0-9_.-]{0,63}$")`,
+      `set(attributes["aigw.project.id"], ExtractPatterns(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")["project"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.project.id"] == nil and IsString(attributes["metadata.user_api_key_auth_metadata"]) and IsMatch(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")`,
     ]
   }
 
   output {
-    traces = [otelcol.processor.batch.default.input]
+    traces = [otelcol.processor.transform.aigw_sensitive_attributes.input]
   }
 }
 // END AIGW MANAGED TRACE CORRELATION
+
+// Promote correlation first, then remove every raw identity/credential source
+// before any signal can reach Tempo, Prometheus, Loki, or customer Cribl.  The
+// application requirement to retain prompt/completion bodies is deliberate:
+// gen_ai.input.messages, gen_ai.output.messages, and their legacy prompt /
+// completion equivalents are not matched by these deletion rules.
+// BEGIN AIGW MANAGED SENSITIVE ATTRIBUTE FILTER
+otelcol.processor.transform "aigw_sensitive_attributes" {
+  // Attribute removal is a security boundary. A runtime transform failure
+  // drops the affected telemetry instead of exporting an unsanitized copy.
+  error_mode = "propagate"
+
+  trace_statements {
+    context = "resource"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  trace_statements {
+    context = "scope"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  trace_statements {
+    context = "span"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  trace_statements {
+    context = "spanevent"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  metric_statements {
+    context = "resource"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  metric_statements {
+    context = "scope"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  metric_statements {
+    context = "datapoint"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  log_statements {
+    context = "resource"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  log_statements {
+    context = "scope"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+    ]
+  }
+
+  log_statements {
+    context = "log"
+    statements = [
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
+      `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:http\\.client_ip|url\\.query|http\\.target|requester_ip_address|(?:.*\\.)?(?:email|e_mail|e-mail))$")`,
+      `delete_matching_keys(body, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.user_api_key_.*)$") where IsMap(body)`,
+      // Arbitrarily nested maps cannot be recursively proven safe in OTTL.
+      // Preserve severity/timestamps/attributes, but fail closed on the body.
+      `set(body, "<redacted-structured-log-body>") where IsMap(body)`,
+      `replace_pattern(body, "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(body)`,
+      `replace_pattern(body, "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(body)`,
+      `replace_pattern(body, "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(body)`,
+    ]
+  }
+
+  output {
+    traces  = [otelcol.processor.batch.default.input]
+    logs    = [otelcol.processor.batch.default.input]
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+// END AIGW MANAGED SENSITIVE ATTRIBUTE FILTER
 
 otelcol.processor.batch "default" {
   timeout             = "1s"
@@ -116,6 +262,39 @@ loki.write "local" {
   }
 }
 
+// Persistent exporter queues survive Alloy restarts and endpoint outages.
+// queue_size remains byte-bounded at each exporter; fsync trades a small
+// amount of throughput for a durable customer audit trail.
+otelcol.storage.file "tempo_queue" {
+  directory             = "/var/lib/alloy/queues/tempo"
+  directory_permissions = "0700"
+  fsync                  = true
+  timeout                = "5s"
+
+  compaction {
+    cleanup_on_start              = true
+    on_start                      = true
+    on_rebound                    = true
+    rebound_needed_threshold_mib  = 32
+    rebound_trigger_threshold_mib = 8
+  }
+}
+
+otelcol.storage.file "cribl_queue" {
+  directory             = "/var/lib/alloy/queues/cribl"
+  directory_permissions = "0700"
+  fsync                  = true
+  timeout                = "5s"
+
+  compaction {
+    cleanup_on_start              = true
+    on_start                      = true
+    on_rebound                    = true
+    rebound_needed_threshold_mib  = 64
+    rebound_trigger_threshold_mib = 16
+  }
+}
+
 // Local trace store. Plaintext is acceptable only on isolated net-traces;
 // Tempo's OTLP receiver is bound to its fixed address on that bridge.
 otelcol.exporter.otlp "tempo" {
@@ -129,12 +308,13 @@ otelcol.exporter.otlp "tempo" {
     queue_size        = 33554432
     sizer             = "bytes"
     block_on_overflow = false
+    storage           = otelcol.storage.file.tempo_queue.handler
   }
   retry_on_failure {
     enabled          = true
     initial_interval = "1s"
     max_interval     = "10s"
-    max_elapsed_time = "1m"
+    max_elapsed_time = "0s"
   }
 }
 
@@ -160,12 +340,13 @@ otelcol.exporter.otlp "cribl" {
     queue_size        = 67108864
     sizer             = "bytes"
     block_on_overflow = false
+    storage           = otelcol.storage.file.cribl_queue.handler
   }
   retry_on_failure {
     enabled          = true
     initial_interval = "1s"
     max_interval     = "30s"
-    max_elapsed_time = "5m"
+    max_elapsed_time = "0s"
   }
 }
 
@@ -210,7 +391,11 @@ loki.process "docker" {
   // a different data class: redact credential-shaped fields and vendor keys if
   // a dependency ever prints them during an error path.
   stage.replace {
-    expression = `(?i)("?(?:api[_-]?key|client[_-]?secret|password|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*["']?)[^"'\s,}]{8,}`
+    expression = `(?i)("?(?:api[_-]?key|client[_-]?secret|password|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*["']?(?:(?:bearer|basic)\s+)?)[^"'\s,}]{8,}`
+    replace    = `${1}<redacted>`
+  }
+  stage.replace {
+    expression = `(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/-]{8,}`
     replace    = `${1}<redacted>`
   }
   stage.replace {

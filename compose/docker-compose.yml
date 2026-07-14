@@ -73,6 +73,15 @@ services:
     user: "0:0"
     network_mode: none
     restart: "no"
+    # The one-shot intentionally does not inherit x-hardening because its
+    # restart/capability contract differs. Keep the same bounded/log-routing
+    # metadata as long-running services so Alloy assigns an exact service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+        labels: "com.docker.compose.project,com.docker.compose.service"
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
@@ -1100,6 +1109,8 @@ services:
       - run
       - /etc/alloy/config.alloy
       - --storage.path=/var/lib/alloy
+      - --stability.level=public-preview
+      - --disable-reporting
       - --server.http.listen-addr=${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}:12345
     environment:
       ALLOY_TELEMETRY_IP: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}
@@ -1177,6 +1188,11 @@ services:
     networks:
       net-observability:
         ipv4_address: ${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}
+        # Prometheus is also attached to net-metrics. Its ordinary service
+        # name is therefore ambiguous from inside the container itself and
+        # can resolve to the non-listening metrics-plane address. Self-scrape
+        # through an alias that exists only on the observability plane.
+        aliases: [prometheus-observability]
       net-metrics: {}
     healthcheck:
       test:
@@ -1320,7 +1336,12 @@ services:
         BASE_IMAGE: dhi.io/grafana:12.4.5@sha256:bf28b93e5f122d0d93574f865df15ba01ca630e91e9af1138c4bfd3461e8619e
     image: ai-gateway/dhi-grafana:12.4.5-probe
     read_only: true
-    tmpfs: [/tmp:mode=1777]
+    # Grafana probes its plugin path even when installation is disabled. Keep
+    # that path writable but ephemeral and non-executable: this deployment
+    # permits only the datasource/panel plugins built into the pinned image.
+    tmpfs:
+      - /tmp:mode=1777
+      - /var/lib/grafana/plugins:uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev
     deploy:
       resources:
         limits: { memory: 512M, cpus: "1.0", pids: 512 }
@@ -1344,8 +1365,20 @@ services:
       GF_AUTH_BASIC_ENABLED: "false"
       GF_SECURITY_COOKIE_SECURE: "true"
       GF_SECURITY_COOKIE_SAMESITE: strict
-      # DHI stays deterministic/offline: do not install background plugins.
+      # Land authenticated operators on the provisioned live overview instead
+      # of Grafana's empty built-in welcome page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/json/ai-gateway-overview.json
+      # DHI stays deterministic/offline. Grafana 12's built-in app preinstall
+      # list remains active even when the explicit list is empty, so disable
+      # that mechanism and every online update/signature lookup. The built-in
+      # Prometheus, Loki, and Tempo datasources require no downloaded plugin.
       GF_PLUGINS_PREINSTALL: ""
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro,Z
       - grafana_data:/var/lib/grafana

@@ -119,7 +119,13 @@ for relative in (
     "traefik/traefik-adm.yml",
     "traefik/dynamic-int.yml",
     "traefik/dynamic-adm.yml",
+    "grafana/provisioning/alerting/empty.yml",
+    "grafana/provisioning/dashboards/dashboards.yml",
+    "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
+    "grafana/provisioning/dashboards/json/ai-gateway-overview.json",
+    "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
     "grafana/provisioning/datasources/datasources.yml",
+    "grafana/provisioning/plugins/empty.yml",
 ):
     path = root / relative
     assert path.is_file() and not path.is_symlink(), relative
@@ -128,7 +134,11 @@ for relative in (
     "traefik",
     "grafana",
     "grafana/provisioning",
+    "grafana/provisioning/alerting",
+    "grafana/provisioning/dashboards",
+    "grafana/provisioning/dashboards/json",
     "grafana/provisioning/datasources",
+    "grafana/provisioning/plugins",
 ):
     path = root / relative
     assert path.is_dir() and not path.is_symlink(), relative
@@ -954,6 +964,14 @@ assert openwebui_mounts["/app/backend/data"] == {
     "volume": {},
 }
 volume_init = services["volume-init"]
+assert volume_init["logging"] == {
+    "driver": "json-file",
+    "options": {
+        "max-size": "20m",
+        "max-file": "5",
+        "labels": "com.docker.compose.project,com.docker.compose.service",
+    },
+}
 volume_init_mounts = {mount["target"]: mount for mount in volume_init["volumes"]}
 assert volume_init_mounts["/state/openwebui"] == {
     "type": "volume", "source": "openwebui_data", "target": "/state/openwebui",
@@ -1128,6 +1146,7 @@ volume_init = services["volume-init"]
 assert volume_init["network_mode"] == "none"
 assert sorted(volume_init["cap_add"]) == ["CHOWN", "FOWNER", "FSETID"]
 assert volume_init["cap_drop"] == ["ALL"]
+assert "/state/grafana/plugins" not in "\n".join(volume_init["command"])
 expected_dhi = {
     "oauth2-proxy", "oauth2-proxy-grafana", "oauth2-proxy-prometheus",
     "oauth2-proxy-vault", "keycloak", "vault", "postgres",
@@ -1139,10 +1158,26 @@ for name in expected_dhi:
     service = services[name]
     image = service["image"]
     assert image.startswith("dhi.io/") or image.startswith("ai-gateway/dhi-"), (name, image)
-assert services["grafana"]["environment"]["GF_PLUGINS_PREINSTALL"] == ""
-assert services["grafana"]["environment"]["GF_AUTH_PROXY_WHITELIST"] == "172.28.6.3"
-assert services["grafana"]["environment"]["GF_AUTH_BASIC_ENABLED"] == "false"
-assert services["grafana"]["environment"]["GF_AUTH_DISABLE_LOGIN_FORM"] == "true"
+grafana = services["grafana"]
+assert grafana["environment"]["GF_PLUGINS_PREINSTALL"] == ""
+assert grafana["environment"]["GF_AUTH_PROXY_WHITELIST"] == "172.28.6.3"
+assert grafana["environment"]["GF_AUTH_BASIC_ENABLED"] == "false"
+assert grafana["environment"]["GF_AUTH_DISABLE_LOGIN_FORM"] == "true"
+grafana_tmpfs = {
+    entry.split(":", 1)[0]: set(entry.split(":", 1)[1].split(","))
+    for entry in grafana["tmpfs"]
+}
+assert len(grafana["tmpfs"]) == len(grafana_tmpfs) == 2
+assert set(grafana_tmpfs) == {"/tmp", "/var/lib/grafana/plugins"}
+for path, expected_options in {
+    "/tmp": {"mode=1777"},
+    "/var/lib/grafana/plugins": {
+        "uid=65532", "gid=65532", "mode=0700", "noexec", "nosuid", "nodev",
+    },
+}.items():
+    # Compose v5 preserves short-syntax options, while v2 may materialize the
+    # implicit writable mode. Accept only those two canonical renderings.
+    assert grafana_tmpfs[path] in (expected_options, expected_options | {"rw"})
 assert services["oauth2-proxy-grafana"]["networks"]["net-grafana"]["ipv4_address"] == "172.28.6.3"
 assert services["key-rotator"]["environment"]["KEYCLOAK_PUBLIC_URL"] == "https://auth.aigw.internal"
 assert services["key-rotator"]["environment"]["WIF_KEYCLOAK_PUBLIC_URL"] == "https://idp.wif-a.example.invalid"
@@ -1309,6 +1344,20 @@ node_exporter_bind = node_exporter_root["bind"]
 assert set(node_exporter_bind) <= {"propagation", "create_host_path"}
 assert node_exporter_bind["propagation"] == "rslave"
 assert node_exporter_bind.get("create_host_path") in (None, True)
+grafana = config["services"]["grafana"]
+grafana_tmpfs = {
+    entry.split(":", 1)[0]: set(entry.split(":", 1)[1].split(","))
+    for entry in grafana["tmpfs"]
+}
+assert len(grafana["tmpfs"]) == len(grafana_tmpfs) == 2
+assert set(grafana_tmpfs) == {"/tmp", "/var/lib/grafana/plugins"}
+for path, expected_options in {
+    "/tmp": {"mode=1777"},
+    "/var/lib/grafana/plugins": {
+        "uid=65532", "gid=65532", "mode=0700", "noexec", "nosuid", "nodev",
+    },
+}.items():
+    assert grafana_tmpfs[path] in (expected_options, expected_options | {"rw"})
 for name, service in config["services"].items():
     if name != "volume-init":
         assert service.get("labels", {}).get(
@@ -1426,19 +1475,21 @@ assert 'context = "span"' in correlation
 assert text.count(
     'traces  = [otelcol.processor.transform.aigw_correlation.input]'
 ) == 1
-assert text.count('traces = [otelcol.processor.batch.default.input]') == 1
+assert text.count('traces  = [otelcol.processor.batch.default.input]') == 1
 for canonical, source in (
     ('aigw.user.id', 'metadata.user_api_key_user_id'),
     ('aigw.api_key.id', 'metadata.user_api_key_hash'),
-    ('aigw.api_key.alias', 'metadata.user_api_key_alias'),
     ('aigw.request.id', 'litellm.call_id'),
-    ('aigw.project.id', 'metadata.user_api_key_auth_metadata'),
+    ('aigw.project.id', 'metadata.user_api_key_project_id'),
 ):
     assert canonical in correlation
     assert source in correlation
 assert correlation.count('resource.attributes["service.name"] == "litellm"') == 5
 assert correlation.count('name == "litellm_request"') == 5
 assert '^[0-9a-f]{64}$' in correlation
+assert 'aigw.api_key.alias' not in correlation
+assert 'metadata.user_api_key_auth_metadata' in correlation
+assert 'attributes["aigw.project.id"] == nil' in correlation
 assert '(?P<project>[a-z0-9][a-z0-9_.-]{0,63})' in correlation
 for forbidden in ('gen_ai.request.id', 'llm.user', 'authorization', 'access_token'):
     assert forbidden not in correlation

@@ -263,7 +263,11 @@
     - cribl-mock
     - grafana
     - grafana/provisioning
+    - grafana/provisioning/alerting
+    - grafana/provisioning/dashboards
+    - grafana/provisioning/dashboards/json
     - grafana/provisioning/datasources
+    - grafana/provisioning/plugins
     - litellm
     - loki
     - postgres/init
@@ -271,6 +275,30 @@
     - traefik
     - tempo
     - vault
+
+- name: Find existing Grafana dashboard artifacts
+  ansible.builtin.find:
+    paths: "{{ stack_dir }}/grafana/provisioning/dashboards/json"
+    recurse: false
+    hidden: true
+    file_type: any
+  register: aigw_existing_grafana_dashboard_artifacts
+
+- name: Remove unmanaged Grafana dashboard artifacts
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ aigw_existing_grafana_dashboard_artifacts.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when: >-
+    (not (item.isreg | default(false) | bool)) or
+    ((item.path | basename) not in
+      [
+        'ai-gateway-live-logs.json',
+        'ai-gateway-overview.json',
+        'ai-gateway-request-audit.json'
+      ])
 
 - name: Sync allow-listed compose configuration files
   ansible.builtin.copy:
@@ -289,7 +317,13 @@
     - docker-compose.lab.yml
     - alloy/config.alloy
     - cribl-mock/config.yaml
+    - grafana/provisioning/alerting/empty.yml
+    - grafana/provisioning/dashboards/dashboards.yml
+    - grafana/provisioning/dashboards/json/ai-gateway-live-logs.json
+    - grafana/provisioning/dashboards/json/ai-gateway-overview.json
+    - grafana/provisioning/dashboards/json/ai-gateway-request-audit.json
     - grafana/provisioning/datasources/datasources.yml
+    - grafana/provisioning/plugins/empty.yml
     - litellm/config.yaml
     - loki/config.yml
     - postgres/init/01-init-databases.sh

@@ -1,0 +1,211 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "ADM-only request audit. Select a trace to inspect its UTC timestamp, opaque user ID, project ID, nonreversible API-key fingerprint, request ID, and retained prompt/completion attributes together.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "AI Gateway Overview",
+      "type": "link",
+      "url": "/d/aigw-overview/ai-gateway-overview"
+    },
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "AI Gateway Live Logs",
+      "type": "link",
+      "url": "/d/aigw-live-logs/ai-gateway-live-logs"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "code": {
+          "language": "plaintext",
+          "showLineNumbers": false,
+          "showMiniMap": false
+        },
+        "content": "### Request audit contract\nOpen a matching trace and select the `litellm_request` span. The same span contains its UTC start time, `aigw.user.id`, `aigw.project.id`, `aigw.api_key.id` (SHA-256 fingerprint only), `aigw.request.id`, and the approved `gen_ai.input.messages` / `gen_ai.output.messages` content. Raw authorization, API keys, request headers, email, IP, and unfiltered LiteLLM auth metadata are removed before Tempo or Cribl export. Prompt content is sensitive and this dashboard is intentionally ADM-only.",
+        "mode": "markdown"
+      },
+      "pluginVersion": "12.4.5",
+      "title": "How to inspect a request",
+      "type": "text"
+    },
+    {
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "id": 2,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "12.4.5",
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "limit": 100,
+          "query": "{ span:name = \"litellm_request\" && span.aigw.user.id != nil && span.aigw.project.id != nil && span.aigw.api_key.id != nil } | select(span.aigw.user.id, span.aigw.project.id, span.aigw.api_key.id, span.aigw.request.id, span.gen_ai.input.messages, span.gen_ai.output.messages) with (most_recent=true)",
+          "queryType": "traceql",
+          "refId": "A",
+          "spanLimit": 20,
+          "tableType": "spans"
+        }
+      ],
+      "title": "Fully Correlated AI Requests",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 3,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "12.4.5",
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "limit": 100,
+          "query": "{ span:name = \"litellm_request\" && (span.aigw.user.id = nil || span.aigw.project.id = nil || span.aigw.api_key.id = nil) } with (most_recent=true)",
+          "queryType": "traceql",
+          "refId": "A",
+          "spanLimit": 20,
+          "tableType": "spans"
+        }
+      ],
+      "title": "Requests Missing Required Correlation",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 16,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "id": 4,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "12.4.5",
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "limit": 100,
+          "query": "{ resource.service.name = \"litellm\" && span:name = \"litellm_request\" } with (most_recent=true)",
+          "queryType": "traceql",
+          "refId": "A",
+          "spanLimit": 20,
+          "tableType": "spans"
+        }
+      ],
+      "title": "All AI Request Traces",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": [
+    "ai-gateway",
+    "audit",
+    "traces",
+    "provisioned"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "AI Gateway Request Audit",
+  "uid": "aigw-request-audit",
+  "version": 1,
+  "weekStart": ""
+}

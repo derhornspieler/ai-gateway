@@ -1,6 +1,7 @@
 # Prometheus scrape config — solution-map §1.8.
-# node_exporter/cAdvisor/postgres_exporter/redis_exporter land in the
-# hardening pass (test-runbook "next steps").
+# Only endpoints reachable on the dedicated metrics/observability planes are
+# scraped. Data services stay isolated until a least-privilege exporter can be
+# added without exposing their native administration protocols.
 global:
   scrape_interval: 15s
 
@@ -34,9 +35,23 @@ scrape_configs:
     static_configs:
       - targets: ["tempo:3200"]
 
+  - job_name: prometheus
+    static_configs:
+      # Prometheus binds only its fixed net-observability address, so use its
+      # observability-only alias instead of its ambiguous dual-plane service
+      # name or loopback for the self-scrape.
+      - targets: ["prometheus-observability:9090"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
   - job_name: node-exporter
     static_configs:
       - targets: ["node-exporter:9100"]
 
-  # Vault telemetry requires either a token or unauthenticated_metrics_access;
-  # wire in the hardening pass with a scrape token from the bootstrap script.
+  # Vault telemetry requires either a scoped scrape token or
+  # unauthenticated_metrics_access. Vault is intentionally absent from both
+  # Prometheus networks, so do not weaken that boundary merely to add a target.
+  # PostgreSQL and Redis likewise need dedicated exporters; LiteLLM exposes no
+  # reviewed unauthenticated private metrics endpoint in this deployment.

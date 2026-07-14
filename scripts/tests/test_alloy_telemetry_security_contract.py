@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import json
+import re
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+ALLOY = ROOT / "compose/alloy/config.alloy"
+COMPOSE = ROOT / "compose/docker-compose.yml"
+
+
+def managed(text: str, label: str) -> str:
+    begin = f"// BEGIN AIGW MANAGED {label}"
+    end = f"// END AIGW MANAGED {label}"
+    if text.count(begin) != 1 or text.count(end) != 1:
+        raise AssertionError(f"invalid managed block: {label}")
+    return text.split(begin, 1)[1].split(end, 1)[0]
+
+
+def deletion_patterns(sanitizer: str) -> list[re.Pattern[str]]:
+    encoded = re.findall(
+        r'delete_matching_keys\(attributes, "((?:\\.|[^"\\])*)"\)',
+        sanitizer,
+    )
+    # Alloy raw strings still contain an OTTL double-quoted string. JSON
+    # decoding mirrors the OTTL string escape layer before Python evaluates
+    # the same RE2-compatible expressions against representative keys.
+    return [re.compile(json.loads(f'"{value}"')) for value in dict.fromkeys(encoded)]
+
+
+class AlloyTelemetrySecurityContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.alloy = ALLOY.read_text(encoding="utf-8")
+        cls.compose = COMPOSE.read_text(encoding="utf-8")
+        cls.correlation = managed(cls.alloy, "TRACE CORRELATION")
+        cls.sanitizer = managed(cls.alloy, "SENSITIVE ATTRIBUTE FILTER")
+        cls.patterns = deletion_patterns(cls.sanitizer)
+
+    def test_only_server_authenticated_identity_is_promoted(self) -> None:
+        expected = {
+            "aigw.user.id": "metadata.user_api_key_user_id",
+            "aigw.api_key.id": "metadata.user_api_key_hash",
+            "aigw.request.id": "litellm.call_id",
+            "aigw.project.id": "metadata.user_api_key_project_id",
+        }
+        for canonical, source in expected.items():
+            self.assertIn(f'attributes["{canonical}"]', self.correlation)
+            self.assertIn(f'attributes["{source}"]', self.correlation)
+
+        # LiteLLM OSS 1.91.3 cannot create native projects. Portal keys carry
+        # the project in server-issued auth metadata, so that narrow fallback
+        # remains until project management is available, but can never
+        # overwrite a future native project_id.
+        self.assertIn("metadata.user_api_key_auth_metadata", self.correlation)
+        self.assertIn('attributes["aigw.project.id"] == nil', self.correlation)
+        self.assertIn("^[0-9a-f]{64}$", self.correlation)
+        self.assertNotIn("aigw.api_key.alias", self.correlation)
+        self.assertNotIn("llm.user", self.correlation)
+
+    def test_every_otlp_signal_is_sanitized_before_batch_and_export(self) -> None:
+        memory = self.alloy.split(
+            'otelcol.processor.memory_limiter "default"', 1
+        )[1].split("// Promote only", 1)[0]
+        self.assertIn(
+            "traces  = [otelcol.processor.transform.aigw_correlation.input]",
+            memory,
+        )
+        for signal in ("logs", "metrics"):
+            self.assertIn(
+                f"{signal}    = [otelcol.processor.transform.aigw_sensitive_attributes.input]"
+                if signal == "logs"
+                else f"{signal} = [otelcol.processor.transform.aigw_sensitive_attributes.input]",
+                memory,
+            )
+        self.assertIn(
+            "traces = [otelcol.processor.transform.aigw_sensitive_attributes.input]",
+            self.correlation,
+        )
+        for context in ('context = "span"', 'context = "spanevent"', 'context = "datapoint"', 'context = "log"'):
+            self.assertIn(context, self.sanitizer)
+        self.assertEqual(self.sanitizer.count('context = "resource"'), 3)
+        self.assertEqual(self.sanitizer.count('context = "scope"'), 3)
+        self.assertIn('error_mode = "propagate"', self.sanitizer)
+        self.assertNotIn('error_mode = "ignore"', self.sanitizer)
+        for signal in ("traces", "logs", "metrics"):
+            self.assertRegex(
+                self.sanitizer,
+                rf"{signal}\s+= \[otelcol\.processor\.batch\.default\.input\]",
+            )
+
+    def test_sensitive_attributes_are_deleted_and_required_content_is_retained(self) -> None:
+        sensitive = (
+            "authorization",
+            "api_key",
+            "x-api-key",
+            "access_token",
+            "client_secret",
+            "password",
+            "headers",
+            "hidden_params",
+            "proxy_server_request",
+            "metadata.user_api_key_hash",
+            "metadata.user_api_key_alias",
+            "metadata.user_api_key_user_id",
+            "metadata.user_api_key_project_id",
+            "metadata.user_api_key_auth_metadata",
+            "metadata.user_api_key_user_email",
+            "metadata.requester_ip_address",
+            "metadata.requester_metadata",
+            "requester_metadata",
+            "http.request.header.authorization",
+            "http.request.header.x-forwarded-for",
+            "http.response.header.set-cookie",
+            "client.address",
+            "network.peer.address",
+            "net.peer.ip",
+            "http.client_ip",
+            "url.query",
+            "enduser.email",
+        )
+        for key in sensitive:
+            self.assertTrue(
+                any(pattern.search(key) for pattern in self.patterns),
+                f"sensitive attribute is not removed: {key}",
+            )
+
+        retained = (
+            "aigw.user.id",
+            "aigw.project.id",
+            "aigw.api_key.id",
+            "aigw.request.id",
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+            "gen_ai.prompt.0.content",
+            "gen_ai.completion.0.content",
+            "gen_ai.request.model",
+            "gen_ai.usage.input_tokens",
+            "http.response.status_code",
+        )
+        for key in retained:
+            self.assertFalse(
+                any(pattern.search(key) for pattern in self.patterns),
+                f"required attribute would be removed: {key}",
+            )
+
+        for body_contract in (
+            'delete_matching_keys(body,',
+            '<redacted-structured-log-body>',
+            '<redacted-credential>',
+            '<redacted-authorization>',
+            '<redacted-vendor-key>',
+            'where IsMap(body)',
+            'where IsString(body)',
+        ):
+            self.assertIn(body_contract, self.sanitizer)
+
+        docker_logs = self.alloy.split('loki.process "docker"', 1)[1].split(
+            'loki.process "external_file_logs"', 1
+        )[0]
+        self.assertIn('(?:(?:bearer|basic)\\s+)?', docker_logs)
+        self.assertIn('((?:bearer|basic)\\s+)', docker_logs)
+
+    def test_tempo_and_cribl_queues_are_durable_bounded_and_independent(self) -> None:
+        for label, directory, size in (
+            ("tempo", "/var/lib/alloy/queues/tempo", 33554432),
+            ("cribl", "/var/lib/alloy/queues/cribl", 67108864),
+        ):
+            storage = self.alloy.split(
+                f'otelcol.storage.file "{label}_queue"', 1
+            )[1].split("}\n\n", 1)[0]
+            self.assertIn(f'directory             = "{directory}"', storage)
+            self.assertIn("fsync                  = true", storage)
+            self.assertIn("on_start                      = true", storage)
+            self.assertIn("on_rebound                    = true", storage)
+
+            exporter = self.alloy.split(
+                f'otelcol.exporter.otlp "{label}"', 1
+            )[1].split("\n}\n", 1)[0]
+            self.assertIn(f"queue_size        = {size}", exporter)
+            self.assertIn('sizer             = "bytes"', exporter)
+            self.assertIn(
+                f"storage           = otelcol.storage.file.{label}_queue.handler",
+                exporter,
+            )
+            self.assertIn('max_elapsed_time = "0s"', exporter)
+
+        alloy_service = self.compose.split("  alloy:\n", 1)[1].split(
+            "  loki:\n", 1
+        )[0]
+        self.assertIn("- alloy_data:/var/lib/alloy", alloy_service)
+        self.assertIn("- --stability.level=public-preview", alloy_service)
+        self.assertIn("- --disable-reporting", alloy_service)
+
+
+if __name__ == "__main__":
+    unittest.main()

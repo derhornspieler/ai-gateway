@@ -1,4 +1,119 @@
 groups:
+  - name: aigw-observability-pipeline
+    rules:
+      - alert: AIGatewayScrapeTargetDown
+        expr: up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Prometheus target {{ $labels.job }} is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }} for job {{ $labels.job }}."
+
+      - alert: AIGatewayAlloyExporterSendFailures
+        expr: >-
+          sum by (component_id, exporter, data_type) (
+            label_replace(
+              increase(otelcol_exporter_send_failed_spans_total{
+                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}[2m]),
+              "data_type", "traces", "component_id", ".+"
+            ) or label_replace(
+              increase(otelcol_exporter_send_failed_log_records_total{
+                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}[2m]),
+              "data_type", "logs", "component_id", ".+"
+            ) or label_replace(
+              increase(otelcol_exporter_send_failed_metric_points_total{
+                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}[2m]),
+              "data_type", "metrics", "component_id", ".+"
+            )
+          ) > 0
+        # One transient retry must not page. Requiring a non-zero two-minute
+        # window continuously for five minutes detects a sustained outage.
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Alloy OTLP exporter is failing to send telemetry"
+          description: "Exporter {{ $labels.component_id }} has sustained failed {{ $labels.data_type }} sends; its persistent queue is retaining data for retry."
+
+      - alert: AIGatewayAlloyExporterEnqueueFailures
+        expr: >-
+          sum by (component_id, exporter, data_type) (
+            label_replace(
+              otelcol_exporter_enqueue_failed_spans_total{
+                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"},
+              "data_type", "traces", "component_id", ".+"
+            ) or label_replace(
+              otelcol_exporter_enqueue_failed_log_records_total{
+                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"},
+              "data_type", "logs", "component_id", ".+"
+            ) or label_replace(
+              otelcol_exporter_enqueue_failed_metric_points_total{
+                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"},
+              "data_type", "metrics", "component_id", ".+"
+            )
+          ) > 0
+        # block_on_overflow=false protects collector availability, but a full
+        # queue then rejects new telemetry. Latch the cumulative loss signal
+        # until Alloy restarts: a range increase can miss the first failure
+        # when its labeled counter series is first created at a non-zero value.
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "Alloy OTLP exporter rejected telemetry at its queue"
+          description: "Exporter {{ $labels.component_id }} could not enqueue {{ $labels.data_type }} telemetry; audit data was lost before export."
+
+      - alert: AIGatewayAlloyExporterQueueSaturation
+        expr: >-
+          (otelcol_exporter_queue_size{job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}
+          / otelcol_exporter_queue_capacity{job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}) > 0.80
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Alloy OTLP exporter queue is over 80% full"
+          description: "Exporter {{ $labels.component_id }} {{ $labels.data_type }} queue is close to exhaustion."
+
+      - alert: AIGatewayLokiWriteDrops
+        expr: increase(loki_write_dropped_entries_total{job="alloy"}[5m]) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Alloy permanently dropped Loki log entries"
+          description: "Loki writer dropped entries after retries (reason={{ $labels.reason }})."
+
+      - alert: AIGatewayLokiWriteRetriesHigh
+        expr: increase(loki_write_batch_retries_total{job="alloy"}[5m]) >= 3
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Alloy is repeatedly retrying Loki writes"
+          description: "The Loki writer retried at least three batches in five minutes."
+
+      - alert: AIGatewayTempoRefusedSpans
+        expr: increase(tempo_receiver_refused_spans{job="tempo"}[5m]) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Tempo refused incoming spans"
+          description: "Tempo receiver {{ $labels.receiver }} refused spans over {{ $labels.transport }}."
+
+      - alert: AIGatewayPrometheusRemoteWriteFailures
+        expr: >-
+          increase(prometheus_remote_storage_samples_failed_total{job="alloy"}[5m]) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Alloy remote-write samples failed permanently"
+          description: "Remote write {{ $labels.remote_name }} could not deliver samples to Prometheus."
+
+      - alert: AIGatewayPrometheusRemoteWriteBacklog
+        expr: >-
+          prometheus_remote_storage_samples_pending{job="alloy"}
+          > 2 * prometheus_remote_storage_max_samples_per_send{job="alloy"}
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Alloy remote-write queue has a sustained backlog"
+          description: "Remote write {{ $labels.remote_name }} has more than two full batches pending."
+
   - name: aigw-state-capacity
     rules:
       - alert: AIGatewayFilesystemSpaceLow

@@ -347,6 +347,7 @@
 
             expected_user = {
                 "alloy": "473:473",
+                "grafana": "65532",
                 "node-exporter": "65532:65532",
                 "open-webui": "65532:65532",
             }.get(service)
@@ -419,6 +420,47 @@
                 }
                 if any(environment.get(key) != value for key, value in required_environment.items()):
                     raise SystemExit("open-webui: hardened runtime environment contract drift")
+            if service == "grafana":
+                if host.get("ReadonlyRootfs") is not True:
+                    raise SystemExit("grafana: read-only root filesystem is required")
+                tmpfs = host.get("Tmpfs") or {}
+                plugin_options = set(
+                    (tmpfs.get("/var/lib/grafana/plugins") or "").split(",")
+                )
+                required_plugin_options = {
+                    "rw",
+                    "noexec",
+                    "nosuid",
+                    "nodev",
+                    "uid=65532",
+                    "gid=65532",
+                    "mode=0700",
+                }
+                if not required_plugin_options <= plugin_options:
+                    raise SystemExit(
+                        "grafana: hardened ephemeral plugin tmpfs contract is missing"
+                    )
+                mounts = normalized_container_mounts(container)
+                if mounts is None:
+                    raise SystemExit("grafana: malformed Docker mount metadata")
+                plugin_mounts = [
+                    mount
+                    for mount in mounts
+                    if mount.get("Type") == "tmpfs"
+                    and mount.get("Destination") == "/var/lib/grafana/plugins"
+                ]
+                data_volumes = [
+                    mount
+                    for mount in mounts
+                    if mount.get("Type") == "volume"
+                    and mount.get("Name") == f"{project}_grafana_data"
+                    and mount.get("Destination") == "/var/lib/grafana"
+                    and mount.get("RW") is True
+                ]
+                if len(plugin_mounts) != 1 or len(data_volumes) != 1:
+                    raise SystemExit(
+                        "grafana: exact ephemeral plugin and persistent data mounts are required"
+                    )
 
             status = {}
             for line in Path(f"/proc/{pid}/status").read_text().splitlines():
@@ -429,6 +471,7 @@
                 raise SystemExit(f"{service}: live NNP/seccomp contract drift")
             expected_uid = {
                 "alloy": "473",
+                "grafana": "65532",
                 "node-exporter": "65532",
                 "open-webui": "65532",
             }.get(service)
@@ -1266,8 +1309,18 @@
             "traefik/dynamic-adm.yml": ("file", 0, 0, 0o644),
             "grafana": ("dir", 0, 0, 0o755),
             "grafana/provisioning": ("dir", 0, 0, 0o755),
+            "grafana/provisioning/alerting": ("dir", 0, 0, 0o755),
+            "grafana/provisioning/alerting/empty.yml": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards": ("dir", 0, 0, 0o755),
+            "grafana/provisioning/dashboards/json": ("dir", 0, 0, 0o755),
+            "grafana/provisioning/dashboards/dashboards.yml": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/ai-gateway-overview.json": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/datasources": ("dir", 0, 0, 0o755),
             "grafana/provisioning/datasources/datasources.yml": ("file", 0, 0, 0o644),
+            "grafana/provisioning/plugins": ("dir", 0, 0, 0o755),
+            "grafana/provisioning/plugins/empty.yml": ("file", 0, 0, 0o644),
             "keycloak/realms": ("dir", 0, 65532, 0o750),
             "keycloak/realms/aigw-realm.json": ("file", 0, 65532, 0o640),
             "keycloak/realms/anthropic-wif-realm.json": ("file", 0, 65532, 0o640),
@@ -1409,7 +1462,7 @@
     label: "{{ item.hostname }}{{ item.path }} -> {{ item.status }}"
   changed_when: false
 
-- name: Prove Grafana loaded the exact provisioned datasource graph without a local-login bypass
+- name: Prove Grafana loaded the exact provisioned observability graph without a local-login bypass
   ansible.builtin.command:
     argv:
       - docker
@@ -1438,6 +1491,8 @@
       - -I
       - -c
       - |
+        import json
+        import re
         import sqlite3
         import urllib.request
 
@@ -1454,6 +1509,95 @@
         }
         if actual != expected:
             raise SystemExit("Grafana datasource graph does not match the reviewed provisioning")
+        # Grafana 12 file provisioning writes dashboards to unified storage;
+        # the legacy dashboard/dashboard_provisioning tables remain empty.
+        # Parse the stored resource JSON in Python so verification does not
+        # depend on optional SQLite JSON extensions.
+        resources = list(
+            database.execute(
+                """
+                SELECT "group", resource, namespace, name, folder, action, value
+                FROM resource
+                WHERE namespace = 'default' AND (
+                    ("group" = 'dashboard.grafana.app' AND resource = 'dashboards') OR
+                    ("group" = 'folder.grafana.app' AND resource = 'folders' AND name = 'aigw')
+                )
+                ORDER BY "group", resource, name
+                """
+            )
+        )
+        if len(resources) != 4:
+            raise SystemExit("Grafana unified-storage resource inventory is not exact")
+
+        expected_dashboards = {
+            "aigw-live-logs": (
+                "AI Gateway Live Logs",
+                "/etc/grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
+            ),
+            "aigw-overview": (
+                "AI Gateway Overview",
+                "/etc/grafana/provisioning/dashboards/json/ai-gateway-overview.json",
+            ),
+            "aigw-request-audit": (
+                "AI Gateway Request Audit",
+                "/etc/grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
+            ),
+        }
+        observed_dashboards = set()
+        observed_folder = False
+        for group, resource, namespace, name, folder, action, raw_value in resources:
+            try:
+                value = json.loads(raw_value)
+            except (TypeError, ValueError) as error:
+                raise SystemExit("Grafana unified-storage resource is not valid JSON") from error
+            metadata = value.get("metadata", {})
+            annotations = metadata.get("annotations", {})
+            if namespace != "default" or metadata.get("namespace") != "default" or action != 1:
+                raise SystemExit("Grafana unified-storage namespace/action contract drifted")
+            if annotations.get("grafana.app/managedBy") != "classic-file-provisioning":
+                raise SystemExit("Grafana resource is not owned by file provisioning")
+            if annotations.get("grafana.app/managerId") != "AI Gateway":
+                raise SystemExit("Grafana resource manager identity drifted")
+
+            if group == "folder.grafana.app":
+                if (
+                    resource != "folders"
+                    or name != "aigw"
+                    or folder != ""
+                    or value.get("kind") != "Folder"
+                    or value.get("apiVersion") != "folder.grafana.app/v1beta1"
+                    or metadata.get("name") != "aigw"
+                    or value.get("spec", {}).get("title") != "AI Gateway"
+                ):
+                    raise SystemExit("Grafana provisioned folder contract drifted")
+                observed_folder = True
+                continue
+
+            expected = expected_dashboards.get(name)
+            if expected is None:
+                raise SystemExit("Grafana contains an unreviewed provisioned dashboard")
+            title, source_path = expected
+            if (
+                group != "dashboard.grafana.app"
+                or resource != "dashboards"
+                or folder != "aigw"
+                or value.get("kind") != "Dashboard"
+                or value.get("apiVersion") != "dashboard.grafana.app/v0alpha1"
+                or metadata.get("name") != name
+                or annotations.get("grafana.app/folder") != "aigw"
+                or annotations.get("grafana.app/sourcePath") != source_path
+                or not re.fullmatch(
+                    r"[0-9a-f]{32}", annotations.get("grafana.app/sourceChecksum", "")
+                )
+                or value.get("spec", {}).get("title") != title
+            ):
+                raise SystemExit("Grafana provisioned dashboard contract drifted")
+            observed_dashboards.add(name)
+        if not observed_folder or observed_dashboards != set(expected_dashboards):
+            raise SystemExit("Grafana provisioned folder/dashboard graph is incomplete")
+        with urllib.request.urlopen("http://grafana:3000/api/health", timeout=10) as response:
+            if response.status != 200:
+                raise SystemExit("Grafana API is unhealthy")
         # Each exact provisioned backend must answer its application-native
         # readiness endpoint from Grafana's private observability plane.
         for url in (
@@ -1468,6 +1612,89 @@
   retries: 12
   delay: 5
   until: grafana_datasource_graph.rc == 0
+  changed_when: false
+
+- name: Prove Prometheus loaded the exact reviewed scrape and alert graph
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import sys
+        import urllib.request
+
+        base = f"http://{sys.argv[1]}:9090/api/v1"
+
+        def fetch(path):
+            with urllib.request.urlopen(base + path, timeout=10) as response:
+                payload = json.load(response)
+            if payload.get("status") != "success":
+                raise SystemExit(f"Prometheus API failed for {path}")
+            return payload["data"]
+
+        targets = fetch("/targets?state=active")["activeTargets"]
+        actual_targets = {
+            (target["labels"].get("job"), target["discoveredLabels"].get("__address__"))
+            for target in targets
+        }
+        expected_targets = {
+            ("traefik", "traefik-int:9100"),
+            ("traefik", "traefik-adm:9100"),
+            ("envoy-egress", "envoy-egress:9902"),
+            ("keycloak", "keycloak:9000"),
+            ("alloy", "alloy:12345"),
+            ("grafana", "grafana:3000"),
+            ("tempo", "tempo:3200"),
+            ("prometheus", "prometheus-observability:9090"),
+            ("loki", "loki:3100"),
+            ("node-exporter", "node-exporter:9100"),
+        }
+        if actual_targets != expected_targets or len(targets) != len(expected_targets):
+            raise SystemExit("Prometheus scrape target graph does not match reviewed source")
+        failed_targets = [
+            target for target in targets
+            if target.get("health") != "up" or target.get("lastError")
+        ]
+        if failed_targets:
+            raise SystemExit("one or more reviewed Prometheus targets is not cleanly up")
+
+        groups = fetch("/rules?type=alert")["groups"]
+        actual_rules = {
+            (group["name"], rule["name"])
+            for group in groups
+            for rule in group["rules"]
+        }
+        expected_rules = {
+            ("aigw-observability-pipeline", "AIGatewayScrapeTargetDown"),
+            ("aigw-observability-pipeline", "AIGatewayAlloyExporterSendFailures"),
+            ("aigw-observability-pipeline", "AIGatewayAlloyExporterEnqueueFailures"),
+            ("aigw-observability-pipeline", "AIGatewayAlloyExporterQueueSaturation"),
+            ("aigw-observability-pipeline", "AIGatewayLokiWriteDrops"),
+            ("aigw-observability-pipeline", "AIGatewayLokiWriteRetriesHigh"),
+            ("aigw-observability-pipeline", "AIGatewayTempoRefusedSpans"),
+            ("aigw-observability-pipeline", "AIGatewayPrometheusRemoteWriteFailures"),
+            ("aigw-observability-pipeline", "AIGatewayPrometheusRemoteWriteBacklog"),
+            ("aigw-state-capacity", "AIGatewayFilesystemSpaceLow"),
+            ("aigw-state-capacity", "AIGatewayFilesystemSpaceCritical"),
+            ("aigw-state-capacity", "AIGatewayFilesystemPredictedFull"),
+        }
+        if actual_rules != expected_rules:
+            raise SystemExit("Prometheus alert rule graph does not match reviewed source")
+        unhealthy_rules = [
+            rule
+            for group in groups
+            for rule in group["rules"]
+            if rule.get("health") != "ok"
+        ]
+        if unhealthy_rules:
+            raise SystemExit("one or more reviewed Prometheus rules failed evaluation")
+      - "{{ prometheus_observability_ip }}"
+  register: prometheus_observability_graph
+  retries: 12
+  delay: 5
+  until: prometheus_observability_graph.rc == 0
   changed_when: false
 
 - name: Prove Prometheus scraped the host filesystem through node-exporter
