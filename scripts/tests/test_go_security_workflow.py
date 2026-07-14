@@ -17,6 +17,12 @@ class GoSecurityWorkflowTests(unittest.TestCase):
         self.assertIn("run: go test -race ./...", WORKFLOW)
         self.assertIn("run: go vet ./...", WORKFLOW)
         self.assertIn("language: [python, go, actions]", CODEQL)
+        self.assertIn(
+            "matrix.language == 'go' && 'manual' || 'none'", CODEQL
+        )
+        self.assertIn(
+            "for module in dhi-health-probe egress-proxy vault-ui-proxy", CODEQL
+        )
 
     def test_final_dhi_images_have_an_explicit_fail_or_skip_contract(self) -> None:
         for image in ("dhi-health-probe", "egress-proxy", "vault-ui-proxy"):
