@@ -192,30 +192,78 @@ verification of everything it just did.
   the first run** — Vault (the secrets safe) starts empty and sealed on
   purpose. Continue to Part 7.
 
-## Part 7 — Initialize the secrets vault (10 minutes)
+## Part 7 — Initialize the secrets vault and hand its key to the controller (15 minutes)
 
-Log in to the VM (first time you actually need to) and run the bootstrap:
+Vault (the built-in secrets safe) starts empty and sealed. You now do three
+things in order: (7a) initialize Vault once on the VM, (7b) give the
+controller an encrypted copy of Vault's unlock key, and (7c) run the converge
+again so the automation can unlock Vault and finish.
+
+**Step 7a — Initialize Vault on the VM.** Log in to the VM (first time you
+actually need to) and run the bootstrap:
 
 ```bash
 ssh <ansible_user>@<vm>
 cd /opt/ai-gateway
-sudo scripts/vault-bootstrap.sh
+sudo AIGW_ALLOW_INSECURE_VAULT_BOOTSTRAP=I_UNDERSTAND_THIS_IS_LAB_ONLY \
+  scripts/vault-bootstrap.sh
 ```
 
 > **Important:** this is the built-in **lab/test** Vault ceremony — one
-> unseal key, no TLS on the internal listener. It is acceptable for a pilot;
-> a production deployment replaces it with the customer's reviewed Vault
-> ceremony (see [operations](operations.md)).
+> unseal key, no TLS on the internal listener. The acknowledgement variable is
+> required because this pilot uses the customer `generic-rocky9` profile, and
+> the script refuses to run on that profile without it. It is acceptable for a
+> pilot; a production deployment replaces this whole step with the customer's
+> reviewed Vault ceremony (see [operations](operations.md)), driven by the
+> [`production-rocky9.first-init.sh.example`](../ansible/inventory/examples/production-rocky9.first-init.sh.example)
+> sequence.
 
 The script initializes Vault, sets up the credential-rotation policies, and
 then waits (up to 10 minutes) for the entire service graph to become
-healthy. **You must securely store** the unseal key and root token it
-produces — print them to paper or a password manager, never a shared drive.
-Anyone with them controls the gateway's secrets; without the unseal key, a
-reboot leaves the system locked.
+healthy. It prints one **unseal key** (a 44-character string ending in `=`)
+and one **root token**. **Securely store both** — a password manager or paper,
+never a shared drive. Anyone with them controls the gateway's secrets.
 
-Back on the controller, run the converge from Part 6 **once more**. This
-time Vault is ready, so it waits for — and verifies — the complete system.
+**Step 7b — Give the controller an encrypted copy of the unseal key.** Back on
+the controller, store the unseal key in a dedicated encrypted file so the
+automation can unlock Vault on every later run. The command reads the key from
+your keyboard (it is never typed on the command line or saved in plain text)
+and writes only its encrypted form:
+
+```bash
+read -rsp 'Vault unseal key from Step 7a: ' AIGW_UNSEAL_SHARE; printf '\n'
+printf '%s\n' "$AIGW_UNSEAL_SHARE" | python3 scripts/store-vault-unseal-key.py \
+  --vault-file ansible/inventory/generated/mygateway/group_vars/generic_rocky9/vault-unseal.yml \
+  --vault-id mygateway \
+  --vault-password-file ~/.aigw-vault-pass
+unset AIGW_UNSEAL_SHARE
+```
+
+**You should see** `Stored and verified inline-encrypted vault_unseal_key`.
+The helper accepts exactly one valid share, never prints it, and refuses to
+overwrite an existing one.
+
+**Step 7c — Run the converge one more time.** Back on the controller, run the
+exact command from Part 6 again. Because Vault is now initialized, the
+automation **automatically unlocks it** using the encrypted key you just
+stored, then waits for and verifies the complete system.
+
+```bash
+ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
+  ansible/site.yml --limit mygateway \
+  --vault-id mygateway@~/.aigw-vault-pass
+```
+
+> If you skip Step 7b, this run **stops on purpose** with a message that an
+> initialized Vault needs `vault_unseal_key` from the controller — it refuses
+> to finish a half-unlocked system. Do Step 7b, then rerun.
+
+The whole 7a → 7b → 7c sequence is also captured, ready to copy, in
+[`rocky9-lab.first-init.sh.example`](../ansible/inventory/examples/rocky9-lab.first-init.sh.example)
+(disposable lab, which pipes the share straight from the bootstrap without
+printing it) and
+[`production-rocky9.first-init.sh.example`](../ansible/inventory/examples/production-rocky9.first-init.sh.example)
+(reviewed production ceremony).
 
 ## Part 8 — First administrator and sign-off (15 minutes)
 
@@ -226,7 +274,11 @@ time Vault is ready, so it waits for — and verifies — the complete system.
    admin portal at `https://admin.<domain>`.
 2. From an administrator machine (on the ADM network), open
    `https://admin.<domain>` and `https://grafana.<domain>` — both should
-   redirect you to a login page and let the administrator in.
+   redirect you to a login page and let the administrator in. In Grafana, the
+   "AI Gateway" folder should already hold six provisioned dashboards
+   (AI Gateway Overview, Live Logs, Request Audit, plus the new Rocky 9 Host,
+   Grafana LGTM Stack, and Edge/Egress/Identity Services); the newer dashboards
+   link back to AI Gateway Overview as their hub.
 3. From a machine on the ADM network, open `https://chat.<domain>` — you
    should reach the chat login. From a user machine (on the internal
    network), open `https://portal.<domain>` — you should reach the
@@ -245,7 +297,8 @@ time Vault is ready, so it waits for — and verifies — the complete system.
 | Converge stops at a topology assertion | The values you entered disagree with the VM's live interfaces/routes | Re-run the Part 1 checks; correct `host_vars` |
 | Converge stops at SELinux / clock / encryption | VM doesn't meet Part 1 rows 4–6 | Fix the VM (this may need the VM team), rerun |
 | First converge "waits only for core services" and mentions Vault | Not an error | Expected — do Part 7 |
-| A service is unhealthy after Part 7 | Vault sealed (e.g. after a reboot) | `sudo scripts/vault-unseal.sh` on the VM with the stored unseal key |
+| A service is unhealthy after Part 7 | Vault sealed (e.g. after a reboot) | Re-run the Part 6 converge — it auto-unlocks Vault from the controller's stored key. For an immediate fix on the VM, pipe the stored unseal key into `sudo scripts/vault-unseal.sh` (see [operations](operations.md)) |
+| Step 7c stops: "initialized Vault requires vault_unseal_key" | You skipped Step 7b, so the controller has no stored unlock key | Do Step 7b (store the key), then rerun Step 7c |
 | You need to change a secret later | — | `ansible-vault edit ansible/inventory/generated/<alias>/group_vars/generic_rocky9/vault.yml --vault-id <alias>@<password-file>`, then rerun the converge |
 
 ## Glossary
@@ -254,8 +307,10 @@ time Vault is ready, so it waits for — and verifies — the complete system.
   the exact desired state. Safe to rerun; an unchanged system stays unchanged.
 - **Vault** — the built-in secrets safe holding provider credentials and
   signing keys. Starts sealed (locked) until initialized/unsealed.
-- **Unseal key** — the key that unlocks Vault after every restart. Stored by
-  a human, never on the VM.
+- **Unseal key** — the key that unlocks Vault after every restart. Stored
+  offline by a human, and also kept as an encrypted copy on the controller
+  (Step 7b) so a later converge can unlock Vault automatically. Never held in
+  plain text and never on the VM.
 - **ADM / internal / egress** — the three network legs: administrators-only,
   internal users, and outbound internet (AI vendors), respectively. Nothing
   listens on the egress leg.

@@ -329,8 +329,10 @@ credentials.
 ## 5. Vault and application readiness
 
 Use the lab bootstrap only on the disposable lab profile, as described
-in `deploy-guide.md`. Unseal Vault without putting the share in an argument or
-shell history, then wait for health checks:
+in `deploy-guide.md`. The full first-init custody-and-auto-unseal sequence is
+the runnable `ansible/inventory/examples/rocky9-lab.first-init.sh.example`. To
+exercise the manual reboot path, unseal Vault without putting the share in an
+argument or shell history, then wait for health checks:
 
 ```bash
 cd /opt/ai-gateway
@@ -352,13 +354,18 @@ the rendered probes with the complete service-by-service health inventory in
 [operations](operations.md); green Docker health still does not prove the
 separate database ACL, DNS, OIDC, inference, or telemetry contracts below.
 
-Exercise the reduced bootstrap wait in isolation. An uninitialized or sealed
-Vault may select only the documented bootstrap-independent core. A fixture in
-which public Vault status is both initialized and unsealed while the strict
-readiness probe fails must stop the converge before final verification; it
-must not be accepted merely because `vault status` itself returned parseable
-JSON. A restore marker with uninitialized Vault must also stop and must never
-run replacement bootstrap.
+Exercise the reduced bootstrap wait in isolation. Only a genuinely
+**uninitialized** Vault may select the documented bootstrap-independent core.
+Prove the auto-unseal contract too: an initialized, sealed Vault must be
+unsealed from the encrypted controller `vault_unseal_key` — streamed to
+`vault-unseal.sh` on stdin under `no_log`, never in argv/environment or `.env` —
+and must then reach full readiness. An initialized Vault with no
+`vault_unseal_key` in the encrypted inventory, a share outside the `t=1`/`n=1`
+Shamir contract, or a Vault that stays sealed or dependency-unready after the
+automatic unseal must each stop the converge before final verification; none
+may be accepted merely because `vault status` itself returned parseable JSON. A
+restore marker with uninitialized Vault must also stop and must never run
+replacement bootstrap.
 
 Require the full Ansible functional probes as well. Connecting to the exact
 Traefik service-plane addresses with trusted TLS and exact SNI, the reviewed
@@ -731,6 +738,15 @@ Generate a uniquely tagged, synthetic prompt. In Grafana Explore, prove:
 - classify the shared Open WebUI key as service/project attribution only; do
   not claim its browser traffic is per-human until a trusted server-side
   identity propagation design has passed this matrix;
+- the Grafana "AI Gateway" folder loads all six provisioned dashboards
+  (AI Gateway Overview, Live Logs, Request Audit, and the new Rocky 9 Host,
+  Grafana LGTM Stack, and Edge/Egress/Identity Services), and the three new
+  component dashboards populate from scraped native metrics — node-exporter
+  host series, LGTM self-observability (`loki_*`, `tempo_*`, `otelcol_*`,
+  `prometheus_*`), and Traefik/Keycloak/Envoy/JVM edge and identity series —
+  with their component-health panels counting exact scrape targets (`== bool 5`
+  for LGTM, `== bool 4` for edge/identity) rather than any cAdvisor or
+  `container_*` metric;
 - the Cribl mock or approved external receiver records delivery without a
   collector feedback loop;
 - a user without `aigw-admins` cannot cross the Grafana edge gate.
@@ -795,7 +811,12 @@ converge to replace captured configuration and repair exact bind modes; then
 stream the separately held old share to `vault-unseal.sh`; then run
 `aigw-runtime-up.sh -d --wait --wait-timeout 300`. The marker-aware converge
 must recognize initialized, sealed restored Vault state and reject replacement
-initialization. `vault-bootstrap.sh` is prohibited on this path. Only a
+initialization. `vault-bootstrap.sh` is prohibited on this path. Under current
+source that converge also auto-unseals an initialized Vault from the controller
+`vault_unseal_key` and its verify role refuses to finish with Vault sealed, so
+the explicit `vault-unseal.sh` step is the fallback for a controller that does
+not hold the matching 1-of-1 share; this restore-path interaction is on the
+same not-yet-live hold as the other Vault-readiness changes noted below. Only a
 successful persistence/security comparison plus the final change/restart/
 unchanged-converge gate permits marker removal and access reopening.
 

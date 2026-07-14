@@ -145,9 +145,13 @@ nft list table inet aigw_guard
 iptables -S DOCKER-USER
 ```
 
-Vault starts sealed by design. Retrieve an unseal share from approved offline
-custody and pipe it on stdin; never place it in command arguments or shell
-history:
+Vault starts sealed by design after every restart. Two supported paths unlock
+it. From the controller, rerunning the full `site.yml` converge auto-unseals an
+initialized Vault from the encrypted `vault_unseal_key` (streamed to the
+stdin-only helper under `no_log`) and then requires full readiness; this is the
+normal path once first-init custody is complete. For an immediate fix on the VM
+itself, retrieve an unseal share from approved offline custody and pipe it on
+stdin; never place it in command arguments or shell history:
 
 ```bash
 cd /opt/ai-gateway
@@ -232,9 +236,11 @@ health therefore does not replace the HTTP, OIDC, database-ACL, DNS, identity,
 inference, egress, or telemetry tests in the [acceptance
 runbook](test-runbook.md).
 
-The reduced first-converge wait is allowed only when Vault's public status says
-it is uninitialized or sealed. If the strict probe fails while Vault is both
-initialized and unsealed, Ansible fails closed rather than treating that state as
+The reduced first-converge wait is now allowed only when Vault's public status
+says it is genuinely **uninitialized**. An initialized Vault is auto-unsealed
+from the controller `vault_unseal_key` and must then pass the strict probe: if
+it stays sealed or unready (wrong share, a seal contract other than `t=1`/`n=1`,
+or a missing key), Ansible fails closed rather than treating that state as
 bootstrap; diagnose the listener, storage, or probe contract instead of
 reinitializing Vault or broadening the exception. Two native probes have
 important blind spots: Traefik's private `/ping` can be healthy while a non-root
@@ -479,6 +485,18 @@ notification, and an executable backup/restore drill.
 uninitialized fresh deployment with no restore marker; running it against a
 restored, initialized Vault is a data-loss error.
 
+Later converges auto-unseal an already-initialized Vault. This is Ansible
+replaying the existing 1-of-1 Shamir share held on the controller as the
+encrypted `vault_unseal_key` — custodied once with
+`scripts/store-vault-unseal-key.py` into a dedicated `vault-unseal.yml` overlay,
+streamed to the same stdin-only `vault-unseal.sh` under `no_log`, and never
+rendered into `.env` or the target. It is *not* a Vault-native seal such as a
+cloud-KMS or transit auto-unseal; the seal mechanism itself is unchanged, and
+the converge simply refuses to complete an initialized-but-sealed Vault. The
+production hardening above (listener TLS, customer-rooted intermediate, and
+either multiple custodians or a reviewed KMS auto-unseal) is still required
+before this single-share replay is treated as sufficient.
+
 Vault audit writes to `vault_audit`, and `aigw-vault-audit-rotate.timer` checks
 every 15 minutes. `scripts/rotate-vault-audit.sh` runs a locked, networkless,
 read-only helper under Vault's audit-volume UID/GID, rotates at 100 MiB by
@@ -643,6 +661,16 @@ register and the protected execution receipts. The summarized order is:
 7. Verify packet policy, identity fingerprints, database access, prompt and log
    storage, and a vendor canary, then run the entire acceptance suite. Clear the
    restore marker only after the final gate passes and before reopening access.
+
+Interaction with automatic unseal: current source makes the full converge in
+steps 4–5 auto-unseal an initialized Vault from the controller-held
+`vault_unseal_key`, and the verify role refuses to finish with an initialized
+Vault sealed. Where the controller holds the matching 1-of-1 share, that
+converge performs the unseal and the explicit step-5 `vault-unseal.sh` becomes
+the fallback for a controller that does not hold it. This restore-path
+interaction is source-tested but not yet proven live; the authoritative
+sequence and its gates remain the [lab rebuild and restore
+rehearsal](archive/lab-dr-rehearsal.md).
 
 If preflight reports a Docker subnet or live-route collision, choose new
 inventory subnets and update every fixed-IP, trust, and firewall assertion as one

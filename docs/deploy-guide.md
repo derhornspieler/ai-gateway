@@ -137,6 +137,14 @@ Keep environment topology in a customer inventory/host-vars file or a separate
 overlay. Do not turn the generic defaults or the lab profile into a
 customer template.
 
+Committed name-only templates for both profiles live in
+`ansible/inventory/examples/`: `{rocky9-lab,production-rocky9}.host-vars.yml.example`
+and `.vault.yml.example` for the two input surfaces, and
+`{rocky9-lab,production-rocky9}.first-init.sh.example` for the runnable
+first-converge/Vault-custody/second-converge sequence. They carry only
+placeholders — never real values — and are the starting point for a new
+deployment's inputs.
+
 ### Connection and topology
 
 The operator supplies topology through Ansible inventory variables, each of
@@ -332,6 +340,22 @@ asserts that the server command/environment remain secretless and that both
 authentication sources are regular, single-link files with the exact private
 ownership above.
 
+One further secret, `vault_unseal_key`, is **operator-supplied rather than
+generated**. `bootstrap-generic-rocky9.py` never creates it, because it does
+not exist until HashiCorp Vault is initialized. After the first Vault init
+returns its 1-of-1 Shamir share, store it with the stdin-only
+`scripts/store-vault-unseal-key.py` helper into a **dedicated sibling overlay**
+— `group_vars/generic_rocky9/vault-unseal.yml` for a generic/customer
+inventory, or `inventory/group_vars/gateway/vault-unseal.yml` for the lab. The
+helper reads the share only from stdin, writes just one inline-encrypted
+`!vault` value, refuses a whole-file-encrypted target, and will not overwrite
+an existing key. It must never appear as an active definition in
+`group_vars/all.yml` (a contract test rejects that) or in plaintext host vars.
+Once the value is present, every later converge unlocks an initialized Vault
+automatically from it (see [Generic Rocky 9 deployment](#generic-rocky-9-deployment)).
+The committed `ansible/inventory/examples/*.vault.yml.example` files show the
+name-only shape of both overlays.
+
 Ansible also assigns deterministic deployment modes rather than preserving
 controller-checkout modes. Reviewed non-secret directories/files are
 `root:root 0755/0644`; only explicit scripts and the PostgreSQL initializer are
@@ -461,15 +485,31 @@ The role order in `site.yml` is deliberate:
 9. audit-rotation, routing, firewall, listener, network, storage-root, SELinux
    MCS/bind/runtime-type, zero-AVC, and lab Samba assertions run.
 
-The first converge intentionally cannot report the whole graph ready because
-Vault is uninitialized/sealed and key-rotator's `/readyz` requires both a
+The first converge intentionally cannot report the whole graph ready because a
+fresh Vault is uninitialized and key-rotator's `/readyz` requires both a
 database query and authenticated unsealed Vault access. It waits only for the
-bootstrap-independent core and prints the explicit Vault gate. A subsequent
-converge with ready Vault waits for the complete graph; the lab
-`vault-bootstrap.sh` also ends with a full profile-aware Compose wait. An
-initialized and unsealed Vault is never eligible for that bootstrap exception:
-if its strict readiness probe fails, the converge stops instead of allowing
-Vault or key-rotator health failures through the reduced wait.
+bootstrap-independent core and prints the explicit Vault gate. The reduced-wait
+exception is now bounded strictly to a genuinely **uninitialized** Vault.
+
+Once Vault has been initialized (a separate, explicit ceremony) and its 1-of-1
+Shamir share has been custodied to the controller as the encrypted
+`vault_unseal_key` (see the overlay note above), every later converge
+**automatically unseals** the initialized Vault by streaming that value to
+`scripts/vault-unseal.sh` on stdin under `no_log`, then requires the complete
+graph to pass strict readiness. This fails closed: an initialized Vault with no
+`vault_unseal_key` in the encrypted inventory stops the converge before it
+would complete, and an initialized Vault that is still sealed after the
+automatic unseal (wrong share, or a seal contract other than `t=1`/`n=1`)
+aborts rather than completing a partially functional deploy. The share is never
+rendered into `.env`, copied to the target, or placed in argv/environment. The
+lab `vault-bootstrap.sh` also ends with a full profile-aware Compose wait.
+
+The exact first-init order — first (incomplete) converge, reviewed Vault
+init/unseal, hidden controller custody through `scripts/store-vault-unseal-key.py`,
+then the ordinary second converge that reaches full readiness — is captured as
+runnable templates in
+`ansible/inventory/examples/rocky9-lab.first-init.sh.example` and
+`ansible/inventory/examples/production-rocky9.first-init.sh.example`.
 
 The initialization/seal-state command fixes the isolated listener transport
 explicitly with `vault status -address=http://127.0.0.1:8200 -format=json`;
@@ -573,9 +613,23 @@ It is not the customer Vault initialization path and is forbidden on the restore
 path. Immediately move its generated unseal key/root token into approved offline
 custody and remove the plaintext `secrets/vault-init.json` as the script
 instructs; `state-backup.sh` refuses to run while that file is co-located with
-Vault state. After every reboot Vault is sealed again — reuse the stdin-only
+Vault state. After every reboot Vault is sealed again — either rerun the
+`site.yml` converge (it unlocks Vault automatically from the controller-held
+`vault_unseal_key`, described below) or reuse the stdin-only
 `scripts/vault-unseal.sh` helper, which never places the share in argv,
 environment, container config, or logs.
+
+To enable that automatic unlock, custody the same 1-of-1 share to the
+controller's encrypted inventory. `vault-bootstrap.sh --emit-unseal-key`
+reserves stdout exclusively for the accepted share — it refuses a terminal,
+keeps all status output on stderr, and emits only after Vault accepted the
+share and the full post-bootstrap runtime gate passed — so you can pipe it
+straight into `scripts/store-vault-unseal-key.py` without the share ever
+printing. That is exactly what `rocky9-lab.first-init.sh.example` does; the
+root-owned `secrets/vault-init.json` recovery copy stays on the VM until the
+controller helper has stored and independently decrypt-verified the encrypted
+value. With `vault_unseal_key` in the inventory, the ordinary second converge
+unlocks Vault and drives it to full readiness.
 
 Next, establish the first administrator. Sign in to Keycloak over the ADM
 address (`auth.DOMAIN` resolved to the ADM leg) using the server bootstrap
