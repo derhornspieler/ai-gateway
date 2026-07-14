@@ -206,20 +206,25 @@ issue_and_install_samba_leaf() {
   # shellcheck disable=SC2064
   trap "rm -rf -- '$staging'" EXIT HUP INT TERM
 
+  # The reviewed edge chain (intermediate + self-signed customer root), written
+  # by install-signed, is the ONLY complete chain: Vault's ca_chain returns the
+  # intermediate but omits the external root it does not hold. The DC publishes
+  # this bundle as its trust anchor (samba-public/ca.pem), so it must reach the
+  # root or a client cannot complete the path.
+  [[ -s "$STACK_DIR/secrets/aigw-edge-chain.pem" ]] \
+    || die "samba-tls requires the customer-CA edge chain; run install-signed first"
+
   echo ">> issuing samba-ad.$DOMAIN from the customer-CA-signed intermediate"
   vlt write -format=json pki_int/issue/aigw \
       common_name="samba-ad.$DOMAIN" ttl=2160h \
-  | STAGING="$staging" python3 -I -c '
+  | STAGING="$staging" EDGE_CHAIN="$STACK_DIR/secrets/aigw-edge-chain.pem" python3 -I -c '
 import json, os, sys
 staging = os.environ["STAGING"]
 data = json.load(sys.stdin)["data"]
-# Serve the full chain: leaf followed by the issuing CA chain (intermediate +
-# root). Keycloak still anchors on certs/ca.pem, but presenting the chain keeps
-# the handshake robust for any client.
-chain = data.get("ca_chain") or ([data["issuing_ca"]] if data.get("issuing_ca") else [])
-bundle = data["certificate"].rstrip("\n") + "\n"
-for cert in chain:
-    bundle += cert.rstrip("\n") + "\n"
+# Leaf, then the complete issuing chain (intermediate + self-signed root) taken
+# from the reviewed edge chain so the published trust anchor reaches a root.
+ca = open(os.environ["EDGE_CHAIN"], encoding="ascii").read().rstrip("\n") + "\n"
+bundle = data["certificate"].rstrip("\n") + "\n" + ca
 cert_fd = os.open(os.path.join(staging, "tls.crt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
 os.write(cert_fd, bundle.encode())
 os.close(cert_fd)
