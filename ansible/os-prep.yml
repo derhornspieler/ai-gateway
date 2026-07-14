@@ -105,6 +105,14 @@
           - not (identity_ldap_enabled | bool) or identity_ldap_url is match('^ldaps://')
           - not (identity_ldap_enabled | bool) or
             identity_ldap_directory_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          # The single LDAPS /32 firewall pin must target a real off-host
+          # directory: reject loopback/link-local/multicast (the same
+          # anti-martian filter the internal/egress resolvers receive) and any
+          # of this host's own NIC addresses, so the allowance can never point
+          # at loopback, a multicast group, or the gateway itself.
+          - not (identity_ldap_enabled | bool) or
+            (identity_ldap_directory_ip is not match('^(127|169\\.254|22[4-9]|23[0-9])\\.') and
+             identity_ldap_directory_ip not in [eth0_ip, eth1_ip, eth2_ip])
           - (manage_networking | bool) or pbr_tables | length == 0
           - not (manage_networking | bool) or pbr_tables | length == 2
           - pbr_tables | map(attribute='id') | unique | length == pbr_tables | length

@@ -1321,34 +1321,74 @@
       regular single-link file.
   when: identity_ldap_enabled | bool
 
-# Public, reviewed content: the bundle Keycloak trusts for LDAPS. Validate it
-# before it can be mounted so a private key or an empty/garbage file can never
-# become the LDAPS trust anchor.
-- name: Materialize the external directory public CA bundle for Keycloak
-  ansible.builtin.copy:
-    src: "{{ identity_ldap_ca_bundle_src }}"
-    dest: "{{ stack_dir }}/keycloak/identity-ldap-ca.pem"
-    owner: root
-    group: "65532"
-    mode: "0440"
-    follow: false
+# Public, reviewed content: the bundle Keycloak trusts for LDAPS. It is staged
+# and fully validated (certificates-only, no PRIVATE KEY, parses) on a private
+# copy BEFORE the live trust anchor is overwritten, so a bad, empty, or
+# key-bearing controller-side bundle can never destroy the known-good deployed
+# bundle or land private-key bytes at the mounted destination. Only a validated
+# bundle is promoted, atomically, to keycloak/identity-ldap-ca.pem.
+- name: Install the validated external directory public CA bundle for Keycloak
   when: identity_ldap_enabled | bool
+  block:
+    - name: Create the external directory CA state boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
 
-- name: Require a certificates-only external directory trust bundle
-  ansible.builtin.command:
-    argv:
-      - openssl
-      - storeutl
-      - -noout
-      - -certs
-      - "{{ stack_dir }}/keycloak/identity-ldap-ca.pem"
-  register: identity_ldap_ca_probe
-  changed_when: false
-  failed_when: >-
-    identity_ldap_ca_probe.rc != 0 or
-    'Total found: 0' in identity_ldap_ca_probe.stdout or
-    (lookup('ansible.builtin.file', identity_ldap_ca_bundle_src) is search('PRIVATE KEY'))
-  when: identity_ldap_enabled | bool
+    - name: Reset the external directory CA staging boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state/edge-tls-staging-identity-ca"
+        state: absent
+
+    - name: Create the external directory CA staging boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state/edge-tls-staging-identity-ca"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Stage the external directory public CA bundle
+      ansible.builtin.copy:
+        src: "{{ identity_ldap_ca_bundle_src }}"
+        dest: "{{ stack_dir }}/.state/edge-tls-staging-identity-ca/identity-ldap-ca.pem"
+        owner: root
+        group: root
+        mode: "0600"
+        follow: false
+
+    - name: Require a certificates-only external directory trust bundle
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - storeutl
+          - -noout
+          - -certs
+          - "{{ stack_dir }}/.state/edge-tls-staging-identity-ca/identity-ldap-ca.pem"
+      register: identity_ldap_ca_probe
+      changed_when: false
+      failed_when: >-
+        identity_ldap_ca_probe.rc != 0 or
+        'Total found: 0' in identity_ldap_ca_probe.stdout or
+        (lookup('ansible.builtin.file', identity_ldap_ca_bundle_src) is search('PRIVATE KEY'))
+
+    - name: Promote the validated external directory public CA bundle for Keycloak
+      ansible.builtin.copy:
+        src: "{{ stack_dir }}/.state/edge-tls-staging-identity-ca/identity-ldap-ca.pem"
+        dest: "{{ stack_dir }}/keycloak/identity-ldap-ca.pem"
+        remote_src: true
+        owner: root
+        group: "65532"
+        mode: "0440"
+        follow: false
+  always:
+    - name: Remove the external directory CA staging boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state/edge-tls-staging-identity-ca"
+        state: absent
 
 - name: Placeholder certs dir (vault-bootstrap issues real ones)
   ansible.builtin.file:
@@ -1375,23 +1415,12 @@
   changed_when: false
   failed_when: false
 
-- name: Remove edge material that belongs to a different lab domain
-  ansible.builtin.file:
-    path: "{{ stack_dir }}/certs/{{ item }}"
-    state: absent
-  loop:
-    - int.crt
-    - int.key
-    - ca.pem
-  when: >-
-    existing_edge_certificate.rc != 0 or
-    ('DNS:*.' ~ aigw_domain) not in existing_edge_certificate.stdout or
-    ('DNS:' ~ aigw_domain) not in existing_edge_certificate.stdout
-
 # The marker records that a customer-CA-signed chain was installed by
 # scripts/vault-pki-intermediate.sh. Once it exists, a placeholder must never
 # reappear: silently downgrading a real edge certificate to a self-signed one
-# would keep the stack "working" while destroying its identity.
+# would keep the stack "working" while destroying its identity. Inspect it and
+# assert the SAN contract BEFORE any deletion so a real-CA domain mismatch fails
+# closed instead of deleting live production material.
 - name: Inspect the vault-intermediate issuance marker
   ansible.builtin.stat:
     path: "{{ stack_dir }}/.state/edge-tls-issued"
@@ -1399,10 +1428,12 @@
     get_checksum: false
   register: aigw_edge_tls_issued_marker
 
-# Catches both "the real certificate vanished" and "the domain moved, so the
-# task above just deleted a certificate the marker says was CA-signed". In
-# either case the placeholder is suppressed (the marker gates it), so failing
-# here with an actionable message beats failing later with a missing-file error.
+# Fire BEFORE any deletion. On vault-intermediate, once the ceremony wrote its
+# marker certs/int.crt must be a CA-signed leaf for aigw_domain; if it is
+# missing, unreadable, or issued for a different domain (the operator moved
+# aigw_domain), fail here with an actionable message. The material is never
+# removed in this mode, so the mismatch is preserved for recovery rather than
+# masked by a self-signed placeholder or an empty certs/ served by default.
 - name: Refuse to mask lost production edge material with a placeholder
   ansible.builtin.assert:
     that:
@@ -1420,6 +1451,26 @@
       install-signed); otherwise restore state or run renew-leaf. A self-signed
       placeholder must never silently replace a CA-signed certificate.
   when: aigw_edge_tls_mode == 'vault-intermediate'
+
+# Only lab mode deletes stale edge material, because regenerating a self-signed
+# placeholder there is free. On the real-CA modes the material is NEVER deleted:
+# a vault-intermediate mismatch already failed the assert above, and
+# customer-supplied is overwritten atomically by edge-tls.py install only after
+# it validates. A failed real-CA converge therefore can never leave certs/ empty
+# and served by Traefik's built-in self-signed default.
+- name: Remove edge material that belongs to a different lab domain
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/certs/{{ item }}"
+    state: absent
+  loop:
+    - int.crt
+    - int.key
+    - ca.pem
+  when: >-
+    aigw_edge_tls_mode == 'lab' and
+    (existing_edge_certificate.rc != 0 or
+     ('DNS:*.' ~ aigw_domain) not in existing_edge_certificate.stdout or
+     ('DNS:' ~ aigw_domain) not in existing_edge_certificate.stdout)
 
 # ── Mode customer-supplied: validate on the target, then install atomically ──
 # The private key is staged with no_log and every crypto check runs BEFORE the

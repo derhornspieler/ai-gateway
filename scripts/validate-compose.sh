@@ -787,8 +787,9 @@ if ansible.is_file():
         "Require the external directory bind credential boundary",
         "Materialize the external directory bind credential outside command and environment metadata",
         "Require exact external directory secret-file ownership and mode",
-        "Materialize the external directory public CA bundle for Keycloak",
+        "Install the validated external directory public CA bundle for Keycloak",
         "Require a certificates-only external directory trust bundle",
+        "Promote the validated external directory public CA bundle for Keycloak",
         "docker-compose.identity-ldap.yml",
         "keycloak_internal_ip == '172.28.2.3'",
     ):
