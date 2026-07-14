@@ -51,16 +51,20 @@ override from that vendor registry before adding the bounded project block,
 preserving standard table names instead of shadowing them.
 
 Ansible orchestrates the host through the ordered roles in `ansible/site.yml`:
-`host_preflight`, `selinux_baseline`, `network_routing`, `firewalld_zones`,
-`os_baseline`, `docker_networks`, `docker_stack`, and `verify`. `ansible/deploy-stack-only.yml` performs an
+`host_preflight`, `firewall_preflight`, `time_sync`, `selinux_baseline`,
+`network_routing`, `firewalld_zones`, `os_baseline`, `docker_networks`,
+`docker_stack`, `verify`, and `host_finalize`. `ansible/deploy-stack-only.yml` performs an
 app-only rollout and refuses to run against a stale firewall or network ABI.
 The inventory ships a generic `inventory/hosts.yml` and an explicit lab
 `inventory/lab.yml`. See [deploy-guide.md](deploy-guide.md).
 
 ## Implemented component inventory
 
-The base stack is 24 services: the one-shot `volume-init` plus 23 long-running
-services. All third-party runtime bases are pinned by tag and immutable OCI
+The base stack defines 25 services: the one-shot `volume-init` plus 24
+long-running services, of which two — `vault-ui-proxy` and its
+`oauth2-proxy-vault` gate — are enabled only by the optional `vault-ui`
+Compose profile (`aigw_vault_ui_enabled`, default off), so a default
+deployment runs 23. All third-party runtime bases are pinned by tag and immutable OCI
 digest. Locally built services use reviewed Dockerfiles and pinned bases;
 several layer a static health/startup probe onto an otherwise shellless final
 stage.
@@ -78,7 +82,8 @@ stage.
 | `open-webui` | OIDC browser chat | `chat.<domain>`; `openwebui_data` |
 | `keycloak` | `aigw` user realm and isolated `anthropic-wif` realm | `auth.<domain>` scoped to the `aigw` realm on the internal leg; full console and master realm through the same `auth.<domain>` host on the ADM leg; DB in `pg_data` |
 | `dev-portal` | OIDC self-service gateway keys and tool snippets; no admin route | `portal.<domain>` on the internal edge |
-| `admin-portal` | separate OIDC application for managed Keycloak projects/users and provider rotation | `admin-portal.<domain>` on the ADM edge |
+| `admin-portal` | separate OIDC application for managed Keycloak projects/users and provider rotation | `admin.<domain>` on the ADM edge |
+| `vault-ui-proxy` (optional `vault-ui` profile) | static Go proxy serving the extracted, analytics-disabled Vault 2.0.3 browser UI and forwarding only `/v1` to the fixed `http://vault:8200` backend | `net-vault` only; behind `oauth2-proxy-vault` |
 | `envoy-egress` | sole vendor egress; originating TLS, exact routes/SANs, narrowed CA stores | no host port; loopback admin; read-only Prometheus facade |
 | `key-rotator` | static seed, Anthropic WIF, OpenAI rotation, scheduler, identity controller | internal API with `X-Internal-Auth`; DB in `pg_data` |
 | `vault` | KV v2, PKI, rotator and identity key material, audit | isolated plaintext API on `net-vault`; ADM UI only through OAuth2 Proxy; `vault_data`, `vault_audit` |
@@ -91,7 +96,7 @@ stage.
 | `tempo` | prompt-bearing distributed traces | 30-day `tempo_data` |
 | `grafana` | query UI for Prometheus, Loki, and Tempo | `grafana_data`; ADM-only behind `oauth2-proxy-grafana`, auth-proxy header trust, org Admin auto-assign, own login form disabled |
 | `cribl-mock` | lab-only OTLP receipt proof | basic debug counts; no durable storage |
-| `lab-dns` (lab overlay only) | authoritative, non-recursive `aigw.internal` DNS for host-side lab clients | exact ADM/internal host IPs:53 TCP+UDP; dedicated no-peer bridge |
+| `lab-dns` (platform-DNS overlay only) | authoritative, non-recursive `aigw.internal` DNS for host-side clients | exact ADM/internal host IPs:53 TCP+UDP; dedicated no-peer bridge; enabled by `platform_authoritative_dns_enabled` |
 | `samba-ad` (lab overlay only) | disposable AD-compatible directory and hostname-verified LDAPS | isolated `net-identity`; no published host port; three persistent lab volumes |
 
 The four OAuth2 Proxy instances share one image
@@ -102,7 +107,7 @@ but run as different ASGI applications in different containers, Docker planes,
 OIDC clients, session secrets, and hostnames. `key-rotator` is the rotation
 engine and Keycloak identity controller built from `services/key-rotator`.
 
-The explicit lab overlay adds `samba-ad` and `lab-dns` under the
+The explicit lab overlay adds `samba-ad` (and the platform-DNS overlay adds `lab-dns`) under the
 `lab-ad` profile, bringing the running set to 25 long-running services plus
 `volume-init`. The overlay defines `samba-ad` on `net-identity` and joins
 `keycloak` to `net-identity` so Keycloak can perform LDAPS user federation
@@ -229,14 +234,17 @@ Docker-socket discovery. `traefik-int` binds `${ETH2_IP}:443` and routes
 model, and liveness/readiness paths; any other path on the api host hits an
 explicit deny-all `403`), the `aigw`-realm-scoped `auth.<domain>` to Keycloak,
 and `portal.<domain>` to the dev portal. `traefik-adm` binds `${ETH1_IP}:443`
-and routes `admin.<domain>` through `oauth2-proxy` to the LiteLLM Admin UI,
-`admin-portal.<domain>` to the admin portal, `grafana.<domain>` through
+and routes `litellm-admin.<domain>` through `oauth2-proxy` to the LiteLLM
+Admin UI, `admin.<domain>` to the admin portal, `grafana.<domain>` through
 `oauth2-proxy-grafana`, `prometheus.<domain>` through `oauth2-proxy-prometheus`,
-`vault.<domain>` through `oauth2-proxy-vault`, and the full-console
-`auth.<domain>` to Keycloak. Only Traefik publishes container ports, bound to
-the exact ADM/internal host IPs; nothing binds the egress IP or `0.0.0.0`. The
-`verify` role DNS-checks `portal`, `auth`, `admin`, `admin-portal`, `grafana`,
-`prometheus`, and `vault`.
+`vault.<domain>` through `oauth2-proxy-vault` to `vault-ui-proxy` (this
+router and backend are rendered only when the optional Vault UI profile is
+enabled), the legacy `admin-portal.<domain>` host as a redirect to
+`admin.<domain>`, and the full-console `auth.<domain>` to Keycloak. Only
+Traefik publishes container ports in the base stack, bound to the exact
+ADM/internal host IPs; nothing binds the egress IP or `0.0.0.0`. The `verify`
+role DNS-checks `portal`, `auth`, `admin`, `admin-portal`, `litellm-admin`,
+`grafana`, `prometheus`, and `vault`.
 
 ```mermaid
 flowchart LR
@@ -255,8 +263,9 @@ flowchart LR
   O2G -->|aigw-admins| GF[Grafana]
   TA --> O2P[oauth2-proxy: Prometheus]
   O2P -->|aigw-admins| PR[(Prometheus)]
-  TA --> O2V[oauth2-proxy: Vault]
-  O2V -->|aigw-admins then Vault login| VT[(Vault)]
+  TA --> O2V[oauth2-proxy: Vault<br/>optional vault-ui profile]
+  O2V -->|aigw-admins| VUP[vault-ui-proxy<br/>static UI + /v1 only]
+  VUP -->|then Vault login| VT[(Vault)]
   TA -->|auth host: admin/master| KC
 
   OW --> LL
@@ -333,7 +342,7 @@ chat attribution requires a separate server-side integration and acceptance
 test.
 
 The internal `dev-portal` application registers no admin route. Identity, group,
-and rotation workflows exist only at `admin-portal.<domain>/admin` on the ADM
+and rotation workflows exist only at `admin.<domain>/admin` on the ADM
 edge; every page rechecks the caller's live admin role, and mutations also
 require CSRF plus a fresh `prompt=login,max_age=0` Keycloak step-up.
 

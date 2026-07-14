@@ -67,6 +67,11 @@ enforcing key-only authentication and disabling every forwarding channel:
 | Forwarding | `DisableForwarding yes`, `AllowTcpForwarding no`, `AllowStreamLocalForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, `GatewayPorts no` |
 | Rate limits | `MaxAuthTries 3`, `LoginGraceTime 30`, `MaxSessions 4`, `MaxStartups 10:30:30` |
 
+The hardened profile keeps password authentication off by default
+(`aigw_ssh_password_authentication` defaults to `false`); password SSH and the
+ADM SOCKS forwarder are permitted only on the lab profile, and SOCKS
+additionally requires an explicit operator acknowledgement string.
+
 **Lockout-safe application.** Before touching sshd, the controller proves a
 fresh, strictly key-only connection. The candidate file is validated in
 isolation (`sshd -t -f`), the complete daemon configuration is validated
@@ -76,6 +81,14 @@ with all 23 directives asserted, and a second independent key-only login with
 non-interactive `sudo -n` is proved before the play proceeds. SSH is
 reachable only on the ADM interface from `vpn_client_cidr`, on the exact
 managed port.
+
+## 2.5 Time synchronization
+
+A dedicated `time_sync` role gates the converge on a proven synchronized clock
+(`aigw_require_time_sync`, default on; maximum offset
+`aigw_time_sync_max_offset_seconds`, default 5 s) before SELinux or Docker can
+install signed packages or build images — OIDC, TLS, and short-lived JWTs all
+depend on trustworthy time.
 
 ## 3. Encrypted state storage
 
@@ -141,5 +154,12 @@ future ADM firewall rule; conflicting Docker daemon flags or environment
 indirection in systemd drop-ins; unsafe (symlinked, group-writable,
 non-root) path ancestry for the stack, data root, or configuration;
 foreign containers or networks on a live daemon; active Swarm mode; a
-drifted `daemon.json` on a marked host; and adoption of any pre-existing
-Docker or firewall state without its explicit one-time acknowledgement flag.
+drifted `daemon.json` on a marked host; a non-canonical or non-root Docker
+CLI, auxiliary daemon sockets, unreviewed systemd overrides, retained Docker
+plugins, or an active rootless/second container runtime; and adoption of any
+pre-existing Docker, firewall, or AIGW sshd state without its matching
+explicit acknowledgement flag (`aigw_adopt_dedicated_docker_host`,
+`aigw_adopt_firewalld_state` — now narrowed to resuming a validated pending
+converge — and `aigw_adopt_ssh_state`). A `firewall_preflight` role audits
+existing firewall state, and `host_finalize` promotes the dedicated-host
+marker only after a fully verified converge.

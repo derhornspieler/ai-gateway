@@ -18,12 +18,14 @@ interface binding. It does persist the expected firewalld zone in the single
 bounded `connection.zone` property of each supplied active profile, by exact
 UUID and without cycling or reactivating the connection.
 
-One converge brings up a single Compose project. The base stack is 24 services:
-one `volume-init` one-shot plus 23 long-running services, spread across 18 of
-the 20 pre-created Docker bridges, fronted by two Traefik instances, gated by
-four oauth2-proxy OIDC reverse proxies, and served through two portals. The
-lab overlay adds a Samba AD directory and an authoritative lab DNS
-service, taking the graph to 25 long-running services plus `volume-init` and
+One converge brings up a single Compose project. The base stack defines 25
+services: one `volume-init` one-shot plus 24 long-running services (two of
+which — the optional Vault browser UI pair — run only when
+`aigw_vault_ui_enabled` is set), spread across 18 of the 20 pre-created
+Docker bridges, fronted by two Traefik instances, gated by up to four
+oauth2-proxy OIDC reverse proxies, and served through two portals. The
+lab overlay adds a Samba AD directory, and the platform-DNS overlay an
+authoritative DNS service, growing the long-running graph beyond `volume-init` and
 using all 20 bridges.
 
 ## Production-readiness warning
@@ -153,7 +155,10 @@ which also accepts a controller `AIGW_*` environment fallback:
 | `eth2_ip`, `eth2_gateway` | `AIGW_INTERNAL_IP`, `AIGW_INTERNAL_GATEWAY` | existing internal address and next hop |
 | `vpn_client_cidr` | `AIGW_VPN_CLIENT_CIDR` | only source range allowed to ADM TCP/22 and TCP/443 |
 | `internal_cidr` | `AIGW_INTERNAL_CIDR` | only source range allowed to internal TCP/443 |
-| `container_dns_server` | `AIGW_CONTAINER_DNS_SERVER` | explicit real resolver; loopback/link-local/multicast rejected |
+| `internal_dns_servers` | `AIGW_INTERNAL_DNS_SERVERS` (comma-separated) | 1–3 unique corporate/ADM-plane resolvers; loopback/link-local/multicast rejected; must route via the ADM/internal legs only |
+| `egress_dns_servers` | `AIGW_EGRESS_DNS_SERVERS` (comma-separated) | 1–3 unique Internet-plane resolvers (Envoy only); must route via the egress leg only; may not overlap the internal list |
+| `platform_authoritative_dns_enabled` | — | serve the split-view authoritative DNS overlay (`lab-dns` on ADM/internal :53); default on only for `rocky9-lab` |
+| `aigw_vault_ui_enabled` | — | optional ADM-only Vault browser UI (`vault-ui-proxy` + its OAuth gate); default `false`; the internal Vault API is always deployed |
 
 Despite their historical `eth0_*` names, the address variables are semantic;
 the actual interfaces may be named `enp*`, `ens*`, or otherwise. The full
@@ -198,15 +203,19 @@ fail closed until each is populated.
 key off this exact value). `DOMAIN` is the base domain every router host is
 built from. `ETH1_IP` is the ADM leg that `traefik-adm` binds `:443` on, and
 `ETH2_IP` is the internal leg that `traefik-int` binds `:443` on — nothing
-binds the egress IP or `0.0.0.0`. `CONTAINER_DNS_SERVER` is the approved
-non-loopback resolver.
+binds the egress IP or `0.0.0.0`. Container resolvers are rendered per plane
+into `docker-compose.dns.yml` from `internal_dns_servers` and
+`egress_dns_servers` (the legacy shared `CONTAINER_DNS_SERVER` variable no
+longer exists); `PLATFORM_AUTHORITATIVE_DNS_ENABLED` and `VAULT_UI_ENABLED`
+select the platform-DNS overlay and the `vault-ui` Compose profile through
+`aigw-compose.sh`.
 
 A set of fixed workload IPs pin the few containers that other components
 address directly: `ENVOY_EGRESS_IP` (the sole external-DNS/TCP-443 workload at
 `172.28.0.2`), `ALLOY_INTERNAL_IP`, `ALLOY_TELEMETRY_IP`,
 `ALLOY_OBSERVABILITY_IP`, `PROMETHEUS_OBSERVABILITY_IP`, `TEMPO_INGEST_IP`,
 `TRAEFIK_INT_CHAT_IP`, `TRAEFIK_INT_PORTAL_IP`, `TRAEFIK_ADM_ADMIN_IP`,
-`TRAEFIK_ADM_GRAFANA_IP`, and the lab-only `LAB_DNS_IP`. These must stay inside
+`TRAEFIK_ADM_GRAFANA_IP`, `OAUTH2_PROXY_LITELLM_IP`, and the overlay-only `LAB_DNS_IP`. These must stay inside
 their bridge subnets and off the reserved gateway address; the preflight
 rejects a value that is out of range or collides with a reserved address.
 
@@ -277,7 +286,7 @@ Compose interpolation and database URLs remain unambiguous.
 | `webui_litellm_key` | dedicated scoped LiteLLM virtual key, never the master key |
 | `webui_secret_key` | stable 32+ character Open WebUI application/session signing secret; never regenerate during converge or replacement |
 | `webui_oidc_client_secret`, `portal_oidc_client_secret`, `admin_portal_oidc_client_secret`, `oauth2_proxy_client_secret` | OIDC clients; each 32+ and alphanumeric-safe |
-| `oauth2_proxy_cookie_secret` | stable, exactly 32 alphanumeric bytes |
+| `oauth2_proxy_litellm_cookie_secret`, `oauth2_proxy_grafana_cookie_secret`, `oauth2_proxy_prometheus_cookie_secret`, `oauth2_proxy_vault_cookie_secret` | one per OAuth gate; each exactly 32 alphanumeric bytes, mutually unique, and distinct from both portal session secrets |
 | `portal_session_secret`, `admin_portal_session_secret` | sign the two portals' role-bearing sessions; each 32+ and mutually distinct |
 | `rotator_internal_token` | admin portal → rotator internal API; 32+ |
 | `portal_identity_token` | dev portal → rotator identity API; 32+, distinct from `rotator_internal_token` |
@@ -293,10 +302,18 @@ values. The lab profile additionally requires five 16+ character secrets:
 - `samba_user_lab_developer_password`
 - `samba_user_lab_user_password`
 
-Edit the encrypted overlay without producing a plaintext working copy:
+For a generic/customer deployment, generate the dedicated inventory and
+ciphertext-only overlay with `scripts/bootstrap-generic-rocky9.py` (it creates
+`ansible/inventory/generated/<alias>/` with `hosts.yml`,
+`host_vars/<alias>.yml`, and `group_vars/generic_rocky9/vault.yml`, encrypting
+every secret in memory under an explicit `--vault-id`), then validate it with
+the controller-only `ansible/preflight-generic-rocky9.yml` before ever
+contacting the target. The committed `inventory/group_vars/gateway/vault.yml`
+overlay belongs to the lab profile. Edit an overlay only in place, without
+producing a plaintext working copy:
 
 ```bash
-ansible-vault edit ansible/inventory/group_vars/gateway/vault.yml
+ansible-vault edit ansible/inventory/generated/<alias>/group_vars/generic_rocky9/vault.yml
 ```
 
 Do not print, diff, or commit decrypted values. The role renders

@@ -105,14 +105,20 @@ historical input only. It is not an operational reference.
 
 ## Deployment entry points
 
-For a real customer host, supply the actual interface names, addresses,
-gateways, source CIDRs, and resolver through an environment-specific inventory,
-`--extra-vars`, or the documented `AIGW_*` controller environment variables:
+For a real customer host, generate a dedicated inventory with an encrypted
+secret overlay, fill in the topology, pass the controller-only preflight, and
+then converge:
 
 ```bash
 ansible-galaxy collection install -r ansible/requirements.yml
-ansible-playbook -i ansible/inventory/hosts.yml ansible/site.yml \
-  -e @/secure/customer-topology.yml --ask-vault-pass
+scripts/bootstrap-generic-rocky9.py --inventory-alias <alias> \
+  --vault-id <vault-id> --vault-password-file <password-file>
+# edit ansible/inventory/generated/<alias>/host_vars/<alias>.yml
+ansible-playbook -i ansible/inventory/generated/<alias>/hosts.yml \
+  ansible/preflight-generic-rocky9.yml --limit <alias> \
+  --vault-id <vault-id>@<password-file>
+ansible-playbook -i ansible/inventory/generated/<alias>/hosts.yml \
+  ansible/site.yml --limit <alias> --vault-id <vault-id>@<password-file>
 ```
 
 For the explicit lab only:
@@ -140,11 +146,13 @@ ansible/
   deploy-stack-only.yml    app-only rollout; refuses a stale firewall/network ABI
   inventory/               generic entry point (hosts.yml) + lab (lab.yml)
   group_vars/all.yml       20 segmented bridge definitions and host variables
-  roles/                   host_preflight, selinux_baseline, network_routing,
-                           firewalld_zones, os_baseline, docker_networks,
-                           docker_stack, verify
+  roles/                   host_preflight, firewall_preflight, time_sync,
+                           selinux_baseline, network_routing, firewalld_zones,
+                           os_baseline, docker_networks, docker_stack, verify,
+                           host_finalize
 compose/
-  docker-compose.yml       base stack, 24 services; images tag-and-digest pinned
+  docker-compose.yml       base stack, 25 services (23 default; Vault UI pair
+                           profile-gated); images tag-and-digest pinned
   docker-compose.lab.yml   lab overlay (Samba AD + authoritative DNS)
   .env.example             fail-closed variable contract templated by Ansible
   traefik/                 separate internal and ADM routing

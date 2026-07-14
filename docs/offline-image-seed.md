@@ -119,3 +119,14 @@ python3 -m unittest scripts.tests.test_load_offline_image_seed
 ansible-playbook -i ansible/inventory/lab.yml ansible/site.yml \
   --syntax-check --ask-vault-pass
 ```
+
+## Building a seed
+
+`scripts/rebuild-offline-image-seed.py` is the build-side counterpart to the
+on-target loader: run it on a controller or build host with a local Docker
+daemon (remote TCP/SSH daemons are refused). It never pulls — it exports
+already-present, digest-pin-verified images into a root-owned OCI archive
+plus manifest (`<name>.docker.tar.zst` + `<name>.manifest.json`), which are
+then staged on the target and consumed exactly once at converge time by
+`scripts/load-offline-image-seed.py` under the `offline_image_seed_*`
+inventory variables.

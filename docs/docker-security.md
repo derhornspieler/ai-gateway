@@ -51,6 +51,14 @@ with `--network=none`.
 known-vulnerable release with the rationale recorded inline: LiteLLM
 v1.91.3, Open WebUI 0.10.2, and the lab-only Debian Samba build.
 
+**Extracted, never executed.** The optional Vault browser UI
+(`vault-ui-proxy`) is a stdlib-only Go proxy whose UI assets are extracted
+from the official `hashicorp/vault:2.0.3` image *as data* — the upstream
+binary is never run — with the exact embedded file set pinned in
+`upstream-provenance.json`, analytics force-disabled, a strict no-external
+CSP, and a startup proof that the proxy is PID 1 with no other process in
+the container.
+
 **Deterministic builds and rollback.** A build planner digests each
 service's effective build definition and complete build context
 (length-framed, collision-resistant) into a root-only manifest
@@ -64,7 +72,8 @@ forbidden.
 ## 3. Runtime hardening
 
 A shared hardening anchor applies to every long-running service:
-`no-new-privileges`, `cap_drop: ALL`, an explicit per-container DNS server,
+`no-new-privileges`, `cap_drop: ALL`, explicit per-plane container resolvers
+(rendered into `docker-compose.dns.yml`; only Envoy receives Internet DNS),
 bounded JSON logging (20 MiB × 5), a PID limit, and `restart:
 unless-stopped`. On top of that baseline:
 
@@ -142,9 +151,10 @@ systemd ACL reconciler with a read-only socket bind.
 
 ## 7. Port publication
 
-Exactly two services publish host ports, each bound to one exact address:
-`traefik-int` on `ETH2_IP:443` and `traefik-adm` on `ETH1_IP:443` (the lab
-overlay adds authoritative DNS on port 53, bound to the same two addresses).
+Exactly two services publish host ports in the base stack, each bound to one
+exact address: `traefik-int` on `ETH2_IP:443` and `traefik-adm` on
+`ETH1_IP:443` (the optional platform-DNS overlay adds authoritative DNS on
+port 53, bound to the same two addresses).
 The converge asserts the live publication set equals that expectation,
 rejects any binding on `0.0.0.0`, `::`, or the egress address, and verifies
 the corresponding NAT rules — Envoy's admin endpoint and every telemetry

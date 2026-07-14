@@ -11,8 +11,9 @@ production blockers, and it cross-links the architecture in
 posture in [high-availability.md](high-availability.md), and the living status in
 [project-status.md](project-status.md).
 
-The base project is 24 services: one `volume-init` one-shot plus 23 long-running
-services. The lab overlay adds `samba-ad` and `lab-dns`, for 25
+The base project defines 25 services: one `volume-init` one-shot plus 24
+long-running services, two of which (`vault-ui-proxy`, `oauth2-proxy-vault`)
+run only when the optional Vault UI profile is enabled. The lab overlay adds `samba-ad` and `lab-dns`, for 25
 long-running services. Wherever a service count matters below it refers to that
 current topology; historical rehearsal receipts that recorded a smaller set are
 held in [lab-dr-rehearsal.md](archive/lab-dr-rehearsal.md).
@@ -240,8 +241,9 @@ important blind spots: Traefik's private `/ping` can be healthy while a non-root
 process cannot read its dynamic TLS and router files, and Grafana's `/api/health`
 can be healthy while its provisioning tree was not loaded. The verify role
 therefore performs trusted TLS with exact SNI, requiring
-`portal.<domain>/healthz` = 200, internal `api.<domain>/ui` = 403, and ADM
-`admin.<domain>/` = 403, and it queries Grafana's authenticated API from an
+`portal.<domain>/healthz` = 200, internal `api.<domain>/ui` = 403, ADM
+`admin.<domain>/` = 303 (OIDC redirect), and
+`litellm-admin.<domain>/openapi.json` = 403, and it queries Grafana's authenticated API from an
 isolated `net-grafana` probe that must find the exact Prometheus, Loki, and Tempo
 datasource graph with each datasource reporting `OK`. That probe retries at most
 12 times with a five-second delay; Ansible streams the password on exact stdin
@@ -810,3 +812,15 @@ and unmanaged bridges whose names are outside the project inventory are outside
 the native container-input scope. Root on the VM, Docker daemon access, Compose
 file and entrypoint changes, and the encrypted secret overlay remain high-trust
 administrative boundaries.
+
+## Legacy lab reset
+
+`ansible/reset-rocky9-lab.yml` is a destructive, snapshot-gated teardown for
+the unmarked legacy lab VM only. It refuses to run without a verified
+hypervisor snapshot, exact VM identity and NIC binding, the profile
+`rocky9-lab`, and two literal acknowledgement tokens
+(`DESTROY_AIGW01_LAB_STATE` and `REMOVE_AIGW01_LEGACY_HOST_ARTIFACTS`); it
+removes only preflight-enumerated AIGW objects, never runs a broad prune,
+and hands the NICs to a fail-closed `drop` zone. It never targets a generic
+or customer inventory.
+

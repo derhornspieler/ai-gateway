@@ -1,5 +1,28 @@
 # Observability and Sensitive-Telemetry Operations
 
+## Telemetry sanitization and scrape scope (enforced in configuration)
+
+Alloy is the sanitization chokepoint: it promotes only server-authenticated
+identity into safe span attributes (`aigw.user.id`, `aigw.api_key.id`,
+`aigw.project.id`, strictly validated), then strips secret- and
+identity-bearing keys from every OTLP signal before batching or export —
+authorization and API-key material, raw request headers, cookies,
+client/server addresses and ports, query strings, and e-mail addresses.
+Telemetry that cannot be sanitized is dropped rather than exported.
+
+Prometheus scrapes only reviewed metrics/observability-plane endpoints (the
+two Traefik edges, Envoy's read-only stats facade, Keycloak management,
+Alloy, Grafana, Tempo, Loki, node-exporter, and itself); Vault, Postgres,
+Redis, and LiteLLM are deliberately not scraped because exposing their
+metrics would weaken an authentication boundary. Alert rules live in
+Prometheus (`compose/prometheus/rules.yml`), not Grafana.
+
+Grafana is fully provisioned and immutable in the UI: three reviewed
+dashboards (overview, live logs, request audit) in the "AI Gateway" folder,
+exactly three datasources (Prometheus, Loki, Tempo) with trace/log
+cross-linking, no plugin downloads, and no alerting configured in Grafana
+itself.
+
 This is the operational contract for the local Grafana stack and the optional
 Cribl export. It is explicit because AI prompt capture changes the
 data-classification, capacity, and recovery requirements of an otherwise ordinary

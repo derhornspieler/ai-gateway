@@ -1,6 +1,6 @@
 # AI Gateway — Project Status
 
-_As of 2026-07-13._
+_As of 2026-07-14._
 
 This is the living implementation-status record for AI Gateway. For the
 authoritative, gate-by-gate destructive-recovery evidence, see the
@@ -17,7 +17,19 @@ accepted, highly available, or ready for access reopening.
 
 ## What is implemented
 
-The repository contains an implemented base Compose stack of 24 services — one
+The hardened control-plane drop (July 2026) added: a generated per-customer
+inventory flow (`scripts/bootstrap-generic-rocky9.py` plus the controller-only
+`ansible/preflight-generic-rocky9.yml` gate), three new converge roles
+(`firewall_preflight`, `time_sync`, `host_finalize`), split internal/egress
+DNS resolver planes replacing the shared container resolver, four per-gate
+OAuth cookie secrets, an optional extracted-asset Vault browser UI
+(`vault-ui-proxy`), continuous portal-key reconciliation, a pre-Vault
+identity baseline bridge, an Anthropic WIF enrollment control plane,
+provisioned immutable Grafana dashboards with Alloy-side telemetry
+sanitization, and a snapshot-gated legacy lab reset playbook.
+
+
+The repository contains an implemented base Compose stack of 25 services — one
 `volume-init` one-shot DHI volume initializer plus 23 long-running services —
 using 18 of the 20 segmented Docker bridges that Ansible pre-creates. The
 lab overlay adds two long-running services: Samba AD on the isolated

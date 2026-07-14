@@ -295,3 +295,19 @@ Official references:
 - [Anthropic Workload Identity Federation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation)
 - [Anthropic WIF reference](https://platform.claude.com/docs/en/manage-claude/wif-reference)
 - [Manage WIF with the Admin API](https://platform.claude.com/docs/en/manage-claude/wif-admin-api)
+
+## Enrollment control plane
+
+Enrollment, disable, and delete now run through bounded key-rotator routes
+(`GET/PUT/DELETE /providers/anthropic`, `POST /providers/anthropic/disable`)
+surfaced in the admin portal. The enrollment payload carries only non-secret
+identifiers (organization, service account, federation rule, optional
+workspace, and the approved federation JWKS SHA-256 fingerprint) plus the
+literal confirmation `ENROLLED`; it is rejected unless identity bootstrap has
+already generated the `private_key_jwt` key in Vault, and any drift between
+the live Keycloak JWKS and the approved fingerprint is surfaced as a
+`jwks_drift` state rather than silently accepted. Disable stops refresh and
+lets the active short-lived credential expire; delete requires the literal
+`DELETE anthropic` and succeeds only with durable proof that the last
+short-lived credential was never issued or has already expired.
+

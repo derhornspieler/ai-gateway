@@ -141,13 +141,22 @@ additionally asserts that Docker's `FORWARD` chain actually jumps to
 
 ## 5. Container DNS enforcement
 
-Compose passes `CONTAINER_DNS_SERVER` as an explicit per-container DNS
-override. This matters on Docker 29: an inherited host resolver is dialed by
-`dockerd` from the host namespace and would bypass the forward path
-entirely, whereas the explicit override keeps queries inside the container
-namespace where `DOCKER-USER` and `aigw_guard` enforce them. Loopback,
-link-local, and multicast resolver values are rejected at preflight. Only
-Envoy's pinned address may reach the resolver.
+DNS is split into two non-overlapping resolver planes, rendered by Ansible
+into a dedicated `docker-compose.dns.yml` overlay (the legacy shared
+`CONTAINER_DNS_SERVER` variable is gone): `internal_dns_servers` (the
+corporate/ADM resolver plane, reachable only via the ADM and internal legs)
+and `egress_dns_servers` (the Internet resolver plane, reachable only by
+Envoy over the egress leg). Explicit per-container resolvers matter on
+Docker 29: an inherited host resolver is dialed by `dockerd` from the host
+namespace and would bypass the forward path entirely, whereas explicit
+per-plane resolvers keep queries inside the container namespace where
+`DOCKER-USER` and `aigw_guard` enforce them. Loopback, link-local, and
+multicast values are rejected at preflight, the two lists may not overlap,
+and only Envoy's pinned address may reach an Internet resolver. When the
+platform runs its own authoritative DNS
+(`platform_authoritative_dns_enabled`, default on only for the lab profile),
+the `docker-compose.platform-dns.yml` overlay adds the CoreDNS service,
+which then publishes port 53 on the exact ADM and internal host addresses.
 
 ## 6. Kernel settings
 

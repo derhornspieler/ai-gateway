@@ -1,190 +1,258 @@
-# AI Gateway — Ansible Deployment Runbook
+# AI Gateway — Deployment Runbook
 
-This runbook is the condensed, execution-order procedure for deploying AI
-Gateway onto a customer-provided Rocky Linux 9 VM with the repository's
-Ansible playbooks. It tells the deploying engineer exactly what to prepare,
-what values to supply, and in what order to run each step. The
-[deployment guide](deploy-guide.md) remains the authoritative reference for
-the rationale, edge cases, and full validation behavior behind each step;
-section references below point into it.
+This runbook walks you through deploying AI Gateway from nothing to a working
+system, step by step. It is written so that an engineer with basic IT
+experience — comfortable with a terminal, SSH, and editing a text file — can
+complete the deployment without prior knowledge of this project. Every step
+tells you what to type, what you should see, and what to do if you don't see
+it. Deeper explanations live in the [deployment guide](deploy-guide.md); you
+do not need them to finish this runbook.
 
-**Audience:** an infrastructure engineer with SSH and sudo access to the
-target VM and permission to manage the customer's DNS and certificate
-issuance.
+**Time required:** roughly 2–4 hours, most of it waiting for the automated
+converge.
 
-**Scope:** the `generic-rocky9` profile (one Docker Compose project on one
-VM). The `rocky9-lab` profile differs only where noted.
+**The two computers involved:**
 
-## 1. Before you begin
-
-Confirm every item below before running any playbook. The preflight fails
-closed on each of these, but confirming them first avoids a failed first run.
-
-| # | Requirement | Detail |
+| Name | What it is | What you do on it |
 |---|---|---|
-| 1 | Control node | `ansible-core` 2.16+, SSH key access to a sudo-capable account on the VM, host-key verification enabled |
-| 2 | Target OS | Rocky Linux 9 with Python 3 |
-| 3 | SELinux | Rocky `targeted` policy already **Enforcing** — the playbook verifies this and will not convert a permissive or disabled host |
-| 4 | Interfaces | Three distinct, active, already-addressed IPv4 interfaces (egress, ADM, internal); exactly one main-table default route, through the egress interface |
-| 5 | DNS resolver | A real, non-loopback resolver reachable over a supplied physical leg |
-| 6 | Time sync | Working NTP/chrony (OIDC, TLS, and short-lived JWTs depend on it) |
-| 7 | Encrypted storage | `/var/lib/docker` (or the configured `docker_data_root`) and `/opt/ai-gateway` must resolve through a `crypto_LUKS` block-device ancestor |
-| 8 | Capacity | Base service limits total ≈ 19.6 GiB memory. A 4-vCPU / 12-GiB / 40-GB VM is a low-volume lab baseline only; size production from measured workload (see the [scaling posture](high-availability.md)) |
-| 9 | Outbound access | Package/image retrieval and vendor API traffic (or a completed [offline image seed](offline-image-seed.md)) |
+| **Controller** | Your workstation or a jump host (Linux or macOS) | Run the setup scripts and Ansible commands |
+| **Target VM** | The Rocky Linux 9 virtual machine that will run AI Gateway | Mostly nothing — Ansible configures it for you. You log in once, near the end |
 
-Install the pinned collections once on the control node:
+> **What is Ansible?** An automation tool that connects to the target VM over
+> SSH and configures it exactly as this repository specifies. You run it from
+> the controller; it does the work on the VM. If any safety check fails, it
+> stops *before* changing anything — a failed run early on is normal and safe.
+
+---
+
+## Part 1 — Check the target VM (10 minutes)
+
+Someone (you, or your virtualization/cloud team) must provide a VM that meets
+this checklist **before** you start. For each row, run the check command on
+the VM and compare.
+
+| # | Requirement | How to check (run on the VM) | You should see |
+|---|---|---|---|
+| 1 | Rocky Linux 9 | `cat /etc/rocky-release` | `Rocky Linux release 9.x` |
+| 2 | Three network interfaces, each already configured with its own IP address: one for internet egress, one for administrators (ADM), one for internal users | `ip -br -4 address` | Three interfaces, each with an IPv4 address |
+| 3 | Exactly one default route, on the egress interface | `ip -4 route show table main` | One line starting `default via …` naming the egress interface |
+| 4 | SELinux enforcing | `getenforce` | `Enforcing` |
+| 5 | Encrypted disk under Docker and the install directory | `lsblk -o NAME,FSTYPE \| grep crypto_LUKS` | At least one `crypto_LUKS` entry backing the root/data volume |
+| 6 | Clock synchronized | `chronyc tracking \| head -2` | A reference server and a small offset (under 5 seconds) |
+| 7 | A login account with sudo that accepts your SSH key | `ssh <user>@<vm> sudo -n true` from the controller | No password prompt, no error |
+| 8 | Enough resources | — | At least 4 vCPU / 24 GiB RAM / 100 GB disk for a pilot; the services alone reserve ~20 GiB of memory |
+
+If any row fails, stop and fix it first — the automation checks all of these
+and will refuse to proceed.
+
+Write down these values now; you will need them in Part 3:
+
+- The **names** of the three interfaces (e.g. `ens160`, `ens192`, `ens224`)
+  and which role each plays (egress / ADM / internal)
+- Each interface's **IP address** and **gateway**
+- The **network range (CIDR)** administrators connect from (e.g. `10.8.10.0/24`)
+- The **network range (CIDR)** internal users connect from
+- One to three **internal DNS server** addresses (your corporate resolvers)
+- One to three **internet DNS server** addresses (what the gateway may use to
+  look up AI vendor APIs — must be different servers from the internal list)
+- The **base domain** the services will live under (e.g. `aigw.example.com` —
+  the system creates hostnames like `chat.aigw.example.com` under it)
+
+## Part 2 — Prepare the controller (10 minutes)
+
+On your workstation:
 
 ```bash
+# 1. Confirm Ansible 2.16 or newer is installed
+ansible --version | head -1
+
+# 2. Get the repository and its pinned dependencies
+git clone <repository-url> ai-gateway
+cd ai-gateway
 ansible-galaxy collection install -r ansible/requirements.yml
 ```
 
-## 2. Values the engineer must supply
-
-### 2.1 Connection and network topology (non-secret)
-
-Provide these in an environment-specific inventory or `--extra-vars` file
-(for example `/secure/customer-topology.yml`). Every variable also accepts
-the listed `AIGW_*` environment variable on the control node. None have
-usable defaults except where shown; the playbook rejects empty values before
-mutating the host.
-
-| Ansible variable | Environment equivalent | Value to supply |
-|---|---|---|
-| `ansible_host` | `AIGW_ANSIBLE_HOST` | SSH management address of the VM |
-| `ansible_user` | `AIGW_ANSIBLE_USER` | sudo-capable SSH account (default `ansible`) |
-| `deployment_profile` | `AIGW_DEPLOYMENT_PROFILE` | `generic-rocky9` (default) or `rocky9-lab` |
-| `nic_egress` | `AIGW_NIC_EGRESS` | interface name owning the only default route |
-| `nic_adm` | `AIGW_NIC_ADM` | administrator/VPN interface name |
-| `nic_internal` | `AIGW_NIC_INTERNAL` | internal-user interface name |
-| `eth0_ip` / `eth0_gateway` | `AIGW_EGRESS_IP` / `AIGW_EGRESS_GATEWAY` | existing egress address and next hop |
-| `eth1_ip` / `eth1_gateway` | `AIGW_ADM_IP` / `AIGW_ADM_GATEWAY` | existing ADM address and next hop |
-| `eth2_ip` / `eth2_gateway` | `AIGW_INTERNAL_IP` / `AIGW_INTERNAL_GATEWAY` | existing internal address and next hop |
-| `vpn_client_cidr` | `AIGW_VPN_CLIENT_CIDR` | only source range permitted to ADM TCP/22 and TCP/443 |
-| `internal_cidr` | `AIGW_INTERNAL_CIDR` | only source range permitted to internal TCP/443 |
-| `container_dns_server` | `AIGW_CONTAINER_DNS_SERVER` | real resolver address; loopback, link-local, and multicast values are rejected |
-
-The `eth0_/eth1_/eth2_` names are semantic labels; actual interfaces may be
-named `enp*`, `ens*`, or otherwise. Ansible validates the supplied names,
-live addresses, gateways, default route, and source CIDRs against the running
-host and stops before the first mutating role on any mismatch
-(deploy-guide §“Connection and topology”).
-
-### 2.2 Domain and DNS
-
-Supply the base `DOMAIN` for the stack. The customer DNS must resolve the
-service hosts (`portal`, `auth`, `admin`, `admin-portal`, `grafana`,
-`prometheus`, `vault`, and the chat/API hosts) to the correct leg — the
-verify role checks them (deploy-guide §“DNS and certificates”).
-
-### 2.3 Secrets (encrypted overlay)
-
-All credentials live only in the Ansible-Vault-encrypted overlay
-`ansible/inventory/group_vars/gateway/vault.yml`. Edit it in place — never
-create a plaintext working copy:
+Create a **vault password file** — a single strong passphrase that encrypts
+all the secrets this deployment will generate. Do not reuse an existing
+password:
 
 ```bash
-ansible-vault edit ansible/inventory/group_vars/gateway/vault.yml
+umask 077
+openssl rand -base64 30 > ~/.aigw-vault-pass
 ```
 
-Prepare values that meet these enforced constraints (characters are generally
-restricted to `[A-Za-z0-9_-]`; the role rejects short values and obvious
-placeholders):
+Keep this file safe (and back the passphrase up in your password manager):
+without it, the deployment's secrets cannot be read or changed later.
 
-| Secret | Constraint |
+## Part 3 — Generate your deployment folder (5 minutes)
+
+One command creates a dedicated inventory for this customer/host, with every
+secret generated randomly and stored only in encrypted form:
+
+```bash
+scripts/bootstrap-generic-rocky9.py \
+  --inventory-alias mygateway \
+  --vault-id mygateway \
+  --vault-password-file ~/.aigw-vault-pass
+```
+
+Pick your own short name instead of `mygateway` (letters, digits, dots,
+dashes). **You should see** it create three files under
+`ansible/inventory/generated/mygateway/` and print the exact next command to
+run. It never prints or stores a secret in plain text.
+
+Now open the one file you must fill in:
+
+```bash
+nano ansible/inventory/generated/mygateway/host_vars/mygateway.yml
+```
+
+Every blank value maps to something you wrote down in Part 1. The essentials:
+
+| Field | What to put there |
 |---|---|
-| `pg_super_password` | 24+ characters |
-| `pg_litellm_password`, `pg_keycloak_password`, `pg_rotator_password` | 24+ each |
-| `kc_admin_password` | 24+ (temporary bootstrap user) |
-| `kc_bootstrap_admin_client_secret` | 32+ (one-time bootstrap client) |
-| `litellm_master_key` | 32+, normally `sk-...` |
-| `litellm_salt_key` | 32+ |
-| `redis_password` | 32+ |
-| `webui_litellm_key` | scoped LiteLLM virtual key — never the master key |
-| `webui_secret_key` | 32+, stable for the life of the deployment |
-| `webui_oidc_client_secret`, `portal_oidc_client_secret`, `admin_portal_oidc_client_secret`, `oauth2_proxy_client_secret` | 32+ each |
-| `oauth2_proxy_cookie_secret` | exactly 32 alphanumeric bytes |
-| `portal_session_secret`, `admin_portal_session_secret` | 32+ each, mutually distinct |
-| `rotator_internal_token`, `portal_identity_token` | 32+ each, mutually distinct |
-| `grafana_admin_password` | 24+ |
+| `ansible_host` | The VM's management IP (usually the ADM address) |
+| `ansible_user` | The sudo account from Part 1, row 7 |
+| `aigw_domain` | Your base domain, lowercase (e.g. `aigw.example.com`) |
+| `nic_egress` / `nic_adm` / `nic_internal` | The three interface **names** |
+| `eth0_ip` / `eth0_gateway` | Egress interface IP and gateway |
+| `eth1_ip` / `eth1_gateway` | ADM interface IP and gateway |
+| `eth2_ip` / `eth2_gateway` | Internal interface IP and gateway |
+| `vpn_client_cidr` | The administrators' network range |
+| `internal_cidr` | The internal users' network range |
+| `internal_dns_servers` | Your corporate resolver list (1–3 addresses) |
+| `egress_dns_servers` | The internet resolver list (1–3 addresses, no overlap with the line above) |
 
-The `rocky9-lab` profile additionally requires the five 16+ character Samba
-lab secrets (`samba_ad_admin_password`, `samba_ad_bind_password`, and the
-three `samba_user_lab_*` passwords).
+Leave everything you don't understand at its default — the defaults are the
+safe, fail-closed choices. (The `eth0/1/2` names are just labels; your real
+interfaces can be called anything.)
 
-### 2.4 Optional overrides
+## Part 4 — Pass the preflight gate (2 minutes)
 
-Review these only when the customer environment requires them
-(deploy-guide §“Inputs”): `docker_data_root`, `encrypted_state_paths`,
-`require_encrypted_state`, `require_preupgrade_backup`,
-`aigw_management_ssh_port`, and the external Cribl export block
-(`cribl_external_export_enabled` and its endpoint/TLS variables).
-
-## 3. Deployment procedure
-
-Run each step in order; do not skip a verification step.
-
-1. **Verify the customer topology read-only** on the VM before any playbook:
-
-   ```bash
-   ip -br -4 address
-   ip -4 route show table main
-   ip -4 route get <ADM_GATEWAY> oif <ADM_INTERFACE>
-   ip -4 route get <INTERNAL_GATEWAY> oif <INTERNAL_INTERFACE>
-   ```
-
-2. **Confirm controller connectivity:**
-
-   ```bash
-   export AIGW_ANSIBLE_HOST=<VM_MANAGEMENT_ADDRESS>
-   export AIGW_ANSIBLE_USER=<SUDO_ACCOUNT>
-   ansible -i ansible/inventory/hosts.yml gateway -m ping
-   ```
-
-3. **Run the full converge.** The vault password unlocks the secret overlay;
-   the extra-vars file carries the non-secret topology:
-
-   ```bash
-   ansible-playbook -i ansible/inventory/hosts.yml ansible/site.yml \
-     -e @/secure/customer-topology.yml --ask-vault-pass
-   ```
-
-   Keep the existing console/SSH session open until the run completes: the
-   playbook hardens sshd (key-only, no forwarding) and proves a fresh key-only
-   login before proceeding. Roles run in a fixed order — `host_preflight`,
-   `selinux_baseline`, `network_routing`, `firewalld_zones`, `os_baseline`,
-   `docker_networks`, `docker_stack`, `verify` — and the run stops at the
-   first failed contract.
-
-4. **Expect the Vault gate on the first converge.** Vault starts
-   uninitialized and sealed, so the first run deliberately waits only for the
-   bootstrap-independent services and prints the explicit Vault gate; this is
-   normal, not a failure.
-
-5. **Initialize Vault.** On the lab profile, run `scripts/vault-bootstrap.sh`
-   on the VM. For a customer deployment, the lab bootstrap is not
-   production-safe; perform the reviewed production Vault ceremony instead
-   (see [operations](operations.md) and the
-   [project status](project-status.md) open items).
-
-6. **Re-run the converge** (or the runtime helper) once Vault is initialized
-   and unsealed; this run waits for the complete service graph.
-
-7. **Bootstrap identity.** Establish the first `aigw-admins` administrator
-   through the controlled Keycloak/customer-IdP procedure, then run the admin
-   portal's identity-controller initialization
-   ([identity operations](identity-operations.md)).
-
-8. **Accept.** Execute the applicable sections of the
-   [acceptance test runbook](test-runbook.md) before opening user access.
-
-## 4. Re-running and application-only rollouts
-
-The full `site.yml` converge is idempotent and safe to re-run. For
-application-only changes on an already-converged host, use
-`ansible/deploy-stack-only.yml`, which refuses to run against a stale
-firewall or network configuration (deploy-guide §“Stack-only rollout”).
-Render-only validation that starts no containers:
+This checks your folder for mistakes **without touching the VM at all**:
 
 ```bash
-scripts/validate-compose.sh
+ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
+  ansible/preflight-generic-rocky9.yml --limit mygateway \
+  --vault-id mygateway@~/.aigw-vault-pass
 ```
+
+**You should see** a line containing `AIGW_GENERIC_PREFLIGHT=` with
+`"status": "ok"`. If the status is `invalid`, the same line lists exactly
+which fields are missing or malformed — fix them in the `host_vars` file and
+run it again. Repeat until it says `ok`.
+
+Then confirm the controller can actually reach the VM:
+
+```bash
+ansible -i ansible/inventory/generated/mygateway/hosts.yml mygateway -m ping
+```
+
+**You should see** `"ping": "pong"`. If not, check `ansible_host`,
+`ansible_user`, and your SSH key.
+
+## Part 5 — Register the DNS names (coordinate with your DNS admin)
+
+Before the converge, your DNS must point these names at the gateway. All of
+them are hostnames under your base domain:
+
+| Hostname | Points to | Who uses it |
+|---|---|---|
+| `chat.<domain>`, `portal.<domain>`, `api.<domain>`, `auth.<domain>` | the **internal** interface IP | users and developers |
+| `admin.<domain>`, `admin-portal.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, `vault.<domain>` | the **ADM** interface IP | administrators only |
+
+## Part 6 — Run the converge (30–90 minutes)
+
+This is the main event. Keep your current terminal open until it finishes —
+the automation hardens SSH partway through and proves it can still log in
+before continuing, but don't close your safety line early.
+
+```bash
+ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
+  ansible/site.yml --limit mygateway \
+  --vault-id mygateway@~/.aigw-vault-pass
+```
+
+What happens, in order: safety checks on the host → clock verification →
+SELinux verification → network policy routing → firewall zones and packet
+rules → OS packages, Docker, and SSH hardening → 20 isolated container
+networks → configuration rendering, image builds, and container start →
+verification of everything it just did.
+
+**Two outcomes are normal:**
+
+- It stops early with a clear assertion message. Nothing was changed; read
+  the message, fix the input, and run it again.
+- It completes but prints an explicit notice that **Vault is not initialized
+  yet** and that it only waited for the core services. **This is expected on
+  the first run** — Vault (the secrets safe) starts empty and sealed on
+  purpose. Continue to Part 7.
+
+## Part 7 — Initialize the secrets vault (10 minutes)
+
+Log in to the VM (first time you actually need to) and run the bootstrap:
+
+```bash
+ssh <ansible_user>@<vm>
+cd /opt/ai-gateway
+sudo scripts/vault-bootstrap.sh
+```
+
+> **Important:** this is the built-in **lab/test** Vault ceremony — one
+> unseal key, no TLS on the internal listener. It is acceptable for a pilot;
+> a production deployment replaces it with the customer's reviewed Vault
+> ceremony (see [operations](operations.md)).
+
+The script initializes Vault, sets up the credential-rotation policies, and
+then waits (up to 10 minutes) for the entire service graph to become
+healthy. **You must securely store** the unseal key and root token it
+produces — print them to paper or a password manager, never a shared drive.
+Anyone with them controls the gateway's secrets; without the unseal key, a
+reboot leaves the system locked.
+
+Back on the controller, run the converge from Part 6 **once more**. This
+time Vault is ready, so it waits for — and verifies — the complete system.
+
+## Part 8 — First administrator and sign-off (15 minutes)
+
+1. Connect your directory and create the first administrator following
+   [identity operations](identity-operations.md) — the short version: a
+   Keycloak/directory procedure grants one named person the `aigw-admins`
+   role, and that person then presses **Initialize identity control** in the
+   admin portal at `https://admin.<domain>`.
+2. From an administrator machine (on the ADM network), open
+   `https://admin.<domain>` and `https://grafana.<domain>` — both should
+   redirect you to a login page and let the administrator in.
+3. From a user machine (on the internal network), open
+   `https://chat.<domain>` — you should reach the chat login.
+4. Enroll the AI vendor credential (Anthropic) following
+   [anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md).
+5. Before opening access to real users, run the applicable sections of the
+   [acceptance test runbook](test-runbook.md).
+
+## Troubleshooting quick reference
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| Preflight says `"status": "invalid"` | A blank or malformed field in `host_vars` | The receipt lists the exact keys; fix and rerun — nothing was touched |
+| `ping` fails in Part 4 | SSH target/user/key wrong | Verify `ssh <user>@<vm>` works by hand first |
+| Converge stops at a topology assertion | The values you entered disagree with the VM's live interfaces/routes | Re-run the Part 1 checks; correct `host_vars` |
+| Converge stops at SELinux / clock / encryption | VM doesn't meet Part 1 rows 4–6 | Fix the VM (this may need the VM team), rerun |
+| First converge "waits only for core services" and mentions Vault | Not an error | Expected — do Part 7 |
+| A service is unhealthy after Part 7 | Vault sealed (e.g. after a reboot) | `sudo scripts/vault-unseal.sh` on the VM with the stored unseal key |
+| You need to change a secret later | — | `ansible-vault edit ansible/inventory/generated/<alias>/group_vars/generic_rocky9/vault.yml --vault-id <alias>@<password-file>`, then rerun the converge |
+
+## Glossary
+
+- **Converge** — one full run of the Ansible automation that brings the VM to
+  the exact desired state. Safe to rerun; an unchanged system stays unchanged.
+- **Vault** — the built-in secrets safe holding provider credentials and
+  signing keys. Starts sealed (locked) until initialized/unsealed.
+- **Unseal key** — the key that unlocks Vault after every restart. Stored by
+  a human, never on the VM.
+- **ADM / internal / egress** — the three network legs: administrators-only,
+  internal users, and outbound internet (AI vendors), respectively. Nothing
+  listens on the egress leg.
+- **Inventory** — the folder generated in Part 3 holding this deployment's
+  connection details, topology, and encrypted secrets.
+- **Preflight** — a check that reads and validates but changes nothing.

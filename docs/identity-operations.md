@@ -480,3 +480,46 @@ Keycloak logout and that no cookie survives the eight-hour maximum. See
 [project-status.md](project-status.md) for the overall prototype posture: this is
 a customer prototype, not a turnkey, highly available appliance, and recovery
 acceptance does not confer HA.
+
+## Continuous key reconciliation and pre-Vault identity baseline
+
+Two mechanisms added by the hardened control plane are worth knowing:
+
+**Portal-key reconciliation (`sys_portal_key_reconciliation`).** A recurring
+key-rotator job (`PORTAL_KEY_RECONCILE_INTERVAL_SECONDS`, default 60 s)
+sweeps every portal-issued LiteLLM key and revokes any whose owner no longer
+holds live managed-project membership — the safety net for removals made
+directly in the Keycloak console that bypass portal mutation hooks. An
+identity-lookup outage is treated as "unknown", not "empty": keys are
+preserved and the job reports unhealthy rather than over-revoking. The
+dev-portal additionally re-verifies live membership at mint time and again
+immediately after generation, deactivating any key whose liveness cannot be
+proved before disclosure.
+
+**Pre-Vault identity baseline.** Because a fresh converge runs with Vault
+sealed, a bounded one-time reconciler
+(`services/key-rotator/app/reconcile_pre_vault_identity.py`, confirmation
+string `RECONCILE_PRE_VAULT_MANAGED_IDENTITY_BASELINE`) can make one named,
+federated administrator able to cross the OAuth gate before Vault exists. It
+uses only the temporary Keycloak bootstrap client, never touches Vault,
+never deletes Keycloak objects, and fails closed on any undeclared member or
+role mapping. A sibling one-time reconciler
+(`RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES`) maintains the realm-role scope
+mappings on the four relying parties. Both are invoked root-owned through
+Ansible, never interactively.
+
+**Provider enrollment control plane.** Anthropic WIF enrollment, disable, and
+delete now run through bounded rotator routes (`/providers/anthropic*`)
+surfaced in the admin portal. Enrollment accepts only non-secret identifiers
+plus the confirmation `ENROLLED`, requires the `private_key_jwt` key to exist
+in Vault first, and pins the approved federation JWKS fingerprint; disable
+and delete require the exact strings `DISABLE anthropic` / `DELETE
+anthropic`, and delete succeeds only with proof the last short-lived
+credential was never issued or has expired. See
+[anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md).
+
+After any OIDC-affecting change in the lab, run the acceptance harness
+`scripts/test-oidc-callbacks.py --ca <ca.pem> --target all` to prove every
+protected service completes the full login→callback→landing flow (expect
+`OIDC_CALLBACK_ALL_PASS`).
+

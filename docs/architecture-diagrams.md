@@ -227,14 +227,17 @@ run stops at the first failure, before later stages can mutate the host.
 
 ```mermaid
 flowchart TD
-  R1[host_preflight<br/>topology, SELinux enforcing,<br/>encrypted-state backing] --> R2[selinux_baseline<br/>container-selinux, MCS contract]
+  R1[host_preflight<br/>topology, dedicated-host adoption,<br/>encrypted-state backing] --> R1b[firewall_preflight<br/>existing firewall-state audit]
+  R1b --> R1c[time_sync<br/>proven synchronized clock<br/>before signed installs]
+  R1c --> R2[selinux_baseline<br/>container-selinux, MCS contract,<br/>enforcing required]
   R2 --> R3[network_routing<br/>additive tables 101/102]
   R3 --> R4[firewalld_zones<br/>zone ownership by live UUID;<br/>nftables + DOCKER-USER live]
   R4 --> R5[os_baseline<br/>Docker CE behind packet policy;<br/>sshd hardening with proven re-login]
   R5 --> R6[docker_networks<br/>20 pinned bridges]
   R6 --> R7[docker_stack<br/>render .env + secrets, bind digests,<br/>DB contracts, volume-init, pinned builds,<br/>Compose up — no implicit builds]
   R7 --> R8[verify<br/>routing, firewall, listeners, DNS,<br/>SELinux/MCS, zero AVCs]
-  R8 --> GATE{Vault initialized<br/>and unsealed?}
+  R8 --> R9[host_finalize<br/>promote dedicated-host marker]
+  R9 --> GATE{Vault initialized<br/>and unsealed?}
   GATE -- no — first converge --> WAIT[Reduced wait + explicit Vault gate<br/>→ initialize Vault, re-run]
   GATE -- yes --> FULL[Full service-graph wait — done]
 ```
