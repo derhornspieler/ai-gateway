@@ -58,13 +58,13 @@ http:
       entryPoints: [websecure]
       service: oauth2-proxy-prometheus
       tls: {}
-{{ if eq (env "VAULT_UI_ENABLED") "true" }}
+# {{ if eq (env "VAULT_UI_ENABLED") "true" }}
     vault:
       rule: 'Host(`vault.{{ env "DOMAIN" }}`)'
       entryPoints: [websecure]
       service: oauth2-proxy-vault
       tls: {}
-{{ end }}
+# {{ end }}
     keycloak-admin:
       # The ADM listener is source-restricted to the VPN CIDR by host firewall
       # and DOCKER-USER rules. It carries the admin console/master realm that
@@ -105,11 +105,11 @@ http:
     oauth2-proxy-prometheus:
       loadBalancer:
         servers: [{ url: "http://oauth2-proxy-prometheus:4180" }]
-{{ if eq (env "VAULT_UI_ENABLED") "true" }}
+# {{ if eq (env "VAULT_UI_ENABLED") "true" }}
     oauth2-proxy-vault:
       loadBalancer:
         servers: [{ url: "http://oauth2-proxy-vault:4180" }]
-{{ end }}
+# {{ end }}
     keycloak:
       loadBalancer:
         # This network-scoped alias resolves only on net-admin-app. It prevents

@@ -262,8 +262,12 @@ class VaultUIProxyContractTests(unittest.TestCase):
         )
 
     def test_route_and_platform_dns_follow_the_toggle(self) -> None:
-        condition = '{{ if eq (env "VAULT_UI_ENABLED") "true" }}'
+        # Keep Traefik's Go-template actions inside YAML comments: Go still
+        # executes the actions, while source-level YAML linters can parse the
+        # unrendered file used by CI and offline review.
+        condition = '# {{ if eq (env "VAULT_UI_ENABLED") "true" }}'
         self.assertEqual(TRAEFIK_ADM.count(condition), 2)
+        self.assertEqual(TRAEFIK_ADM.count("# {{ end }}"), 2)
         self.assertIn("VAULT_UI_ENABLED: ${VAULT_UI_ENABLED:-false}", COMPOSE)
         vault_record = "vault        IN A {{ eth1_ip }}"
         self.assertIn(vault_record, ADM_ZONE)
