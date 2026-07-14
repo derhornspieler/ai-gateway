@@ -508,6 +508,10 @@ def _full_valid_host_vars(contract: dict, profile: str) -> str:
         "aigw_ssh_password_authentication: false",
         "aigw_adm_socks_enabled: false",
         "aigw_lab_reset_handoff_drop_interfaces: []",
+        # Edge TLS mode is a required production input. 'vault-intermediate'
+        # is the mode that needs no operator-supplied file paths, so it keeps
+        # this fixture to the contract's own required-key set.
+        "aigw_edge_tls_mode: vault-intermediate",
     ]
     for index, entry in enumerate(contract["required_secret_keys"]):
         length = entry.get("exact_length") or entry["min_length"]

@@ -40,9 +40,11 @@ TARGETS=(
   scripts/rotate-vault-audit.sh
   scripts/state-backup.sh
   scripts/state-restore.sh
+  scripts/sign-vault-intermediate.sh
   scripts/validate-compose.sh
   scripts/validate-vault-config.sh
   scripts/vault-bootstrap.sh
+  scripts/vault-pki-intermediate.sh
   scripts/vault-unseal.sh
   services/egress-proxy/generate-pins.sh
   services/samba-ad-lab/policy-rc.d
