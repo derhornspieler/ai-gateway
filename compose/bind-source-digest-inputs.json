@@ -23,10 +23,13 @@
     ]
   },
   "lab_identity": {
+    "keycloak": ["certs/ca.pem", "keycloak/realms"],
     "key-rotator": ["secrets/samba_ad_bind_password"],
     "samba-ad": [
       "secrets/samba_ad_admin_password",
       "secrets/samba_ad_bind_password",
+      "secrets/samba_ad_tls_cert",
+      "secrets/samba_ad_tls_key",
       "secrets/samba_user_lab-admin_password",
       "secrets/samba_user_lab-developer_password",
       "secrets/samba_user_lab-user_password"

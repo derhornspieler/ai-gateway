@@ -86,19 +86,39 @@ assert set(manifest) == {"base", "platform_dns", "lab_identity", "identity_ldap"
 service_pattern = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 segment_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 assert set(manifest["base"]).isdisjoint(manifest["platform_dns"])
-assert set(manifest["base"]).isdisjoint(manifest["lab_identity"])
+# Each identity overlay (lab Samba AD, external directory) mounts one extra CA
+# into Keycloak's truststore, so each REPLACES keycloak's base source list and
+# may re-state `keycloak`. Every OTHER service name stays disjoint from base.
+assert (set(manifest["base"]) & set(manifest["lab_identity"])) <= {"keycloak"}
+assert (set(manifest["base"]) & set(manifest["identity_ldap"])) <= {"keycloak"}
 assert set(manifest["platform_dns"]).isdisjoint(manifest["lab_identity"])
-# The two identity sources are mutually exclusive, so their key-rotator entries
-# may collide; nothing else may. Keycloak's identity_ldap entry deliberately
-# re-states keycloak/realms because the overlay REPLACES the base source list.
+# The two identity sources are mutually exclusive, so their key-rotator and
+# keycloak entries may collide with each other; nothing else may.
 assert set(manifest["identity_ldap"]).isdisjoint(manifest["platform_dns"])
+assert set(manifest["lab_identity"]).isdisjoint(manifest["platform_dns"])
 assert set(manifest["identity_ldap"]) == {"keycloak", "key-rotator"}
+assert set(manifest["lab_identity"]) == {"keycloak", "key-rotator", "samba-ad"}
 assert manifest["identity_ldap"]["keycloak"] == [
     "keycloak/identity-ldap-ca.pem",
     "keycloak/realms",
 ]
 assert manifest["identity_ldap"]["key-rotator"] == [
     "secrets/identity_ldap_bind_password"
+]
+# The lab keycloak digest captures the shared Aegis CA chain (certs/ca.pem)
+# added to Keycloak's truststore, alongside the realm import it replaces.
+assert manifest["lab_identity"]["keycloak"] == ["certs/ca.pem", "keycloak/realms"]
+assert manifest["lab_identity"]["key-rotator"] == ["secrets/samba_ad_bind_password"]
+# The lab DC digest binds its LDAPS leaf+key so a re-issued certificate forces a
+# samba-ad recreation on the next converge.
+assert manifest["lab_identity"]["samba-ad"] == [
+    "secrets/samba_ad_admin_password",
+    "secrets/samba_ad_bind_password",
+    "secrets/samba_ad_tls_cert",
+    "secrets/samba_ad_tls_key",
+    "secrets/samba_user_lab-admin_password",
+    "secrets/samba_user_lab-developer_password",
+    "secrets/samba_user_lab-user_password",
 ]
 for profile in ("base", "platform_dns", "lab_identity", "identity_ldap"):
     assert isinstance(manifest[profile], dict) and manifest[profile]
@@ -633,6 +653,8 @@ if ansible.is_file():
         "'/secrets/redis_users.acl'",
         "'/secrets/samba_ad_admin_password'",
         "'/secrets/samba_ad_bind_password'",
+        "'/secrets/samba_ad_tls_cert'",
+        "'/secrets/samba_ad_tls_key'",
         "'/keycloak/identity-ldap-ca.pem'",
         "'/secrets/identity_ldap_bind_password'",
     ):
@@ -1483,6 +1505,11 @@ samba_mounts = {mount["target"]: mount for mount in samba["volumes"]}
 expected_samba_relabels = {
     "/run/secrets/samba_ad_admin_password": "Z",
     "/run/secrets/samba_ad_bind_password": "z",
+    # The CA-issued LDAPS leaf + key are private to this DC (never shared with a
+    # peer), so a private-category Z relabel is correct. The key is delivered
+    # root:root 0640 on the host and is never world-readable.
+    "/run/secrets/samba_ad_tls_cert": "Z",
+    "/run/secrets/samba_ad_tls_key": "Z",
     "/run/secrets/samba_user_lab-admin_password": "Z",
     "/run/secrets/samba_user_lab-developer_password": "Z",
     "/run/secrets/samba_user_lab-user_password": "Z",
@@ -1492,8 +1519,38 @@ for target, expected_relabel in expected_samba_relabels.items():
     assert mount["type"] == "bind", target
     assert mount["read_only"] is True, target
     assert mount["bind"]["selinux"] == expected_relabel, target
+# The DC serves LDAPS on the FQDN the CA-signed leaf bears, resolvable inside
+# net-identity via a Docker network alias. A bare-hostname endpoint is unusable
+# under the customer CA name constraints.
+assert samba["environment"]["SAMBA_LDAPS_FQDN"] == "samba-ad.aigw.aegisgroup.ch"
+assert "samba-ad.aigw.aegisgroup.ch" in samba["networks"]["net-identity"]["aliases"]
+
+# Keycloak trusts the REAL Aegis chain for LDAPS (production trust path). The
+# self-signed DC cert is kept ONLY as a comma-separated bootstrap-window anchor.
+keycloak_lab = config["services"]["keycloak"]
+assert keycloak_lab["environment"]["KC_TRUSTSTORE_PATHS"] == (
+    "/etc/aigw/aegis-ca.pem,/var/lib/samba-public/ca.pem"
+)
+assert keycloak_lab["environment"]["KC_TLS_HOSTNAME_VERIFIER"] == "DEFAULT"
+assert keycloak_lab["environment"]["KC_TLS_HOSTNAME_VERIFIER"] != "ANY"
+aegis_mount = next(
+    mount for mount in keycloak_lab["volumes"]
+    if mount["target"] == "/etc/aigw/aegis-ca.pem"
+)
+assert aegis_mount["type"] == "bind"
+assert aegis_mount["read_only"] is True
+# certs/ is SHARED with traefik-int/traefik-adm/open-webui/alloy: the shared
+# lowercase category `z` is mandatory. A private `Z` would steal the label.
+assert aegis_mount["bind"]["selinux"] == "z", aegis_mount["bind"]["selinux"]
+assert Path(aegis_mount["source"]).as_posix().endswith("/certs/ca.pem")
+
+rotator_lab = config["services"]["key-rotator"]
+assert rotator_lab["environment"]["LAB_SAMBA_LDAP_ENABLED"] == "true"
+assert rotator_lab["environment"]["LAB_SAMBA_LDAP_URL"] == (
+    "ldaps://samba-ad.aigw.aegisgroup.ch:636"
+)
 rotator_bind = next(
-    mount for mount in config["services"]["key-rotator"]["volumes"]
+    mount for mount in rotator_lab["volumes"]
     if mount["target"] == "/run/secrets/samba_keycloak_bind_password"
 )
 assert rotator_bind["type"] == "bind"

@@ -449,7 +449,14 @@ class IdentityLdapLabProviderIdentityTests(unittest.TestCase):
     def test_the_lab_overlay_is_untouched_by_the_production_feature(self) -> None:
         lab = (ROOT / "compose" / "docker-compose.lab.yml").read_text(encoding="utf-8")
         self.assertIn("LAB_SAMBA_LDAP_ENABLED", lab)
-        self.assertIn("KC_TRUSTSTORE_PATHS: /var/lib/samba-public/ca.pem", lab)
+        # The lab now trusts the REAL Aegis chain (certs/ca.pem) for LDAPS, with
+        # the self-signed DC certificate kept only as a bootstrap-window anchor.
+        # It still shares NONE of the production external-directory overlay's
+        # inventory-driven IDENTITY_LDAP surface.
+        self.assertIn(
+            "KC_TRUSTSTORE_PATHS: /etc/aigw/aegis-ca.pem,/var/lib/samba-public/ca.pem",
+            lab,
+        )
         self.assertNotIn("IDENTITY_LDAP", lab)
 
 

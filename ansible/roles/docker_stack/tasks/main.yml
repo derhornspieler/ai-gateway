@@ -1226,6 +1226,63 @@
     label: "{{ item.item.filename }}"
   when: samba_lab_enabled | bool
 
+# The lab DC's LDAPS leaf and key are ISSUED from the customer-CA-signed Vault
+# intermediate by the operator ceremony (scripts/vault-pki-intermediate.sh
+# samba-tls), NOT by this converge — the converge holds no Vault token. On a
+# FRESH first converge Vault is uninitialized, so these bind sources must still
+# EXIST for the digest computation and the read-only bind mount to succeed:
+# create empty placeholders and let the samba-ad entrypoint self-sign until the
+# ceremony delivers real material. force=false never overwrites CA-issued
+# material once it is present; a later converge simply re-digests the new bytes
+# and recreates samba-ad so it adopts them.
+- name: Provide empty Samba LDAPS certificate placeholders on first converge
+  ansible.builtin.copy:
+    content: ""
+    dest: "{{ stack_dir }}/secrets/{{ item.filename }}"
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+    force: false
+  loop:
+    - { filename: samba_ad_tls_cert, mode: '0644' }
+    - { filename: samba_ad_tls_key, mode: '0640' }
+  loop_control:
+    label: "{{ item.filename }}"
+  when: samba_lab_enabled | bool
+
+- name: Inspect the Samba LDAPS certificate material boundary
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/secrets/{{ item.filename }}"
+    follow: false
+  loop:
+    - { filename: samba_ad_tls_cert, mode: '0644' }
+    - { filename: samba_ad_tls_key, mode: '0640' }
+  loop_control:
+    label: "{{ item.filename }}"
+  register: samba_tls_files
+  when: samba_lab_enabled | bool
+
+# The private key must never be world-readable. Samba runs as root inside the
+# container, so root:root (cert 0644 public, key 0640 root-only) is sufficient
+# and correct; the ceremony writes exactly these modes.
+- name: Require exact Samba LDAPS certificate material ownership and modes
+  ansible.builtin.assert:
+    that:
+      - item.stat.isreg | default(false)
+      - not (item.stat.islnk | default(false))
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.mode == item.item.mode
+      - (item.stat.nlink | default(1) | int) == 1
+    quiet: true
+    fail_msg: >-
+      Samba LDAPS certificate material must be a root:root regular single-link
+      file (cert 0644, key 0640): {{ item.item.filename }}
+  loop: "{{ samba_tls_files.results }}"
+  loop_control:
+    label: "{{ item.item.filename }}"
+  when: samba_lab_enabled | bool
+
 # The directory bind credential never becomes a Compose environment value, an
 # argv element, or a log line. It exists on the host only as this root-owned
 # file, bind-mounted read-only into the single reconciliation component.
@@ -1835,6 +1892,8 @@
         ([
           {'path': stack_dir ~ '/secrets/samba_ad_admin_password', 'recursive': false},
           {'path': stack_dir ~ '/secrets/samba_ad_bind_password', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/samba_ad_tls_cert', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/samba_ad_tls_key', 'recursive': false},
           {'path': stack_dir ~ '/secrets/samba_user_lab-admin_password', 'recursive': false},
           {'path': stack_dir ~ '/secrets/samba_user_lab-developer_password', 'recursive': false},
           {'path': stack_dir ~ '/secrets/samba_user_lab-user_password', 'recursive': false}

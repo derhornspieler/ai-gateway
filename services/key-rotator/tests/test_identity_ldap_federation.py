@@ -141,7 +141,9 @@ def test_lab_spec_is_byte_identical_to_the_deployed_lab_representation() -> None
     resolved = settings(LAB_SAMBA_LDAP_ENABLED=True)
     assert ldap_federation_spec(resolved) == LdapFederationSpec(
         provider_name="lab-samba-ad",
-        connection_url="ldaps://samba-ad:636",
+        # FQDN under the lab domain — the only name the customer-CA-signed leaf
+        # can bear (a bare-hostname SAN violates the Aegis name constraints).
+        connection_url="ldaps://samba-ad.aigw.aegisgroup.ch:636",
         users_dn="OU=AIGWUsers,DC=lab,DC=aigw,DC=internal",
         bind_dn="CN=svc-keycloak-ldap,CN=Users,DC=lab,DC=aigw,DC=internal",
         bind_password_file="/run/secrets/samba_keycloak_bind_password",
