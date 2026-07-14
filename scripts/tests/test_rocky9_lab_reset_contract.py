@@ -15,6 +15,7 @@ LAB_COMPOSE = ROOT / "compose" / "docker-compose.lab.yml"
 PLATFORM_DNS_COMPOSE = ROOT / "compose" / "docker-compose.platform-dns.yml"
 ALL_VARS = ROOT / "ansible" / "group_vars" / "all.yml"
 SITE = ROOT / "ansible" / "site.yml"
+OS_PREP = ROOT / "ansible" / "os-prep.yml"
 STACK_ONLY = ROOT / "ansible" / "deploy-stack-only.yml"
 
 
@@ -106,6 +107,7 @@ class Rocky9LabResetContractTests(unittest.TestCase):
         for text in required:
             self.assertIn(text, self.source)
         self.assertNotIn(PLAYBOOK.name, SITE.read_text(encoding="utf-8"))
+        self.assertNotIn(PLAYBOOK.name, OS_PREP.read_text(encoding="utf-8"))
         self.assertNotIn(PLAYBOOK.name, STACK_ONLY.read_text(encoding="utf-8"))
 
     def test_legacy_cleanup_is_pinned_to_snapshot_artifact_and_filter_bytes(self) -> None:

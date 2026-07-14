@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 TASKS = ROOT / "ansible" / "roles" / "docker_stack" / "tasks" / "main.yml"
-SITE = ROOT / "ansible" / "site.yml"
+OS_PREP = ROOT / "ansible" / "os-prep.yml"
 OS_BASELINE = ROOT / "ansible" / "roles" / "os_baseline" / "tasks" / "main.yml"
 
 
@@ -20,7 +20,7 @@ class DockerLogAclReconcilerSourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.source = TASKS.read_text(encoding="utf-8")
-        cls.site = SITE.read_text(encoding="utf-8")
+        cls.os_prep = OS_PREP.read_text(encoding="utf-8")
         cls.helper_block = cls.source.split(
             "- name: Install scoped Docker json-log ACL reconciler", 1
         )[1].split(
@@ -109,15 +109,15 @@ class DockerLogAclReconcilerSourceTests(unittest.TestCase):
             r"^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62})"
             r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,62}){0,15}$"
         )
-        self.assertGreaterEqual(self.site.count(path_pattern), 2)
-        self.assertIn("stack_dir | length <= 192", self.site)
-        self.assertIn("docker_data_root | length <= 192", self.site)
-        self.assertIn("stack_dir != docker_data_root", self.site)
-        self.assertIn("not stack_dir.startswith(docker_data_root ~ '/')", self.site)
-        self.assertIn("not docker_data_root.startswith(stack_dir ~ '/')", self.site)
+        self.assertGreaterEqual(self.os_prep.count(path_pattern), 2)
+        self.assertIn("stack_dir | length <= 192", self.os_prep)
+        self.assertIn("docker_data_root | length <= 192", self.os_prep)
+        self.assertIn("stack_dir != docker_data_root", self.os_prep)
+        self.assertIn("not stack_dir.startswith(docker_data_root ~ '/')", self.os_prep)
+        self.assertIn("not docker_data_root.startswith(stack_dir ~ '/')", self.os_prep)
         self.assertIn(
             "compose_project_name is match('^[a-z0-9][a-z0-9_-]{0,62}$')",
-            self.site,
+            self.os_prep,
         )
         self.assertIn("state_root={{ docker_data_root | quote }}", self.helper_block)
 

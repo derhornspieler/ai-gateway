@@ -861,8 +861,11 @@ ansible-playbook -i ansible/inventory/lab.yml ansible/site.yml \
   --syntax-check --ask-vault-pass
 ```
 
-Use `deploy-stack-only.yml` only after its live firewall/network preflight
-passes; otherwise run the full converge. Repeat the packet, identity, provider,
+Use `deploy-stack-only.yml` only after its dedicated-host-marker and live
+firewall/network preflights pass; otherwise run the full converge (host-level
+inventory changes alone can use `os-prep.yml`, which converges the host up to
+the Docker bridges without touching the running stack). Repeat the packet,
+identity, provider,
 and telemetry acceptance checks afterward. LiteLLM worker or replica changes are
 architecture changes, not ordinary resource edits: follow [LiteLLM capacity and
 scaling](litellm-scaling.md) for aggregate PostgreSQL connection accounting,

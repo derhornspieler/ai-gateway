@@ -14,6 +14,7 @@ class DnsPlaneContractTests(unittest.TestCase):
             ROOT / "ansible/inventory/host_vars/lab-aigw01.yml"
         ).read_text()
         cls.site = (ROOT / "ansible/site.yml").read_text()
+        cls.os_prep = (ROOT / "ansible/os-prep.yml").read_text()
         cls.stack = (
             ROOT / "ansible/roles/docker_stack/tasks/main.yml"
         ).read_text()
@@ -45,7 +46,8 @@ class DnsPlaneContractTests(unittest.TestCase):
 
     def test_legacy_shared_resolver_contract_is_gone(self) -> None:
         checked = "\n".join(
-            [self.group_vars, self.lab_vars, self.site, self.compose,
+            [self.group_vars, self.lab_vars, self.site, self.os_prep,
+             self.compose,
              self.dns_overlay, self.env_example, self.iptables, self.nft]
         ).lower()
         self.assertNotIn("container_dns_server", checked)
@@ -100,9 +102,9 @@ class DnsPlaneContractTests(unittest.TestCase):
             "egress_dns_servers | unique | length == egress_dns_servers | length",
             "internal_dns_servers | intersect(egress_dns_servers) | length == 0",
         ):
-            self.assertIn(contract, self.site)
-        self.assertIn("[nic_adm, nic_internal]", self.site)
-        self.assertIn("'dev ' ~ (nic_egress | regex_escape)", self.site)
+            self.assertIn(contract, self.os_prep)
+        self.assertIn("[nic_adm, nic_internal]", self.os_prep)
+        self.assertIn("'dev ' ~ (nic_egress | regex_escape)", self.os_prep)
 
     def test_runtime_overlay_assigns_only_envoy_to_internet_dns(self) -> None:
         hardening_services = set(

@@ -1,8 +1,13 @@
 ---
-# Safe partial converge: bring up the container stack ONLY.
-# Host network (routing, firewalld zones, docker networks) is already converged
-# on the target; re-running those roles is unnecessary for an app-only rollout.
-# docker_stack does not touch host networking, so it is safe in isolation.
+# Container-stack phase: bring up the container stack ONLY, verify it, then
+# let host_finalize promote the completed dedicated-Docker-host marker.
+# Runs two ways with identical semantics:
+#   * standalone, for an app-only rollout on an already-prepared host;
+#   * as the second phase of the full site.yml converge, after os-prep.yml.
+# Host network (routing, firewalld zones, docker networks) must already be
+# converged on the target; the pre_tasks below re-derive that from live host
+# state and refuse to run otherwise. docker_stack does not touch host
+# networking, so it is safe in isolation.
 # Kept in the ansible/ project root so playbook-adjacent group_vars/all.yml loads.
 - name: AI Gateway — container stack only
   hosts: gateway:generic_rocky9
@@ -25,12 +30,16 @@
       no_log: true
 
     # Stack-only is deliberately unable to create/adopt a Docker host. Require
-    # the exact marker promoted only after a successful full converge, and
-    # refuse a host left in the pending state after a partial daemon-policy
-    # change.
-    - name: Preflight — define the completed dedicated-Docker-host marker contract
+    # the exact dedicated-Docker-host ownership contract that only host
+    # preparation writes: either the COMPLETED marker promoted after a prior
+    # verified converge (redeploy), or the PENDING marker os-prep.yml leaves
+    # once os_baseline has mutated Docker host policy (first stack deploy).
+    # A host carrying neither marker never ran os-prep.yml and is refused;
+    # the live SELinux/firewall/network gates below then prove the prepared
+    # ABI is actually in force rather than trusting the marker alone.
+    - name: Preflight — define the exact dedicated-Docker-host marker contract
       ansible.builtin.set_fact:
-        stack_only_docker_host_marker_content: |
+        aigw_docker_host_marker_content: |
           format=aigw-dedicated-docker-host-v1
           project={{ compose_project_name }}
           docker_data_root={{ docker_data_root }}
@@ -53,22 +62,42 @@
       no_log: true
       when: stack_only_host_markers.results[0].stat.exists | default(false)
 
-    - name: Preflight — require a completed exact dedicated-host marker
+    - name: Preflight — read the pending dedicated-host marker
+      ansible.builtin.slurp:
+        src: "{{ aigw_docker_host_pending_marker }}"
+      register: stack_only_docker_host_pending_marker_raw
+      no_log: true
+      when: stack_only_host_markers.results[1].stat.exists | default(false)
+
+    - name: Preflight — require an exact completed or host-prep dedicated-host marker
       ansible.builtin.assert:
         that:
-          - stack_only_host_markers.results[0].stat.exists | default(false)
-          - stack_only_host_markers.results[0].stat.isreg | default(false)
-          - not (stack_only_host_markers.results[0].stat.islnk | default(false))
-          - stack_only_host_markers.results[0].stat.uid == 0
-          - stack_only_host_markers.results[0].stat.gid == 0
-          - stack_only_host_markers.results[0].stat.mode == '0600'
-          - (stack_only_docker_host_marker_raw.content | b64decode) == stack_only_docker_host_marker_content
-          - not (stack_only_host_markers.results[1].stat.exists | default(false))
+          - >-
+            (stack_only_host_markers.results[0].stat.exists | default(false)) or
+            (stack_only_host_markers.results[1].stat.exists | default(false))
+          - >-
+            not (stack_only_host_markers.results[0].stat.exists | default(false)) or
+            (stack_only_host_markers.results[0].stat.isreg | default(false) and
+             not (stack_only_host_markers.results[0].stat.islnk | default(false)) and
+             stack_only_host_markers.results[0].stat.uid == 0 and
+             stack_only_host_markers.results[0].stat.gid == 0 and
+             stack_only_host_markers.results[0].stat.mode == '0600' and
+             (stack_only_docker_host_marker_raw.content | b64decode) == aigw_docker_host_marker_content)
+          - >-
+            not (stack_only_host_markers.results[1].stat.exists | default(false)) or
+            (stack_only_host_markers.results[1].stat.isreg | default(false) and
+             not (stack_only_host_markers.results[1].stat.islnk | default(false)) and
+             stack_only_host_markers.results[1].stat.uid == 0 and
+             stack_only_host_markers.results[1].stat.gid == 0 and
+             stack_only_host_markers.results[1].stat.mode == '0600' and
+             (stack_only_docker_host_pending_marker_raw.content | b64decode) == aigw_docker_host_marker_content)
         quiet: true
         fail_msg: >-
-          Refusing stack-only mutation: run a successful full site.yml converge
-          first. The exact completed dedicated-Docker-host marker is required
-          and no pending adoption marker may remain.
+          Refusing stack-only mutation: run ansible/os-prep.yml (or the full
+          site.yml converge) first. This host carries neither the exact
+          completed dedicated-Docker-host marker from a verified converge nor
+          the exact pending host-prep marker os-prep.yml leaves, so it was
+          never prepared as a dedicated AI Gateway Docker host.
       no_log: true
 
     # This partial play deliberately omits os_baseline. Refuse to recreate a
@@ -106,8 +135,17 @@
       ansible.builtin.command: date +'%m/%d/%y %H:%M:%S'
       environment:
         LC_ALL: C
-      register: aigw_selinux_audit_window_start
+      register: stack_only_selinux_audit_window_start
       changed_when: false
+
+    # A standalone stack-only run opens verify's audit window here. Inside the
+    # composed site.yml converge, selinux_baseline already opened a wider
+    # window during host preparation; keep that one so verify still fails on
+    # denials raised while the host-prep roles ran.
+    - name: Preflight — open the SELinux AVC audit window unless host prep already did
+      ansible.builtin.set_fact:
+        aigw_selinux_audit_window_start: "{{ stack_only_selinux_audit_window_start }}"
+      when: aigw_selinux_audit_window_start is not defined
 
     - name: Preflight — require encrypted backing for all sensitive state
       ansible.builtin.command:
@@ -296,3 +334,7 @@
   roles:
     - role: docker_stack
     - role: verify
+    # Promote the completed dedicated-Docker-host marker (and remove the
+    # pending one) only after docker_stack and the full runtime verify
+    # succeeded — the same postcondition the pre-split site.yml guaranteed.
+    - role: host_finalize

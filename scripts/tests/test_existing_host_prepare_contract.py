@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GROUP_VARS = ROOT / "ansible" / "group_vars" / "all.yml"
 LAB_VARS = ROOT / "ansible" / "inventory" / "host_vars" / "lab-aigw01.yml"
 SITE = ROOT / "ansible" / "site.yml"
+OS_PREP = ROOT / "ansible" / "os-prep.yml"
 HOST_PREFLIGHT = ROOT / "ansible" / "roles" / "host_preflight" / "tasks" / "main.yml"
 FIREWALL_PREFLIGHT = ROOT / "ansible" / "roles" / "firewall_preflight" / "tasks" / "main.yml"
 FIREWALL_ROLE = ROOT / "ansible" / "roles" / "firewalld_zones" / "tasks" / "main.yml"
@@ -31,6 +32,7 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         cls.group = GROUP_VARS.read_text(encoding="utf-8")
         cls.lab = LAB_VARS.read_text(encoding="utf-8")
         cls.site = SITE.read_text(encoding="utf-8")
+        cls.os_prep = OS_PREP.read_text(encoding="utf-8")
         cls.host = HOST_PREFLIGHT.read_text(encoding="utf-8")
         cls.firewall_preflight = FIREWALL_PREFLIGHT.read_text(encoding="utf-8")
         cls.firewall = FIREWALL_ROLE.read_text(encoding="utf-8")
@@ -125,12 +127,14 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
                 docker_zone_checker_start:docker_zone_checker_end
             ]
         )
-        validator_start = cls.site.index("            import ipaddress\n")
-        validator_end = cls.site.index(
+        validator_start = cls.os_prep.index("            import ipaddress\n")
+        validator_end = cls.os_prep.index(
             "          - \"{{ deployment_profile | default('') }}\"",
             validator_start,
         )
-        cls.socks_validator = textwrap.dedent(cls.site[validator_start:validator_end])
+        cls.socks_validator = textwrap.dedent(
+            cls.os_prep[validator_start:validator_end]
+        )
 
     def run_socks_validator(self, *arguments: str) -> None:
         original_argv = sys.argv
@@ -198,14 +202,14 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
 
     def run_policy_table_validator(self, routes_by_command: dict[tuple[str, ...], list[dict[str, object]]]) -> None:
         """Run the embedded collision guard against a deterministic `ip -j` view."""
-        validator_start = self.site.index(
+        validator_start = self.os_prep.index(
             "            import ipaddress\n",
-            self.site.index("Preflight — reject live policy-table and rule collisions before replacement"),
+            self.os_prep.index("Preflight — reject live policy-table and rule collisions before replacement"),
         )
-        validator_end = self.site.index(
+        validator_end = self.os_prep.index(
             '          - "{{ pbr_tables | to_json }}"', validator_start
         )
-        validator = textwrap.dedent(self.site[validator_start:validator_end])
+        validator = textwrap.dedent(self.os_prep[validator_start:validator_end])
 
         import json
         import subprocess
@@ -248,18 +252,22 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             "aigw_adm_socks_trusted_operator_ack: I_UNDERSTAND_SOCKS_REACHES_ALL_HOST_ROUTES",
         ):
             self.assertIn(required, self.lab)
-        self.assertIn("aigw_adm_socks_trusted_operator_ack is string", self.site)
-        self.assertIn("PermitOpen any reaches every host-routable destination", self.site)
-        self.assertIn("or trusted_operator_ack", self.site)
+        self.assertIn(
+            "aigw_adm_socks_trusted_operator_ack is string", self.os_prep
+        )
+        self.assertIn(
+            "PermitOpen any reaches every host-routable destination", self.os_prep
+        )
+        self.assertIn("or trusted_operator_ack", self.os_prep)
 
     def test_ssh_password_and_socks_exceptions_are_lab_profile_gated(self) -> None:
         self.assertIn(
             "Preflight — restrict SSH password and SOCKS exceptions to rocky9-lab",
-            self.site,
+            self.os_prep,
         )
         self.assertIn(
             "(deployment_profile | default('')) == 'rocky9-lab' or",
-            self.site,
+            self.os_prep,
         )
         for required in (
             "password SSH authentication is allowed only in deployment_profile=rocky9-lab",
@@ -267,7 +275,7 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             "- \"{{ deployment_profile | default('') }}\"",
             "- \"{{ 'true' if (aigw_ssh_password_authentication | bool) else 'false' }}\"",
         ):
-            self.assertIn(required, self.site)
+            self.assertIn(required, self.os_prep)
         for required in (
             "PasswordAuthentication {{ 'yes' if ((deployment_profile | default('')) == 'rocky9-lab' and (aigw_ssh_password_authentication | bool)) else 'no' }}",
             "{% if ((deployment_profile | default('')) == 'rocky9-lab') and (aigw_adm_socks_enabled | bool) %}",
@@ -1027,6 +1035,93 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             self.assertIn("cross-plane drop occurs after reply allowance", source)
             self.assertIn("physical cross-plane accept exists", source)
 
+    def test_site_is_exactly_the_host_prep_then_stack_composition(self) -> None:
+        """site.yml composes os-prep.yml and deploy-stack-only.yml, nothing else."""
+        imports = [
+            line for line in self.site.splitlines()
+            if line.startswith("- import_playbook:")
+        ]
+        self.assertEqual(
+            imports,
+            [
+                "- import_playbook: os-prep.yml",
+                "- import_playbook: deploy-stack-only.yml",
+            ],
+        )
+        # The composition holds no play of its own; every gate and role lives
+        # in the two imported playbooks.
+        for forbidden in ("hosts:", "pre_tasks:", "roles:", "tasks:"):
+            self.assertNotIn(forbidden, self.site)
+        # Host preparation stops at the Docker bridges; the stack phase owns
+        # docker_stack, verify, and the marker promotion.
+        self.assertIn("- role: docker_networks", self.os_prep)
+        for stack_role in ("- role: docker_stack", "- role: verify", "- role: host_finalize"):
+            self.assertNotIn(stack_role, self.os_prep)
+            self.assertIn(stack_role, self.stack_only)
+        roles = self.stack_only.split("  roles:", 1)[1]
+        self.assertLess(roles.index("- role: docker_stack"), roles.index("- role: verify"))
+        self.assertLess(roles.index("- role: verify"), roles.index("- role: host_finalize"))
+
+    def test_stack_only_marker_gate_accepts_host_prep_and_refuses_unprepared_hosts(self) -> None:
+        """First deploy trusts os-prep's pending marker; no marker is refused.
+
+        The completed marker still attests a verified full converge; the
+        pending marker is the sanctioned host-prep-done ownership signal that
+        os_baseline writes during os-prep.yml. Either must byte-match the
+        exact dedicated-Docker-host contract; a host with neither never ran
+        host preparation.
+        """
+        self.assertIn(
+            "Preflight — require an exact completed or host-prep dedicated-host marker",
+            self.stack_only,
+        )
+        # Both markers are shape- and content-checked against the exact contract.
+        self.assertIn(
+            "(stack_only_docker_host_marker_raw.content | b64decode) == aigw_docker_host_marker_content",
+            self.stack_only,
+        )
+        self.assertIn(
+            "(stack_only_docker_host_pending_marker_raw.content | b64decode) == aigw_docker_host_marker_content",
+            self.stack_only,
+        )
+        # At least one marker must exist; an unprepared host is refused toward
+        # os-prep.yml, never silently adopted.
+        self.assertIn(
+            "(stack_only_host_markers.results[0].stat.exists | default(false)) or\n"
+            "            (stack_only_host_markers.results[1].stat.exists | default(false))",
+            self.stack_only,
+        )
+        self.assertIn("run ansible/os-prep.yml", self.stack_only)
+        self.assertIn(
+            "never prepared as a dedicated AI Gateway Docker host", self.stack_only
+        )
+        # The marker contract is one definition shared with host_preflight and
+        # host_finalize: same format string, same 0600 root:root shape.
+        self.assertIn("format=aigw-dedicated-docker-host-v1", self.stack_only)
+        self.assertIn("format=aigw-dedicated-docker-host-v1", self.host)
+        self.assertIn("aigw_docker_host_marker_content: |", self.stack_only)
+        self.assertEqual(2, self.stack_only.count("stat.mode == '0600'"))
+        # os_baseline still records the pending ownership contract during host
+        # prep, and only host_finalize promotes the completed marker.
+        self.assertIn(
+            "Record an in-progress dedicated-Docker-host ownership contract before daemon mutation",
+            self.os_baseline,
+        )
+        finalize = (
+            ROOT / "ansible" / "roles" / "host_finalize" / "tasks" / "main.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Finalize — promote the verified dedicated-Docker-host marker", finalize)
+        self.assertIn("Finalize — remove the in-progress dedicated-Docker-host marker", finalize)
+        # Composed converges keep selinux_baseline's wider AVC audit window;
+        # only a standalone stack-only run opens its own.
+        self.assertIn(
+            "when: aigw_selinux_audit_window_start is not defined", self.stack_only
+        )
+        self.assertIn(
+            'aigw_selinux_audit_window_start: "{{ stack_only_selinux_audit_window_start }}"',
+            self.stack_only,
+        )
+
     def test_site_preflight_requires_firewall_and_only_declared_policy_routing(self) -> None:
         for required in (
             "manage_firewalld | bool",
@@ -1036,7 +1131,7 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             "vpn_client_cidr",
             "internal_cidr",
         ):
-            self.assertIn(required, self.site)
+            self.assertIn(required, self.os_prep)
 
     def test_policy_table_guard_accepts_only_main_connected_routes_on_the_target_nic(self) -> None:
         # `ip -j route show ... dev enp0s7` suppresses the `dev` key on Rocky
@@ -1044,13 +1139,13 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         # filter the target NIC, otherwise its own copied connected routes are
         # falsely classified as foreign immediately after a clean deploy.
         self.assertIn(
-            'invoke("-j", "-4", "route", "show", "table", "main")', self.site
+            'invoke("-j", "-4", "route", "show", "table", "main")', self.os_prep
         )
-        self.assertIn('if route.get("dev") == device', self.site)
-        self.assertIn('route.get("scope") != "link"', self.site)
-        self.assertIn('route.get("gateway") is not None', self.site)
+        self.assertIn('if route.get("dev") == device', self.os_prep)
+        self.assertIn('route.get("scope") != "link"', self.os_prep)
+        self.assertIn('route.get("gateway") is not None', self.os_prep)
         self.assertNotIn(
-            '"table", "main", "dev", device, "scope", "link"', self.site
+            '"table", "main", "dev", device, "scope", "link"', self.os_prep
         )
 
         routes = {

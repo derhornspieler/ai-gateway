@@ -148,8 +148,11 @@ scripts/validate-compose.sh
 
 ```text
 ansible/
-  site.yml                 full host + network + stack converge (heavy preflight gates)
-  deploy-stack-only.yml    app-only rollout; refuses a stale firewall/network ABI
+  site.yml                 full converge = os-prep.yml then deploy-stack-only.yml
+  os-prep.yml              host preparation only (heavy preflight gates + roles
+                           through docker_networks); starts no containers
+  deploy-stack-only.yml    stack deploy + verify + marker promotion; refuses an
+                           unprepared host or a stale firewall/network ABI
   inventory/               generic entry point (hosts.yml) + lab (lab.yml)
   group_vars/all.yml       20 segmented bridge definitions and host variables
   roles/                   host_preflight, firewall_preflight, time_sync,

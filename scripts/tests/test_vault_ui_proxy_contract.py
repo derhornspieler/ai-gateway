@@ -28,7 +28,7 @@ GENERIC_VARS = (
 LAB_VARS = (
     ROOT / "ansible/inventory/host_vars/lab-aigw01.yml"
 ).read_text(encoding="utf-8")
-SITE = (ROOT / "ansible/site.yml").read_text(encoding="utf-8")
+OS_PREP = (ROOT / "ansible/os-prep.yml").read_text(encoding="utf-8")
 ENV_TEMPLATE = (
     ROOT / "ansible/roles/docker_stack/templates/env.j2"
 ).read_text(encoding="utf-8")
@@ -52,7 +52,7 @@ class VaultUIProxyContractTests(unittest.TestCase):
         self.assertRegex(ALL_VARS, r"(?m)^aigw_vault_ui_enabled: false$")
         self.assertRegex(GENERIC_VARS, r"(?m)^aigw_vault_ui_enabled: false$")
         self.assertRegex(LAB_VARS, r"(?m)^aigw_vault_ui_enabled: true$")
-        self.assertIn("aigw_vault_ui_enabled is boolean", SITE)
+        self.assertIn("aigw_vault_ui_enabled is boolean", OS_PREP)
         self.assertIn("aigw_vault_ui_enabled is boolean", STACK_ONLY)
 
     def test_positive_profile_gates_only_the_two_browser_services(self) -> None:

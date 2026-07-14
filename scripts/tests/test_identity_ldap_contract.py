@@ -31,7 +31,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = ROOT / "ansible" / "generic-rocky9-contract.json"
 PREFLIGHT = ROOT / "ansible" / "preflight-generic-rocky9.yml"
-SITE = ROOT / "ansible" / "site.yml"
+OS_PREP = ROOT / "ansible" / "os-prep.yml"
 STACK_TASKS = ROOT / "ansible" / "roles" / "docker_stack" / "tasks" / "main.yml"
 VERIFY_TASKS = ROOT / "ansible" / "roles" / "verify" / "tasks" / "main.yml"
 ENV_TEMPLATE = ROOT / "ansible" / "roles" / "docker_stack" / "templates" / "env.j2"
@@ -213,7 +213,7 @@ class IdentityLdapContractJsonTests(unittest.TestCase):
 
 class IdentityLdapPlaintextRejectionTests(unittest.TestCase):
     def test_every_mutation_gate_anchors_on_ldaps(self) -> None:
-        for source_file in (PREFLIGHT, SITE, STACK_TASKS):
+        for source_file in (PREFLIGHT, OS_PREP, STACK_TASKS):
             with self.subTest(path=source_file.name):
                 self.assertIn("^ldaps://", source_file.read_text(encoding="utf-8"))
 
@@ -381,7 +381,7 @@ class IdentityLdapFirewallTests(unittest.TestCase):
         )
 
     def test_site_proves_the_directory_uses_the_internal_leg(self) -> None:
-        site = SITE.read_text(encoding="utf-8")
+        site = OS_PREP.read_text(encoding="utf-8")
         self.assertIn(
             "Preflight — prove the external directory uses the internal physical leg",
             site,
@@ -399,7 +399,7 @@ class IdentityLdapMutualExclusionTests(unittest.TestCase):
         self.assertIn("identity_ldap_provider_name != 'lab-samba-ad'", block)
 
     def test_site_refuses_both_identity_sources(self) -> None:
-        site = SITE.read_text(encoding="utf-8")
+        site = OS_PREP.read_text(encoding="utf-8")
         self.assertIn(
             "not (identity_ldap_enabled | bool) or not (samba_lab_enabled | bool)", site
         )

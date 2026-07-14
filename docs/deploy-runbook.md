@@ -187,6 +187,41 @@ rules → OS packages, Docker, and SSH hardening → 20 isolated container
 networks → configuration rendering, image builds, and container start →
 verification of everything it just did.
 
+### The three playbooks — which one do I run?
+
+`site.yml` is actually two playbooks run back-to-back, and you can run each
+half on its own. All three take the same `-i`, `--limit`, and `--vault-id`
+arguments shown above:
+
+| Playbook | What it does | When you run it |
+|---|---|---|
+| `ansible/site.yml` | Everything: prepares the host, then deploys and verifies the stack | **First deploy** (this Part and Step 7c), and any time you are unsure — it is always safe |
+| `ansible/os-prep.yml` | Host preparation only: all safety checks, clock, SELinux, routing, firewall, OS packages, Docker, and the 20 container networks. **Starts no containers.** | When the host/OS team prepares the VM ahead of time, or after changing host-level inventory (NICs, firewall, DNS resolvers) without wanting to touch the running stack yet |
+| `ansible/deploy-stack-only.yml` | Stack only: deploys the containers, verifies everything, and records the host as a completed dedicated gateway host | App/config updates on a host that already converged, or the stack half of a first deploy after `os-prep.yml` ran |
+
+```bash
+# Host preparation only (no containers started):
+ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
+  ansible/os-prep.yml --limit mygateway \
+  --vault-id mygateway@~/.aigw-vault-pass
+
+# Stack deploy/redeploy on a prepared host:
+ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
+  ansible/deploy-stack-only.yml --limit mygateway \
+  --vault-id mygateway@~/.aigw-vault-pass
+```
+
+Two rules keep this safe, and the playbooks enforce both for you:
+
+- `deploy-stack-only.yml` **refuses to run on a host that was never
+  prepared** — it requires the ownership marker that only `os-prep.yml` (or
+  `site.yml`) writes, and it re-checks the live firewall and container
+  networks before touching anything. If it refuses, run `site.yml`; never
+  work around its assertions.
+- Running `os-prep.yml` then `deploy-stack-only.yml` ends in exactly the
+  same state as one `site.yml` run, so you can hand the two halves to two
+  different people (host team, then app team) without losing anything.
+
 **Two outcomes are normal:**
 
 - It stops early with a clear assertion message. Nothing was changed; read
