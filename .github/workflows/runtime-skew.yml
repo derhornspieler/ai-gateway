@@ -1,0 +1,183 @@
+name: Docker and Compose runtime skew
+
+# `scripts/validate-compose.sh` proves the rendered Compose *model* is sound.
+# It cannot see behaviour that only exists once containers are running, and
+# that is precisely where this repository has been bitten twice:
+#
+#   * Compose v5.3.1 began validating the whole project model on live-project
+#     `exec`, so an emptied COMPOSE_PROFILES made every exec-style Ansible task
+#     fail with `depends on undefined service` on lab hosts.
+#   * A Compose/Engine release stopped materialising the implicit `rw` tmpfs
+#     token, so `ansible/roles/verify/tasks/main.yml` failed its live-container
+#     assertions with the stack already up.
+#
+# Neither had a repository change behind it. `ansible/roles/os_baseline` installs
+# `docker-ce` and `docker-compose-plugin` from `docker-ce-stable` with no version
+# pin, so a customer converge silently adopts whatever Compose shipped that week.
+# This workflow therefore runs the real runtime contracts against two Composes:
+# the one CI validates everything else with, and the newest upstream release —
+# the one the next converge will actually install.
+#
+# It is ADVISORY on purpose. Upstream can break us on a day nobody pushed, and
+# that must not red-wall unrelated pull requests. It compensates by being loud:
+# annotations, a step summary, and an auto-filed issue on scheduled runs. Run it
+# with `strict: true` from the Actions tab to make it a hard gate on demand.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: Fail the job when a runtime contract breaks, instead of reporting it
+        required: true
+        default: false
+        type: boolean
+      compose_version:
+        description: Pin the upstream Compose leg to a tag (e.g. v5.3.1) instead of the latest release
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-skew-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  canary:
+    name: Runtime contracts on ${{ matrix.channel }} Compose
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Scheduled runs have no pull request to annotate. Without an issue, an
+      # advisory failure is invisible until the next converge fails on a host.
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [runner, upstream]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.25.x
+          # The canary's probe image is built FROM scratch around a static Go
+          # binary precisely so it pulls no base image and cannot be
+          # rate-limited. There is no module graph here to cache.
+          cache: false
+
+      # The customer host installs an unpinned docker-compose-plugin, so the
+      # release most likely to break the next converge is the newest one. Verify
+      # the published checksum before trusting the binary.
+      - name: Install the upstream Compose release
+        if: matrix.channel == 'upstream'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.compose_version || '' }}
+        run: |
+          set -euo pipefail
+          version="$REQUESTED_VERSION"
+          if [[ -z "$version" ]]; then
+            version="$(gh api repos/docker/compose/releases/latest --jq .tag_name)"
+          fi
+          echo "Upstream Compose release: $version"
+
+          base="https://github.com/docker/compose/releases/download/$version"
+          asset=docker-compose-linux-x86_64
+          workdir="$(mktemp -d)"
+          curl -fsSL --retry 3 -o "$workdir/$asset" "$base/$asset"
+          curl -fsSL --retry 3 -o "$workdir/$asset.sha256" "$base/$asset.sha256"
+          (cd "$workdir" && sha256sum -c "$asset.sha256")
+
+          plugins="$HOME/.docker/cli-plugins"
+          mkdir -p "$plugins"
+          install -m 0755 "$workdir/$asset" "$plugins/docker-compose"
+
+          installed="v$(docker compose version --short)"
+          if [[ "$installed" != "$version" ]]; then
+            echo "::error title=Compose install::requested $version but docker resolves $installed"
+            exit 1
+          fi
+
+      - name: Record the Docker and Compose under test
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${{ matrix.channel }} channel"
+            echo
+            echo "- Engine \`$(docker version --format '{{.Server.Version}}')\`"
+            echo "- Compose \`$(docker compose version --short)\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Exit 1 is real version skew and stays advisory. Exit 2 is a harness fault
+      # — our own bug — and must never be laundered into a clean run.
+      - name: Exercise the live runtime contracts
+        id: canary
+        run: |
+          set +e
+          python3 .github/scripts/compose-engine-canary.py --summary "$GITHUB_STEP_SUMMARY"
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0)
+              echo "All runtime contracts held on this Docker/Compose."
+              ;;
+            1)
+              echo "::warning title=Runtime skew::a runtime contract broke on this Docker/Compose; see the job summary"
+              ;;
+            *)
+              echo "::error title=Canary harness fault::the runtime canary could not run (exit $code)"
+              exit 1
+              ;;
+          esac
+
+      - name: Open or refresh the skew issue on scheduled runs
+        if: steps.canary.outputs.code == '1' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ matrix.channel }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Docker/Compose runtime skew on the $CHANNEL channel"
+          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          body="A scheduled runtime-skew canary found a broken runtime contract on the ${CHANNEL} Compose channel.
+
+          The Ansible converge asserts these contracts on live containers, so this
+          breaks a customer deployment at the verify role with the stack already up.
+
+          Run: ${RUN_URL}"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "$body" || true
+          else
+            gh issue create --title "$title" --body "$body" || true
+          fi
+
+      # The escape hatch: `strict: true` from the Actions tab turns the advisory
+      # canary into a hard gate. Flip this default once the verify role's tmpfs
+      # token contract matches what current Compose actually emits.
+      - name: Enforce the runtime contracts when strict
+        if: steps.canary.outputs.code == '1' && inputs.strict
+        run: |
+          echo "::error title=Runtime skew::a runtime contract broke and this run is strict"
+          exit 1

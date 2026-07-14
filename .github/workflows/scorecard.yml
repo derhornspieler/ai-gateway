@@ -1,0 +1,64 @@
+name: OpenSSF Scorecard
+
+# An independent, externally maintained read on this repository's supply-chain
+# posture. Most of what Scorecard grades is already enforced here, and enforced
+# harder: SHA-pinned `uses:` (zgosalvez), dangerous-workflow and token
+# permissions (zizmor), SAST (CodeQL), vulnerable dependencies (Trivy,
+# pip-audit, dependency-review), an update tool (Dependabot).
+#
+# It is kept for the checks nothing else here performs — Binary-Artifacts
+# (a committed binary is exactly the supply-chain defect this stack exists to
+# avoid), Security-Policy, and Code-Review — and because an outside grader
+# notices the controls we never thought to write.
+#
+# Scheduled and on-demand only: this grades the repository, not a diff, so
+# running it per pull request would burn minutes to re-report the same score.
+# Advisory: results land in the Security tab, they never gate a merge. Results
+# are NOT published to the public OpenSSF datastore — this is a customer
+# prototype, and its posture is nobody else's telemetry.
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "51 8 * * 1"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Supply-chain posture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Upload the SARIF to this repository's own code scanning.
+      security-events: write
+      # Read-only workflow-run metadata for the Token-Permissions and
+      # Dangerous-Workflow checks.
+      actions: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false
+
+      - name: Upload the posture report to code scanning
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        with:
+          sarif_file: scorecard.sarif
+          category: scorecard

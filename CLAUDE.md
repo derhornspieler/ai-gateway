@@ -16,7 +16,7 @@ Editing anything under `ansible/`, `compose/`, `scripts/`, or `.github/workflows
 
 ```bash
 bash scripts/validate-compose.sh                                  # render-only Compose + contract gate; starts no containers; needs a local Docker daemon
-python3 -I -m unittest discover -v -s scripts/tests -p 'test_*.py' # infrastructure contract suite (~292 tests, ~1 min); stdlib unittest, NOT pytest
+python3 -I -m unittest discover -v -s scripts/tests -p 'test_*.py' # infrastructure contract suite (~315 tests, ~1 min); stdlib unittest, NOT pytest
 python3 -I scripts/validate-identity-policy.py                    # identity policy parity (only needed for keycloak/realm changes)
 ```
 
@@ -58,7 +58,16 @@ yamllint -c .yamllint.yml .github .trivyignore.yaml .yamllint.yml ansible compos
 ansible-playbook -i ansible/inventory/lab.yml ansible/site.yml --syntax-check --ask-vault-pass
 ```
 
-CI reproduces with `ansible-core==2.21.1` + `yamllint==1.38.0` (minimum ansible-core is 2.16) and `ansible-galaxy collection install -r ansible/requirements.yml`. There is **no ansible-lint and no shellcheck** — shell is gated by `bash -n scripts/*.sh` plus contract tests.
+CI reproduces with `ansible-core==2.21.1` + `yamllint==1.38.0` (minimum ansible-core is 2.16) and `ansible-galaxy collection install -r ansible/requirements.yml`. There is **no ansible-lint**.
+
+### Shell lint
+
+```bash
+bash .github/scripts/run-shellcheck.sh error   # blocking bar in CI; currently clean
+bash .github/scripts/run-shellcheck.sh info    # advisory; 16 known pre-existing findings
+```
+
+ShellCheck (pinned by tag+digest, run in Docker) replaced the old `bash -n` gate. `run-shellcheck.sh` holds the **single** target list, and `scripts/tests/test_ci_health_checks.py` fails if a tracked shell file is neither listed there nor explicitly excluded — so a new root-run script cannot quietly escape the linter. `ansible/**/templates/*.j2` are excluded and unlintable: ShellCheck cannot parse Jinja.
 
 ### Deploy (controller → target VM)
 
@@ -77,6 +86,10 @@ The converge is **deliberately two-pass**: the first `site.yml` run leaves Vault
 ### CI-only gates (no local invocation — don't chase these locally)
 
 Trivy fs scan (HIGH/CRITICAL, waivers only via `.trivyignore.yaml` with `expired_at` + justification), actionlint + zizmor + **mandatory full-commit-SHA pinning of every workflow `uses:`** (a bare `@v4` fails CI), dependency-review, gitleaks over full git history (a secret committed then removed still fails). Final DHI image builds skip on PRs without `dhi.io` credentials — a green PR does not prove images build.
+
+**`runtime-skew.yml` is advisory and expected to be loud.** `validate-compose.sh` only proves the rendered *model*; this workflow starts real containers and asserts the *runtime* contracts the verify role checks on a live host (tmpfs option tokens, live-project `exec` under the joined profile set) against both the runner's Compose and the newest upstream release — the one a converge actually installs, since `os_baseline` pins no `docker-compose-plugin` version. It never blocks a merge (upstream must not red-wall unrelated PRs); it annotates, writes a job summary, and files an issue on scheduled runs. Run it with `strict: true` from the Actions tab to gate on it deliberately. **It currently reports CONTRACT B BROKEN on Compose ≥5.2**: the grafana plugin tmpfs spec omits `rw`, current Compose no longer materialises that implicit token, and `roles/verify` still requires it — a converge fails at the verify role with the stack already up. Fix the verify role's token set, then flip `strict`'s default.
+
+`repo-hygiene.yml`: ShellCheck (blocking at `error`, advisory at `info`), JSON duplicate-key/BOM rejection, and an advisory contract-test drift guard that flags a PR touching `ansible/`, `compose/`, `scripts/`, or `.github/workflows/` with no matching contract-test or validator change. The drift guard is a reviewer prompt and never blocks. `scorecard.yml`: OpenSSF Scorecard, scheduled, advisory, results to the Security tab only (`publish_results: false` — this prototype's posture is not public telemetry).
 
 ## Architecture
 
