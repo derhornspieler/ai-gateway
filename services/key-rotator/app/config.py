@@ -13,8 +13,70 @@ import re
 from functools import lru_cache
 from urllib.parse import SplitResult, urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The lab Samba federation owns this exact Keycloak component name. A
+# production external-directory converge must never be able to adopt it: the
+# lab provider identity (component id/name) has to survive lab converges
+# untouched, and reusing the name would silently reprovision that directory.
+LAB_LDAP_PROVIDER_NAME = "lab-samba-ad"
+
+# Bounded LDAP filter grammar. `$` is deliberately excluded so a value carried
+# through Compose interpolation can never be re-expanded.
+_LDAP_FILTER_RE = re.compile(r"[A-Za-z0-9()&|!=<>~*.,:@ _\\-]+")
+_LDAP_ATTRIBUTE_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,59}")
+_LDAP_OBJECT_CLASSES_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9-]{0,63}(, [A-Za-z][A-Za-z0-9-]{0,63}){0,7}"
+)
+_LDAP_PROVIDER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+# Hostname verification is only meaningful against a real name, so an IP
+# literal is refused for the production directory origin.
+_LDAP_FQDN_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+)
+_IPV4_LITERAL_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
+
+
+def _validate_ldaps_origin(value: str, field_name: str) -> str:
+    """Reject anything that is not a bare ldaps:// origin.
+
+    Plaintext ``ldap://`` is refused here as the last of four independent
+    layers (controller preflight, site.yml, docker_stack, and this service).
+    """
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme.lower() != "ldaps"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"{field_name} must be a bare ldaps:// origin")
+    return value.rstrip("/")
+
+
+def _is_single_ldap_group(value: str) -> bool:
+    """True iff the filter is exactly one balanced top-level parenthesis group.
+
+    A valid LDAP filter is a single parenthesized expression. Requiring the
+    depth to return to zero only at the final character rejects both
+    unbalanced input and content that escapes the outer group
+    (``()a=b(x=y)`` or two sibling groups ``(a=b)(c=d)``).
+    """
+    depth = 0
+    for index, character in enumerate(value):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+            if depth == 0 and index != len(value) - 1:
+                return False
+    return depth == 0
 
 # Values that must never be accepted as the internal auth token (compared
 # case-insensitively). Anything under 16 chars is rejected too.
@@ -208,6 +270,43 @@ class Settings(BaseSettings):
         alias="LAB_SAMBA_BIND_PASSWORD_FILE",
     )
 
+    # Production external directory federation. Mutually exclusive with the lab
+    # Samba path; the reserved lab provider name is refused here so a production
+    # converge can never adopt the lab component identity. Every value is
+    # inventory-owned and reaches this service only through Ansible-rendered
+    # Compose environment, except the bind credential, which is read from a
+    # root-owned file bind-mounted at IDENTITY_LDAP_BIND_PASSWORD_FILE.
+    identity_ldap_enabled: bool = Field(
+        default=False, alias="IDENTITY_LDAP_ENABLED"
+    )
+    identity_ldap_provider_name: str = Field(
+        default="", alias="IDENTITY_LDAP_PROVIDER_NAME"
+    )
+    identity_ldap_url: str = Field(default="", alias="IDENTITY_LDAP_URL")
+    identity_ldap_users_dn: str = Field(default="", alias="IDENTITY_LDAP_USERS_DN")
+    identity_ldap_bind_dn: str = Field(default="", alias="IDENTITY_LDAP_BIND_DN")
+    identity_ldap_bind_password_file: str = Field(
+        default="/run/secrets/identity_ldap_bind_password",
+        alias="IDENTITY_LDAP_BIND_PASSWORD_FILE",
+    )
+    identity_ldap_vendor: str = Field(default="ad", alias="IDENTITY_LDAP_VENDOR")
+    identity_ldap_username_attribute: str = Field(
+        default="sAMAccountName", alias="IDENTITY_LDAP_USERNAME_ATTRIBUTE"
+    )
+    identity_ldap_rdn_attribute: str = Field(
+        default="cn", alias="IDENTITY_LDAP_RDN_ATTRIBUTE"
+    )
+    identity_ldap_uuid_attribute: str = Field(
+        default="objectGUID", alias="IDENTITY_LDAP_UUID_ATTRIBUTE"
+    )
+    identity_ldap_user_object_classes: str = Field(
+        default="person, organizationalPerson, user",
+        alias="IDENTITY_LDAP_USER_OBJECT_CLASSES",
+    )
+    identity_ldap_user_filter: str = Field(
+        default="", alias="IDENTITY_LDAP_USER_FILTER"
+    )
+
     # Keycloak client authentication for the anthropic-token-broker client
     # is private_key_jwt (RFC 7523) with a Vault-PKI-issued key — NO static
     # client secret (docs/anthropic-wif-bootstrap.md Phase 0 step 2).
@@ -337,36 +436,112 @@ class Settings(BaseSettings):
     @field_validator("lab_samba_ldap_url")
     @classmethod
     def validate_lab_ldap_url(cls, value: str) -> str:
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme.lower() != "ldaps"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("LAB_SAMBA_LDAP_URL must be a bare ldaps:// origin")
-        return value.rstrip("/")
+        return _validate_ldaps_origin(value, "LAB_SAMBA_LDAP_URL")
 
-    @field_validator("lab_samba_users_dn", "lab_samba_bind_dn")
+    @field_validator(
+        "lab_samba_users_dn",
+        "lab_samba_bind_dn",
+        "identity_ldap_users_dn",
+        "identity_ldap_bind_dn",
+    )
     @classmethod
     def validate_lab_dns(cls, value: str, info) -> str:
+        # The external directory DNs are empty when the feature is disabled;
+        # validate_ldap_federation_boundary enforces non-empty when enabled.
+        if not value and info.field_name.startswith("identity_ldap"):
+            return value
         if not value or len(value) > 512 or any(ord(ch) < 32 for ch in value):
             raise ValueError(f"{info.field_name} is invalid")
         if not value.upper().startswith(("CN=", "OU=")) or "DC=" not in value.upper():
             raise ValueError(f"{info.field_name} must be an explicit LDAP DN")
         return value
 
-    @field_validator("lab_samba_bind_password_file")
+    @field_validator(
+        "lab_samba_bind_password_file", "identity_ldap_bind_password_file"
+    )
     @classmethod
-    def validate_lab_bind_password_file(cls, value: str) -> str:
+    def validate_lab_bind_password_file(cls, value: str, info) -> str:
         if not re.fullmatch(r"/run/secrets/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
             raise ValueError(
-                "LAB_SAMBA_BIND_PASSWORD_FILE must name a file under /run/secrets"
+                f"{info.field_name} must name a file under /run/secrets"
             )
         return value
+
+    @model_validator(mode="after")
+    def validate_ldap_federation_boundary(self) -> "Settings":
+        """Fail closed on any ambiguous or unsafe directory federation input.
+
+        Exactly one LDAP federation source may be enabled: the lab Samba
+        overlay and the production external directory would otherwise contend
+        for the Keycloak truststore and the same reconciliation inputs.
+        """
+        if self.identity_ldap_enabled and self.lab_samba_ldap_enabled:
+            raise ValueError("exactly one LDAP federation source may be enabled")
+        if not self.identity_ldap_enabled:
+            return self
+
+        for field_name, alias in (
+            ("identity_ldap_provider_name", "IDENTITY_LDAP_PROVIDER_NAME"),
+            ("identity_ldap_url", "IDENTITY_LDAP_URL"),
+            ("identity_ldap_users_dn", "IDENTITY_LDAP_USERS_DN"),
+            ("identity_ldap_bind_dn", "IDENTITY_LDAP_BIND_DN"),
+            ("identity_ldap_user_filter", "IDENTITY_LDAP_USER_FILTER"),
+        ):
+            if not getattr(self, field_name):
+                raise ValueError(f"{alias} is required when IDENTITY_LDAP_ENABLED")
+
+        url = _validate_ldaps_origin(self.identity_ldap_url, "IDENTITY_LDAP_URL")
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        # An IP literal makes certificate hostname verification meaningless, so
+        # the directory origin must be a real FQDN covered by the DC's SANs.
+        if (
+            _LDAP_FQDN_RE.fullmatch(host) is None
+            or _IPV4_LITERAL_RE.fullmatch(host) is not None
+        ):
+            raise ValueError("IDENTITY_LDAP_URL must name a directory FQDN")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("IDENTITY_LDAP_URL contains an invalid port") from exc
+        if port not in (None, 636):
+            raise ValueError("IDENTITY_LDAP_URL must use the standard LDAPS port 636")
+
+        if _LDAP_PROVIDER_NAME_RE.fullmatch(self.identity_ldap_provider_name) is None:
+            raise ValueError("IDENTITY_LDAP_PROVIDER_NAME contains unsupported characters")
+        if self.identity_ldap_provider_name == LAB_LDAP_PROVIDER_NAME:
+            raise ValueError(
+                "IDENTITY_LDAP_PROVIDER_NAME must not reuse the reserved lab "
+                "federation provider name"
+            )
+
+        if self.identity_ldap_vendor not in {"ad", "rhds", "other"}:
+            raise ValueError("IDENTITY_LDAP_VENDOR is not a supported directory vendor")
+        for field_name, alias in (
+            ("identity_ldap_username_attribute", "IDENTITY_LDAP_USERNAME_ATTRIBUTE"),
+            ("identity_ldap_rdn_attribute", "IDENTITY_LDAP_RDN_ATTRIBUTE"),
+            ("identity_ldap_uuid_attribute", "IDENTITY_LDAP_UUID_ATTRIBUTE"),
+        ):
+            if _LDAP_ATTRIBUTE_RE.fullmatch(getattr(self, field_name)) is None:
+                raise ValueError(f"{alias} is not a bounded LDAP attribute name")
+        if (
+            _LDAP_OBJECT_CLASSES_RE.fullmatch(self.identity_ldap_user_object_classes)
+            is None
+        ):
+            raise ValueError(
+                "IDENTITY_LDAP_USER_OBJECT_CLASSES is not a bounded object-class list"
+            )
+
+        user_filter = self.identity_ldap_user_filter
+        if (
+            len(user_filter) > 512
+            or not user_filter.startswith("(")
+            or not user_filter.endswith(")")
+            or _LDAP_FILTER_RE.fullmatch(user_filter) is None
+            or not _is_single_ldap_group(user_filter)
+        ):
+            raise ValueError("IDENTITY_LDAP_USER_FILTER is not a bounded LDAP filter")
+        return self
 
     @staticmethod
     def _token_ok(value: str) -> bool:

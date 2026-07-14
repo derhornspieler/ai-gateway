@@ -624,7 +624,7 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
         async def _root_group(self, admin_token, *, create):
             return {"id": "managed-root"}
 
-        async def _ensure_lab_ldap(self, admin_token, bind_password):
+        async def _ensure_ldap_federation(self, admin_token, bind_password):
             return None
 
         async def _ensure_broker(self, admin_token):

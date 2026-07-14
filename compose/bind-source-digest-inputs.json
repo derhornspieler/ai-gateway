@@ -31,5 +31,9 @@
       "secrets/samba_user_lab-developer_password",
       "secrets/samba_user_lab-user_password"
     ]
+  },
+  "identity_ldap": {
+    "keycloak": ["keycloak/identity-ldap-ca.pem", "keycloak/realms"],
+    "key-rotator": ["secrets/identity_ldap_bind_password"]
   }
 }

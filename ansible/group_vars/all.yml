@@ -157,6 +157,10 @@ net_egress_subnet: 172.28.0.0/24
 # subnet to use a physical NIC.
 envoy_egress_ip: 172.28.0.2
 alloy_internal_ip: 172.28.2.2
+# Keycloak joins the routable internal bridge only so the single external
+# directory allowance can be pinned to one exact source address. Everything
+# else it reaches stays on `internal: true` bridges.
+keycloak_internal_ip: 172.28.2.3
 
 # The in-stack Cribl mock stays on the Docker bridge and needs no physical-NIC
 # exception. A customer overlay that exports to a real Cribl worker must opt in
@@ -165,6 +169,34 @@ alloy_internal_ip: 172.28.2.2
 cribl_external_export_enabled: false
 cribl_otlp_allowed_cidr: ""
 cribl_otlp_allowed_port: 4317
+
+# ── External production directory federation (LDAPS only) ───────────────
+# Optional customer Active Directory federation for generic/production
+# deployments. It is never combined with the lab Samba overlay: exactly one
+# identity source may own the Keycloak truststore and the federation
+# reconciliation inputs. Every value is inventory-owned and fail-closed, and
+# the bind credential lives only in a dedicated encrypted overlay written by
+# scripts/store-identity-ldap-bind-password.py. Plaintext ldap:// is refused
+# at every layer; the URL must be ldaps:// on port 636.
+identity_ldap_enabled: false
+identity_ldap_provider_name: ""
+identity_ldap_url: ""
+identity_ldap_users_dn: ""
+identity_ldap_bind_dn: ""
+# Controller-local path to the PUBLIC CA bundle (PEM, certificates only). It
+# is validated before mutation and mounted read-only into Keycloak alone.
+identity_ldap_ca_bundle_src: ""
+# Exact IPv4 address of the directory host. It feeds both the Keycloak
+# extra_hosts pin and the single Keycloak -> directory tcp/636 allowance, so
+# LDAPS never depends on a resolver Keycloak is not allowed to query.
+identity_ldap_directory_ip: ""
+identity_ldap_vendor: ad
+identity_ldap_username_attribute: sAMAccountName
+identity_ldap_rdn_attribute: cn
+identity_ldap_uuid_attribute: objectGUID
+identity_ldap_user_object_classes: "person, organizationalPerson, user"
+identity_ldap_user_filter: ""
+# identity_ldap_bind_password: <encrypted overlay only; never here>
 
 # Fixed edge addresses are rendered into both Compose's network attachments
 # and every downstream proxy-trust allowlist. A single source of truth avoids
@@ -329,6 +361,8 @@ aigw_seed_test_users: false
 #   samba_ad_admin_password     samba_ad_bind_password
 #   samba_user_lab_admin_password samba_user_lab_developer_password
 #   samba_user_lab_user_password
+# A production deployment with identity_ldap_enabled additionally requires:
+#   identity_ldap_bind_password  <encrypted overlay only when identity_ldap_enabled>
 #
 # Left undefined on purpose (uncomment ONLY in a vault overlay, never here):
 # pg_super_password:          <vault overlay only>
@@ -368,6 +402,9 @@ aigw_seed_test_users: false
 # vault_unseal_key:           <vault overlay only>  # Operator-supplied output
 #     of HashiCorp Vault initialization. Never randomly generate this value.
 #     When defined, Ansible may use it via the stdin-only unseal helper.
+# identity_ldap_bind_password: <vault overlay only>  # Customer-supplied
+#     read-only directory service-account credential. Never randomly generated;
+#     store it with scripts/store-identity-ldap-bind-password.py (stdin only).
 
 # Not an overlay secret: starts empty, written in place on the VM by
 # scripts/vault-bootstrap.sh after Vault init/unseal.
