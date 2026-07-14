@@ -1,9 +1,12 @@
 [extend]
 useDefault = true
 
-[[allowlists]]
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
 description = "Deterministic non-production tokens used by validation and unit tests"
-targetRules = ["generic-api-key"]
+regexTarget = "secret"
 regexes = [
   '''^0123456789abcdef0123456789abcdef$''',
   '''^abcdef0123456789abcdef0123456789$''',
@@ -11,4 +14,14 @@ regexes = [
   '''^sk-ValidationVirtualKey_0123456789$''',
   '''^ValidationWebuiOIDCSecret0123456789ABC$''',
   '''^ValidationRotatorInternal0123456789ABCDE$''',
+  '''^WebuiOIDCSecret_0123456789_ABCDEFGHI$''',
+  '''^PortalOIDCSecret_0123456789_ABCDEFGH$''',
+  '''^AdminPortalOIDCSecret_0123456789_ABCDE$''',
+  '''^OAuth2ProxySecret_0123456789_ABCDEFGHI$''',
+  '''^WebuiOIDCSecret!0123456789-ABCDEFGHI$''',
+  '''^PortalOIDCSecret!0123456789-ABCDEFGH$''',
+  '''^AdminPortalOIDCSecret!0123456789-ABCDE$''',
+  '''^OAuth2ProxySecret!0123456789-ABCDEFGHI$''',
+  # Public HashiCorp release-signing subkey fingerprint, not a credential.
+  '''^374EC75B485913604A831CC7C820C6D5CD27AB87$''',
 ]

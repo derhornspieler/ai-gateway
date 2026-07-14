@@ -46,12 +46,15 @@ jobs:
       - name: Syntax-check Ansible without lab credentials
         run: |
           inventory="$RUNNER_TEMP/ci-inventory.ini"
-          printf '[gateway]\nlocalhost ansible_connection=local\n' > "$inventory"
+          printf '[gateway]\nlocalhost ansible_connection=local\n[generic_rocky9]\n' > "$inventory"
           ansible-playbook -i "$inventory" ansible/site.yml --syntax-check
           ansible-playbook -i "$inventory" ansible/deploy-stack-only.yml --syntax-check
 
       - name: Render and validate base and lab Compose contracts
         run: bash scripts/validate-compose.sh
+
+      - name: Run infrastructure security regression tests
+        run: python3 -I -m unittest discover -v -s scripts/tests -p 'test_*.py'
 
       - name: Validate identity policy source parity
         run: python3 -I scripts/validate-identity-policy.py

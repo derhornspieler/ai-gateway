@@ -1,0 +1,150 @@
+name: Go quality and final-image security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "31 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      require_dhi_auth:
+        description: Fail instead of explicitly skipping final-image SBOMs when DHI credentials are unavailable
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: ${{ matrix.module }} test, race, and vet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [dhi-health-probe, egress-proxy, vault-ui-proxy]
+    defaults:
+      run:
+        working-directory: services/${{ matrix.module }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.25.x
+          cache: true
+          cache-dependency-path: services/${{ matrix.module }}/go.mod
+
+      - name: Run tests with the race detector
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  final-image-sbom:
+    name: ${{ matrix.image }} final image and SBOM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: dhi-health-probe
+            context: services/dhi-health-probe
+            base_image: dhi.io/oauth2-proxy:7.15.3@sha256:3e225291283ad41745327dcbd2e97b8a6aed461d38e9e84d1e664092b53f1158
+          - image: egress-proxy
+            context: services/egress-proxy
+            base_image: ""
+          - image: vault-ui-proxy
+            context: services/vault-ui-proxy
+            base_image: ""
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Decide the DHI-authenticated artifact contract
+        id: dhi
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_PASSWORD: ${{ secrets.DHI_PASSWORD }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUIRE_DHI_AUTH: ${{ inputs.require_dhi_auth || false }}
+        run: |
+          if [[ -n "$DHI_USERNAME" && -n "$DHI_PASSWORD" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$DHI_USERNAME" || -n "$DHI_PASSWORD" ]]; then
+            echo "::error::DHI_USERNAME and DHI_PASSWORD must be configured together"
+            exit 1
+          elif [[ "$EVENT_NAME" == "schedule" || "$REQUIRE_DHI_AUTH" == "true" ]]; then
+            echo "::error::DHI authentication is required for this final-image run"
+            exit 1
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Final-image build and SBOM explicitly skipped because DHI auth is unavailable"
+          fi
+
+      - name: Authenticate to DHI
+        if: steps.dhi.outputs.available == 'true'
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_PASSWORD: ${{ secrets.DHI_PASSWORD }}
+        run: printf '%s' "$DHI_PASSWORD" | docker login dhi.io --username "$DHI_USERNAME" --password-stdin
+
+      - name: Build the actual final runtime image
+        if: steps.dhi.outputs.available == 'true'
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+          BUILD_CONTEXT: ${{ matrix.context }}
+          BASE_IMAGE: ${{ matrix.base_image }}
+        run: |
+          build_args=(--pull --tag "ai-gateway/ci-${IMAGE_NAME}:${GITHUB_SHA}")
+          if [[ -n "$BASE_IMAGE" ]]; then
+            build_args+=(--build-arg "BASE_IMAGE=$BASE_IMAGE")
+          fi
+          docker build "${build_args[@]}" "$BUILD_CONTEXT"
+
+      - name: Generate the final-image CycloneDX SBOM
+        if: steps.dhi.outputs.available == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          scan-type: image
+          image-ref: ai-gateway/ci-${{ matrix.image }}:${{ github.sha }}
+          format: cyclonedx
+          output: ${{ matrix.image }}.cdx.json
+          hide-progress: "true"
+
+      - name: Upload the final-image SBOM
+        if: steps.dhi.outputs.available == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.image }}-final-image-sbom
+          path: ${{ matrix.image }}.cdx.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record explicit artifact disposition
+        if: always()
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+          DHI_AVAILABLE: ${{ steps.dhi.outputs.available }}
+        run: |
+          if [[ "$DHI_AVAILABLE" == "true" ]]; then
+            echo "Final image and SBOM: COMPLETE ($IMAGE_NAME)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Final image and SBOM: SKIPPED/FAILED ($IMAGE_NAME; see DHI auth gate)" >> "$GITHUB_STEP_SUMMARY"
+          fi
