@@ -295,7 +295,7 @@ they exist only to preserve exact-IP host publication under Docker 29.
 `samba-ad` must have no published port and only one attachment,
 `net-identity`. `lab-dns` must publish TCP/UDP 53 only on the exact ADM and
 internal addresses, have no forwarding plugin, and return `NXDOMAIN` for a
-name outside `aigw.internal`.
+name outside `aigw.aegisgroup.ch`.
 
 Prove service discovery still works while direct internet and host access are
 blocked:

@@ -266,6 +266,21 @@ print("          0123456789abcdef")
             self.assertIn("must not replace a client's general", host_text)
             self.assertIn("only Envoy gets", host_text)
             self.assertIn("keep service discovery but have no", host_text)
+            # Edge TLS mode is a required non-secret contract key, so the
+            # generated host_vars must offer it (empty = fail closed) together
+            # with its per-mode inputs. The private key is a controller-local
+            # file path, never an inventory secret.
+            self.assertIn("aigw_edge_tls_mode", self.contract["required_nonsecret_keys"])
+            for edge_tls_key in (
+                'aigw_edge_tls_mode: ""',
+                'aigw_edge_tls_leaf_cert_file: ""',
+                'aigw_edge_tls_private_key_file: ""',
+                'aigw_edge_tls_chain_file: ""',
+                "aigw_edge_tls_min_days_remaining: 30",
+            ):
+                self.assertIn(edge_tls_key, host_text)
+            secret_names = [entry["name"] for entry in self.contract["required_secret_keys"]]
+            self.assertNotIn("aigw_edge_tls_private_key", secret_names)
             for entry in self.contract["required_secret_keys"]:
                 self.assertNotIn(entry["name"], host_text)
             vault_text = vault.read_text(encoding="utf-8")

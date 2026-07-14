@@ -359,8 +359,8 @@
     mode: "0644"
   loop:
     - { src: Corefile.authoritative.j2, dest: Corefile }
-    - { src: db.aigw.internal.j2, dest: db.aigw.internal }
-    - { src: db.aigw.internal.adm.j2, dest: db.aigw.internal.adm }
+    - { src: db.aigw.aegisgroup.ch.j2, dest: db.aigw.aegisgroup.ch }
+    - { src: db.aigw.aegisgroup.ch.adm.j2, dest: db.aigw.aegisgroup.ch.adm }
   when: platform_authoritative_dns_enabled | bool
 
 - name: Render mutually exclusive Cribl plaintext or verified-TLS client
@@ -513,6 +513,7 @@
       - aigw-compose.sh
       - aigw-runtime-up.sh
       - compute-bind-source-digests.py
+      - edge-tls.py
       - load-offline-image-seed.py
       - plan-compose-builds.py
       - preserve-compose-rollbacks.py
@@ -532,6 +533,7 @@
       - validate-identity-policy.py
       - validate-vault-config.sh
       - vault-bootstrap.sh
+      - vault-pki-intermediate.sh
       - vault-unseal.sh
       - verify-live-lab-identity.py
   block:
@@ -1048,10 +1050,15 @@
       - (cribl_otlp_insecure | bool) or (cribl_otlp_ca_file | length > 0)
       - cribl_otlp_server_name is regex('^[A-Za-z0-9.-]+$')
       - cribl_otlp_ca_file is regex('^/[A-Za-z0-9_./-]+$')
+      # The Cribl trust anchor is a SEPARATE, operator-supplied bundle. The edge
+      # CA is never implicitly trusted for the telemetry endpoint.
+      - not (cribl_external_export_enabled | bool) or (cribl_otlp_ca_pem_file | length > 0)
+      - not (cribl_external_export_enabled | bool) or cribl_otlp_ca_file == '/etc/ssl/certs/aigw-cribl-ca.pem'
     quiet: true
     fail_msg: >-
       CRIBL OTLP plaintext is allowed only for cribl-mock:4317. Real endpoints
-      require cribl_otlp_insecure=false plus CA file and TLS server name.
+      require cribl_otlp_insecure=false, the dedicated cribl_otlp_ca_pem_file
+      bundle mounted at /etc/ssl/certs/aigw-cribl-ca.pem, and a TLS server name.
 
 - name: Create root-only runtime secret source directory
   ansible.builtin.file:
@@ -1195,22 +1202,143 @@
     ('DNS:*.' ~ aigw_domain) not in existing_edge_certificate.stdout or
     ('DNS:' ~ aigw_domain) not in existing_edge_certificate.stdout
 
+# The marker records that a customer-CA-signed chain was installed by
+# scripts/vault-pki-intermediate.sh. Once it exists, a placeholder must never
+# reappear: silently downgrading a real edge certificate to a self-signed one
+# would keep the stack "working" while destroying its identity.
+- name: Inspect the vault-intermediate issuance marker
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/.state/edge-tls-issued"
+    follow: false
+    get_checksum: false
+  register: aigw_edge_tls_issued_marker
+
+# Catches both "the real certificate vanished" and "the domain moved, so the
+# task above just deleted a certificate the marker says was CA-signed". In
+# either case the placeholder is suppressed (the marker gates it), so failing
+# here with an actionable message beats failing later with a missing-file error.
+- name: Refuse to mask lost production edge material with a placeholder
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (aigw_edge_tls_issued_marker.stat.exists and (
+          existing_edge_certificate.rc != 0 or
+          ('DNS:*.' ~ aigw_domain) not in existing_edge_certificate.stdout or
+          ('DNS:' ~ aigw_domain) not in existing_edge_certificate.stdout))
+    quiet: true
+    fail_msg: >-
+      The vault-intermediate ceremony previously installed customer-CA-signed
+      edge material, but certs/int.crt is now missing, unreadable, or issued for
+      a different domain than aigw_domain. If aigw_domain changed, rerun the
+      ceremony (scripts/vault-pki-intermediate.sh csr -> customer CA signs ->
+      install-signed); otherwise restore state or run renew-leaf. A self-signed
+      placeholder must never silently replace a CA-signed certificate.
+  when: aigw_edge_tls_mode == 'vault-intermediate'
+
+# ── Mode customer-supplied: validate on the target, then install atomically ──
+# The private key is staged with no_log and every crypto check runs BEFORE the
+# live certs/ store is touched. A failure anywhere leaves the previous
+# certificates exactly as they were.
+- name: Install validated customer-supplied edge TLS material
+  when: aigw_edge_tls_mode == 'customer-supplied'
+  block:
+    - name: Create the private edge TLS state boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Reset the private edge TLS staging boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state/edge-tls-staging"
+        state: absent
+
+    - name: Create the private edge TLS staging boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state/edge-tls-staging"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Stage the customer edge certificate and chain
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ stack_dir }}/.state/edge-tls-staging/{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - { src: "{{ aigw_edge_tls_leaf_cert_file }}", dest: leaf.pem }
+        - { src: "{{ aigw_edge_tls_chain_file }}", dest: chain.pem }
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: Stage the customer edge private key without logging
+      ansible.builtin.copy:
+        src: "{{ aigw_edge_tls_private_key_file }}"
+        dest: "{{ stack_dir }}/.state/edge-tls-staging/leaf.key"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Validate and atomically install the customer edge TLS material
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - "{{ stack_dir }}/scripts/edge-tls.py"
+          - install
+          - --leaf
+          - "{{ stack_dir }}/.state/edge-tls-staging/leaf.pem"
+          - --key
+          - "{{ stack_dir }}/.state/edge-tls-staging/leaf.key"
+          - --chain
+          - "{{ stack_dir }}/.state/edge-tls-staging/chain.pem"
+          - --certs-dir
+          - "{{ stack_dir }}/certs"
+          - --domain
+          - "{{ aigw_domain }}"
+          - --min-days-remaining
+          - "{{ aigw_edge_tls_min_days_remaining }}"
+          - --expect-key-owner
+          - "0:0"
+          - --expect-key-mode
+          - "0600"
+      register: aigw_edge_tls_install
+      changed_when: "'edge-tls=changed' in aigw_edge_tls_install.stdout"
+  always:
+    - name: Remove the edge TLS staging boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state/edge-tls-staging"
+        state: absent
+
 - name: Self-signed placeholder cert so traefik/open-webui start pre-bootstrap
   ansible.builtin.command:
     cmd: >
       openssl req -x509 -newkey rsa:2048 -nodes -days 7
       -subj "/CN=*.{{ aigw_domain }}"
       -addext "subjectAltName=DNS:*.{{ aigw_domain }},DNS:{{ aigw_domain }}"
+      -addext "extendedKeyUsage=serverAuth"
       -keyout {{ stack_dir }}/certs/int.key -out {{ stack_dir }}/certs/int.crt
     creates: "{{ stack_dir }}/certs/int.crt"
+  when: >-
+    aigw_edge_tls_mode in ['lab', 'vault-intermediate'] and
+    not (aigw_edge_tls_issued_marker.stat.exists | default(false))
 
-- name: Placeholder CA bundle (replaced by vault-bootstrap)
+- name: Placeholder CA bundle (replaced by the reviewed edge TLS ceremony)
   ansible.builtin.copy:
     src: "{{ stack_dir }}/certs/int.crt"
     dest: "{{ stack_dir }}/certs/ca.pem"
     remote_src: true
     force: false
     mode: "0644"
+  when: >-
+    aigw_edge_tls_mode in ['lab', 'vault-intermediate'] and
+    not (aigw_edge_tls_issued_marker.stat.exists | default(false))
 
 - name: Reconcile public edge certificate material permissions
   ansible.builtin.file:
@@ -1230,6 +1358,99 @@
     group: "65532"
     mode: "0640"
     follow: false
+
+# Fail the converge BEFORE any compose activity if the installed production
+# material is a placeholder, self-signed, expiring, or otherwise invalid. For
+# vault-intermediate this activates only once the ceremony has written its
+# marker; before that the placeholder is expected and this gate stays dormant.
+- name: Prove installed production edge TLS material before starting the stack
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ stack_dir }}/scripts/edge-tls.py"
+      - validate-installed
+      - --certs-dir
+      - "{{ stack_dir }}/certs"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --min-days-remaining
+      - "{{ aigw_edge_tls_min_days_remaining }}"
+      - --reject-self-signed
+  changed_when: false
+  when: >-
+    deployment_profile != 'rocky9-lab' and
+    (aigw_edge_tls_mode == 'customer-supplied' or
+     (aigw_edge_tls_mode == 'vault-intermediate' and
+      (aigw_edge_tls_issued_marker.stat.exists | default(false))))
+
+# ── Cribl export CA bundle (separate trust anchor from the edge CA) ──────────
+# alloy always mounts certs/cribl-ca.pem, so the bind source must always exist.
+# When exporting to a real Cribl endpoint it is the operator's validated bundle;
+# otherwise it is a copy of the edge ca.pem whose content is unused while the
+# mock export runs insecure. The edge CA is never TRUSTED for Cribl either way:
+# alloy only reads cribl-ca.pem when cribl_otlp_insecure is false.
+- name: Install the external Cribl export CA bundle
+  when: cribl_external_export_enabled | bool
+  block:
+    - name: Create the Cribl CA staging boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state/edge-tls-staging-cribl"
+        state: "{{ item }}"
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - absent
+        - directory
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Stage the external Cribl CA bundle
+      ansible.builtin.copy:
+        src: "{{ cribl_otlp_ca_pem_file }}"
+        dest: "{{ stack_dir }}/.state/edge-tls-staging-cribl/bundle.pem"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Validate the external Cribl CA bundle
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - "{{ stack_dir }}/scripts/edge-tls.py"
+          - validate-ca-bundle
+          - --bundle
+          - "{{ stack_dir }}/.state/edge-tls-staging-cribl/bundle.pem"
+          - --min-days-remaining
+          - "{{ aigw_edge_tls_min_days_remaining }}"
+      changed_when: false
+
+    - name: Install the validated external Cribl CA bundle
+      ansible.builtin.copy:
+        src: "{{ stack_dir }}/.state/edge-tls-staging-cribl/bundle.pem"
+        dest: "{{ stack_dir }}/certs/cribl-ca.pem"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+  always:
+    - name: Remove the Cribl CA staging boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/.state/edge-tls-staging-cribl"
+        state: absent
+
+- name: Provide a placeholder Cribl CA bundle when no external endpoint is used
+  ansible.builtin.copy:
+    src: "{{ stack_dir }}/certs/ca.pem"
+    dest: "{{ stack_dir }}/certs/cribl-ca.pem"
+    remote_src: true
+    force: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: not (cribl_external_export_enabled | bool)
 
 # Linux bind mounts retain the source inode selected at container creation.
 # Ansible's safe atomic replacement can therefore install correct new bytes at
@@ -1474,8 +1695,8 @@
         +
         ([
           {'path': stack_dir ~ '/services/lab-dns/Corefile', 'recursive': false},
-          {'path': stack_dir ~ '/services/lab-dns/db.aigw.internal', 'recursive': false},
-          {'path': stack_dir ~ '/services/lab-dns/db.aigw.internal.adm', 'recursive': false}
+          {'path': stack_dir ~ '/services/lab-dns/db.aigw.aegisgroup.ch', 'recursive': false},
+          {'path': stack_dir ~ '/services/lab-dns/db.aigw.aegisgroup.ch.adm', 'recursive': false}
         ] if (platform_authoritative_dns_enabled | bool) else [])
         +
         ([

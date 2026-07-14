@@ -91,7 +91,7 @@ def main() -> int:
         allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
+    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
         raise RuntimeError("portal step-up did not return to /admin")
 
     group_pattern = re.compile(

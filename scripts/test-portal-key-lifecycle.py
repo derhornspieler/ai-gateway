@@ -25,7 +25,7 @@ if SPEC is None or SPEC.loader is None:
 flow = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(flow)
 
-API_ORIGIN = "https://api.aigw.internal"
+API_ORIGIN = "https://api.aigw.aegisgroup.ch"
 
 
 class OneTimeSecretParser(HTMLParser):

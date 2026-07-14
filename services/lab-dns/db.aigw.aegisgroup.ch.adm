@@ -1,14 +1,14 @@
-$ORIGIN aigw.internal.
+$ORIGIN aigw.aegisgroup.ch.
 $TTL 60
 
-@       IN SOA  dns.aigw.internal. hostmaster.aigw.internal. (
+@       IN SOA  dns.aigw.aegisgroup.ch. hostmaster.aigw.aegisgroup.ch. (
                     2026071303 ; serial
                     3600       ; refresh
                     900        ; retry
                     604800     ; expire
                     60         ; negative cache TTL
                 )
-        IN NS   dns.aigw.internal.
+        IN NS   dns.aigw.aegisgroup.ch.
         IN A    10.8.10.10
 
 ; ADM-view administration surfaces terminate only on the ADM host-only NIC.

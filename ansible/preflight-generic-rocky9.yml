@@ -209,6 +209,86 @@
           }}
       changed_when: false
 
+    # Edge TLS mode is fail-closed on the controller too, so an operator learns
+    # the inventory is unusable before the first mutating converge. The three
+    # customer-supplied file paths are lstat'ed here, on the machine that holds
+    # them: a symlinked or group-readable private key is a custody failure.
+    - name: Preflight — inspect declared customer edge TLS inputs
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      delegate_to: localhost
+      loop:
+        - "{{ aigw_edge_tls_leaf_cert_file | default('') }}"
+        - "{{ aigw_edge_tls_private_key_file | default('') }}"
+        - "{{ aigw_edge_tls_chain_file | default('') }}"
+      register: aigw_generic_edge_tls_stats
+      changed_when: false
+      when: (aigw_edge_tls_mode | default('')) == 'customer-supplied'
+
+    # A skipped loop still registers one result per item, each carrying
+    # skipped=true and no stat. Drop those first: treating them as stat failures
+    # would make every non-customer-supplied inventory look invalid.
+    - name: Preflight — collect unsafe customer edge TLS input boundaries
+      ansible.builtin.set_fact:
+        aigw_generic_unsafe_edge_tls_inputs: >-
+          {{
+            ((aigw_generic_edge_tls_stats.results | default([]))
+             | rejectattr('skipped', 'defined')
+             | selectattr('stat', 'defined')
+             | rejectattr('stat.exists')
+             | map(attribute='item') | map('basename') | list) +
+            ((aigw_generic_edge_tls_stats.results | default([]))
+             | rejectattr('skipped', 'defined')
+             | selectattr('stat', 'defined')
+             | selectattr('stat.exists')
+             | rejectattr('stat.isreg')
+             | map(attribute='item') | map('basename') | list) +
+            ((aigw_generic_edge_tls_stats.results | default([]))
+             | rejectattr('skipped', 'defined')
+             | selectattr('stat', 'defined')
+             | selectattr('stat.islnk', 'defined')
+             | selectattr('stat.islnk')
+             | map(attribute='item') | map('basename') | list) +
+            ((aigw_generic_edge_tls_stats.results | default([]))
+             | rejectattr('skipped', 'defined')
+             | selectattr('stat', 'defined')
+             | selectattr('item', 'equalto', aigw_edge_tls_private_key_file | default(''))
+             | selectattr('stat.exists')
+             | rejectattr('stat.mode', 'equalto', '0600')
+             | map(attribute='item') | map('basename') | list)
+          }}
+      changed_when: false
+
+    - name: Preflight — collect invalid generic edge TLS selections only
+      ansible.builtin.set_fact:
+        aigw_generic_invalid_edge_tls: >-
+          {{
+            ([] if (aigw_edge_tls_mode | default('')) in
+                   ['customer-supplied', 'vault-intermediate']
+             else ['aigw_edge_tls_mode']) +
+            ([] if ((aigw_edge_tls_mode | default('')) != 'customer-supplied' or
+                    ((aigw_edge_tls_leaf_cert_file | default('') | length > 0) and
+                     (aigw_edge_tls_private_key_file | default('') | length > 0) and
+                     (aigw_edge_tls_chain_file | default('') | length > 0)))
+             else ['customer_supplied_files_incomplete']) +
+            ([] if ((aigw_edge_tls_mode | default('')) == 'customer-supplied' or
+                    ((aigw_edge_tls_leaf_cert_file | default('') | length == 0) and
+                     (aigw_edge_tls_private_key_file | default('') | length == 0) and
+                     (aigw_edge_tls_chain_file | default('') | length == 0)))
+             else ['customer_supplied_files_set_for_other_mode']) +
+            ([] if ((aigw_edge_tls_min_days_remaining | default(30) | int) >= 7)
+             else ['aigw_edge_tls_min_days_remaining']) +
+            aigw_generic_unsafe_edge_tls_inputs
+          }}
+      changed_when: false
+
+    - name: Preflight — deduplicate the generic edge TLS failure receipt
+      ansible.builtin.set_fact:
+        aigw_generic_invalid_edge_tls: "{{ aigw_generic_invalid_edge_tls | unique }}"
+      changed_when: false
+
     - name: Preflight — report a machine-readable generic inventory result
       ansible.builtin.assert:
         that:
@@ -227,6 +307,7 @@
           - aigw_generic_invalid_secret_keys | length == 0
           - aigw_generic_duplicate_secret_boundaries | length == 0
           - aigw_generic_forbidden_lab_options | length == 0
+          - aigw_generic_invalid_edge_tls | length == 0
         quiet: true
         fail_msg: >-
           AIGW_GENERIC_PREFLIGHT={{ {
@@ -240,7 +321,8 @@
             'missing_secret': aigw_generic_missing_secret_keys,
             'invalid_secret': aigw_generic_invalid_secret_keys,
             'duplicate_secret_boundaries': aigw_generic_duplicate_secret_boundaries,
-            'forbidden_lab_options': aigw_generic_forbidden_lab_options
+            'forbidden_lab_options': aigw_generic_forbidden_lab_options,
+            'invalid_edge_tls': aigw_generic_invalid_edge_tls
           } | to_json }}
 
     - name: Preflight — emit the successful machine-readable generic contract receipt

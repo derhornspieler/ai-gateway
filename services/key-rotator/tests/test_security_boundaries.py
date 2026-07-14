@@ -105,11 +105,11 @@ def test_keycloak_bootstrap_url_is_same_origin_and_canonical() -> None:
 
 def test_keycloak_assertion_audiences_follow_each_realm_frontend() -> None:
     cfg = settings(
-        KEYCLOAK_PUBLIC_URL="https://auth.aigw.internal",
+        KEYCLOAK_PUBLIC_URL="https://auth.aigw.aegisgroup.ch",
         WIF_KEYCLOAK_PUBLIC_URL="https://idp.wif-a.example.invalid",
     )
     assert cfg.keycloak_assertion_audience("aigw") == (
-        "https://auth.aigw.internal/realms/aigw/protocol/openid-connect/token"
+        "https://auth.aigw.aegisgroup.ch/realms/aigw/protocol/openid-connect/token"
     )
     internal = "http://keycloak:8080/realms/anthropic-wif/protocol/openid-connect/token"
     assert cfg.keycloak_assertion_audience_for_token_url(internal) == (

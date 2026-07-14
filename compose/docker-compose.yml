@@ -1117,11 +1117,14 @@ services:
       TEMPO_INGEST_IP: ${TEMPO_INGEST_IP:?TEMPO_INGEST_IP must be set}
       CRIBL_OTLP_ENDPOINT: ${CRIBL_OTLP_ENDPOINT:?CRIBL_OTLP_ENDPOINT must be set}
       CRIBL_OTLP_INSECURE: ${CRIBL_OTLP_INSECURE:-false}
-      CRIBL_OTLP_CA_FILE: ${CRIBL_OTLP_CA_FILE:-/etc/ssl/certs/aigw-ca.pem}
+      CRIBL_OTLP_CA_FILE: ${CRIBL_OTLP_CA_FILE:-/etc/ssl/certs/aigw-cribl-ca.pem}
       CRIBL_OTLP_SERVER_NAME: ${CRIBL_OTLP_SERVER_NAME:-}
     volumes:
       - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
-      - ./certs/ca.pem:/etc/ssl/certs/aigw-ca.pem:ro
+      # Dedicated trust anchor for the Cribl OTLP export. Deliberately NOT the
+      # edge CA: the authority that signs this gateway's edge certificate has no
+      # business vouching for the customer's telemetry endpoint.
+      - ./certs/cribl-ca.pem:/etc/ssl/certs/aigw-cribl-ca.pem:ro
       - alloy_data:/var/lib/alloy
       # Read-only Docker json-file ingestion; never mount /var/run/docker.sock.
       - ${DOCKER_DATA_ROOT:?DOCKER_DATA_ROOT must be set}/containers:/var/lib/docker/containers:ro

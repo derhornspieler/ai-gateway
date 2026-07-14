@@ -1,6 +1,6 @@
 {
   "base": {
-    "alloy": ["alloy/config.alloy", "certs/ca.pem"],
+    "alloy": ["alloy/config.alloy", "certs/cribl-ca.pem"],
     "cribl-mock": ["cribl-mock/config.yaml"],
     "grafana": ["grafana/provisioning"],
     "keycloak": ["keycloak/realms"],
@@ -18,8 +18,8 @@
   "platform_dns": {
     "lab-dns": [
       "services/lab-dns/Corefile",
-      "services/lab-dns/db.aigw.internal",
-      "services/lab-dns/db.aigw.internal.adm"
+      "services/lab-dns/db.aigw.aegisgroup.ch",
+      "services/lab-dns/db.aigw.aegisgroup.ch.adm"
     ]
   },
   "lab_identity": {

@@ -72,6 +72,29 @@ the inventory note above.
 
 The `verify` role resolves and probes each name after every converge, so a
 missing or wrong record fails the deployment rather than surfacing as a
-user-reported outage. TLS certificates must cover each name on its
-respective edge; see the [deployment guide](deploy-guide.md) §"DNS and
-certificates".
+user-reported outage.
+
+## The certificate that covers all of them
+
+Every published name above is a **one-level subdomain of the base domain**, so a
+single edge certificate with
+
+```
+SAN = DNS:*.<domain>, DNS:<domain>
+```
+
+covers every FQDN on **both** edges. `scripts/edge-tls.py` enforces exactly this
+shape: it refuses edge material whose SAN is missing either the wildcard or the
+apex, so a certificate that would leave one vhost unservable cannot reach the
+live store. The apex entry is not decorative — a `*.<domain>` wildcard does not
+match the bare `<domain>`.
+
+Both Traefik edges read the same store (`certs/int.crt` + `certs/int.key`).
+HTTPS terminates there and nowhere else; traffic behind the edges is plain HTTP
+on segmented internal bridges. See [operations](operations.md) §"Production edge
+TLS" for the two ways that certificate is produced (`vault-intermediate` and
+`customer-supplied`) and the ceremony commands.
+
+> If the signing CA carries `nameConstraints`, `<domain>` must fall within a
+> permitted DNS subtree or the chain will not verify. Pick the base domain to
+> satisfy the CA before deploying, not after.

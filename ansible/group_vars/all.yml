@@ -105,10 +105,47 @@ aigw_time_sync_max_offset_seconds: 5
 # Observability export target. Plaintext is permitted only for the in-stack
 # development mock; docker_stack asserts that any real target uses validated
 # TLS. A production overlay sets endpoint/server name/CA and false here.
+#
+# The Cribl CA bundle is deliberately SEPARATE from the edge CA. The CA that
+# signs this gateway's edge certificate has no authority over the customer's
+# telemetry endpoint, and trusting it for Cribl would silently widen the set of
+# certificates Alloy accepts on an outbound connection.
 cribl_otlp_endpoint: "cribl-mock:4317"
 cribl_otlp_insecure: true
-cribl_otlp_ca_file: "/etc/ssl/certs/aigw-ca.pem"
+cribl_otlp_ca_file: "/etc/ssl/certs/aigw-cribl-ca.pem"
 cribl_otlp_server_name: "cribl-mock"
+# Controller-local PEM bundle for the REAL Cribl endpoint's CA. Required when
+# cribl_external_export_enabled is true; never the edge CA.
+cribl_otlp_ca_pem_file: ""
+
+# ── Edge TLS / PKI ──────────────────────────────────────────────────────
+# HTTPS terminates at the two Traefik edges (traefik-int, traefik-adm) and
+# nowhere else. Container-to-container application traffic is deliberately
+# plain HTTP on segmented, internal-only bridges. The exceptions are Envoy,
+# which originates vendor TLS with narrowed per-vendor CA bundles, and Alloy,
+# which speaks OTLP/TLS to Cribl using the dedicated bundle above. This
+# platform does not do service-to-service mTLS.
+#
+# Exactly one mode must be selected; the selection is fail-closed in site.yml.
+#
+#   lab                -- self-signed TEST root minted by vault-bootstrap.sh.
+#                         Legal on rocky9-lab only, and only as the explicit
+#                         fallback for a disposable lab with no real CA.
+#   vault-intermediate -- Vault generates the intermediate key INTERNALLY and
+#                         emits a CSR; the customer CA signs it OFFLINE; the
+#                         signed cert + chain are imported back. The customer's
+#                         root private key is never requested or stored.
+#   customer-supplied  -- the operator supplies the edge leaf, its private key,
+#                         and the complete chain as controller-local files.
+aigw_edge_tls_mode: "{{ 'lab' if deployment_profile == 'rocky9-lab' else '' }}"
+# Mode customer-supplied only: controller-local PEM paths. Never committed,
+# never placed in the encrypted inventory overlay (a multi-line PEM in an inline
+# vault would create a second custody path); the key file must be 0600.
+aigw_edge_tls_leaf_cert_file: ""
+aigw_edge_tls_private_key_file: ""
+aigw_edge_tls_chain_file: ""
+# Certificates within this many days of notAfter fail validation and verify.
+aigw_edge_tls_min_days_remaining: 30
 
 # ── Policy routing ──────────────────────────────────────────────────────
 # An existing host's addressing and ordinary routing are customer-owned.

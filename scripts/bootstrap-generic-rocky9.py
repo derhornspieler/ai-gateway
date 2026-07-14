@@ -253,6 +253,38 @@ platform_authoritative_dns_enabled: false
 # deployed for platform consumers when this stays false.
 aigw_vault_ui_enabled: false
 
+# Production edge TLS. HTTPS terminates at the two Traefik edges; container-to-
+# container traffic stays plain HTTP on segmented internal bridges. Choose
+# exactly one mode -- the converge refuses to start without one.
+#
+#   vault-intermediate -- Vault GENERATES the intermediate private key
+#                         INTERNALLY and emits a CSR. Your CA signs that CSR
+#                         OFFLINE and you import the signed certificate plus the
+#                         complete chain. Leave the three *_file paths empty.
+#                         Your CA's root/issuing PRIVATE KEY is never requested,
+#                         never copied here, and never placed on the gateway.
+#                         After the Vault init ceremony:
+#                             sudo scripts/vault-pki-intermediate.sh csr
+#                             scripts/sign-vault-intermediate.sh   (on your CA host)
+#                             sudo scripts/vault-pki-intermediate.sh install-signed ...
+#
+#   customer-supplied  -- you already hold an edge certificate for this domain.
+#                         Set the three paths below to controller-local PEM
+#                         files. The key must be mode 0600 and owned by you. The
+#                         chain file must contain the COMPLETE chain including
+#                         the self-signed root. Ansible validates the material
+#                         (key/leaf match, wildcard+apex SAN, serverAuth EKU,
+#                         chain to root, expiry window) before installing it.
+aigw_edge_tls_mode: ""
+aigw_edge_tls_leaf_cert_file: ""
+aigw_edge_tls_private_key_file: ""
+aigw_edge_tls_chain_file: ""
+aigw_edge_tls_min_days_remaining: 30
+
+# Telemetry export CA. Required only when exporting to a real Cribl endpoint.
+# This is deliberately a SEPARATE trust anchor from the edge CA above.
+cribl_otlp_ca_pem_file: ""
+
 # Source-policy routes are enabled for the ADM and internal interfaces.
 manage_networking: true
 pbr_tables: []

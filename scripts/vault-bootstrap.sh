@@ -3,16 +3,25 @@
 #
 # Run ON THE VM from the stack directory (default /opt/ai-gateway) AFTER
 # `docker compose up -d vault`. Production differences are flagged inline:
-# single unseal key share (prod: 5/3 shares to separate custodians), and a
-# self-generated PKI root (prod: intermediate CSR signed by customer root,
-# per docs/anthropic-wif-bootstrap.md + solution-map §9.5).
+# single unseal key share (prod: 5/3 shares to separate custodians).
+#
+# EDGE PKI depends on the deployed aigw_edge_tls_mode:
+#   vault-intermediate -- steps 3a/4 are SKIPPED. Vault's intermediate CSR is
+#                         signed by the CUSTOMER's CA and imported by
+#                         scripts/vault-pki-intermediate.sh. No test root is
+#                         created. This is what the committed lab now uses.
+#   lab                -- steps 3a/4 mint a self-signed TEST root and issue the
+#                         edge certificate from it. Disposable labs only; no
+#                         browser or customer trusts that root.
 #
 # What it does:
 #   1. vault operator init (1 share) -> secrets/vault-init.json (0600)
 #      [MOVE TO A PASSWORD MANAGER AND DELETE — see warning at the end]
 #   2. unseal + root login (secrets passed via stdin/env, never as argv)
-#   3. enable kv-v2 at kv/, pki root + pki_int intermediate
-#   4. issue wildcard+apex cert for *.${DOMAIN}/${DOMAIN} -> ./certs/{int.crt,int.key}, CA -> ./certs/ca.pem
+#   3. enable kv-v2 at kv/ and the pki_int intermediate mount
+#   3a. (mode 'lab' only) self-signed TEST root at pki/
+#   4. (mode 'lab' only) issue wildcard+apex cert for *.${DOMAIN}/${DOMAIN}
+#      -> ./certs/{int.crt,int.key}, CA -> ./certs/ca.pem
 #   5. create rotator policy + token  (written into .env ROTATOR_VAULT_TOKEN)
 #   6. optionally seed vendor keys from $ANTHROPIC_API_KEY / $OPENAI_API_KEY
 #   7. restart cert/CA consumers
@@ -78,6 +87,19 @@ EOF
 fi
 DOMAIN="$(grep -E '^DOMAIN=' .env | cut -d= -f2)"
 DOMAIN="${DOMAIN:-aigw.example.internal}"
+# Edge PKI ownership is decided by the deployed inventory, not by this script.
+#   lab                -- this script mints the self-signed TEST root below.
+#   vault-intermediate -- the REAL customer CA signs Vault's intermediate CSR.
+#                         This script must NOT create a competing test root or
+#                         issue an edge certificate; scripts/vault-pki-intermediate.sh
+#                         owns the edge in that mode. Everything else here (init,
+#                         unseal, audit, kv, rotator token, vendor seeding) still runs.
+AIGW_EDGE_TLS_MODE="$(grep -E '^AIGW_EDGE_TLS_MODE=' .env | cut -d= -f2- || true)"
+AIGW_EDGE_TLS_MODE="${AIGW_EDGE_TLS_MODE:-lab}"
+case "$AIGW_EDGE_TLS_MODE" in
+  lab|vault-intermediate) ;;
+  *) echo "FATAL: vault-bootstrap.sh cannot run with aigw_edge_tls_mode=$AIGW_EDGE_TLS_MODE" >&2; exit 1 ;;
+esac
 KC_CLIENT_ASSERTION_KEY_VAULT_PATH="$(grep -E '^KC_CLIENT_ASSERTION_KEY_VAULT_PATH=' .env | cut -d= -f2-)"
 KC_CLIENT_ASSERTION_KEY_VAULT_PATH="${KC_CLIENT_ASSERTION_KEY_VAULT_PATH:-ai-gateway/anthropic-wif-client-key}"
 IDENTITY_CONTROLLER_KEY_VAULT_PATH="$(grep -E '^IDENTITY_CONTROLLER_KEY_VAULT_PATH=' .env | cut -d= -f2-)"
@@ -275,16 +297,20 @@ fi
 
 # ── 3: engines ───────────────────────────────────────────────────────────
 vlt secrets list -format=json | grep -q '"kv/"'      || vlt secrets enable -path=kv kv-v2
-vlt secrets list -format=json | grep -q '"pki/"'     || vlt secrets enable -path=pki pki
 vlt secrets list -format=json | grep -q '"pki_int/"' || vlt secrets enable -path=pki_int pki
-vlt secrets tune -max-lease-ttl=87600h pki
 vlt secrets tune -max-lease-ttl=43800h pki_int
 
-# ── root CA (TEST). PRODUCTION: generate CSR on pki_int, have the CUSTOMER
-#    ROOT sign it, and skip the self-signed root entirely (§9.5):
-#      vlt write -format=json pki_int/intermediate/generate/internal common_name="AIGW Intermediate CA" > csr.json
+if [[ "$AIGW_EDGE_TLS_MODE" == "lab" ]]; then
+# ── 3a+4 (mode 'lab' ONLY): self-signed TEST root and edge certificate ───
+# This is the disposable-lab fallback. It produces a root that no browser and
+# no customer trusts. The real path -- and the one the committed lab inventory
+# selects -- is aigw_edge_tls_mode=vault-intermediate, where the CUSTOMER's CA
+# signs Vault's intermediate CSR and this block never runs.
+vlt secrets list -format=json | grep -q '"pki/"'     || vlt secrets enable -path=pki pki
+vlt secrets tune -max-lease-ttl=87600h pki
+
 if ! vlt read pki/cert/ca >/dev/null 2>&1; then
-  echo ">> generating TEST root CA (prod: customer-root-signed intermediate)"
+  echo ">> generating TEST root CA (real CA path: aigw_edge_tls_mode=vault-intermediate)"
   vlt write -field=certificate pki/root/generate/internal \
       common_name="AIGW Test Root CA" ttl=87600h > /dev/null
   # intermediate
@@ -299,7 +325,6 @@ vlt write pki_int/roles/aigw \
     allowed_domains="$DOMAIN" allow_subdomains=true allow_bare_domains=true \
     max_ttl=2160h >/dev/null
 
-# ── 4: issue wildcard + bare-domain cert for the traefik edges ───────────
 # Stream the issue response straight into python — the private key goes only
 # to certs/int.key (created privately, then narrowed to the Traefik runtime
 # group); no JSON copy of it is left on disk.
@@ -323,6 +348,13 @@ chown root:65532 certs certs/int.key
 chmod 750 certs
 chmod 640 certs/int.key
 rm -f secrets/edge-cert.json  # plaintext key copy written by older versions
+else
+# ── mode 'vault-intermediate': the edge belongs to the customer CA ───────
+# Deliberately no root mount, no test root, and no edge certificate here. The
+# bootstrap placeholder keeps Traefik serving until the ceremony completes.
+echo ">> edge PKI deferred to the customer CA (aigw_edge_tls_mode=vault-intermediate)"
+echo ">>   next: sudo scripts/vault-pki-intermediate.sh csr"
+fi
 
 # ── 5: rotator policy + token ────────────────────────────────────────────
 vlt policy write rotator - <<HCL
@@ -411,8 +443,18 @@ DONE.
   !!!     shred -u $STACK_DIR/secrets/vault-init.json   # or: rm -P / rm
   !!! Anyone who reads that file owns this Vault.
 
+  edge TLS mode : $AIGW_EDGE_TLS_MODE
   edge certs    : $STACK_DIR/certs/  (int.crt / int.key / ca.pem)
   rotator token : written to .env (ROTATOR_VAULT_TOKEN)
+
+$(if [[ "$AIGW_EDGE_TLS_MODE" == "vault-intermediate" ]]; then cat <<'NEXT'
+  !!! The edge is still serving the SELF-SIGNED BOOTSTRAP PLACEHOLDER.
+  !!! Complete the customer-CA ceremony before anyone uses this deployment:
+  !!!     sudo scripts/vault-pki-intermediate.sh csr        # emits the CSR
+  !!!     (customer CA signs it offline — the root key never comes here)
+  !!!     sudo scripts/vault-pki-intermediate.sh install-signed ...
+NEXT
+fi)
 
 After every VM reboot Vault is SEALED unless the deployment controller has an
 inline-encrypted vault_unseal_key. Use a hidden shell read, then the hardened

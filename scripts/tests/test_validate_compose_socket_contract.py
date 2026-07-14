@@ -66,7 +66,7 @@ class ValidateComposeSocketContractTests(unittest.TestCase):
         for required in (
             "LAB_DNS_ADM_CIDR=10.8.10.0/24",
             'dns["environment"] == {"LAB_DNS_ADM_CIDR": "10.8.10.0/24"}',
-            'if mount["target"] == "/etc/coredns/zones/db.aigw.internal.adm"',
+            'if mount["target"] == "/etc/coredns/zones/db.aigw.aegisgroup.ch.adm"',
             'assert adm_zone["read_only"] is True',
             'assert adm_zone["bind"]["selinux"] == "Z"',
             "LAB_DNS_ADM_CIDR: ${LAB_DNS_ADM_CIDR:?LAB_DNS_ADM_CIDR must be set}",

@@ -22,10 +22,10 @@ class AdminSurfaceContractTests(unittest.TestCase):
         )
         cls.adm_zone = (
             ROOT
-            / "ansible/roles/docker_stack/templates/db.aigw.internal.adm.j2"
+            / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.adm.j2"
         ).read_text()
         cls.internal_zone = (
-            ROOT / "ansible/roles/docker_stack/templates/db.aigw.internal.j2"
+            ROOT / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.j2"
         ).read_text()
         cls.verify = (ROOT / "ansible/roles/verify/tasks/main.yml").read_text()
 

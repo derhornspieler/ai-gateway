@@ -76,7 +76,7 @@ def main() -> int:
         )
         actual_path = urllib.parse.urlsplit(final_url).path
     except urllib.error.HTTPError as exc:
-        if exc.code != 403 or urllib.parse.urlsplit(exc.geturl()).hostname != "portal.aigw.internal":
+        if exc.code != 403 or urllib.parse.urlsplit(exc.geturl()).hostname != "portal.aigw.aegisgroup.ch":
             raise
         actual_path = "forbidden"
     if args.expect_path == "denied":
@@ -114,7 +114,7 @@ def main() -> int:
         )
         parsed_admin = urllib.parse.urlsplit(admin_url)
         if (
-            parsed_admin.hostname != "admin.aigw.internal"
+            parsed_admin.hostname != "admin.aigw.aegisgroup.ch"
             or parsed_admin.path != "/admin"
         ):
             raise RuntimeError("directory administrator could not access /admin")
@@ -145,7 +145,7 @@ def main() -> int:
                 allowed_hosts=flow.PORTAL_ALLOWED_HOSTS,
             )
             parsed_logout = urllib.parse.urlsplit(logout_url)
-        if parsed_logout.hostname != "portal.aigw.internal" or parsed_logout.path != "/login":
+        if parsed_logout.hostname != "portal.aigw.aegisgroup.ch" or parsed_logout.path != "/login":
             raise RuntimeError(
                 "portal logout did not complete the reviewed Keycloak redirect: "
                 f"host={parsed_logout.hostname} path={parsed_logout.path}"

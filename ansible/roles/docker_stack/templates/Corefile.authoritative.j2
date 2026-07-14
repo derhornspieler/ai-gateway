@@ -7,7 +7,7 @@
     }
     errors
     health 127.0.0.1:8080
-    file /etc/coredns/zones/db.aigw.internal.adm {{ aigw_domain }}
+    file /etc/coredns/zones/db.aigw.aegisgroup.ch.adm {{ aigw_domain }}
     cache 30
 }
 
@@ -16,7 +16,7 @@
         expr true
     }
     errors
-    file /etc/coredns/zones/db.aigw.internal {{ aigw_domain }}
+    file /etc/coredns/zones/db.aigw.aegisgroup.ch {{ aigw_domain }}
     cache 30
 }
 

@@ -4,7 +4,7 @@ deployment_profile: rocky9-lab
 ansible_host: "<LAB_ADM_INTERFACE_IP>"
 ansible_user: ansible
 ansible_become: true
-aigw_domain: aigw.internal
+aigw_domain: aigw.aegisgroup.ch
 aigw_management_ssh_port: 22
 
 nic_egress: "<LAB_EGRESS_INTERFACE>"

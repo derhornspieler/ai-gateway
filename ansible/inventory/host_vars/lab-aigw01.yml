@@ -3,7 +3,21 @@
 # This applies only to the lab-aigw01 alias in inventory/lab.yml. Its
 # profile and encryption exception intentionally live in the inventory entry
 # so stack-only runs do not depend on host_vars discovery.
-aigw_domain: aigw.internal
+aigw_domain: aigw.aegisgroup.ch
+# This lab exercises the REAL production PKI path. The Aegis Group Root CA
+# carries DNS name constraints permitting only aegisgroup.ch and cluster.local,
+# which is why the lab domain is a subdomain of aegisgroup.ch: the edge chain
+# must actually verify to that root, so the lab proves the same ceremony a
+# customer will run rather than a self-signed stand-in.
+#
+# Vault generates the intermediate key internally and emits a CSR; the Aegis
+# root signs it offline (scripts/sign-vault-intermediate.sh) and the signed
+# certificate is imported back (scripts/vault-pki-intermediate.sh install-signed).
+# The root private key never reaches this VM or this repository.
+#
+# Set this to 'lab' instead to fall back to the self-signed TEST root that
+# vault-bootstrap.sh mints, for a disposable lab with no access to the real CA.
+aigw_edge_tls_mode: vault-intermediate
 # Greenfield lab convenience: expose the separately OIDC-gated Vault UI on
 # the ADM plane. Generic/customer inventories remain default-deny.
 aigw_vault_ui_enabled: true

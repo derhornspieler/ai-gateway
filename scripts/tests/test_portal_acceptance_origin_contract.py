@@ -20,11 +20,11 @@ class PortalAcceptanceOriginTests(unittest.TestCase):
     def test_user_and_admin_redirect_boundaries_are_distinct(self) -> None:
         self.assertEqual(
             flow.PORTAL_ALLOWED_HOSTS,
-            frozenset({"portal.aigw.internal", "auth.aigw.internal"}),
+            frozenset({"portal.aigw.aegisgroup.ch", "auth.aigw.aegisgroup.ch"}),
         )
         self.assertEqual(
             flow.ADMIN_PORTAL_ALLOWED_HOSTS,
-            frozenset({"admin.aigw.internal", "auth.aigw.internal"}),
+            frozenset({"admin.aigw.aegisgroup.ch", "auth.aigw.aegisgroup.ch"}),
         )
         with self.assertRaises(ValueError):
             flow.RestrictedRedirects(
@@ -127,7 +127,7 @@ class PortalAcceptanceOriginTests(unittest.TestCase):
         source = (ROOT / "scripts/test-portal-key-lifecycle.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('API_ORIGIN = "https://api.aigw.internal"', source)
+        self.assertIn('API_ORIGIN = "https://api.aigw.aegisgroup.ch"', source)
         self.assertIn('API_ORIGIN + "/v1/models"', source)
         self.assertIn('"Authorization": f"Bearer {secret}"', source)
         self.assertIn("require_gateway_key_accepted(context, first)", source)
