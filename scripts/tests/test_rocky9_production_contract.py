@@ -163,7 +163,17 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
             self.assertIn("SECTION 2 — generated encrypted application secrets", host_text)
             self.assertIn("SECTION 3 — operator-supplied vault_unseal_key", host_text)
             self.assertIn("SECTION 4 — external AD / LDAPS inputs (optional, ships disabled)", host_text)
-            self.assertIn("SECTION 5 — PKI inputs (placeholder)", host_text)
+            self.assertIn("SECTION 5 — edge TLS / PKI inputs (choose exactly one mode)", host_text)
+            # SECTION 5 now carries the real edge-TLS contract: a required mode
+            # plus the two customer file-path trios (customer-supplied leaf and
+            # customer-intermediate CA), all shipped empty and fail-closed.
+            for edge_tls_key in (
+                'aigw_edge_tls_mode: ""',
+                'aigw_edge_tls_intermediate_cert_file: ""',
+                'aigw_edge_tls_intermediate_key_file: ""',
+                'aigw_edge_tls_intermediate_chain_file: ""',
+            ):
+                self.assertIn(edge_tls_key, host_text)
             # SECTION 3 documents the real controller-custody machinery: the
             # dedicated inline-encrypted sibling overlay written by the
             # stdin-only helper — never a randomly generated value.
@@ -213,17 +223,18 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
                     json.loads(dump.stdout)["deployment_profile"], "rocky9-production"
                 )
 
-    def test_placeholder_sections_carry_no_active_keys(self) -> None:
-        """SECTIONS 3 and 5 stay comment-only; SECTION 4 owns identity_ldap_*.
+    def test_section_3_is_comment_only_and_section_5_owns_the_edge_tls_keys(self) -> None:
+        """SECTION 3 stays comment-only; SECTION 4 owns identity_ldap_*; SECTION 5
+        now owns the edge-TLS contract.
 
-        Workstream C (external AD/LDAPS) has landed, so SECTION 4 now carries
-        exactly the conditional identity_ldap_* contract keys — shipped disabled
-        — and nothing else. The still-unowned sections stay comment-only:
-        workstream D (production TLS/PKI) owns SECTION 5's pki_* keys and the
-        operator ceremony (store-vault-unseal-key.py) owns vault_unseal_key.
-        Neither may appear as an active key in the generated host_vars, and the
-        directory bind credential never appears in any section: it belongs to a
-        dedicated inline-encrypted overlay written from stdin.
+        Workstream C (external AD/LDAPS) owns SECTION 4's conditional
+        identity_ldap_* keys — shipped disabled. Workstream D (production TLS/PKI)
+        has landed and owns SECTION 5's edge-TLS keys: a required mode plus the
+        two customer file-path trios (customer-supplied leaf, customer-intermediate
+        CA), all shipped empty and fail-closed. SECTION 3's vault_unseal_key stays
+        an operator-ceremony value (store-vault-unseal-key.py) and never an active
+        key here; the directory bind credential likewise never appears in any
+        section: it belongs to a dedicated inline-encrypted overlay from stdin.
         """
         module = _load_bootstrap_module()
         host_text = module.production_host_vars_document("customer-prod01")
@@ -245,10 +256,8 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
         self.assertLess(section_3, section_4)
         self.assertLess(section_4, section_5)
 
-        # SECTION 3 (vault_unseal_key ceremony) and SECTION 5 (PKI) are still
-        # documentation only — no key may be invented ahead of its workstream.
+        # SECTION 3 (vault_unseal_key ceremony) is still documentation only.
         self.assertEqual(_active(section_3, section_4), [])
-        self.assertEqual(_active(section_5), [])
 
         # SECTION 4 carries exactly the contract's conditional feature keys plus
         # its off-by-default flag, in the contract's own order.
@@ -262,6 +271,22 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
         self.assertEqual(emitted[0], expected[0])
         self.assertEqual([line.split(":", 1)[0] for line in emitted[1:]], expected[1:])
 
+        # SECTION 5 carries exactly the edge-TLS keys: the required mode, the two
+        # customer file-path trios, and the min-days window. Nothing else.
+        self.assertEqual(
+            [line.split(":", 1)[0] for line in _active(section_5)],
+            [
+                "aigw_edge_tls_mode",
+                "aigw_edge_tls_leaf_cert_file",
+                "aigw_edge_tls_private_key_file",
+                "aigw_edge_tls_chain_file",
+                "aigw_edge_tls_intermediate_cert_file",
+                "aigw_edge_tls_intermediate_key_file",
+                "aigw_edge_tls_intermediate_chain_file",
+                "aigw_edge_tls_min_days_remaining",
+            ],
+        )
+
         for line in host_text.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -270,6 +295,10 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
             self.assertFalse(stripped.startswith("vault_unseal_key"), stripped)
             self.assertFalse(
                 stripped.startswith("identity_ldap_bind_password"), stripped
+            )
+            # The intermediate PRIVATE KEY is a file-path input, never a secret.
+            self.assertFalse(
+                stripped.startswith("aigw_edge_tls_intermediate_key:"), stripped
             )
 
     def test_legacy_bootstrap_still_works_and_prints_deprecation(self) -> None:

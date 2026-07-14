@@ -281,11 +281,30 @@ print("          0123456789abcdef")
                 'aigw_edge_tls_leaf_cert_file: ""',
                 'aigw_edge_tls_private_key_file: ""',
                 'aigw_edge_tls_chain_file: ""',
+                'aigw_edge_tls_intermediate_cert_file: ""',
+                'aigw_edge_tls_intermediate_key_file: ""',
+                'aigw_edge_tls_intermediate_chain_file: ""',
                 "aigw_edge_tls_min_days_remaining: 30",
             ):
                 self.assertIn(edge_tls_key, host_text)
             secret_names = [entry["name"] for entry in self.contract["required_secret_keys"]]
             self.assertNotIn("aigw_edge_tls_private_key", secret_names)
+            # The customer-intermediate trio is a mode-conditional file-path set,
+            # recorded informationally in the contract, never a required key nor a
+            # secret. The intermediate PRIVATE KEY is a controller-local file path.
+            self.assertNotIn("aigw_edge_tls_intermediate_key", secret_names)
+            for key in (
+                "aigw_edge_tls_intermediate_cert_file",
+                "aigw_edge_tls_intermediate_key_file",
+                "aigw_edge_tls_intermediate_chain_file",
+            ):
+                self.assertNotIn(key, self.contract["required_nonsecret_keys"])
+                self.assertIn(
+                    key,
+                    self.contract["conditional_feature_keys"]["edge_tls_customer_intermediate"][
+                        "required_nonsecret_keys"
+                    ],
+                )
             # Optional external AD/LDAPS federation ships disabled with every
             # input present and empty; the bind credential is never templated.
             self.assertIn("identity_ldap_enabled: false", host_text)

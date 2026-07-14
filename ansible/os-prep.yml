@@ -917,9 +917,9 @@
           - aigw_edge_tls_mode is string
           - >-
             (deployment_profile == 'rocky9-lab' and
-             aigw_edge_tls_mode in ['lab', 'vault-intermediate']) or
+             aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate']) or
             (deployment_profile != 'rocky9-lab' and
-             aigw_edge_tls_mode in ['customer-supplied', 'vault-intermediate'])
+             aigw_edge_tls_mode in ['customer-supplied', 'vault-intermediate', 'customer-intermediate'])
           - >-
             aigw_edge_tls_mode != 'customer-supplied' or
             (aigw_edge_tls_leaf_cert_file | length > 0 and
@@ -930,12 +930,23 @@
             (aigw_edge_tls_leaf_cert_file | length == 0 and
              aigw_edge_tls_private_key_file | length == 0 and
              aigw_edge_tls_chain_file | length == 0)
+          - >-
+            aigw_edge_tls_mode != 'customer-intermediate' or
+            (aigw_edge_tls_intermediate_cert_file | length > 0 and
+             aigw_edge_tls_intermediate_key_file | length > 0 and
+             aigw_edge_tls_intermediate_chain_file | length > 0)
+          - >-
+            aigw_edge_tls_mode == 'customer-intermediate' or
+            (aigw_edge_tls_intermediate_cert_file | length == 0 and
+             aigw_edge_tls_intermediate_key_file | length == 0 and
+             aigw_edge_tls_intermediate_chain_file | length == 0)
           - aigw_edge_tls_min_days_remaining | int >= 7
         fail_msg: >-
           Select exactly one edge TLS mode with its complete, unambiguous input
-          set. Production profiles must use customer-supplied or
-          vault-intermediate; the self-signed 'lab' mode is legal only on
-          rocky9-lab.
+          set. Production profiles must use customer-supplied, vault-intermediate,
+          or customer-intermediate; the self-signed 'lab' mode is legal only on
+          rocky9-lab. customer-intermediate requires exactly the three
+          aigw_edge_tls_intermediate_* files and no customer-supplied files.
 
     # Inspect the customer's TLS inputs on the CONTROLLER, before any role can
     # mutate the target. A symlink or a group-readable key here would mean the
@@ -974,6 +985,45 @@
       loop_control:
         label: "{{ item.item | basename }}"
       when: aigw_edge_tls_mode == 'customer-supplied'
+
+    # Same controller-side custody proof for the customer-intermediate trio. The
+    # intermediate PRIVATE KEY is about to be staged onto the target; a symlink
+    # or a group-readable key here would mean it is not under the operator's
+    # sole control before it ever leaves this machine.
+    - name: Preflight — inspect customer intermediate edge TLS inputs on the controller
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      delegate_to: localhost
+      become: false
+      loop:
+        - "{{ aigw_edge_tls_intermediate_cert_file }}"
+        - "{{ aigw_edge_tls_intermediate_key_file }}"
+        - "{{ aigw_edge_tls_intermediate_chain_file }}"
+      register: aigw_edge_tls_intermediate_input_stats
+      changed_when: false
+      when: aigw_edge_tls_mode == 'customer-intermediate'
+
+    - name: Preflight — require regular private customer intermediate edge TLS inputs
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists | default(false)
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - (item.stat.nlink | default(1) | int) == 1
+          - >-
+            item.item != aigw_edge_tls_intermediate_key_file or
+            item.stat.mode == '0600'
+        quiet: true
+        fail_msg: >-
+          Customer intermediate edge TLS inputs must be regular non-symlink
+          single-link files, and the intermediate private key must be mode 0600.
+          Never point these at key material that other users can read.
+      loop: "{{ aigw_edge_tls_intermediate_input_stats.results }}"
+      loop_control:
+        label: "{{ item.item | basename }}"
+      when: aigw_edge_tls_mode == 'customer-intermediate'
 
     - name: Preflight — validate concrete lab profile
       ansible.builtin.assert:

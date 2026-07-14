@@ -97,7 +97,7 @@ DOMAIN="${DOMAIN:-aigw.example.internal}"
 AIGW_EDGE_TLS_MODE="$(grep -E '^AIGW_EDGE_TLS_MODE=' .env | cut -d= -f2- || true)"
 AIGW_EDGE_TLS_MODE="${AIGW_EDGE_TLS_MODE:-lab}"
 case "$AIGW_EDGE_TLS_MODE" in
-  lab|vault-intermediate) ;;
+  lab|vault-intermediate|customer-intermediate) ;;
   *) echo "FATAL: vault-bootstrap.sh cannot run with aigw_edge_tls_mode=$AIGW_EDGE_TLS_MODE" >&2; exit 1 ;;
 esac
 KC_CLIENT_ASSERTION_KEY_VAULT_PATH="$(grep -E '^KC_CLIENT_ASSERTION_KEY_VAULT_PATH=' .env | cut -d= -f2-)"
@@ -349,11 +349,21 @@ chmod 750 certs
 chmod 640 certs/int.key
 rm -f secrets/edge-cert.json  # plaintext key copy written by older versions
 else
-# ── mode 'vault-intermediate': the edge belongs to the customer CA ───────
+# ── modes vault-intermediate / customer-intermediate: the edge belongs to the
+#    customer CA ──────────────────────────────────────────────────────────────
 # Deliberately no root mount, no test root, and no edge certificate here. The
-# bootstrap placeholder keeps Traefik serving until the ceremony completes.
-echo ">> edge PKI deferred to the customer CA (aigw_edge_tls_mode=vault-intermediate)"
-echo ">>   next: sudo scripts/vault-pki-intermediate.sh csr"
+# bootstrap placeholder keeps Traefik serving until the operator ceremony
+# completes. pki_int is already enabled above; the ceremony promotes the
+# customer issuer into it.
+echo ">> edge PKI deferred to the customer CA (aigw_edge_tls_mode=$AIGW_EDGE_TLS_MODE)"
+if [[ "$AIGW_EDGE_TLS_MODE" == "customer-intermediate" ]]; then
+  echo ">>   next: sudo scripts/vault-pki-intermediate.sh import-intermediate \\"
+  echo ">>           --intermediate secrets/aigw-intermediate-import.pem \\"
+  echo ">>           --intermediate-key secrets/aigw-intermediate-import.key \\"
+  echo ">>           --chain secrets/aigw-intermediate-import-chain.pem"
+else
+  echo ">>   next: sudo scripts/vault-pki-intermediate.sh csr"
+fi
 fi
 
 # ── 5: rotator policy + token ────────────────────────────────────────────
@@ -453,6 +463,15 @@ $(if [[ "$AIGW_EDGE_TLS_MODE" == "vault-intermediate" ]]; then cat <<'NEXT'
   !!!     sudo scripts/vault-pki-intermediate.sh csr        # emits the CSR
   !!!     (customer CA signs it offline — the root key never comes here)
   !!!     sudo scripts/vault-pki-intermediate.sh install-signed ...
+NEXT
+elif [[ "$AIGW_EDGE_TLS_MODE" == "customer-intermediate" ]]; then cat <<'NEXT'
+  !!! The edge is still serving the SELF-SIGNED BOOTSTRAP PLACEHOLDER.
+  !!! Complete the customer-intermediate import ceremony before anyone uses this
+  !!! deployment (the staged intermediate key is validated, imported, shredded):
+  !!!     sudo scripts/vault-pki-intermediate.sh import-intermediate \
+  !!!         --intermediate secrets/aigw-intermediate-import.pem \
+  !!!         --intermediate-key secrets/aigw-intermediate-import.key \
+  !!!         --chain secrets/aigw-intermediate-import-chain.pem
 NEXT
 fi)
 

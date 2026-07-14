@@ -1467,9 +1467,10 @@
 # self-signed placeholder trivially satisfies because it IS its own CA bundle.
 # This gate closes that hole: on any deployment that selected a real CA path,
 # the installed material must be CA-issued, in-window, and chain to a real root.
-# customer-supplied is enforced on every pass; vault-intermediate is enforced as
-# soon as Vault is initialized -- i.e. an operator who initializes Vault but
-# skips the PKI ceremony fails here rather than quietly serving a placeholder.
+# customer-supplied is enforced on every pass; vault-intermediate and
+# customer-intermediate are enforced as soon as Vault is initialized -- i.e. an
+# operator who initializes Vault but skips the PKI ceremony fails here rather
+# than quietly serving a placeholder.
 - name: Reject placeholder, self-signed, or expiring edge certificates on real-CA profiles
   ansible.builtin.command:
     argv:
@@ -1487,7 +1488,7 @@
   changed_when: false
   when: >-
     aigw_edge_tls_mode == 'customer-supplied' or
-    (aigw_edge_tls_mode == 'vault-intermediate' and
+    (aigw_edge_tls_mode in ['vault-intermediate', 'customer-intermediate'] and
      vault_public_status is defined and
      ((vault_public_status.stdout | from_json).initialized | bool))
 

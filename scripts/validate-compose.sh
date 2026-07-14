@@ -252,10 +252,21 @@ for required in (
     "edge-tls.py",
     ".state/edge-tls-issued",
     "certificate input contains private key material; the customer CA signing key must never be supplied",
+    # customer-intermediate: the operator supplies the intermediate cert AND key.
+    # It is validated fail-closed, imported over the modern multi-issuer endpoint
+    # (KEY+CERT bundle on stdin), promoted with proof-by-fingerprint, and shredded.
+    "import-intermediate)",
+    "import-intermediate requires aigw_edge_tls_mode=customer-intermediate",
+    "validate-intermediate",
+    "pki_int/issuers/import/bundle pem_bundle=-",
+    "the promoted Vault issuer is not the customer-supplied intermediate",
+    "Vault holds no issuer matching --intermediate",
+    "shred -u",
 ):
     assert required in text, required
-# The mode-2 ceremony signs a CSR. It must never create a Vault ROOT CA, and it
-# must never accept the customer's root key by any channel.
+# Both intermediate ceremonies sign or import an intermediate. Neither must ever
+# create a Vault ROOT CA, and neither must accept the customer root key by any
+# channel.
 assert "pki/root/generate" not in text
 assert "pki/root/sign-intermediate" not in text
 assert "--token" not in text
@@ -305,6 +316,17 @@ for required in (
     "edge-tls=changed",
     "--reject-self-signed",
     "DEFAULT_OPENSSL = \"/usr/bin/openssl\"",
+    # customer-intermediate: validate an operator-supplied intermediate CA + key
+    # fail-closed BEFORE any Vault import. The self-signed refusal keeps the root
+    # out of Vault; the single-key count rejects a smuggled root key; the offline
+    # test leaf proves the domain is inside the CA name-constraint subtree.
+    "validate-intermediate",
+    "def validate_intermediate_material",
+    "def check_ca_key_usage",
+    "def check_intermediate_name_constraints",
+    "refusing to import a self-signed root CA",
+    "the intermediate key file must contain exactly one private key",
+    "Certificate Sign",
 ):
     assert required in source, required
 # One subprocess idiom, no shell, and the private key never reaches a stream:

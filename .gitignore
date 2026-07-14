@@ -29,6 +29,11 @@ ansible/inventory/generated/
 ansible/inventory/group_vars/*/vault-unseal.yml
 ansible/inventory/generated/
 
+# Controller-local edge-TLS intermediate material staged for customer-intermediate
+# (lab convenience or production). The private key is already caught by *.key;
+# this also keeps the intermediate cert/chain PEMs out of git.
+ansible/inventory/local-pki/
+
 # Claude Code agent worktrees
 .claude/worktrees/
 

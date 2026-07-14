@@ -88,6 +88,16 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertIn('cribl_otlp_ca_file: "/etc/ssl/certs/aigw-cribl-ca.pem"', group_vars)
         self.assertIn('cribl_otlp_ca_pem_file: ""', group_vars)
         self.assertIn("aigw_edge_tls_min_days_remaining: 30", group_vars)
+        # The customer-intermediate trio: mode-conditional controller-local file
+        # paths defaulting empty, exactly like the customer-supplied trio.
+        self.assertIn('aigw_edge_tls_intermediate_cert_file: ""', group_vars)
+        self.assertIn('aigw_edge_tls_intermediate_key_file: ""', group_vars)
+        self.assertIn('aigw_edge_tls_intermediate_chain_file: ""', group_vars)
+        # The intermediate PRIVATE KEY is a file path, never an inventory secret.
+        self.assertNotIn(
+            "aigw_edge_tls_intermediate_key",
+            [entry["name"] for entry in contract["required_secret_keys"]],
+        )
 
         env_j2 = ENV_J2.read_text(encoding="utf-8")
         self.assertIn("AIGW_EDGE_TLS_MODE={{ aigw_edge_tls_mode }}", env_j2)
@@ -103,6 +113,9 @@ class EdgeTlsContractTests(unittest.TestCase):
             "aigw_edge_tls_leaf_cert_file: \"\"",
             "aigw_edge_tls_private_key_file: \"\"",
             "aigw_edge_tls_chain_file: \"\"",
+            "aigw_edge_tls_intermediate_cert_file: \"\"",
+            "aigw_edge_tls_intermediate_key_file: \"\"",
+            "aigw_edge_tls_intermediate_chain_file: \"\"",
             "aigw_edge_tls_min_days_remaining: 30",
             "cribl_otlp_ca_pem_file: \"\"",
         ):
@@ -116,15 +129,32 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertIn("Preflight — require exactly one reviewed edge TLS mode", site)
         self.assertIn(
             "(deployment_profile == 'rocky9-lab' and\n"
-            "             aigw_edge_tls_mode in ['lab', 'vault-intermediate']) or",
+            "             aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate']) or",
             site,
         )
         self.assertIn(
             "(deployment_profile != 'rocky9-lab' and\n"
-            "             aigw_edge_tls_mode in ['customer-supplied', 'vault-intermediate'])",
+            "             aigw_edge_tls_mode in ['customer-supplied', 'vault-intermediate', 'customer-intermediate'])",
             site,
         )
         self.assertIn("aigw_edge_tls_min_days_remaining | int >= 7", site)
+        # customer-intermediate mutual-exclusivity: its trio must be complete when
+        # selected and empty for every other mode, and the customer-supplied trio
+        # must be empty when customer-intermediate is selected (and vice-versa).
+        self.assertIn(
+            "aigw_edge_tls_mode != 'customer-intermediate' or\n"
+            "            (aigw_edge_tls_intermediate_cert_file | length > 0 and",
+            site,
+        )
+        self.assertIn(
+            "aigw_edge_tls_mode == 'customer-intermediate' or\n"
+            "            (aigw_edge_tls_intermediate_cert_file | length == 0 and",
+            site,
+        )
+        # Controller-side lstat of the intermediate trio, before any role runs.
+        self.assertIn(
+            "Preflight — inspect customer intermediate edge TLS inputs on the controller", site
+        )
         # Controller-side lstat of the customer files, before any role runs.
         self.assertIn("Preflight — inspect customer edge TLS inputs on the controller", site)
         self.assertIn("not (item.stat.islnk | default(false))", site)
@@ -148,14 +178,22 @@ class EdgeTlsContractTests(unittest.TestCase):
         key_block = source[stage_key : stage_key + 400]
         self.assertIn("no_log: true", key_block)
 
-        # Both placeholder tasks are gated on mode + marker absence.
+        # Both placeholder tasks are gated on mode + marker absence. The mode
+        # list now includes customer-intermediate (a placeholder is served until
+        # its import ceremony writes the marker), and the count stays exactly 2.
         self.assertEqual(
             2,
             source.count(
-                "aigw_edge_tls_mode in ['lab', 'vault-intermediate'] and\n"
+                "aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate'] and\n"
                 "    not (aigw_edge_tls_issued_marker.stat.exists | default(false))"
             ),
         )
+        # The customer-intermediate staging block stages the trio under secrets/
+        # gated on marker absence, and the key copy is never logged.
+        self.assertIn("Stage the customer intermediate CA material for the import ceremony", source)
+        stage_int = source.index("Stage the intermediate CA private key without logging")
+        self.assertIn("no_log: true", source[stage_int : stage_int + 400])
+        self.assertIn("secrets/aigw-intermediate-import.key", source)
         # The staging boundary is always removed.
         self.assertIn("Remove the edge TLS staging boundary", source)
         # The pre-start production gate rejects placeholders.
@@ -280,6 +318,82 @@ class EdgeTlsContractTests(unittest.TestCase):
             text,
         )
 
+    def test_import_intermediate_ceremony_imports_promotes_proves_and_shreds(self) -> None:
+        # customer-intermediate: the operator supplies an intermediate cert + KEY.
+        # The ceremony validates it fail-closed (via edge-tls.py), imports it into
+        # pki_int over stdin, promotes it to the default issuer with the same
+        # proof-by-fingerprint the vault-intermediate path uses, pins the role,
+        # and shreds the staged key. It never touches a Vault ROOT mount and never
+        # accepts the customer root key.
+        text = VAULT_PKI.read_text(encoding="utf-8")
+        subprocess.run(["bash", "-n", str(VAULT_PKI)], check=True)
+        for required in (
+            "import-intermediate)",
+            "import-intermediate requires aigw_edge_tls_mode=customer-intermediate",
+            "edge-tls.py",
+            "validate-intermediate",
+            # imported over the modern multi-issuer endpoint, KEY+CERT bundle on stdin
+            "pki_int/issuers/import/bundle pem_bundle=-",
+            "imported_issuers",
+            # promotion + proof-by-fingerprint, mirroring install-signed
+            "default_follows_latest_issuer=false",
+            'issuer_ref="$imported"',
+            "vlt read -format=json pki_int/config/issuers",
+            "the promoted Vault issuer is not the customer-supplied intermediate",
+            "Vault holds no issuer matching --intermediate",
+            # the reviewed chain is retained for renew-leaf/samba-tls
+            "secrets/aigw-edge-chain.pem",
+            # the marker records the mode; the staged key is shredded post-import
+            "customer-intermediate %s",
+            "shred -u",
+        ):
+            self.assertIn(required, text)
+        # Still never a Vault ROOT mount, never the customer root key.
+        self.assertNotIn("pki/root/generate", text)
+        self.assertNotIn("pki/root/sign-intermediate", text)
+        self.assertNotIn("--root-key", text)
+        # Per-subcommand mode gates keep csr/install-signed on vault-intermediate.
+        self.assertIn(
+            "csr requires aigw_edge_tls_mode=vault-intermediate", text
+        )
+        self.assertIn(
+            "install-signed requires aigw_edge_tls_mode=vault-intermediate", text
+        )
+
+    def test_edge_tls_validate_intermediate_subcommand_is_present_and_fail_closed(self) -> None:
+        source = EDGE_TLS.read_text(encoding="utf-8")
+        compile(source, str(EDGE_TLS), "exec")
+        for required in (
+            '"validate-intermediate"',
+            "def command_validate_intermediate",
+            "def validate_intermediate_material",
+            "def check_ca_key_usage",
+            "def check_key_matches_cert",
+            "def check_intermediate_name_constraints",
+            "def count_private_key_blocks",
+            # the primary root-keep-out guard: a self-signed cert is refused
+            "refusing to import a self-signed root CA",
+            # exactly one private key block; a smuggled root key is refused
+            "the intermediate key file must contain exactly one private key",
+            # Certificate Sign is required to issue leaves
+            "Certificate Sign",
+            # the offline test leaf runs the SAME verification the real leaves get
+            "-verify_hostname",
+            "permitted name-constraint subtree",
+        ):
+            self.assertIn(required, source)
+
+    def test_vault_bootstrap_accepts_customer_intermediate_and_defers_its_edge(self) -> None:
+        text = VAULT_BOOTSTRAP.read_text(encoding="utf-8")
+        subprocess.run(["bash", "-n", str(VAULT_BOOTSTRAP)], check=True)
+        self.assertIn("lab|vault-intermediate|customer-intermediate)", text)
+        # customer-intermediate mints no test root: the root generation stays
+        # inside the lab-only branch, and the deferral points at import-intermediate.
+        self.assertIn("import-intermediate", text)
+        lab_branch = text.split('if [[ "$AIGW_EDGE_TLS_MODE" == "lab" ]]; then', 1)[1]
+        deferral = lab_branch.split("else", 1)[1]
+        self.assertNotIn("pki/root/generate/internal", deferral)
+
     def test_sign_script_is_offline_only_and_pins_the_intermediate_extensions(self) -> None:
         text = SIGN_SCRIPT.read_text(encoding="utf-8")
         subprocess.run(["bash", "-n", str(SIGN_SCRIPT)], check=True)
@@ -369,6 +483,10 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
             "-CAkey", str(root_key), "-CAcreateserial", "-days", "1825",
             "-extfile", str(int_ext), "-out", str(cls.intermediate),
         )
+        # validate-intermediate custody-checks the intermediate key at 0600;
+        # signing (-CAkey) does not care about the mode, so this is safe for the
+        # existing vault-intermediate fixtures that only sign with it.
+        os.chmod(int_key, 0o600)
         # Leaf issued by the intermediate.
         leaf_csr = work / "leaf.csr"
         cls._ossl(
@@ -665,6 +783,227 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
             "--expect-key-owner", owner, "--expect-key-mode", "0640",
         )
         self.assertEqual(proof.returncode, 0, proof.stderr)
+
+    # ── customer-intermediate: validate-intermediate functional coverage ──────
+
+    def validate_intermediate(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+        params = {
+            "--intermediate": str(self.intermediate),
+            "--intermediate-key": str(self.workspace / "intermediate.key"),
+            "--chain": str(self.chain),
+            "--domain": self.domain,
+            "--min-days-remaining": "30",
+            "--expect-key-mode": "0600",
+        }
+        params.update(overrides)
+        argv: list[str] = ["validate-intermediate"]
+        for key, value in params.items():
+            argv.extend([key, value])
+        return self.run_edge_tls(*argv)
+
+    def _build_constrained_pki(self, permitted: str) -> tuple[Path, Path, Path]:
+        """Build root(nameConstraints permitted;DNS:<permitted>) -> intermediate.
+        Returns (intermediate_cert, intermediate_key, chain)."""
+        work = Path(tempfile.mkdtemp(prefix="edge-tls-nc-pki-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        root = work / "root.pem"
+        root_key = work / "root.key"
+        self._ossl(
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+            "-subj", "/CN=Constrained Root CA",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-addext", f"nameConstraints=critical,permitted;DNS:{permitted}",
+            "-keyout", str(root_key), "-out", str(root),
+        )
+        int_cert = work / "intermediate.pem"
+        int_key = work / "intermediate.key"
+        int_csr = work / "intermediate.csr"
+        self._ossl(
+            "req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-subj", "/CN=Constrained Intermediate CA",
+            "-keyout", str(int_key), "-out", str(int_csr),
+        )
+        os.chmod(int_key, 0o600)
+        ext = work / "intermediate.ext"
+        ext.write_text(
+            "basicConstraints=critical,CA:TRUE,pathlen:0\n"
+            "keyUsage=critical,digitalSignature,cRLSign,keyCertSign\n",
+            encoding="utf-8",
+        )
+        self._ossl(
+            "x509", "-req", "-in", str(int_csr), "-CA", str(root),
+            "-CAkey", str(root_key), "-CAcreateserial", "-days", "1825",
+            "-extfile", str(ext), "-out", str(int_cert),
+        )
+        chain = work / "chain.pem"
+        chain.write_text(
+            int_cert.read_text(encoding="utf-8") + root.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return int_cert, int_key, chain
+
+    def test_valid_intermediate_passes(self) -> None:
+        result = self.validate_intermediate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("edge-tls=valid", result.stdout)
+        self.assert_no_key_bytes(result)
+
+    def test_intermediate_key_cert_mismatch_rejected(self) -> None:
+        # Supply the ROOT key against the intermediate cert: the pubkeys differ.
+        other = self.workspace / "im-mismatch.key"
+        self._ossl("genrsa", "-out", str(other), "2048")
+        os.chmod(other, 0o600)
+        result = self.validate_intermediate(**{"--intermediate-key": str(other)})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("key-match", result.stderr)
+        self.assert_no_key_bytes(result)
+
+    def test_non_ca_cert_as_intermediate_rejected(self) -> None:
+        # The end-entity leaf is CA:FALSE, so it cannot be imported as an issuer.
+        result = self.validate_intermediate(
+            **{"--intermediate": str(self.leaf), "--intermediate-key": str(self.leaf_key)}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ca-constraints", result.stderr)
+        self.assert_no_key_bytes(result)
+
+    def test_root_key_in_bundle_rejected(self) -> None:
+        two_keys = self.workspace / "im-two.key"
+        two_keys.write_text(
+            (self.workspace / "intermediate.key").read_text(encoding="utf-8")
+            + (self.workspace / "root.key").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        os.chmod(two_keys, 0o600)
+        result = self.validate_intermediate(**{"--intermediate-key": str(two_keys)})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("single-key", result.stderr)
+        self.assert_no_key_bytes(result)
+
+    def test_self_signed_root_as_intermediate_rejected(self) -> None:
+        # Handing over the ROOT (cert + key) instead of an intermediate: the cert
+        # is self-signed, which is the primary guard keeping the root out of Vault.
+        result = self.validate_intermediate(
+            **{
+                "--intermediate": str(self.root_cert),
+                "--intermediate-key": str(self.workspace / "root.key"),
+            }
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("self-signed-root", result.stderr)
+        self.assert_no_key_bytes(result)
+
+    def test_expired_intermediate_rejected(self) -> None:
+        work = Path(tempfile.mkdtemp(prefix="edge-tls-im-exp-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        int_cert = work / "intermediate.pem"
+        int_key = work / "intermediate.key"
+        int_csr = work / "intermediate.csr"
+        self._ossl(
+            "req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-subj", "/CN=Expiring Intermediate CA",
+            "-keyout", str(int_key), "-out", str(int_csr),
+        )
+        os.chmod(int_key, 0o600)
+        ext = work / "intermediate.ext"
+        ext.write_text(
+            "basicConstraints=critical,CA:TRUE,pathlen:0\n"
+            "keyUsage=critical,digitalSignature,cRLSign,keyCertSign\n",
+            encoding="utf-8",
+        )
+        # 5 days validity fails the 30-day window.
+        self._ossl(
+            "x509", "-req", "-in", str(int_csr), "-CA", str(self.root_cert),
+            "-CAkey", str(self.workspace / "root.key"), "-CAcreateserial", "-days", "5",
+            "-extfile", str(ext), "-out", str(int_cert),
+        )
+        chain = work / "chain.pem"
+        chain.write_text(
+            int_cert.read_text(encoding="utf-8") + self.root_cert.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        result = self.validate_intermediate(
+            **{"--intermediate": str(int_cert), "--intermediate-key": str(int_key),
+               "--chain": str(chain)}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("validity", result.stderr)
+
+    def test_world_readable_intermediate_key_rejected(self) -> None:
+        loose = self.workspace / "im-loose.key"
+        loose.write_text(
+            (self.workspace / "intermediate.key").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        os.chmod(loose, 0o644)
+        result = self.validate_intermediate(**{"--intermediate-key": str(loose)})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("mode 0644", result.stderr)
+
+    def test_symlinked_intermediate_key_rejected(self) -> None:
+        link = self.workspace / "im-linked.key"
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(self.workspace / "intermediate.key")
+        result = self.validate_intermediate(**{"--intermediate-key": str(link)})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("symlink", result.stderr)
+
+    def test_domain_outside_name_constraint_subtree_rejected_and_inside_passes(self) -> None:
+        int_cert, int_key, chain = self._build_constrained_pki("aegisgroup.ch")
+        common = {
+            "--intermediate": str(int_cert),
+            "--intermediate-key": str(int_key),
+            "--chain": str(chain),
+        }
+        # A domain outside the permitted subtree fails with OpenSSL's verbatim
+        # "permitted subtree violation" -- the same engine Vault's real leaves hit.
+        outside = self.validate_intermediate(**{**common, "--domain": "foo.example.com"})
+        self.assertEqual(outside.returncode, 1)
+        self.assertIn("name-constraints", outside.stderr)
+        self.assertIn("permitted subtree violation", outside.stderr)
+        self.assert_no_key_bytes(outside)
+        # A domain inside the subtree passes: the offline test leaf verifies.
+        inside = self.validate_intermediate(**{**common, "--domain": "aigw.aegisgroup.ch"})
+        self.assertEqual(inside.returncode, 0, inside.stderr)
+        self.assertIn("edge-tls=valid", inside.stdout)
+        self.assert_no_key_bytes(inside)
+
+    def test_leaves_signed_by_intermediate_chain_to_the_customer_root(self) -> None:
+        # Prove the promise: after import, both the edge wildcard and the Samba
+        # LDAPS leaf the intermediate signs verify to the customer root with the
+        # exact -CAfile root -untrusted intermediate the install/verify path uses.
+        int_key = self.workspace / "intermediate.key"
+        for name, san in (
+            ("edge-wild", f"DNS:*.{self.domain},DNS:{self.domain}"),
+            ("samba-leaf", f"DNS:samba-ad.{self.domain}"),
+        ):
+            work = self.workspace
+            csr = work / f"{name}.csr"
+            key = work / f"{name}.key"
+            cert = work / f"{name}.pem"
+            self._ossl(
+                "req", "-new", "-newkey", "rsa:2048", "-nodes",
+                "-subj", f"/CN={name}.{self.domain}", "-keyout", str(key), "-out", str(csr),
+            )
+            ext = work / f"{name}.ext"
+            ext.write_text(
+                f"subjectAltName={san}\nextendedKeyUsage=serverAuth\n"
+                "basicConstraints=critical,CA:FALSE\n",
+                encoding="utf-8",
+            )
+            self._ossl(
+                "x509", "-req", "-in", str(csr), "-CA", str(self.intermediate),
+                "-CAkey", str(int_key), "-CAcreateserial", "-days", "90",
+                "-extfile", str(ext), "-out", str(cert),
+            )
+            proof = subprocess.run(
+                [self.openssl, "verify", "-CAfile", str(self.root_cert),
+                 "-untrusted", str(self.intermediate), str(cert)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(proof.returncode, 0, proof.stderr)
+            self.assertIn("OK", proof.stdout)
 
     def test_self_signed_placeholder_rejected_by_validate_installed(self) -> None:
         certs_dir = Path(tempfile.mkdtemp(prefix="edge-tls-placeholder-"))

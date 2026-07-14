@@ -137,6 +137,19 @@ cribl_otlp_ca_pem_file: ""
 #                         root private key is never requested or stored.
 #   customer-supplied  -- the operator supplies the edge leaf, its private key,
 #                         and the complete chain as controller-local files.
+#   customer-intermediate -- the operator supplies an INTERMEDIATE CA
+#                         certificate AND its private key plus the complete
+#                         chain. Vault imports that intermediate into pki_int,
+#                         promotes it to the default issuer, and issues every
+#                         leaf (edge wildcard + Samba LDAPS) under it. This is a
+#                         higher-trust posture than vault-intermediate: the
+#                         gateway briefly holds the intermediate signing key,
+#                         which transits the no_log Ansible pipe, sits at
+#                         secrets/aigw-intermediate-import.key (0600 root) until
+#                         the import ceremony, is imported over stdin, and is
+#                         then shredded. The customer ROOT key is still never
+#                         supplied. One mode for lab and production; they differ
+#                         only in where the intermediate material comes from.
 aigw_edge_tls_mode: "{{ 'lab' if deployment_profile == 'rocky9-lab' else '' }}"
 # Mode customer-supplied only: controller-local PEM paths. Never committed,
 # never placed in the encrypted inventory overlay (a multi-line PEM in an inline
@@ -144,6 +157,12 @@ aigw_edge_tls_mode: "{{ 'lab' if deployment_profile == 'rocky9-lab' else '' }}"
 aigw_edge_tls_leaf_cert_file: ""
 aigw_edge_tls_private_key_file: ""
 aigw_edge_tls_chain_file: ""
+# Mode customer-intermediate only: controller-local PEM paths. Same custody
+# rules as the customer-supplied trio -- the intermediate key is a file path,
+# never an inline-encrypted overlay value, and must be 0600.
+aigw_edge_tls_intermediate_cert_file: ""
+aigw_edge_tls_intermediate_key_file: ""
+aigw_edge_tls_intermediate_chain_file: ""
 # Certificates within this many days of notAfter fail validation and verify.
 aigw_edge_tls_min_days_remaining: 30
 

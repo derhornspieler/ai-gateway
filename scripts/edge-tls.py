@@ -220,20 +220,30 @@ def is_ca(text: str) -> bool:
 # ── the checks ──────────────────────────────────────────────────────────────
 
 
-def check_key_matches_leaf(openssl: OpenSSL, key_path: Path, leaf_pem: str) -> str:
+def check_key_matches_cert(
+    openssl: OpenSSL, key_path: Path, cert_pem: str, *, subject: str = "certificate"
+) -> str:
     """Compare public keys; return the PUBLIC half for the strength check.
 
     The private key travels to openssl by file path and never crosses a stream
-    this process reads, so it cannot leak into stdout, stderr, or a log.
+    this process reads, so it cannot leak into stdout, stderr, or a log. This is
+    the general key<->certificate binding proof: the edge leaf uses it (via
+    check_key_matches_leaf), and the customer-intermediate ceremony uses it to
+    prove the supplied key belongs to the supplied intermediate -- a supplied
+    ROOT key (or any other key) fails here before Vault is ever touched.
     """
     from_key = openssl.run("pkey", "-in", str(key_path), "-pubout", check_name="key-match")
-    from_leaf = openssl.run("x509", "-noout", "-pubkey", stdin=leaf_pem, check_name="key-match")
-    if from_key.strip() != from_leaf.strip():
+    from_cert = openssl.run("x509", "-noout", "-pubkey", stdin=cert_pem, check_name="key-match")
+    if from_key.strip() != from_cert.strip():
         fail(
             "key-match",
-            "the private key does not match the leaf certificate's public key",
+            f"the private key does not match the {subject}'s public key",
         )
     return from_key
+
+
+def check_key_matches_leaf(openssl: OpenSSL, key_path: Path, leaf_pem: str) -> str:
+    return check_key_matches_cert(openssl, key_path, leaf_pem, subject="leaf certificate")
 
 
 def check_key_strength(openssl: OpenSSL, public_key_pem: str) -> None:
@@ -297,6 +307,32 @@ def check_eku(text: str) -> None:
 def check_leaf_is_not_a_ca(text: str) -> None:
     if is_ca(text):
         fail("leaf-basic-constraints", "leaf certificate asserts CA:TRUE; it must be an end-entity")
+
+
+def check_ca_key_usage(text: str) -> None:
+    """An issuing CA certificate must be permitted to sign certificates.
+
+    The non-Extended `X509v3 Key Usage:` heading holds `Certificate Sign` for a
+    real intermediate; `extension_section` matches the exact heading so the
+    Extended Key Usage section is never confused for it.
+    """
+    section = extension_section(text, "X509v3 Key Usage:")
+    if "Certificate Sign" not in section:
+        fail(
+            "ca-key-usage",
+            "the intermediate CA certificate does not carry the Certificate Sign "
+            f"key usage and cannot issue leaves (found: {section or 'no Key Usage extension'})",
+        )
+
+
+def count_private_key_blocks(text: str) -> int:
+    """Count PEM private-key BEGIN lines. Each `-----BEGIN ... PRIVATE KEY-----`
+    is one block; the END line is not counted."""
+    return sum(
+        1
+        for line in text.splitlines()
+        if line.startswith("-----BEGIN") and "PRIVATE KEY" in line
+    )
 
 
 def check_chain_shape(openssl: OpenSSL, leaf_pem: str, chain_pems: list[str]) -> list[str]:
@@ -407,7 +443,178 @@ def check_chain_verifies(
             )
 
 
+def check_intermediate_chain(
+    openssl: OpenSSL, intermediate_pem: str, chain_pems: list[str]
+) -> list[str]:
+    """Every chain member is a CA, a self-signed root is present, and the
+    supplied intermediate verifies up to that root.
+
+    Unlike check_chain_shape (used for a leaf, which must NOT appear in its own
+    chain), the intermediate legitimately appears in `chain = intermediate +
+    root`, so this cannot reuse that helper.
+    """
+    roots: list[str] = []
+    for index, pem in enumerate(chain_pems):
+        text = certificate_text(openssl, pem, f"chain[{index}]")
+        if not is_ca(text):
+            subject, _ = subject_and_issuer(openssl, pem)
+            fail("ca-constraints", f"chain certificate is not a CA (CA:TRUE absent): {subject}")
+        if is_self_signed(openssl, pem):
+            roots.append(pem)
+    if not roots:
+        fail("ca-constraints", f"no self-signed root CA is present in the chain; {CHAIN_NEEDS_ROOT_HINT}")
+    other_intermediates = [
+        pem for pem in chain_pems if pem not in roots and pem.strip() != intermediate_pem.strip()
+    ]
+    with tempfile.TemporaryDirectory(prefix="edge-tls-int-verify-") as workspace:
+        work = Path(workspace)
+        intermediate_file = work / "intermediate.pem"
+        roots_file = work / "roots.pem"
+        untrusted_file = work / "untrusted.pem"
+        intermediate_file.write_text(intermediate_pem, encoding="utf-8")
+        roots_file.write_text("".join(roots), encoding="utf-8")
+        arguments = ["verify", "-CAfile", str(roots_file)]
+        if other_intermediates:
+            # A multi-level chain needs its middle intermediates as -untrusted;
+            # an empty -untrusted file is an OpenSSL error, so only pass it when
+            # there is something to pass.
+            untrusted_file.write_text("".join(other_intermediates), encoding="utf-8")
+            arguments += ["-untrusted", str(untrusted_file)]
+        code, out, err = openssl.try_run(*arguments, str(intermediate_file))
+        if code != 0:
+            fail(
+                "chain-verify",
+                "the supplied intermediate does not verify to a self-signed root in "
+                "the chain:\n"
+                + "\n".join(
+                    f"    {line}" for line in (err + out).strip().splitlines() if line.strip()
+                ),
+            )
+    return roots
+
+
+def check_intermediate_name_constraints(
+    openssl: OpenSSL,
+    key_path: Path,
+    intermediate_pem: str,
+    roots: list[str],
+    chain_pems: list[str],
+    domain: str,
+) -> None:
+    """Prove the domain falls inside the CA's permitted name-constraint subtree.
+
+    Because this mode holds the intermediate's PRIVATE KEY, it can do what no
+    other mode can: sign a throwaway test leaf under the SUPPLIED intermediate
+    and run the exact `openssl verify` the real edge and Samba leaves get. If
+    the root (or the intermediate itself) carries DNS name constraints that do
+    not permit `domain`, OpenSSL returns error 47 and its verbatim "permitted
+    subtree violation" is surfaced -- fail closed BEFORE any Vault mutation.
+
+    The intermediate's private key reaches openssl only as `-CAkey <path>`; the
+    signed test leaf is written to the temp dir, never to a stream this process
+    reads, so no key bytes can leak.
+    """
+    untrusted = [pem for pem in chain_pems if pem not in roots]
+    if all(pem.strip() != intermediate_pem.strip() for pem in untrusted):
+        untrusted.insert(0, intermediate_pem)
+    with tempfile.TemporaryDirectory(prefix="edge-tls-nc-") as workspace:
+        work = Path(workspace)
+        ca_file = work / "intermediate.pem"
+        roots_file = work / "roots.pem"
+        untrusted_file = work / "untrusted.pem"
+        test_key = work / "testleaf.key"
+        test_csr = work / "testleaf.csr"
+        test_ext = work / "testleaf.ext"
+        test_leaf = work / "testleaf.pem"
+        ca_file.write_text(intermediate_pem, encoding="utf-8")
+        roots_file.write_text("".join(roots), encoding="utf-8")
+        untrusted_file.write_text("".join(untrusted), encoding="utf-8")
+        openssl.run(
+            "req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-subj", f"/CN=*.{domain}",
+            "-keyout", str(test_key), "-out", str(test_csr),
+            check_name="name-constraints",
+        )
+        test_ext.write_text(
+            f"subjectAltName=DNS:*.{domain},DNS:{domain},DNS:samba-ad.{domain}\n"
+            "extendedKeyUsage=serverAuth\n"
+            "basicConstraints=critical,CA:FALSE\n",
+            encoding="utf-8",
+        )
+        openssl.run(
+            "x509", "-req", "-in", str(test_csr),
+            "-CA", str(ca_file), "-CAkey", str(key_path), "-CAcreateserial",
+            "-days", "1", "-extfile", str(test_ext), "-out", str(test_leaf),
+            check_name="name-constraints",
+        )
+        base = [
+            "verify", "-CAfile", str(roots_file), "-untrusted", str(untrusted_file),
+            "-purpose", "sslserver",
+        ]
+        for hostname in (f"portal.{domain}", f"samba-ad.{domain}"):
+            code, out, err = openssl.try_run(*base, "-verify_hostname", hostname, str(test_leaf))
+            if code != 0:
+                fail(
+                    "name-constraints",
+                    f"a leaf for {hostname} signed by the supplied intermediate does not "
+                    f"verify to the customer root; {domain} may fall outside the CA's "
+                    "permitted name-constraint subtree:\n"
+                    + "\n".join(
+                        f"    {line}"
+                        for line in (err + out).strip().splitlines()
+                        if line.strip()
+                    ),
+                )
+
+
 # ── composite validation ────────────────────────────────────────────────────
+
+
+def validate_intermediate_material(
+    openssl: OpenSSL,
+    *,
+    intermediate_pem: str,
+    chain_pems: list[str],
+    key_path: Path,
+    domain: str,
+    min_days: int,
+) -> None:
+    """Fail-closed validation of an operator-supplied intermediate CA + key.
+
+    Every check runs BEFORE the caller imports anything into Vault; the first
+    failure aborts. The order is deliberate so the operator gets the most
+    specific reason (a self-signed root refusal, not a downstream chain error).
+    """
+    text = certificate_text(openssl, intermediate_pem, "intermediate")
+    if not is_ca(text):
+        fail(
+            "ca-constraints",
+            "the supplied intermediate is not a CA certificate (CA:TRUE absent)",
+        )
+    check_ca_key_usage(text)
+    if is_self_signed(openssl, intermediate_pem):
+        subject, _ = subject_and_issuer(openssl, intermediate_pem)
+        fail(
+            "self-signed-root",
+            "refusing to import a self-signed root CA; supply an intermediate "
+            f"issued by your root, not the root itself ({subject})",
+        )
+    public_key = check_key_matches_cert(
+        openssl, key_path, intermediate_pem, subject="intermediate certificate"
+    )
+    check_key_strength(openssl, public_key)
+    key_text = key_path.read_text(encoding="utf-8", errors="replace")
+    if count_private_key_blocks(key_text) != 1:
+        fail(
+            "single-key",
+            "the intermediate key file must contain exactly one private key; a "
+            "bundle including the root/issuing key is refused",
+        )
+    roots = check_intermediate_chain(openssl, intermediate_pem, chain_pems)
+    check_validity(openssl, [intermediate_pem, *chain_pems], min_days)
+    check_intermediate_name_constraints(
+        openssl, key_path, intermediate_pem, roots, chain_pems, domain
+    )
 
 
 def validate_material(
@@ -613,6 +820,34 @@ def command_validate_ca_bundle(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def command_validate_intermediate(arguments: argparse.Namespace) -> int:
+    openssl = OpenSSL(arguments.openssl)
+    intermediate = Path(arguments.intermediate)
+    key = Path(arguments.intermediate_key)
+    chain = Path(arguments.chain)
+    # 1. custody: absolute, regular, non-symlink, single-link; key owner + 0600.
+    require_safe_file(intermediate, "--intermediate")
+    require_safe_file(chain, "--chain")
+    require_safe_file(
+        key, "--intermediate-key",
+        expect_owner=arguments.expect_key_owner, expect_mode=arguments.expect_key_mode,
+    )
+    # 2. no smuggled private key in either public file (the root/issuing key must
+    #    never be supplied); read_certificate_file refuses `PRIVATE KEY`.
+    intermediate_pems = read_certificate_file(intermediate, "--intermediate")
+    chain_pems = read_certificate_file(chain, "--chain")
+    validate_intermediate_material(
+        openssl,
+        intermediate_pem=intermediate_pems[0],
+        chain_pems=chain_pems,
+        key_path=key,
+        domain=arguments.domain,
+        min_days=arguments.min_days_remaining,
+    )
+    print("edge-tls=valid")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -634,6 +869,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--expect-key-mode", type=lambda v: int(v, 8), default=0o600)
     add_common(validate)
     validate.set_defaults(handler=command_validate)
+
+    validate_intermediate = subparsers.add_parser("validate-intermediate")
+    validate_intermediate.add_argument("--intermediate", required=True)
+    validate_intermediate.add_argument("--intermediate-key", required=True)
+    validate_intermediate.add_argument("--chain", required=True)
+    validate_intermediate.add_argument("--expect-key-owner", type=parse_owner, default=None)
+    validate_intermediate.add_argument("--expect-key-mode", type=lambda v: int(v, 8), default=0o600)
+    add_common(validate_intermediate)
+    validate_intermediate.set_defaults(handler=command_validate_intermediate)
 
     validate_installed = subparsers.add_parser("validate-installed")
     validate_installed.add_argument("--certs-dir", required=True)
