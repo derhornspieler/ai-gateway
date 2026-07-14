@@ -124,6 +124,9 @@ for relative in (
     "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
     "grafana/provisioning/dashboards/json/ai-gateway-overview.json",
     "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
+    "grafana/provisioning/dashboards/json/edge-identity-services.json",
+    "grafana/provisioning/dashboards/json/grafana-lgtm-stack.json",
+    "grafana/provisioning/dashboards/json/rocky9-host.json",
     "grafana/provisioning/datasources/datasources.yml",
     "grafana/provisioning/plugins/empty.yml",
 ):
@@ -610,8 +613,10 @@ if ansible.is_file():
         "Require a root-only authenticated-restore marker",
         "Require restored Vault state instead of replacement initialization",
         "- -address=http://127.0.0.1:8200",
-        "Authenticated restored state is present and Vault is sealed",
-        "or running scripts/vault-bootstrap.sh is forbidden",
+        "Require the encrypted controller Vault unseal key after initialization",
+        "Automatically unseal initialized Vault from controller inventory",
+        "Require automatic unseal for every initialized Vault deployment",
+        "Bound the Vault bootstrap health exception to fresh uninitialized state",
     ):
         assert required in source, required
     assert (

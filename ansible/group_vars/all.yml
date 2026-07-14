@@ -362,6 +362,9 @@ aigw_seed_test_users: false
 # samba_user_lab_admin_password: <lab vault overlay only>
 # samba_user_lab_developer_password: <lab vault overlay only>
 # samba_user_lab_user_password: <lab vault overlay only>
+# vault_unseal_key:           <vault overlay only>  # Operator-supplied output
+#     of HashiCorp Vault initialization. Never randomly generate this value.
+#     When defined, Ansible may use it via the stdin-only unseal helper.
 
 # Not an overlay secret: starts empty, written in place on the VM by
 # scripts/vault-bootstrap.sh after Vault init/unseal.

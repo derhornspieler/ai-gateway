@@ -297,7 +297,10 @@
       [
         'ai-gateway-live-logs.json',
         'ai-gateway-overview.json',
-        'ai-gateway-request-audit.json'
+        'ai-gateway-request-audit.json',
+        'edge-identity-services.json',
+        'grafana-lgtm-stack.json',
+        'rocky9-host.json'
       ])
 
 - name: Sync allow-listed compose configuration files
@@ -322,6 +325,9 @@
     - grafana/provisioning/dashboards/json/ai-gateway-live-logs.json
     - grafana/provisioning/dashboards/json/ai-gateway-overview.json
     - grafana/provisioning/dashboards/json/ai-gateway-request-audit.json
+    - grafana/provisioning/dashboards/json/edge-identity-services.json
+    - grafana/provisioning/dashboards/json/grafana-lgtm-stack.json
+    - grafana/provisioning/dashboards/json/rocky9-host.json
     - grafana/provisioning/datasources/datasources.yml
     - grafana/provisioning/plugins/empty.yml
     - litellm/config.yaml
@@ -2611,32 +2617,6 @@
         done
   changed_when: false
 
-# Vault is intentionally uninitialized/sealed on the first converge. Starting
-# the complete graph is necessary so the operator can execute the bootstrap,
-# but waiting for every readiness probe here would deadlock that ceremony.
-- name: Probe strict Vault readiness after stack start
-  ansible.builtin.command:
-    argv:
-      - docker
-      - --host
-      - unix:///run/docker.sock
-      - compose
-      - exec
-      - -T
-      - vault
-      - /usr/local/bin/aigw-health-probe
-      - http
-      - --url
-      - http://127.0.0.1:8200/v1/sys/health?standbyok=true
-  args:
-    chdir: "{{ stack_dir }}"
-  environment:
-    COMPOSE_PROFILES: ""
-    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
-  register: vault_strict_readiness
-  changed_when: false
-  failed_when: false
-
 - name: Inspect the authenticated-restore marker
   ansible.builtin.stat:
     path: "{{ stack_dir }}/.state/restore-required-unseal"
@@ -2665,7 +2645,77 @@
       single-link file containing only the independently authenticated backup SHA-256.
   when: restore_required_unseal_marker.stat.exists | default(false)
 
-- name: Read public Vault initialization and seal state
+- name: Read public Vault initialization and seal state before automatic unseal
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - compose
+      - exec
+      - -T
+      - vault
+      - vault
+      - status
+      - -address=http://127.0.0.1:8200
+      - -format=json
+  args:
+    chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
+  register: vault_status_before_unseal
+  changed_when: false
+  failed_when: vault_status_before_unseal.rc not in [0, 2]
+
+- name: Require the reviewed 1-of-1 Shamir seal contract after initialization
+  ansible.builtin.assert:
+    that:
+      - (vault_status_before_unseal.stdout | from_json).type == 'shamir'
+      - (vault_status_before_unseal.stdout | from_json).t | int == 1
+      - (vault_status_before_unseal.stdout | from_json).n | int == 1
+    quiet: true
+    fail_msg: >-
+      This deployment supports exactly one Shamir unseal share with threshold
+      one (Vault status t=1, n=1). The initialized Vault reports another seal
+      contract, so a singular vault_unseal_key cannot safely unseal it.
+  when: (vault_status_before_unseal.stdout | from_json).initialized | bool
+
+# The 1-of-1 Shamir key is deliberately controller-owned. It may be present
+# only as an inventory secret (normally an Ansible-Vault/SOPS overlay), and is
+# never rendered into .env, copied to the target, placed in argv/environment,
+# or registered without no_log. A genuinely fresh Vault is the sole exception:
+# it has no valid key until the separately reviewed initialization ceremony.
+- name: Require the encrypted controller Vault unseal key after initialization
+  ansible.builtin.assert:
+    that:
+      - vault_unseal_key is defined
+      - vault_unseal_key is vault_encrypted
+      - vault_unseal_key is string
+      - vault_unseal_key | length == 44
+      - vault_unseal_key is match('^[A-Za-z0-9+/]{43}=$')
+    quiet: true
+    fail_msg: >-
+      An initialized Vault requires vault_unseal_key from the encrypted
+      controller inventory. Supply its existing 1-of-1 Shamir unseal key;
+      never generate a replacement key or place it in plaintext host vars.
+  when: (vault_status_before_unseal.stdout | from_json).initialized | bool
+  no_log: true
+
+- name: Automatically unseal initialized Vault from controller inventory
+  ansible.builtin.command:
+    argv:
+      - "{{ stack_dir }}/scripts/vault-unseal.sh"
+    stdin: "{{ vault_unseal_key }}"
+    stdin_add_newline: false
+  register: vault_automatic_unseal
+  changed_when: true
+  when:
+    - (vault_status_before_unseal.stdout | from_json).initialized | bool
+    - (vault_status_before_unseal.stdout | from_json).sealed | bool
+  no_log: true
+
+- name: Re-read public Vault state after the automatic-unseal decision
   ansible.builtin.command:
     argv:
       - docker
@@ -2687,6 +2737,63 @@
   register: vault_public_status
   changed_when: false
   failed_when: vault_public_status.rc not in [0, 2]
+  no_log: true
+
+- name: Require automatic unseal for every initialized Vault deployment
+  ansible.builtin.assert:
+    that:
+      - (vault_public_status.stdout | from_json).initialized | bool
+      - not ((vault_public_status.stdout | from_json).sealed | bool)
+      - vault_public_status.rc == 0
+    quiet: true
+    fail_msg: >-
+      Vault remained sealed after the controller supplied its encrypted
+      1-of-1 unseal key. Refusing to complete a partially functional deploy.
+  when: (vault_status_before_unseal.stdout | from_json).initialized | bool
+  no_log: true
+
+- name: Prove a fresh deployment was not initialized implicitly
+  ansible.builtin.assert:
+    that:
+      - not ((vault_public_status.stdout | from_json).initialized | bool)
+      - (vault_public_status.stdout | from_json).sealed | bool
+    quiet: true
+    fail_msg: >-
+      Vault initialization state changed during the automatic-unseal phase.
+      Initialization is a separate explicit ceremony and must never be
+      inferred or made destructive by a normal converge.
+  when: not ((vault_status_before_unseal.stdout | from_json).initialized | bool)
+
+# A genuinely fresh Vault remains uninitialized/sealed on first converge so
+# the operator can execute the reviewed bootstrap ceremony. Every initialized
+# deployment must pass the strict health probe after the automatic unseal.
+- name: Probe strict Vault readiness after the automatic-unseal decision
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - compose
+      - exec
+      - -T
+      - vault
+      - /usr/local/bin/aigw-health-probe
+      - http
+      - --url
+      - http://127.0.0.1:8200/v1/sys/health?standbyok=true
+  args:
+    chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
+  register: vault_strict_readiness
+  changed_when: false
+  failed_when: false
+  retries: 12
+  delay: 5
+  until: >-
+    vault_strict_readiness.rc == 0 or
+    not ((vault_public_status.stdout | from_json).initialized | bool)
 
 - name: Probe strict key-rotator dependency readiness after stack start
   ansible.builtin.command:
@@ -2711,15 +2818,24 @@
   register: key_rotator_strict_readiness
   changed_when: false
   failed_when: false
+  retries: 12
+  delay: 5
+  until: >-
+    key_rotator_strict_readiness.rc == 0 or
+    not ((vault_public_status.stdout | from_json).initialized | bool)
   no_log: true
 
-- name: Bound the Vault bootstrap health exception to public sealed state
+- name: Bound the Vault bootstrap health exception to fresh uninitialized state
   ansible.builtin.assert:
     that:
       - >-
-        vault_strict_readiness.rc == 0 or
-        not ((vault_public_status.stdout | from_json).initialized | bool) or
-        ((vault_public_status.stdout | from_json).sealed | bool)
+        (not ((vault_public_status.stdout | from_json).initialized | bool) and
+         vault_strict_readiness.rc != 0 and
+         key_rotator_strict_readiness.rc != 0) or
+        ((vault_public_status.stdout | from_json).initialized | bool and
+         not ((vault_public_status.stdout | from_json).sealed | bool) and
+         vault_strict_readiness.rc == 0 and
+         key_rotator_strict_readiness.rc == 0)
       - >-
         (vault_strict_readiness.rc == 0 and
          key_rotator_strict_readiness.rc == 0) or
@@ -2728,8 +2844,9 @@
     quiet: true
     fail_msg: >-
       Vault and key-rotator strict readiness disagree with the public seal
-      state. This is not a bootstrap exception: fail closed and diagnose the
-      dependency boundary instead of weakening Docker liveness.
+      state, or an initialized deployment is not fully ready after automatic
+      unseal. Only a genuinely uninitialized first bootstrap may remain
+      unhealthy; every initialized deployment fails closed here.
 
 - name: Require restored Vault state instead of replacement initialization
   ansible.builtin.assert:
@@ -3308,28 +3425,6 @@
       - "{{ platform_authoritative_dns_enabled | bool | lower }}"
   register: published_port_contract
   changed_when: false
-
-- name: Report the authenticated-restore Vault unseal gate
-  ansible.builtin.debug:
-    msg: >-
-      Authenticated restored state is present and Vault is sealed. Initializing
-      or running scripts/vault-bootstrap.sh is forbidden. Keep the restore
-      marker and maintenance ingress in place; stream the separately held old
-      unseal share to scripts/vault-unseal.sh, then run the full runtime wait.
-  when:
-    - vault_strict_readiness.rc != 0
-    - restore_required_unseal_marker.stat.exists | default(false)
-
-- name: Report the existing initialized Vault unseal gate
-  ansible.builtin.debug:
-    msg: >-
-      Vault is already initialized but sealed. Do not run
-      scripts/vault-bootstrap.sh; use the separately held existing unseal
-      shares and then run the full runtime wait.
-  when:
-    - vault_strict_readiness.rc != 0
-    - not (restore_required_unseal_marker.stat.exists | default(false))
-    - (vault_public_status.stdout | from_json).initialized | bool
 
 - name: Report the fresh Vault bootstrap gate
   ansible.builtin.debug:

@@ -22,6 +22,45 @@ set -euo pipefail
 # other users, not even between creation and a later chmod.
 umask 077
 
+EMIT_UNSEAL_KEY=false
+case "${1:-}" in
+  "") ;;
+  --emit-unseal-key)
+    EMIT_UNSEAL_KEY=true
+    shift
+    ;;
+  -h|--help)
+    cat <<'EOF'
+Usage: vault-bootstrap.sh [--emit-unseal-key]
+
+  --emit-unseal-key  Reserve stdout exclusively for the generated 1-of-1
+                     unseal share. Stdout must be a pipe, never a terminal.
+                     The root-owned 0600 init response remains on the Vault
+                     host until controller-side encrypted custody is verified.
+EOF
+    exit 0
+    ;;
+  *)
+    echo "FATAL: unsupported argument: $1" >&2
+    exit 2
+    ;;
+esac
+if [[ "$#" -ne 0 ]]; then
+  echo "FATAL: vault-bootstrap.sh accepts only one optional argument" >&2
+  exit 2
+fi
+if [[ "$EMIT_UNSEAL_KEY" == true ]]; then
+  if [[ -t 1 ]]; then
+    echo "FATAL: --emit-unseal-key requires captured stdout; refusing to print an unseal share to a terminal" >&2
+    exit 2
+  fi
+  # Preserve the caller's captured stdout as the single-purpose custody
+  # channel. Everything else from this script and its children goes to stderr,
+  # so status output can never be confused with or appended to the share.
+  exec 3>&1
+  exec 1>&2
+fi
+
 STACK_DIR="${STACK_DIR:-/opt/ai-gateway}"
 cd "$STACK_DIR"
 compose=("$STACK_DIR/scripts/aigw-compose.sh")
@@ -211,7 +250,7 @@ ROOT_TOKEN="$(python3 -c 'import json;print(json.load(open("secrets/vault-init.j
 # capability-free DHI client and keeps the share exclusively on stdin.
 printf '%s\n' "$UNSEAL_KEY" | "$STACK_DIR/scripts/vault-unseal.sh"
 export VAULT_TOKEN="$ROOT_TOKEN"
-unset UNSEAL_KEY ROOT_TOKEN
+unset ROOT_TOKEN
 echo ">> unsealed."
 
 # Enable a named, idempotent Vault audit device before any secrets/PKI work.
@@ -349,6 +388,19 @@ chmod 600 .env
 # a scheduling margin so this final bootstrap gate does not preempt it.
 "$STACK_DIR/scripts/aigw-runtime-up.sh" -d --wait --wait-timeout 600
 
+if [[ "$EMIT_UNSEAL_KEY" == true ]]; then
+  # Emit only after Vault accepted the share and the complete post-bootstrap
+  # runtime gate passed. The durable 0600 init response remains the recovery
+  # copy until the controller helper has atomically stored and independently
+  # decrypted-verified the inline Ansible Vault value.
+  if ! printf '%s\n' "$UNSEAL_KEY" >&3; then
+    echo "FATAL: controller custody channel rejected the unseal share; retaining secrets/vault-init.json" >&2
+    exit 1
+  fi
+  exec 3>&-
+fi
+unset UNSEAL_KEY
+
 cat <<EOF
 
 DONE.
@@ -362,9 +414,10 @@ DONE.
   edge certs    : $STACK_DIR/certs/  (int.crt / int.key / ca.pem)
   rotator token : written to .env (ROTATOR_VAULT_TOKEN)
 
-After every VM reboot Vault is SEALED (manual-unseal posture, §9.6).
-Use a hidden shell read, then the hardened stdin-only helper (the share is
-never an argument, environment variable, container setting, or Docker log):
+After every VM reboot Vault is SEALED unless the deployment controller has an
+inline-encrypted vault_unseal_key. Use a hidden shell read, then the hardened
+stdin-only helper when manual recovery is required (the share is never an
+argument, environment variable, container setting, or Docker log):
   read -rsp 'Vault unseal share: ' AIGW_UNSEAL_SHARE; printf '\n'
   printf '%s\n' "\$AIGW_UNSEAL_SHARE" | sudo scripts/vault-unseal.sh
   unset AIGW_UNSEAL_SHARE

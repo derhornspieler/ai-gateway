@@ -1,6 +1,24 @@
 ---
 # Post-converge assertions. Fail loudly rather than assume.
 
+- name: Refuse a sealed or dependency-unready initialized Vault deployment
+  ansible.builtin.assert:
+    that:
+      - vault_public_status is defined
+      - vault_strict_readiness is defined
+      - key_rotator_strict_readiness is defined
+      - >-
+        not ((vault_public_status.stdout | from_json).initialized | bool) or
+        (not ((vault_public_status.stdout | from_json).sealed | bool) and
+         vault_public_status.rc == 0 and
+         vault_strict_readiness.rc == 0 and
+         key_rotator_strict_readiness.rc == 0)
+    quiet: true
+    fail_msg: >-
+      An initialized deployment may not complete with Vault sealed or
+      key-rotator unready. Supply vault_unseal_key through the encrypted
+      controller inventory and rerun the deployment.
+
 - name: Read Docker daemon state-root configuration
   ansible.builtin.command:
     argv: [docker, --host, unix:///run/docker.sock, info, --format=json]
@@ -513,7 +531,8 @@
       - >-
         {{
           (['vault', 'key-rotator']
-           if (vault_strict_readiness is defined and vault_strict_readiness.rc != 0)
+           if (vault_public_status is defined and
+               not ((vault_public_status.stdout | from_json).initialized | bool))
            else [])
           | to_json
         }}
@@ -1317,6 +1336,9 @@
             "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/ai-gateway-overview.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/edge-identity-services.json": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/grafana-lgtm-stack.json": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/rocky9-host.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/datasources": ("dir", 0, 0, 0o755),
             "grafana/provisioning/datasources/datasources.yml": ("file", 0, 0, 0o644),
             "grafana/provisioning/plugins": ("dir", 0, 0, 0o755),
@@ -1526,7 +1548,7 @@
                 """
             )
         )
-        if len(resources) != 4:
+        if len(resources) != 7:
             raise SystemExit("Grafana unified-storage resource inventory is not exact")
 
         expected_dashboards = {
@@ -1541,6 +1563,18 @@
             "aigw-request-audit": (
                 "AI Gateway Request Audit",
                 "/etc/grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
+            ),
+            "aigw-edge-identity": (
+                "Edge, Egress and Identity Services",
+                "/etc/grafana/provisioning/dashboards/json/edge-identity-services.json",
+            ),
+            "aigw-grafana-lgtm": (
+                "Grafana LGTM Stack",
+                "/etc/grafana/provisioning/dashboards/json/grafana-lgtm-stack.json",
+            ),
+            "aigw-rocky9-host": (
+                "Rocky 9 Host (Node Exporter)",
+                "/etc/grafana/provisioning/dashboards/json/rocky9-host.json",
             ),
         }
         observed_dashboards = set()

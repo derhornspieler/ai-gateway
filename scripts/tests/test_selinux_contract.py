@@ -185,10 +185,10 @@ class SelinuxContractTests(unittest.TestCase):
         self.assertIn("the captured graph is intentionally stopped", restore)
         self.assertNotIn("docker compose start", restore)
 
-    def test_vault_bootstrap_health_exception_is_sealed_state_only(self) -> None:
+    def test_vault_bootstrap_health_exception_is_fresh_state_only(self) -> None:
         stack = STACK_TASKS.read_text(encoding="utf-8")
         boundary = stack.split(
-            "- name: Bound the Vault bootstrap health exception to public sealed state",
+            "- name: Bound the Vault bootstrap health exception to fresh uninitialized state",
             1,
         )[1].split(
             "- name: Require restored Vault state instead of replacement initialization",
@@ -197,7 +197,8 @@ class SelinuxContractTests(unittest.TestCase):
         self.assertIn("vault_strict_readiness.rc == 0", boundary)
         self.assertIn(".initialized | bool", boundary)
         self.assertIn(".sealed | bool", boundary)
-        self.assertIn("not a bootstrap exception", boundary)
+        self.assertIn("Only a genuinely uninitialized first bootstrap", boundary)
+        self.assertNotIn("or\n        ((vault_public_status.stdout | from_json).sealed", boundary)
 
     def test_stack_only_deploy_cannot_bypass_selinux_or_runtime_verify(self) -> None:
         source = (ROOT / "ansible/deploy-stack-only.yml").read_text(

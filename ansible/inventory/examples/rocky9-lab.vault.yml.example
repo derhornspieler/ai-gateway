@@ -1,0 +1,39 @@
+---
+# SAFE NAME-ONLY TEMPLATE. Real values belong in an Ansible Vault overlay.
+# The base stack secret names are identical to production.
+pg_super_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+pg_litellm_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+pg_keycloak_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+pg_rotator_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+kc_admin_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+litellm_master_key: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+litellm_salt_key: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+redis_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+webui_litellm_key: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+webui_secret_key: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+webui_oidc_client_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+portal_oidc_client_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+admin_portal_oidc_client_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+oauth2_proxy_client_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+oauth2_proxy_litellm_cookie_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+oauth2_proxy_grafana_cookie_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+oauth2_proxy_prometheus_cookie_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+oauth2_proxy_vault_cookie_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+portal_session_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+admin_portal_session_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+rotator_internal_token: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+portal_identity_token: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+grafana_admin_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+kc_bootstrap_admin_client_secret: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+samba_ad_admin_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+samba_ad_bind_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+samba_user_lab_admin_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+samba_user_lab_developer_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+samba_user_lab_user_password: "<INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"
+
+# Added only after first operator init; never randomly generated. In a
+# disposable lab, reserve remote bootstrap stdout for the share and pipe it
+# directly to scripts/store-vault-unseal-key.py using a dedicated sibling
+# group_vars/gateway/vault-unseal.yml. Then rerun the ordinary playbook and
+# require full readiness before deleting remote secrets/vault-init.json.
+vault_unseal_key: "<OPERATOR_INIT_OUTPUT; INLINE_ANSIBLE_VAULT_VALUE_REQUIRED>"

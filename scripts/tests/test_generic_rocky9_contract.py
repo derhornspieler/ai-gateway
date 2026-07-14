@@ -239,7 +239,13 @@ print("          0123456789abcdef")
             self.assertTrue((layout / "hosts.yml").is_file())
             self.assertTrue(host_vars.is_file())
             self.assertTrue(vault.is_file())
-            self.assertIn("customer-aigw01:", (layout / "hosts.yml").read_text())
+            inventory_text = (layout / "hosts.yml").read_text(encoding="utf-8")
+            self.assertIn("customer-aigw01:", inventory_text)
+            self.assertIn("production_rocky9:", inventory_text)
+            self.assertIn(
+                "generic_rocky9:\n      children:\n        production_rocky9:",
+                inventory_text,
+            )
             host_text = host_vars.read_text(encoding="utf-8")
             self.assertIn("aigw_generic_inventory_alias: customer-aigw01", host_text)
             self.assertIn("deployment_profile: generic-rocky9", host_text)

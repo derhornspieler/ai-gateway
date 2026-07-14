@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# SAFE EXECUTABLE TEMPLATE. Run only after the reviewed production Vault init
+# ceremony has initialized and unsealed Vault and returned its 1-of-1 share.
+set -euo pipefail
+
+: "${AIGW_INVENTORY:?set to the generated production inventory path}"
+: "${AIGW_INVENTORY_ALIAS:?set to the production host alias}"
+: "${AIGW_VAULT_ID:?set to the Ansible Vault ID label}"
+: "${AIGW_VAULT_PASSWORD_FILE:?set to a private 0600 controller file}"
+
+read -rsp 'Vault unseal share: ' AIGW_UNSEAL_SHARE
+printf '\n'
+trap 'unset AIGW_UNSEAL_SHARE' EXIT HUP INT TERM
+printf '%s\n' "$AIGW_UNSEAL_SHARE" |
+  python3 scripts/store-vault-unseal-key.py \
+    --vault-file "$(dirname "$AIGW_INVENTORY")/group_vars/generic_rocky9/vault-unseal.yml" \
+    --vault-id "$AIGW_VAULT_ID" \
+    --vault-password-file "$AIGW_VAULT_PASSWORD_FILE"
+unset AIGW_UNSEAL_SHARE
+trap - EXIT HUP INT TERM
+
+# The ordinary second converge is the completion boundary. It validates the
+# encrypted controller variable and requires full runtime readiness.
+ansible-playbook -i "$AIGW_INVENTORY" ansible/site.yml \
+  --limit "$AIGW_INVENTORY_ALIAS" \
+  --vault-id "$AIGW_VAULT_ID@$AIGW_VAULT_PASSWORD_FILE"
+
+printf '%s\n' \
+  'Full readiness passed. Separately custody/revoke the bootstrap root token,' \
+  'then securely delete the remote secrets/vault-init.json recovery response.'

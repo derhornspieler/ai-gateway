@@ -48,6 +48,9 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
                 "aigw-live-logs": "AI Gateway Live Logs",
                 "aigw-overview": "AI Gateway Overview",
                 "aigw-request-audit": "AI Gateway Request Audit",
+                "aigw-edge-identity": "Edge, Egress and Identity Services",
+                "aigw-grafana-lgtm": "Grafana LGTM Stack",
+                "aigw-rocky9-host": "Rocky 9 Host (Node Exporter)",
             },
         )
         for dashboard in self.dashboards:
@@ -126,6 +129,70 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         for fragment in required_fragments:
             self.assertIn(fragment, rendered)
 
+    def test_component_dashboards_use_scraped_native_metric_contracts(self) -> None:
+        expected = {
+            "aigw-rocky9-host": (
+                "node_boot_time_seconds",
+                "node_cpu_seconds_total",
+                "node_memory_MemAvailable_bytes",
+                "node_memory_MemTotal_bytes",
+                "node_selinux_enabled",
+                "node_load1",
+                "node_load5",
+                "node_load15",
+                "node_network_receive_bytes_total",
+                "node_network_transmit_bytes_total",
+                "node_filesystem_avail_bytes",
+                "node_filesystem_size_bytes",
+            ),
+            "aigw-grafana-lgtm": (
+                "loki_distributor_lines_received_total",
+                "tempo_distributor_spans_received_total",
+                "otelcol_exporter_send_failed_log_records_total",
+                "otelcol_exporter_send_failed_spans_total",
+                "prometheus_tsdb_head_samples_appended_total",
+                "otelcol_exporter_queue_size",
+                "otelcol_exporter_queue_capacity",
+                "loki_request_duration_seconds_bucket",
+                "tempo_request_duration_seconds_bucket",
+                "grafana_datasource_request_duration_seconds_bucket",
+                "process_resident_memory_bytes",
+            ),
+            "aigw-edge-identity": (
+                "traefik_service_requests_total",
+                "traefik_tls_certs_not_after",
+                "keycloak_credentials_password_hashing_validations_total",
+                "envoy_cluster_upstream_rq_xx",
+                "jvm_memory_used_bytes",
+                "jvm_memory_max_bytes",
+            ),
+        }
+        for uid, metrics in expected.items():
+            dashboard = next(item for item in self.dashboards if item["uid"] == uid)
+            expressions = "\n".join(
+                target["expr"]
+                for panel in panels(dashboard)
+                for target in panel.get("targets", [])
+            )
+            for metric in metrics:
+                self.assertIn(metric, expressions)
+            self.assertNotIn("cadvisor", expressions.lower())
+            self.assertNotIn("container_", expressions.lower())
+        lgtm = next(item for item in self.dashboards if item["uid"] == "aigw-grafana-lgtm")
+        lgtm_queries = "\n".join(
+            target["expr"]
+            for panel in panels(lgtm)
+            for target in panel.get("targets", [])
+        )
+        self.assertIn('== bool 5', lgtm_queries)
+        edge = next(item for item in self.dashboards if item["uid"] == "aigw-edge-identity")
+        edge_queries = "\n".join(
+            target["expr"]
+            for panel in panels(edge)
+            for target in panel.get("targets", [])
+        )
+        self.assertIn('== bool 4', edge_queries)
+
     def test_logs_dashboard_has_bounded_operational_filters_and_no_secret_query(self) -> None:
         dashboard = next(item for item in self.dashboards if item["uid"] == "aigw-live-logs")
         log_panels = [panel for panel in panels(dashboard) if panel.get("type") == "logs"]
@@ -154,12 +221,22 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
             "grafana/provisioning/dashboards/json/ai-gateway-overview.json",
             "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
+            "grafana/provisioning/dashboards/json/edge-identity-services.json",
+            "grafana/provisioning/dashboards/json/grafana-lgtm-stack.json",
+            "grafana/provisioning/dashboards/json/rocky9-host.json",
             "grafana/provisioning/plugins/empty.yml",
         }
         for relative in expected:
             self.assertIn(relative, self.stack)
             self.assertIn(relative, self.verify)
-        for uid in ("aigw-overview", "aigw-live-logs", "aigw-request-audit"):
+        for uid in (
+            "aigw-overview",
+            "aigw-live-logs",
+            "aigw-request-audit",
+            "aigw-edge-identity",
+            "aigw-grafana-lgtm",
+            "aigw-rocky9-host",
+        ):
             self.assertIn(uid, self.verify)
 
     def test_ansible_removes_only_unmanaged_dashboard_artifacts_before_copy(self) -> None:
@@ -181,6 +258,9 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "ai-gateway-live-logs.json",
             "ai-gateway-overview.json",
             "ai-gateway-request-audit.json",
+            "edge-identity-services.json",
+            "grafana-lgtm-stack.json",
+            "rocky9-host.json",
         ):
             self.assertIn(name, cleanup)
         self.assertIn("FROM resource", self.verify)

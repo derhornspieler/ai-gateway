@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Create a separate, deployable generic Rocky 9 Ansible inventory.
+"""Create a separate, deployable production Rocky 9 Ansible inventory.
 
 The helper deliberately never reads an existing vault and never writes a
 plaintext secret file.  It creates a new inventory layout, with the host-vars
 file named exactly for the requested inventory alias, and encrypts each
 required stack secret directly from process memory with ``ansible-vault``.
+The historical ``generic_rocky9`` Ansible group/profile name remains the
+compatibility identifier for production deployments; it is not a lab profile.
+The HashiCorp Vault unseal share is never randomly generated here because it
+does not exist until ``vault operator init`` completes.
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ def fail(message: str) -> NoReturn:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Create a new generic Rocky 9 inventory and encrypted Ansible Vault "
+            "Create a new production Rocky 9 inventory and encrypted Ansible Vault "
             "without a plaintext secret file."
         )
     )
@@ -88,6 +92,14 @@ def load_contract() -> dict[str, Any]:
         or contract.get("schema") != "aigw.generic-rocky9/v1"
         or contract.get("profile") != "generic-rocky9"
         or not isinstance(contract.get("required_secret_keys"), list)
+        or contract.get("operator_supplied_secret_keys")
+        != [
+            {
+                "name": "vault_unseal_key",
+                "source": "hashicorp-vault-operator-init",
+                "generated_by_inventory_bootstrap": False,
+            }
+        ]
     ):
         fail("generic Rocky 9 contract has an invalid schema")
     return contract
@@ -149,15 +161,22 @@ def write_text(path: Path, content: str, mode: int) -> None:
 
 def inventory_document(alias: str) -> str:
     return f"""---
-# Generated generic Rocky 9 inventory. Keep this separate from the committed
-# lab inventory. Its host-specific non-secret values live in host_vars/{alias}.yml.
+# Generated production Rocky 9 inventory. Keep this separate from the
+# committed lab inventory. The generic_rocky9 group name is retained as a
+# backwards-compatible automation selector. Host-specific non-secret values
+# live in host_vars/{alias}.yml.
 all:
   children:
     # Empty selector group: the generic host below is deliberately not a
     # gateway member, so a lab-only Vault cannot be inherited.
     gateway:
       hosts: {{}}
+    # Compatibility selector used by existing playbooks. New automation may
+    # target production_rocky9; generic_rocky9 deliberately includes it.
     generic_rocky9:
+      children:
+        production_rocky9:
+    production_rocky9:
       hosts:
         {alias}:
 """
@@ -165,8 +184,10 @@ all:
 
 def host_vars_document(alias: str) -> str:
     return f"""---
-# Generated generic Rocky 9 host contract. Fill every empty value before the
-# non-mutating preflight; the encrypted Vault is intentionally elsewhere.
+# Generated production Rocky 9 host contract. Fill every empty value before
+# the non-mutating preflight; the encrypted Vault is intentionally elsewhere.
+# deployment_profile=generic-rocky9 is the backwards-compatible production
+# runtime identifier and must not be changed to the lab-only rocky9-lab value.
 aigw_generic_inventory_alias: {alias}
 deployment_profile: generic-rocky9
 
@@ -370,15 +391,43 @@ def main() -> int:
         return 2
 
     vault_reference = f"{args.vault_id}@{args.vault_password_file.expanduser()}"
-    print(f"Created generic Rocky 9 inventory: {inventory_path}")
+    print(f"Created production Rocky 9 inventory: {inventory_path}")
     print(f"Fill non-secret topology in: {host_path}")
     print(f"Created encrypted Vault only: {vault_path}")
-    print("Then run the non-mutating contract gate:")
-    print(
-        "  ansible-playbook"
+    custody_path = vault_path.with_name("vault-unseal.yml")
+    preflight_command = (
+        "ansible-playbook"
         f" -i {inventory_path} ansible/preflight-generic-rocky9.yml"
         f" --limit {args.inventory_alias} --vault-id {vault_reference}"
     )
+    deploy_command = (
+        "ansible-playbook"
+        f" -i {inventory_path} ansible/site.yml"
+        f" --limit {args.inventory_alias} --vault-id {vault_reference}"
+    )
+    print("vault_unseal_key was NOT generated; HashiCorp Vault creates it at first init.")
+    print("\nTWO-PHASE DEPLOYMENT BOUNDARY (the first converge is not completion):")
+    print("1. Fill host-vars, then run the non-mutating contract gate:")
+    print(f"  {preflight_command}")
+    print("2. Run the first converge. A fresh Vault remains uninitialized by design:")
+    print(f"  {deploy_command}")
+    print("3. Complete the reviewed production Vault init/unseal ceremony. The bundled")
+    print("   vault-bootstrap.sh is lab-only and is intentionally NOT invoked here.")
+    print("   On the controller, enter its generated 1-of-1 share without echo:")
+    print("  read -rsp 'Vault unseal share: ' AIGW_UNSEAL_SHARE; printf '\\n'")
+    print(
+        "  printf '%s\\n' \"$AIGW_UNSEAL_SHARE\" | "
+        "python3 scripts/store-vault-unseal-key.py"
+        f" --vault-file {custody_path}"
+        f" --vault-id {args.vault_id}"
+        f" --vault-password-file {args.vault_password_file.expanduser()}"
+    )
+    print("  unset AIGW_UNSEAL_SHARE")
+    print("4. Run the ordinary converge again. It must finish strict readiness with")
+    print("   the controller-owned vault_unseal_key available for future auto-unseal:")
+    print(f"  {deploy_command}")
+    print("5. Only after step 4 succeeds, separately custody or revoke the bootstrap")
+    print("   root token, then securely delete remote secrets/vault-init.json.")
     return 0
 
 

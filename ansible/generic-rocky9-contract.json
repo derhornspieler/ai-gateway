@@ -54,6 +54,13 @@
     {"name": "grafana_admin_password", "min_length": 24, "alphabet": "safe"},
     {"name": "kc_bootstrap_admin_client_secret", "min_length": 32, "alphabet": "safe"}
   ],
+  "operator_supplied_secret_keys": [
+    {
+      "name": "vault_unseal_key",
+      "source": "hashicorp-vault-operator-init",
+      "generated_by_inventory_bootstrap": false
+    }
+  ],
   "lab_only_secret_keys": [
     "samba_ad_admin_password",
     "samba_ad_bind_password",
