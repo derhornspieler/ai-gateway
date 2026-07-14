@@ -657,6 +657,117 @@ class KeycloakAdmin:
             self._verify_realm_roles_mapper(verified, client_id)
         return True
 
+    async def _reconcile_relying_party_redirect_uris(self, admin_token: str) -> bool:
+        """Converge ONLY the domain-derived callback allow-lists of the four
+        managed first-party OIDC clients.
+
+        A domain migration moves only the callback hostnames, so this is
+        deliberately far narrower than :meth:`_ensure_relying_parties`: it
+        rewrites only ``redirectUris`` / ``webOrigins`` (and the RP-initiated
+        logout allow-list where the spec already manages it) and never disturbs
+        confidential client credentials, flow flags, protocol mappers, realm
+        role scope mappings, the durable controller, the WIF broker, Vault, or
+        any client outside ``RELYING_PARTY_CLIENT_IDS``.  Each managed client is
+        fetched fresh, mutated in place, PUT only when it drifts, then read back
+        and verified before the next client.  Set-like URL lists are compared
+        sorted so a harmless Keycloak response reordering is not mistaken for
+        drift and cannot turn this into a churning privileged PUT.
+        """
+
+        realm = self.settings.identity_realm
+        specs = {str(spec["clientId"]): spec for spec in self._relying_party_specs()}
+        changed = False
+        for client_id in RELYING_PARTY_CLIENT_IDS:
+            desired = specs.get(client_id)
+            if desired is None:
+                raise IdentityError(f"missing managed OIDC client spec for {client_id}")
+            found = await self._find_client(realm, client_id, admin_token)
+            if found is None:
+                raise IdentityError(f"OIDC client {client_id} is missing")
+            current = await self._get_client(realm, found, admin_token)
+            desired_redirects = list(desired["redirectUris"])
+            desired_origins = list(desired["webOrigins"])
+            desired_logout = desired["attributes"].get("post.logout.redirect.uris")
+            needs_update = False
+            for field, want in (
+                ("redirectUris", desired_redirects),
+                ("webOrigins", desired_origins),
+            ):
+                have = current.get(field)
+                if not isinstance(have, list) or sorted(have) != sorted(want):
+                    current[field] = want
+                    needs_update = True
+            # Only the two clients whose spec declares an RP-initiated logout
+            # allow-list have that attribute managed here.  Never invent one on
+            # a client that does not use it, and never disturb any other
+            # operator- or Keycloak-owned attribute on the representation.
+            if desired_logout is not None:
+                attributes = dict(current.get("attributes") or {})
+                if attributes.get("post.logout.redirect.uris") != desired_logout:
+                    attributes["post.logout.redirect.uris"] = desired_logout
+                    current["attributes"] = attributes
+                    needs_update = True
+            if needs_update:
+                await self._put_client(realm, current, admin_token)
+                changed = True
+
+            verified = await self._get_client(realm, current, admin_token)
+            if sorted(verified.get("redirectUris") or []) != sorted(
+                desired_redirects
+            ) or sorted(verified.get("webOrigins") or []) != sorted(desired_origins):
+                raise IdentityError(
+                    f"Keycloak did not verify OIDC client {client_id} URLs"
+                )
+            if desired_logout is not None:
+                verified_attributes = verified.get("attributes")
+                if (
+                    not isinstance(verified_attributes, dict)
+                    or verified_attributes.get("post.logout.redirect.uris")
+                    != desired_logout
+                ):
+                    raise IdentityError(
+                        f"Keycloak did not verify OIDC client {client_id} logout URLs"
+                    )
+        return changed
+
+    async def reconcile_prebootstrap_relying_party_redirect_uris(self) -> str:
+        """Realign managed OIDC callbacks to ``aigw_domain`` while bootstrap is
+        still available, or fail closed toward the re-bootstrap ceremony.
+
+        A domain migration on an existing realm leaves every first-party
+        client's ``redirectUris`` / ``webOrigins`` pinned to the old domain,
+        because Keycloak imports realm JSON only into an empty database.
+        Browser SSO then fails with ``Invalid parameter: redirect_uri``.  This
+        repair uses ONLY the already-reviewed temporary master-realm bootstrap
+        client (``aigw-bootstrap-controller``); it grants no standing authority,
+        and the durable post-bootstrap controller keeps no ``manage-clients``
+        role, so it can never perform this from a routine converge.
+
+        Returns one of ``"applied"`` (callbacks were realigned), ``"verified"``
+        (already correct), or ``"rebootstrap_required"``.  The last is the
+        fail-closed outcome for a host whose interactive bootstrap has already
+        consumed the temporary client: this converge then holds no
+        client-management authority, so a later domain change must be repaired
+        by re-running the documented identity bootstrap ceremony rather than
+        silently leaving SSO broken or crashing the converge.  The state is
+        detected, never assumed.
+        """
+
+        if not self.settings.bootstrap_admin_secret_ok():
+            return "rebootstrap_required"
+        try:
+            admin_token = await self._bootstrap_token()
+        except IdentityError:
+            # The temporary master-realm client has been deleted by the
+            # interactive bootstrap ceremony (or Keycloak is transiently
+            # unreachable — the converge waits for Keycloak health first).
+            # Either way this routine converge cannot manage clients; report the
+            # required operator ceremony instead of failing or falsely claiming
+            # success while SSO stays broken.
+            return "rebootstrap_required"
+        changed = await self._reconcile_relying_party_redirect_uris(admin_token)
+        return "applied" if changed else "verified"
+
     @staticmethod
     def _validate_pre_vault_identity_spec(
         spec: dict[str, Any],

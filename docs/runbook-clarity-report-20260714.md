@@ -160,3 +160,28 @@ parallel workstream)**
   must show non-null `node_load1`; `grafana-lgtm-stack` must show a non-zero
   component-up count), derivable from the metric contracts in
   `test_grafana_provisioning_contract.py`.
+
+**12. Post-ceremony domain migration has no break-glass runbook for customer
+profiles. (PARTIAL — automatic repair landed; re-bootstrap path still thin)**
+- *Doc + section:* `identity-operations.md` "Domain migration on an existing
+  realm" (added this pass); `operations.md` OIDC troubleshooting.
+- *What changed:* a converge now reconciles the four managed OIDC clients'
+  `redirectUris`/`webOrigins` to `aigw_domain` automatically **while the
+  bootstrap window is open** (temporary `aigw-bootstrap-controller` still
+  present), via `app.reconcile_oidc_redirect_uris` using only that reviewed
+  credential. This closes the common lab/pre-bootstrap case: after a domain
+  change, re-running the converge restores browser SSO with no manual Keycloak
+  edits.
+- *Remaining gap:* on a host that has already completed the interactive
+  **Initialize identity control** ceremony, the temporary client is gone and the
+  durable controller intentionally holds no `manage-clients` role, so the
+  converge fails closed with
+  `OIDC_REDIRECT_URI_PREBOOTSTRAP_RECONCILIATION_REBOOTSTRAP_REQUIRED` and a note
+  to re-run the ceremony. For the **lab** that is a re-seed + re-init; for a
+  **customer** profile the exact reviewed break-glass sequence to safely
+  recreate `aigw-bootstrap-controller` (or otherwise re-open the bootstrap
+  window) and re-run the ceremony is referenced but not yet written as an
+  operator procedure.
+- *Fix:* a customer break-glass runbook from the identity workstream covering
+  domain migration on an already-bootstrapped host, aligned with the production
+  Vault/PKI ceremony gaps in items 9–10.
