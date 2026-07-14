@@ -25,7 +25,8 @@
     "pbr_tables",
     "require_encrypted_state",
     "require_preupgrade_backup",
-    "platform_authoritative_dns_enabled"
+    "platform_authoritative_dns_enabled",
+    "aigw_vault_ui_enabled"
   ],
   "required_secret_keys": [
     {"name": "pg_super_password", "min_length": 24, "alphabet": "safe"},

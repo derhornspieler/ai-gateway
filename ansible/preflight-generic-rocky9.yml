@@ -193,6 +193,7 @@
         that:
           - deployment_profile | default('') == aigw_generic_rocky9_contract.profile
           - aigw_generic_inventory_alias | default('') == inventory_hostname
+          - aigw_vault_ui_enabled is boolean
           - aigw_generic_host_vars_file.stat.exists | default(false)
           - aigw_generic_host_vars_file.stat.isreg | default(false)
           - not (aigw_generic_host_vars_file.stat.islnk | default(false))

@@ -4,6 +4,9 @@
 # profile and encryption exception intentionally live in the inventory entry
 # so stack-only runs do not depend on host_vars discovery.
 aigw_domain: aigw.internal
+# Greenfield lab convenience: expose the separately OIDC-gated Vault UI on
+# the ADM plane. Generic/customer inventories remain default-deny.
+aigw_vault_ui_enabled: true
 # Lab-only greenfield convenience. Generic/customer inventories inherit the
 # key-only default from group_vars and must opt in deliberately if required.
 aigw_ssh_password_authentication: true

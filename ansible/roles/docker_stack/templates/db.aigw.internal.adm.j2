@@ -13,7 +13,9 @@ admin-portal IN A {{ eth1_ip }}
 litellm-admin IN A {{ eth1_ip }}
 grafana      IN A {{ eth1_ip }}
 prometheus   IN A {{ eth1_ip }}
+{% if aigw_vault_ui_enabled | bool %}
 vault        IN A {{ eth1_ip }}
+{% endif %}
 auth         IN A {{ eth1_ip }}
 chat         IN A {{ eth1_ip }}
 api          IN A {{ eth2_ip }}

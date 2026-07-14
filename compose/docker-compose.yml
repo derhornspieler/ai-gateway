@@ -180,6 +180,9 @@ services:
         limits: { memory: 512M, cpus: "1.0", pids: 512 }
     environment:
       DOMAIN: ${DOMAIN:?DOMAIN must be set}
+      # The file-provider template removes the Vault router and backend when
+      # Ansible keeps the optional browser surface disabled.
+      VAULT_UI_ENABLED: ${VAULT_UI_ENABLED:-false}
     ports:
       - "${ETH1_IP:?ETH1_IP must be set}:443:443"
     volumes:
@@ -396,6 +399,7 @@ services:
 
   oauth2-proxy-vault:
     <<: *hardening
+    profiles: [vault-ui]
     build:
       context: ./services/dhi-health-probe
       network: none
@@ -888,6 +892,7 @@ services:
 
   vault-ui-proxy:
     <<: *hardening
+    profiles: [vault-ui]
     # The runtime reuses the same reviewed DHI Vault base but directly launches
     # only a static Go proxy plus the reviewed Vault 2.0.3 UI assets. Startup
     # asserts that the base's UI-less Vault binary is dormant. The Dockerfile

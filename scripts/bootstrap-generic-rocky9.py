@@ -210,6 +210,10 @@ internal_dns_servers: []
 egress_dns_servers: []
 platform_authoritative_dns_enabled: false
 
+# Optional ADM-only Vault browser surface. The internal Vault API remains
+# deployed for platform consumers when this stays false.
+aigw_vault_ui_enabled: false
+
 # Source-policy routes are enabled for the ADM and internal interfaces.
 manage_networking: true
 pbr_tables: []

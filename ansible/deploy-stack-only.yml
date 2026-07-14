@@ -17,10 +17,11 @@
             (aigw_domain | default('')) is match(
               '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
             )
+          - aigw_vault_ui_enabled is boolean
         quiet: true
         fail_msg: >-
           Refusing stack-only mutation: aigw_domain must be a bounded canonical
-          lowercase FQDN.
+          lowercase FQDN and aigw_vault_ui_enabled must be a real boolean.
       no_log: true
 
     # Stack-only is deliberately unable to create/adopt a Docker host. Require

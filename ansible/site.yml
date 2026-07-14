@@ -73,6 +73,7 @@
           - egress_dns_servers | select('match', '^(127|169\\.254|22[4-9]|23[0-9])\\.') | list | length == 0
           - internal_dns_servers | intersect(egress_dns_servers) | length == 0
           - platform_authoritative_dns_enabled is boolean
+          - aigw_vault_ui_enabled is boolean
           - >-
             not (platform_authoritative_dns_enabled | bool) or
             (internal_dns_servers | sort == [eth1_ip, eth2_ip] | sort)

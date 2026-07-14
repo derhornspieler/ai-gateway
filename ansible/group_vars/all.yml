@@ -222,6 +222,11 @@ manage_firewalld: true       # zones + DOCKER-USER
 # in explicitly when clients should point their ADM/internal interfaces at the
 # corresponding gateway address.
 platform_authoritative_dns_enabled: "{{ deployment_profile == 'rocky9-lab' }}"
+# The Vault API remains an internal control-plane dependency regardless of
+# this flag. Only the browser-facing ADM UI and its OIDC proxy are optional;
+# generic/customer deployments keep that additional operator surface closed
+# unless an environment inventory explicitly enables it.
+aigw_vault_ui_enabled: false
 
 # ── Stack ───────────────────────────────────────────────────────────────
 stack_dir: /opt/ai-gateway

@@ -721,6 +721,14 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         )[0]
         self.assertIn('"admin-portal.{{ aigw_domain }}"', negative)
         self.assertIn('"litellm-admin.{{ aigw_domain }}"', negative)
+        self.assertIn(
+            '{ name: "vault.{{ aigw_domain }}", transport: +notcp }',
+            negative,
+        )
+        self.assertIn(
+            '{ name: "vault.{{ aigw_domain }}", transport: +tcp }',
+            negative,
+        )
         self.assertIn("status: NXDOMAIN", negative)
 
         adm = self.verify.split(

@@ -8,7 +8,8 @@
          + (['docker-compose.lab.yml']
             if (samba_lab_enabled | bool) else []) }}
     aigw_compose_profiles: >-
-      {{ ['lab-ad'] if (samba_lab_enabled | bool) else [] }}
+      {{ (['lab-ad'] if (samba_lab_enabled | bool) else [])
+         + (['vault-ui'] if (aigw_vault_ui_enabled | bool) else []) }}
     aigw_compose_cli_overlay_args: >-
       {{ ['--file', 'docker-compose.yml', '--file', 'docker-compose.dns.yml']
          + (['--file', 'docker-compose.platform-dns.yml']
@@ -16,7 +17,9 @@
          + (['--file', 'docker-compose.lab.yml']
             if (samba_lab_enabled | bool) else [])
          + (['--profile', 'lab-ad']
-            if (samba_lab_enabled | bool) else []) }}
+            if (samba_lab_enabled | bool) else [])
+         + (['--profile', 'vault-ui']
+            if (aigw_vault_ui_enabled | bool) else []) }}
 
 - name: Validate fixed edge IP / trusted-proxy network ABI
   ansible.builtin.assert:
@@ -1561,6 +1564,139 @@
   changed_when: false
   when: require_preupgrade_backup | bool
 
+# Explicitly targeting a profiled Compose service activates it, so a stale
+# container can survive a profile transition. Never trust its predictable
+# name alone: prove the full Compose ownership tuple before removing exactly
+# the two UI containers. Vault, its volumes, images, and API consumers remain
+# untouched.
+- name: Inspect stale Vault browser-surface containers when disabled
+  community.docker.docker_container_info:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
+    name: "{{ compose_project_name }}-{{ item }}-1"
+  loop:
+    - oauth2-proxy-vault
+    - vault-ui-proxy
+  register: aigw_disabled_vault_ui_inventory
+  when: not (aigw_vault_ui_enabled | bool)
+
+- name: Require the full Compose ownership tuple before stale UI removal
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.exists or
+        (item.container.Id is match('^[0-9a-f]{64}$') and
+         item.container.Name == ('/' ~ compose_project_name ~ '-' ~ item.item ~ '-1') and
+         item.container.Config.Labels.get('com.docker.compose.project', '') == compose_project_name and
+         item.container.Config.Labels.get('com.docker.compose.project.working_dir', '') == stack_dir and
+         item.container.Config.Labels.get('com.docker.compose.service', '') == item.item and
+         item.container.Config.Labels.get('com.docker.compose.oneoff', '') == 'False' and
+         item.container.Config.Labels.get('com.docker.compose.container-number', '') == '1' and
+         item.container.Config.Labels.get('com.docker.compose.config-hash', '') is match('^[0-9a-f]{64}$'))
+    quiet: true
+    fail_msg: >-
+      Refusing to remove a predictable Vault UI container name without the
+      complete AI Gateway Compose ownership tuple.
+  loop: "{{ aigw_disabled_vault_ui_inventory.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when: not (aigw_vault_ui_enabled | bool)
+
+- name: Detect an enabled-to-disabled Vault browser-surface transition
+  ansible.builtin.set_fact:
+    aigw_vault_ui_transitioning_off: >-
+      {{ (aigw_disabled_vault_ui_inventory.results | default([]) |
+          selectattr('exists', 'equalto', true) | list | length) > 0 }}
+  when: not (aigw_vault_ui_enabled | bool)
+
+# Remove the edge route before its backend. Recreating the single ADM edge
+# loads both the disabled environment selector and the freshly-rendered
+# dynamic config, while explicitly emptying ambient profiles prevents this
+# targeted service operation from reactivating either optional UI service.
+- name: Reconcile the ADM edge before removing stale Vault UI backends
+  community.docker.docker_compose_v2:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
+    project_src: "{{ stack_dir }}"
+    project_name: "{{ compose_project_name }}"
+    files: "{{ aigw_compose_files }}"
+    profiles: "{{ aigw_compose_profiles }}"
+    services: [traefik-adm]
+    dependencies: false
+    state: present
+    build: never
+    wait: true
+    wait_timeout: 600
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
+  when:
+    - not (aigw_vault_ui_enabled | bool)
+    - aigw_vault_ui_transitioning_off | default(false) | bool
+  no_log: true
+
+- name: Prove the disabled Vault host has no router before backend removal
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import socket
+        import ssl
+        import sys
+
+        ca_file, address, hostname = sys.argv[1:]
+        context = ssl.create_default_context(cafile=ca_file)
+        with socket.create_connection((address, 443), timeout=5) as plain:
+            with context.wrap_socket(plain, server_hostname=hostname) as tls:
+                tls.sendall((
+                    f"GET / HTTP/1.1\r\nHost: {hostname}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii"))
+                response = bytearray()
+                while b"\r\n" not in response and len(response) <= 4096:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+        status_line = bytes(response).split(b"\r\n", 1)[0].decode("ascii", "strict")
+        fields = status_line.split()
+        if len(fields) < 2 or fields[1] != "404":
+            raise SystemExit(f"Vault route remained active: {status_line!r}")
+        print("404")
+      - "{{ stack_dir }}/certs/ca.pem"
+      - "{{ traefik_adm_admin_ip }}"
+      - "vault.{{ aigw_domain }}"
+  register: aigw_disabled_vault_ui_route_probe
+  changed_when: false
+  retries: 30
+  delay: 1
+  until: aigw_disabled_vault_ui_route_probe.rc == 0
+  when:
+    - not (aigw_vault_ui_enabled | bool)
+    - aigw_vault_ui_transitioning_off | default(false) | bool
+
+- name: Remove verified stale Vault browser-surface containers when disabled
+  community.docker.docker_container:
+    docker_host: unix:///run/docker.sock
+    tls: false
+    validate_certs: false
+    # Address the exact inspected object, not a reusable predictable name. If
+    # another Docker-root actor replaces it after validation, this removal is
+    # harmless and the later absence proof fails closed on the replacement.
+    name: "{{ item.container.Id }}"
+    state: absent
+    keep_volumes: true
+  loop: "{{ aigw_disabled_vault_ui_inventory.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when:
+    - not (aigw_vault_ui_enabled | bool)
+    - item.exists | default(false)
+
 - name: Read the effective Compose service set
   ansible.builtin.command:
     argv: >-
@@ -1571,6 +1707,9 @@
       }}
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: effective_compose_services
   changed_when: false
 
@@ -1584,6 +1723,9 @@
       }}
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: desired_volume_init_hash
   changed_when: false
 
@@ -1678,6 +1820,9 @@
     dependencies: false
     state: present
     build: never
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   when: >-
     not existing_volume_init.exists or
     existing_volume_init.container.State.Status != 'exited' or
@@ -1767,6 +1912,9 @@
     dependencies: false
     state: present
     build: policy
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   no_log: true
 
 - name: Wait for PostgreSQL local-socket readiness
@@ -1786,6 +1934,9 @@
       - postgres
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: postgres_ready
   changed_when: false
   retries: 30
@@ -1809,6 +1960,9 @@
       - /docker-entrypoint-initdb.d/01-init-databases.sh
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: postgres_reconcile
   changed_when: "'AIGW_POSTGRES_CHANGED' in postgres_reconcile.stdout"
   no_log: true
@@ -1862,6 +2016,9 @@
             OR member_role.rolname IN ('keycloak','litellm','rotator');
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: postgres_connect_matrix
   changed_when: false
 
@@ -1941,6 +2098,9 @@
       }}
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: effective_compose_model
   changed_when: false
   no_log: true
@@ -1982,13 +2142,14 @@
           'traefik-int', 'traefik-adm', 'alloy', 'cribl-mock'
         ] | to_json }}
       - >-
-        {{ [
+        {{ ([
           'oauth2-proxy', 'oauth2-proxy-grafana',
-          'oauth2-proxy-prometheus', 'oauth2-proxy-vault', 'litellm',
+          'oauth2-proxy-prometheus', 'litellm',
           'open-webui', 'keycloak', 'dev-portal', 'admin-portal',
-          'key-rotator', 'vault', 'vault-ui-proxy', 'postgres', 'redis',
+          'key-rotator', 'vault', 'postgres', 'redis',
           'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana'
-        ] | to_json }}
+        ] + (['oauth2-proxy-vault', 'vault-ui-proxy']
+             if (aigw_vault_ui_enabled | bool) else [])) | to_json }}
     stdin: "{{ effective_compose_model.stdout }}"
     stdin_add_newline: false
   changed_when: false
@@ -2079,6 +2240,9 @@
       }}
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   when: compose_build_plan.services | length > 0
   no_log: true
 
@@ -2176,6 +2340,9 @@
     # recreating/resealing Vault as a side effect of unrelated build contexts.
     build: never
     remove_orphans: true
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   no_log: true
 
 # A successful image build alone is not proof that its service ever deployed.
@@ -2271,6 +2438,7 @@
   until: >-
     vault_ui_proxy_startup.exists and
     (vault_ui_proxy_startup.container.State.Running | bool)
+  when: aigw_vault_ui_enabled | bool
 
 - name: Vault UI proxy directly replaces the dormant DHI Vault entrypoint
   ansible.builtin.assert:
@@ -2283,6 +2451,7 @@
     fail_msg: >-
       The Vault UI companion must run the reviewed proxy directly as uid 1000;
       the DHI base Vault binary and its tini entrypoint must remain dormant.
+  when: aigw_vault_ui_enabled | bool
 
 - name: Read the effective Vault UI proxy identity and executable
   ansible.builtin.shell:
@@ -2293,6 +2462,7 @@
     executable: /bin/bash
   register: vault_ui_proxy_process_security
   changed_when: false
+  when: aigw_vault_ui_enabled | bool
 
 - name: Vault UI proxy is the non-root capability-free PID 1 executable
   ansible.builtin.assert:
@@ -2307,6 +2477,7 @@
     fail_msg: >-
       The Vault UI proxy must be the direct uid-1000 executable with no Linux
       capabilities and no-new-privileges enabled.
+  when: aigw_vault_ui_enabled | bool
 
 - name: Prove the Vault UI proxy serves the reviewed UI and reaches only Vault
   ansible.builtin.command:
@@ -2325,6 +2496,7 @@
   retries: 42
   delay: 5
   until: vault_ui_proxy_contract.rc == 0
+  when: aigw_vault_ui_enabled | bool
 
 - name: Inspect DHI Alloy after Compose start
   community.docker.docker_container_info:
@@ -2424,6 +2596,9 @@
       - http://127.0.0.1:8200/v1/sys/health?standbyok=true
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: vault_strict_readiness
   changed_when: false
   failed_when: false
@@ -2472,6 +2647,9 @@
       - -format=json
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: vault_public_status
   changed_when: false
   failed_when: vault_public_status.rc not in [0, 2]
@@ -2493,6 +2671,9 @@
         urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3).read()
   args:
     chdir: "{{ stack_dir }}"
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: key_rotator_strict_readiness
   changed_when: false
   failed_when: false
@@ -2633,6 +2814,9 @@
     build: never
     wait: true
     wait_timeout: 600
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   when:
     - aigw_pre_vault_identity_baseline_reconciliation | bool
     - not (aigw_pre_vault_identity_baseline_receipt.stat.exists | default(false))
@@ -2751,6 +2935,9 @@
     # Compose health window; a slow but healthy initial Keycloak migration
     # must not be misclassified as an OIDC-repair failure.
     wait_timeout: 600
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   when:
     - aigw_prebootstrap_oidc_scope_reconciliation | bool
     - vault_strict_readiness.rc == 0
@@ -2810,6 +2997,9 @@
     # margin so a healthy clean-Rocky deployment is not failed by Compose
     # before the service's own reviewed health window has elapsed.
     wait_timeout: 600
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   when: vault_strict_readiness.rc == 0
   no_log: true
 
@@ -2822,19 +3012,13 @@
     project_name: "{{ compose_project_name }}"
     files: "{{ aigw_compose_files }}"
     profiles: "{{ aigw_compose_profiles }}"
-    services:
-      - postgres
-      - redis
-      - envoy-egress
-      - keycloak
-      - litellm
-      - dev-portal
-      - open-webui
-      - vault-ui-proxy
-      - prometheus
-      - grafana
-      - traefik-int
-      - traefik-adm
+    services: >-
+      {{ [
+           'postgres', 'redis', 'envoy-egress', 'keycloak', 'litellm',
+           'dev-portal', 'open-webui'
+         ]
+         + (['vault-ui-proxy'] if (aigw_vault_ui_enabled | bool) else [])
+         + ['prometheus', 'grafana', 'traefik-int', 'traefik-adm'] }}
     dependencies: false
     state: present
     build: never
@@ -2842,6 +3026,9 @@
     # Keep the fresh-bootstrap core gate aligned with the full-stack wait:
     # Open WebUI's reviewed readiness window can reach 450 seconds.
     wait_timeout: 600
+  environment:
+    COMPOSE_PROFILES: ""
+    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   when: vault_strict_readiness.rc != 0
   no_log: true
 

@@ -740,6 +740,8 @@ assert direct_pins.items() <= locked.items(), (direct_pins, locked)
 PY
 
 env \
+  COMPOSE_PROFILES=vault-ui \
+  VAULT_UI_ENABLED=true \
   DOMAIN=aigw.internal \
   DOCKER_DATA_ROOT="$docker_data_root" \
   ETH1_IP=10.8.10.10 \
@@ -806,6 +808,31 @@ env \
   CRIBL_OTLP_SERVER_NAME=cribl-mock \
   sh -eu -c '
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config -q
+    base_services="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --services)"
+    vault_hash_enabled="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash vault)"
+    vault_volumes_enabled="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
+      python3 -I -c '\''import json,sys; config=json.load(sys.stdin); print(json.dumps({name: config["volumes"][name] for name in ("vault_data", "vault_audit")}, sort_keys=True, separators=(",", ":")))'\'')"
+    disabled_services="$(COMPOSE_PROFILES= VAULT_UI_ENABLED=false docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --services)"
+    vault_hash_disabled="$(COMPOSE_PROFILES= VAULT_UI_ENABLED=false docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash vault)"
+    vault_volumes_disabled="$(COMPOSE_PROFILES= VAULT_UI_ENABLED=false docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
+      python3 -I -c '\''import json,sys; config=json.load(sys.stdin); print(json.dumps({name: config["volumes"][name] for name in ("vault_data", "vault_audit")}, sort_keys=True, separators=(",", ":")))'\'')"
+    test "$vault_hash_enabled" = "$vault_hash_disabled"
+    test "$vault_volumes_enabled" = "$vault_volumes_disabled"
+    COMPOSE_PROFILES= VAULT_UI_ENABLED=false docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
+      python3 -I -c '\''
+import json
+import sys
+base = set(sys.argv[1].splitlines())
+disabled = set(sys.argv[2].splitlines())
+model = json.load(sys.stdin)["services"]
+assert base - disabled == {"oauth2-proxy-vault", "vault-ui-proxy"}
+assert not disabled - base
+assert "vault" in disabled
+assert "vault" in model
+assert "oauth2-proxy-vault" not in model
+assert "vault-ui-proxy" not in model
+assert model["traefik-adm"]["environment"]["VAULT_UI_ENABLED"] == "false"
+'\'' "$base_services" "$disabled_services"
     redis_hash_before="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash redis)"
     vault_hash_before="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash vault)"
     initializer_hash_before="$(docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --hash volume-init)"
@@ -849,6 +876,7 @@ assert litellm_admin_proxy["OAUTH2_PROXY_UPSTREAMS"] == "http://litellm:4000"
 internal_edge = services["traefik-int"]
 assert "net-int-edge" in internal_edge["networks"]
 assert [name for name, service in services.items() if "net-int-edge" in service.get("networks", {})] == ["traefik-int"]
+assert services["traefik-adm"]["environment"]["VAULT_UI_ENABLED"] == "true"
 assert services["keycloak"]["user"] == "65532:65532"
 assert "net-grafana" not in services["keycloak"]["networks"]
 vault = services["vault"]
@@ -1134,7 +1162,7 @@ assert set(portal["networks"]) == {"net-portal", "net-telemetry"}
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
       python3 -I "$1/scripts/validate-build-contract.py" "$1" base
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
-      -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad config --format json |
+      -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad --profile vault-ui config --format json |
       python3 -I -c '\''
 import json
 import os
@@ -1311,7 +1339,7 @@ for name, service in config["services"].items():
     assert service["healthcheck"]["test"][0] == "CMD", name
 '\'' "$2/bind-source-digest-inputs.json" "$1"
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
-      -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad config --format json |
+      -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad --profile vault-ui config --format json |
       python3 -I "$1/scripts/validate-build-contract.py" "$1" lab
   ' sh "$ROOT" "$COMPOSE_DIR"
 

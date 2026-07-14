@@ -102,6 +102,7 @@ class GenericRocky9ContractTests(unittest.TestCase):
             "deployment_profile: generic-rocky9",
             "require_encrypted_state: true",
             "require_preupgrade_backup: true",
+            "aigw_vault_ui_enabled: false",
             "aigw_ssh_password_authentication: false",
             "aigw_adm_socks_enabled: false",
         ):
@@ -243,6 +244,7 @@ print("          0123456789abcdef")
             self.assertIn("aigw_generic_inventory_alias: customer-aigw01", host_text)
             self.assertIn("deployment_profile: generic-rocky9", host_text)
             self.assertIn("require_encrypted_state: true", host_text)
+            self.assertIn("aigw_vault_ui_enabled: false", host_text)
             self.assertIn("Mode A -- use existing corporate DNS", host_text)
             self.assertIn("Mode B -- let this gateway answer only its own aigw_domain", host_text)
             self.assertIn(
@@ -421,6 +423,7 @@ retain_bootstrap_admin_user: false
 aigw_prebootstrap_oidc_scope_reconciliation: false
 aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
 platform_authoritative_dns_enabled: false
+aigw_vault_ui_enabled: false
 aigw_lab_reset_handoff_drop_interfaces: []
 """,
                 encoding="utf-8",
@@ -480,6 +483,7 @@ retain_bootstrap_admin_user: false
 aigw_prebootstrap_oidc_scope_reconciliation: false
 aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
 platform_authoritative_dns_enabled: false
+aigw_vault_ui_enabled: false
 aigw_lab_reset_handoff_drop_interfaces: []
 """,
                     encoding="utf-8",

@@ -453,13 +453,14 @@
           ([
             'traefik-int', 'traefik-adm', 'oauth2-proxy',
             'oauth2-proxy-grafana', 'oauth2-proxy-prometheus',
-            'oauth2-proxy-vault', 'vault-ui-proxy',
             'litellm', 'open-webui', 'keycloak',
             'dev-portal', 'admin-portal',
             'envoy-egress', 'key-rotator', 'vault', 'postgres', 'redis',
             'alloy', 'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana',
             'cribl-mock'
           ]
+          + (['oauth2-proxy-vault', 'vault-ui-proxy']
+             if (aigw_vault_ui_enabled | bool) else [])
           + (['lab-dns'] if (platform_authoritative_dns_enabled | bool) else [])
           + (['samba-ad'] if (samba_lab_enabled | bool) else []))
           | to_json
@@ -479,6 +480,26 @@
   retries: 24
   delay: 5
   until: selinux_runtime_contract.rc == 0
+
+- name: Prove disabled Vault browser-surface containers are absent, not stopped
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - ps
+      - -aq
+      - --filter
+      - "label=com.docker.compose.project={{ compose_project_name }}"
+      - --filter
+      - "label=com.docker.compose.service={{ item }}"
+  loop:
+    - oauth2-proxy-vault
+    - vault-ui-proxy
+  register: disabled_vault_ui_containers
+  changed_when: false
+  failed_when: disabled_vault_ui_containers.stdout | trim | length > 0
+  when: not (aigw_vault_ui_enabled | bool)
 
 - name: Read Docker runtime-root SELinux types without relabeling them
   ansible.builtin.command:
@@ -931,13 +952,16 @@
       - >-
         {{ ['traefik-int', 'traefik-adm', 'alloy', 'cribl-mock'] | to_json }}
       - >-
-        {{ [
-          'oauth2-proxy', 'oauth2-proxy-grafana',
-          'oauth2-proxy-prometheus', 'oauth2-proxy-vault', 'litellm',
-          'open-webui', 'keycloak', 'dev-portal', 'admin-portal',
-          'key-rotator', 'vault', 'vault-ui-proxy', 'postgres', 'redis',
-          'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana'
-        ] | to_json }}
+        {{ (
+          [
+            'oauth2-proxy', 'oauth2-proxy-grafana',
+            'oauth2-proxy-prometheus', 'litellm', 'open-webui', 'keycloak',
+            'dev-portal', 'admin-portal', 'key-rotator', 'vault', 'postgres',
+            'redis', 'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana'
+          ]
+          + (['oauth2-proxy-vault', 'vault-ui-proxy']
+             if (aigw_vault_ui_enabled | bool) else [])
+        ) | to_json }}
   changed_when: false
 
 - name: Preserve embedded service discovery for an upstream-DNS-isolated backend
@@ -1036,6 +1060,7 @@
     - { name: "grafana.{{ aigw_domain }}", transport: +notcp }
     - { name: "prometheus.{{ aigw_domain }}", transport: +tcp }
     - { name: "vault.{{ aigw_domain }}", transport: +notcp }
+    - { name: "vault.{{ aigw_domain }}", transport: +tcp }
   register: lab_dns_restricted_negative_queries
   changed_when: false
   failed_when: >-
@@ -1084,7 +1109,6 @@
     - { name: "litellm-admin.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
     - { name: "grafana.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
     - { name: "prometheus.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
-    - { name: "vault.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
     - { name: "chat.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
     - { name: "api.{{ aigw_domain }}", expected: "{{ eth2_ip }}", transport: +tcp }
     - { name: "portal.{{ aigw_domain }}", expected: "{{ eth2_ip }}", transport: +notcp }
@@ -1096,6 +1120,57 @@
     lab_dns_adm_queries.rc != 0 or
     lab_dns_adm_queries.stdout | trim != item.expected
   when: platform_authoritative_dns_enabled | bool
+
+- name: Verify enabled Vault UI is published in the ADM DNS view
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - "@{{ eth1_ip }}"
+      - "vault.{{ aigw_domain }}"
+      - A
+      - +short
+      - "{{ '+tcp' if item == 'tcp' else '+notcp' }}"
+      - +time=5
+      - +tries=1
+  register: lab_dns_vault_ui_enabled
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: >-
+    lab_dns_vault_ui_enabled.rc != 0 or
+    lab_dns_vault_ui_enabled.stdout | trim != eth1_ip
+  loop: [udp, tcp]
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - platform_authoritative_dns_enabled | bool
+    - aigw_vault_ui_enabled | bool
+
+- name: Verify disabled Vault UI is absent from the ADM DNS view
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - "@{{ eth1_ip }}"
+      - "vault.{{ aigw_domain }}"
+      - A
+      - +noall
+      - +comments
+      - "{{ '+tcp' if item == 'tcp' else '+notcp' }}"
+      - +time=5
+      - +tries=1
+  register: lab_dns_vault_ui_disabled
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: >-
+    lab_dns_vault_ui_disabled.rc != 0 or
+    'status: NXDOMAIN' not in lab_dns_vault_ui_disabled.stdout
+  loop: [udp, tcp]
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - platform_authoritative_dns_enabled | bool
+    - not (aigw_vault_ui_enabled | bool)
 
 - name: Prove the ADM DNS listener cannot recurse public names
   ansible.builtin.command:
@@ -1326,7 +1401,9 @@
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /redoc, status: "403" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "grafana.{{ aigw_domain }}", path: /, status: "302" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "prometheus.{{ aigw_domain }}", path: /, status: "302" }
-    - { address: "{{ traefik_adm_admin_ip }}", hostname: "vault.{{ aigw_domain }}", path: /, status: "302" }
+    # A disabled UI must have no matching router (Traefik 404), not a dangling
+    # backend that leaks its former hostname through a 502 response.
+    - { address: "{{ traefik_adm_admin_ip }}", hostname: "vault.{{ aigw_domain }}", path: /, status: "{{ '302' if (aigw_vault_ui_enabled | bool) else '404' }}" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "auth.{{ aigw_domain }}", path: /admin/, status: "302" }
   loop_control:
     label: "{{ item.hostname }}{{ item.path }} -> {{ item.status }}"

@@ -74,7 +74,7 @@ class DnsPlaneContractTests(unittest.TestCase):
         self.assertNotIn("regex_replace", selector)
         self.assertNotIn("\\\\1", selector)
 
-    def test_compose_file_env_value_cannot_trim_into_compose_profiles(self) -> None:
+    def test_env_never_persists_an_implicit_compose_profile(self) -> None:
         compose_file_lines = [
             line for line in self.env_template.splitlines()
             if line.startswith("COMPOSE_FILE=")
@@ -84,7 +84,11 @@ class DnsPlaneContractTests(unittest.TestCase):
             ["COMPOSE_FILE={{ aigw_env_compose_files | join(':') }}"],
         )
         self.assertNotIn("{%", compose_file_lines[0])
-        self.assertIn("\nCOMPOSE_PROFILES=lab-ad\n", self.env_template)
+        self.assertNotIn("COMPOSE_PROFILES=", self.env_template)
+        self.assertNotIn("aigw_env_compose_profiles", self.env_template)
+        self.assertIn("COMPOSE_FILE COMPOSE_PROFILES", (
+            ROOT / "scripts/aigw-compose.sh"
+        ).read_text())
 
     def test_resolver_inputs_are_bounded_unique_and_disjoint(self) -> None:
         for contract in (
