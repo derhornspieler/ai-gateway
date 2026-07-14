@@ -291,6 +291,31 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         )[0]
         self.assertNotIn("/state/grafana/plugins", volume_init)
 
+    def test_runtime_plugin_tmpfs_contract_is_engine_normalization_neutral(self) -> None:
+        """Compose v5 / Engine 29 echo the reviewed tmpfs option string
+        verbatim, while older Engines normalized an implicit "rw" token into
+        HostConfig.Tmpfs. The runtime verifier must therefore require every
+        security-bearing plugin tmpfs option plus the absence of "ro" (which
+        proves writability on both renderings) and must never require an
+        Engine-normalized "rw" literal."""
+        plugin_contract = self.verify.split("required_plugin_options = {", 1)[1].split(
+            "hardened ephemeral plugin tmpfs contract is missing", 1
+        )[0]
+        for required in (
+            '"noexec",',
+            '"nosuid",',
+            '"nodev",',
+            '"uid=65532",',
+            '"gid=65532",',
+            '"mode=0700",',
+            'or "ro" in plugin_options',
+        ):
+            self.assertIn(required, plugin_contract)
+        self.assertNotIn('"rw"', plugin_contract)
+        # No runtime assertion in the verify role may require a literal
+        # normalized "rw" set element again.
+        self.assertNotIn('"rw",', self.verify)
+
 
 if __name__ == "__main__":
     unittest.main()

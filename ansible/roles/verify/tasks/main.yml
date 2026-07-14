@@ -407,7 +407,14 @@
                     raise SystemExit("open-webui: read-only root filesystem is required")
                 tmpfs = host.get("Tmpfs") or {}
                 tmpfs_options = set((tmpfs.get("/tmp") or "").split(","))
-                if not {"rw", "noexec", "nosuid", "nodev", "mode=1777", "size=256m"} <= tmpfs_options:
+                # Same tmpfs writability contract as grafana below: require
+                # every security-bearing option and prove writability by the
+                # absence of "ro" rather than a literal "rw" token, which an
+                # Engine may or may not normalize into inspect metadata.
+                if (
+                    not {"noexec", "nosuid", "nodev", "mode=1777", "size=256m"} <= tmpfs_options
+                    or "ro" in tmpfs_options
+                ):
                     raise SystemExit("open-webui: bounded hardened /tmp tmpfs contract is missing")
                 mounts = normalized_container_mounts(container)
                 if mounts is None:
@@ -445,8 +452,13 @@
                 plugin_options = set(
                     (tmpfs.get("/var/lib/grafana/plugins") or "").split(",")
                 )
+                # A tmpfs is read-write unless "ro" is present. Compose v5 /
+                # Engine 29 echo the reviewed option string verbatim, while
+                # older engines normalized an implicit "rw" token into
+                # inspect metadata. Require every security-bearing option
+                # and prove writability by the absence of "ro"; tolerate a
+                # normalized "rw" token so both renderings verify.
                 required_plugin_options = {
-                    "rw",
                     "noexec",
                     "nosuid",
                     "nodev",
@@ -454,7 +466,10 @@
                     "gid=65532",
                     "mode=0700",
                 }
-                if not required_plugin_options <= plugin_options:
+                if (
+                    not required_plugin_options <= plugin_options
+                    or "ro" in plugin_options
+                ):
                     raise SystemExit(
                         "grafana: hardened ephemeral plugin tmpfs contract is missing"
                     )

@@ -80,6 +80,11 @@ class SelinuxContractTests(unittest.TestCase):
             '"open-webui": "65532"',
             'host.get("ReadonlyRootfs") is not True',
             'tmpfs.get("/tmp")',
+            # The /tmp writability proof must be Engine-normalization
+            # neutral: require the security-bearing options and the absence
+            # of "ro" instead of a literal Engine-normalized "rw" token.
+            'not {"noexec", "nosuid", "nodev", "mode=1777", "size=256m"} <= tmpfs_options',
+            'or "ro" in tmpfs_options',
             '"/app/backend/data"',
             '"PYTHONNOUSERSITE": "1"',
             '"STATIC_DIR": "/tmp/static"',
