@@ -16,12 +16,12 @@ import urllib.request
 from html.parser import HTMLParser
 
 
-PORTAL_ORIGIN = "https://portal.aigw.internal"
-ADMIN_PORTAL_ORIGIN = "https://admin.aigw.internal"
-AUTH_HOST = "auth.aigw.internal"
-PORTAL_ALLOWED_HOSTS = frozenset({"portal.aigw.internal", AUTH_HOST})
+PORTAL_ORIGIN = "https://portal.aigw.aegisgroup.ch"
+ADMIN_PORTAL_ORIGIN = "https://admin.aigw.aegisgroup.ch"
+AUTH_HOST = "auth.aigw.aegisgroup.ch"
+PORTAL_ALLOWED_HOSTS = frozenset({"portal.aigw.aegisgroup.ch", AUTH_HOST})
 ADMIN_PORTAL_ALLOWED_HOSTS = frozenset(
-    {"admin.aigw.internal", AUTH_HOST}
+    {"admin.aigw.aegisgroup.ch", AUTH_HOST}
 )
 REVIEWED_HOST_SETS = frozenset(
     {PORTAL_ALLOWED_HOSTS, ADMIN_PORTAL_ALLOWED_HOSTS}
@@ -159,7 +159,7 @@ def identity_flow(portal_opener, admin_opener, password: str) -> None:
         allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
+    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
         raise RuntimeError("ordinary admin OIDC login did not reach /admin")
     print("ADMIN_PORTAL_OIDC_LOGIN_PASS")
 
@@ -170,7 +170,7 @@ def identity_flow(portal_opener, admin_opener, password: str) -> None:
         allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
+    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
         raise RuntimeError("forced OIDC reauthentication did not return to /admin")
     print("PORTAL_FORCED_REAUTH_PASS")
 
@@ -195,7 +195,7 @@ def identity_flow(portal_opener, admin_opener, password: str) -> None:
         allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
+    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
         raise RuntimeError("INITIALIZE did not return to the admin portal")
     if "Keycloak identity setup completed." not in html:
         raise RuntimeError("portal did not report successful identity setup")
@@ -210,7 +210,7 @@ def identity_flow(portal_opener, admin_opener, password: str) -> None:
         allowed_hosts=PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "portal.aigw.internal" or parsed.path != "/":
+    if parsed.hostname != "portal.aigw.aegisgroup.ch" or parsed.path != "/":
         raise RuntimeError("ordinary OIDC login did not reach the portal home page")
     print("PORTAL_OIDC_LOGIN_PASS")
 

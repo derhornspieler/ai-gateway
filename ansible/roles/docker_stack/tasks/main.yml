@@ -359,8 +359,8 @@
     mode: "0644"
   loop:
     - { src: Corefile.authoritative.j2, dest: Corefile }
-    - { src: db.aigw.internal.j2, dest: db.aigw.internal }
-    - { src: db.aigw.internal.adm.j2, dest: db.aigw.internal.adm }
+    - { src: db.aigw.aegisgroup.ch.j2, dest: db.aigw.aegisgroup.ch }
+    - { src: db.aigw.aegisgroup.ch.adm.j2, dest: db.aigw.aegisgroup.ch.adm }
   when: platform_authoritative_dns_enabled | bool
 
 - name: Render mutually exclusive Cribl plaintext or verified-TLS client
@@ -1474,8 +1474,8 @@
         +
         ([
           {'path': stack_dir ~ '/services/lab-dns/Corefile', 'recursive': false},
-          {'path': stack_dir ~ '/services/lab-dns/db.aigw.internal', 'recursive': false},
-          {'path': stack_dir ~ '/services/lab-dns/db.aigw.internal.adm', 'recursive': false}
+          {'path': stack_dir ~ '/services/lab-dns/db.aigw.aegisgroup.ch', 'recursive': false},
+          {'path': stack_dir ~ '/services/lab-dns/db.aigw.aegisgroup.ch.adm', 'recursive': false}
         ] if (platform_authoritative_dns_enabled | bool) else [])
         +
         ([

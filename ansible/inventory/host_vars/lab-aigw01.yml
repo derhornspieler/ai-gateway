@@ -3,7 +3,7 @@
 # This applies only to the lab-aigw01 alias in inventory/lab.yml. Its
 # profile and encryption exception intentionally live in the inventory entry
 # so stack-only runs do not depend on host_vars discovery.
-aigw_domain: aigw.internal
+aigw_domain: aigw.aegisgroup.ch
 # Greenfield lab convenience: expose the separately OIDC-gated Vault UI on
 # the ADM plane. Generic/customer inventories remain default-deny.
 aigw_vault_ui_enabled: true

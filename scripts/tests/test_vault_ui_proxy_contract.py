@@ -36,7 +36,7 @@ TRAEFIK_ADM = (ROOT / "compose/traefik/dynamic-adm.yml").read_text(
     encoding="utf-8"
 )
 ADM_ZONE = (
-    ROOT / "ansible/roles/docker_stack/templates/db.aigw.internal.adm.j2"
+    ROOT / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.adm.j2"
 ).read_text(encoding="utf-8")
 COMPOSE_WRAPPER = (ROOT / "scripts/aigw-compose.sh").read_text(encoding="utf-8")
 VALIDATE_COMPOSE = (ROOT / "scripts/validate-compose.sh").read_text(encoding="utf-8")

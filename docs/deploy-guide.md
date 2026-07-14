@@ -405,7 +405,7 @@ Traefik currently consumes certificate files; Vault ACME is a design option, not
 implemented configuration.
 
 The lab overlay supplies this split view through an authoritative,
-non-recursive `aigw.internal` CoreDNS service. It publishes TCP and UDP 53 on
+non-recursive `aigw.aegisgroup.ch` CoreDNS service. It publishes TCP and UDP 53 on
 the exact ADM and internal lab addresses, not on the egress address, and has no
 forwarder. Its dedicated ordinary bridge has no peers; it exists because Docker
 29 does not publish host ports for a container attached only to an

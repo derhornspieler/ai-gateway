@@ -1,14 +1,14 @@
-$ORIGIN aigw.internal.
+$ORIGIN aigw.aegisgroup.ch.
 $TTL 60
 
-@       IN SOA  dns.aigw.internal. hostmaster.aigw.internal. (
+@       IN SOA  dns.aigw.aegisgroup.ch. hostmaster.aigw.aegisgroup.ch. (
                     2026071302 ; serial
                     3600       ; refresh
                     900        ; retry
                     604800     ; expire
                     60         ; negative cache TTL
                 )
-        IN NS   dns.aigw.internal.
+        IN NS   dns.aigw.aegisgroup.ch.
         IN A    10.20.0.10
 
 ; Restricted internal view: only DNS itself, the inference API, developer

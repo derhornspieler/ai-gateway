@@ -144,7 +144,7 @@ class OidcRelyingPartySecretDriftGateTests(unittest.TestCase):
         self.assertIn("Validate the platform DNS administrative view selector", self.source)
         self.assertIn("db\\.aigw\\.internal(?:\\.adm)?", self.source)
         self.assertIn(
-            "stack_dir ~ '/services/lab-dns/db.aigw.internal.adm'",
+            "stack_dir ~ '/services/lab-dns/db.aigw.aegisgroup.ch.adm'",
             self.source,
         )
 

@@ -30,7 +30,7 @@ flow = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(flow)
 
 
-AUTH_HOST = "auth.aigw.internal"
+AUTH_HOST = "auth.aigw.aegisgroup.ch"
 AUTH_LOGIN_ACTION_PREFIX = "/realms/aigw/login-actions/authenticate"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 ACCEPTANCE_USERNAMES = frozenset({"lab-admin", "testadmin"})
@@ -69,7 +69,7 @@ class OidcTarget:
 TARGETS = (
     OidcTarget(
         name="litellm-admin",
-        host="litellm-admin.aigw.internal",
+        host="litellm-admin.aigw.aegisgroup.ch",
         start_path="/oauth2/start",
         callback_path="/oauth2/callback",
         requested_path="/ui",
@@ -88,7 +88,7 @@ TARGETS = (
     ),
     OidcTarget(
         name="grafana",
-        host="grafana.aigw.internal",
+        host="grafana.aigw.aegisgroup.ch",
         start_path="/oauth2/start",
         callback_path="/oauth2/callback",
         requested_path="/",
@@ -99,7 +99,7 @@ TARGETS = (
     ),
     OidcTarget(
         name="prometheus",
-        host="prometheus.aigw.internal",
+        host="prometheus.aigw.aegisgroup.ch",
         start_path="/oauth2/start",
         callback_path="/oauth2/callback",
         requested_path="/",
@@ -112,7 +112,7 @@ TARGETS = (
     ),
     OidcTarget(
         name="vault",
-        host="vault.aigw.internal",
+        host="vault.aigw.aegisgroup.ch",
         start_path="/oauth2/start",
         callback_path="/oauth2/callback",
         requested_path="/ui/",
@@ -123,7 +123,7 @@ TARGETS = (
     ),
     OidcTarget(
         name="chat",
-        host="chat.aigw.internal",
+        host="chat.aigw.aegisgroup.ch",
         start_path="/oauth/oidc/login",
         callback_path="/oauth/oidc/callback",
         requested_path="/auth",

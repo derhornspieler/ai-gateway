@@ -244,11 +244,11 @@ class DnsPlaneContractTests(unittest.TestCase):
         self.assertNotRegex(core, r"(?m)^\s*forward(?:\s|$)")
         internal = (
             ROOT
-            / "ansible/roles/docker_stack/templates/db.aigw.internal.j2"
+            / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.j2"
         ).read_text()
         adm = (
             ROOT
-            / "ansible/roles/docker_stack/templates/db.aigw.internal.adm.j2"
+            / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.adm.j2"
         ).read_text()
         for name in ("api", "portal", "auth"):
             self.assertRegex(internal, rf"(?m)^{name}\s+IN A\s+{{{{ eth2_ip }}}}$")

@@ -96,7 +96,7 @@ stage.
 | `tempo` | prompt-bearing distributed traces | 30-day `tempo_data` |
 | `grafana` | query UI for Prometheus, Loki, and Tempo | `grafana_data`; ADM-only behind `oauth2-proxy-grafana`, auth-proxy header trust, org Admin auto-assign, own login form disabled |
 | `cribl-mock` | lab-only OTLP receipt proof | basic debug counts; no durable storage |
-| `lab-dns` (platform-DNS overlay only) | authoritative, non-recursive `aigw.internal` DNS for host-side clients | exact ADM/internal host IPs:53 TCP+UDP; dedicated no-peer bridge; enabled by `platform_authoritative_dns_enabled` |
+| `lab-dns` (platform-DNS overlay only) | authoritative, non-recursive `aigw.aegisgroup.ch` DNS for host-side clients | exact ADM/internal host IPs:53 TCP+UDP; dedicated no-peer bridge; enabled by `platform_authoritative_dns_enabled` |
 | `samba-ad` (lab overlay only) | disposable AD-compatible directory and hostname-verified LDAPS | isolated `net-identity`; no published host port; three persistent lab volumes |
 
 The four OAuth2 Proxy instances share one image

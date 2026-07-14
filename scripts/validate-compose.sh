@@ -757,7 +757,7 @@ PY
 env \
   COMPOSE_PROFILES=vault-ui \
   VAULT_UI_ENABLED=true \
-  DOMAIN=aigw.internal \
+  DOMAIN=aigw.aegisgroup.ch \
   DOCKER_DATA_ROOT="$docker_data_root" \
   ETH1_IP=10.8.10.10 \
   ETH2_IP=10.20.0.10 \
@@ -882,7 +882,7 @@ for name in (
     assert env["OAUTH2_PROXY_OIDC_GROUPS_CLAIM"] == "roles", name
 litellm_admin_proxy = services["oauth2-proxy"]["environment"]
 assert litellm_admin_proxy["OAUTH2_PROXY_REDIRECT_URL"] == (
-    "https://litellm-admin.aigw.internal/oauth2/callback"
+    "https://litellm-admin.aigw.aegisgroup.ch/oauth2/callback"
 )
 assert litellm_admin_proxy["OAUTH2_PROXY_COOKIE_NAME"] == (
     "_aigw_litellm_admin_oauth"
@@ -1184,7 +1184,7 @@ for path, expected_options in {
     # implicit writable mode. Accept only those two canonical renderings.
     assert grafana_tmpfs[path] in (expected_options, expected_options | {"rw"})
 assert services["oauth2-proxy-grafana"]["networks"]["net-grafana"]["ipv4_address"] == "172.28.6.3"
-assert services["key-rotator"]["environment"]["KEYCLOAK_PUBLIC_URL"] == "https://auth.aigw.internal"
+assert services["key-rotator"]["environment"]["KEYCLOAK_PUBLIC_URL"] == "https://auth.aigw.aegisgroup.ch"
 assert services["key-rotator"]["environment"]["WIF_KEYCLOAK_PUBLIC_URL"] == "https://idp.wif-a.example.invalid"
 assert services["keycloak"].get("read_only", False) is False
 portal = services["dev-portal"]
@@ -1236,12 +1236,12 @@ assert config["networks"]["net-lab-dns"]["external"] is True
 assert all(v["read_only"] for v in dns["volumes"])
 adm_zone = next(
     mount for mount in dns["volumes"]
-    if mount["target"] == "/etc/coredns/zones/db.aigw.internal.adm"
+    if mount["target"] == "/etc/coredns/zones/db.aigw.aegisgroup.ch.adm"
 )
 assert adm_zone["type"] == "bind"
 assert adm_zone["read_only"] is True
 assert adm_zone["bind"]["selinux"] == "Z"
-assert Path(adm_zone["source"]).name == "db.aigw.internal.adm"
+assert Path(adm_zone["source"]).name == "db.aigw.aegisgroup.ch.adm"
 samba = config["services"]["samba-ad"]
 assert samba["healthcheck"]["test"] == ["CMD", "/usr/local/sbin/samba-ad-healthcheck"]
 assert samba.get("labels", {}).get(
@@ -1406,7 +1406,7 @@ import sys
 corefile = Path(sys.argv[1]).read_text(encoding="utf-8")
 assert "view adm {" in corefile
 assert "expr incidr(client_ip(), '{$LAB_DNS_ADM_CIDR}')" in corefile
-assert "db.aigw.internal.adm" in corefile
+assert "db.aigw.aegisgroup.ch.adm" in corefile
 assert re.search(r"(?m)^\s*forward(?:\s|$)", corefile) is None
 PY
 

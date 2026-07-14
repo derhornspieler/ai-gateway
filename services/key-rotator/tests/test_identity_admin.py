@@ -472,7 +472,7 @@ async def test_prebootstrap_scope_reconciliation_requires_the_exact_status_gate(
 async def test_private_key_jwt_uses_public_audience_over_internal_transport() -> None:
     pem, _ = private_key_pem()
     expected_audience = (
-        "https://auth.aigw.internal/realms/aigw/protocol/openid-connect/token"
+        "https://auth.aigw.aegisgroup.ch/realms/aigw/protocol/openid-connect/token"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -486,7 +486,7 @@ async def test_private_key_jwt_uses_public_audience_over_internal_transport() ->
         return httpx.Response(200, json={"access_token": "controller-token"})
 
     admin = KeycloakAdmin(
-        settings(KEYCLOAK_PUBLIC_URL="https://auth.aigw.internal"),
+        settings(KEYCLOAK_PUBLIC_URL="https://auth.aigw.aegisgroup.ch"),
         FakeVault(),
         FakeDB(),
         transport=httpx.MockTransport(handler),
