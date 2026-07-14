@@ -1,24 +1,40 @@
 #!/usr/bin/env bash
-# vault-pki-intermediate.sh — gateway side of the mode-2 PKI ceremony.
+# vault-pki-intermediate.sh — gateway side of the intermediate PKI ceremonies.
 #
 # Run ON THE VM from the stack directory (default /opt/ai-gateway) as root.
+# It serves the two intermediate edge-TLS modes; each subcommand narrows to its
+# own mode:
+#
+#   vault-intermediate    (csr / install-signed)
+#     Vault GENERATES the intermediate private key INTERNALLY and never exports
+#     it; a CSR goes out to the customer CA and a signed certificate comes back.
+#
+#   customer-intermediate (import-intermediate)
+#     The operator DELIBERATELY supplies the intermediate CA certificate AND its
+#     private key plus the full chain. That key is validated fail-closed, then
+#     imported into pki_int over stdin and shredded from disk; afterwards it
+#     lives only inside Vault, which issues every leaf under the customer CA.
 #
 # The trust model, which every gate below exists to preserve:
 #
-#   * Vault GENERATES the intermediate private key INTERNALLY and never exports
-#     it. This script cannot extract it and does not try.
 #   * The CUSTOMER's root/issuing private key stays wherever the customer keeps
 #     it. It is never requested, transported, or stored here. What crosses the
-#     boundary is a CSR going out and a signed certificate coming back.
+#     boundary is a CSR (vault-intermediate) or an operator-owned INTERMEDIATE
+#     key (customer-intermediate) -- never the root key.
 #   * Consequently this script never enables or writes a Vault ROOT PKI mount.
 #     A contract test asserts that no root-generation or root-signing Vault path
 #     appears anywhere in this file -- including in comments, which is why none
 #     is spelled out here.
 #
-# Ceremony:
+# vault-intermediate ceremony:
 #   1.  vault-pki-intermediate.sh csr            (here)   -> secrets/aigw-intermediate.csr
 #   2.  sign-vault-intermediate.sh               (CA host) -> intermediate.pem + chain.pem
 #   3.  vault-pki-intermediate.sh install-signed (here)   -> live edge certificates
+#
+# customer-intermediate ceremony:
+#   1.  the staging converge places the operator intermediate + key + chain under
+#       secrets/ (key 0600 root, no_log Ansible pipe)
+#   2.  vault-pki-intermediate.sh import-intermediate (here) -> live edge certificates
 #
 # The Vault token is read from stdin only -- never argv, never an environment
 # variable on a command line, never a log.
@@ -40,23 +56,32 @@ shift || true
 
 SIGNED_INTERMEDIATE=""
 CHAIN=""
+INTERMEDIATE=""
+INTERMEDIATE_KEY=""
 REGENERATE=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --signed-intermediate) SIGNED_INTERMEDIATE="${2:-}"; shift 2 ;;
     --chain)               CHAIN="${2:-}"; shift 2 ;;
+    --intermediate)        INTERMEDIATE="${2:-}"; shift 2 ;;
+    --intermediate-key)    INTERMEDIATE_KEY="${2:-}"; shift 2 ;;
     --regenerate)          REGENERATE=true; shift ;;
     *) die "unsupported argument: $1" ;;
   esac
 done
 
 # ── mode gate ───────────────────────────────────────────────────────────────
-# This ceremony is meaningless on a deployment that did not select it, and on a
-# customer-supplied deployment it would silently replace operator-owned material.
+# This ceremony is meaningless on a deployment that did not select an intermediate
+# path, and on a customer-supplied deployment it would silently replace
+# operator-owned material. Two intermediate modes are served here and each
+# subcommand narrows to exactly its own mode below:
+#   vault-intermediate    -- csr / install-signed (Vault mints the key internally)
+#   customer-intermediate -- import-intermediate  (operator supplies key + cert)
 AIGW_EDGE_TLS_MODE="$(env_value AIGW_EDGE_TLS_MODE)"
-if [[ "$AIGW_EDGE_TLS_MODE" != "vault-intermediate" ]]; then
-  die "vault-pki-intermediate.sh requires aigw_edge_tls_mode=vault-intermediate in the deployed inventory"
-fi
+case "$AIGW_EDGE_TLS_MODE" in
+  vault-intermediate|customer-intermediate) : ;;
+  *) die "vault-pki-intermediate.sh requires aigw_edge_tls_mode=vault-intermediate or customer-intermediate in the deployed inventory" ;;
+esac
 
 DOMAIN="$(env_value DOMAIN)"
 [[ -n "$DOMAIN" ]] || die "DOMAIN is not set in .env"
@@ -131,6 +156,27 @@ require_safe_input() {
   if grep -q "PRIVATE KEY" "$path"; then
     die "certificate input contains private key material; the customer CA signing key must never be supplied"
   fi
+}
+
+# The intermediate KEY input is the one file here that is SUPPOSED to hold a
+# private key, so it cannot use require_safe_input (which refuses key material).
+# edge-tls.py validate-intermediate performs the full crypto custody proof
+# (owner/mode/single-link/single-key) before Vault is touched.
+require_key_input() {
+  local path="$1" label="$2"
+  [[ -n "$path" ]]   || die "$label is required"
+  [[ ! -L "$path" ]] || die "$label is a symlink; supply the real file: $path"
+  [[ -f "$path" ]]   || die "$label is not a regular file: $path"
+  grep -q "PRIVATE KEY" "$path" || die "$label does not contain a private key"
+}
+
+# Resolve a possibly-relative input to an absolute path WITHOUT following
+# symlinks (edge-tls.py requires an absolute path and lstat-refuses a symlink).
+abspath() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *)  printf '%s/%s' "$STACK_DIR" "$1" ;;
+  esac
 }
 
 issue_and_install_leaf() {
@@ -268,6 +314,8 @@ os.close(key_fd)
 
 case "$SUBCOMMAND" in
   csr)
+    [[ "$AIGW_EDGE_TLS_MODE" == "vault-intermediate" ]] \
+      || die "csr requires aigw_edge_tls_mode=vault-intermediate; customer-intermediate uses import-intermediate"
     if [[ -e "$MARKER" && "$REGENERATE" != true ]]; then
       die "this deployment already has customer-CA-signed edge material ($MARKER). Regenerating the intermediate key invalidates the currently installed chain and any pending CSR; pass --regenerate only if you intend to repeat the whole ceremony."
     fi
@@ -312,6 +360,8 @@ EOF
     ;;
 
   install-signed)
+    [[ "$AIGW_EDGE_TLS_MODE" == "vault-intermediate" ]] \
+      || die "install-signed requires aigw_edge_tls_mode=vault-intermediate; customer-intermediate uses import-intermediate"
     require_safe_input "$SIGNED_INTERMEDIATE" "--signed-intermediate"
     require_safe_input "$CHAIN" "--chain"
 
@@ -399,6 +449,120 @@ EOF
     echo ">> edge now serves a certificate chaining to the customer root CA."
     ;;
 
+  import-intermediate)
+    [[ "$AIGW_EDGE_TLS_MODE" == "customer-intermediate" ]] \
+      || die "import-intermediate requires aigw_edge_tls_mode=customer-intermediate"
+
+    INTERMEDIATE="$(abspath "$INTERMEDIATE")"
+    INTERMEDIATE_KEY="$(abspath "$INTERMEDIATE_KEY")"
+    CHAIN="$(abspath "$CHAIN")"
+    require_safe_input "$INTERMEDIATE" "--intermediate"
+    require_safe_input "$CHAIN" "--chain"
+    require_key_input  "$INTERMEDIATE_KEY" "--intermediate-key"
+
+    # FULL crypto validation BEFORE any Vault mutation. edge-tls.py proves the
+    # supplied cert is a non-self-signed CA that can sign, the key matches THAT
+    # cert (a supplied root key fails here), the key file holds exactly one
+    # private key (a smuggled root key is refused), the chain verifies to a
+    # self-signed root, and -- because this mode holds the intermediate key -- an
+    # offline test leaf proves aigw_domain (and samba-ad.$DOMAIN) fall inside the
+    # CA name-constraint subtree. A failure aborts before Vault is touched.
+    python3 -I "$STACK_DIR/scripts/edge-tls.py" validate-intermediate \
+        --intermediate      "$INTERMEDIATE" \
+        --intermediate-key  "$INTERMEDIATE_KEY" \
+        --chain             "$CHAIN" \
+        --domain            "$DOMAIN" \
+        --min-days-remaining "$MIN_DAYS" \
+        --expect-key-owner  "0:0" \
+        --expect-key-mode   "0600"
+
+    if ! vlt secrets list -format=json | grep -q '"pki_int/"'; then
+      vlt secrets enable -path=pki_int pki
+    fi
+    vlt secrets tune -max-lease-ttl=43800h pki_int
+
+    # Import the operator intermediate (KEY then CERT, exactly two blocks) over
+    # STDIN. issuers/import/bundle imports every certificate it finds as an
+    # issuer, so the customer ROOT is deliberately NOT included: it would import
+    # the root as a keyless Vault issuer -- unwanted trust surface. The key bytes
+    # reach Vault only through this pipe, never argv, never an env var, never a
+    # log. import returns the created issuer id in imported_issuers[0].
+    imported="$(
+      INT_KEY="$INTERMEDIATE_KEY" INT_CERT="$INTERMEDIATE" python3 -I -c '
+import os, sys
+key = open(os.environ["INT_KEY"], encoding="ascii").read().rstrip("\n") + "\n"
+cert = open(os.environ["INT_CERT"], encoding="ascii").read().rstrip("\n") + "\n"
+sys.stdout.write(key + cert)
+' \
+      | vlt write -format=json pki_int/issuers/import/bundle pem_bundle=- \
+      | python3 -I -c 'import json,sys; ids=(json.load(sys.stdin)["data"] or {}).get("imported_issuers") or []; print(ids[0] if ids else "")')"
+
+    supplied_fp="$(openssl x509 -in "$INTERMEDIATE" -noout -fingerprint -sha256)"
+
+    # import/bundle is idempotent: re-importing a key+cert Vault already holds
+    # returns an empty list. It may also attach the now-supplied key to a keyless
+    # issuer created by an earlier set-signed of the same cert. Resolve the issuer
+    # by certificate identity so the ceremony stays re-runnable on every path.
+    if [[ -z "$imported" ]]; then
+      for candidate in $(vlt list -format=json pki_int/issuers \
+          | python3 -I -c 'import json,sys; [print(i) for i in json.load(sys.stdin)]'); do
+        if [[ "$(vlt read -field=certificate "pki_int/issuer/$candidate" \
+                 | openssl x509 -noout -fingerprint -sha256)" == "$supplied_fp" ]]; then
+          imported="$candidate"
+          break
+        fi
+      done
+    fi
+    [[ -n "$imported" ]] \
+      || die "Vault holds no issuer matching --intermediate; refusing to leave the mount issuing from a stale CA"
+
+    # Promote the imported issuer to the mount default. default_follows_latest_issuer
+    # is false, so on a brownfield mount (a prior test root or a prior run) the
+    # mount keeps signing from the OLD issuer unless this explicit pin is written.
+    vlt write pki_int/config/issuers \
+        default="$imported" default_follows_latest_issuer=false >/dev/null
+
+    # Prove the promotion took: read the mount's configured DEFAULT issuer and
+    # assert IT resolves to the customer-supplied certificate.
+    default_issuer="$(vlt read -format=json pki_int/config/issuers \
+      | python3 -I -c 'import json,sys; print((json.load(sys.stdin)["data"] or {}).get("default") or "")')"
+    [[ -n "$default_issuer" ]] \
+      || die "could not read the mount default issuer after promotion"
+    promoted_fp="$(vlt read -field=certificate "pki_int/issuer/$default_issuer" \
+      | openssl x509 -noout -fingerprint -sha256)"
+    [[ "$promoted_fp" == "$supplied_fp" ]] \
+      || die "the promoted Vault issuer is not the customer-supplied intermediate"
+
+    # Pin the role to the promoted issuer so a later default change cannot
+    # silently move leaf issuance back onto a stale CA.
+    vlt write pki_int/roles/aigw \
+        issuer_ref="$imported" \
+        allowed_domains="$DOMAIN" allow_subdomains=true allow_bare_domains=true \
+        max_ttl=2160h >/dev/null
+
+    # Retain the reviewed chain (public material only) so renew-leaf/samba-tls can
+    # rebuild the edge bundle without the operator re-supplying it.
+    install -m 0644 -- "$CHAIN" "$STACK_DIR/secrets/aigw-edge-chain.pem"
+
+    mkdir -p "$STACK_DIR/.state"
+    issue_and_install_leaf
+
+    printf 'customer-intermediate %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER"
+    chmod 600 "$MARKER"
+
+    restart_edge_consumers
+
+    # The intermediate key now lives (encrypted at rest) inside Vault. Remove the
+    # staged plaintext copies from disk; the operator's source material is
+    # untouched. shred the key; the cert/chain are public but there is no reason
+    # to leave the staged import copies behind.
+    shred -u -- "$INTERMEDIATE_KEY" 2>/dev/null || rm -f -- "$INTERMEDIATE_KEY"
+    rm -f -- "$INTERMEDIATE" "$STACK_DIR/secrets/aigw-intermediate-import-chain.pem"
+
+    echo ">> edge now serves a certificate chaining to the customer root CA (customer-intermediate)."
+    echo ">> the staged intermediate private key has been shredded; it now lives only inside Vault."
+    ;;
+
   renew-leaf)
     [[ -e "$MARKER" ]] || die "no customer-CA-signed intermediate is installed; run the csr + install-signed ceremony first"
     issue_and_install_leaf
@@ -413,6 +577,6 @@ EOF
     ;;
 
   *)
-    die "usage: vault-pki-intermediate.sh {csr|install-signed --signed-intermediate FILE --chain FILE|renew-leaf|samba-tls}"
+    die "usage: vault-pki-intermediate.sh {csr|install-signed --signed-intermediate FILE --chain FILE|import-intermediate --intermediate FILE --intermediate-key FILE --chain FILE|renew-leaf|samba-tls}"
     ;;
 esac

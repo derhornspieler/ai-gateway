@@ -275,10 +275,31 @@ aigw_vault_ui_enabled: false
 #                         the self-signed root. Ansible validates the material
 #                         (key/leaf match, wildcard+apex SAN, serverAuth EKU,
 #                         chain to root, expiry window) before installing it.
+#
+#   customer-intermediate -- you hold an INTERMEDIATE CA (certificate AND its
+#                         private key) issued by your root. Set the three
+#                         aigw_edge_tls_intermediate_* paths below to
+#                         controller-local PEM files (key mode 0600, chain =
+#                         intermediate + root). The converge stages them under
+#                         secrets/; then run the import ceremony:
+#                             sudo scripts/vault-pki-intermediate.sh import-intermediate ...
+#                         Vault imports the intermediate, promotes it to the
+#                         default issuer, and issues every leaf under your CA.
+#                         The intermediate key transits the no_log Ansible pipe,
+#                         sits at secrets/aigw-intermediate-import.key (0600 root)
+#                         until the import, and is shredded after. Higher trust
+#                         than vault-intermediate (the gateway briefly holds the
+#                         intermediate signing key); the ROOT key is never
+#                         supplied. aigw_domain must fall inside your CA's
+#                         permitted name-constraint subtree or the ceremony fails
+#                         closed with OpenSSL's "permitted subtree violation".
 aigw_edge_tls_mode: ""
 aigw_edge_tls_leaf_cert_file: ""
 aigw_edge_tls_private_key_file: ""
 aigw_edge_tls_chain_file: ""
+aigw_edge_tls_intermediate_cert_file: ""
+aigw_edge_tls_intermediate_key_file: ""
+aigw_edge_tls_intermediate_chain_file: ""
 aigw_edge_tls_min_days_remaining: 30
 
 # Telemetry export CA. Required only when exporting to a real Cribl endpoint.
@@ -370,9 +391,11 @@ def production_host_vars_document(alias: str) -> str:
 # Generated rocky9-production host contract (canonical profile). Fill every
 # empty value in SECTION 1 before the non-mutating preflight; the encrypted
 # Vault is intentionally in group_vars/production_rocky9/vault.yml beside this
-# file. SECTIONS 3 and 5 are inputs added later in the deployment lifecycle;
-# leave them exactly as-is until the referenced step. SECTION 4 is an optional
-# feature that ships disabled and fails closed until every value is supplied.
+# file. SECTION 3 (vault_unseal_key) is an operator-ceremony input added later
+# in the deployment lifecycle; leave it as-is until the referenced step.
+# SECTION 5 (edge TLS) requires you to choose exactly one mode before the
+# converge. SECTION 4 is an optional feature that ships disabled and fails
+# closed until every value is supplied.
 aigw_generic_inventory_alias: {alias}
 deployment_profile: rocky9-production
 
@@ -509,11 +532,63 @@ identity_ldap_uuid_attribute: objectGUID
 identity_ldap_user_object_classes: "person, organizationalPerson, user"
 identity_ldap_user_filter: ""
 
-# ── SECTION 5 — PKI inputs (placeholder) ─────────────────────────────────
-# Reserved for the production TLS / PKI workstream (customer-supplied leaf chain
-# or a CA-signed Vault intermediate). Its variables are defined by a parallel
-# change; do not invent keys here yet. Leave this section empty until that
-# contract lands.
+# ── SECTION 5 — edge TLS / PKI inputs (choose exactly one mode) ───────────
+# HTTPS terminates at the two Traefik edges; container-to-container traffic
+# stays plain HTTP on segmented internal bridges. Select exactly one mode -- the
+# converge refuses to start without one. The private-key file paths below are
+# controller-local files, never inventory secrets and never inline-encrypted
+# overlay values (a multi-line PEM in an inline vault would create a second
+# custody path); each key file must be mode 0600 and owned by you.
+#
+#   vault-intermediate    -- Vault GENERATES the intermediate private key
+#                            INTERNALLY and emits a CSR. Your CA signs it OFFLINE
+#                            and you import the signed cert + complete chain.
+#                            Leave every *_file path empty. Your CA's
+#                            root/issuing PRIVATE KEY never comes to the gateway.
+#                                sudo scripts/vault-pki-intermediate.sh csr
+#                                scripts/sign-vault-intermediate.sh (on your CA host)
+#                                sudo scripts/vault-pki-intermediate.sh install-signed ...
+#
+#   customer-supplied     -- you already hold an edge LEAF certificate for this
+#                            domain. Set the three customer-supplied file paths
+#                            (aigw_edge_tls_leaf_cert_file /
+#                            aigw_edge_tls_private_key_file /
+#                            aigw_edge_tls_chain_file); leave the intermediate
+#                            trio empty. Ansible validates and installs it.
+#
+#   customer-intermediate -- you hold an INTERMEDIATE CA (certificate AND its
+#                            private key) issued by your root. Set the three
+#                            aigw_edge_tls_intermediate_* paths (chain =
+#                            intermediate + root); leave the customer-supplied
+#                            trio empty. The converge stages them under secrets/;
+#                            then run:
+#                                sudo scripts/vault-pki-intermediate.sh import-intermediate \\
+#                                    --intermediate secrets/aigw-intermediate-import.pem \\
+#                                    --intermediate-key secrets/aigw-intermediate-import.key \\
+#                                    --chain secrets/aigw-intermediate-import-chain.pem
+#                            Vault imports the intermediate, promotes it to the
+#                            default issuer, and issues every leaf under your CA.
+#                            HIGHER TRUST than vault-intermediate: the gateway
+#                            briefly HOLDS the intermediate signing key -- it
+#                            transits the no_log Ansible pipe, sits at
+#                            secrets/aigw-intermediate-import.key (0600 root)
+#                            until the import, is imported over stdin, and is then
+#                            shredded; afterwards it lives (encrypted at rest)
+#                            inside Vault. The customer ROOT key is still NEVER
+#                            supplied, transported, or stored. aigw_domain must
+#                            fall inside your CA's permitted name-constraint
+#                            subtree or the ceremony fails closed with OpenSSL's
+#                            "permitted subtree violation". Prefer
+#                            vault-intermediate unless you accept the gateway
+#                            becoming a holder of a live intermediate signing key.
+aigw_edge_tls_mode: ""
+aigw_edge_tls_leaf_cert_file: ""
+aigw_edge_tls_private_key_file: ""
+aigw_edge_tls_chain_file: ""
+aigw_edge_tls_intermediate_cert_file: ""
+aigw_edge_tls_intermediate_key_file: ""
+aigw_edge_tls_intermediate_chain_file: ""
+aigw_edge_tls_min_days_remaining: 30
 """
 
 

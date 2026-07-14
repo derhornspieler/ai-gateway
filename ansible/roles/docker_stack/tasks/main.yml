@@ -1444,13 +1444,15 @@
           ('DNS:' ~ aigw_domain) not in existing_edge_certificate.stdout))
     quiet: true
     fail_msg: >-
-      The vault-intermediate ceremony previously installed customer-CA-signed
-      edge material, but certs/int.crt is now missing, unreadable, or issued for
-      a different domain than aigw_domain. If aigw_domain changed, rerun the
-      ceremony (scripts/vault-pki-intermediate.sh csr -> customer CA signs ->
-      install-signed); otherwise restore state or run renew-leaf. A self-signed
-      placeholder must never silently replace a CA-signed certificate.
-  when: aigw_edge_tls_mode == 'vault-intermediate'
+      The vault-intermediate or customer-intermediate ceremony previously
+      installed customer-CA-signed edge material, but certs/int.crt is now
+      missing, unreadable, or issued for a different domain than aigw_domain. If
+      aigw_domain changed, rerun the ceremony (vault-intermediate:
+      scripts/vault-pki-intermediate.sh csr -> customer CA signs ->
+      install-signed; customer-intermediate: import-intermediate); otherwise
+      restore state or run renew-leaf. A self-signed placeholder must never
+      silently replace a CA-signed certificate.
+  when: aigw_edge_tls_mode in ['vault-intermediate', 'customer-intermediate']
 
 # Only lab mode deletes stale edge material, because regenerating a self-signed
 # placeholder there is free. On the real-CA modes the material is NEVER deleted:
@@ -1553,6 +1555,48 @@
         path: "{{ stack_dir }}/.state/edge-tls-staging"
         state: absent
 
+# ── Mode customer-intermediate: stage the operator intermediate + key + chain ─
+# The converge does NOT touch Vault (it holds no privileged token); it only
+# stages the material into the root-only secrets/ dir so the operator ceremony
+# (scripts/vault-pki-intermediate.sh import-intermediate) has Ansible-validated,
+# no_log-transported inputs. Staging is gated on marker ABSENCE, exactly like the
+# placeholder, so a post-ceremony converge (which sees the marker, after the
+# ceremony shredded the key) never re-writes the intermediate private key.
+- name: Stage the customer intermediate CA material for the import ceremony
+  when: >-
+    aigw_edge_tls_mode == 'customer-intermediate' and
+    not (aigw_edge_tls_issued_marker.stat.exists | default(false))
+  block:
+    - name: Create the private secrets boundary
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/secrets"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Stage the intermediate certificate and complete chain
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ stack_dir }}/secrets/{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - { src: "{{ aigw_edge_tls_intermediate_cert_file }}", dest: aigw-intermediate-import.pem }
+        - { src: "{{ aigw_edge_tls_intermediate_chain_file }}", dest: aigw-intermediate-import-chain.pem }
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: Stage the intermediate CA private key without logging
+      ansible.builtin.copy:
+        src: "{{ aigw_edge_tls_intermediate_key_file }}"
+        dest: "{{ stack_dir }}/secrets/aigw-intermediate-import.key"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
 - name: Self-signed placeholder cert so traefik/open-webui start pre-bootstrap
   ansible.builtin.command:
     cmd: >
@@ -1563,7 +1607,7 @@
       -keyout {{ stack_dir }}/certs/int.key -out {{ stack_dir }}/certs/int.crt
     creates: "{{ stack_dir }}/certs/int.crt"
   when: >-
-    aigw_edge_tls_mode in ['lab', 'vault-intermediate'] and
+    aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate'] and
     not (aigw_edge_tls_issued_marker.stat.exists | default(false))
 
 - name: Placeholder CA bundle (replaced by the reviewed edge TLS ceremony)
@@ -1574,7 +1618,7 @@
     force: false
     mode: "0644"
   when: >-
-    aigw_edge_tls_mode in ['lab', 'vault-intermediate'] and
+    aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate'] and
     not (aigw_edge_tls_issued_marker.stat.exists | default(false))
 
 - name: Reconcile public edge certificate material permissions
@@ -1598,8 +1642,9 @@
 
 # Fail the converge BEFORE any compose activity if the installed production
 # material is a placeholder, self-signed, expiring, or otherwise invalid. For
-# vault-intermediate this activates only once the ceremony has written its
-# marker; before that the placeholder is expected and this gate stays dormant.
+# vault-intermediate and customer-intermediate this activates only once the
+# ceremony has written its marker; before that the placeholder is expected and
+# this gate stays dormant.
 - name: Prove installed production edge TLS material before starting the stack
   ansible.builtin.command:
     argv:
@@ -1618,7 +1663,7 @@
   when: >-
     deployment_profile != 'rocky9-lab' and
     (aigw_edge_tls_mode == 'customer-supplied' or
-     (aigw_edge_tls_mode == 'vault-intermediate' and
+     (aigw_edge_tls_mode in ['vault-intermediate', 'customer-intermediate'] and
       (aigw_edge_tls_issued_marker.stat.exists | default(false))))
 
 # ── Cribl export CA bundle (separate trust anchor from the edge CA) ──────────

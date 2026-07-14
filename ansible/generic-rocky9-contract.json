@@ -98,6 +98,15 @@
           "generated_by_inventory_bootstrap": false
         }
       ]
+    },
+    "edge_tls_customer_intermediate": {
+      "enabled_by": "aigw_edge_tls_mode == 'customer-intermediate'",
+      "informational": "These three keys are edge-TLS-mode-conditional file paths, validated in the playbooks like the customer-supplied trio; they are intentionally NOT in required_nonsecret_keys so lab/vault-intermediate/customer-supplied inventories stay valid. The intermediate PRIVATE KEY is a controller-local file path, never an inventory secret and never an inline-encrypted overlay value.",
+      "required_nonsecret_keys": [
+        "aigw_edge_tls_intermediate_cert_file",
+        "aigw_edge_tls_intermediate_key_file",
+        "aigw_edge_tls_intermediate_chain_file"
+      ]
     }
   }
 }
