@@ -1,23 +1,13 @@
 {% extends "base.html" %}
-{% block title %}Tool config snippets — dev-portal{% endblock %}
+{% block title %}Connect a tool — dev-portal{% endblock %}
+{% block tabs %}
+<nav class="tabs" role="tablist" aria-label="Developer portal sections">
+  <a role="tab" href="/" aria-selected="false">My keys</a>
+  <a role="tab" href="/snippets" aria-selected="true" aria-current="page">Connect a tool</a>
+</nav>
+{% endblock %}
 {% block content %}
-<h1>Coding tool config snippets</h1>
-<p class="muted">Gateway base URL: <code>{{ api_base }}</code></p>
-{% if using_placeholder %}
-<div class="flash info">For security, later pages never retain or redisplay a generated key. These snippets use <code>YOUR_KEY</code>; replace it locally with the key you copied from its one-time creation response.</div>
-{% endif %}
-
-{% for tool in tools %}
-<div class="card">
-  <h3>{{ tool.name }}</h3>
-  <p class="muted">{{ tool.description }}</p>
-  <div style="position: relative;">
-    <pre id="snippet-{{ tool.id }}">{{ tool.snippet }}</pre>
-    <button type="button" data-copy-target="snippet-{{ tool.id }}">Copy</button>
-  </div>
-  {% if tool.note %}
-  <p class="muted"><strong>Note:</strong> {{ tool.note }}</p>
-  {% endif %}
-</div>
-{% endfor %}
+<section class="panel active" id="tab-connect" role="tabpanel" aria-label="Connect a tool">
+{% include "_connect_panel.html" %}
+</section>
 {% endblock %}

@@ -2884,6 +2884,424 @@ def test_project_policy_refuses_silent_widening_of_deconfigured_restriction(
     assert "claude-opus" in response.text
 
 
+# --- tabbed console surface ---------------------------------------------------
+
+
+def _happy_admin_rotator(monkeypatch, *, status=None, settings_payload=None):
+    """Install a bounded happy-path rotator mock for admin page renders."""
+
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        if path == "/status":
+            return status if status is not None else []
+        if path == "/settings":
+            return settings_payload if settings_payload is not None else []
+        if path.startswith("/history"):
+            return []
+        if path == "/providers/anthropic":
+            return {
+                "vendor": "anthropic",
+                "state": "awaiting_enrollment",
+                "configured": False,
+                "enabled": False,
+                "private_key_jwt_ready": True,
+                "nonsecret_ids": {},
+            }
+        if path == "/identity/status":
+            return None
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+
+
+def test_dev_portal_renders_the_two_tab_rail_with_inline_connect_panel(
+    client, set_session, monkeypatch
+):
+    async def key_list(_user_id):
+        return []
+
+    monkeypatch.setattr(litellm_client, "key_list", key_list)
+    set_session({"user": portal_user()})
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'role="tablist"' in response.text
+    for pinned in (
+        'data-tab="keys"',
+        'data-tab="connect"',
+        'id="tab-keys" role="tabpanel"',
+        'id="tab-connect" role="tabpanel"',
+    ):
+        assert pinned in response.text, pinned
+    # The connect tab is server-rendered inline with placeholder snippets and
+    # never exposes admin surfaces.
+    assert "YOUR_KEY" in response.text
+    assert "/admin" not in response.text
+
+
+def test_admin_console_renders_the_five_tab_rail(
+    admin_client, set_admin_session, monkeypatch
+):
+    _happy_admin_rotator(monkeypatch)
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    response = admin_client.get("/admin")
+
+    assert response.status_code == 200
+    assert 'role="tablist"' in response.text
+    for pinned in (
+        'data-tab="identity"',
+        'href="/admin/keys"',
+        'data-tab="providers"',
+        'data-tab="rotation"',
+        'data-tab="audit"',
+        'id="tab-identity" role="tabpanel"',
+        'id="tab-providers" role="tabpanel"',
+        'id="tab-rotation" role="tabpanel"',
+        'id="tab-audit" role="tabpanel"',
+    ):
+        assert pinned in response.text, pinned
+
+
+def test_admin_key_inventory_carries_the_tab_rail(
+    admin_client, set_admin_session, monkeypatch
+):
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def admin_key_list_page(page):
+        return {"keys": [], "page": 1, "total_pages": 0, "total_count": 0}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    response = admin_client.get("/admin/keys")
+
+    assert response.status_code == 200
+    for pinned in (
+        'href="/admin/keys" aria-selected="true"',
+        'href="/admin#tab-providers"',
+        'href="/admin#tab-rotation"',
+        'href="/admin#tab-audit"',
+    ):
+        assert pinned in response.text, pinned
+
+
+def test_connect_surface_shows_no_cost_and_models_populate_dynamically(
+    client, set_session, monkeypatch
+):
+    async def key_list(_user_id):
+        return []
+
+    async def model_names():
+        # A model newly configured in LiteLLM must appear with no code change.
+        return ["claude-haiku", "claude-newly-configured", "claude-sonnet"]
+
+    monkeypatch.setattr(litellm_client, "key_list", key_list)
+    monkeypatch.setattr(litellm_client, "model_names", model_names)
+    set_session({"user": portal_user()})
+
+    index = client.get("/")
+    snippets = client.get("/snippets")
+
+    assert index.status_code == 200
+    assert snippets.status_code == 200
+    for response in (index, snippets):
+        assert "claude-newly-configured" in response.text
+        for forbidden in ("$", "spend", "budget", "Budget"):
+            assert forbidden not in response.text, forbidden
+
+
+def test_rotation_tab_renders_status_table_without_raw_dump_or_internal_rows(
+    admin_client, set_admin_session, monkeypatch
+):
+    status = [
+        {
+            "vendor": "anthropic",
+            "enabled": True,
+            "interval_seconds": 3000,
+            "grace_seconds": 300,
+            "last_rotation": {
+                "timestamp": "2026-07-14T05:36:43Z",
+                "status": "skipped",
+            },
+            "next_run_time": "2026-07-15T05:36:43+00:00",
+            "rotation_in_progress": False,
+            "alerts": [],
+        },
+        {
+            "vendor": "portal-key-reconciliation-state",
+            "enabled": False,
+            "interval_seconds": 0,
+            "last_rotation": None,
+            "next_run_time": None,
+            "rotation_in_progress": False,
+            "alerts": [],
+        },
+    ]
+    settings_payload = [
+        {"vendor": "anthropic", "enabled": True, "interval_seconds": 3000,
+         "grace_seconds": 300},
+        {"vendor": "static-openai", "enabled": False, "interval_seconds": 3600,
+         "grace_seconds": 300},
+        {"vendor": "portal-key-reconciliation-state", "enabled": False,
+         "interval_seconds": 0, "grace_seconds": 0},
+    ]
+    _happy_admin_rotator(
+        monkeypatch, status=status, settings_payload=settings_payload
+    )
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    response = admin_client.get("/admin")
+
+    assert response.status_code == 200
+    # Scheduler facts render as a table, never as a raw Python-dict dump.
+    assert "2026-07-15T05:36:43+00:00" in response.text
+    assert "2026-07-14T05:36:43Z" in response.text
+    assert "rotation_in_progress" not in response.text
+    assert "'vendor':" not in response.text
+    # The internal reconciliation bookkeeping row is not an operator control.
+    assert "portal-key-reconciliation-state" not in response.text
+    # Static fallbacks live behind the advanced disclosure.
+    assert "Static fallback keys (advanced)" in response.text
+    assert "static-openai" in response.text
+
+
+def _identity_admin_rotator(monkeypatch, group):
+    """Rotator mock with a configured identity controller and one group."""
+
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        if path in {"/status", "/settings"} or path.startswith("/history"):
+            return []
+        if path == "/providers/anthropic":
+            return {
+                "vendor": "anthropic",
+                "state": "awaiting_enrollment",
+                "configured": False,
+                "enabled": False,
+                "private_key_jwt_ready": True,
+                "nonsecret_ids": {},
+            }
+        if path == "/identity/status":
+            return {
+                "configured": True,
+                "controller_usable": True,
+                "bootstrap_available": False,
+                "ldap_configured": True,
+                "break_glass_escrowed": True,
+                "vault_oidc_rp_escrowed": True,
+            }
+        if path == "/identity/groups":
+            return [dict(group)]
+        if path.startswith("/identity/users?"):
+            return [
+                {
+                    "id": "user-1",
+                    "username": "lab-developer",
+                    "email": "lab-developer@example.test",
+                    "enabled": True,
+                }
+            ]
+        if path == f"/identity/groups/{group['id']}/members":
+            return [
+                {
+                    "id": "member-1",
+                    "username": "lab-developer",
+                    "email": "lab-developer@example.test",
+                    "enabled": True,
+                }
+            ]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+
+
+def test_selected_group_renders_policy_form_and_members_inline(
+    admin_client, set_admin_session, monkeypatch
+):
+    _identity_admin_rotator(
+        monkeypatch,
+        _unlimited_group(
+            allowed_models=["claude-haiku"], default_model="claude-haiku"
+        ),
+    )
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": "c" * 43,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.get("/admin?group_id=group-1")
+
+    assert response.status_code == 200
+    # Re-homed policy form: same route and field names, now master-detail.
+    assert 'action="/admin/identity/groups/group-1/policy"' in response.text
+    for field in (
+        'name="tpm_limit"',
+        'name="rpm_limit"',
+        'name="allowed_models"',
+        'name="default_model"',
+    ):
+        assert field in response.text, field
+    # Inline member management for the selected group.
+    assert 'action="/admin/identity/groups/group-1/members"' in response.text
+    assert (
+        'action="/admin/identity/groups/group-1/members/member-1/remove"'
+        in response.text
+    )
+    assert "lab-developer@example.test" in response.text
+
+
+def test_selected_group_deconfigured_restriction_renders_the_widening_guard(
+    admin_client, set_admin_session, monkeypatch
+):
+    _identity_admin_rotator(
+        monkeypatch,
+        _unlimited_group(
+            allowed_models=["claude-opus"], default_model="claude-opus"
+        ),
+    )
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": "c" * 43,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.get("/admin?group_id=group-1")
+
+    assert response.status_code == 200
+    assert "no longer configured in LiteLLM" in response.text
+    assert 'name="remove_model_restrictions"' in response.text
+
+
+# --- egress trust pin ---------------------------------------------------------
+
+
+def test_egress_trust_status_verifies_the_shipped_bundle():
+    trust = main._egress_trust_status()
+
+    assert trust["verified"] is True
+    assert [pin["sha256"] for pin in trust["pins"]] == [
+        pin["sha256"] for pin in main.ANTHROPIC_EGRESS_CA_PINS
+    ]
+    assert trust["pins"][0]["display"].startswith("1D:FC:16:05:")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,  # missing bundle
+        "no certificates at all",
+        "-----BEGIN CERTIFICATE-----\n!!!not-base64!!!\n-----END CERTIFICATE-----\n",
+        # Valid PEM shape, wrong certificate content: fingerprint mismatch.
+        "-----BEGIN CERTIFICATE-----\nbm90LWEtcmVhbC1jZXJ0aWZpY2F0ZQ==\n"
+        "-----END CERTIFICATE-----\n",
+    ],
+)
+def test_egress_trust_status_fails_closed_on_missing_or_tampered_bundle(
+    monkeypatch, tmp_path, content
+):
+    bundle = tmp_path / "anthropic-egress-ca.pem"
+    if content is not None:
+        bundle.write_text(content)
+    monkeypatch.setattr(main, "ANTHROPIC_EGRESS_CA_BUNDLE_PATH", bundle)
+
+    trust = main._egress_trust_status()
+
+    assert trust["verified"] is False
+    # The reviewed pins are still rendered so the operator can compare.
+    assert [pin["sha256"] for pin in trust["pins"]] == [
+        pin["sha256"] for pin in main.ANTHROPIC_EGRESS_CA_PINS
+    ]
+
+
+def test_admin_page_renders_the_verified_egress_pin(
+    admin_client, set_admin_session, monkeypatch
+):
+    _happy_admin_rotator(monkeypatch)
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    response = admin_client.get("/admin")
+
+    assert response.status_code == 200
+    assert "Pin verified" in response.text
+    assert "Google Trust Services WE1" in response.text
+    assert "GTS Root R4" in response.text
+    assert 'action="/admin/egress-trust/verify"' in response.text
+    # The periodic canary is an explicit follow-up, never a faked live monitor.
+    assert "not yet wired" in response.text
+
+
+def test_egress_trust_verify_requires_live_admin_and_csrf(
+    admin_client, set_admin_session, monkeypatch
+):
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        if path == "/identity/authorization/revoked-admin":
+            return {"admin": False}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    csrf = "c" * 43
+
+    # A revoked admin session is denied before any verification runs.
+    set_admin_session(
+        {
+            "user": portal_user(subject="revoked-admin", roles=[settings.admin_role]),
+            "csrf_token": csrf,
+        }
+    )
+    revoked = admin_client.post(
+        "/admin/egress-trust/verify",
+        data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert revoked.status_code == 403
+
+    # A bad CSRF token is rejected; a valid one re-verifies and redirects to
+    # the Providers tab.
+    admin_client.cookies.clear()
+    set_admin_session(
+        {"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf}
+    )
+    bad_csrf = admin_client.post(
+        "/admin/egress-trust/verify",
+        data={"csrf_token": "x" * 43},
+        follow_redirects=False,
+    )
+    assert bad_csrf.status_code == 303
+
+    set_admin_session(
+        {"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf}
+    )
+    verified = admin_client.post(
+        "/admin/egress-trust/verify",
+        data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert verified.status_code == 303
+    assert verified.headers["location"] == "/admin#tab-providers"
+
+
+def test_user_portal_has_no_egress_trust_or_tabbed_admin_routes(client) -> None:
+    assert (
+        client.post("/admin/egress-trust/verify", follow_redirects=False).status_code
+        == 404
+    )
+    assert client.get("/admin", follow_redirects=False).status_code == 404
+
+
 def test_project_policy_widens_deconfigured_restriction_only_with_explicit_optout(
     admin_client, set_admin_session, monkeypatch
 ):

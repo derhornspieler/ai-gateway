@@ -1,8 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Gateway key inventory — AI Gateway{% endblock %}
+{% block tabs %}
+<nav class="tabs" role="tablist" aria-label="Admin console sections">
+  <a role="tab" href="/admin" aria-selected="false">Identity &amp; Access</a>
+  <a role="tab" href="/admin/keys" aria-selected="true" aria-current="page">API Keys{% if total_count %} <span class="count">{{ total_count }}</span>{% endif %}</a>
+  <a role="tab" href="/admin#tab-providers" aria-selected="false">Providers &amp; JWT</a>
+  <a role="tab" href="/admin#tab-rotation" aria-selected="false">Key Rotation</a>
+  <a role="tab" href="/admin#tab-audit" aria-selected="false">Audit</a>
+</nav>
+{% endblock %}
 {% block content %}
-<h1>Gateway key inventory</h1>
-<p class="muted">Every LiteLLM virtual key issued by this gateway — self-service portal keys and operator-managed keys. Identifiers are persisted token hashes; plaintext credentials are never shown here. Spend analytics live in Grafana.</p>
+<h1 class="page">API keys</h1>
+<p class="sub">Every LiteLLM virtual key issued by this gateway — self-service portal keys and operator-managed keys. Identifiers are persisted token hashes; plaintext credentials are never shown here. Spend and usage analytics live in Grafana.</p>
 
 {% if list_error %}
 <div class="flash error">{{ list_error }}</div>
@@ -16,100 +25,109 @@
 </div>
 {% endif %}
 
-<div class="card">
-  <h3>Keys <span class="badge">{{ total_count }} total</span></h3>
-  {% if keys %}
-  <table>
-    <thead>
-      <tr>
-        <th>Owner</th><th>Alias</th><th>Provenance</th><th>Models</th>
-        <th>Spend</th><th>Budget</th><th>TPM</th><th>RPM</th>
-        <th>Expires</th><th>Status</th><th>Actions</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for k in keys %}
-      <tr>
-        <td class="muted">{{ k.owner or "—" }}</td>
-        <td>{{ k.alias or "(no alias)" }}<br><code class="muted">{{ k.token[:16] }}{% if k.token %}&hellip;{% endif %}</code></td>
-        <td>
-          {% if k.provenance == "portal" %}
-          <span class="badge">portal: {{ k.project }}</span>
-          {% elif k.provenance == "invalid-provenance" %}
-          <span class="badge">invalid provenance</span>
-          {% else %}
-          <span class="badge">operator</span>
-          {% endif %}
-          {% if k.created_via and k.provenance != "portal" %}<br><span class="muted">{{ k.created_via }}</span>{% endif %}
-        </td>
-        <td class="muted">{{ k.models | join(", ") if k.models else "all" }}</td>
-        <td>{{ "%.4f" | format(k.spend) if k.spend is not none else "—" }}</td>
-        <td>{{ k.max_budget if k.max_budget is not none else "none" }}</td>
-        <td>{{ k.tpm_limit if k.tpm_limit is not none else "none" }}</td>
-        <td>{{ k.rpm_limit if k.rpm_limit is not none else "none" }}</td>
-        <td class="muted">{{ k.expires or "never" }}</td>
-        <td>
-          {% if k.blocked %}
-          <span class="badge">blocked</span>
-          {% elif k.active %}
-          <span class="badge">active</span>
-          {% else %}
-          <span class="badge">expired</span>
-          {% endif %}
-        </td>
-        <td>
-          {% if identity_step_up_recent and k.manageable %}
-          {% if k.blocked %}
-          <form class="inline" method="post" action="/admin/keys/unblock" data-confirm="Unblock this key? It starts working again immediately.">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="token" value="{{ k.token }}">
-            <input type="hidden" name="page" value="{{ page }}">
-            <button type="submit" class="ghost">Unblock</button>
-          </form>
-          {% else %}
-          <form class="inline" method="post" action="/admin/keys/block" data-confirm="Block this key? All of its requests fail immediately.">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="token" value="{{ k.token }}">
-            <input type="hidden" name="page" value="{{ page }}">
-            <button type="submit" class="danger">Block</button>
-          </form>
-          {% endif %}
-          <form method="post" action="/admin/keys/limits" style="margin-top: 8px;">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="token" value="{{ k.token }}">
-            <input type="hidden" name="page" value="{{ page }}">
-            <label for="budget-{{ loop.index }}">Budget (USD, or none)</label>
-            <input type="text" id="budget-{{ loop.index }}" name="max_budget" maxlength="32" placeholder="unchanged" autocomplete="off">
-            <label for="tpm-{{ loop.index }}">TPM limit (or none)</label>
-            <input type="text" id="tpm-{{ loop.index }}" name="tpm_limit" maxlength="32" placeholder="unchanged" autocomplete="off">
-            <label for="rpm-{{ loop.index }}">RPM limit (or none)</label>
-            <input type="text" id="rpm-{{ loop.index }}" name="rpm_limit" maxlength="32" placeholder="unchanged" autocomplete="off">
-            <label for="duration-{{ loop.index }}">Extend expiry (e.g. 30d)</label>
-            <input type="text" id="duration-{{ loop.index }}" name="duration" maxlength="16" placeholder="unchanged" autocomplete="off">
-            <div style="margin-top: 8px;"><button type="submit" class="ghost">Apply limits</button></div>
-          </form>
-          {% elif not k.manageable %}
-          <span class="muted">No persisted identifier</span>
-          {% else %}
-          <span class="muted">Reauthenticate to change</span>
-          {% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <p class="muted">No keys on this page.</p>
-  {% endif %}
-
-  <div style="margin-top: 14px;">
-    {% if page > 1 %}
-    <a class="btn ghost" href="/admin/keys?page={{ page - 1 }}">&larr; Previous</a>
-    {% endif %}
-    <span class="muted">Page {{ page }} of {{ total_pages if total_pages else 1 }}</span>
-    {% if page < total_pages %}
-    <a class="btn ghost" href="/admin/keys?page={{ page + 1 }}">Next &rarr;</a>
-    {% endif %}
+{% if keys %}
+<div class="card" style="padding: 0; overflow: hidden;">
+  <div class="tblwrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Key</th><th>Provenance</th><th>Owner</th><th>Models</th>
+          <th class="tnum">Spend</th><th class="tnum">Budget</th>
+          <th class="tnum">TPM</th><th class="tnum">RPM</th>
+          <th>Expires</th><th>Status</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for k in keys %}
+        <tr>
+          <td>{{ k.alias or "(no alias)" }}<br><code class="muted">{{ k.token[:16] }}{% if k.token %}&hellip;{% endif %}</code></td>
+          <td>
+            {% if k.provenance == "portal" %}
+            <span class="chip cap">portal: {{ k.project }}</span>
+            {% elif k.provenance == "invalid-provenance" %}
+            <span class="chip">invalid provenance</span>
+            {% else %}
+            <span class="chip">operator</span>
+            {% endif %}
+            {% if k.created_via and k.provenance != "portal" %}<br><span class="muted">{{ k.created_via }}</span>{% endif %}
+          </td>
+          <td class="muted">{{ k.owner or "—" }}</td>
+          <td class="muted">{{ k.models | join(", ") if k.models else "all" }}</td>
+          <td class="tnum">{{ "%.4f" | format(k.spend) if k.spend is not none else "—" }}</td>
+          <td class="tnum">{{ k.max_budget if k.max_budget is not none else "none" }}</td>
+          <td class="tnum">{{ k.tpm_limit if k.tpm_limit is not none else "none" }}</td>
+          <td class="tnum">{{ k.rpm_limit if k.rpm_limit is not none else "none" }}</td>
+          <td class="muted">{{ k.expires or "never" }}</td>
+          <td>
+            {% if k.blocked %}
+            <span class="pill off"><span class="dot"></span>blocked</span>
+            {% elif k.active %}
+            <span class="pill ok"><span class="dot"></span>active</span>
+            {% else %}
+            <span class="pill warn"><span class="dot"></span>expired</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if identity_step_up_recent and k.manageable %}
+            {% if k.blocked %}
+            <form class="inline" method="post" action="/admin/keys/unblock" data-confirm="Unblock this key? It starts working again immediately.">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="token" value="{{ k.token }}">
+              <input type="hidden" name="page" value="{{ page }}">
+              <button type="submit" class="ghost sm">Unblock</button>
+            </form>
+            {% else %}
+            <form class="inline" method="post" action="/admin/keys/block" data-confirm="Block this key? All of its requests fail immediately.">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="token" value="{{ k.token }}">
+              <input type="hidden" name="page" value="{{ page }}">
+              <button type="submit" class="danger sm">Block</button>
+            </form>
+            {% endif %}
+            <details class="adv" style="margin-top: 8px; min-width: 190px;">
+              <summary>Edit limits</summary>
+              <div class="advbody">
+                <form method="post" action="/admin/keys/limits">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="token" value="{{ k.token }}">
+                  <input type="hidden" name="page" value="{{ page }}">
+                  <label class="fld" for="budget-{{ loop.index }}" style="margin-top: 6px;">Budget (USD, or none)</label>
+                  <input type="text" id="budget-{{ loop.index }}" name="max_budget" maxlength="32" placeholder="unchanged" autocomplete="off">
+                  <label class="fld" for="tpm-{{ loop.index }}">TPM limit (or none)</label>
+                  <input type="text" id="tpm-{{ loop.index }}" name="tpm_limit" maxlength="32" placeholder="unchanged" autocomplete="off">
+                  <label class="fld" for="rpm-{{ loop.index }}">RPM limit (or none)</label>
+                  <input type="text" id="rpm-{{ loop.index }}" name="rpm_limit" maxlength="32" placeholder="unchanged" autocomplete="off">
+                  <label class="fld" for="duration-{{ loop.index }}">Extend expiry (e.g. 30d)</label>
+                  <input type="text" id="duration-{{ loop.index }}" name="duration" maxlength="16" placeholder="unchanged" autocomplete="off">
+                  <div style="margin-top: 10px;"><button type="submit" class="ghost sm">Apply limits</button></div>
+                </form>
+              </div>
+            </details>
+            {% elif not k.manageable %}
+            <span class="muted">No persisted identifier</span>
+            {% else %}
+            <span class="muted">Reauthenticate to change</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
+</div>
+{% else %}
+<div class="card">
+  <p class="muted" style="margin: 0;">No keys on this page.</p>
+</div>
+{% endif %}
+
+<div style="margin-top: 14px; display: flex; align-items: center; gap: 12px;">
+  {% if page > 1 %}
+  <a class="btn ghost sm" href="/admin/keys?page={{ page - 1 }}">&larr; Previous</a>
+  {% endif %}
+  <span class="muted">Page {{ page }} of {{ total_pages if total_pages else 1 }}</span>
+  {% if page < total_pages %}
+  <a class="btn ghost sm" href="/admin/keys?page={{ page + 1 }}">Next &rarr;</a>
+  {% endif %}
 </div>
 {% endblock %}

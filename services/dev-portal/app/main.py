@@ -12,6 +12,8 @@ route.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -76,6 +78,34 @@ PROVIDER_STATES = frozenset(
 )
 PROJECT_LOCK_STRIPES = 64
 AMBIGUOUS_GENERATE_CLEANUP_LIMIT = 8
+
+# --- egress trust pin (Anthropic) -------------------------------------------
+#
+# The Envoy egress proxy originates TLS to api.anthropic.com against exactly
+# this reviewed two-certificate bundle (services/egress-proxy/certs/
+# anthropic-ca.pem). A byte-identical copy ships inside this control-plane
+# image (app/data/) so the admin console can re-verify the pin on demand
+# without any egress network access. The fingerprints below are the REVIEWED
+# values; a contract test recomputes them from the committed bundle.
+ANTHROPIC_EGRESS_CA_BUNDLE_PATH = (
+    Path(__file__).parent / "data" / "anthropic-egress-ca.pem"
+)
+ANTHROPIC_EGRESS_CA_PINS = (
+    {
+        "role": "Issuing CA",
+        "label": "Google Trust Services WE1",
+        "sha256": "1dfc1605fbad358d8bc844f76d15203fac9ca5c1a79fd4857ffaf2864fbebf96",
+    },
+    {
+        "role": "Root",
+        "label": "GTS Root R4",
+        "sha256": "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d",
+    },
+)
+EGRESS_CA_BUNDLE_MAX_BYTES = 64 * 1024
+_PEM_CERTIFICATE_RE = re.compile(
+    r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", re.S
+)
 _project_locks = tuple(asyncio.Lock() for _ in range(PROJECT_LOCK_STRIPES))
 # A browser disconnect must not cancel a post-generation authorization check
 # halfway through and leave its plaintext-bearing response path in an
@@ -872,6 +902,10 @@ async def index(
             "project_policies": project_policies,
             "available_models": available_models,
             "policy_error": policy_error,
+            # The "Connect a tool" tab always renders placeholder snippets;
+            # a generated key exists only in its one-time POST response.
+            "tools": tools.rendered_tools(settings.public_api_base, "YOUR_KEY"),
+            "api_base": settings.public_api_base,
             "flashes": auth.pop_flash(request),
             "csrf_token": auth.get_csrf_token(request),
         },
@@ -974,6 +1008,8 @@ async def create_key(
             "project_policies": policies,
             "available_models": available_models,
             "policy_error": None,
+            "tools": tools.rendered_tools(settings.public_api_base, "YOUR_KEY"),
+            "api_base": settings.public_api_base,
             "selected_project": clean_project,
             "flashes": auth.pop_flash(request),
             "csrf_token": auth.get_csrf_token(request),
@@ -1054,11 +1090,18 @@ async def deactivate_key(
 async def snippets_page(
     request: Request, user: dict[str, Any] = Depends(auth.require_developer)
 ) -> HTMLResponse:
-    if not await _live_project_ids(request, user):
+    project_ids = await _live_project_ids(request, user)
+    if not project_ids:
         raise auth.NotAuthorized()
     # Plaintext keys are never persisted for later views. Snippets reached by
     # navigation therefore always use an explicit placeholder.
     rendered = tools.rendered_tools(settings.public_api_base, "YOUR_KEY")
+    # The connect surface shows the project's live model policy (allowed
+    # models with the default marked) so a newly configured model appears
+    # automatically; a failed policy read degrades to an explanatory note.
+    project_policies, available_models, _policy_error = await _project_policy_view(
+        request, user, project_ids
+    )
 
     return templates.TemplateResponse(
         request,
@@ -1069,6 +1112,9 @@ async def snippets_page(
             "tools": rendered,
             "api_base": settings.public_api_base,
             "using_placeholder": True,
+            "project_ids": project_ids,
+            "project_policies": project_policies,
+            "available_models": available_models,
             "flashes": auth.pop_flash(request),
         },
     )
@@ -1637,6 +1683,154 @@ def _safe_provider_status(raw: Any) -> dict[str, Any] | None:
     }
 
 
+def _safe_rotator_status(raw: Any) -> dict[str, dict[str, Any]]:
+    """Allowlist the rotator's per-vendor scheduler summary for display.
+
+    Replaces the old raw ``repr`` dump on the admin page: only bounded,
+    validated fields reach the template, keyed by a validated vendor id, so a
+    compromised rotator cannot inject markup or unbounded data through this
+    read-only view.
+    """
+
+    if not isinstance(raw, list):
+        return {}
+
+    def bounded_text(value: Any, limit: int = 64) -> str:
+        return value[:limit] if isinstance(value, str) else ""
+
+    rows: dict[str, dict[str, Any]] = {}
+    for item in raw[:100]:
+        if not isinstance(item, dict):
+            continue
+        vendor = item.get("vendor")
+        if not isinstance(vendor, str) or VENDOR_RE.fullmatch(vendor) is None:
+            continue
+        interval = item.get("interval_seconds")
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 0:
+            interval = None
+        last = item.get("last_rotation")
+        last_time = ""
+        last_status = ""
+        if isinstance(last, dict):
+            last_time = bounded_text(last.get("timestamp") or last.get("time"))
+            last_status = bounded_text(last.get("status"))
+        alerts = item.get("alerts")
+        rows[vendor] = {
+            "vendor": vendor,
+            "enabled": item.get("enabled") is True,
+            "interval_seconds": interval,
+            "next_run_time": bounded_text(item.get("next_run_time")),
+            "rotation_in_progress": item.get("rotation_in_progress") is True,
+            "last_time": last_time,
+            "last_status": last_status,
+            "alert_count": min(len(alerts), 100) if isinstance(alerts, list) else 0,
+        }
+    return rows
+
+
+# --- admin / egress trust pin ------------------------------------------------
+
+
+def _fingerprint_display(hex_value: str) -> str:
+    """Render a SHA-256 hex digest in the conventional colon-separated form."""
+
+    return ":".join(
+        hex_value[index : index + 2].upper() for index in range(0, len(hex_value), 2)
+    )
+
+
+def _egress_trust_status() -> dict[str, Any]:
+    """Re-verify the shipped Anthropic egress CA bundle against reviewed pins.
+
+    On-demand and local-only by design: this control plane has no external
+    network path (only Envoy does), so the verifiable property here is that
+    the pinned bundle shipped in this image is byte-for-byte the reviewed
+    WE1/R4 issuer set Envoy enforces at egress. Continuous monitoring of the
+    live presented chain is a deliberate follow-up, not silently faked here.
+    """
+
+    pins = [
+        {**pin, "display": _fingerprint_display(pin["sha256"])}
+        for pin in ANTHROPIC_EGRESS_CA_PINS
+    ]
+    expected = [pin["sha256"] for pin in ANTHROPIC_EGRESS_CA_PINS]
+    try:
+        raw = ANTHROPIC_EGRESS_CA_BUNDLE_PATH.read_bytes()
+    except OSError:
+        return {
+            "pins": pins,
+            "verified": False,
+            "detail": "The pinned CA bundle shipped with this image is missing "
+            "or unreadable. Re-converge with Ansible to restore the reviewed "
+            "bundle.",
+        }
+    if len(raw) > EGRESS_CA_BUNDLE_MAX_BYTES:
+        return {
+            "pins": pins,
+            "verified": False,
+            "detail": "The shipped CA bundle exceeds the reviewed size bound "
+            "and was not verified.",
+        }
+    observed: list[str] = []
+    for block in _PEM_CERTIFICATE_RE.findall(raw.decode("ascii", errors="replace")):
+        try:
+            der = base64.b64decode("".join(block.split()), validate=True)
+        except (binascii.Error, ValueError):
+            return {
+                "pins": pins,
+                "verified": False,
+                "detail": "The shipped CA bundle contains an unparseable "
+                "certificate block and was not verified.",
+            }
+        observed.append(hashlib.sha256(der).hexdigest())
+    if observed == expected:
+        return {
+            "pins": pins,
+            "verified": True,
+            "detail": "The pinned bundle shipped in this control plane matches "
+            "the reviewed WE1 and GTS Root R4 fingerprints exactly. Envoy "
+            "rejects any api.anthropic.com chain not issued by this CA.",
+        }
+    return {
+        "pins": pins,
+        "verified": False,
+        "detail": "The shipped CA bundle does NOT match the reviewed "
+        "fingerprints. Treat egress trust as unverified and re-converge with "
+        "Ansible to restore the reviewed bundle.",
+    }
+
+
+@admin_app.post("/admin/egress-trust/verify")
+async def admin_egress_trust_verify(
+    request: Request,
+    user: dict[str, Any] = Depends(require_live_admin),
+    csrf_token: str = Form(..., min_length=32, max_length=128),
+):
+    """On-demand re-verification of the Anthropic egress CA pin (read-only)."""
+
+    redirect = RedirectResponse("/admin#tab-providers", status_code=303)
+    if not auth.verify_csrf(request, csrf_token):
+        auth.flash(request, "Your session expired — please try again.", "error")
+        return redirect
+    trust = _egress_trust_status()
+    if trust["verified"]:
+        _audit("egress.trust.verify", "success", user)
+        auth.flash(
+            request,
+            "Egress CA pin re-verified: the shipped Anthropic bundle matches "
+            "the reviewed fingerprints.",
+            "success",
+        )
+    else:
+        _audit("egress.trust.verify", "mismatch", user)
+        auth.flash(
+            request,
+            "Egress CA pin verification failed: " + str(trust["detail"]),
+            "error",
+        )
+    return redirect
+
+
 @admin_app.get("/admin", response_class=HTMLResponse)
 async def admin_page(
     request: Request, user: dict[str, Any] = Depends(auth.require_admin)
@@ -1783,9 +1977,10 @@ async def admin_page(
         {
             "user": user,
             "is_admin": True,
-            "status": status_data,
+            "rotator_status": _safe_rotator_status(status_data),
             "vendors": vendors,
             "history": history,
+            "egress_trust": _egress_trust_status(),
             "anthropic_provider": anthropic_provider,
             "identity_status": identity_status,
             "identity_groups": identity_groups,

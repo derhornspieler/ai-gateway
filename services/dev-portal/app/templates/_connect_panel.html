@@ -1,0 +1,42 @@
+{# Shared "Connect a tool" surface: rendered as the second tab of the
+   dev-portal index page and as the standalone /snippets page. Snippets reached
+   by navigation always use the YOUR_KEY placeholder — a generated key exists
+   only in its one-time creation response. #}
+<h1 class="page">Connect a tool</h1>
+<p class="sub">Point any OpenAI- or Anthropic-compatible tool at the gateway. These templates use the <span class="mono">YOUR_KEY</span> placeholder — replace it locally with the key you copied from its one-time creation response. For security this portal never retains or redisplays a generated key.</p>
+
+<div class="baseurl"><span class="note">Gateway base URL</span> <code id="gateway-base-url">{{ api_base }}</code><span class="spacer"></span><button type="button" class="copy" data-copy-target="gateway-base-url">Copy</button></div>
+
+<div class="toolgrid">
+  {% for tool in tools %}
+  <div class="card toolcard">
+    <h4>{{ tool.name }} <button type="button" class="copy" data-copy-target="snippet-{{ tool.id }}">copy</button></h4>
+    <p class="note" style="margin: 0 0 8px;">{{ tool.description }}</p>
+    <pre id="snippet-{{ tool.id }}">{{ tool.snippet }}</pre>
+    {% if tool.note %}
+    <p class="note" style="margin: 8px 0 0;"><strong>Note:</strong> {{ tool.note }}</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+{% if project_ids %}
+<p class="note" style="margin-top: 16px;">
+  {% for project_id in project_ids %}
+  {% set policy = project_policies.get(project_id) if project_policies else none %}
+  Your project <span class="mono">{{ project_id }}</span> can use:
+  {% if policy %}
+  {% set project_models = policy.allowed_models if policy.allowed_models else available_models %}
+  {% if project_models %}
+  {% for model in project_models %}<span class="mono">{{ model }}</span>{% if policy.default_model == model %} <span class="pill ok" style="font-size: 10px; padding: 0 6px;">default</span>{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}.
+  {% else %}
+  all configured models.
+  {% endif %}
+  {% else %}
+  <span class="muted">model policy unavailable right now.</span>
+  {% endif %}
+  <br>
+  {% endfor %}
+  An administrator sets which models a project may use — a newly configured model appears here automatically. A request that omits a model is served with the project default.
+</p>
+{% endif %}

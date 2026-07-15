@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 import unittest
@@ -7,6 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PORTAL_TEMPLATES = ROOT / "services/dev-portal/app/templates"
 
 
 class AdminSurfaceContractTests(unittest.TestCase):
@@ -229,6 +232,78 @@ class AdminSurfaceContractTests(unittest.TestCase):
         )
         self.assertNotIn('path "kv/data/ai-gateway/*"', bootstrap)
         self.assertNotIn('path "kv/metadata/ai-gateway/*"', bootstrap)
+
+
+class TabbedConsoleSurfaceContractTests(unittest.TestCase):
+    """The tabbed portal/console structure and the egress-trust pin are
+    reviewed text: the vendored CA bundle must stay byte-identical to the
+    Envoy egress pin, its reviewed fingerprints must match the committed
+    bundle, and the tab rails (including the strict dev/admin surface split)
+    must not drift silently."""
+
+    def test_portal_ships_the_exact_pinned_anthropic_egress_bundle(self) -> None:
+        source = (ROOT / "services/egress-proxy/certs/anthropic-ca.pem").read_bytes()
+        shipped = (
+            ROOT / "services/dev-portal/app/data/anthropic-egress-ca.pem"
+        ).read_bytes()
+        self.assertEqual(shipped, source)
+
+    def test_reviewed_egress_pin_fingerprints_match_the_committed_bundle(
+        self,
+    ) -> None:
+        pem = (ROOT / "services/egress-proxy/certs/anthropic-ca.pem").read_text()
+        blocks = re.findall(
+            r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", pem, re.S
+        )
+        self.assertEqual(len(blocks), 2)
+        portal_main = (ROOT / "services/dev-portal/app/main.py").read_text()
+        for block in blocks:
+            digest = hashlib.sha256(
+                base64.b64decode("".join(block.split()))
+            ).hexdigest()
+            self.assertIn(f'"{digest}"', portal_main)
+
+    def test_admin_console_tab_rail_is_pinned(self) -> None:
+        admin = (PORTAL_TEMPLATES / "admin.html").read_text()
+        self.assertIn('role="tablist"', admin)
+        for pinned in (
+            'data-tab="identity"',
+            '<a role="tab" href="/admin/keys"',
+            'data-tab="providers"',
+            'data-tab="rotation"',
+            'data-tab="audit"',
+            'id="tab-identity" role="tabpanel"',
+            'id="tab-providers" role="tabpanel"',
+            'id="tab-rotation" role="tabpanel"',
+            'id="tab-audit" role="tabpanel"',
+            'action="/admin/egress-trust/verify"',
+        ):
+            self.assertIn(pinned, admin)
+
+        keys_page = (PORTAL_TEMPLATES / "admin_keys.html").read_text()
+        self.assertIn('role="tablist"', keys_page)
+        for pinned in (
+            '<a role="tab" href="/admin" aria-selected="false">Identity',
+            'href="/admin/keys" aria-selected="true"',
+            'href="/admin#tab-providers"',
+            'href="/admin#tab-rotation"',
+            'href="/admin#tab-audit"',
+        ):
+            self.assertIn(pinned, keys_page)
+
+    def test_dev_portal_tab_rail_never_references_the_admin_surface(self) -> None:
+        index = (PORTAL_TEMPLATES / "index.html").read_text()
+        for pinned in (
+            'role="tablist"',
+            'data-tab="keys"',
+            'data-tab="connect"',
+            'id="tab-keys" role="tabpanel"',
+            'id="tab-connect" role="tabpanel"',
+            "data-one-time-secret",
+        ):
+            self.assertIn(pinned, index)
+        for name in ("index.html", "snippets.html", "_connect_panel.html"):
+            self.assertNotIn("/admin", (PORTAL_TEMPLATES / name).read_text())
 
 
 if __name__ == "__main__":

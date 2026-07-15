@@ -1,37 +1,30 @@
 {% extends "base.html" %}
 {% block title %}Administration — AI Gateway{% endblock %}
+{% block tabs %}
+<nav class="tabs" role="tablist" aria-label="Admin console sections">
+  <button type="button" role="tab" id="tabbtn-identity" data-tab="identity" aria-controls="tab-identity" aria-selected="true">Identity &amp; Access{% if identity_groups %} <span class="count">{{ identity_groups | length }}</span>{% endif %}</button>
+  <a role="tab" href="/admin/keys" aria-selected="false">API Keys</a>
+  <button type="button" role="tab" id="tabbtn-providers" data-tab="providers" aria-controls="tab-providers" aria-selected="false">Providers &amp; JWT{% if anthropic_provider and anthropic_provider.state != 'configured' %} <span class="pipdot warn" aria-hidden="true"></span>{% endif %}</button>
+  <button type="button" role="tab" id="tabbtn-rotation" data-tab="rotation" aria-controls="tab-rotation" aria-selected="false">Key Rotation</button>
+  <button type="button" role="tab" id="tabbtn-audit" data-tab="audit" aria-controls="tab-audit" aria-selected="false">Audit</button>
+</nav>
+{% endblock %}
 {% block content %}
-<h1>AI Gateway administration</h1>
-
-<h2>Identity and authorization</h2>
-<p class="muted">Samba AD owns lab usernames and passwords. This portal manages only Keycloak-local authorization groups and their imported directory users.</p>
-
-{% if identity_status %}
-<div class="card">
-  <h3>Keycloak controller
-    <span class="badge">{{ 'ready' if identity_status.configured else 'setup required' }}</span>
-  </h3>
-  <p>Controller credential: {{ 'usable' if identity_status.controller_usable else 'unavailable' }}<br>
-     LDAP federation: {{ 'configured' if identity_status.ldap_configured else 'not configured' }}<br>
-     Break-glass escrow: {% if identity_status.break_glass_escrowed %}escrowed{% elif not identity_status.break_glass_escrow_readable %}unreadable — rotator Vault policy predates the escrow path (see identity operations, “Upgrading an existing deployment”){% else %}not escrowed{% endif %}<br>
-     Vault OIDC client escrow: {% if identity_status.vault_oidc_rp_escrowed %}escrowed{% elif not identity_status.vault_oidc_rp_escrow_readable %}unreadable — rotator Vault policy predates the escrow path (see identity operations, “Vault OIDC login”){% else %}not escrowed{% endif %}</p>
-  {% if identity_status.controller_certificate_sha256 %}
-  <p class="muted">Controller certificate SHA-256</p>
-  <code>{{ identity_status.controller_certificate_sha256 }}</code>
-  {% endif %}
-  {% if identity_status.broker_certificate_sha256 %}
-  <p class="muted">Anthropic broker certificate SHA-256</p>
-  <code>{{ identity_status.broker_certificate_sha256 }}</code>
-  {% endif %}
-</div>
 
 {% if not identity_step_up_recent %}
 <div class="card">
   <h3>Fresh authentication required for changes</h3>
-  <p class="muted">Viewing status is allowed with your current admin session. Identity mutations require a new Keycloak login and remain unlocked for five minutes.</p>
+  <p class="muted">Viewing status is allowed with your current admin session. Identity, provider, and policy mutations require a new Keycloak login and remain unlocked for five minutes.</p>
   <a class="btn" href="/admin/reauth">Reauthenticate with Keycloak</a>
 </div>
 {% endif %}
+
+<!-- ===================== IDENTITY & ACCESS ===================== -->
+<section class="panel active" id="tab-identity" role="tabpanel" aria-labelledby="tabbtn-identity">
+<h1 class="page">Identity &amp; access</h1>
+<p class="sub">Samba AD owns usernames and passwords. This console manages only Keycloak-local <strong>access groups</strong> — each grants capabilities and maps to an API-key project namespace. Pick a group to manage its policy and members.</p>
+
+{% if identity_status %}
 
 {% if not identity_status.configured %}
 <div class="card">
@@ -66,269 +59,485 @@
 </div>
 {% endif %}
 
-{% if identity_step_up_recent %}
-<div class="card">
-  <h3>Create project group</h3>
-  <form method="post" action="/admin/identity/groups">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="identity-group-name">Project ID (lowercase; becomes the API-key project)</label>
-    <input type="text" id="identity-group-name" name="name" required maxlength="64" pattern="[a-z0-9][a-z0-9_.-]{0,63}" autocomplete="off">
-    <label>Capabilities</label>
-    {% for capability in identity_capabilities %}
-    <label><input type="checkbox" name="capabilities" value="{{ capability }}"> {{ capability }}</label>
-    {% endfor %}
-    <div style="margin-top: 14px;"><button type="submit">Create group</button></div>
-  </form>
-</div>
-{% endif %}
-
-<h3>Managed groups</h3>
-{% if identity_groups %}
-{% for group in identity_groups %}
-<div class="card">
-  <h3>{{ group.name }} <span class="badge">{{ group.member_count }} members</span></h3>
-  <p class="muted">{{ group.capabilities | join(', ') }}</p>
-  <p class="muted">Policy — rate limit:
-    {% if group.policy.tpm_limit or group.policy.rpm_limit %}{{ group.policy.tpm_limit or "unlimited" }} TPM &middot; {{ group.policy.rpm_limit or "unlimited" }} RPM{% else %}Unlimited (default){% endif %};
-    models: {% if group.policy.allowed_models %}{{ group.policy.allowed_models | join(', ') }}{% else %}all configured{% endif %}{% if group.policy.default_model %}; default: {{ group.policy.default_model }}{% endif %}
-  </p>
-  <a class="btn ghost" href="/admin?group_id={{ group.id }}">Manage members</a>
-  {% if identity_step_up_recent and policy_models %}
-  <form method="post" action="/admin/identity/groups/{{ group.id }}/policy" style="margin-top: 14px;" data-confirm="Save this policy and re-tune every existing key in {{ group.name }}? Rate limits and model access change immediately.">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="policy-tpm-{{ group.id }}">TPM limit (blank = unlimited)</label>
-    <input type="text" id="policy-tpm-{{ group.id }}" name="tpm_limit" value="{{ group.policy.tpm_limit or '' }}" maxlength="32" placeholder="unlimited" autocomplete="off">
-    <label for="policy-rpm-{{ group.id }}">RPM limit (blank = unlimited)</label>
-    <input type="text" id="policy-rpm-{{ group.id }}" name="rpm_limit" value="{{ group.policy.rpm_limit or '' }}" maxlength="32" placeholder="unlimited" autocomplete="off">
-    <label>Allowed models (none checked = all configured models, including future ones)</label>
-    {% for model in policy_models %}
-    <label><input type="checkbox" name="allowed_models" value="{{ model }}"{% if group.policy.allowed_models and model in group.policy.allowed_models %} checked{% endif %}> {{ model }}</label>
-    {% endfor %}
-    {% set stored_models = (group.policy.allowed_models or []) + ([group.policy.default_model] if group.policy.default_model else []) %}
-    {% set deconfigured = stored_models | reject('in', policy_models) | unique | list %}
-    {% if deconfigured %}
-    <p class="flash error" style="margin-top: 8px;">This project is restricted to <strong>{{ deconfigured | join(', ') }}</strong>, no longer configured in LiteLLM. This form cannot preserve that restriction. Re-add the model(s) to LiteLLM, or check the box below to widen the project deliberately.</p>
-    <label><input type="checkbox" name="remove_model_restrictions" value="1"> Remove all model restrictions (widen this project to every configured model)</label>
-    {% endif %}
-    <label for="policy-default-{{ group.id }}">Default model (surfaced to developers)</label>
-    <select id="policy-default-{{ group.id }}" name="default_model">
-      <option value="">(none)</option>
-      {% for model in policy_models %}
-      <option value="{{ model }}"{% if group.policy.default_model == model %} selected{% endif %}>{{ model }}</option>
-      {% endfor %}
-    </select>
-    <div style="margin-top: 14px;"><button type="submit">Save policy &amp; re-tune existing keys</button></div>
-  </form>
-  {% elif identity_step_up_recent %}
-  <p class="muted" style="margin-top: 10px;">Policy editing is disabled until the configured model list can be verified.</p>
-  {% endif %}
-  {% if identity_step_up_recent and group.member_count == 0 %}
-  <form method="post" action="/admin/identity/groups/{{ group.id }}/delete" style="margin-top: 10px;" data-confirm="Delete the empty group {{ group.name }}?">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit" class="danger">Delete empty group</button>
-  </form>
-  {% endif %}
-</div>
-{% endfor %}
-{% else %}
-<p class="muted">No managed authorization groups have been created.</p>
-{% endif %}
-
-{% if selected_group_id %}
-<div class="card">
-  <h3>Directory-user assignment</h3>
-  <form method="get" action="/admin">
-    <input type="hidden" name="group_id" value="{{ selected_group_id }}">
-    <label for="identity-user-search">Find an imported AD user</label>
-    <input type="text" id="identity-user-search" name="user_search" value="{{ user_search }}" maxlength="64" autocomplete="off">
-    <button type="submit" class="ghost">Search</button>
-  </form>
-  {% if identity_step_up_recent and identity_users %}
-  <form method="post" action="/admin/identity/groups/{{ selected_group_id }}/members" style="margin-top: 14px;">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="identity-user-id">Directory user</label>
-    <select id="identity-user-id" name="user_id" required>
-      {% for directory_user in identity_users %}
-      <option value="{{ directory_user.id }}">{{ directory_user.username }}{% if directory_user.email %} — {{ directory_user.email }}{% endif %}</option>
-      {% endfor %}
-    </select>
-    <button type="submit">Assign user</button>
-  </form>
-  {% endif %}
-
-  <h3>Current members and effective access</h3>
-  {% if identity_members %}
-  <table>
-    <thead><tr><th>User</th><th>Email</th><th>Effective access</th><th>Action</th></tr></thead>
-    <tbody>
-      {% for member in identity_members %}
-      <tr>
-        <td>{{ member.username }}</td>
-        <td class="muted">{{ member.email }}</td>
-        <td>{{ selected_group.capabilities | join(', ') }}</td>
-        <td>
-          {% if identity_step_up_recent %}
-          <form class="inline" method="post" action="/admin/identity/groups/{{ selected_group_id }}/members/{{ member.id }}/remove" data-confirm="Remove {{ member.username }} from this group?">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button type="submit" class="danger">Remove</button>
-          </form>
+<div class="grid2">
+  <div>
+    <div class="eyebrow" style="margin-top: 0;">Access groups</div>
+    {% if identity_groups %}
+    <div class="glist">
+      {% for group in identity_groups %}
+      {# data-group precedes href on purpose: the live-lab acceptance harness
+         resolves a group's id from "<name> ... href=/admin?group_id=<id>". #}
+      <a class="grow" data-group="{{ group.name }}" href="/admin?group_id={{ group.id }}" aria-current="{{ 'true' if group.id == selected_group_id else 'false' }}">
+        <span class="gname">{{ group.name }} <span class="memct">{{ group.member_count }} member{{ '' if group.member_count == 1 else 's' }}</span></span>
+        <span class="gmeta">
+          {% for capability in group.capabilities %}<span class="chip cap">{{ capability }}</span>{% endfor %}
+          {% if group.policy.tpm_limit or group.policy.rpm_limit %}
+          <span class="chip">{{ group.policy.tpm_limit or "unlimited" }} TPM &middot; {{ group.policy.rpm_limit or "unlimited" }} RPM</span>
           {% else %}
-          <span class="muted">Reauthenticate to change</span>
+          <span class="chip">Unlimited</span>
           {% endif %}
-        </td>
-      </tr>
+        </span>
+      </a>
       {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <p class="muted">This group has no imported directory members.</p>
-  {% endif %}
+    </div>
+    {% else %}
+    <p class="muted">No managed authorization groups have been created.</p>
+    {% endif %}
+
+    {% if identity_step_up_recent %}
+    <details class="adv">
+      <summary>New project group</summary>
+      <div class="advbody">
+        <form method="post" action="/admin/identity/groups">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label class="fld" for="identity-group-name">Project ID (lowercase; becomes the API-key project)</label>
+          <input type="text" id="identity-group-name" name="name" required maxlength="64" pattern="[a-z0-9][a-z0-9_.-]{0,63}" autocomplete="off">
+          <label class="fld">Capabilities</label>
+          {% for capability in identity_capabilities %}
+          <label class="check"><input type="checkbox" name="capabilities" value="{{ capability }}"> {{ capability }}</label>
+          {% endfor %}
+          <div style="margin-top: 14px;"><button type="submit">Create group</button></div>
+        </form>
+      </div>
+    </details>
+    {% endif %}
+  </div>
+
+  <div>
+    {% if selected_group %}
+    <div class="eyebrow" style="margin-top: 0;">Project policy — <span style="color: var(--text);">{{ selected_group.name }}</span></div>
+    <div class="card">
+      <p class="muted" style="margin-top: 0;">Rate limit:
+        {% if selected_group.policy.tpm_limit or selected_group.policy.rpm_limit %}{{ selected_group.policy.tpm_limit or "unlimited" }} TPM &middot; {{ selected_group.policy.rpm_limit or "unlimited" }} RPM{% else %}Unlimited (default){% endif %};
+        models: {% if selected_group.policy.allowed_models %}{{ selected_group.policy.allowed_models | join(', ') }}{% else %}all configured{% endif %}{% if selected_group.policy.default_model %}; default: {{ selected_group.policy.default_model }}{% endif %}
+      </p>
+      {% if identity_step_up_recent and policy_models %}
+      <form method="post" action="/admin/identity/groups/{{ selected_group.id }}/policy" data-confirm="Save this policy and re-tune every existing key in {{ selected_group.name }}? Rate limits and model access change immediately.">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div style="display: flex; gap: 22px; flex-wrap: wrap;">
+          <div>
+            <label class="fld" for="policy-tpm-{{ selected_group.id }}" style="margin-top: 0;">TPM limit (blank = unlimited)</label>
+            <input type="text" id="policy-tpm-{{ selected_group.id }}" name="tpm_limit" value="{{ selected_group.policy.tpm_limit or '' }}" maxlength="32" placeholder="unlimited" autocomplete="off" style="width: 140px;">
+            <label class="fld" for="policy-rpm-{{ selected_group.id }}">RPM limit (blank = unlimited)</label>
+            <input type="text" id="policy-rpm-{{ selected_group.id }}" name="rpm_limit" value="{{ selected_group.policy.rpm_limit or '' }}" maxlength="32" placeholder="unlimited" autocomplete="off" style="width: 140px;">
+          </div>
+          <div>
+            <label class="fld" style="margin-top: 0;">Allowed models (none checked = all configured models, including future ones)</label>
+            {% for model in policy_models %}
+            <label class="check"><input type="checkbox" name="allowed_models" value="{{ model }}"{% if selected_group.policy.allowed_models and model in selected_group.policy.allowed_models %} checked{% endif %}> {{ model }}</label>
+            {% endfor %}
+            <label class="fld" for="policy-default-{{ selected_group.id }}">Default model (enforced — requests that omit a model use it)</label>
+            <select id="policy-default-{{ selected_group.id }}" name="default_model" style="max-width: 220px;">
+              <option value="">(none)</option>
+              {% for model in policy_models %}
+              <option value="{{ model }}"{% if selected_group.policy.default_model == model %} selected{% endif %}>{{ model }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        {% set stored_models = (selected_group.policy.allowed_models or []) + ([selected_group.policy.default_model] if selected_group.policy.default_model else []) %}
+        {% set deconfigured = stored_models | reject('in', policy_models) | unique | list %}
+        {% if deconfigured %}
+        <p class="flash error" style="margin-top: 12px;">This project is restricted to <strong>{{ deconfigured | join(', ') }}</strong>, no longer configured in LiteLLM. This form cannot preserve that restriction. Re-add the model(s) to LiteLLM, or check the box below to widen the project deliberately.</p>
+        <label class="check"><input type="checkbox" name="remove_model_restrictions" value="1"> Remove all model restrictions (widen this project to every configured model)</label>
+        {% endif %}
+        <div style="margin-top: 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+          <button type="submit">Save project policy</button>
+          <span class="note">Applies to new keys and re-tunes existing keys in this project.</span>
+        </div>
+      </form>
+      {% elif identity_step_up_recent %}
+      <p class="muted" style="margin-top: 10px;">Policy editing is disabled until the configured model list can be verified.</p>
+      {% endif %}
+    </div>
+
+    <div class="eyebrow">Members of <span style="color: var(--text);">{{ selected_group.name }}</span></div>
+    <div class="card">
+      <form method="get" action="/admin" class="addrow">
+        <input type="hidden" name="group_id" value="{{ selected_group_id }}">
+        <div>
+          <label class="fld" for="identity-user-search" style="margin-top: 0;">Find an imported AD user</label>
+          <input type="text" id="identity-user-search" name="user_search" value="{{ user_search }}" maxlength="64" autocomplete="off">
+        </div>
+        <div style="flex: 0 0 auto; min-width: 0;"><button type="submit" class="ghost">Search</button></div>
+      </form>
+      {% if identity_step_up_recent and identity_users %}
+      <form method="post" action="/admin/identity/groups/{{ selected_group_id }}/members" class="addrow" style="margin-top: 14px;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div>
+          <label class="fld" for="identity-user-id" style="margin-top: 0;">Directory user</label>
+          <select id="identity-user-id" name="user_id" required>
+            {% for directory_user in identity_users %}
+            <option value="{{ directory_user.id }}">{{ directory_user.username }}{% if directory_user.email %} — {{ directory_user.email }}{% endif %}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div style="flex: 0 0 auto; min-width: 0;"><button type="submit">Assign user</button></div>
+      </form>
+      {% endif %}
+    </div>
+
+    {% if identity_members %}
+    <div class="card" style="padding: 0; overflow: hidden;">
+      <div class="tblwrap">
+        <table>
+          <thead><tr><th>User</th><th>Email</th><th>Effective access</th><th>Action</th></tr></thead>
+          <tbody>
+            {% for member in identity_members %}
+            <tr>
+              <td>{{ member.username }}</td>
+              <td class="muted">{{ member.email }}</td>
+              <td>{% for capability in selected_group.capabilities %}<span class="chip cap">{{ capability }}</span> {% endfor %}</td>
+              <td style="text-align: right;">
+                {% if identity_step_up_recent %}
+                <form class="inline" method="post" action="/admin/identity/groups/{{ selected_group_id }}/members/{{ member.id }}/remove" data-confirm="Remove {{ member.username }} from this group?">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit" class="danger sm">Remove</button>
+                </form>
+                {% else %}
+                <span class="muted">Reauthenticate to change</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% else %}
+    <div class="card">
+      <p class="muted" style="margin: 0;">This group has no imported directory members.</p>
+    </div>
+    {% endif %}
+
+    {% if identity_step_up_recent and selected_group.member_count == 0 %}
+    <form method="post" action="/admin/identity/groups/{{ selected_group.id }}/delete" data-confirm="Delete the empty group {{ selected_group.name }}?">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="danger sm">Delete empty group</button>
+    </form>
+    {% endif %}
+    {% else %}
+    <div class="card">
+      <h3>Pick a group</h3>
+      <p class="muted">Select an access group on the left to manage its project policy and members.</p>
+    </div>
+    {% endif %}
+  </div>
 </div>
 {% endif %}
-{% endif %}
+
+<div class="eyebrow">Controller health</div>
+<div class="card">
+  <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap;">
+    <h3 style="margin: 0;">Keycloak identity controller</h3>
+    {% if identity_status.configured %}
+    <span class="pill ok"><span class="dot"></span>ready</span>
+    {% else %}
+    <span class="pill warn"><span class="dot"></span>setup required</span>
+    {% endif %}
+  </div>
+  <p>Controller credential: {{ 'usable' if identity_status.controller_usable else 'unavailable' }}<br>
+     LDAP federation: {{ 'configured' if identity_status.ldap_configured else 'not configured' }}<br>
+     Break-glass escrow: {% if identity_status.break_glass_escrowed %}escrowed{% elif not identity_status.break_glass_escrow_readable %}unreadable — rotator Vault policy predates the escrow path (see identity operations, “Upgrading an existing deployment”){% else %}not escrowed{% endif %}<br>
+     Vault OIDC client escrow: {% if identity_status.vault_oidc_rp_escrowed %}escrowed{% elif not identity_status.vault_oidc_rp_escrow_readable %}unreadable — rotator Vault policy predates the escrow path (see identity operations, “Vault OIDC login”){% else %}not escrowed{% endif %}</p>
+  {% if identity_status.controller_certificate_sha256 %}
+  <p class="muted" style="margin-bottom: 4px;">Controller certificate SHA-256</p>
+  <p style="margin-top: 0;"><code class="hash" id="controller-cert-sha">{{ identity_status.controller_certificate_sha256 }}</code> <button type="button" class="copy" data-copy-target="controller-cert-sha">copy</button></p>
+  {% endif %}
+  {% if identity_status.broker_certificate_sha256 %}
+  <p class="muted" style="margin-bottom: 4px;">Anthropic broker certificate SHA-256</p>
+  <p style="margin-top: 0;"><code class="hash" id="broker-cert-sha">{{ identity_status.broker_certificate_sha256 }}</code> <button type="button" class="copy" data-copy-target="broker-cert-sha">copy</button></p>
+  {% endif %}
+</div>
 {% else %}
 <p class="muted">Identity-controller status is unavailable.</p>
 {% endif %}
+</section>
 
-<h2>Provider authentication</h2>
-<p class="muted">Provider enrollment is a one-way control-plane operation. Private JWT signing material is generated by the identity controller and remains in Vault; this page never accepts or displays it.</p>
+<!-- ===================== PROVIDERS & JWT ===================== -->
+<section class="panel" id="tab-providers" role="tabpanel" aria-labelledby="tabbtn-providers">
+<h1 class="page">Providers &amp; JWT federation</h1>
+<p class="sub">Set up the upstream Anthropic credential. Workload Identity Federation mints short-lived JWT-signed tokens from your own Keycloak — no long-lived API key to rotate. Provider enrollment is a one-way control-plane operation: private JWT signing material is generated by the identity controller and remains in Vault; this page never accepts or displays it.</p>
 
 {% if anthropic_provider %}
+{% set provider = anthropic_provider %}
+{% set jwt_ready = provider.private_key_jwt_ready %}
+{% set controller_ready = jwt_ready or (identity_status and identity_status.configured) %}
+{% set federation_active = provider.configured and provider.enabled %}
 <div class="card">
-  <h3>Anthropic Workload Identity Federation
-    <span class="badge">{{ anthropic_provider.state }}</span>
-  </h3>
-  <p>Refresh: {{ 'enabled' if anthropic_provider.enabled else 'disabled' }}<br>
-     Server-generated private_key_jwt: {{ 'ready' if anthropic_provider.private_key_jwt_ready else 'identity bootstrap required' }}</p>
-  {% if anthropic_provider.client_certificate_sha256 %}
-  <p class="muted">Client certificate SHA-256</p>
-  <code>{{ anthropic_provider.client_certificate_sha256 }}</code>
-  {% endif %}
-  {% if anthropic_provider.current_jwks_sha256 %}
-  <p class="muted">Current Keycloak JWKS SHA-256</p>
-  <code>{{ anthropic_provider.current_jwks_sha256 }}</code>
-  {% endif %}
-  {% if anthropic_provider.approved_jwks_sha256 %}
-  <p class="muted">Operator-approved Anthropic JWKS SHA-256</p>
-  <code>{{ anthropic_provider.approved_jwks_sha256 }}</code>
-  {% endif %}
-  {% if anthropic_provider.revocation_pending_until %}
-  <p class="muted">Deletion remains fail-closed until at least {{ anthropic_provider.revocation_pending_until }}.</p>
-  {% endif %}
+  <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap;">
+    <h3 style="margin: 0;">Anthropic Workload Identity Federation</h3>
+    {% if federation_active %}
+    <span class="pill ok"><span class="dot"></span>{{ provider.state }}</span>
+    {% elif provider.state == 'unavailable' %}
+    <span class="pill off"><span class="dot"></span>{{ provider.state }}</span>
+    {% else %}
+    <span class="pill warn"><span class="dot"></span>{{ provider.state }}</span>
+    {% endif %}
+  </div>
+  <div class="steps">
+    <div class="step {{ 'done' if controller_ready else 'active' }}">
+      <div class="rail"><div class="node">{{ '✓' if controller_ready else '1' }}</div><div class="line"></div></div>
+      <div class="body">
+        <h4>Identity controller bootstrapped</h4>
+        <p class="note">{% if controller_ready %}The Keycloak controller is ready and the broker realm is provisioned.{% else %}Initialize identity control on the Identity &amp; Access tab first.{% endif %}</p>
+      </div>
+    </div>
+    <div class="step {{ 'done' if jwt_ready else ('active' if controller_ready else 'pending') }}">
+      <div class="rail"><div class="node">{{ '✓' if jwt_ready else '2' }}</div><div class="line"></div></div>
+      <div class="body">
+        <h4>Broker JWT signing key ready</h4>
+        <p class="note">Server-generated <span class="mono">private_key_jwt</span>: {{ 'ready — held in Vault' if jwt_ready else 'identity bootstrap required' }}.</p>
+        {% if provider.client_certificate_sha256 %}
+        <p class="note" style="margin: 6px 0 0;">Client certificate SHA-256<br><code class="hash" id="anthropic-client-cert-sha">{{ provider.client_certificate_sha256 }}</code> <button type="button" class="copy" data-copy-target="anthropic-client-cert-sha">copy</button></p>
+        {% endif %}
+      </div>
+    </div>
+    <div class="step {{ 'done' if provider.configured else ('active' if jwt_ready else 'pending') }}">
+      <div class="rail"><div class="node">{{ '✓' if provider.configured else '3' }}</div><div class="line"></div></div>
+      <div class="body">
+        <h4>Enroll in the Anthropic console</h4>
+        {% if provider.setup_bundle %}
+        <p class="note" style="margin-bottom: 10px;">Use an interactive Anthropic organization-admin session to create or update the Custom OIDC federation issuer with these exact server-derived values (inline JWKS — Anthropic never contacts Keycloak). No organization-admin credential is stored by AI Gateway.</p>
+        <dl class="kv" style="font-size: 12.5px;">
+          <dt>Issuer</dt><dd><code class="hash">{{ provider.setup_bundle.issuer }}</code></dd>
+          <dt>Client ID</dt><dd><code class="hash">{{ provider.setup_bundle.client_id }}</code></dd>
+          <dt>Subject</dt><dd><code class="hash">{{ provider.setup_bundle.subject }}</code></dd>
+          <dt>Audience</dt><dd><code class="hash">{{ provider.setup_bundle.audience }}</code></dd>
+        </dl>
+        <details class="adv" style="margin-top: 10px;">
+          <summary>Public JWKS (copy into the Anthropic console)</summary>
+          <div class="advbody">
+            <pre id="anthropic-jwks">{{ provider.setup_bundle.jwks_json }}</pre>
+            <button type="button" class="ghost sm" data-copy-target="anthropic-jwks">Copy public JWKS</button>
+          </div>
+        </details>
+        {% endif %}
+        {% if provider.current_jwks_sha256 %}
+        <p class="note" style="margin: 10px 0 0;">Current Keycloak JWKS SHA-256<br><code class="hash">{{ provider.current_jwks_sha256 }}</code></p>
+        {% endif %}
+        {% if provider.approved_jwks_sha256 %}
+        <p class="note" style="margin: 6px 0 0;">Operator-approved Anthropic JWKS SHA-256<br><code class="hash">{{ provider.approved_jwks_sha256 }}</code></p>
+        {% endif %}
+        {% if identity_step_up_recent and jwt_ready %}
+        <div class="card" style="margin-top: 14px; margin-bottom: 0; background: var(--bg-2);">
+          <form method="post" action="/admin/providers/anthropic">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="federation_jwks_sha256" value="{{ provider.current_jwks_sha256 }}">
+            <label class="fld" for="anthropic-organization" style="margin-top: 0;">Anthropic organization ID</label>
+            <input type="text" id="anthropic-organization" name="organization_id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" value="{{ provider.nonsecret_ids.organization_id or '' }}" autocomplete="off">
+            <label class="fld" for="anthropic-service-account">Anthropic service-account ID</label>
+            <input type="text" id="anthropic-service-account" name="service_account_id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" value="{{ provider.nonsecret_ids.service_account_id or '' }}" autocomplete="off">
+            <label class="fld" for="anthropic-rule">Anthropic federation-rule ID</label>
+            <input type="text" id="anthropic-rule" name="federation_rule_id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" value="{{ provider.nonsecret_ids.federation_rule_id or '' }}" autocomplete="off">
+            <label class="fld" for="anthropic-workspace">Anthropic workspace ID (optional)</label>
+            <input type="text" id="anthropic-workspace" name="workspace_id" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" value="{{ provider.nonsecret_ids.workspace_id or '' }}" autocomplete="off">
+            <label class="fld" for="anthropic-enrolled">After completing the external console step, type ENROLLED</label>
+            <input type="text" id="anthropic-enrolled" name="enrollment_confirmation" required maxlength="32" autocomplete="off">
+            <div style="margin-top: 14px;"><button type="submit">Save verified enrollment</button></div>
+          </form>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+    <div class="step {{ 'done' if federation_active else 'pending' }}">
+      <div class="rail"><div class="node">{{ '✓' if federation_active else '4' }}</div></div>
+      <div class="body">
+        <h4>Federation active</h4>
+        <p class="note">Token refresh: {{ 'enabled' if provider.enabled else 'disabled' }}. When active, refresh runs on the Key Rotation schedule and LiteLLM is hot-swapped to WIF.</p>
+        {% if provider.revocation_pending_until %}
+        <p class="note">Deletion remains fail-closed until at least {{ provider.revocation_pending_until }}.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
 
-  {% if anthropic_provider.setup_bundle %}
-  <h3>Nonsecret external enrollment bundle</h3>
-  <p class="muted">Use an interactive Anthropic organization-admin session to create or update the federation issuer with these exact server-derived values. No organization-admin credential is stored by AI Gateway.</p>
-  <table>
-    <tbody>
-      <tr><th>Issuer</th><td><code>{{ anthropic_provider.setup_bundle.issuer }}</code></td></tr>
-      <tr><th>Client ID</th><td><code>{{ anthropic_provider.setup_bundle.client_id }}</code></td></tr>
-      <tr><th>Subject</th><td><code>{{ anthropic_provider.setup_bundle.subject }}</code></td></tr>
-      <tr><th>Audience</th><td><code>{{ anthropic_provider.setup_bundle.audience }}</code></td></tr>
-    </tbody>
-  </table>
-  <pre id="anthropic-jwks">{{ anthropic_provider.setup_bundle.jwks_json }}</pre>
-  <button type="button" class="ghost" data-copy-target="anthropic-jwks">Copy public JWKS</button>
-  {% endif %}
-
-  {% if identity_step_up_recent and anthropic_provider.private_key_jwt_ready %}
-  <form method="post" action="/admin/providers/anthropic" style="margin-top: 18px;">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="hidden" name="federation_jwks_sha256" value="{{ anthropic_provider.current_jwks_sha256 }}">
-    <label for="anthropic-organization">Anthropic organization ID</label>
-    <input type="text" id="anthropic-organization" name="organization_id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" value="{{ anthropic_provider.nonsecret_ids.organization_id or '' }}" autocomplete="off">
-    <label for="anthropic-service-account">Anthropic service-account ID</label>
-    <input type="text" id="anthropic-service-account" name="service_account_id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" value="{{ anthropic_provider.nonsecret_ids.service_account_id or '' }}" autocomplete="off">
-    <label for="anthropic-rule">Anthropic federation-rule ID</label>
-    <input type="text" id="anthropic-rule" name="federation_rule_id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" value="{{ anthropic_provider.nonsecret_ids.federation_rule_id or '' }}" autocomplete="off">
-    <label for="anthropic-workspace">Anthropic workspace ID (optional)</label>
-    <input type="text" id="anthropic-workspace" name="workspace_id" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" value="{{ anthropic_provider.nonsecret_ids.workspace_id or '' }}" autocomplete="off">
-    <label for="anthropic-enrolled">After completing the external console step, type ENROLLED</label>
-    <input type="text" id="anthropic-enrolled" name="enrollment_confirmation" required maxlength="32" autocomplete="off">
-    <div style="margin-top: 14px;"><button type="submit">Save verified enrollment</button></div>
-  </form>
-
-  {% if anthropic_provider.configured %}
-  <form method="post" action="/admin/providers/anthropic/disable" style="margin-top: 18px;" data-confirm="Stop Anthropic token refresh? Existing short-lived credentials are not claimed revoked until expiry is proven.">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="anthropic-disable">Type DISABLE anthropic</label>
-    <input type="text" id="anthropic-disable" name="confirmation" required maxlength="32" autocomplete="off">
-    <button type="submit" class="danger">Disable refresh</button>
-  </form>
-  <form method="post" action="/admin/providers/anthropic/delete" style="margin-top: 18px;" data-confirm="Permanently delete Anthropic enrollment state? This remains blocked unless credential expiry is proven.">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="anthropic-delete">Type DELETE anthropic</label>
-    <input type="text" id="anthropic-delete" name="confirmation" required maxlength="32" autocomplete="off">
-    <button type="submit" class="danger">Delete enrollment</button>
-  </form>
-  {% endif %}
+  {% if identity_step_up_recent and jwt_ready and provider.configured %}
+  <details class="adv">
+    <summary>Danger zone — stop or delete this federation</summary>
+    <div class="advbody">
+      <form method="post" action="/admin/providers/anthropic/disable" data-confirm="Stop Anthropic token refresh? Existing short-lived credentials are not claimed revoked until expiry is proven.">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="anthropic-disable">Type DISABLE anthropic</label>
+        <input type="text" id="anthropic-disable" name="confirmation" required maxlength="32" autocomplete="off">
+        <div style="margin-top: 10px;"><button type="submit" class="danger">Disable refresh</button></div>
+      </form>
+      <form method="post" action="/admin/providers/anthropic/delete" style="margin-top: 18px;" data-confirm="Permanently delete Anthropic enrollment state? This remains blocked unless credential expiry is proven.">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="anthropic-delete">Type DELETE anthropic</label>
+        <input type="text" id="anthropic-delete" name="confirmation" required maxlength="32" autocomplete="off">
+        <div style="margin-top: 10px;"><button type="submit" class="danger">Delete enrollment</button></div>
+      </form>
+    </div>
+  </details>
   {% endif %}
 </div>
 {% else %}
 <p class="muted">Provider enrollment status is unavailable.</p>
 {% endif %}
 
-<h2>Provider key rotation</h2>
-<p class="muted">Changes below are hot-applied to the key-rotator scheduler.</p>
+{% if egress_trust %}
+<div class="eyebrow">Egress trust — is Anthropic really Anthropic?</div>
+<p class="sub" style="margin-bottom: 12px;">Opposite direction from the JWT above. The JWT proves <em>us</em> to Anthropic; this proves <em>Anthropic to us</em>. Envoy trusts only Anthropic's issuing CA for <span class="mono">api.anthropic.com</span> — not the full public CA set — so a mis-issued or intercepted certificate is rejected at egress.</p>
 
-{% if status %}
 <div class="card">
-  <h3>Rotator status</h3>
-  <pre>{{ status }}</pre>
+  <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap;">
+    <h3 style="margin: 0;">Anthropic egress CA pin</h3>
+    {% if egress_trust.verified %}
+    <span class="pill ok"><span class="dot"></span>Pin verified</span>
+    {% else %}
+    <span class="pill warn"><span class="dot"></span>Pin mismatch</span>
+    {% endif %}
+  </div>
+  <dl class="kv">
+    {% for pin in egress_trust.pins %}
+    <dt>{{ pin.role }}</dt><dd>{{ pin.label }}</dd>
+    <dt>SHA-256</dt><dd><code class="hash" id="egress-pin-{{ loop.index }}">{{ pin.display }}</code> <button type="button" class="copy" data-copy-target="egress-pin-{{ loop.index }}">copy</button></dd>
+    {% endfor %}
+  </dl>
+  <div class="trustbox {{ 'ok' if egress_trust.verified else 'warn' }}">
+    <p class="note" style="margin: 0 0 11px;">{{ egress_trust.detail }}</p>
+    <form method="post" action="/admin/egress-trust/verify" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="ghost sm">Re-verify now</button>
+    </form>
+    <p class="note" style="margin: 11px 0 0; padding-top: 11px; border-top: 1px solid var(--border);">Continuous monitoring of the live egress chain (periodic canary and staged CA-rotation review) is not yet wired — it is a planned follow-up. This action re-verifies, on demand, that the pinned bundle shipped in this control plane still matches the reviewed fingerprints above.</p>
+  </div>
 </div>
 {% endif %}
+</section>
 
-<h2>Vendors</h2>
+<!-- ===================== KEY ROTATION ===================== -->
+<section class="panel" id="tab-rotation" role="tabpanel" aria-labelledby="tabbtn-rotation">
+<h1 class="page">Key rotation</h1>
+<p class="sub">Rotation schedules for upstream provider credentials. Changes below are hot-applied to the key-rotator scheduler. WIF federation is the primary Anthropic path — static keys are a fallback only when a provider is not federated.</p>
+
 {% if vendors %}
+{% set internal_vendor_ids = ('portal-key-reconciliation-state',) %}
+{% set primary_vendors = [] %}
+{% set advanced_vendors = [] %}
 {% for v in vendors %}
 {% set vendor_id = v.vendor or v.name %}
-<div class="card">
-  <h3>{{ vendor_id }} <span class="badge">{{ 'enabled' if v.enabled else 'disabled' }}</span></h3>
-  <form method="post" action="/admin/settings/{{ vendor_id }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    {% if vendor_id == 'anthropic' %}
-    {% if v.enabled %}<input type="hidden" name="enabled" value="1">{% endif %}
-    <p class="muted">Enable/disable is managed only by the confirmed Anthropic WIF lifecycle controls above.</p>
-    {% else %}
-    <label><input type="checkbox" name="enabled" {% if v.enabled %}checked{% endif %}> Rotation enabled</label>
-    {% endif %}
-    <label for="interval-{{ vendor_id }}">Interval (seconds)</label>
-    <input type="number" id="interval-{{ vendor_id }}" name="interval_seconds" value="{{ v.interval_seconds or 3600 }}" min="60" max="31536000">
-    <label for="grace-{{ vendor_id }}">Grace / soak window (seconds)</label>
-    <input type="number" id="grace-{{ vendor_id }}" name="grace_seconds" value="{{ v.grace_seconds or 300 }}" min="0" max="86400">
-    <div style="margin-top: 14px;"><button type="submit">Save</button></div>
-  </form>
-  {% if vendor_id != 'anthropic' or v.enabled %}
-  <form method="post" action="/admin/rotate/{{ vendor_id }}" style="margin-top: 10px;" data-confirm="Rotate {{ vendor_id }} now?">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit" class="ghost">Rotate now</button>
-  </form>
-  {% endif %}
-</div>
+{% if vendor_id in internal_vendor_ids %}
+{# Internal scheduler bookkeeping rows are not operator-facing controls. #}
+{% elif vendor_id == 'anthropic' %}
+{% set _ = primary_vendors.append((vendor_id, v)) %}
+{% else %}
+{% set _ = advanced_vendors.append((vendor_id, v)) %}
+{% endif %}
 {% endfor %}
+
+<div class="card" style="padding: 0; overflow: hidden;">
+  <div class="tblwrap">
+    <table>
+      <thead><tr><th>Provider</th><th>Mode</th><th>Rotation</th><th class="tnum">Interval</th><th>Last run</th><th>Next run</th><th></th></tr></thead>
+      <tbody>
+        {% for vendor_id, v in primary_vendors %}
+        {% set st = rotator_status.get(vendor_id) %}
+        <tr>
+          <td>{{ vendor_id }}</td>
+          <td>{% if anthropic_provider and anthropic_provider.configured %}<span class="chip">WIF &middot; JWT</span>{% else %}<span class="chip">static key</span>{% endif %}</td>
+          <td>{% if v.enabled %}<span class="pill ok"><span class="dot"></span>enabled{% if st and st.rotation_in_progress %} &middot; rotating{% endif %}</span>{% else %}<span class="pill off"><span class="dot"></span>disabled</span>{% endif %}</td>
+          <td class="tnum{{ ' muted' if not v.interval_seconds }}">{{ v.interval_seconds ~ 's' if v.interval_seconds else '—' }}</td>
+          <td class="muted">{% if st and st.last_time %}{{ st.last_time }}{% if st.last_status %} &middot; {{ st.last_status }}{% endif %}{% else %}never{% endif %}</td>
+          <td class="muted">{{ st.next_run_time if st and st.next_run_time else '—' }}</td>
+          <td style="text-align: right;"><button type="button" class="copy" data-tab-jump="providers">managed by federation &rarr;</button></td>
+        </tr>
+        {% endfor %}
+        {% if not primary_vendors %}
+        <tr><td colspan="7" class="muted" style="padding: 16px;">No federated provider is configured yet — see the Providers &amp; JWT tab.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% for vendor_id, v in primary_vendors %}
+<details class="adv">
+  <summary>Anthropic rotation scheduler settings</summary>
+  <div class="advbody">
+    <form method="post" action="/admin/settings/{{ vendor_id }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      {% if v.enabled %}<input type="hidden" name="enabled" value="1">{% endif %}
+      <p class="muted">Enable/disable is managed only by the confirmed Anthropic WIF lifecycle controls on the Providers &amp; JWT tab.</p>
+      <label for="interval-{{ vendor_id }}">Interval (seconds)</label>
+      <input type="number" id="interval-{{ vendor_id }}" name="interval_seconds" value="{{ v.interval_seconds or 3600 }}" min="60" max="31536000">
+      <label for="grace-{{ vendor_id }}">Grace / soak window (seconds)</label>
+      <input type="number" id="grace-{{ vendor_id }}" name="grace_seconds" value="{{ v.grace_seconds or 300 }}" min="0" max="86400">
+      <div style="margin-top: 14px;"><button type="submit">Save</button></div>
+    </form>
+    {% if v.enabled %}
+    <form method="post" action="/admin/rotate/{{ vendor_id }}" style="margin-top: 10px;" data-confirm="Rotate {{ vendor_id }} now?">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="ghost">Rotate now</button>
+    </form>
+    {% endif %}
+  </div>
+</details>
+{% endfor %}
+
+<details class="adv">
+  <summary>Static fallback keys (advanced){% if not advanced_vendors %} — none configured{% endif %}</summary>
+  <div class="advbody">
+    <p class="note" style="margin: 0 0 12px;">These only apply if a static API key is placed in Vault instead of using federation. Hidden by default to keep the console focused.</p>
+    {% for vendor_id, v in advanced_vendors %}
+    {% set st = rotator_status.get(vendor_id) %}
+    <div class="card" style="background: var(--bg-2);">
+      <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px;">
+        <h3 style="margin: 0;">{{ vendor_id }}</h3>
+        {% if v.enabled %}<span class="pill ok"><span class="dot"></span>enabled</span>{% else %}<span class="pill off"><span class="dot"></span>disabled</span>{% endif %}
+        {% if st %}<span class="note">last run: {% if st.last_time %}{{ st.last_time }}{% if st.last_status %} &middot; {{ st.last_status }}{% endif %}{% else %}never{% endif %} &middot; next: {{ st.next_run_time or '—' }}</span>{% endif %}
+      </div>
+      <form method="post" action="/admin/settings/{{ vendor_id }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="check"><input type="checkbox" name="enabled" {% if v.enabled %}checked{% endif %}> Rotation enabled</label>
+        <label for="interval-{{ vendor_id }}">Interval (seconds)</label>
+        <input type="number" id="interval-{{ vendor_id }}" name="interval_seconds" value="{{ v.interval_seconds or 3600 }}" min="60" max="31536000">
+        <label for="grace-{{ vendor_id }}">Grace / soak window (seconds)</label>
+        <input type="number" id="grace-{{ vendor_id }}" name="grace_seconds" value="{{ v.grace_seconds or 300 }}" min="0" max="86400">
+        <div style="margin-top: 14px;"><button type="submit">Save</button></div>
+      </form>
+      <form method="post" action="/admin/rotate/{{ vendor_id }}" style="margin-top: 10px;" data-confirm="Rotate {{ vendor_id }} now?">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="ghost">Rotate now</button>
+      </form>
+    </div>
+    {% endfor %}
+    {% if not advanced_vendors %}
+    <p class="muted">No static fallback vendors are configured.</p>
+    {% endif %}
+  </div>
+</details>
 {% else %}
 <p class="muted">No vendor settings available (key-rotator may be unreachable).</p>
 {% endif %}
+</section>
 
-<h2>Rotation history</h2>
+<!-- ===================== AUDIT ===================== -->
+<section class="panel" id="tab-audit" role="tabpanel" aria-labelledby="tabbtn-audit">
+<h1 class="page">Audit</h1>
+<p class="sub">Identity and rotation events recorded by the key-rotator, newest first.</p>
 {% if history %}
-<div class="card">
-<table>
-  <thead><tr><th>Time</th><th>Vendor</th><th>Action</th><th>Status</th><th>Detail</th></tr></thead>
-  <tbody>
-    {% for h in history %}
-    <tr>
-      <td class="muted">{{ h.timestamp or h.time or "" }}</td>
-      <td>{{ h.vendor or "" }}</td>
-      <td>{{ h.action or h.event or "" }}</td>
-      <td>{{ h.status or "" }}</td>
-      <td class="muted">{{ h.detail or h.message or "" }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<div class="card" style="padding: 0; overflow: hidden;">
+  <div class="tblwrap">
+    <table>
+      <thead><tr><th>Time</th><th>Source</th><th>Action</th><th>Status</th><th>Detail</th></tr></thead>
+      <tbody>
+        {% for h in history %}
+        <tr>
+          <td class="muted mono tnum">{{ h.timestamp or h.time or "" }}</td>
+          <td>{{ h.vendor or "" }}</td>
+          <td>{{ h.action or h.event or "" }}</td>
+          <td>{% set event_status = h.status or "" %}{% if event_status == 'success' %}<span class="pill ok">{{ event_status }}</span>{% elif event_status %}<span class="pill warn">{{ event_status }}</span>{% endif %}</td>
+          <td class="muted">{{ h.detail or h.message or "" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </div>
 {% else %}
 <p class="muted">No rotation history available.</p>
 {% endif %}
+</section>
 {% endblock %}

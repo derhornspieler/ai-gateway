@@ -136,8 +136,13 @@ def main() -> int:
         )
         if "User removed from the group." not in html:
             raise RuntimeError("portal did not report member removal")
+        # The tabbed console renders the empty-group delete control in the
+        # selected-group detail pane, not on the group list.
         admin_url, html = flow.read_page(
-            opener, flow.ADMIN_PORTAL_ORIGIN + "/admin"
+            opener,
+            flow.ADMIN_PORTAL_ORIGIN
+            + "/admin?"
+            + urllib.parse.urlencode({"group_id": group_id}),
         )
         delete_path = f"/admin/identity/groups/{group_id}/delete"
         delete = exact_form(html, delete_path)
@@ -222,8 +227,13 @@ def main() -> int:
             return 0
         if "User removed from the group." not in html:
             raise RuntimeError("portal did not report member removal")
+        # The tabbed console renders the empty-group delete control in the
+        # selected-group detail pane, not on the group list.
         admin_url, html = flow.read_page(
-            opener, flow.ADMIN_PORTAL_ORIGIN + "/admin"
+            opener,
+            flow.ADMIN_PORTAL_ORIGIN
+            + "/admin?"
+            + urllib.parse.urlencode({"group_id": group_id}),
         )
         delete_path = f"/admin/identity/groups/{group_id}/delete"
         delete = exact_form(html, delete_path)

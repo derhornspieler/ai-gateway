@@ -1,38 +1,86 @@
 {% extends "base.html" %}
 {% block title %}Your API keys — dev-portal{% endblock %}
+{% block tabs %}
+<nav class="tabs" role="tablist" aria-label="Developer portal sections">
+  <button type="button" role="tab" id="tabbtn-keys" data-tab="keys" aria-controls="tab-keys" aria-selected="true">My keys</button>
+  <button type="button" role="tab" id="tabbtn-connect" data-tab="connect" aria-controls="tab-connect" aria-selected="false">Connect a tool</button>
+</nav>
+{% endblock %}
 {% block content %}
-<h1>Your gateway API keys</h1>
-<p class="muted">Generate a LiteLLM virtual key scoped to your identity ({{ user.email }}). Keys are shown once in full — copy them immediately.</p>
-
-{% if new_key %}
-<div class="card" data-one-time-secret style="border-color: var(--success);">
-  <h3>New key created</h3>
-  <p class="muted">This POST response is the only time the full key will be shown. Copy the key and any needed snippets now; later pages use a placeholder.</p>
-  <div class="key-box">
-    <code id="new-key-value" data-sensitive-value>{{ new_key }}</code>
-    <button type="button" data-copy-target="new-key-value">Copy</button>
-  </div>
-  <h3>One-time tool snippets</h3>
-  {% for tool in new_tools %}
-  <div style="position: relative;">
-    <p class="muted"><strong>{{ tool.name }}</strong> — {{ tool.description }}</p>
-    <pre id="new-snippet-{{ tool.id }}" data-sensitive-value>{{ tool.snippet }}</pre>
-    <button type="button" data-copy-target="new-snippet-{{ tool.id }}">Copy</button>
-  </div>
-  {% endfor %}
-</div>
-{% endif %}
+<section class="panel active" id="tab-keys" role="tabpanel" aria-labelledby="tabbtn-keys">
+<h1 class="page">Your gateway API keys</h1>
+<p class="sub">Generate a LiteLLM virtual key scoped to your identity (<span class="mono">{{ user.email }}</span>). A key is shown in full <strong>once</strong> — copy it immediately. Each user may have at most one active key per project.</p>
 
 {% if policy_error %}
 <div class="flash error">{{ policy_error }}</div>
 {% endif %}
 
-{% if project_ids %}
+<div class="eyebrow" style="margin-top: 0;">Create a key</div>
 <div class="card">
-  <h3>Your project access</h3>
+  {% if project_ids and policy_error %}
+  <p class="muted">Key generation is paused until your project's policy can be verified.</p>
+  {% elif project_ids %}
+  <form method="post" action="/keys">
+    <div class="addrow">
+      <div style="flex: 0 1 220px;">
+        {% if project_ids|length > 1 %}
+        <label class="fld" for="project-id" style="margin-top: 0;">Project</label>
+        <select id="project-id" name="project_id" required>
+          {% for project_id in project_ids %}
+          <option value="{{ project_id }}"{% if selected_project == project_id %} selected{% endif %}>{{ project_id }}</option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <label class="fld" style="margin-top: 0;">Project</label>
+        <span class="pill" style="font-size: 13px; padding: 6px 12px;"><span class="mono">{{ project_ids[0] }}</span></span>
+        <input type="hidden" name="project_id" value="{{ project_ids[0] }}">
+        {% endif %}
+      </div>
+      <div>
+        <label class="fld" for="alias" style="margin-top: 0;">Key alias (helps you tell keys apart later)</label>
+        <input type="text" id="alias" name="alias" maxlength="128" placeholder="e.g. laptop-claude-code" required>
+      </div>
+      <div style="flex: 0 0 auto; min-width: 0;">
+        <button type="submit">Generate key</button>
+      </div>
+    </div>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  </form>
+  <p class="note" style="margin: 12px 0 0;">New keys inherit your project's limits. Deactivate the current project key below before replacing it.</p>
+  {% else %}
+  <p class="muted">Key generation is unavailable until an administrator assigns your directory account to a managed developer project.</p>
+  {% endif %}
+</div>
+
+{% if new_key %}
+<div class="card reveal" data-one-time-secret>
+  <div style="display: flex; align-items: center; gap: 9px; margin-bottom: 6px; flex-wrap: wrap;">
+    <span class="pill ok"><span class="dot"></span>Key created</span>
+    <span class="note">This POST response is the only time the full key will be shown — copy it now. Later pages use a placeholder.</span>
+  </div>
+  <div class="keyrow">
+    <code id="new-key-value" data-sensitive-value>{{ new_key }}</code>
+    <button type="button" class="copy" data-copy-target="new-key-value">Copy key</button>
+  </div>
+  <h3>One-time tool snippets</h3>
+  {% for tool in new_tools %}
+  <div>
+    <p class="note"><strong>{{ tool.name }}</strong> — {{ tool.description }}</p>
+    <pre id="new-snippet-{{ tool.id }}" data-sensitive-value>{{ tool.snippet }}</pre>
+    <button type="button" class="copy" data-copy-target="new-snippet-{{ tool.id }}">Copy</button>
+  </div>
+  {% endfor %}
+  <p style="margin: 14px 0 0;"><button type="button" class="btn ghost sm" data-tab-jump="connect">Now connect a tool &rarr;</button></p>
+</div>
+{% endif %}
+
+{% if project_ids %}
+<div class="eyebrow">Your project access</div>
+<div class="card">
   {% for project_id in project_ids %}
   {% set policy = project_policies.get(project_id) %}
-  <p><code>{{ project_id }}</code><br>
+  <p{% if not loop.last %} style="margin-bottom: 14px;"{% endif %}>
+    <span class="mono">{{ project_id }}</span><br>
     {% if policy %}
     <span class="muted">Token rate limit:</span>
     {% if policy.tpm_limit or policy.rpm_limit %}
@@ -43,6 +91,7 @@
     {% if project_models %}
     {% for model in project_models %}<code>{{ model }}</code>{% if policy.default_model == model %} <span class="badge">default</span>{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
     {% else %}all configured models{% endif %}
+    {% if policy.default_model %}<br><span class="note">Requests that omit a model are served with the project default.</span>{% endif %}
     {% else %}
     <span class="muted">Policy unavailable right now.</span>
     {% endif %}
@@ -51,68 +100,49 @@
 </div>
 {% endif %}
 
-<div class="card">
-  <h3>Generate a new key</h3>
-  <p class="muted">Each user may have at most one active key per project. Deactivate the current project key before replacing it.</p>
-  {% if project_ids and policy_error %}
-  <p class="muted">Key generation is paused until your project's policy can be verified.</p>
-  {% elif project_ids %}
-  <form method="post" action="/keys">
-    {% if project_ids|length > 1 %}
-    <label for="project-id">Project</label>
-    <select id="project-id" name="project_id" required>
-      {% for project_id in project_ids %}
-      <option value="{{ project_id }}"{% if selected_project == project_id %} selected{% endif %}>{{ project_id }}</option>
-      {% endfor %}
-    </select>
-    {% else %}
-    <p>Project: <code>{{ project_ids[0] }}</code></p>
-    <input type="hidden" name="project_id" value="{{ project_ids[0] }}">
-    {% endif %}
-    <label for="alias">Key alias (helps you tell keys apart later)</label>
-    <input type="text" id="alias" name="alias" maxlength="128" placeholder="e.g. laptop-claude-code" required>
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <div style="margin-top: 14px;"><button type="submit">Generate key</button></div>
-  </form>
-  {% else %}
-  <p class="muted">Key generation is unavailable until an administrator assigns your directory account to a managed developer project.</p>
-  {% endif %}
+<div class="eyebrow">Your keys</div>
+{% if list_error %}
+<div class="flash error">{{ list_error }}</div>
+{% endif %}
+{% if keys %}
+<div class="card" style="padding: 0; overflow: hidden;">
+  <div class="tblwrap">
+    <table>
+      <thead><tr><th>Alias</th><th>Project</th><th>Identifier</th><th>Rate limit</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        {% for k in keys %}
+        <tr>
+          <td>{{ k.key_alias or k.alias or "(no alias)" }}</td>
+          <td class="mono muted">{{ k.portal_project_id }}</td>
+          <td class="mono muted">{{ (k.token or k.key_name or "")[:16] }}&hellip;</td>
+          <td class="muted">{% if k.tpm_limit or k.rpm_limit %}{{ k.tpm_limit or "unlimited" }} TPM &middot; {{ k.rpm_limit or "unlimited" }} RPM{% else %}Unlimited{% endif %}</td>
+          <td class="muted">{{ k.expires or "never" }}</td>
+          <td>{% if k.portal_active %}<span class="pill ok"><span class="dot"></span>active</span>{% else %}<span class="pill off"><span class="dot"></span>inactive</span>{% endif %}</td>
+          <td style="text-align: right;">
+            {% if k.portal_active %}
+            <form class="inline" method="post" action="/keys/deactivate" data-confirm="Deactivate this key? It will stop working immediately.">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="token" value="{{ k.token or k.key_name or '' }}">
+              <input type="hidden" name="project_id" value="{{ k.portal_project_id }}">
+              <button type="submit" class="danger sm">Deactivate</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </div>
-
+<p class="note">Replacing a machine or hit a limit? Deactivate the project's current key, then generate a fresh one above.</p>
+{% else %}
 <div class="card">
-  <h3>Existing keys</h3>
-  {% if list_error %}
-  <div class="flash error">{{ list_error }}</div>
-  {% endif %}
-  {% if keys %}
-  <table>
-    <thead><tr><th>Project</th><th>Alias</th><th>Identifier</th><th>Rate limit</th><th>Status</th><th></th></tr></thead>
-    <tbody>
-      {% for k in keys %}
-      <tr>
-        <td><code>{{ k.portal_project_id }}</code></td>
-        <td>{{ k.key_alias or k.alias or "(no alias)" }}</td>
-        <td><code>{{ (k.token or k.key_name or "")[:16] }}&hellip;</code></td>
-        <td class="muted">{% if k.tpm_limit or k.rpm_limit %}{{ k.tpm_limit or "unlimited" }} TPM &middot; {{ k.rpm_limit or "unlimited" }} RPM{% else %}Unlimited{% endif %}</td>
-        <td><span class="badge">{{ "active" if k.portal_active else "inactive" }}</span></td>
-        <td>
-          {% if k.portal_active %}
-          <form class="inline" method="post" action="/keys/deactivate" data-confirm="Deactivate this key? It will stop working immediately.">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="token" value="{{ k.token or k.key_name or '' }}">
-            <input type="hidden" name="project_id" value="{{ k.portal_project_id }}">
-            <button type="submit" class="danger">Deactivate</button>
-          </form>
-          {% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <p class="muted">No keys yet. Generate one above to get started.</p>
-  {% endif %}
+  <p class="muted" style="margin: 0;">No keys yet. Generate one above to get started.</p>
 </div>
+{% endif %}
+</section>
 
-<p><a href="/snippets">View placeholder tool config snippets &rarr;</a></p>
+<section class="panel" id="tab-connect" role="tabpanel" aria-labelledby="tabbtn-connect">
+{% include "_connect_panel.html" %}
+</section>
 {% endblock %}
