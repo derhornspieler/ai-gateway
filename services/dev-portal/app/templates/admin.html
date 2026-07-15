@@ -13,7 +13,8 @@
   </h3>
   <p>Controller credential: {{ 'usable' if identity_status.controller_usable else 'unavailable' }}<br>
      LDAP federation: {{ 'configured' if identity_status.ldap_configured else 'not configured' }}<br>
-     Break-glass escrow: {% if identity_status.break_glass_escrowed %}escrowed{% elif not identity_status.break_glass_escrow_readable %}unreadable — rotator Vault policy predates the escrow path (see identity operations, “Upgrading an existing deployment”){% else %}not escrowed{% endif %}</p>
+     Break-glass escrow: {% if identity_status.break_glass_escrowed %}escrowed{% elif not identity_status.break_glass_escrow_readable %}unreadable — rotator Vault policy predates the escrow path (see identity operations, “Upgrading an existing deployment”){% else %}not escrowed{% endif %}<br>
+     Vault OIDC client escrow: {% if identity_status.vault_oidc_rp_escrowed %}escrowed{% elif not identity_status.vault_oidc_rp_escrow_readable %}unreadable — rotator Vault policy predates the escrow path (see identity operations, “Vault OIDC login”){% else %}not escrowed{% endif %}</p>
   {% if identity_status.controller_certificate_sha256 %}
   <p class="muted">Controller certificate SHA-256</p>
   <code>{{ identity_status.controller_certificate_sha256 }}</code>

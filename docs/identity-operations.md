@@ -79,8 +79,8 @@ capabilities the portals honor:
 | `aigw-admins` | developer functions plus rotation, identity administration, the LiteLLM Admin UI, and Grafana edge access |
 
 Authorization is carried as a realm-role claim, not a group claim: each of the
-four first-party OIDC clients (`open-webui`, `dev-portal`, `admin-portal`,
-`admin-ui`) maps realm roles into a `roles` claim. Membership in an
+five first-party OIDC clients (`open-webui`, `dev-portal`, `admin-portal`,
+`admin-ui`, `vault`) maps realm roles into a `roles` claim. Membership in an
 `aigw-admins`-capable managed group is how a directory user acquires the
 `aigw-admins` role.
 
@@ -124,7 +124,7 @@ exclude Keycloak bodies that might contain DNs or credential configuration.
 The full stack — and the lab overlay, if applicable — must be running, and Vault
 must be initialized and unsealed with `vault-bootstrap.sh` having created the
 rotator policy and token. That policy grants create/read/update only to the
-four identity records the controller uses, whose logical paths are configured
+five identity records the controller uses, whose logical paths are configured
 by environment variable (defaults shown):
 
 - `ai-gateway/keycloak/identity-controller-key` (`IDENTITY_CONTROLLER_KEY_VAULT_PATH`)
@@ -133,6 +133,10 @@ by environment variable (defaults shown):
 - `ai-gateway/keycloak/break-glass-admin` (`BREAK_GLASS_ADMIN_VAULT_PATH`) —
   the escrowed durable master-realm administrator credential; see
   [Break-glass administrator](#break-glass-administrator)
+- `ai-gateway/keycloak/vault-oidc-rp` (`VAULT_OIDC_RP_VAULT_PATH`) — the
+  escrowed `vault` relying-party client secret consumed by the
+  `scripts/vault-oidc-setup.sh` root ceremony; see
+  [Vault OIDC login](#vault-oidc-login-for-the-aigw-admins-operators)
 
 These are logical paths under the KV-v2 `kv/` mount; the configured default
 strings themselves carry no `kv/` prefix.
@@ -167,11 +171,11 @@ The rotator then performs one ordered transaction, consuming the temporary
 bootstrap service client and establishing durable controls:
 
 1. obtain a short-lived token from the temporary master-realm service client;
-2. reconcile and verify the four first-party OIDC clients (`open-webui`,
-   `dev-portal`, `admin-portal`, `admin-ui`) — their callbacks, web origins, and
-   secrets are read back and compared, because Keycloak's `--import-realm`
-   deliberately skips an already-existing realm, so a restored database needs
-   this repair rather than a fresh import;
+2. reconcile and verify the five first-party OIDC clients (`open-webui`,
+   `dev-portal`, `admin-portal`, `admin-ui`, `vault`) — their callbacks, web
+   origins, and secrets are read back and compared, because Keycloak's
+   `--import-realm` deliberately skips an already-existing realm, so a
+   restored database needs this repair rather than a fresh import;
 3. create or repair the disabled `aigw-identity-controller` client (`client-jwt`,
    RS256), ask Keycloak to generate a 3072-bit PKCS#12 keypair under a one-use
    random archive password, extract it in memory, and verify the unencrypted
@@ -211,9 +215,15 @@ bootstrap service client and establishing durable controls:
    credential-less account never adopts an old escrow — it is rotated. Any
    failure disables the account and fails the bootstrap (see
    [Break-glass administrator](#break-glass-administrator));
-9. write verified identity state plus controller and broker certificate SHA-256
-   fingerprints to Vault; and
-10. only after every prior proof succeeds, delete the temporary bootstrap
+9. escrow the `vault` relying-party client secret to Vault with a verified
+   write (skipped when a matching escrow already exists, so idempotent
+   re-runs cause no version churn). Vault's own OIDC login cannot read
+   Compose environment, so the root-token ceremony
+   `scripts/vault-oidc-setup.sh` consumes this escrow instead — see
+   [Vault OIDC login](#vault-oidc-login-for-the-aigw-admins-operators);
+10. write verified identity state plus controller and broker certificate SHA-256
+    fingerprints to Vault; and
+11. only after every prior proof succeeds, delete the temporary bootstrap
     principals. The broad temporary service client is always deleted; the
     password-backed temporary admin user is deleted too, unless
     `RETAIN_BOOTSTRAP_ADMIN_USER` is set (lab only), in which case it is
@@ -230,13 +240,94 @@ whole initialization fails closed and the affected durable client stays
 disabled; the operation is idempotent, so reauthenticating and running
 **Initialize identity control** again reuses proven state and retries.
 
+## Vault OIDC login for the aigw-admins operators
+
+Vault's browser UI (`https://vault.<domain>`, optional `vault-ui` profile) and
+CLI can authenticate through Keycloak instead of a pasted Vault token: the
+identity bootstrap reconciles a fifth first-party client (`vault`, realm
+`aigw`) and escrows its secret, and a one-time root-token ceremony wires
+Vault's `auth/oidc` method to it. After the ceremony, **Sign in with OIDC
+Provider** works for any `aigw` user whose token carries the `aigw-admins`
+realm role, and routine root-token logins are retired — the root token
+remains reserved for ceremonies (PKI, policy amendments, escrow retrievals,
+and this script).
+
+**When to run:** once, after the identity initialization ceremony
+(**Initialize identity control**) has completed on a stack deployed with the
+current converge — the escrow at `kv/ai-gateway/keycloak/vault-oidc-rp` and
+the `net-vault` edge alias both come from that pairing. The script is
+idempotent and re-runnable; every write is read back and verified, and it
+ends by generating a real authorization URL as an end-to-end proof. Re-run it
+after an edge-CA change (it re-pins `certs/ca.pem` into the OIDC
+configuration) or after rotating the `vault` client secret via a
+re-initialization.
+
+**Ceremony** (on the VM, as root, from `/opt/ai-gateway`; the root token is
+read from stdin only, matching every other Vault ceremony):
+
+```bash
+cd /opt/ai-gateway
+read -rsp 'Vault root token: ' TOK; printf '\n'
+printf '%s\n' "$TOK" | sudo scripts/vault-oidc-setup.sh
+unset TOK
+```
+
+What it configures, deliberately:
+
+- `auth/oidc` with discovery against the **public issuer**
+  `https://auth.<domain>/realms/aigw`, trust-pinned to the deployment CA
+  bundle (`certs/ca.pem`). Discovery must use the public issuer because OIDC
+  requires the discovery document's issuer to equal the discovery URL, and
+  the hostname-pinned Keycloak advertises the public issuer on every
+  listener; the vault container reaches that hostname through a scoped
+  `auth.<domain>` alias on `net-vault` (the same reviewed pattern Open WebUI
+  uses on `net-chat`).
+- role `aigw` — `user_claim` `preferred_username`, `groups_claim` `roles`,
+  bound to audience `vault` **and** `roles ∋ aigw-admins` (a non-admin who
+  reaches the listener cannot log in at all), redirect allow-list of exactly
+  the UI callback `https://vault.<domain>/ui/vault/auth/oidc/oidc/callback`
+  and the CLI loopback `http://localhost:8250/oidc/callback`, token TTL
+  1h/8h.
+- external identity group `aigw-admins` (plus its OIDC mount alias) mapped to
+  the new **`vault-admins`** policy.
+
+The `vault-admins` policy is scoped, not a root replacement. It **can**:
+manage the `kv/` application data plane (all CRUD, version
+delete/undelete/destroy, metadata), operate the `pki_int` edge issuing mount
+(roles, issuance, revocation, CRL), tune `kv` and `pki_int`, and read mount /
+health / seal-status introspection. It **cannot**: read the four
+root-ceremony records (the break-glass escrow, the `vault` OIDC escrow, the
+identity-controller private key, the WIF broker private key — all explicitly
+denied), enable or configure auth methods, write policies, touch
+`identity/*`, manage audit devices, seal/rekey/step-down, use raw storage,
+create or delete mounts, or mint tokens for others.
+
+CLI logins are possible through a deliberate operator SSH tunnel to the
+Vault listener (the API is never published on a host port); with the tunnel
+up, `vault login -method=oidc role=aigw` opens the browser flow against the
+loopback callback.
+
+**Brownfield note** (host bootstrapped before this feature): the rotator's
+Vault policy predates the escrow path, so `/identity/status` reports
+`vault_oidc_rp_escrow_readable: false` and the acceptance verifier fails
+until the migration completes. Follow the same amendment shape as
+[Upgrading an existing deployment to the break-glass contract](#upgrading-an-existing-deployment-to-the-break-glass-contract):
+re-write the full `rotator` policy from the heredoc in
+`scripts/vault-bootstrap.sh` §5 (the single source of truth — it now grants
+`kv/data/ai-gateway/keycloak/vault-oidc-rp`), then re-run the identity
+initialization (temporary-service recovery + **Initialize identity
+control**) so the escrow is written and the `vault` client is reconciled,
+then run `scripts/vault-oidc-setup.sh`. The ceremony fails closed with a
+pointed message if the escrow is missing.
+
 ## Domain migration on an existing realm
 
 Changing `aigw_domain` after the realm database already exists (for example
 migrating `aigw.internal` to `aigw.aegisgroup.ch`) does **not** re-key the
 first-party OIDC clients on its own: Keycloak imports realm JSON only into an
-empty database, so `admin-portal`, `dev-portal`, `open-webui`, and the four
-`admin-ui` oauth2-proxy callbacks keep their old `redirectUris`/`webOrigins`.
+empty database, so `admin-portal`, `dev-portal`, `open-webui`, the `vault`
+OIDC-login callbacks, and the four `admin-ui` oauth2-proxy callbacks keep
+their old `redirectUris`/`webOrigins`.
 Every browser login then fails with Keycloak `400 "Invalid parameter:
 redirect_uri"`, because the edge correctly emits the new-domain callback that is
 no longer on the client's allow-list.
@@ -246,7 +337,7 @@ has run the interactive **Initialize identity control** ceremony, so the
 temporary master-realm client `aigw-bootstrap-controller` still exists — a
 converge repairs this automatically. The `docker_stack` role runs
 `app.reconcile_oidc_redirect_uris` through the key-rotator service; it uses only
-that already-reviewed bootstrap credential to realign the four managed clients'
+that already-reviewed bootstrap credential to realign the five managed clients'
 `redirectUris`, `webOrigins`, and the two managed `post.logout.redirect.uris`
 allow-lists to the configured `aigw_domain`. It touches nothing else — not
 client secrets, flows, protocol mappers, realm-role scopes, the durable
@@ -266,7 +357,7 @@ identity bootstrap ceremony. To repair callbacks on such a host, restore the
 temporary bootstrap client through your reviewed break-glass process (it is
 recreated on a realm re-seed into an empty database) and run **Initialize
 identity control** again — step 2 of that ceremony reconciles and verifies the
-same four clients. Never grant the durable controller a standing
+same five clients. Never grant the durable controller a standing
 `manage-clients` role to avoid the ceremony; that is the security boundary this
 design preserves.
 
@@ -687,7 +778,7 @@ uses only the temporary Keycloak bootstrap client, never touches Vault,
 never deletes Keycloak objects, and fails closed on any undeclared member or
 role mapping. A sibling one-time reconciler
 (`RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES`) maintains the realm-role scope
-mappings on the four relying parties. Both are invoked root-owned through
+mappings on the five relying parties. Both are invoked root-owned through
 Ansible, never interactively.
 
 **Provider enrollment control plane.** Anthropic WIF enrollment, disable, and

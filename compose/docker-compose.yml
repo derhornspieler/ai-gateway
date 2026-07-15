@@ -213,6 +213,15 @@ services:
       net-grafana:
         ipv4_address: ${TRAEFIK_ADM_GRAFANA_IP:?TRAEFIK_ADM_GRAFANA_IP must be set}
       net-metrics: {}
+      # Vault's OIDC auth method performs issuer-exact discovery, token, and
+      # JWKS calls against https://auth.<domain> (an OIDC provider's issuer
+      # must equal the discovery URL, and hostname-pinned Keycloak advertises
+      # the public issuer on every listener). This alias resolves that one
+      # hostname to the full ADM Keycloak route for the vault plane, exactly
+      # like the net-chat alias above does for Open WebUI; trust is pinned by
+      # the CA bundle installed in auth/oidc/config by vault-oidc-setup.sh.
+      net-vault:
+        aliases: ["auth.${DOMAIN}"]
     healthcheck:
       test: [CMD, traefik, healthcheck]
       interval: 10s
@@ -665,6 +674,7 @@ services:
       PORTAL_OIDC_CLIENT_SECRET: ${PORTAL_OIDC_CLIENT_SECRET:?PORTAL_OIDC_CLIENT_SECRET must be set}
       ADMIN_PORTAL_OIDC_CLIENT_SECRET: ${ADMIN_PORTAL_OIDC_CLIENT_SECRET:?ADMIN_PORTAL_OIDC_CLIENT_SECRET must be set}
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
+      VAULT_OIDC_CLIENT_SECRET: ${VAULT_OIDC_CLIENT_SECRET:?VAULT_OIDC_CLIENT_SECRET must be set}
     volumes:
       - ./keycloak/realms:/opt/keycloak/data/import:ro,Z
     networks:
@@ -869,6 +879,11 @@ services:
       PORTAL_OIDC_CLIENT_SECRET: ${PORTAL_OIDC_CLIENT_SECRET:?PORTAL_OIDC_CLIENT_SECRET must be set}
       ADMIN_PORTAL_OIDC_CLIENT_SECRET: ${ADMIN_PORTAL_OIDC_CLIENT_SECRET:?ADMIN_PORTAL_OIDC_CLIENT_SECRET must be set}
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
+      # Vault's own OIDC login client. The rotator reconciles it in Keycloak
+      # and escrows this secret at VAULT_OIDC_RP_VAULT_PATH for the root-token
+      # ceremony scripts/vault-oidc-setup.sh; Vault never reads Compose env.
+      VAULT_OIDC_CLIENT_SECRET: ${VAULT_OIDC_CLIENT_SECRET:?VAULT_OIDC_CLIENT_SECRET must be set}
+      VAULT_OIDC_RP_VAULT_PATH: ${VAULT_OIDC_RP_VAULT_PATH:-ai-gateway/keycloak/vault-oidc-rp}
       RETAIN_BOOTSTRAP_ADMIN_USER: ${RETAIN_BOOTSTRAP_ADMIN_USER:-false}
       # Durable group-gated master-realm administration. No secret: the
       # rotator generates the break-glass password and escrows it in Vault.

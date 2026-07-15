@@ -232,6 +232,18 @@ class Settings(BaseSettings):
     oauth2_proxy_client_secret: str = Field(
         default="", alias="OAUTH2_PROXY_CLIENT_SECRET"
     )
+    # Confidential OIDC client for Vault's own auth/oidc login (UI "Sign in
+    # with OIDC Provider" + CLI loopback). Vault never reads this from the
+    # environment: the rotator reconciles the Keycloak client and escrows the
+    # secret at VAULT_OIDC_RP_VAULT_PATH, where the root-token ceremony
+    # scripts/vault-oidc-setup.sh consumes it.
+    vault_oidc_client_secret: str = Field(
+        default="", alias="VAULT_OIDC_CLIENT_SECRET"
+    )
+    vault_oidc_rp_vault_path: str = Field(
+        default="ai-gateway/keycloak/vault-oidc-rp",
+        alias="VAULT_OIDC_RP_VAULT_PATH",
+    )
     # Disposable lab only: keep the password-backed bootstrap user
     # as a durable ADM-console recovery operator while still deleting the
     # much broader temporary bootstrap service client. Customer profiles keep
@@ -461,9 +473,9 @@ class Settings(BaseSettings):
                 "master-realm administrators are the Vault-escrowed "
                 "break-glass user until the directory overlay ships"
             )
-        # The four identity Vault paths must be pairwise distinct. An aliased
+        # The five identity Vault paths must be pairwise distinct. An aliased
         # escrow path is silently destructive: bootstrap overwrites the state
-        # and key documents after the escrow is written, and the
+        # and key documents after the escrows are written, and the
         # ai-gateway/anthropic-wif enrollment record is the one rotator path
         # whose policy permits deletion — an escrow parked there could be
         # permanently destroyed by the provider teardown flow.
@@ -476,6 +488,7 @@ class Settings(BaseSettings):
                 self.kc_client_assertion_key_vault_path
             ),
             "BREAK_GLASS_ADMIN_VAULT_PATH": self.break_glass_admin_vault_path,
+            "VAULT_OIDC_RP_VAULT_PATH": self.vault_oidc_rp_vault_path,
         }
         if len(set(identity_paths.values())) != len(identity_paths):
             raise ValueError(
@@ -510,6 +523,7 @@ class Settings(BaseSettings):
         "identity_controller_key_vault_path",
         "identity_state_vault_path",
         "break_glass_admin_vault_path",
+        "vault_oidc_rp_vault_path",
     )
     @classmethod
     def validate_identity_vault_paths(cls, value: str, info) -> str:
@@ -679,6 +693,7 @@ class Settings(BaseSettings):
             self.portal_oidc_client_secret,
             self.admin_portal_oidc_client_secret,
             self.oauth2_proxy_client_secret,
+            self.vault_oidc_client_secret,
         )
         normalized = tuple(value.strip() for value in values)
         return (

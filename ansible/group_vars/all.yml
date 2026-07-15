@@ -429,7 +429,7 @@ aigw_seed_test_users: false
 #   litellm_salt_key          redis_password             webui_litellm_key
 #   webui_secret_key          webui_oidc_client_secret
 #   portal_oidc_client_secret admin_portal_oidc_client_secret
-#   oauth2_proxy_client_secret
+#   oauth2_proxy_client_secret vault_oidc_client_secret
 #   oauth2_proxy_litellm_cookie_secret oauth2_proxy_grafana_cookie_secret
 #   oauth2_proxy_prometheus_cookie_secret oauth2_proxy_vault_cookie_secret
 #   portal_session_secret admin_portal_session_secret
@@ -462,6 +462,9 @@ aigw_seed_test_users: false
 # portal_oidc_client_secret:  <vault overlay only>  # alphanumeric only
 # admin_portal_oidc_client_secret: <vault overlay only>  # alphanumeric only
 # oauth2_proxy_client_secret: <vault overlay only>  # alphanumeric only
+# vault_oidc_client_secret:   <vault overlay only>  # alphanumeric only; the
+#     Vault OIDC login client. The rotator escrows it in Vault for the
+#     scripts/vault-oidc-setup.sh root ceremony (docs/identity-operations.md).
 # oauth2_proxy_litellm_cookie_secret: <vault overlay only>  # STABLE 32-char alphanumeric
 # oauth2_proxy_grafana_cookie_secret: <vault overlay only>  # STABLE 32-char alphanumeric
 # oauth2_proxy_prometheus_cookie_secret: <vault overlay only> # STABLE 32-char alphanumeric
@@ -508,3 +511,8 @@ identity_state_vault_path: "ai-gateway/keycloak/identity-state"
 # docs/identity-operations.md.
 break_glass_admin_enabled: true
 break_glass_admin_vault_path: "ai-gateway/keycloak/break-glass-admin"
+# Escrow path for the `vault` OIDC relying-party client secret (non-secret
+# path string). The rotator writes it during the identity bootstrap; the
+# root-token ceremony scripts/vault-oidc-setup.sh reads it to wire Vault's
+# auth/oidc login to Keycloak (docs/identity-operations.md).
+vault_oidc_rp_vault_path: "ai-gateway/keycloak/vault-oidc-rp"

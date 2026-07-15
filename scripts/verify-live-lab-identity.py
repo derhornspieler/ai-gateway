@@ -57,6 +57,9 @@ def main() -> int:
         # The durable break-glass administrator's credential must be escrowed
         # in Vault; the boolean is derived from the escrow document alone.
         "break_glass_escrowed": True,
+        # The `vault` relying-party client secret must be escrowed for the
+        # vault-oidc-setup.sh ceremony; also a pure escrow-presence boolean.
+        "vault_oidc_rp_escrowed": True,
     }
     for field, expected in expected_status.items():
         actual = status.get(field)
@@ -75,6 +78,21 @@ def main() -> int:
                         " — no valid escrow document; re-run the identity "
                         "initialization ceremony (docs/identity-operations.md"
                         ", 'Break-glass administrator')"
+                    )
+            elif field == "vault_oidc_rp_escrowed":
+                if status.get("vault_oidc_rp_escrow_readable") is False:
+                    hint = (
+                        " — the rotator's Vault policy predates the vault "
+                        "OIDC escrow path; run the one-time policy amendment,"
+                        " then the re-initialization ceremony "
+                        "(docs/identity-operations.md, 'Vault OIDC login')"
+                    )
+                else:
+                    hint = (
+                        " — no valid vault OIDC escrow; re-run the identity "
+                        "initialization ceremony, then "
+                        "scripts/vault-oidc-setup.sh "
+                        "(docs/identity-operations.md, 'Vault OIDC login')"
                     )
             raise RuntimeError(
                 "unexpected identity status field: "

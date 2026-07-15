@@ -35,6 +35,7 @@ RP_SECRETS = {
         "AdminPortalOIDCSecret!0123456789-ABCDE"
     ),
     "OAUTH2_PROXY_CLIENT_SECRET": "OAuth2ProxySecret!0123456789-ABCDEFGHI",
+    "VAULT_OIDC_CLIENT_SECRET": "VaultOIDCSecret!0123456789-ABCDEFGHIJ",
 }
 
 
@@ -118,10 +119,20 @@ def test_relying_party_specs_require_distinct_strong_secrets() -> None:
         "dev-portal",
         "admin-portal",
         "admin-ui",
+        "vault",
     ]
     assert tuple(spec["clientId"] for spec in specs) == RELYING_PARTY_CLIENT_IDS
-    assert len({spec["secret"] for spec in specs}) == 4
+    assert len({spec["secret"] for spec in specs}) == 5
     assert all(spec["fullScopeAllowed"] is False for spec in specs)
+    vault_spec = next(spec for spec in specs if spec["clientId"] == "vault")
+    domain = admin.settings.aigw_domain
+    assert vault_spec["redirectUris"] == [
+        f"https://vault.{domain}/ui/vault/auth/oidc/oidc/callback",
+        "http://localhost:8250/oidc/callback",
+    ]
+    assert vault_spec["webOrigins"] == [f"https://vault.{domain}"]
+    assert vault_spec["directAccessGrantsEnabled"] is False
+    assert vault_spec["serviceAccountsEnabled"] is False
 
 
 @pytest.mark.asyncio
@@ -216,6 +227,11 @@ async def test_relying_party_reconciliation_verifies_logout_redirect_allowlist()
         (
             "OAUTH2_PROXY_CLIENT_SECRET",
             RP_SECRETS["WEBUI_OIDC_CLIENT_SECRET"],
+        ),
+        ("VAULT_OIDC_CLIENT_SECRET", ""),
+        (
+            "VAULT_OIDC_CLIENT_SECRET",
+            RP_SECRETS["OAUTH2_PROXY_CLIENT_SECRET"],
         ),
     ],
 )
@@ -644,16 +660,24 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
         async def status(self):
             return {"configured": True}
 
-    result = await OrderedAdmin(settings(), vault, FakeDB()).bootstrap()
+    result = await OrderedAdmin(settings(**RP_SECRETS), vault, FakeDB()).bootstrap()
     assert result == {"configured": True}
     break_glass = events.index(("keycloak", "break_glass_ensured"))
+    vault_rp_escrow = events.index(
+        ("vault_write", "ai-gateway/keycloak/vault-oidc-rp")
+    )
     state_write = events.index(
         ("vault_write", "ai-gateway/keycloak/identity-state")
     )
     admin_delete = events.index(("keycloak", "bootstrap_deleted"))
-    # The durable break-glass administrator must be proven before the state
-    # write, and the temporary admin destroyed only after both.
-    assert break_glass < state_write < admin_delete
+    # The durable break-glass administrator and the vault RP escrow must be
+    # proven before the state write, and the temporary admin destroyed only
+    # after all of them.
+    assert break_glass < vault_rp_escrow < state_write < admin_delete
+    escrow = vault.docs["ai-gateway/keycloak/vault-oidc-rp"]
+    assert escrow["schema_version"] == 1
+    assert escrow["client_id"] == "vault"
+    assert escrow["client_secret"] == RP_SECRETS["VAULT_OIDC_CLIENT_SECRET"]
 
 
 @pytest.mark.asyncio

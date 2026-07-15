@@ -155,6 +155,38 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "vault",
+      "name": "Vault UI and CLI OIDC login",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "fullScopeAllowed": false,
+      "secret": "${VAULT_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "https://vault.aigw.example.internal/ui/vault/auth/oidc/oidc/callback",
+        "http://localhost:8250/oidc/callback"
+      ],
+      "webOrigins": ["https://vault.aigw.example.internal"],
+      "protocolMappers": [
+        {
+          "name": "realm-roles-to-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "scopeMappings": [
@@ -172,6 +204,10 @@
     },
     {
       "client": "admin-ui",
+      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+    },
+    {
+      "client": "vault",
       "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
     }
   ]

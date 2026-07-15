@@ -1213,6 +1213,12 @@ def _safe_identity_status(raw: Any) -> dict[str, Any] | None:
         "break_glass_escrow_readable": (
             raw.get("break_glass_escrow_readable") is not False
         ),
+        # Same custody model for the `vault` OIDC relying-party secret that
+        # the scripts/vault-oidc-setup.sh root ceremony consumes.
+        "vault_oidc_rp_escrowed": raw.get("vault_oidc_rp_escrowed") is True,
+        "vault_oidc_rp_escrow_readable": (
+            raw.get("vault_oidc_rp_escrow_readable") is not False
+        ),
         "controller_certificate_sha256": fingerprint("controller_certificate_sha256"),
         "broker_certificate_sha256": fingerprint("broker_certificate_sha256"),
     }

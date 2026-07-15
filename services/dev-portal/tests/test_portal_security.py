@@ -1730,6 +1730,8 @@ def test_admin_page_surfaces_break_glass_escrow_state(
         "ldap_configured": True,
         "break_glass_escrowed": True,
         "break_glass_escrow_readable": True,
+        "vault_oidc_rp_escrowed": True,
+        "vault_oidc_rp_escrow_readable": True,
         "controller_certificate_sha256": "a" * 64,
         "broker_certificate_sha256": "b" * 64,
     }
@@ -1751,6 +1753,7 @@ def test_admin_page_surfaces_break_glass_escrow_state(
     escrowed = admin_client.get("/admin")
     assert escrowed.status_code == 200
     assert "Break-glass escrow: escrowed" in escrowed.text
+    assert "Vault OIDC client escrow: escrowed" in escrowed.text
 
     status["break_glass_escrowed"] = False
     status["break_glass_escrow_readable"] = False
@@ -1763,6 +1766,12 @@ def test_admin_page_surfaces_break_glass_escrow_state(
     assert missing.status_code == 200
     assert "Break-glass escrow: not escrowed" in missing.text
 
+    status["vault_oidc_rp_escrowed"] = False
+    status["vault_oidc_rp_escrow_readable"] = True
+    vault_missing = admin_client.get("/admin")
+    assert vault_missing.status_code == 200
+    assert "Vault OIDC client escrow: not escrowed" in vault_missing.text
+
 
 def test_safe_identity_status_maps_break_glass_booleans_only():
     mapped = main._safe_identity_status(
@@ -1770,14 +1779,22 @@ def test_safe_identity_status_maps_break_glass_booleans_only():
             "configured": True,
             "break_glass_escrowed": True,
             "break_glass_escrow_readable": False,
+            "vault_oidc_rp_escrowed": True,
+            "vault_oidc_rp_escrow_readable": False,
             "password": "must-never-cross",
+            "client_secret": "must-never-cross-either",
         }
     )
     assert mapped["break_glass_escrowed"] is True
     assert mapped["break_glass_escrow_readable"] is False
+    assert mapped["vault_oidc_rp_escrowed"] is True
+    assert mapped["vault_oidc_rp_escrow_readable"] is False
     assert "password" not in mapped
+    assert "client_secret" not in mapped
     # A pre-upgrade rotator that omits the readable field must not render as
     # a policy gap: absence defaults to readable.
     legacy = main._safe_identity_status({"configured": True})
     assert legacy["break_glass_escrowed"] is False
     assert legacy["break_glass_escrow_readable"] is True
+    assert legacy["vault_oidc_rp_escrowed"] is False
+    assert legacy["vault_oidc_rp_escrow_readable"] is True

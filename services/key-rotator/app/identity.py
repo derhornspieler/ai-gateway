@@ -46,7 +46,15 @@ RELYING_PARTY_CLIENT_IDS = (
     "dev-portal",
     "admin-portal",
     "admin-ui",
+    "vault",
 )
+# Vault's own OIDC login (auth/oidc) authenticates against this confidential
+# client. Vault cannot read Compose environment, so the reconciled secret is
+# escrowed to VAULT_OIDC_RP_VAULT_PATH for the root-token ceremony
+# scripts/vault-oidc-setup.sh — the same custody model as the break-glass
+# administrator credential.
+VAULT_RP_CLIENT_ID = "vault"
+VAULT_OIDC_RP_SCHEMA = 1
 CONTROLLER_ADMIN_ROLES = (
     "manage-users",
     "query-groups",
@@ -1341,6 +1349,21 @@ class KeycloakAdmin:
                     f"https://prometheus.{domain}",
                     f"https://vault.{domain}",
                 ],
+            ),
+            # Vault's inner OIDC login, behind the admin-ui oauth2-proxy gate.
+            # The loopback callback serves `vault login -method=oidc` through
+            # a deliberate operator SSH tunnel; the code arriving there is
+            # useless without this confidential client's secret, which only
+            # Vault holds.
+            client(
+                VAULT_RP_CLIENT_ID,
+                "Vault UI and CLI OIDC login",
+                self.settings.vault_oidc_client_secret,
+                [
+                    f"https://vault.{domain}/ui/vault/auth/oidc/oidc/callback",
+                    "http://localhost:8250/oidc/callback",
+                ],
+                [f"https://vault.{domain}"],
             ),
         ]
 
@@ -3001,6 +3024,70 @@ class KeycloakAdmin:
         )
         return retained_user
 
+    def _vault_oidc_rp_escrow_doc(self) -> dict[str, Any] | None:
+        try:
+            doc = self.vault.read(self.settings.vault_oidc_rp_vault_path)
+        except Exception as exc:  # noqa: BLE001
+            raise IdentityError(
+                "could not read the Vault OIDC relying-party escrow from Vault"
+            ) from exc
+        if (
+            isinstance(doc, dict)
+            and doc.get("schema_version") == VAULT_OIDC_RP_SCHEMA
+            and doc.get("client_id") == VAULT_RP_CLIENT_ID
+            and isinstance(doc.get("client_secret"), str)
+            and len(doc["client_secret"]) >= 32
+        ):
+            return doc
+        return None
+
+    def _escrow_vault_oidc_rp_secret(self) -> str:
+        """Escrow the verified ``vault`` relying-party secret for the ceremony.
+
+        Vault's own OIDC login cannot read Compose environment, so the
+        root-token ceremony ``scripts/vault-oidc-setup.sh`` consumes this
+        escrow instead — the client secret never crosses argv, environment
+        listings, or logs. Called only after ``_ensure_relying_parties`` has
+        read the secret back from Keycloak, so the escrow always describes a
+        credential Keycloak provably holds. An escrow that already matches is
+        left untouched to avoid KV version churn on idempotent re-runs.
+        """
+        secret = self.settings.vault_oidc_client_secret
+        # Defense in depth: _ensure_relying_parties already gates on the full
+        # relying-party secret policy, but this escrow is consumed by a root
+        # ceremony and must never park a missing or weak credential even if a
+        # future caller reorders the bootstrap.
+        if len(secret) < 32 or not self.settings.relying_party_secrets_ok():
+            raise IdentityConflict(
+                "refusing to escrow a missing or weak vault OIDC "
+                "relying-party secret"
+            )
+        existing = self._vault_oidc_rp_escrow_doc()
+        if existing is not None and hmac.compare_digest(
+            existing["client_secret"].encode(), secret.encode()
+        ):
+            return str(existing.get("created_at", ""))
+        escrow = {
+            "schema_version": VAULT_OIDC_RP_SCHEMA,
+            "client_id": VAULT_RP_CLIENT_ID,
+            "client_secret": secret,
+            "realm": self.settings.identity_realm,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            written = self.vault.write_verified(
+                self.settings.vault_oidc_rp_vault_path, escrow
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise IdentityError(
+                "Vault rejected the vault OIDC relying-party escrow"
+            ) from exc
+        if not written:
+            raise IdentityError(
+                "Vault did not verify the vault OIDC relying-party escrow write"
+            )
+        return str(escrow["created_at"])
+
     async def _audit(self, action: str, status: str, detail: dict[str, Any]) -> None:
         try:
             await self.db.record_history(
@@ -3046,6 +3133,14 @@ class KeycloakAdmin:
                         "administrator: BREAK_GLASS_ADMIN_ENABLED must remain "
                         "true"
                     )
+                # Escrowed before the verified state write and teardown, like
+                # the break-glass credential: the vault-oidc-setup.sh ceremony
+                # must always find the secret Keycloak verifiably holds. On a
+                # rotator whose Vault policy predates this path, amend the
+                # policy first (docs/identity-operations.md) — this write
+                # fails closed rather than consuming the bootstrap without
+                # the escrow.
+                vault_oidc_rp_escrowed_at = self._escrow_vault_oidc_rp_secret()
                 state_doc = {
                     "schema_version": IDENTITY_STATE_SCHEMA,
                     "managed_root_group_id": path_segment(
@@ -3073,6 +3168,7 @@ class KeycloakAdmin:
                     "break_glass_escrowed_at": (
                         break_glass["escrowed_at"] if break_glass else ""
                     ),
+                    "vault_oidc_rp_escrowed_at": vault_oidc_rp_escrowed_at,
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                 }
                 if not self.vault.write_verified(
@@ -3091,6 +3187,7 @@ class KeycloakAdmin:
                         "temporary_bootstrap_service_deleted": True,
                         "lab_recovery_operator_retained": bootstrap_user_retained,
                         "break_glass_admin_ensured": bool(break_glass),
+                        "vault_oidc_rp_escrowed": True,
                     },
                 )
                 return await self.status()
@@ -3125,6 +3222,15 @@ class KeycloakAdmin:
             # brownfield host must keep converging while the documented
             # policy-amendment ceremony is pending.
             break_glass_escrow_readable = False
+        vault_oidc_rp_doc = None
+        vault_oidc_rp_escrow_readable = True
+        try:
+            vault_oidc_rp_doc = self.vault.read(
+                self.settings.vault_oidc_rp_vault_path
+            )
+        except Exception:  # noqa: BLE001
+            # Same brownfield degradation as the break-glass escrow above.
+            vault_oidc_rp_escrow_readable = False
         controller_usable = False
         if isinstance(controller_key, dict):
             try:
@@ -3178,6 +3284,18 @@ class KeycloakAdmin:
                 == self.settings.break_glass_admin_username
                 and isinstance(break_glass_doc.get("password"), str)
                 and len(break_glass_doc["password"]) >= 32
+            ),
+            # Presence booleans for the escrowed `vault` relying-party client
+            # secret consumed by the vault-oidc-setup.sh ceremony. The secret
+            # itself never leaves Vault through this API.
+            "vault_oidc_rp_escrow_readable": vault_oidc_rp_escrow_readable,
+            "vault_oidc_rp_escrowed": (
+                vault_oidc_rp_escrow_readable
+                and isinstance(vault_oidc_rp_doc, dict)
+                and vault_oidc_rp_doc.get("schema_version") == VAULT_OIDC_RP_SCHEMA
+                and vault_oidc_rp_doc.get("client_id") == VAULT_RP_CLIENT_ID
+                and isinstance(vault_oidc_rp_doc.get("client_secret"), str)
+                and len(vault_oidc_rp_doc["client_secret"]) >= 32
             ),
         }
 

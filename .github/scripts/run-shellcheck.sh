@@ -47,6 +47,7 @@ TARGETS=(
   scripts/validate-compose-on-vm.sh
   scripts/validate-vault-config.sh
   scripts/vault-bootstrap.sh
+  scripts/vault-oidc-setup.sh
   scripts/vault-pki-intermediate.sh
   scripts/vault-unseal.sh
   services/egress-proxy/generate-pins.sh

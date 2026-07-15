@@ -64,6 +64,7 @@ class GenericRocky9ContractTests(unittest.TestCase):
                 "portal_oidc_client_secret",
                 "admin_portal_oidc_client_secret",
                 "oauth2_proxy_client_secret",
+                "vault_oidc_client_secret",
                 "oauth2_proxy_litellm_cookie_secret",
                 "oauth2_proxy_grafana_cookie_secret",
                 "oauth2_proxy_prometheus_cookie_secret",

@@ -608,9 +608,9 @@ This section applies only to the lab overlay.
    **Reauthenticate with Keycloak**, then submit `INITIALIZE`.
 3. Confirm status shows the durable controller and WIF broker ready, the lab
    LDAP provider ready, certificate fingerprints, `break_glass_escrowed` true,
-   and no `bootstrap_cleanup_required`. Private keys, bootstrap tokens,
-   PKCS#12 data, LDAP credentials, and the break-glass password must never
-   appear.
+   `vault_oidc_rp_escrowed` true, and no `bootstrap_cleanup_required`. Private
+   keys, bootstrap tokens, PKCS#12 data, LDAP credentials, the break-glass
+   password, and the `vault` client secret must never appear.
 4. Prove the durable break-glass administrator: retrieve the escrowed
    credential with the root Vault ceremony in
    [identity operations](identity-operations.md#break-glass-administrator),
@@ -621,23 +621,36 @@ This section applies only to the lab overlay.
    (`bruteForceProtected` on, failure factor 5). Confirm the same console URL
    is refused on the internal edge. Rotate the credential afterwards per the
    documented ceremony (disable → delete escrow version → re-initialize).
-5. Confirm only the three seeded Samba users are imported from the dedicated
+5. Wire and prove Vault's OIDC login (`vault-ui` profile deployments): run
+   the root-token ceremony `scripts/vault-oidc-setup.sh` per
+   [identity operations](identity-operations.md#vault-oidc-login-for-the-aigw-admins-operators)
+   — it must end with its own end-to-end auth-URL verification — then open
+   `https://vault.<domain>`, pass the oauth2-proxy gate, choose **Sign in
+   with OIDC Provider**, and confirm an `aigw-admins` user receives a token
+   carrying the `vault-admins` (plus `default`) policy: it can list
+   `kv/ai-gateway/...` application secrets but is denied
+   `kv/ai-gateway/keycloak/break-glass-admin` and
+   `kv/ai-gateway/keycloak/vault-oidc-rp`, and cannot read `sys/policies` or
+   enable auth methods. Confirm a user without `aigw-admins` cannot complete
+   the inner OIDC login even when reaching the listener directly (bound
+   claims), and that no root-token login was needed anywhere in this step.
+6. Confirm only the three seeded Samba users are imported from the dedicated
    AI Gateway user OU; `svc-keycloak-ldap` must not appear.
-6. Create capability groups below `/aigw-managed`, assign imported users, and
+7. Create capability groups below `/aigw-managed`, assign imported users, and
    prove fresh login changes the emitted roles and access matrix.
-7. Prove an out-of-tree group, unknown capability, non-federated user,
+8. Prove an out-of-tree group, unknown capability, non-federated user,
    non-empty group deletion, and removal of the final managed administrator
    are rejected.
-8. Adversarially race deletion of an empty recovery-admin group, addition of a
+9. Adversarially race deletion of an empty recovery-admin group, addition of a
    recovery administrator to it, and removal of the existing last
    administrator. Pass only if the process-local topology lock serializes all
    three operations and at least one conflicting mutation fails without
    leaving zero managed administrators. This is single-worker evidence, not a
    multi-replica guarantee.
-9. Create a second durable directory administrator for the lab, synchronize
-   users, assign both durable administrators, and prove both can log in using
-   Samba-owned passwords.
-10. Remove disposable `testadmin` through the controlled Keycloak ADM process,
+10. Create a second durable directory administrator for the lab, synchronize
+    users, assign both durable administrators, and prove both can log in using
+    Samba-owned passwords.
+11. Remove disposable `testadmin` through the controlled Keycloak ADM process,
     sign out its sessions, and prove it can no longer authenticate. Do not
     leave seeded Keycloak-local identities in a customer deployment.
 

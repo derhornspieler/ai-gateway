@@ -34,7 +34,7 @@ vs *machine identities*.
 | Realm | Purpose | Who/what lives there |
 |---|---|---|
 | `master` | Keycloak administration | The `keycloak-admins` group, mapped to master's full `admin` composite role; the durable `break-glass-admin` user, password escrowed in Vault; optionally, admins federated from a designated AD admin group. Temporary bootstrap principals exist only between first start and the identity ceremony. |
-| `aigw` | People and applications | Human users (federated from AD over LDAPS — lab Samba or the customer directory); the app clients `open-webui`, `dev-portal`, `admin-portal`, `admin-ui`; the realm roles `aigw-users`, `aigw-developers`, `aigw-admins`; the managed group tree under `/aigw-managed`; the durable `aigw-identity-controller` service client. |
+| `aigw` | People and applications | Human users (federated from AD over LDAPS — lab Samba or the customer directory); the app clients `open-webui`, `dev-portal`, `admin-portal`, `admin-ui`, `vault`; the realm roles `aigw-users`, `aigw-developers`, `aigw-admins`; the managed group tree under `/aigw-managed`; the durable `aigw-identity-controller` service client. |
 | `anthropic-wif` | Machine / workload identity | The `anthropic-token-broker` service client used for the Anthropic workload-identity-federation token exchange. No human users, no roles. See [anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md). |
 
 `master` keeps its built-in name: in Keycloak, administering *other* realms
@@ -198,7 +198,7 @@ defense-in-depth — three independent layers, each of which must pass:
 | `litellm-admin.<domain>` — LiteLLM Admin UI | oauth2-proxy, `aigw-admins` | LiteLLM **master key** (its built-in SSO is enterprise-licensed) |
 | `grafana.<domain>` | oauth2-proxy, `aigw-admins` | None by design — Grafana trusts identity headers from its proxy and shows no second login form |
 | `prometheus.<domain>` | oauth2-proxy, `aigw-admins` | None — Prometheus has no native login |
-| `vault.<domain>` (optional `vault-ui` profile) | oauth2-proxy, `aigw-admins` | **Vault token** — the Vault OIDC auth method is not wired up |
+| `vault.<domain>` (optional `vault-ui` profile) | oauth2-proxy, `aigw-admins` | **Sign in with OIDC Provider** — Vault's `auth/oidc` method against the `aigw` realm (`vault` client, role `aigw`, bound to `aigw-admins`), wired by the one-time root ceremony `scripts/vault-oidc-setup.sh`; the resulting session carries the scoped `vault-admins` policy, and the root token is reserved for ceremonies |
 | `admin.<domain>` — admin portal | Portal's own Keycloak OIDC login (`aigw` realm) + live role re-check | Same login; mutations additionally require a fresh Keycloak step-up |
 | `auth.<domain>` — Keycloak admin console | None — served directly on the ADM edge, deliberately outside oauth2-proxy | Keycloak admin login: **`break-glass-admin`** (password via the on-VM Vault ceremony) or a **federated AD admin account** (optional overlay) |
 
@@ -211,9 +211,11 @@ protections are the layer-1 network gate, its own brute-force-protected
 admin login, and admin-event logging.
 
 So a Grafana session costs two prompts (VPN, then Keycloak), a Vault session
-three (VPN, Keycloak, token), and the Keycloak console two (VPN, then a
-master-realm admin login) — with the console's inner credential either a
-per-person federated AD account or the escrowed break-glass password.
+three (VPN, the Keycloak oauth2-proxy gate, then Vault's own OIDC sign-in —
+usually silent, since the Keycloak SSO session from the gate is still live),
+and the Keycloak console two (VPN, then a master-realm admin login) — with
+the console's inner credential either a per-person federated AD account or
+the escrowed break-glass password.
 
 Routine identity work — creating groups, assigning users, key rotation —
 continues to flow through the admin portal and the narrow `aigw` controller,

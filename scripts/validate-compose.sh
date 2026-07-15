@@ -556,6 +556,7 @@ if ansible.is_file():
         "validate-identity-policy.py",
         "validate-vault-config.sh",
         "vault-bootstrap.sh",
+        "vault-oidc-setup.sh",
         "vault-pki-intermediate.sh",
         "vault-unseal.sh",
         "verify-live-lab-identity.py",
@@ -1088,6 +1089,7 @@ env \
   PORTAL_OIDC_CLIENT_SECRET=ValidationPortalOIDCSecret0123456789AB \
   ADMIN_PORTAL_OIDC_CLIENT_SECRET=ValidationAdminPortalOIDC0123456789AB \
   OAUTH2_PROXY_CLIENT_SECRET=ValidationOauth2ClientSecret0123456789A \
+  VAULT_OIDC_CLIENT_SECRET=ValidationVaultOIDCSecret0123456789ABC \
   OAUTH2_PROXY_LITELLM_COOKIE_SECRET=LitellmCookie0123456789ABCDEFGHI \
   OAUTH2_PROXY_GRAFANA_COOKIE_SECRET=GrafanaCookie0123456789ABCDEFGHI \
   OAUTH2_PROXY_PROMETHEUS_COOKIE_SECRET=PromCookie0123456789ABCDEFGHIJKL \
@@ -1185,6 +1187,14 @@ assert vault["ulimits"]["memlock"] == {"soft": -1, "hard": -1}
 config_mount = next(v for v in vault["volumes"] if v["target"] == "/vault/config/aigw.hcl")
 assert config_mount["type"] == "bind"
 assert config_mount["read_only"] is True
+# The vault OIDC auth method performs issuer-exact discovery against the
+# public hostname. The vault plane itself never widens beyond net-vault; the
+# ADM edge joins net-vault carrying only the one auth alias (mirroring
+# net-chat), and no other public name leaks onto that bridge.
+assert set(vault["networks"]) == {"net-vault"}
+assert services["traefik-adm"]["networks"]["net-vault"]["aliases"] == [
+    "auth.aigw.aegisgroup.ch"
+]
 vault_ui_proxy = services["vault-ui-proxy"]
 assert vault_ui_proxy["image"] == "ai-gateway/dhi-vault-ui-proxy:2.0.3"
 assert vault_ui_proxy["user"] == "1000:1000"
@@ -1484,6 +1494,14 @@ for path, expected_options in {
 assert services["oauth2-proxy-grafana"]["networks"]["net-grafana"]["ipv4_address"] == "172.28.6.3"
 assert services["key-rotator"]["environment"]["KEYCLOAK_PUBLIC_URL"] == "https://auth.aigw.aegisgroup.ch"
 assert services["key-rotator"]["environment"]["WIF_KEYCLOAK_PUBLIC_URL"] == "https://idp.wif-a.example.invalid"
+# The vault OIDC relying-party secret reaches exactly two consumers: Keycloak
+# (realm-import ${VAR} substitution) and the rotator (reconcile + escrow).
+# Vault itself never receives it via environment — the root-token ceremony
+# scripts/vault-oidc-setup.sh reads the rotator-written Vault escrow instead.
+assert services["key-rotator"]["environment"]["VAULT_OIDC_CLIENT_SECRET"] == "ValidationVaultOIDCSecret0123456789ABC"
+assert services["key-rotator"]["environment"]["VAULT_OIDC_RP_VAULT_PATH"] == "ai-gateway/keycloak/vault-oidc-rp"
+assert services["keycloak"]["environment"]["VAULT_OIDC_CLIENT_SECRET"] == "ValidationVaultOIDCSecret0123456789ABC"
+assert "VAULT_OIDC_CLIENT_SECRET" not in services["vault"].get("environment", {})
 assert services["keycloak"].get("read_only", False) is False
 portal = services["dev-portal"]
 assert portal.get("command") in (None, [])

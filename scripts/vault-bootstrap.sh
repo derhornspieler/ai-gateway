@@ -108,6 +108,8 @@ IDENTITY_STATE_VAULT_PATH="$(grep -E '^IDENTITY_STATE_VAULT_PATH=' .env | cut -d
 IDENTITY_STATE_VAULT_PATH="${IDENTITY_STATE_VAULT_PATH:-ai-gateway/keycloak/identity-state}"
 BREAK_GLASS_ADMIN_VAULT_PATH="$(grep -E '^BREAK_GLASS_ADMIN_VAULT_PATH=' .env | cut -d= -f2-)"
 BREAK_GLASS_ADMIN_VAULT_PATH="${BREAK_GLASS_ADMIN_VAULT_PATH:-ai-gateway/keycloak/break-glass-admin}"
+VAULT_OIDC_RP_VAULT_PATH="$(grep -E '^VAULT_OIDC_RP_VAULT_PATH=' .env | cut -d= -f2-)"
+VAULT_OIDC_RP_VAULT_PATH="${VAULT_OIDC_RP_VAULT_PATH:-ai-gateway/keycloak/vault-oidc-rp}"
 
 validate_vault_path() {
   local label="$1" value="$2"
@@ -125,6 +127,7 @@ validate_vault_path KC_CLIENT_ASSERTION_KEY_VAULT_PATH "$KC_CLIENT_ASSERTION_KEY
 validate_vault_path IDENTITY_CONTROLLER_KEY_VAULT_PATH "$IDENTITY_CONTROLLER_KEY_VAULT_PATH"
 validate_vault_path IDENTITY_STATE_VAULT_PATH "$IDENTITY_STATE_VAULT_PATH"
 validate_vault_path BREAK_GLASS_ADMIN_VAULT_PATH "$BREAK_GLASS_ADMIN_VAULT_PATH"
+validate_vault_path VAULT_OIDC_RP_VAULT_PATH "$VAULT_OIDC_RP_VAULT_PATH"
 mkdir -p secrets certs
 
 # VAULT_TOKEN is forwarded by NAME only (`-e VAULT_TOKEN`): docker takes the
@@ -382,15 +385,18 @@ path "kv/metadata/ai-gateway/anthropic-wif" { capabilities = ["read", "delete"] 
 path "kv/data/ai-gateway/openai-admin" { capabilities = ["read"] }
 path "kv/data/ai-gateway/vendors/anthropic" { capabilities = ["read"] }
 
-# The identity setup controller writes only its four exact, prevalidated
+# The identity setup controller writes only its five exact, prevalidated
 # records. It cannot enumerate or mutate any neighboring Vault subtree. The
-# break-glass record is the escrowed master-realm administrator credential;
-# operators read it through the documented root ceremony, never through the
-# rotator API, which reports only a presence boolean.
+# break-glass record is the escrowed master-realm administrator credential
+# and the vault-oidc-rp record is the escrowed 'vault' relying-party client
+# secret consumed by scripts/vault-oidc-setup.sh; operators read them through
+# the documented root ceremonies, never through the rotator API, which
+# reports only presence booleans.
 path "kv/data/${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
 path "kv/data/${IDENTITY_CONTROLLER_KEY_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
 path "kv/data/${IDENTITY_STATE_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
 path "kv/data/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
+path "kv/data/${VAULT_OIDC_RP_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
 
 # OpenAI's driver rotates these two exact records.
 path "kv/data/ai-gateway/vendors/openai" { capabilities = ["create", "read", "update"] }

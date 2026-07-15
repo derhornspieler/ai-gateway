@@ -18,6 +18,7 @@ RP_SECRETS = {
         "AdminPortalOIDCSecret_0123456789_ABCDE"
     ),
     "OAUTH2_PROXY_CLIENT_SECRET": "OAuth2ProxySecret_0123456789_ABCDEFGHI",
+    "VAULT_OIDC_CLIENT_SECRET": "VaultOIDCSecret_0123456789_ABCDEFGHIJK",
 }
 
 
@@ -100,6 +101,13 @@ class OidcRelyingPartySecretDriftGateTests(unittest.TestCase):
                 "export OAUTH2_PROXY_CLIENT_SECRET = ",
             )
         )
+        # The one tolerated absence is the NEW vault RP secret (see below);
+        # a present-but-different value is still an ordinary rotation refusal.
+        changed_vault = dict(RP_SECRETS)
+        changed_vault["VAULT_OIDC_CLIENT_SECRET"] = (
+            "ChangedVaultOIDCSecret_0123456789_ABCDE"
+        )
+        cases.append(self.environment(changed_vault))
 
         for deployed in cases:
             with self.subTest(deployed=deployed.splitlines()[-1].split("=", 1)[0]):
@@ -107,6 +115,23 @@ class OidcRelyingPartySecretDriftGateTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(result.stderr, "")
+
+    def test_missing_vault_rp_secret_is_an_addition_not_a_rotation(self) -> None:
+        """A pre-feature deployed .env lacks exactly VAULT_OIDC_CLIENT_SECRET.
+
+        Introducing the new relying-party secret on such a host must not be
+        mistaken for a rotation — the converge is the reviewed path that adds
+        it. Only this one key may be absent; the legacy four stay mandatory.
+        """
+        legacy_only = {
+            key: value
+            for key, value in RP_SECRETS.items()
+            if key != "VAULT_OIDC_CLIENT_SECRET"
+        }
+        result = self.run_gate(self.environment(legacy_only))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
 
     def test_gate_precedes_secret_bearing_or_runtime_deployment_writes(self) -> None:
         gate = self.source.index(

@@ -37,6 +37,7 @@ FIRST_PARTY_OIDC_CLIENTS = {
     "dev-portal",
     "admin-portal",
     "admin-ui",
+    "vault",
 }
 
 
@@ -167,6 +168,17 @@ expected = {
             f"https://prometheus.{domain}",
             f"https://vault.{domain}",
         ],
+    },
+    # Vault's inner OIDC login behind the admin-ui oauth2-proxy gate. The
+    # loopback callback serves the CLI's `vault login -method=oidc` through a
+    # deliberate operator SSH tunnel; the code is useless without the
+    # confidential client secret that only Vault holds.
+    "vault": {
+        "redirectUris": [
+            f"https://vault.{domain}/ui/vault/auth/oidc/oidc/callback",
+            "http://localhost:8250/oidc/callback",
+        ],
+        "webOrigins": [f"https://vault.{domain}"],
     },
 }
 for client_id, contract in expected.items():

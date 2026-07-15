@@ -278,7 +278,7 @@
           - >-
             [webui_oidc_client_secret, portal_oidc_client_secret,
              admin_portal_oidc_client_secret,
-             oauth2_proxy_client_secret] | unique | length == 4
+             oauth2_proxy_client_secret, vault_oidc_client_secret] | unique | length == 5
         quiet: true
       register: aigw_generic_oidc_secret_boundary
       delegate_to: localhost
@@ -295,7 +295,7 @@
             ([] if not (aigw_generic_session_secret_boundary.failed | default(false))
              else ['portal_session_secret,admin_portal_session_secret']) +
             ([] if not (aigw_generic_oidc_secret_boundary.failed | default(false))
-             else ['webui_oidc_client_secret,portal_oidc_client_secret,admin_portal_oidc_client_secret,oauth2_proxy_client_secret'])
+             else ['webui_oidc_client_secret,portal_oidc_client_secret,admin_portal_oidc_client_secret,oauth2_proxy_client_secret,vault_oidc_client_secret'])
           }}
       changed_when: false
 

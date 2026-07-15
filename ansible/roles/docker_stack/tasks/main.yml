@@ -159,7 +159,13 @@
             "PORTAL_OIDC_CLIENT_SECRET",
             "ADMIN_PORTAL_OIDC_CLIENT_SECRET",
             "OAUTH2_PROXY_CLIENT_SECRET",
+            "VAULT_OIDC_CLIENT_SECRET",
         )
+        # Introducing a NEW relying-party secret is an addition, not a
+        # rotation: a pre-feature deployed .env may lack exactly this key
+        # and the converge may then add it. Present-but-different still
+        # fails closed like every other managed secret.
+        optional_new_keys = frozenset({"VAULT_OIDC_CLIENT_SECRET"})
         try:
             request = json.loads(sys.stdin.buffer.read(524289))
             if not isinstance(request, dict) or set(request) != {
@@ -206,13 +212,14 @@
                 ):
                     raise ValueError
                 deployed[key] = value
-            if set(deployed) != set(expected_keys):
+            required = set(expected_keys) - (optional_new_keys - set(deployed))
+            if set(deployed) != required:
                 raise ValueError
-            if len(set(deployed.values())) != len(expected_keys):
+            if len(set(deployed.values())) != len(deployed):
                 raise ValueError
             if any(
                 not hmac.compare_digest(deployed[key], desired[key])
-                for key in expected_keys
+                for key in deployed
             ):
                 raise ValueError
         except Exception:
@@ -226,7 +233,8 @@
             'WEBUI_OIDC_CLIENT_SECRET': webui_oidc_client_secret | default(''),
             'PORTAL_OIDC_CLIENT_SECRET': portal_oidc_client_secret | default(''),
             'ADMIN_PORTAL_OIDC_CLIENT_SECRET': admin_portal_oidc_client_secret | default(''),
-            'OAUTH2_PROXY_CLIENT_SECRET': oauth2_proxy_client_secret | default('')
+            'OAUTH2_PROXY_CLIENT_SECRET': oauth2_proxy_client_secret | default(''),
+            'VAULT_OIDC_CLIENT_SECRET': vault_oidc_client_secret | default('')
           }
         } | to_json
       }}
@@ -548,6 +556,7 @@
       - validate-identity-policy.py
       - validate-vault-config.sh
       - vault-bootstrap.sh
+      - vault-oidc-setup.sh
       - vault-pki-intermediate.sh
       - vault-unseal.sh
       - verify-live-lab-identity.py
@@ -967,6 +976,7 @@
     - { name: portal_oidc_client_secret, min_length: 32 }
     - { name: admin_portal_oidc_client_secret, min_length: 32 }
     - { name: oauth2_proxy_client_secret, min_length: 32 }
+    - { name: vault_oidc_client_secret, min_length: 32 }
     - { name: oauth2_proxy_litellm_cookie_secret, min_length: 32 }
     - { name: oauth2_proxy_grafana_cookie_secret, min_length: 32 }
     - { name: oauth2_proxy_prometheus_cookie_secret, min_length: 32 }
@@ -997,7 +1007,7 @@
       - >-
         [webui_oidc_client_secret, portal_oidc_client_secret,
          admin_portal_oidc_client_secret,
-         oauth2_proxy_client_secret] | unique | length == 4
+         oauth2_proxy_client_secret, vault_oidc_client_secret] | unique | length == 5
     quiet: true
     fail_msg: Portal tokens, session keys, and OIDC client secrets must be distinct.
   no_log: true
