@@ -231,15 +231,43 @@ path "kv/undelete/*" { capabilities = ["update"] }
 path "kv/destroy/*" { capabilities = ["update"] }
 
 # The credential escrows and the two Keycloak client private keys stay
-# root-ceremony-only. deny wins over every glob above.
+# root-ceremony-only, and "untouchable" must cover EVERY KV v2 sub-API, not
+# just reads. Vault matches one most-specific rule per exact request path, and
+# KV v2 serves read/write (kv/data), metadata + permanent delete-all
+# (kv/metadata), per-version soft-delete (kv/delete), undelete (kv/undelete),
+# permanent per-version destroy (kv/destroy), and subkey-structure reads
+# (kv/subkeys) at SEPARATE paths. A deny on only kv/data/X + kv/metadata/X
+# would leave `vault kv delete -versions=N` and `vault kv destroy -versions=N`
+# falling through to the wildcard grants above and irreversibly wiping the
+# break-glass recovery credential (or a rotator private key). So each protected
+# record is denied on all six sub-APIs. (kv/subkeys has no matching grant above
+# and is therefore already default-denied; it is pinned here as defense in
+# depth so a future kv/subkeys/* grant cannot silently expose these records.)
+# deny always wins over the globs.
 path "kv/data/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["deny"] }
 path "kv/metadata/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/delete/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/undelete/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/destroy/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/subkeys/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["deny"] }
 path "kv/data/${VAULT_OIDC_RP_VAULT_PATH}" { capabilities = ["deny"] }
 path "kv/metadata/${VAULT_OIDC_RP_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/delete/${VAULT_OIDC_RP_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/undelete/${VAULT_OIDC_RP_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/destroy/${VAULT_OIDC_RP_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/subkeys/${VAULT_OIDC_RP_VAULT_PATH}" { capabilities = ["deny"] }
 path "kv/data/${IDENTITY_CONTROLLER_KEY_VAULT_PATH}" { capabilities = ["deny"] }
 path "kv/metadata/${IDENTITY_CONTROLLER_KEY_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/delete/${IDENTITY_CONTROLLER_KEY_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/undelete/${IDENTITY_CONTROLLER_KEY_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/destroy/${IDENTITY_CONTROLLER_KEY_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/subkeys/${IDENTITY_CONTROLLER_KEY_VAULT_PATH}" { capabilities = ["deny"] }
 path "kv/data/${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}" { capabilities = ["deny"] }
 path "kv/metadata/${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/delete/${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/undelete/${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/destroy/${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}" { capabilities = ["deny"] }
+path "kv/subkeys/${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}" { capabilities = ["deny"] }
 
 # Edge PKI: operate the pki_int issuing mount (roles, issuance, revocation,
 # CRL). No authority over any root CA mount and no mount create/delete.
@@ -349,7 +377,17 @@ if not all(checks):
     raise SystemExit("auth/oidc role aigw did not verify")
 ' "$DOMAIN" || die "auth/oidc role did not verify"
 
-vlt policy read vault-admins | grep -q 'pki_int/\*' || die "vault-admins policy did not verify"
+vault_admins_policy="$(vlt policy read vault-admins)"
+printf '%s' "$vault_admins_policy" | grep -q 'pki_int/\*' \
+  || die "vault-admins policy did not verify"
+# Prove the version-sub-API denies actually landed, not just the reads: the
+# break-glass escrow is the irreversible worst case, so require its
+# soft-delete and permanent-destroy denies explicitly.
+for protected_sub_api in delete destroy; do
+  printf '%s' "$vault_admins_policy" \
+    | grep -q "kv/${protected_sub_api}/${BREAK_GLASS_ADMIN_VAULT_PATH}" \
+    || die "vault-admins escrow ${protected_sub_api}-deny did not verify"
+done
 
 group_verify_json="$(vlt read -format=json identity/group/name/aigw-admins)"
 printf '%s' "$group_verify_json" | python3 -I -c '

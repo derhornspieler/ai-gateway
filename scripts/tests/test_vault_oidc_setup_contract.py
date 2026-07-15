@@ -144,21 +144,64 @@ class VaultOidcSetupContractTest(unittest.TestCase):
         )
         self.assertIsNotNone(policy_match, "vault-admins policy heredoc is missing")
         policy = policy_match.group(1)
-        # The four credential/private-key records stay root-ceremony-only.
-        for denied in (
+        # The four credential/private-key records stay root-ceremony-only, and
+        # "untouchable" must cover EVERY KV v2 sub-API — not just the reads.
+        # kv/delete, kv/undelete, kv/destroy are the destructive version
+        # endpoints (soft-delete / undelete / permanent per-version destroy);
+        # a deny on only kv/data + kv/metadata would let a vault-admins holder
+        # run `vault kv destroy -versions=N` and irreversibly wipe the
+        # break-glass recovery credential. kv/subkeys is the structure-read
+        # endpoint, pinned for defense in depth. Assert the FULL deny stanza
+        # (path + exact ["deny"] capability) for each of 4 paths x 6 sub-APIs,
+        # so a regression that drops or weakens any leg fails here.
+        protected_paths = (
             "${BREAK_GLASS_ADMIN_VAULT_PATH}",
             "${VAULT_OIDC_RP_VAULT_PATH}",
             "${IDENTITY_CONTROLLER_KEY_VAULT_PATH}",
             "${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}",
-        ):
+        )
+        kv_sub_apis = (
+            "data",
+            "metadata",
+            "delete",
+            "undelete",
+            "destroy",
+            "subkeys",
+        )
+        for denied in protected_paths:
+            for sub_api in kv_sub_apis:
+                self.assertIn(
+                    f'path "kv/{sub_api}/{denied}" {{ capabilities = ["deny"] }}',
+                    policy,
+                    f"missing kv/{sub_api} deny for {denied}",
+                )
+        # Belt-and-suspenders count: exactly the 24 protected denies and no
+        # accidental grant capability slipped onto any of them.
+        self.assertEqual(
+            len(protected_paths) * len(kv_sub_apis),
+            sum(
+                policy.count(
+                    f'path "kv/{sub_api}/{denied}" {{ capabilities = ["deny"] }}'
+                )
+                for denied in protected_paths
+                for sub_api in kv_sub_apis
+            ),
+        )
+        # Every one of the three destructive version wildcards that the policy
+        # grants must be counter-denied for every protected path; prove the
+        # grant/deny pairing exists so a grant can never be added without its
+        # matching per-record denies.
+        for destructive in ("delete", "undelete", "destroy"):
             self.assertIn(
-                f'path "kv/data/{denied}" {{ capabilities = ["deny"] }}',
+                f'path "kv/{destructive}/*" {{ capabilities = ["update"] }}',
                 policy,
+                f"kv/{destructive}/* grant missing",
             )
-            self.assertIn(
-                f'path "kv/metadata/{denied}" {{ capabilities = ["deny"] }}',
-                policy,
-            )
+            for denied in protected_paths:
+                self.assertIn(
+                    f'path "kv/{destructive}/{denied}" {{ capabilities = ["deny"] }}',
+                    policy,
+                )
         # No authority over auth methods, policies, identity, audit devices,
         # seal state, raw storage, or mount creation — the root token stays
         # reserved for ceremonies.
