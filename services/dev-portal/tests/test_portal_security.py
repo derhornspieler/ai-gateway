@@ -5,6 +5,7 @@ import json
 import re
 import time
 from base64 import b64decode
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -105,7 +106,7 @@ def test_key_creation_uses_immutable_subject_and_rejects_bad_csrf(
         assert user_id == "stable-oidc-sub"
         return list(inventory)
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         calls.append((user_id, alias, project_id))
         listed = portal_key(
             owner=user_id,
@@ -195,7 +196,7 @@ def test_post_generation_membership_failure_revokes_without_disclosure(
         assert user_id == owner
         return [dict(entry) for entry in inventory]
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         inventory.append(
             portal_key(
                 owner=user_id,
@@ -257,7 +258,7 @@ def test_post_generation_cleanup_failure_never_discloses_plaintext(
         assert user_id == owner
         return [dict(entry) for entry in inventory]
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         inventory.append(
             portal_key(
                 owner=user_id,
@@ -393,7 +394,7 @@ def test_existing_active_key_blocks_generation(client, set_session, monkeypatch)
     async def key_list(user_id):
         return [portal_key(owner=user_id, token="already-active")]
 
-    async def key_generate(_user_id, _alias, _project_id):
+    async def key_generate(_user_id, _alias, _project_id, _project_policy=None):
         nonlocal generated
         generated = True
         return {"key": "must-not-exist"}
@@ -478,7 +479,7 @@ def test_deactivation_then_regeneration(client, set_session, monkeypatch):
                 entry["blocked"] = True
         return {"key": key, "blocked": True}
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         state.append(
             portal_key(
                 owner=user_id,
@@ -532,7 +533,7 @@ def test_two_concurrent_generations_create_only_one(monkeypatch):
         await asyncio.sleep(0)
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         nonlocal generate_calls
         generate_calls += 1
         await asyncio.sleep(0.01)
@@ -576,7 +577,7 @@ def test_malformed_generate_response_deactivates_unverified_candidate(monkeypatc
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         state.append(
             portal_key(
                 owner=user_id,
@@ -645,7 +646,7 @@ def test_committed_key_after_generate_disconnect_is_deactivated(monkeypatch, cap
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         # Model LiteLLM committing before the response connection is lost.
         state.append(
             portal_key(
@@ -711,7 +712,7 @@ def test_ambiguous_generate_cleanup_refuses_unbounded_candidate_set(
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         state.extend(
             portal_key(
                 owner=user_id,
@@ -752,7 +753,7 @@ def test_post_generate_duplicate_is_cleaned_up_without_disclosure(monkeypatch):
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id):
+    async def key_generate(user_id, alias, project_id, project_policy=None):
         # Model a future unsupported second replica racing this worker after
         # both observed an empty inventory.
         state.extend(
@@ -2128,6 +2129,12 @@ def test_admin_key_limits_send_parsed_allowlisted_updates(
         updates_sent.append(updates)
         for field, value in updates.items():
             entry_state[field] = value
+        if "duration" in updates:
+            # LiteLLM computes expires = now + duration on a duration update.
+            entry_state["expires"] = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=main._duration_seconds(updates["duration"]))
+            ).isoformat()
         return {}
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
@@ -2159,3 +2166,501 @@ def test_admin_key_limits_send_parsed_allowlisted_updates(
     assert updates_sent == [
         {"max_budget": 50.0, "tpm_limit": None, "duration": "30d"}
     ]
+
+
+def test_admin_key_limits_duration_is_effect_verified(
+    admin_client, set_admin_session, monkeypatch
+):
+    """A duration edit must verify the resulting expiry, tolerantly."""
+
+    entry_state = full_key_object()
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def admin_key_lookup(token):
+        return dict(entry_state)
+
+    async def key_update(key, updates):
+        # The update is acknowledged but the expiry never moves: the stale
+        # 2027 timestamp is nowhere near now + 30d, so verification fails.
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/keys/limits",
+        data={"token": "inv-hash-1", "csrf_token": csrf, "duration": "30d"},
+        follow_redirects=True,
+    )
+
+    assert "Could not verify the key limit change" in response.text
+
+
+def test_expiry_property_check_tolerates_format_but_not_wrong_lifetimes():
+    now = datetime.now(timezone.utc)
+    in_30_days = now + timedelta(days=30)
+    assert main._expiry_matches_duration(in_30_days.isoformat(), "30d", now=now)
+    # Z-suffix and naive-UTC formats are tolerated; the property is the value.
+    assert main._expiry_matches_duration(
+        in_30_days.strftime("%Y-%m-%dT%H:%M:%SZ"), "30d", now=now
+    )
+    assert main._expiry_matches_duration(
+        in_30_days.replace(tzinfo=None).isoformat(), "30d", now=now
+    )
+    assert main._expiry_matches_duration(in_30_days, "30d", now=now)
+    # Wrong lifetime, garbage, and absent expiry all fail the property.
+    assert not main._expiry_matches_duration(
+        (now + timedelta(days=29)).isoformat(), "30d", now=now
+    )
+    assert not main._expiry_matches_duration("not-a-date", "30d", now=now)
+    assert not main._expiry_matches_duration(None, "30d", now=now)
+
+
+# --- runtime per-project policy ----------------------------------------------
+
+
+RESTRICTED_POLICY = {
+    "tpm_limit": 50000,
+    "rpm_limit": 30,
+    "allowed_models": ["claude-haiku"],
+    "default_model": "claude-haiku",
+}
+
+
+def test_index_shows_rate_limits_and_models_but_never_cost(
+    client, set_session, monkeypatch
+):
+    async def live_policies(_request, _user, project_ids):
+        return {project_id: dict(RESTRICTED_POLICY) for project_id in project_ids}
+
+    async def key_list(user_id):
+        return [
+            portal_key(owner="subject-123")
+            | {"tpm_limit": 50000, "rpm_limit": 30, "spend": 12.34, "max_budget": 99.0}
+        ]
+
+    monkeypatch.setattr(main, "_live_project_policies", live_policies)
+    monkeypatch.setattr(litellm_client, "key_list", key_list)
+    set_session({"user": portal_user()})
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "50000" in response.text and "30" in response.text
+    assert "claude-haiku" in response.text
+    assert "default" in response.text
+    # Cost is an admin-only concept: no dollars, spend, or budget on the
+    # user surface.
+    for forbidden in ("$", "12.34", "99.0", "spend", "budget", "Budget"):
+        assert forbidden not in response.text, forbidden
+
+
+def test_index_shows_unlimited_defaults_without_policy_restrictions(
+    client, set_session, monkeypatch
+):
+    async def key_list(user_id):
+        return [portal_key(owner="subject-123")]
+
+    monkeypatch.setattr(litellm_client, "key_list", key_list)
+    set_session({"user": portal_user()})
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Unlimited" in response.text
+    # Unrestricted projects list every configured model from the gateway.
+    assert "claude-sonnet" in response.text and "claude-haiku" in response.text
+
+
+def test_key_mint_carries_the_projects_runtime_policy(
+    client, set_session, monkeypatch
+):
+    generated = []
+    inventory: list[dict] = []
+
+    async def live_policies(_request, _user, project_ids):
+        return {project_id: dict(RESTRICTED_POLICY) for project_id in project_ids}
+
+    async def key_list(user_id):
+        return [dict(entry) for entry in inventory]
+
+    async def key_generate(user_id, alias, project_id, project_policy=None):
+        generated.append(project_policy)
+        inventory.append(
+            portal_key(owner=user_id, token="minted-hash", alias=alias)
+        )
+        return {"key": "sk-minted-once", "key_alias": alias}
+
+    monkeypatch.setattr(main, "_live_project_policies", live_policies)
+    monkeypatch.setattr(litellm_client, "key_list", key_list)
+    monkeypatch.setattr(litellm_client, "key_generate", key_generate)
+    csrf = "c" * 43
+    set_session({"user": portal_user(), "csrf_token": csrf})
+
+    response = client.post(
+        "/keys",
+        data={"alias": "laptop", "project_id": "ai-gateway", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 201
+    assert generated == [RESTRICTED_POLICY]
+
+
+def test_unreadable_project_policy_fails_the_mint_closed(
+    client, set_session, monkeypatch
+):
+    called = False
+
+    async def live_policies(_request, _user, project_ids):
+        raise main.HTTPException(
+            status_code=503, detail="Current project policy could not be verified."
+        )
+
+    async def key_generate(user_id, alias, project_id, project_policy=None):
+        nonlocal called
+        called = True
+        return {"key": "sk-never"}
+
+    monkeypatch.setattr(main, "_live_project_policies", live_policies)
+    monkeypatch.setattr(litellm_client, "key_generate", key_generate)
+    csrf = "c" * 43
+    set_session({"user": portal_user(), "csrf_token": csrf})
+
+    response = client.post(
+        "/keys",
+        data={"alias": "laptop", "project_id": "ai-gateway", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 503
+    assert called is False
+
+
+def test_policy_payload_validation_fails_closed_on_ambiguity():
+    valid = main._validated_policy_object(dict(RESTRICTED_POLICY))
+    assert valid == RESTRICTED_POLICY
+    for malformed in (
+        None,
+        [],
+        {},
+        {**RESTRICTED_POLICY, "max_budget": 5},
+        {**RESTRICTED_POLICY, "tpm_limit": -1},
+        {**RESTRICTED_POLICY, "tpm_limit": True},
+        {**RESTRICTED_POLICY, "allowed_models": []},
+        {**RESTRICTED_POLICY, "allowed_models": ["bad model"]},
+        {**RESTRICTED_POLICY, "default_model": "claude-opus"},
+    ):
+        assert main._validated_policy_object(malformed) is None
+
+
+def test_admin_unblock_denies_resurrecting_a_membership_revoked_portal_key(
+    admin_client, set_admin_session, monkeypatch
+):
+    updated = False
+
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        assert path == "/identity/projects/dev-subject"
+        return {"projects": ["another-project"], "policies": {}}
+
+    async def admin_key_lookup(token):
+        return full_key_object(
+            token="portal-hash-2",
+            user_id="dev-subject",
+            blocked=True,
+            metadata={
+                "created_via": "dev-portal",
+                "aigw_project_id": "ai-gateway",
+            },
+        )
+
+    async def key_update(key, updates):
+        nonlocal updated
+        updated = True
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/keys/unblock",
+        data={"token": "portal-hash-2", "csrf_token": csrf},
+        follow_redirects=True,
+    )
+
+    assert updated is False
+    assert "Unblock denied" in response.text
+    assert "ai-gateway" in response.text
+
+
+def test_admin_unblock_denies_on_membership_ambiguity_but_allows_operator_keys(
+    admin_client, set_admin_session, monkeypatch
+):
+    updated_keys: list[str] = []
+
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        raise RuntimeError("identity controller unavailable")
+
+    lookup_entry = {}
+
+    async def admin_key_lookup(token):
+        return dict(lookup_entry)
+
+    async def key_update(key, updates):
+        updated_keys.append(key)
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    csrf = "c" * 43
+    base_session = {
+        "user": portal_user(roles=[settings.admin_role]),
+        "csrf_token": csrf,
+        "admin_reauth_at": int(time.time()),
+    }
+
+    # Portal key + unreachable membership decision: ambiguity denies.
+    lookup_entry.update(
+        full_key_object(
+            token="portal-hash-2",
+            user_id="dev-subject",
+            blocked=True,
+            metadata={
+                "created_via": "dev-portal",
+                "aigw_project_id": "ai-gateway",
+            },
+        )
+    )
+    set_admin_session(base_session)
+    denied = admin_client.post(
+        "/admin/keys/unblock",
+        data={"token": "portal-hash-2", "csrf_token": csrf},
+        follow_redirects=True,
+    )
+    assert "Unblock denied" in denied.text
+    assert updated_keys == []
+
+    # Operator keys are outside membership revocation; unblock proceeds.
+    lookup_entry.clear()
+    lookup_entry.update(full_key_object(blocked=False, metadata={}))
+    set_admin_session(base_session)
+    allowed = admin_client.post(
+        "/admin/keys/unblock",
+        data={"token": "inv-hash-1", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert allowed.status_code == 303
+    assert updated_keys == ["inv-hash-1"]
+
+
+def test_project_policy_route_requires_step_up_and_csrf(
+    admin_client, set_admin_session, monkeypatch
+):
+    called = False
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def rotator_put(path, payload):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    csrf = "c" * 43
+
+    # No fresh step-up: redirected to reauthentication before any mutation.
+    set_admin_session(
+        {"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf}
+    )
+    stale = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={"tpm_limit": "1000", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert stale.status_code == 303
+    assert stale.headers["location"] == "/admin/reauth"
+
+    # Fresh step-up but a stale CSRF token: rejected before the controller.
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+    bad_csrf = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={"tpm_limit": "1000", "csrf_token": "x" * 43},
+        follow_redirects=False,
+    )
+    assert bad_csrf.status_code == 303
+    assert called is False
+
+
+def test_project_policy_save_retunes_existing_project_keys(
+    admin_client, set_admin_session, monkeypatch
+):
+    puts = []
+    key_updates = []
+    key_state: dict[str, dict] = {
+        "portal-1": full_key_object(
+            token="portal-1",
+            user_id="dev-a",
+            metadata={"created_via": "dev-portal", "aigw_project_id": "ai-gateway"},
+        ),
+        "portal-other": full_key_object(
+            token="portal-other",
+            user_id="dev-b",
+            metadata={"created_via": "dev-portal", "aigw_project_id": "other-project"},
+        ),
+        "operator-1": full_key_object(token="operator-1", metadata={}),
+    }
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def rotator_put(path, payload):
+        puts.append((path, payload))
+        return {
+            "id": "group-1",
+            "name": "ai-gateway",
+            "policy": {
+                "tpm_limit": 50000,
+                "rpm_limit": 30,
+                "allowed_models": ["claude-haiku"],
+                "default_model": "claude-haiku",
+            },
+        }
+
+    async def admin_key_list_page(page):
+        assert page == 1
+        keys = [dict(entry) for entry in key_state.values()]
+        return {"keys": keys, "page": 1, "total_pages": 1, "total_count": len(keys)}
+
+    async def key_update(key, updates):
+        key_updates.append((key, updates))
+        key_state[key].update(updates)
+        return {}
+
+    async def admin_key_lookup(token):
+        return dict(key_state[token])
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={
+            "tpm_limit": "50000",
+            "rpm_limit": "30",
+            "allowed_models": "claude-haiku",
+            "default_model": "claude-haiku",
+            "csrf_token": csrf,
+        },
+        follow_redirects=True,
+    )
+
+    assert puts == [
+        (
+            "/identity/groups/group-1/policy",
+            {
+                "tpm_limit": 50000,
+                "rpm_limit": 30,
+                "allowed_models": ["claude-haiku"],
+                "default_model": "claude-haiku",
+            },
+        )
+    ]
+    # Retroactive re-tune touches exactly the project's portal keys — never
+    # operator keys or other projects.
+    assert key_updates == [
+        (
+            "portal-1",
+            {"tpm_limit": 50000, "rpm_limit": 30, "models": ["claude-haiku"]},
+        )
+    ]
+    assert "1 existing keys re-tuned" in response.text
+
+
+def test_project_policy_rejects_unconfigured_models_before_the_controller(
+    admin_client, set_admin_session, monkeypatch
+):
+    called = False
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def rotator_put(path, payload):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    for fields in (
+        {"allowed_models": "gpt-4o"},
+        {"tpm_limit": "-5"},
+        {"tpm_limit": "0"},
+        {"default_model": "claude-opus"},
+    ):
+        response = admin_client.post(
+            "/admin/identity/groups/group-1/policy",
+            data={"csrf_token": csrf, **fields},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        set_admin_session(
+            {
+                "user": portal_user(roles=[settings.admin_role]),
+                "csrf_token": csrf,
+                "admin_reauth_at": int(time.time()),
+            }
+        )
+    assert called is False

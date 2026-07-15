@@ -23,10 +23,40 @@
 </div>
 {% endif %}
 
+{% if policy_error %}
+<div class="flash error">{{ policy_error }}</div>
+{% endif %}
+
+{% if project_ids %}
+<div class="card">
+  <h3>Your project access</h3>
+  {% for project_id in project_ids %}
+  {% set policy = project_policies.get(project_id) %}
+  <p><code>{{ project_id }}</code><br>
+    {% if policy %}
+    <span class="muted">Token rate limit:</span>
+    {% if policy.tpm_limit or policy.rpm_limit %}
+    {{ policy.tpm_limit if policy.tpm_limit else "unlimited" }} tokens/min &middot; {{ policy.rpm_limit if policy.rpm_limit else "unlimited" }} requests/min
+    {% else %}Unlimited{% endif %}<br>
+    <span class="muted">Models:</span>
+    {% set project_models = policy.allowed_models if policy.allowed_models else available_models %}
+    {% if project_models %}
+    {% for model in project_models %}<code>{{ model }}</code>{% if policy.default_model == model %} <span class="badge">default</span>{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+    {% else %}all configured models{% endif %}
+    {% else %}
+    <span class="muted">Policy unavailable right now.</span>
+    {% endif %}
+  </p>
+  {% endfor %}
+</div>
+{% endif %}
+
 <div class="card">
   <h3>Generate a new key</h3>
   <p class="muted">Each user may have at most one active key per project. Deactivate the current project key before replacing it.</p>
-  {% if project_ids %}
+  {% if project_ids and policy_error %}
+  <p class="muted">Key generation is paused until your project's policy can be verified.</p>
+  {% elif project_ids %}
   <form method="post" action="/keys">
     {% if project_ids|length > 1 %}
     <label for="project-id">Project</label>
@@ -56,15 +86,15 @@
   {% endif %}
   {% if keys %}
   <table>
-    <thead><tr><th>Project</th><th>Alias</th><th>Identifier</th><th>Status</th><th>Created</th><th></th></tr></thead>
+    <thead><tr><th>Project</th><th>Alias</th><th>Identifier</th><th>Rate limit</th><th>Status</th><th></th></tr></thead>
     <tbody>
       {% for k in keys %}
       <tr>
         <td><code>{{ k.portal_project_id }}</code></td>
         <td>{{ k.key_alias or k.alias or "(no alias)" }}</td>
         <td><code>{{ (k.token or k.key_name or "")[:16] }}&hellip;</code></td>
+        <td class="muted">{% if k.tpm_limit or k.rpm_limit %}{{ k.tpm_limit or "unlimited" }} TPM &middot; {{ k.rpm_limit or "unlimited" }} RPM{% else %}Unlimited{% endif %}</td>
         <td><span class="badge">{{ "active" if k.portal_active else "inactive" }}</span></td>
-        <td class="muted">{{ k.created_at or k.created_via or "" }}</td>
         <td>
           {% if k.portal_active %}
           <form class="inline" method="post" action="/keys/deactivate" data-confirm="Deactivate this key? It will stop working immediately.">

@@ -79,6 +79,26 @@ MAX_PRE_VAULT_BOOTSTRAP_IDENTITIES = 16
 # metadata and audit records.  Lowercase-only prevents case-fold collisions
 # across Keycloak, PostgreSQL, log queries, and filesystem/tool configuration.
 PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+# Per-project issuance policy lives as attributes ON the managed project
+# group, exactly like the other durable markers this controller owns
+# (aigw.managed-root, aigw.managed-admin-group). The group IS the project
+# security boundary, so its policy travels with the same object that grants
+# membership — no second store to drift.
+POLICY_TPM_ATTRIBUTE = "aigw.policy.tpm_limit"
+POLICY_RPM_ATTRIBUTE = "aigw.policy.rpm_limit"
+POLICY_MODELS_ATTRIBUTE = "aigw.policy.allowed_models"
+POLICY_DEFAULT_MODEL_ATTRIBUTE = "aigw.policy.default_model"
+POLICY_ATTRIBUTES = frozenset(
+    {
+        POLICY_TPM_ATTRIBUTE,
+        POLICY_RPM_ATTRIBUTE,
+        POLICY_MODELS_ATTRIBUTE,
+        POLICY_DEFAULT_MODEL_ATTRIBUTE,
+    }
+)
+MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}")
+MAX_POLICY_MODELS = 32
+POLICY_LIMIT_MAX = 1_000_000_000
 BOOTSTRAP_IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
 FEDERATION_PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,127}")
 MANAGED_ROOT_ATTRIBUTE = "aigw.managed-root"
@@ -3354,6 +3374,203 @@ class KeycloakAdmin:
             )
         return project_id
 
+    @staticmethod
+    def _single_policy_attribute(
+        attributes: dict[str, Any], name: str
+    ) -> str | None:
+        """Read one single-valued policy attribute or fail on ambiguity."""
+
+        raw = attributes.get(name)
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or any(
+            not isinstance(value, str) for value in raw
+        ):
+            raise IdentityConflict("group policy attribute is invalid")
+        values = [value.strip() for value in raw if value.strip()]
+        if not values:
+            return None
+        if len(values) > 1:
+            raise IdentityConflict("group policy attribute has multiple values")
+        return values[0]
+
+    @classmethod
+    def _group_policy(cls, group: dict[str, Any]) -> dict[str, Any]:
+        """Parse the issuance policy carried by one managed group.
+
+        Absent attributes mean the platform default: unlimited rate and every
+        configured model. A malformed attribute is a hard conflict, never a
+        silent fallback — a broken restriction must not mint unlimited keys.
+        """
+
+        attributes = group.get("attributes") or {}
+        if not isinstance(attributes, dict):
+            raise IdentityConflict("group attributes were invalid")
+
+        policy: dict[str, Any] = {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": None,
+            "default_model": None,
+        }
+        for attribute, knob in (
+            (POLICY_TPM_ATTRIBUTE, "tpm_limit"),
+            (POLICY_RPM_ATTRIBUTE, "rpm_limit"),
+        ):
+            raw = cls._single_policy_attribute(attributes, attribute)
+            if raw is None:
+                continue
+            if not raw.isdigit() or not 1 <= int(raw) <= POLICY_LIMIT_MAX:
+                raise IdentityConflict("group rate-limit policy is invalid")
+            policy[knob] = int(raw)
+
+        raw_models = cls._single_policy_attribute(attributes, POLICY_MODELS_ATTRIBUTE)
+        if raw_models is not None:
+            names = [name.strip() for name in raw_models.split(",")]
+            if (
+                not names
+                or len(names) > MAX_POLICY_MODELS
+                or len(set(names)) != len(names)
+                or any(MODEL_NAME_RE.fullmatch(name) is None for name in names)
+            ):
+                raise IdentityConflict("group model policy is invalid")
+            policy["allowed_models"] = sorted(names)
+
+        raw_default = cls._single_policy_attribute(
+            attributes, POLICY_DEFAULT_MODEL_ATTRIBUTE
+        )
+        if raw_default is not None:
+            if MODEL_NAME_RE.fullmatch(raw_default) is None:
+                raise IdentityConflict("group default-model policy is invalid")
+            allowed = policy["allowed_models"]
+            if allowed is not None and raw_default not in allowed:
+                raise IdentityConflict(
+                    "group default model is outside its allowed models"
+                )
+            policy["default_model"] = raw_default
+        return policy
+
+    @staticmethod
+    def _validated_policy_input(policy: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a requested policy or fail before any Keycloak write."""
+
+        if not isinstance(policy, dict) or set(policy) != {
+            "tpm_limit",
+            "rpm_limit",
+            "allowed_models",
+            "default_model",
+        }:
+            raise IdentityConflict("group policy update has an invalid shape")
+
+        normalized: dict[str, Any] = {}
+        for knob in ("tpm_limit", "rpm_limit"):
+            value = policy[knob]
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= POLICY_LIMIT_MAX
+            ):
+                raise IdentityConflict("group rate-limit policy is invalid")
+            normalized[knob] = value
+
+        models = policy["allowed_models"]
+        if models is not None:
+            if (
+                not isinstance(models, list)
+                or not 1 <= len(models) <= MAX_POLICY_MODELS
+                or any(
+                    not isinstance(name, str)
+                    or MODEL_NAME_RE.fullmatch(name) is None
+                    for name in models
+                )
+                or len(set(models)) != len(models)
+            ):
+                raise IdentityConflict("group model policy is invalid")
+            models = sorted(models)
+        normalized["allowed_models"] = models
+
+        default_model = policy["default_model"]
+        if default_model is not None:
+            if (
+                not isinstance(default_model, str)
+                or MODEL_NAME_RE.fullmatch(default_model) is None
+            ):
+                raise IdentityConflict("group default-model policy is invalid")
+            if models is not None and default_model not in models:
+                raise IdentityConflict(
+                    "group default model is outside its allowed models"
+                )
+        normalized["default_model"] = default_model
+        return normalized
+
+    async def set_group_policy(
+        self, group_id: str, policy: dict[str, Any]
+    ) -> dict[str, Any]:
+        async with self._group_topology_lock:
+            return await self._set_group_policy_locked(group_id, policy)
+
+    async def _set_group_policy_locked(
+        self, group_id: str, policy: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Write and verify one managed group's issuance policy attributes."""
+
+        normalized = self._validated_policy_input(policy)
+        token = await self._controller_token()
+        group = await self._managed_group(group_id, token)
+        project_id = self._managed_project_id(group)
+
+        raw_attributes = group.get("attributes") or {}
+        if not isinstance(raw_attributes, dict):
+            raise IdentityConflict("group attributes were invalid")
+        # Preserve every non-policy attribute byte-for-byte; this controller
+        # only owns the aigw.policy.* namespace on managed project groups.
+        attributes = {
+            name: value
+            for name, value in raw_attributes.items()
+            if name not in POLICY_ATTRIBUTES
+        }
+        if normalized["tpm_limit"] is not None:
+            attributes[POLICY_TPM_ATTRIBUTE] = [str(normalized["tpm_limit"])]
+        if normalized["rpm_limit"] is not None:
+            attributes[POLICY_RPM_ATTRIBUTE] = [str(normalized["rpm_limit"])]
+        if normalized["allowed_models"] is not None:
+            attributes[POLICY_MODELS_ATTRIBUTE] = [
+                ",".join(normalized["allowed_models"])
+            ]
+        if normalized["default_model"] is not None:
+            attributes[POLICY_DEFAULT_MODEL_ATTRIBUTE] = [
+                normalized["default_model"]
+            ]
+
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        safe_group = path_segment(group_id, label="group UUID")
+        await self._request(
+            "PUT",
+            f"/admin/realms/{realm}/groups/{safe_group}",
+            token=token,
+            json_body={
+                "id": group.get("id"),
+                "name": group.get("name"),
+                "attributes": attributes,
+            },
+            expected=(204,),
+        )
+        # Verify the effect from a fresh authoritative read: a 204 alone must
+        # not be trusted to have persisted the exact restriction.
+        applied = self._group_policy(await self._managed_group(group_id, token))
+        if applied != normalized:
+            raise IdentityError("group policy did not verify after update")
+        await self._audit(
+            "group_policy_update",
+            "success",
+            {"group_id": safe_group, "project": project_id, "policy": applied},
+        )
+        return {
+            "id": safe_group,
+            "name": str(group.get("name") or ""),
+            "policy": applied,
+        }
+
     async def _revoke_portal_project_keys(self, user_id: str, project_id: str) -> None:
         """Fail closed unless LiteLLM confirms portal-key revocation.
 
@@ -3475,7 +3692,39 @@ class KeycloakAdmin:
         )
 
     async def user_projects(self, user_id: str) -> list[str]:
-        """Resolve live developer projects from direct managed-group membership.
+        """Resolve live developer projects from direct managed-group membership."""
+        token = await self._controller_token()
+        return sorted(await self._user_project_bindings(user_id, token))
+
+    async def user_project_policies(self, user_id: str) -> dict[str, Any]:
+        """Live projects plus each project's parsed, non-secret issuance policy.
+
+        The policy is read from a fresh authoritative per-group GET (never
+        from a possibly-brief membership representation): the portal uses it
+        to decide the caps and model set minted onto a static bearer key, so
+        an ambiguous read must fail closed rather than default to unlimited.
+        """
+        token = await self._controller_token()
+        bindings = await self._user_project_bindings(user_id, token)
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        policies: dict[str, Any] = {}
+        for project_id in sorted(bindings):
+            response = await self._request(
+                "GET",
+                f"/admin/realms/{realm}/groups/{bindings[project_id]}",
+                token=token,
+                expected=(200,),
+            )
+            group = self._json(response, "project policy group")
+            if not isinstance(group, dict):
+                raise IdentityError("Keycloak project group was invalid")
+            policies[project_id] = self._group_policy(group)
+        return {"projects": sorted(bindings), "policies": policies}
+
+    async def _user_project_bindings(
+        self, user_id: str, token: str
+    ) -> dict[str, str]:
+        """Map live developer project IDs to their managed group UUIDs.
 
         A project is exactly one direct child of ``/aigw-managed`` whose group
         has the ``aigw-developers`` capability.  Nested groups, malformed
@@ -3484,11 +3733,10 @@ class KeycloakAdmin:
         for every key page and mutation, so a stale browser role/group claim
         cannot mint a key after membership removal.
         """
-        token = await self._controller_token()
         state_doc = self._identity_state()
         provider_id = state_doc.get("federation_provider_id")
         if not isinstance(provider_id, str) or not provider_id:
-            return []
+            return {}
         realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         safe_user = path_segment(user_id, label="user UUID")
         user_response = await self._request(
@@ -3498,14 +3746,14 @@ class KeycloakAdmin:
             expected=(200, 404),
         )
         if user_response.status_code == 404:
-            return []
+            return {}
         user = self._json(user_response, "project authorization user")
         if (
             not isinstance(user, dict)
             or user.get("enabled") is not True
             or user.get("federationLink") != provider_id
         ):
-            return []
+            return {}
 
         memberships: list[dict[str, Any]] = []
         for page in range(MAX_PAGE_COUNT):
@@ -3560,7 +3808,7 @@ class KeycloakAdmin:
                     "multiple managed groups claim the same project ID"
                 )
             projects[project_id] = group_id
-        return sorted(projects)
+        return projects
 
     async def _logout_user_sessions(self, user_id: str, token: str) -> None:
         """Invalidate Keycloak sessions after a role-removing mutation."""
@@ -3618,6 +3866,12 @@ class KeycloakAdmin:
                         "name": str(group.get("name") or ""),
                         "capabilities": await self._group_capabilities(group_id, token),
                         "member_count": len(members),
+                        # Non-secret issuance policy for the admin console.
+                        # The children listing is a full representation, so
+                        # the same attribute parser applies; a malformed
+                        # policy fails the listing closed instead of showing
+                        # a restricted project as unlimited.
+                        "policy": self._group_policy(group),
                     }
                 )
             if len(payload) < PAGE_SIZE:

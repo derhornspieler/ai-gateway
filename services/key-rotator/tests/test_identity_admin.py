@@ -1556,3 +1556,247 @@ async def test_broker_reconciles_supported_hardcoded_subject_mapper() -> None:
         == "service-account-anthropic-token-broker"
     )
     assert created["config"]["access.token.claim"] == "true"
+
+
+def test_group_policy_parses_attributes_and_fails_closed_on_malformed() -> None:
+    parse = KeycloakAdmin._group_policy
+    unlimited = {
+        "tpm_limit": None,
+        "rpm_limit": None,
+        "allowed_models": None,
+        "default_model": None,
+    }
+    assert parse({}) == unlimited
+    assert parse({"attributes": {}}) == unlimited
+    assert parse({"attributes": {"custom.marker": ["keep-me"]}}) == unlimited
+
+    full = parse(
+        {
+            "attributes": {
+                "aigw.policy.tpm_limit": ["100000"],
+                "aigw.policy.rpm_limit": ["60"],
+                "aigw.policy.allowed_models": ["claude-sonnet,claude-haiku"],
+                "aigw.policy.default_model": ["claude-sonnet"],
+            }
+        }
+    )
+    assert full == {
+        "tpm_limit": 100000,
+        "rpm_limit": 60,
+        "allowed_models": ["claude-haiku", "claude-sonnet"],
+        "default_model": "claude-sonnet",
+    }
+
+    # A malformed restriction must never fall back to unlimited.
+    for attributes in (
+        {"aigw.policy.tpm_limit": ["-5"]},
+        {"aigw.policy.tpm_limit": ["0"]},
+        {"aigw.policy.rpm_limit": ["sixty"]},
+        {"aigw.policy.tpm_limit": ["1", "2"]},
+        {"aigw.policy.allowed_models": ["claude sonnet"]},
+        {"aigw.policy.allowed_models": ["claude-sonnet,claude-sonnet"]},
+        {"aigw.policy.allowed_models": [",".join(f"m{i}" for i in range(33))]},
+        {
+            "aigw.policy.allowed_models": ["claude-sonnet"],
+            "aigw.policy.default_model": ["claude-opus"],
+        },
+        {"aigw.policy.default_model": ["not a model"]},
+    ):
+        with pytest.raises(IdentityConflict):
+            parse({"attributes": attributes})
+
+
+class PolicyAdmin(KeycloakAdmin):
+    """Managed-group double with an in-memory Keycloak group record."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.group = {
+            "id": "group-1",
+            "name": "project-a",
+            "path": "/aigw-managed/project-a",
+            "attributes": {
+                "custom.marker": ["keep-me"],
+                "aigw.policy.tpm_limit": ["5"],
+            },
+        }
+        self.puts: list[dict] = []
+        self.persist_writes = True
+
+    async def _controller_token(self):
+        return "controller-token"
+
+    async def _request(self, method, path, **kwargs):
+        if method == "GET" and path.endswith("/groups/group-1"):
+            return httpx.Response(200, json=copy.deepcopy(self.group))
+        if method == "PUT" and path.endswith("/groups/group-1"):
+            body = kwargs.get("json_body")
+            self.puts.append(copy.deepcopy(body))
+            if self.persist_writes:
+                self.group = {**self.group, **copy.deepcopy(body)}
+            return httpx.Response(204)
+        raise AssertionError((method, path))
+
+
+def policy_admin() -> PolicyAdmin:
+    cfg = settings()
+    vault = FakeVault(
+        {
+            cfg.identity_state_vault_path: {
+                "managed_root_group_id": "managed-root",
+                "federation_provider_id": "ldap-provider",
+            }
+        }
+    )
+    return PolicyAdmin(cfg, vault, FakeDB())
+
+
+@pytest.mark.asyncio
+async def test_set_group_policy_writes_verifies_and_preserves_foreign_attributes() -> (
+    None
+):
+    admin = policy_admin()
+    result = await admin.set_group_policy(
+        "group-1",
+        {
+            "tpm_limit": 100000,
+            "rpm_limit": 60,
+            "allowed_models": ["claude-sonnet", "claude-haiku"],
+            "default_model": "claude-sonnet",
+        },
+    )
+    assert result == {
+        "id": "group-1",
+        "name": "project-a",
+        "policy": {
+            "tpm_limit": 100000,
+            "rpm_limit": 60,
+            "allowed_models": ["claude-haiku", "claude-sonnet"],
+            "default_model": "claude-sonnet",
+        },
+    }
+    written = admin.puts[0]["attributes"]
+    # Only the aigw.policy.* namespace is owned here; every other attribute
+    # (including a stale policy value) must be preserved or replaced exactly.
+    assert written["custom.marker"] == ["keep-me"]
+    assert written["aigw.policy.tpm_limit"] == ["100000"]
+    assert written["aigw.policy.allowed_models"] == ["claude-haiku,claude-sonnet"]
+
+    # Resetting to the platform default removes the policy attributes.
+    cleared = await admin.set_group_policy(
+        "group-1",
+        {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": None,
+            "default_model": None,
+        },
+    )
+    assert cleared["policy"] == {
+        "tpm_limit": None,
+        "rpm_limit": None,
+        "allowed_models": None,
+        "default_model": None,
+    }
+    assert admin.puts[1]["attributes"] == {"custom.marker": ["keep-me"]}
+
+
+@pytest.mark.asyncio
+async def test_set_group_policy_fails_closed_when_the_write_does_not_verify() -> None:
+    admin = policy_admin()
+    admin.persist_writes = False
+    with pytest.raises(IdentityError, match="did not verify"):
+        await admin.set_group_policy(
+            "group-1",
+            {
+                "tpm_limit": 1000,
+                "rpm_limit": None,
+                "allowed_models": None,
+                "default_model": None,
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_group_policy_rejects_invalid_requests_before_keycloak() -> None:
+    admin = policy_admin()
+    for bad in (
+        {"tpm_limit": 0, "rpm_limit": None, "allowed_models": None, "default_model": None},
+        {"tpm_limit": None, "rpm_limit": None, "allowed_models": [], "default_model": None},
+        {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": ["claude-sonnet"],
+            "default_model": "claude-opus",
+        },
+        {"tpm_limit": None},
+        {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": None,
+            "default_model": None,
+            "max_budget": 5,
+        },
+    ):
+        with pytest.raises(IdentityConflict):
+            await admin.set_group_policy("group-1", bad)
+    assert admin.puts == []
+
+
+@pytest.mark.asyncio
+async def test_user_project_policies_reads_fresh_authoritative_groups() -> None:
+    cfg = settings()
+    vault = FakeVault(
+        {
+            cfg.identity_state_vault_path: {
+                "federation_provider_id": "ldap-provider",
+                "managed_root_group_id": "managed-root",
+            }
+        }
+    )
+
+    class ProjectsPolicyAdmin(KeycloakAdmin):
+        async def _controller_token(self):
+            return "controller-token"
+
+        async def _request(self, method, path, **kwargs):
+            if path.endswith("/users/user-1"):
+                payload = {
+                    "id": "user-1",
+                    "enabled": True,
+                    "federationLink": "ldap-provider",
+                }
+            elif path.endswith("/users/user-1/groups"):
+                # Deliberately attribute-free membership representations: the
+                # policy must come from the authoritative per-group read.
+                payload = [
+                    {"id": "group-a", "path": "/aigw-managed/project-a"},
+                ]
+            elif path.endswith("/groups/group-a"):
+                payload = {
+                    "id": "group-a",
+                    "path": "/aigw-managed/project-a",
+                    "attributes": {
+                        "aigw.policy.rpm_limit": ["120"],
+                        "aigw.policy.allowed_models": ["claude-haiku"],
+                    },
+                }
+            else:
+                raise AssertionError(path)
+            return httpx.Response(200, json=payload)
+
+        async def _group_capabilities(self, group_id, token):
+            return ["aigw-developers"]
+
+    admin = ProjectsPolicyAdmin(cfg, vault, FakeDB())
+    assert await admin.user_project_policies("user-1") == {
+        "projects": ["project-a"],
+        "policies": {
+            "project-a": {
+                "tpm_limit": None,
+                "rpm_limit": 120,
+                "allowed_models": ["claude-haiku"],
+                "default_model": None,
+            }
+        },
+    }

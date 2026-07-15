@@ -157,14 +157,17 @@ class Settings(BaseSettings):
     admin_step_up_seconds: int = Field(default=5 * 60, ge=60, le=15 * 60)
 
     # --- Key-issuance guardrails (reviewed config, never runtime-editable) ---
-    # Every self-service key is minted with these caps. The deployed values
-    # come from ansible/group_vars (rendered into .env by the converge); these
-    # in-code defaults match that reviewed baseline so a missing variable can
-    # never mint an uncapped key. The literal string "none" disables one knob.
-    portal_key_default_max_budget: str = "25"
-    portal_key_default_tpm_limit: str = "100000"
-    portal_key_default_rpm_limit: str = "60"
-    portal_key_default_duration: str = "30d"
+    # Owner decision: the platform default is UNLIMITED — a new key carries no
+    # budget, rate limit, or expiry unless the runtime per-project policy (or
+    # an explicit host_vars override of these static backstop knobs) sets one.
+    # Cost/budget is an admin-only concept: no default budget is ever applied
+    # here, and administrators tune budgets per key from the admin inventory.
+    # The literal string "none" disables one knob; these in-code defaults
+    # match the reviewed group_vars baseline.
+    portal_key_default_max_budget: str = "none"
+    portal_key_default_tpm_limit: str = "none"
+    portal_key_default_rpm_limit: str = "none"
+    portal_key_default_duration: str = "none"
     # Optional per-project overrides: a one-line JSON object keyed by managed
     # project ID; each entry may set max_budget/tpm_limit/rpm_limit/duration,
     # and null lifts the global default for that project.

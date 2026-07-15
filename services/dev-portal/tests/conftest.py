@@ -23,7 +23,7 @@ os.environ.setdefault("OIDC_CLIENT_SECRET", "Test-OIDC-Client!0123456789-Secret-
 os.environ.setdefault("OIDC_ISSUER", "https://idp.test/realms/aigw")
 
 from app.config import settings  # noqa: E402
-from app import main  # noqa: E402
+from app import litellm_client, main  # noqa: E402
 
 app = main.app
 admin_app = main.admin_app
@@ -72,6 +72,14 @@ def set_admin_session(admin_client: TestClient):
     return _set
 
 
+UNLIMITED_POLICY: dict[str, Any] = {
+    "tpm_limit": None,
+    "rpm_limit": None,
+    "allowed_models": None,
+    "default_model": None,
+}
+
+
 @pytest.fixture(autouse=True)
 def default_live_project_membership(monkeypatch):
     """Most portal tests model one canonical managed-project assignment."""
@@ -79,4 +87,12 @@ def default_live_project_membership(monkeypatch):
     async def live_projects(_request, _user):
         return ("ai-gateway",)
 
+    async def live_policies(_request, _user, project_ids):
+        return {project_id: dict(UNLIMITED_POLICY) for project_id in project_ids}
+
+    async def model_names():
+        return ["claude-haiku", "claude-sonnet"]
+
     monkeypatch.setattr(main, "_live_project_ids", live_projects)
+    monkeypatch.setattr(main, "_live_project_policies", live_policies)
+    monkeypatch.setattr(litellm_client, "model_names", model_names)

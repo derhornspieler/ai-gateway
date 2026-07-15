@@ -387,10 +387,22 @@ async def test_auth_fails_closed_and_public_health_redacts_details() -> None:
 async def test_portal_token_is_limited_to_exact_project_membership_reads() -> None:
     old_state = dict(state)
 
+    project_policies = {
+        "projects": ["project-a"],
+        "policies": {
+            "project-a": {
+                "tpm_limit": None,
+                "rpm_limit": None,
+                "allowed_models": None,
+                "default_model": None,
+            }
+        },
+    }
+
     class Identity:
-        async def user_projects(self, user_id):
+        async def user_project_policies(self, user_id):
             assert user_id == "user-1"
-            return ["project-a"]
+            return project_policies
 
     try:
         cfg = settings()
@@ -403,11 +415,20 @@ async def test_portal_token_is_limited_to_exact_project_membership_reads() -> No
             headers = {"X-Internal-Auth": cfg.portal_identity_token}
             allowed = await client.get("/identity/projects/user-1", headers=headers)
             assert allowed.status_code == 200
-            assert allowed.json() == {"projects": ["project-a"]}
+            assert allowed.json() == project_policies
 
             assert (await client.get("/status", headers=headers)).status_code == 401
             assert (
                 await client.post("/identity/projects/user-1", headers=headers)
+            ).status_code == 401
+            # The membership+policy READ is the portal token's entire scope:
+            # the policy WRITE route must stay admin-token-only.
+            assert (
+                await client.put(
+                    "/identity/groups/group-1/policy",
+                    headers=headers,
+                    json={"tpm_limit": 1000},
+                )
             ).status_code == 401
 
             admin = {"X-Internal-Auth": cfg.rotator_internal_token}

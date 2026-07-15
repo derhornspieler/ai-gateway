@@ -95,6 +95,23 @@ class IdentityGroupCreate(BaseModel):
     capabilities: list[str] = Field(min_length=1, max_length=3)
 
 
+class IdentityGroupPolicyUpdate(BaseModel):
+    """Requested per-project issuance policy; null means platform default.
+
+    The identity controller re-validates and normalizes before any Keycloak
+    write — this model only bounds the transport shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tpm_limit: int | None = Field(default=None, ge=1, le=1_000_000_000)
+    rpm_limit: int | None = Field(default=None, ge=1, le=1_000_000_000)
+    allowed_models: list[str] | None = Field(
+        default=None, min_length=1, max_length=32
+    )
+    default_model: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class ProviderLifecycleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -557,11 +574,18 @@ async def identity_authorization(user_id: str) -> dict[str, bool]:
 
 
 @app.get("/identity/projects/{user_id}")
-async def identity_projects(user_id: str) -> dict[str, list[str]]:
-    """Return only live, canonical managed projects for one portal subject."""
+async def identity_projects(user_id: str) -> dict[str, Any]:
+    """Live, canonical managed projects plus each project's issuance policy.
+
+    This is the ONLY route the least-privilege portal identity token may
+    call. Widening its payload with the projects' non-secret issuance policy
+    (rate limits, allowed/default models) is a reviewed choice: the portal
+    needs the policy to mint correctly capped keys, and no mutation authority
+    or secret is added to that token's scope.
+    """
     identity: KeycloakAdmin = state["identity"]
     try:
-        return {"projects": await identity.user_projects(user_id)}
+        return await identity.user_project_policies(user_id)
     except IdentityError as exc:
         raise _identity_http_error(exc) from exc
 
@@ -591,6 +615,22 @@ async def identity_create_group(body: IdentityGroupCreate) -> dict[str, Any]:
     identity: KeycloakAdmin = state["identity"]
     try:
         return await identity.create_group(body.name, body.capabilities)
+    except IdentityError as exc:
+        raise _identity_http_error(exc) from exc
+
+
+@app.put("/identity/groups/{group_id}/policy")
+async def identity_set_group_policy(
+    group_id: str, body: IdentityGroupPolicyUpdate
+) -> dict[str, Any]:
+    """Write one managed group's issuance policy (admin token only).
+
+    The portal identity token's route allowlist never matches this path, so
+    only the full internal token — i.e. the admin portal — can mutate policy.
+    """
+    identity: KeycloakAdmin = state["identity"]
+    try:
+        return await identity.set_group_policy(group_id, body.model_dump())
     except IdentityError as exc:
         raise _identity_http_error(exc) from exc
 

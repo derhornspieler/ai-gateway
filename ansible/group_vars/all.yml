@@ -400,22 +400,26 @@ samba_lab_seed_users:
   - lab-developer
   - lab-user
 
-# ── Portal key-issuance guardrails ──────────────────────────────────────
-# Every self-service virtual key the dev portal mints carries these caps;
-# administrators retune individual keys afterwards from the admin console's
-# key inventory. These are reviewed configuration (this file or an
-# environment inventory), never runtime-editable state. The literal string
-# "none" disables one knob. max_budget is USD; tpm/rpm are per-minute
-# token/request ceilings; duration is the key lifetime in LiteLLM's grammar
-# (e.g. 30d, 12h). The portal re-validates every value at startup and
-# refuses to run on ambiguity, so a typo can never mint an uncapped key.
-portal_key_default_max_budget: "25"
-portal_key_default_tpm_limit: "100000"
-portal_key_default_rpm_limit: "60"
-portal_key_default_duration: "30d"
-# Optional per-project overrides keyed by managed project ID. Each entry may
-# set max_budget/tpm_limit/rpm_limit/duration; null lifts the global default
-# for that one project. Example:
+# ── Portal key-issuance guardrails (static backstop; default UNLIMITED) ─
+# Owner decision: a new self-service key carries NO budget, rate limit, or
+# expiry by default. Day-to-day rate/model restrictions are the RUNTIME
+# per-project policy administrators edit in the admin console (stored as
+# Keycloak group attributes via the identity controller); it overrides these
+# static knobs for tpm/rpm and the model set, and applies retroactively to a
+# project's existing keys. Cost/budget is an admin-only concept — no default
+# budget is ever applied; admins set budgets per key from the admin console.
+# These static knobs remain as a reviewed host_vars-overridable backstop:
+# the literal string "none" disables one (max_budget is USD; tpm/rpm are
+# per-minute ceilings; duration is LiteLLM's lifetime grammar, e.g. 30d).
+# The portal re-validates every value at startup and refuses ambiguity.
+portal_key_default_max_budget: "none"
+portal_key_default_tpm_limit: "none"
+portal_key_default_rpm_limit: "none"
+portal_key_default_duration: "none"
+# Optional per-project STATIC overrides keyed by managed project ID. Each
+# entry may set max_budget/tpm_limit/rpm_limit/duration; null lifts the
+# global default for that one project. Prefer the runtime admin-portal
+# policy for rate/model restrictions. Example:
 #   portal_key_project_limits:
 #     ml-research: { max_budget: "100", duration: "7d" }
 portal_key_project_limits: {}

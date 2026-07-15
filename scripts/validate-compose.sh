@@ -1087,10 +1087,10 @@ env \
   LITELLM_MASTER_KEY=sk-ValidationMasterKey_0123456789ABCDEF \
   LITELLM_SALT_KEY=ValidationSaltKey_0123456789ABCDEFGHIJ \
   LITELLM_UI_BREAKGLASS_PASSWORD=ValidationUiBreakglass_0123456789ABC \
-  PORTAL_KEY_DEFAULT_MAX_BUDGET=25 \
-  PORTAL_KEY_DEFAULT_TPM_LIMIT=100000 \
-  PORTAL_KEY_DEFAULT_RPM_LIMIT=60 \
-  PORTAL_KEY_DEFAULT_DURATION=30d \
+  PORTAL_KEY_DEFAULT_MAX_BUDGET=none \
+  PORTAL_KEY_DEFAULT_TPM_LIMIT=none \
+  PORTAL_KEY_DEFAULT_RPM_LIMIT=none \
+  PORTAL_KEY_DEFAULT_DURATION=none \
   PORTAL_KEY_PROJECT_LIMITS='{}' \
   REDIS_PASSWORD=ValidationRedisPassword_0123456789ABC \
   WEBUI_LITELLM_KEY=sk-ValidationVirtualKey_0123456789 \
@@ -1254,12 +1254,15 @@ assert litellm_env["UI_USERNAME"] == "litellm-breakglass"
 assert litellm_env["UI_PASSWORD"] == "ValidationUiBreakglass_0123456789ABC"
 assert litellm_env["UI_PASSWORD"] != litellm_env["LITELLM_MASTER_KEY"]
 # Reviewed key-issuance guardrails reach exactly the key-minting portal, via
-# the Ansible-rendered .env (never a literal in the compose file).
+# the Ansible-rendered .env (never a literal in the compose file). The
+# platform default is UNLIMITED ("none" on every static knob): rate/model
+# restrictions come from the runtime per-project policy, and budgets are set
+# per key by administrators only.
 portal_env = services["dev-portal"]["environment"]
-assert portal_env["PORTAL_KEY_DEFAULT_MAX_BUDGET"] == "25"
-assert portal_env["PORTAL_KEY_DEFAULT_TPM_LIMIT"] == "100000"
-assert portal_env["PORTAL_KEY_DEFAULT_RPM_LIMIT"] == "60"
-assert portal_env["PORTAL_KEY_DEFAULT_DURATION"] == "30d"
+assert portal_env["PORTAL_KEY_DEFAULT_MAX_BUDGET"] == "none"
+assert portal_env["PORTAL_KEY_DEFAULT_TPM_LIMIT"] == "none"
+assert portal_env["PORTAL_KEY_DEFAULT_RPM_LIMIT"] == "none"
+assert portal_env["PORTAL_KEY_DEFAULT_DURATION"] == "none"
 assert portal_env["PORTAL_KEY_PROJECT_LIMITS"] == "{}"
 assert "PORTAL_KEY_PROJECT_LIMITS" not in services["admin-portal"]["environment"]
 assert "UI_PASSWORD" not in services["admin-portal"]["environment"]

@@ -7,6 +7,10 @@ import pytest
 
 from app import litellm_client
 
+# Captured before the conftest autouse fixture stubs it for route tests,
+# so the direct client tests below exercise the real implementation.
+REAL_MODEL_NAMES = litellm_client.model_names
+
 
 def _mock_client(monkeypatch, handler):
     real_async_client = httpx.AsyncClient
@@ -147,7 +151,7 @@ async def test_key_list_rejects_cross_owner_or_unattributed_results(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_key_generate_binds_project_metadata_and_reviewed_guardrails(
+async def test_key_generate_defaults_to_unlimited_with_project_metadata(
     monkeypatch,
 ):
     body = None
@@ -162,6 +166,10 @@ async def test_key_generate_binds_project_metadata_and_reviewed_guardrails(
 
     await litellm_client.key_generate("owner-sub", "laptop", "ai-gateway")
 
+    # Owner decision: the platform default is UNLIMITED. No budget, rate
+    # limit, model restriction, or expiry is applied unless the runtime
+    # project policy (or an explicit static override) sets one — and no
+    # default budget is ever applied (cost is an admin-only concept).
     assert body == {
         "user_id": "owner-sub",
         "key_alias": "laptop",
@@ -169,25 +177,75 @@ async def test_key_generate_binds_project_metadata_and_reviewed_guardrails(
             "created_via": "dev-portal",
             "aigw_project_id": "ai-gateway",
         },
-        # Reviewed issuance guardrails from validated startup configuration:
-        # the browser request never chooses or removes them.
-        "max_budget": 25.0,
-        "tpm_limit": 100000,
-        "rpm_limit": 60,
-        "duration": "30d",
     }
 
 
 @pytest.mark.asyncio
-async def test_key_generate_applies_per_project_overrides_and_null_lift(
+async def test_key_generate_applies_the_runtime_project_policy(monkeypatch):
+    body = None
+
+    def handler(request: httpx.Request):
+        nonlocal body
+        body = json.loads(request.content)
+        return httpx.Response(200, json={"key": "sk-once"})
+
+    _mock_client(monkeypatch, handler)
+
+    await litellm_client.key_generate(
+        "owner-sub",
+        "laptop",
+        "ai-gateway",
+        {
+            "tpm_limit": 50000,
+            "rpm_limit": 30,
+            "allowed_models": ["claude-sonnet", "claude-haiku"],
+            "default_model": "claude-haiku",
+        },
+    )
+
+    assert body["tpm_limit"] == 50000
+    assert body["rpm_limit"] == 30
+    assert body["models"] == ["claude-haiku", "claude-sonnet"]
+    # The default model is a portal-surfaced concept, never a key field.
+    assert "default_model" not in body
+    assert "max_budget" not in body
+
+
+@pytest.mark.asyncio
+async def test_key_generate_rejects_malformed_runtime_policy(monkeypatch):
+    called = False
+
+    def handler(request: httpx.Request):
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"key": "sk-never"})
+
+    _mock_client(monkeypatch, handler)
+
+    for policy in (
+        {"tpm_limit": -1},
+        {"rpm_limit": True},
+        {"allowed_models": []},
+        {"allowed_models": ["bad model"]},
+        "restricted",
+    ):
+        with pytest.raises(litellm_client.LiteLLMError):
+            await litellm_client.key_generate(
+                "owner-sub", "laptop", "ai-gateway", policy
+            )
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_key_generate_runtime_policy_wins_over_static_backstop(
     monkeypatch,
 ):
     from app.config import settings
 
     monkeypatch.setattr(
         settings,
-        "_key_project_limit_overrides",
-        {"ml-research": {"max_budget": 100.0, "duration": None}},
+        "_key_limit_defaults",
+        {"tpm_limit": 1000, "duration": "7d"},
     )
     body = None
 
@@ -198,12 +256,18 @@ async def test_key_generate_applies_per_project_overrides_and_null_lift(
 
     _mock_client(monkeypatch, handler)
 
-    await litellm_client.key_generate("owner-sub", "laptop", "ml-research")
+    await litellm_client.key_generate(
+        "owner-sub",
+        "laptop",
+        "ai-gateway",
+        {"tpm_limit": 50000, "rpm_limit": None, "allowed_models": None},
+    )
 
-    assert body["max_budget"] == 100.0
-    assert body["tpm_limit"] == 100000
-    assert body["rpm_limit"] == 60
-    assert "duration" not in body
+    # The runtime policy overrides the static backstop where set; static
+    # knobs it does not govern (duration) still apply.
+    assert body["tpm_limit"] == 50000
+    assert body["duration"] == "7d"
+    assert "rpm_limit" not in body
 
 
 @pytest.mark.asyncio
@@ -335,7 +399,8 @@ async def test_key_update_allows_only_reviewed_fields_and_bounded_values(
 
     for updates in (
         {},
-        {"models": ["gpt-4"]},
+        {"models": "all"},
+        {"models": ["bad model"]},
         {"metadata": {"created_via": "dev-portal"}},
         {"user_id": "someone-else"},
         {"blocked": "true"},
@@ -395,22 +460,62 @@ def test_settings_fail_closed_on_malformed_key_guardrails():
             Settings(**overrides)
 
 
-def test_settings_merge_key_guardrails_per_project():
+def test_settings_default_to_unlimited_and_merge_static_overrides():
     from app.config import Settings
 
+    # Owner decision: the shipped default is UNLIMITED on every knob.
+    unlimited = Settings()
+    assert unlimited.key_limits_for_project("any-project") == {}
+
     parsed = Settings(
-        portal_key_default_tpm_limit="none",
+        portal_key_default_tpm_limit="100000",
         portal_key_project_limits=(
-            '{"ml-research": {"max_budget": null, "rpm_limit": "120"}}'
+            '{"ml-research": {"tpm_limit": null, "rpm_limit": "120"}}'
         ),
     )
 
-    assert parsed.key_limits_for_project("other-project") == {
-        "max_budget": 25.0,
-        "rpm_limit": 60,
-        "duration": "30d",
-    }
-    assert parsed.key_limits_for_project("ml-research") == {
-        "rpm_limit": 120,
-        "duration": "30d",
-    }
+    assert parsed.key_limits_for_project("other-project") == {"tpm_limit": 100000}
+    assert parsed.key_limits_for_project("ml-research") == {"rpm_limit": 120}
+
+
+@pytest.mark.asyncio
+async def test_model_names_returns_bounded_validated_ids(monkeypatch):
+    monkeypatch.setattr(litellm_client, "model_names", REAL_MODEL_NAMES)
+
+    def handler(request: httpx.Request):
+        assert request.url.path == "/v1/models"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "claude-sonnet"},
+                    {"id": "claude-haiku"},
+                    {"id": "claude-sonnet"},
+                ]
+            },
+        )
+
+    _mock_client(monkeypatch, handler)
+
+    assert await litellm_client.model_names() == ["claude-haiku", "claude-sonnet"]
+
+
+@pytest.mark.asyncio
+async def test_model_names_fails_closed_on_malformed_entries(monkeypatch):
+    monkeypatch.setattr(litellm_client, "model_names", REAL_MODEL_NAMES)
+    current: list = [{}]
+
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json=current[0])
+
+    _mock_client(monkeypatch, handler)
+
+    for payload in (
+        {"data": [{"id": "bad model"}]},
+        {"data": [{"id": 42}]},
+        {"data": "claude-sonnet"},
+        [],
+    ):
+        current[0] = payload
+        with pytest.raises(litellm_client.LiteLLMError):
+            await litellm_client.model_names()

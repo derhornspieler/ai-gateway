@@ -32,12 +32,35 @@ PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 # LiteLLM key-lifetime grammar (e.g. 30d, 12h). Kept textually identical to
 # config._KEY_DURATION_RE (config cannot import this module without a cycle).
 KEY_DURATION_RE = re.compile(r"^[1-9][0-9]{0,5}(s|m|h|d)$")
+# Kept textually identical to the identity controller's MODEL_NAME_RE: model
+# names travel from Keycloak group policy through this client into LiteLLM.
+MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")
+MAX_POLICY_MODELS = 32
+RATE_LIMIT_MAX = 1_000_000_000
 # The only /key/update fields this portal may ever send. Everything else on
-# that endpoint (owner, team, models, metadata, aliases, rotation) is reserved
-# for the operator path; widening this set is a reviewed security decision.
+# that endpoint (owner, team, metadata, aliases, rotation) is reserved for
+# the operator path; widening this set is a reviewed security decision.
+# `models` joined the set with the runtime per-project policy so an admin
+# policy change can re-tune the model set on existing keys.
 KEY_UPDATE_MUTABLE_FIELDS = frozenset(
-    {"blocked", "max_budget", "tpm_limit", "rpm_limit", "duration"}
+    {"blocked", "max_budget", "tpm_limit", "rpm_limit", "duration", "models"}
 )
+
+
+def _validated_model_list(models: Any, *, allow_empty: bool) -> list[str]:
+    """Accept only a bounded, deduplicated list of well-formed model names."""
+    if (
+        not isinstance(models, list)
+        or len(models) > MAX_POLICY_MODELS
+        or (not models and not allow_empty)
+        or any(
+            not isinstance(name, str) or MODEL_NAME_RE.fullmatch(name) is None
+            for name in models
+        )
+        or len(set(models)) != len(models)
+    ):
+        raise LiteLLMError("model list is invalid")
+    return sorted(models)
 
 
 def _headers() -> dict[str, str]:
@@ -204,7 +227,12 @@ async def key_list(user_id: str) -> list[Any]:
         raise LiteLLMError(f"could not reach LiteLLM: {exc}") from exc
 
 
-async def key_generate(user_id: str, alias: str, project_id: str) -> dict[str, Any]:
+async def key_generate(
+    user_id: str,
+    alias: str,
+    project_id: str,
+    project_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Mint a portal-owned virtual key for one immutable owner/project pair.
 
     LiteLLM's native project_id is a foreign key to a separately provisioned
@@ -227,11 +255,34 @@ async def key_generate(user_id: str, alias: str, project_id: str) -> dict[str, A
             PORTAL_PROJECT_METADATA_KEY: project_id,
         },
     }
-    # Reviewed issuance guardrails (max_budget/tpm_limit/rpm_limit/duration):
-    # resolved from validated startup config only — the browser request can
-    # never raise, lower, or remove them. Admins retune individual keys later
-    # through the separately gated admin key inventory.
-    payload.update(settings.key_limits_for_project(project_id))
+    # Two reviewed guardrail layers, neither reachable from the browser:
+    # 1. Static deployment config (group_vars → env). The platform default is
+    #    now UNLIMITED — cost/budget is an admin-only concept, so no default
+    #    max_budget is applied here.
+    # 2. The runtime per-project policy (Keycloak group attributes via the
+    #    identity controller) wins over the static layer for rate limits and
+    #    the allowed model set. Its values were validated by the caller; they
+    #    are re-validated here so a route bug cannot smuggle garbage into a
+    #    master-key request.
+    limits: dict[str, Any] = dict(settings.key_limits_for_project(project_id))
+    if project_policy is not None:
+        if not isinstance(project_policy, dict):
+            raise LiteLLMError("project policy is invalid")
+        for knob in ("tpm_limit", "rpm_limit"):
+            value = project_policy.get(knob)
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 < value <= RATE_LIMIT_MAX
+            ):
+                raise LiteLLMError("project policy rate limit is invalid")
+            limits[knob] = value
+        models = project_policy.get("allowed_models")
+        if models is not None:
+            limits["models"] = _validated_model_list(models, allow_empty=False)
+    payload.update(limits)
     try:
         async with httpx.AsyncClient(
             timeout=10, trust_env=False, follow_redirects=False
@@ -432,11 +483,16 @@ async def key_update(key: str, updates: dict[str, Any]) -> dict[str, Any]:
                 or not 0 < value <= 1_000_000
             ):
                 raise LiteLLMError("max_budget is invalid")
+        elif field == "models":
+            # An empty list is LiteLLM's "no model restriction" and is the
+            # deliberate re-tune value when a project policy clears its
+            # allowed-models set.
+            _validated_model_list(value, allow_empty=True)
         else:  # tpm_limit / rpm_limit
             if value is not None and (
                 isinstance(value, bool)
                 or not isinstance(value, int)
-                or not 0 < value <= 1_000_000_000
+                or not 0 < value <= RATE_LIMIT_MAX
             ):
                 raise LiteLLMError(f"{field} is invalid")
 
@@ -457,3 +513,34 @@ async def key_update(key: str, updates: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise LiteLLMError("key/update returned an invalid response shape")
     return data
+
+
+async def model_names() -> list[str]:
+    """List the gateway's configured model names from LiteLLM.
+
+    Server-side only (master key). Used to render and validate the
+    per-project policy forms and to show developers which models exist when
+    a project carries no restriction. Response entries are strictly bounded
+    so a compromised upstream cannot inject markup or unbounded data.
+    """
+    url = settings.litellm_url.rstrip("/") + "/v1/models"
+    try:
+        async with httpx.AsyncClient(
+            timeout=10, trust_env=False, follow_redirects=False
+        ) as client:
+            resp = await client.get(url, headers=_headers())
+    except httpx.HTTPError as exc:
+        raise LiteLLMError(f"could not reach LiteLLM: {exc}") from exc
+    if resp.status_code >= 400:
+        raise LiteLLMError(f"v1/models failed: HTTP {resp.status_code}")
+    data = _response_json(resp, "v1/models")
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or len(rows) > 256:
+        raise LiteLLMError("v1/models returned an invalid response shape")
+    names: set[str] = set()
+    for row in rows:
+        name = row.get("id") if isinstance(row, dict) else None
+        if not isinstance(name, str) or MODEL_NAME_RE.fullmatch(name) is None:
+            raise LiteLLMError("v1/models returned an invalid model name")
+        names.add(name)
+    return sorted(names)

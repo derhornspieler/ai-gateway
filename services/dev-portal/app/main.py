@@ -18,7 +18,7 @@ import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
@@ -630,6 +630,7 @@ async def _generate_project_key(
     alias: str,
     project_id: str,
     allowed_projects: tuple[str, ...],
+    project_policy: dict[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Serialize and verify the one-active-key invariant before disclosure."""
     async with _project_lock(user_id, project_id):
@@ -640,7 +641,9 @@ async def _generate_project_key(
         before_ids = _concrete_key_ids(before_owned)
 
         try:
-            result = await litellm_client.key_generate(user_id, alias, project_id)
+            result = await litellm_client.key_generate(
+                user_id, alias, project_id, project_policy
+            )
         except litellm_client.LiteLLMError:
             # LiteLLM may commit before a timeout/disconnect loses the response.
             # Reconcile under the same owner/project lock and remove only exact
@@ -787,6 +790,35 @@ async def _verify_post_generation_liveness(
         )
 
 
+async def _project_policy_view(
+    request: Request, user: dict[str, Any], project_ids: tuple[str, ...]
+) -> tuple[dict[str, dict[str, Any]], list[str], str | None]:
+    """Resolve the non-secret policy/model context for user-facing pages.
+
+    Display never shows cost to users — only the token rate limits and the
+    project's allowed models with the default marked. A failed policy read
+    degrades to an explanatory note (minting separately fails closed).
+    """
+    project_policies: dict[str, dict[str, Any]] = {}
+    policy_error: str | None = None
+    available_models: list[str] = []
+    if project_ids:
+        try:
+            project_policies = await _live_project_policies(
+                request, user, project_ids
+            )
+        except HTTPException:
+            policy_error = (
+                "Project rate-limit/model policy is unavailable right now; "
+                "key creation is paused until it can be verified."
+            )
+        try:
+            available_models = await litellm_client.model_names()
+        except litellm_client.LiteLLMError:
+            available_models = []
+    return project_policies, available_models, policy_error
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(
     request: Request, user: dict[str, Any] = Depends(auth.require_developer)
@@ -809,6 +841,9 @@ async def index(
         except litellm_client.LiteLLMError:
             keys = []
             list_error = "Could not safely list your keys from the gateway right now."
+    project_policies, available_models, policy_error = await _project_policy_view(
+        request, user, project_ids
+    )
 
     return templates.TemplateResponse(
         request,
@@ -821,6 +856,9 @@ async def index(
             "new_key": None,
             "new_tools": [],
             "project_ids": project_ids,
+            "project_policies": project_policies,
+            "available_models": available_models,
+            "policy_error": policy_error,
             "flashes": auth.pop_flash(request),
             "csrf_token": auth.get_csrf_token(request),
         },
@@ -846,9 +884,17 @@ async def create_key(
         raise HTTPException(
             status_code=403, detail="Project membership is missing or was revoked."
         )
+    # The runtime per-project policy (admin-managed Keycloak group attributes)
+    # decides this key's rate caps and model set. Unreadable or ambiguous
+    # policy fails the mint closed (503) rather than minting unlimited.
+    policies = await _live_project_policies(request, user, project_ids)
     try:
         key_value, keys = await _generate_project_key(
-            user["sub"], clean_alias, clean_project, project_ids
+            user["sub"],
+            clean_alias,
+            clean_project,
+            project_ids,
+            policies[clean_project],
         )
         # Close the normal group-removal race before the one-time plaintext is
         # rendered. The check is shielded so a browser disconnect cannot abort
@@ -897,6 +943,10 @@ async def create_key(
         alias=clean_alias,
         project=clean_project,
     )
+    try:
+        available_models = await litellm_client.model_names()
+    except litellm_client.LiteLLMError:
+        available_models = []
     response = templates.TemplateResponse(
         request,
         "index.html",
@@ -908,6 +958,9 @@ async def create_key(
             "new_key": key_value,
             "new_tools": tools.rendered_tools(settings.public_api_base, key_value),
             "project_ids": project_ids,
+            "project_policies": policies,
+            "available_models": available_models,
+            "policy_error": None,
             "selected_project": clean_project,
             "flashes": auth.pop_flash(request),
             "csrf_token": auth.get_csrf_token(request),
@@ -1059,6 +1112,95 @@ async def _live_project_ids(request: Request, user: dict[str, Any]) -> tuple[str
     return tuple(sorted(projects))
 
 
+def _validated_policy_object(raw: Any) -> dict[str, Any] | None:
+    """Validate one non-secret per-project issuance policy from the rotator.
+
+    The policy decides the rate caps and model set minted onto static bearer
+    keys, so anything ambiguous returns ``None`` and the caller fails closed
+    — a malformed restriction must never be treated as unlimited.
+    """
+    if not isinstance(raw, dict) or set(raw) != {
+        "tpm_limit",
+        "rpm_limit",
+        "allowed_models",
+        "default_model",
+    }:
+        return None
+    for knob in ("tpm_limit", "rpm_limit"):
+        value = raw[knob]
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 < value <= litellm_client.RATE_LIMIT_MAX
+        ):
+            return None
+    models = raw["allowed_models"]
+    if models is not None:
+        if (
+            not isinstance(models, list)
+            or not 1 <= len(models) <= litellm_client.MAX_POLICY_MODELS
+            or any(
+                not isinstance(name, str)
+                or litellm_client.MODEL_NAME_RE.fullmatch(name) is None
+                for name in models
+            )
+            or len(set(models)) != len(models)
+        ):
+            return None
+        models = sorted(models)
+    default_model = raw["default_model"]
+    if default_model is not None and (
+        not isinstance(default_model, str)
+        or litellm_client.MODEL_NAME_RE.fullmatch(default_model) is None
+        or (models is not None and default_model not in models)
+    ):
+        return None
+    return {
+        "tpm_limit": raw["tpm_limit"],
+        "rpm_limit": raw["rpm_limit"],
+        "allowed_models": models,
+        "default_model": default_model,
+    }
+
+
+async def _live_project_policies(
+    request: Request, user: dict[str, Any], project_ids: tuple[str, ...]
+) -> dict[str, dict[str, Any]]:
+    """Fetch validated issuance policies for already-authorized projects.
+
+    Fail-closed: the runtime policy decides the caps and model set minted
+    onto a static bearer key, so a missing, ambiguous, or malformed policy
+    payload is a 503 — never a silent unlimited default.
+    """
+    subject = user.get("sub")
+    if not isinstance(subject, str) or IDENTITY_ID_RE.fullmatch(subject) is None:
+        request.session.clear()
+        raise auth.NotAuthorized()
+    try:
+        raw = await _rotator_get(f"/identity/projects/{subject}")
+    except Exception as exc:  # noqa: BLE001 - fail closed without upstream detail
+        raise HTTPException(
+            status_code=503,
+            detail="Current project policy could not be verified.",
+        ) from exc
+    raw_policies = raw.get("policies") if isinstance(raw, dict) else None
+    if not isinstance(raw_policies, dict):
+        raise HTTPException(
+            status_code=503,
+            detail="Current project policy could not be verified.",
+        )
+    policies: dict[str, dict[str, Any]] = {}
+    for project_id in project_ids:
+        policy = _validated_policy_object(raw_policies.get(project_id))
+        if policy is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Current project policy was ambiguous.",
+            )
+        policies[project_id] = policy
+    return policies
+
+
 async def _managed_project_for_group(group_id: str) -> str:
     groups = _safe_identity_groups(await _rotator_get("/identity/groups"))
     matches = [group for group in groups if group["id"] == group_id]
@@ -1153,6 +1295,14 @@ async def require_live_admin(
         # durable controller not configured) to rely on the freshly validated
         # signed OIDC admin role.  Once configured, every request must pass the
         # live controller decision; outages fail closed.
+        #
+        # REVIEWED CHOICE: this narrow pre-bootstrap carve-out also covers the
+        # newer admin surfaces that depend on this gate (the gateway key
+        # inventory mutations and per-project policy edits), not only the
+        # original rotation controls. In that state the key inventory and
+        # policy store are empty or unreachable anyway, and the carve-out
+        # still requires the exact configured=False/bootstrap_available=True
+        # controller status — it is not a general outage bypass.
         try:
             status = _safe_identity_status(await _rotator_get("/identity/status"))
         except Exception:  # noqa: BLE001
@@ -1271,12 +1421,28 @@ def _safe_identity_groups(raw: Any) -> list[dict[str, Any]]:
             or count < 0
         ):
             raise ValueError("identity group response was invalid or ambiguous")
+        # The rotator attaches each managed group's parsed issuance policy.
+        # Absence is tolerated for display compatibility (treated as the
+        # unlimited platform default); a PRESENT but malformed policy is an
+        # ambiguous restriction and fails the listing closed.
+        if "policy" in item:
+            policy = _validated_policy_object(item.get("policy"))
+            if policy is None:
+                raise ValueError("identity group response was invalid or ambiguous")
+        else:
+            policy = {
+                "tpm_limit": None,
+                "rpm_limit": None,
+                "allowed_models": None,
+                "default_model": None,
+            }
         result.append(
             {
                 "id": group_id,
                 "name": name,
                 "capabilities": sorted(set(capabilities)),
                 "member_count": min(count, 1_000_000),
+                "policy": policy,
             }
         )
     return result
@@ -1557,6 +1723,20 @@ async def admin_page(
             request, "Could not reach the provider enrollment controller.", "error"
         )
 
+    # Configured model names gate the per-project policy form: without a
+    # verified model list the form is not rendered at all, because its
+    # full-replace semantics could otherwise silently clear a restriction.
+    policy_models: list[str] = []
+    try:
+        policy_models = await litellm_client.model_names()
+    except litellm_client.LiteLLMError:
+        auth.flash(
+            request,
+            "Could not read the configured model list; project policy "
+            "editing is disabled until it can be verified.",
+            "error",
+        )
+
     try:
         identity_status = _safe_identity_status(await _rotator_get("/identity/status"))
         if identity_status and identity_status["configured"]:
@@ -1603,6 +1783,7 @@ async def admin_page(
             "user_search": user_search,
             "identity_capabilities": sorted(IDENTITY_CAPABILITIES),
             "identity_step_up_recent": auth.has_recent_admin_reauthentication(request),
+            "policy_models": policy_models,
             "admin_surface": True,
             "flashes": auth.pop_flash(request),
             "csrf_token": auth.get_csrf_token(request),
@@ -2046,6 +2227,43 @@ def _admin_key_view(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_DURATION_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+# Tolerance for the post-update expiry property check: generous enough for
+# clock skew and request latency, far too small to hide a wrong lifetime.
+DURATION_VERIFY_TOLERANCE_SECONDS = 900
+
+
+def _duration_seconds(duration: str) -> int:
+    """Convert an already-validated LiteLLM duration (e.g. 30d) to seconds."""
+    return int(duration[:-1]) * _DURATION_UNIT_SECONDS[duration[-1]]
+
+
+def _expiry_matches_duration(
+    expires: Any, duration: str, *, now: datetime | None = None
+) -> bool:
+    """Assert the PROPERTY that a key now expires ≈ now + duration.
+
+    Tolerates the format (string or datetime, Z or offset, naive treated as
+    UTC) and bounded clock skew — never a byte-exact timestamp comparison.
+    """
+    if isinstance(expires, datetime):
+        expiry = expires
+    elif isinstance(expires, str):
+        try:
+            expiry = datetime.fromisoformat(expires.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    else:
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    expected = reference + timedelta(seconds=_duration_seconds(duration))
+    return (
+        abs((expiry - expected).total_seconds()) <= DURATION_VERIFY_TOLERANCE_SECONDS
+    )
+
+
 def _parse_admin_limit_field(field: str, raw: str) -> tuple[bool, Any]:
     """Parse one submitted limit field: empty = unchanged, "none" = uncapped.
 
@@ -2144,6 +2362,58 @@ async def admin_key_block(
     return redirect
 
 
+class _UnblockDenied(Exception):
+    """Unblocking this key would silently restore revoked project access."""
+
+
+async def _require_safe_portal_key_unblock(entry: dict[str, Any]) -> None:
+    """Refuse to resurrect a portal key whose owner lost live membership.
+
+    Membership revocation deactivates portal keys with the same
+    ``blocked: true`` bit a manual admin block uses, so an unblock could
+    silently restore access the identity controller already revoked. For
+    portal-provenance keys the owner's LIVE membership in the key's exact
+    project is therefore re-proven first; every ambiguity (malformed
+    provenance, invalid owner, unreachable controller) denies the unblock.
+    Operator-provenance keys are untouched by membership revocation and skip
+    this check.
+    """
+    try:
+        key_project = _entry_project_id(entry)
+    except litellm_client.LiteLLMError as exc:
+        raise _UnblockDenied(
+            "Unblock denied: this key claims portal provenance but its "
+            "project binding is malformed."
+        ) from exc
+    if key_project is None:
+        return
+    owner = entry.get("user_id")
+    if not isinstance(owner, str) or IDENTITY_ID_RE.fullmatch(owner) is None:
+        raise _UnblockDenied(
+            "Unblock denied: this portal key has no valid owner identity."
+        )
+    try:
+        raw = await _rotator_get(f"/identity/projects/{owner}")
+    except Exception as exc:  # noqa: BLE001 - ambiguity must deny, not allow
+        raise _UnblockDenied(
+            "Unblock denied: the owner's live project membership could not "
+            "be verified."
+        ) from exc
+    projects = raw.get("projects") if isinstance(raw, dict) else None
+    if not isinstance(projects, list) or any(
+        not isinstance(project, str) for project in projects
+    ):
+        raise _UnblockDenied(
+            "Unblock denied: the owner's live project membership could not "
+            "be verified."
+        )
+    if key_project not in projects:
+        raise _UnblockDenied(
+            "Unblock denied: the owner no longer has live membership in "
+            f"project '{key_project}'. Restore the membership first."
+        )
+
+
 @admin_app.post("/admin/keys/unblock")
 async def admin_key_unblock(
     request: Request,
@@ -2158,6 +2428,7 @@ async def admin_key_unblock(
         return redirect
     try:
         entry = await litellm_client.admin_key_lookup(token)
+        await _require_safe_portal_key_unblock(entry)
         await litellm_client.key_update(entry["token"], {"blocked": False})
         after = await litellm_client.admin_key_lookup(token)
         if after.get("blocked") is True:
@@ -2170,6 +2441,9 @@ async def admin_key_unblock(
             owner=str(entry.get("user_id") or "")[:128],
         )
         auth.flash(request, "Key unblocked.", "success")
+    except _UnblockDenied as denial:
+        _audit("admin.key.unblock", "denied-membership", user)
+        auth.flash(request, str(denial), "error")
     except litellm_client.LiteLLMError:
         _audit("admin.key.unblock", "failure", user)
         auth.flash(
@@ -2229,6 +2503,14 @@ async def admin_key_limits(
                 raise litellm_client.LiteLLMError(
                     "key limits did not verify after update"
                 )
+        # Duration is effect-verified like the numeric caps: the property is
+        # that the key now expires ≈ now + duration (format/skew tolerated).
+        if "duration" in updates and not _expiry_matches_duration(
+            after.get("expires"), updates["duration"]
+        ):
+            raise litellm_client.LiteLLMError(
+                "key expiry did not verify after update"
+            )
         _audit(
             "admin.key.limits",
             "success",
@@ -2244,5 +2526,199 @@ async def admin_key_limits(
             request,
             "Could not verify the key limit change. Refresh and try again.",
             "error",
+        )
+    return redirect
+
+
+# --- admin / per-project issuance policy ------------------------------------
+
+
+RETUNE_MAX_PAGES = 40
+
+
+async def _retune_project_keys(
+    project_id: str, policy: dict[str, Any]
+) -> tuple[int, int]:
+    """Retroactively re-tune every portal key in one project to its policy.
+
+    Owner decision: a policy change is DYNAMIC — it applies to existing keys,
+    not only new mints. Each key is updated through the same allowlisted
+    /key/update path as manual admin edits and the effect is verified from a
+    fresh exact-hash read. Returns (retuned, failed); the caller reports both
+    and the operation is idempotent, so a partial failure is retried by
+    simply resubmitting the policy.
+    """
+    updates: dict[str, Any] = {
+        "tpm_limit": policy["tpm_limit"],
+        "rpm_limit": policy["rpm_limit"],
+        # An unrestricted policy clears the per-key model list ([] means "no
+        # restriction" to LiteLLM).
+        "models": (
+            policy["allowed_models"] if policy["allowed_models"] is not None else []
+        ),
+    }
+    retuned = 0
+    failed = 0
+    page = 1
+    while True:
+        listing = await litellm_client.admin_key_list_page(page)
+        for entry in listing["keys"]:
+            try:
+                entry_project = _entry_project_id(entry)
+            except litellm_client.LiteLLMError:
+                # A key with malformed portal provenance cannot be attributed
+                # to any project; it is surfaced (and manageable) in the key
+                # inventory but deliberately not guessed at here.
+                continue
+            if entry_project != project_id:
+                continue
+            concrete = _entry_delete_id(entry)
+            if concrete is None:
+                failed += 1
+                continue
+            try:
+                await litellm_client.key_update(concrete, updates)
+                after = await litellm_client.admin_key_lookup(concrete)
+                if (
+                    after.get("tpm_limit") != updates["tpm_limit"]
+                    or after.get("rpm_limit") != updates["rpm_limit"]
+                    or sorted(
+                        model
+                        for model in (after.get("models") or [])
+                        if isinstance(model, str)
+                    )
+                    != updates["models"]
+                ):
+                    raise litellm_client.LiteLLMError(
+                        "key policy re-tune did not verify"
+                    )
+                retuned += 1
+            except litellm_client.LiteLLMError:
+                failed += 1
+        if listing["total_pages"] <= page:
+            return retuned, failed
+        page += 1
+        if page > RETUNE_MAX_PAGES:
+            raise litellm_client.LiteLLMError(
+                "key inventory exceeded the policy re-tune safety bound"
+            )
+
+
+@admin_app.post("/admin/identity/groups/{group_id}/policy")
+async def admin_identity_set_group_policy(
+    request: Request,
+    group_id: str = APIPath(..., pattern=IDENTITY_ID_PATTERN),
+    user: dict[str, Any] = Depends(require_recent_live_admin),
+    tpm_limit: str = Form("", max_length=32),
+    rpm_limit: str = Form("", max_length=32),
+    allowed_models: list[str] = Form(default=[]),
+    default_model: str = Form("", max_length=128),
+    csrf_token: str = Form(..., min_length=32, max_length=128),
+):
+    redirect = RedirectResponse(
+        "/admin?" + urlencode({"group_id": group_id}), status_code=303
+    )
+    if not auth.verify_csrf(request, csrf_token):
+        auth.flash(request, "Your session expired — please try again.", "error")
+        return redirect
+
+    # Full-replace form semantics: blank rate limit = unlimited; no checked
+    # model = every configured model (including future ones); a checked
+    # subset is an exact restriction.
+    limits: dict[str, int | None] = {}
+    for field, raw in (("tpm_limit", tpm_limit), ("rpm_limit", rpm_limit)):
+        value = raw.strip()
+        if not value:
+            limits[field] = None
+            continue
+        if not value.isdigit() or not 0 < int(value) <= litellm_client.RATE_LIMIT_MAX:
+            auth.flash(
+                request,
+                "Rate limits must be positive integers (blank = unlimited).",
+                "error",
+            )
+            return redirect
+        limits[field] = int(value)
+
+    try:
+        available = await litellm_client.model_names()
+    except litellm_client.LiteLLMError:
+        auth.flash(
+            request,
+            "Could not verify the configured model list; the policy was not "
+            "changed.",
+            "error",
+        )
+        return redirect
+
+    selected = sorted({model.strip() for model in allowed_models if model.strip()})
+    if any(model not in available for model in selected):
+        auth.flash(request, "Choose only configured models.", "error")
+        return redirect
+    clean_default = default_model.strip() or None
+    if clean_default is not None and clean_default not in (selected or available):
+        auth.flash(
+            request,
+            "The default model must be one of the project's allowed models.",
+            "error",
+        )
+        return redirect
+
+    payload = {
+        "tpm_limit": limits["tpm_limit"],
+        "rpm_limit": limits["rpm_limit"],
+        "allowed_models": selected or None,
+        "default_model": clean_default,
+    }
+    try:
+        result = await _rotator_put(f"/identity/groups/{group_id}/policy", payload)
+    except Exception:  # noqa: BLE001 - upstream detail stays server-side
+        _audit("identity.group.policy", "failure", user)
+        auth.flash(request, "Could not save the project policy.", "error")
+        return redirect
+
+    # Re-tune from the server-normalized policy echoed by the controller, so
+    # existing keys converge on exactly what was persisted and verified.
+    applied = (
+        _validated_policy_object(result.get("policy"))
+        if isinstance(result, dict)
+        else None
+    )
+    project_id = result.get("name") if isinstance(result, dict) else None
+    if applied is None or not isinstance(project_id, str) or (
+        litellm_client.PROJECT_ID_RE.fullmatch(project_id) is None
+    ):
+        _audit("identity.group.policy", "failure", user)
+        auth.flash(
+            request,
+            "The controller did not confirm the saved policy; existing keys "
+            "were not re-tuned. Resubmit to retry.",
+            "error",
+        )
+        return redirect
+    _audit("identity.group.policy", "success", user, project=project_id)
+
+    try:
+        retuned, failed = await _retune_project_keys(project_id, applied)
+    except litellm_client.LiteLLMError:
+        auth.flash(
+            request,
+            "Policy saved, but existing project keys could not all be "
+            "re-tuned. Resubmit the policy to retry.",
+            "error",
+        )
+        return redirect
+    if failed:
+        auth.flash(
+            request,
+            f"Policy saved; {retuned} existing keys re-tuned, {failed} could "
+            "not be verified. Resubmit the policy to retry the remainder.",
+            "error",
+        )
+    else:
+        auth.flash(
+            request,
+            f"Project policy saved; {retuned} existing keys re-tuned.",
+            "success",
         )
     return redirect

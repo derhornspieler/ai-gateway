@@ -15,12 +15,14 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-# One reviewed baseline, asserted identically on every surface.
+# One reviewed baseline, asserted identically on every surface. Owner
+# decision: the platform default is UNLIMITED — restrictions come from the
+# runtime per-project policy, and budgets are admin-set per key only.
 EXPECTED_DEFAULTS = {
-    "max_budget": "25",
-    "tpm_limit": "100000",
-    "rpm_limit": "60",
-    "duration": "30d",
+    "max_budget": "none",
+    "tpm_limit": "none",
+    "rpm_limit": "none",
+    "duration": "none",
 }
 
 
@@ -89,10 +91,10 @@ class PortalKeyGuardrailsContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            'portal_env["PORTAL_KEY_DEFAULT_MAX_BUDGET"] == "25"', validator
+            'portal_env["PORTAL_KEY_DEFAULT_MAX_BUDGET"] == "none"', validator
         )
         self.assertIn(
-            'portal_env["PORTAL_KEY_DEFAULT_DURATION"] == "30d"', validator
+            'portal_env["PORTAL_KEY_DEFAULT_DURATION"] == "none"', validator
         )
         self.assertIn(
             '"PORTAL_KEY_PROJECT_LIMITS" not in services["admin-portal"]',

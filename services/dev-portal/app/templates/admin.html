@@ -88,7 +88,34 @@
 <div class="card">
   <h3>{{ group.name }} <span class="badge">{{ group.member_count }} members</span></h3>
   <p class="muted">{{ group.capabilities | join(', ') }}</p>
+  <p class="muted">Policy — rate limit:
+    {% if group.policy.tpm_limit or group.policy.rpm_limit %}{{ group.policy.tpm_limit or "unlimited" }} TPM &middot; {{ group.policy.rpm_limit or "unlimited" }} RPM{% else %}Unlimited (default){% endif %};
+    models: {% if group.policy.allowed_models %}{{ group.policy.allowed_models | join(', ') }}{% else %}all configured{% endif %}{% if group.policy.default_model %}; default: {{ group.policy.default_model }}{% endif %}
+  </p>
   <a class="btn ghost" href="/admin?group_id={{ group.id }}">Manage members</a>
+  {% if identity_step_up_recent and policy_models %}
+  <form method="post" action="/admin/identity/groups/{{ group.id }}/policy" style="margin-top: 14px;" data-confirm="Save this policy and re-tune every existing key in {{ group.name }}? Rate limits and model access change immediately.">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="policy-tpm-{{ group.id }}">TPM limit (blank = unlimited)</label>
+    <input type="text" id="policy-tpm-{{ group.id }}" name="tpm_limit" value="{{ group.policy.tpm_limit or '' }}" maxlength="32" placeholder="unlimited" autocomplete="off">
+    <label for="policy-rpm-{{ group.id }}">RPM limit (blank = unlimited)</label>
+    <input type="text" id="policy-rpm-{{ group.id }}" name="rpm_limit" value="{{ group.policy.rpm_limit or '' }}" maxlength="32" placeholder="unlimited" autocomplete="off">
+    <label>Allowed models (none checked = all configured models, including future ones)</label>
+    {% for model in policy_models %}
+    <label><input type="checkbox" name="allowed_models" value="{{ model }}"{% if group.policy.allowed_models and model in group.policy.allowed_models %} checked{% endif %}> {{ model }}</label>
+    {% endfor %}
+    <label for="policy-default-{{ group.id }}">Default model (surfaced to developers)</label>
+    <select id="policy-default-{{ group.id }}" name="default_model">
+      <option value="">(none)</option>
+      {% for model in policy_models %}
+      <option value="{{ model }}"{% if group.policy.default_model == model %} selected{% endif %}>{{ model }}</option>
+      {% endfor %}
+    </select>
+    <div style="margin-top: 14px;"><button type="submit">Save policy &amp; re-tune existing keys</button></div>
+  </form>
+  {% elif identity_step_up_recent %}
+  <p class="muted" style="margin-top: 10px;">Policy editing is disabled until the configured model list can be verified.</p>
+  {% endif %}
   {% if identity_step_up_recent and group.member_count == 0 %}
   <form method="post" action="/admin/identity/groups/{{ group.id }}/delete" style="margin-top: 10px;" data-confirm="Delete the empty group {{ group.name }}?">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
