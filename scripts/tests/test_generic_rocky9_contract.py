@@ -58,6 +58,7 @@ class GenericRocky9ContractTests(unittest.TestCase):
                 "kc_admin_password",
                 "litellm_master_key",
                 "litellm_salt_key",
+                "litellm_ui_breakglass_password",
                 "redis_password",
                 "webui_litellm_key",
                 "webui_secret_key",

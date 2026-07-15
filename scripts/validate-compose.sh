@@ -1086,6 +1086,12 @@ env \
   KC_BOOTSTRAP_ADMIN_CLIENT_SECRET=ValidationKeycloakBootstrapSecret01234567 \
   LITELLM_MASTER_KEY=sk-ValidationMasterKey_0123456789ABCDEF \
   LITELLM_SALT_KEY=ValidationSaltKey_0123456789ABCDEFGHIJ \
+  LITELLM_UI_BREAKGLASS_PASSWORD=ValidationUiBreakglass_0123456789ABC \
+  PORTAL_KEY_DEFAULT_MAX_BUDGET=25 \
+  PORTAL_KEY_DEFAULT_TPM_LIMIT=100000 \
+  PORTAL_KEY_DEFAULT_RPM_LIMIT=60 \
+  PORTAL_KEY_DEFAULT_DURATION=30d \
+  PORTAL_KEY_PROJECT_LIMITS='{}' \
   REDIS_PASSWORD=ValidationRedisPassword_0123456789ABC \
   WEBUI_LITELLM_KEY=sk-ValidationVirtualKey_0123456789 \
   WEBUI_SECRET_KEY=ValidationStableWebuiSecret_0123456789ABC \
@@ -1239,6 +1245,25 @@ assert litellm_probe[:3] == ["CMD", "python3", "-c"]
 assert len(litellm_probe) == 4
 assert "http://127.0.0.1:4000/health/readiness" in litellm_probe[3]
 assert "/health/liveliness" not in litellm_probe[3]
+# The native LiteLLM admin UI stays enabled behind the ADM OIDC gate, and its
+# browser sign-in is the DEDICATED break-glass credential — never the master
+# key, which must never be typed into a browser.
+litellm_env = services["litellm"]["environment"]
+assert "DISABLE_ADMIN_UI" not in litellm_env
+assert litellm_env["UI_USERNAME"] == "litellm-breakglass"
+assert litellm_env["UI_PASSWORD"] == "ValidationUiBreakglass_0123456789ABC"
+assert litellm_env["UI_PASSWORD"] != litellm_env["LITELLM_MASTER_KEY"]
+# Reviewed key-issuance guardrails reach exactly the key-minting portal, via
+# the Ansible-rendered .env (never a literal in the compose file).
+portal_env = services["dev-portal"]["environment"]
+assert portal_env["PORTAL_KEY_DEFAULT_MAX_BUDGET"] == "25"
+assert portal_env["PORTAL_KEY_DEFAULT_TPM_LIMIT"] == "100000"
+assert portal_env["PORTAL_KEY_DEFAULT_RPM_LIMIT"] == "60"
+assert portal_env["PORTAL_KEY_DEFAULT_DURATION"] == "30d"
+assert portal_env["PORTAL_KEY_PROJECT_LIMITS"] == "{}"
+assert "PORTAL_KEY_PROJECT_LIMITS" not in services["admin-portal"]["environment"]
+assert "UI_PASSWORD" not in services["admin-portal"]["environment"]
+assert "UI_PASSWORD" not in services["dev-portal"]["environment"]
 assert services["open-webui"]["build"]["dockerfile"] == "Dockerfile.open-webui"
 assert services["open-webui"]["image"] == "ai-gateway/open-webui:0.10.2-aigw1"
 assert services["open-webui"]["build"]["args"]["BASE_IMAGE"] == (

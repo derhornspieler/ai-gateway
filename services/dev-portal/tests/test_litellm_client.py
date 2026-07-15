@@ -147,7 +147,9 @@ async def test_key_list_rejects_cross_owner_or_unattributed_results(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_key_generate_binds_namespaced_project_metadata(monkeypatch):
+async def test_key_generate_binds_project_metadata_and_reviewed_guardrails(
+    monkeypatch,
+):
     body = None
 
     def handler(request: httpx.Request):
@@ -167,7 +169,41 @@ async def test_key_generate_binds_namespaced_project_metadata(monkeypatch):
             "created_via": "dev-portal",
             "aigw_project_id": "ai-gateway",
         },
+        # Reviewed issuance guardrails from validated startup configuration:
+        # the browser request never chooses or removes them.
+        "max_budget": 25.0,
+        "tpm_limit": 100000,
+        "rpm_limit": 60,
+        "duration": "30d",
     }
+
+
+@pytest.mark.asyncio
+async def test_key_generate_applies_per_project_overrides_and_null_lift(
+    monkeypatch,
+):
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings,
+        "_key_project_limit_overrides",
+        {"ml-research": {"max_budget": 100.0, "duration": None}},
+    )
+    body = None
+
+    def handler(request: httpx.Request):
+        nonlocal body
+        body = json.loads(request.content)
+        return httpx.Response(200, json={"key": "sk-once"})
+
+    _mock_client(monkeypatch, handler)
+
+    await litellm_client.key_generate("owner-sub", "laptop", "ml-research")
+
+    assert body["max_budget"] == 100.0
+    assert body["tpm_limit"] == 100000
+    assert body["rpm_limit"] == 60
+    assert "duration" not in body
 
 
 @pytest.mark.asyncio
@@ -186,3 +222,195 @@ async def test_key_deactivate_sends_only_pre_authorized_concrete_hash(monkeypatc
     await litellm_client.key_deactivate("owned-hash")
 
     assert body == {"key": "owned-hash", "blocked": True}
+
+
+@pytest.mark.asyncio
+async def test_admin_key_list_page_requires_native_counters(monkeypatch):
+    def handler(request: httpx.Request):
+        assert "user_id" not in request.url.params
+        assert request.url.params["return_full_object"] == "true"
+        return httpx.Response(200, json={"keys": [{"token": "hash-1"}]})
+
+    _mock_client(monkeypatch, handler)
+
+    with pytest.raises(litellm_client.LiteLLMError, match="pagination counters"):
+        await litellm_client.admin_key_list_page(1)
+
+
+@pytest.mark.asyncio
+async def test_admin_key_list_page_rejects_inconsistent_or_wrong_pages(monkeypatch):
+    current: dict = {}
+
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json=current)
+
+    _mock_client(monkeypatch, handler)
+
+    for payload in (
+        # Echoed page differs from the requested one.
+        {"keys": [], "current_page": 2, "total_pages": 1, "total_count": 1},
+        # Declared counters disagree with each other.
+        {"keys": [], "current_page": 1, "total_pages": 3, "total_count": 1},
+        # Short non-final page hides keys.
+        {
+            "keys": [{"token": "hash-1"}],
+            "current_page": 1,
+            "total_pages": 2,
+            "total_count": 51,
+        },
+    ):
+        current.clear()
+        current.update(payload)
+        with pytest.raises(litellm_client.LiteLLMError):
+            await litellm_client.admin_key_list_page(1)
+
+
+@pytest.mark.asyncio
+async def test_admin_key_list_page_returns_one_counter_checked_page(monkeypatch):
+    keys = [{"token": f"hash-{i}", "user_id": f"owner-{i}"} for i in range(50)]
+
+    def handler(request: httpx.Request):
+        assert request.url.params["page"] == "2"
+        assert request.url.params["size"] == "50"
+        return httpx.Response(
+            200,
+            json={
+                "keys": keys,
+                "current_page": 2,
+                "total_pages": 3,
+                "total_count": 130,
+            },
+        )
+
+    _mock_client(monkeypatch, handler)
+
+    listing = await litellm_client.admin_key_list_page(2)
+
+    assert listing["page"] == 2
+    assert listing["total_pages"] == 3
+    assert listing["total_count"] == 130
+    assert len(listing["keys"]) == 50
+
+
+@pytest.mark.asyncio
+async def test_admin_key_lookup_requires_exactly_one_exact_match(monkeypatch):
+    current: dict = {
+        "keys": [{"token": "hash-abc", "user_id": "owner"}],
+        "current_page": 1,
+        "total_pages": 1,
+        "total_count": 1,
+    }
+
+    def handler(request: httpx.Request):
+        assert request.url.params["key_hash"] == "hash-abc"
+        return httpx.Response(200, json=current)
+
+    _mock_client(monkeypatch, handler)
+    entry = await litellm_client.admin_key_lookup("hash-abc")
+    assert entry["token"] == "hash-abc"
+
+    for bad in (
+        {"keys": [], "total_count": 0},
+        {"keys": [{"token": "a"}, {"token": "b"}], "total_count": 2},
+        {"keys": [{"token": "different"}], "total_count": 1},
+    ):
+        current.clear()
+        current.update(bad)
+        with pytest.raises(litellm_client.LiteLLMError):
+            await litellm_client.admin_key_lookup("hash-abc")
+
+
+@pytest.mark.asyncio
+async def test_key_update_allows_only_reviewed_fields_and_bounded_values(
+    monkeypatch,
+):
+    called = False
+
+    def handler(request: httpx.Request):
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    _mock_client(monkeypatch, handler)
+
+    for updates in (
+        {},
+        {"models": ["gpt-4"]},
+        {"metadata": {"created_via": "dev-portal"}},
+        {"user_id": "someone-else"},
+        {"blocked": "true"},
+        {"max_budget": -1},
+        {"max_budget": True},
+        {"tpm_limit": 0},
+        {"rpm_limit": 10.5},
+        {"duration": "forever"},
+        {"duration": None},
+    ):
+        with pytest.raises(litellm_client.LiteLLMError):
+            await litellm_client.key_update("hash-abc", updates)
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_key_update_sends_allowlisted_payload(monkeypatch):
+    body = None
+
+    def handler(request: httpx.Request):
+        nonlocal body
+        assert request.url.path == "/key/update"
+        body = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    _mock_client(monkeypatch, handler)
+
+    await litellm_client.key_update(
+        "hash-abc",
+        {"max_budget": 50.0, "tpm_limit": None, "rpm_limit": 120, "blocked": False},
+    )
+
+    assert body == {
+        "key": "hash-abc",
+        "max_budget": 50.0,
+        "tpm_limit": None,
+        "rpm_limit": 120,
+        "blocked": False,
+    }
+
+
+def test_settings_fail_closed_on_malformed_key_guardrails():
+    from app.config import Settings
+
+    for overrides in (
+        {"portal_key_default_duration": "forever"},
+        {"portal_key_default_max_budget": "0"},
+        {"portal_key_default_tpm_limit": "-5"},
+        {"portal_key_default_rpm_limit": "sixty"},
+        {"portal_key_project_limits": "not-json"},
+        {"portal_key_project_limits": "[]"},
+        {"portal_key_project_limits": '{"UPPER": {"max_budget": "5"}}'},
+        {"portal_key_project_limits": '{"ok": {"models": ["x"]}}'},
+        {"portal_key_project_limits": '{"ok": {"duration": "eternal"}}'},
+    ):
+        with pytest.raises(ValueError, match="key-issuance guardrails"):
+            Settings(**overrides)
+
+
+def test_settings_merge_key_guardrails_per_project():
+    from app.config import Settings
+
+    parsed = Settings(
+        portal_key_default_tpm_limit="none",
+        portal_key_project_limits=(
+            '{"ml-research": {"max_budget": null, "rpm_limit": "120"}}'
+        ),
+    )
+
+    assert parsed.key_limits_for_project("other-project") == {
+        "max_budget": 25.0,
+        "rpm_limit": 60,
+        "duration": "30d",
+    }
+    assert parsed.key_limits_for_project("ml-research") == {
+        "rpm_limit": 120,
+        "duration": "30d",
+    }

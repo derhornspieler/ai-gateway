@@ -400,6 +400,26 @@ samba_lab_seed_users:
   - lab-developer
   - lab-user
 
+# ── Portal key-issuance guardrails ──────────────────────────────────────
+# Every self-service virtual key the dev portal mints carries these caps;
+# administrators retune individual keys afterwards from the admin console's
+# key inventory. These are reviewed configuration (this file or an
+# environment inventory), never runtime-editable state. The literal string
+# "none" disables one knob. max_budget is USD; tpm/rpm are per-minute
+# token/request ceilings; duration is the key lifetime in LiteLLM's grammar
+# (e.g. 30d, 12h). The portal re-validates every value at startup and
+# refuses to run on ambiguity, so a typo can never mint an uncapped key.
+portal_key_default_max_budget: "25"
+portal_key_default_tpm_limit: "100000"
+portal_key_default_rpm_limit: "60"
+portal_key_default_duration: "30d"
+# Optional per-project overrides keyed by managed project ID. Each entry may
+# set max_budget/tpm_limit/rpm_limit/duration; null lifts the global default
+# for that one project. Example:
+#   portal_key_project_limits:
+#     ml-research: { max_budget: "100", duration: "7d" }
+portal_key_project_limits: {}
+
 # ── Keycloak seeded test users (default OFF — no credentials in git) ────
 # When true, the aigw realm template seeds testadmin/testuser. The passwords
 # have NO defaults on purpose: define aigw_test_admin_password and
@@ -432,7 +452,8 @@ aigw_seed_test_users: false
 #   pg_super_password         pg_litellm_password        pg_keycloak_password
 #   pg_rotator_password       pg_grafana_ro_password
 #   kc_admin_password         litellm_master_key
-#   litellm_salt_key          redis_password             webui_litellm_key
+#   litellm_salt_key          litellm_ui_breakglass_password
+#   redis_password            webui_litellm_key
 #   webui_secret_key          webui_oidc_client_secret
 #   portal_oidc_client_secret admin_portal_oidc_client_secret
 #   oauth2_proxy_client_secret vault_oidc_client_secret
@@ -459,6 +480,11 @@ aigw_seed_test_users: false
 # kc_admin_password:          <vault overlay only>
 # litellm_master_key:         <vault overlay only>
 # litellm_salt_key:           <vault overlay only>
+# litellm_ui_breakglass_password: <vault overlay only>  # Dedicated break-glass
+#     browser login for the retained native LiteLLM admin UI (username
+#     litellm-breakglass). NEVER reuse the master key: it is a server-side
+#     bearer credential and must never be typed into a browser. host_finalize
+#     prints a custody pointer (never the value) at the end of each converge.
 # redis_password:             <vault overlay only>
 # webui_litellm_key:          <vault overlay only>  # High-entropy candidate for
 #     the SCOPED Open WebUI LiteLLM virtual key — NEVER the master key. Ansible

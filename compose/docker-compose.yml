@@ -499,6 +499,12 @@ services:
       DATABASE_URL: postgresql://litellm:${PG_LITELLM_PASSWORD:?PG_LITELLM_PASSWORD must be set}@postgres:5432/litellm
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?LITELLM_SALT_KEY must be set}
+      # The native admin UI deliberately stays enabled (behind the ADM-only
+      # oauth2-proxy OIDC gate), but its browser sign-in is a DEDICATED
+      # break-glass credential from the encrypted inventory. The master key is
+      # a server-side bearer credential and is never typed into a browser.
+      UI_USERNAME: litellm-breakglass
+      UI_PASSWORD: ${LITELLM_UI_BREAKGLASS_PASSWORD:?LITELLM_UI_BREAKGLASS_PASSWORD must be set}
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
@@ -741,6 +747,15 @@ services:
       PUBLIC_API_BASE: "https://api.${DOMAIN:?DOMAIN must be set}"
       ADMIN_ROLE: aigw-admins
       ADMIN_STEP_UP_SECONDS: "300"
+      # Reviewed key-issuance guardrails (group_vars → Ansible-rendered .env →
+      # here). Every self-service key is minted with these caps; the browser
+      # never chooses them, and admins retune single keys from the admin
+      # console's key inventory afterwards.
+      PORTAL_KEY_DEFAULT_MAX_BUDGET: ${PORTAL_KEY_DEFAULT_MAX_BUDGET:?PORTAL_KEY_DEFAULT_MAX_BUDGET must be set}
+      PORTAL_KEY_DEFAULT_TPM_LIMIT: ${PORTAL_KEY_DEFAULT_TPM_LIMIT:?PORTAL_KEY_DEFAULT_TPM_LIMIT must be set}
+      PORTAL_KEY_DEFAULT_RPM_LIMIT: ${PORTAL_KEY_DEFAULT_RPM_LIMIT:?PORTAL_KEY_DEFAULT_RPM_LIMIT must be set}
+      PORTAL_KEY_DEFAULT_DURATION: ${PORTAL_KEY_DEFAULT_DURATION:?PORTAL_KEY_DEFAULT_DURATION must be set}
+      PORTAL_KEY_PROJECT_LIMITS: ${PORTAL_KEY_PROJECT_LIMITS:?PORTAL_KEY_PROJECT_LIMITS must be set}
     networks: [net-portal, net-telemetry]
     healthcheck:
       test:

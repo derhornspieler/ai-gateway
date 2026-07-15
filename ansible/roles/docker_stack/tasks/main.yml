@@ -975,6 +975,7 @@
     - { name: kc_admin_password, min_length: 24 }
     - { name: litellm_master_key, min_length: 32 }
     - { name: litellm_salt_key, min_length: 32 }
+    - { name: litellm_ui_breakglass_password, min_length: 32 }
     - { name: redis_password, min_length: 32 }
     - { name: webui_litellm_key, min_length: 24 }
     - { name: webui_secret_key, min_length: 32 }
@@ -1014,9 +1015,31 @@
         [webui_oidc_client_secret, portal_oidc_client_secret,
          admin_portal_oidc_client_secret,
          oauth2_proxy_client_secret, vault_oidc_client_secret] | unique | length == 5
+      # The LiteLLM UI break-glass password exists precisely so the master key
+      # is never typed into a browser; reusing either LiteLLM secret for it
+      # would silently collapse that boundary.
+      - litellm_ui_breakglass_password not in [litellm_master_key, litellm_salt_key]
     quiet: true
     fail_msg: Portal tokens, session keys, and OIDC client secrets must be distinct.
   no_log: true
+
+- name: Validate portal key-issuance guardrail shapes
+  ansible.builtin.assert:
+    that:
+      - portal_key_default_max_budget is string
+      - portal_key_default_max_budget is match('^(none|[0-9]+(\.[0-9]+)?)$')
+      - portal_key_default_tpm_limit is string
+      - portal_key_default_tpm_limit is match('^(none|[1-9][0-9]{0,9})$')
+      - portal_key_default_rpm_limit is string
+      - portal_key_default_rpm_limit is match('^(none|[1-9][0-9]{0,9})$')
+      - portal_key_default_duration is string
+      - portal_key_default_duration is match('^(none|[1-9][0-9]{0,5}(s|m|h|d))$')
+      - portal_key_project_limits is mapping
+    quiet: true
+    fail_msg: >-
+      portal_key_* issuance guardrails are malformed — see group_vars/all.yml
+      for the accepted shapes (the literal string "none" disables one knob).
+      The dev portal itself re-validates and refuses to start on ambiguity.
 
 - name: Fail closed on missing or unsafe Samba lab secrets
   ansible.builtin.assert:

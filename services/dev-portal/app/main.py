@@ -24,7 +24,15 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 import httpx
-from fastapi import Depends, FastAPI, Form, HTTPException, Path as APIPath, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    Form,
+    HTTPException,
+    Path as APIPath,
+    Query,
+    Request,
+)
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -1950,3 +1958,291 @@ async def admin_identity_remove_member(
     return RedirectResponse(
         "/admin?" + urlencode({"group_id": group_id}), status_code=303
     )
+
+
+# --- admin / gateway key inventory -----------------------------------------
+
+
+ADMIN_KEY_TEXT_LIMIT = 128
+ADMIN_KEY_MODELS_LIMIT = 16
+
+
+def _admin_key_view(entry: dict[str, Any]) -> dict[str, Any]:
+    """Build one bounded, allowlisted display row from a full key object.
+
+    The one-time plaintext credential only ever appears in a generate
+    response's ``key`` field, but a list response is never trusted to omit
+    it: this view model copies exact allowlisted fields and nothing else, so
+    the template can never render an unexpected upstream value.
+    """
+
+    def text(*names: str, limit: int = ADMIN_KEY_TEXT_LIMIT) -> str:
+        for name in names:
+            value = entry.get(name)
+            if isinstance(value, str) and value:
+                return value[:limit]
+        return ""
+
+    def number(name: str) -> int | float | None:
+        value = entry.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return value
+
+    provenance = "operator"
+    project = ""
+    created_via = ""
+    try:
+        project_id = _entry_project_id(entry)
+        created_via = str(_key_metadata(entry).get("created_via") or "")[:64]
+    except litellm_client.LiteLLMError:
+        # Renderable but never manageable through provenance shortcuts: a key
+        # claiming portal provenance with malformed project data is displayed
+        # as exactly that, and no mutation is derived from this label.
+        provenance = "invalid-provenance"
+    else:
+        if project_id is not None:
+            provenance = "portal"
+            project = project_id
+
+    models_raw = entry.get("models")
+    models = (
+        [
+            str(model)[:64]
+            for model in models_raw[:ADMIN_KEY_MODELS_LIMIT]
+            if isinstance(model, str)
+        ]
+        if isinstance(models_raw, list)
+        else []
+    )
+
+    concrete = _entry_delete_id(entry)
+    expires = entry.get("expires")
+    if isinstance(expires, datetime):
+        expires_text = expires.isoformat()[:64]
+    elif isinstance(expires, str):
+        expires_text = expires[:64]
+    else:
+        expires_text = ""
+    return {
+        # The persisted token hash — a lookup identifier, never a credential.
+        "token": concrete or "",
+        "manageable": concrete is not None,
+        "alias": text("key_alias", "alias"),
+        "owner": text("user_id"),
+        "team": text("team_id"),
+        "provenance": provenance,
+        "project": project,
+        "created_via": created_via,
+        "models": models,
+        "spend": number("spend"),
+        "max_budget": number("max_budget"),
+        "tpm_limit": number("tpm_limit"),
+        "rpm_limit": number("rpm_limit"),
+        "expires": expires_text,
+        "created_at": text("created_at", limit=64),
+        "blocked": entry.get("blocked") is True,
+        "active": _is_active_key(entry),
+    }
+
+
+def _parse_admin_limit_field(field: str, raw: str) -> tuple[bool, Any]:
+    """Parse one submitted limit field: empty = unchanged, "none" = uncapped.
+
+    Raises ValueError on anything else that is not a strictly bounded value;
+    the caller turns that into a flash without contacting LiteLLM.
+    """
+    value = raw.strip()
+    if not value:
+        return False, None
+    if field == "duration":
+        # Clearing an expiry is deliberately not offered here; leave blank to
+        # keep the current lifetime.
+        if litellm_client.KEY_DURATION_RE.fullmatch(value) is None:
+            raise ValueError(field)
+        return True, value
+    if value.lower() == "none":
+        return True, None
+    if field == "max_budget":
+        number = float(value)
+        if not 0 < number <= 1_000_000:
+            raise ValueError(field)
+        return True, number
+    number_int = int(value, 10)
+    if not 0 < number_int <= 1_000_000_000:
+        raise ValueError(field)
+    return True, number_int
+
+
+@admin_app.get("/admin/keys", response_class=HTMLResponse)
+async def admin_keys_page(
+    request: Request,
+    user: dict[str, Any] = Depends(require_live_admin),
+    page: int = Query(1, ge=1, le=10_000),
+) -> HTMLResponse:
+    listing: dict[str, Any] | None = None
+    rows: list[dict[str, Any]] = []
+    list_error: str | None = None
+    try:
+        listing = await litellm_client.admin_key_list_page(page)
+        rows = [_admin_key_view(entry) for entry in listing["keys"]]
+    except litellm_client.LiteLLMError:
+        list_error = "Could not safely read the gateway key inventory right now."
+
+    return templates.TemplateResponse(
+        request,
+        "admin_keys.html",
+        {
+            "user": user,
+            "is_admin": True,
+            "admin_surface": True,
+            "keys": rows,
+            "list_error": list_error,
+            "page": page,
+            "total_pages": listing["total_pages"] if listing else 0,
+            "total_count": listing["total_count"] if listing else 0,
+            "identity_step_up_recent": auth.has_recent_admin_reauthentication(request),
+            "flashes": auth.pop_flash(request),
+            "csrf_token": auth.get_csrf_token(request),
+        },
+    )
+
+
+@admin_app.post("/admin/keys/block")
+async def admin_key_block(
+    request: Request,
+    user: dict[str, Any] = Depends(require_recent_live_admin),
+    token: str = Form(..., min_length=1, max_length=2048),
+    page: int = Form(1, ge=1, le=10_000),
+    csrf_token: str = Form(..., min_length=32, max_length=128),
+):
+    redirect = RedirectResponse(f"/admin/keys?page={page}", status_code=303)
+    if not auth.verify_csrf(request, csrf_token):
+        auth.flash(request, "Your session expired — please try again.", "error")
+        return redirect
+    try:
+        entry = await litellm_client.admin_key_lookup(token)
+        await litellm_client.key_update(entry["token"], {"blocked": True})
+        after = await litellm_client.admin_key_lookup(token)
+        if after.get("blocked") is not True:
+            raise litellm_client.LiteLLMError("key remained active after block")
+        _audit(
+            "admin.key.block",
+            "success",
+            user,
+            alias=str(entry.get("key_alias") or "")[:128],
+            owner=str(entry.get("user_id") or "")[:128],
+        )
+        auth.flash(request, "Key blocked. It stops working immediately.", "success")
+    except litellm_client.LiteLLMError:
+        _audit("admin.key.block", "failure", user)
+        auth.flash(
+            request,
+            "Could not verify that key was blocked. Refresh and try again.",
+            "error",
+        )
+    return redirect
+
+
+@admin_app.post("/admin/keys/unblock")
+async def admin_key_unblock(
+    request: Request,
+    user: dict[str, Any] = Depends(require_recent_live_admin),
+    token: str = Form(..., min_length=1, max_length=2048),
+    page: int = Form(1, ge=1, le=10_000),
+    csrf_token: str = Form(..., min_length=32, max_length=128),
+):
+    redirect = RedirectResponse(f"/admin/keys?page={page}", status_code=303)
+    if not auth.verify_csrf(request, csrf_token):
+        auth.flash(request, "Your session expired — please try again.", "error")
+        return redirect
+    try:
+        entry = await litellm_client.admin_key_lookup(token)
+        await litellm_client.key_update(entry["token"], {"blocked": False})
+        after = await litellm_client.admin_key_lookup(token)
+        if after.get("blocked") is True:
+            raise litellm_client.LiteLLMError("key remained blocked after unblock")
+        _audit(
+            "admin.key.unblock",
+            "success",
+            user,
+            alias=str(entry.get("key_alias") or "")[:128],
+            owner=str(entry.get("user_id") or "")[:128],
+        )
+        auth.flash(request, "Key unblocked.", "success")
+    except litellm_client.LiteLLMError:
+        _audit("admin.key.unblock", "failure", user)
+        auth.flash(
+            request,
+            "Could not verify that key was unblocked. Refresh and try again.",
+            "error",
+        )
+    return redirect
+
+
+@admin_app.post("/admin/keys/limits")
+async def admin_key_limits(
+    request: Request,
+    user: dict[str, Any] = Depends(require_recent_live_admin),
+    token: str = Form(..., min_length=1, max_length=2048),
+    max_budget: str = Form("", max_length=32),
+    tpm_limit: str = Form("", max_length=32),
+    rpm_limit: str = Form("", max_length=32),
+    duration: str = Form("", max_length=16),
+    page: int = Form(1, ge=1, le=10_000),
+    csrf_token: str = Form(..., min_length=32, max_length=128),
+):
+    redirect = RedirectResponse(f"/admin/keys?page={page}", status_code=303)
+    if not auth.verify_csrf(request, csrf_token):
+        auth.flash(request, "Your session expired — please try again.", "error")
+        return redirect
+
+    updates: dict[str, Any] = {}
+    try:
+        for field, raw in (
+            ("max_budget", max_budget),
+            ("tpm_limit", tpm_limit),
+            ("rpm_limit", rpm_limit),
+            ("duration", duration),
+        ):
+            present, value = _parse_admin_limit_field(field, raw)
+            if present:
+                updates[field] = value
+    except ValueError:
+        auth.flash(
+            request,
+            'Limits must be positive numbers, "none" to remove a cap, or a '
+            "duration like 30d.",
+            "error",
+        )
+        return redirect
+    if not updates:
+        auth.flash(request, "Provide at least one limit change.", "error")
+        return redirect
+
+    try:
+        entry = await litellm_client.admin_key_lookup(token)
+        await litellm_client.key_update(entry["token"], updates)
+        after = await litellm_client.admin_key_lookup(token)
+        for field in ("max_budget", "tpm_limit", "rpm_limit"):
+            if field in updates and after.get(field) != updates[field]:
+                raise litellm_client.LiteLLMError(
+                    "key limits did not verify after update"
+                )
+        _audit(
+            "admin.key.limits",
+            "success",
+            user,
+            alias=str(entry.get("key_alias") or "")[:128],
+            owner=str(entry.get("user_id") or "")[:128],
+            fields=",".join(sorted(updates)),
+        )
+        auth.flash(request, "Key limits updated.", "success")
+    except litellm_client.LiteLLMError:
+        _audit("admin.key.limits", "failure", user)
+        auth.flash(
+            request,
+            "Could not verify the key limit change. Refresh and try again.",
+            "error",
+        )
+    return redirect

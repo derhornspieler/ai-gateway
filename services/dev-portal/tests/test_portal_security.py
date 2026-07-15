@@ -1798,3 +1798,364 @@ def test_safe_identity_status_maps_break_glass_booleans_only():
     assert legacy["break_glass_escrow_readable"] is True
     assert legacy["vault_oidc_rp_escrowed"] is False
     assert legacy["vault_oidc_rp_escrow_readable"] is True
+
+
+# --- admin / gateway key inventory ------------------------------------------
+
+
+def full_key_object(**overrides) -> dict:
+    entry = {
+        "token": "inv-hash-1",
+        "key_name": "sk-...abcd",
+        "key_alias": "ops-key",
+        "user_id": "owner-1",
+        "team_id": "",
+        "models": ["claude-sonnet"],
+        "spend": 1.25,
+        "max_budget": 25.0,
+        "tpm_limit": 100000,
+        "rpm_limit": 60,
+        "expires": "2027-01-01T00:00:00+00:00",
+        "created_at": "2026-07-01T00:00:00+00:00",
+        "blocked": False,
+        "metadata": {},
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_user_portal_has_no_admin_key_routes(client) -> None:
+    assert client.get("/admin/keys", follow_redirects=False).status_code == 404
+    assert (
+        client.post("/admin/keys/block", follow_redirects=False).status_code == 404
+    )
+    assert (
+        client.post("/admin/keys/unblock", follow_redirects=False).status_code == 404
+    )
+    assert (
+        client.post("/admin/keys/limits", follow_redirects=False).status_code == 404
+    )
+
+
+def test_admin_key_inventory_denies_revoked_admin_before_litellm(
+    admin_client, set_admin_session, monkeypatch
+):
+    called = False
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/revoked-admin"
+        return {"admin": False}
+
+    async def admin_key_list_page(page):
+        nonlocal called
+        called = True
+        return {"keys": [], "page": 1, "total_pages": 0, "total_count": 0}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
+    set_admin_session(
+        {"user": portal_user(subject="revoked-admin", roles=[settings.admin_role])}
+    )
+
+    response = admin_client.get("/admin/keys", follow_redirects=False)
+
+    assert response.status_code == 403
+    assert called is False
+
+
+def test_admin_key_inventory_fails_closed_while_vault_is_sealed(
+    admin_client, set_admin_session, monkeypatch
+):
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            raise sealed_authorization_error()
+        raise AssertionError("sealed inventory request reached a data endpoint")
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    response = admin_client.get("/admin/keys", follow_redirects=False)
+
+    # No maintenance fallback here: the inventory is sensitive data, not a
+    # bounded unseal control, so a sealed Vault keeps it entirely closed.
+    assert response.status_code == 503
+
+
+def test_admin_key_inventory_lists_without_rendering_plaintext(
+    admin_client, set_admin_session, monkeypatch
+):
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def admin_key_list_page(page):
+        assert page == 1
+        return {
+            "keys": [
+                # A regressed upstream shape must never surface a plaintext
+                # credential or unescaped markup through this page.
+                full_key_object(
+                    key="sk-plaintext-LEAK-me",
+                    key_alias="<script>alert(1)</script>",
+                ),
+                full_key_object(
+                    token="portal-hash-2",
+                    key_alias="dev-key",
+                    user_id="dev-subject",
+                    metadata={
+                        "created_via": "dev-portal",
+                        "aigw_project_id": "ai-gateway",
+                    },
+                ),
+            ],
+            "page": 1,
+            "total_pages": 1,
+            "total_count": 2,
+        }
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    response = admin_client.get("/admin/keys")
+
+    assert response.status_code == 200
+    assert "sk-plaintext-LEAK-me" not in response.text
+    assert "<script>alert(1)</script>" not in response.text
+    assert "portal: ai-gateway" in response.text
+    assert "operator" in response.text
+    assert "inv-hash-1"[:16] in response.text
+
+
+def test_admin_key_mutations_require_fresh_step_up(
+    admin_client, set_admin_session, monkeypatch
+):
+    called = False
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def admin_key_lookup(token):
+        nonlocal called
+        called = True
+        return full_key_object()
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    csrf = "c" * 43
+    set_admin_session(
+        {"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf}
+    )
+
+    for path in ("/admin/keys/block", "/admin/keys/unblock", "/admin/keys/limits"):
+        response = admin_client.post(
+            path,
+            data={"token": "inv-hash-1", "csrf_token": csrf, "max_budget": "10"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert response.headers["location"] == "/admin/reauth"
+    assert called is False
+
+
+def test_admin_key_mutations_reject_bad_csrf_before_litellm(
+    admin_client, set_admin_session, monkeypatch
+):
+    called = False
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def admin_key_lookup(token):
+        nonlocal called
+        called = True
+        return full_key_object()
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": "c" * 43,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/keys/block",
+        data={"token": "inv-hash-1", "csrf_token": "x" * 43},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/keys?page=1"
+    assert called is False
+
+
+def test_admin_key_block_resolves_exact_hash_and_verifies_the_effect(
+    admin_client, set_admin_session, monkeypatch
+):
+    state = {"blocked": False}
+    updates_sent = []
+    lookups = []
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def admin_key_lookup(token):
+        lookups.append(token)
+        return full_key_object(blocked=state["blocked"])
+
+    async def key_update(key, updates):
+        assert key == "inv-hash-1"
+        updates_sent.append(updates)
+        state["blocked"] = updates.get("blocked", state["blocked"])
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/keys/block",
+        data={"token": "inv-hash-1", "csrf_token": csrf, "page": "2"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/keys?page=2"
+    assert lookups == ["inv-hash-1", "inv-hash-1"]
+    assert updates_sent == [{"blocked": True}]
+
+
+def test_admin_key_block_failure_to_verify_reports_an_error(
+    admin_client, set_admin_session, monkeypatch
+):
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def admin_key_lookup(token):
+        # The key never reads back as blocked.
+        return full_key_object(blocked=False)
+
+    async def key_update(key, updates):
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/keys/block",
+        data={"token": "inv-hash-1", "csrf_token": csrf},
+        follow_redirects=True,
+    )
+
+    assert "Could not verify that key was blocked" in response.text
+
+
+def test_admin_key_limits_reject_malformed_values_before_litellm(
+    admin_client, set_admin_session, monkeypatch
+):
+    called = False
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def admin_key_lookup(token):
+        nonlocal called
+        called = True
+        return full_key_object()
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    csrf = "c" * 43
+    base_session = {
+        "user": portal_user(roles=[settings.admin_role]),
+        "csrf_token": csrf,
+        "admin_reauth_at": int(time.time()),
+    }
+
+    for fields in (
+        {"duration": "forever"},
+        {"max_budget": "-5"},
+        {"tpm_limit": "10.5"},
+        {"rpm_limit": "0"},
+        {"duration": "none"},
+        {},
+    ):
+        set_admin_session(base_session)
+        response = admin_client.post(
+            "/admin/keys/limits",
+            data={"token": "inv-hash-1", "csrf_token": csrf, **fields},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert response.headers["location"] == "/admin/keys?page=1"
+    assert called is False
+
+
+def test_admin_key_limits_send_parsed_allowlisted_updates(
+    admin_client, set_admin_session, monkeypatch
+):
+    entry_state = full_key_object()
+    updates_sent = []
+
+    async def rotator_get(path):
+        return {"admin": True}
+
+    async def admin_key_lookup(token):
+        return dict(entry_state)
+
+    async def key_update(key, updates):
+        assert key == "inv-hash-1"
+        updates_sent.append(updates)
+        for field, value in updates.items():
+            entry_state[field] = value
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/keys/limits",
+        data={
+            "token": "inv-hash-1",
+            "csrf_token": csrf,
+            "max_budget": "50",
+            "tpm_limit": "none",
+            "rpm_limit": "",
+            "duration": "30d",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert updates_sent == [
+        {"max_budget": 50.0, "tpm_limit": None, "duration": "30d"}
+    ]

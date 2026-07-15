@@ -20,10 +20,24 @@ class LiteLLMError(Exception):
 
 KEY_LIST_PAGE_SIZE = 100
 KEY_LIST_MAX_PAGES = 10
+# The admin key inventory is a page-at-a-time browse of EVERY owner's keys; it
+# never merges pages into an authorization decision, so it may page far beyond
+# the owner-scoped safety cap while still requiring native counters per page.
+ADMIN_KEY_LIST_PAGE_SIZE = 50
+ADMIN_KEY_LIST_MAX_PAGE = 10_000
 PORTAL_KEY_CREATOR_FIELD = "created_via"
 PORTAL_KEY_CREATOR_VALUE = "dev-portal"
 PORTAL_PROJECT_METADATA_KEY = "aigw_project_id"
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+# LiteLLM key-lifetime grammar (e.g. 30d, 12h). Kept textually identical to
+# config._KEY_DURATION_RE (config cannot import this module without a cycle).
+KEY_DURATION_RE = re.compile(r"^[1-9][0-9]{0,5}(s|m|h|d)$")
+# The only /key/update fields this portal may ever send. Everything else on
+# that endpoint (owner, team, models, metadata, aliases, rotation) is reserved
+# for the operator path; widening this set is a reviewed security decision.
+KEY_UPDATE_MUTABLE_FIELDS = frozenset(
+    {"blocked", "max_budget", "tpm_limit", "rpm_limit", "duration"}
+)
 
 
 def _headers() -> dict[str, str]:
@@ -205,7 +219,7 @@ async def key_generate(user_id: str, alias: str, project_id: str) -> dict[str, A
     if not isinstance(project_id, str) or PROJECT_ID_RE.fullmatch(project_id) is None:
         raise LiteLLMError("project_id is invalid")
     url = settings.litellm_url.rstrip("/") + "/key/generate"
-    payload = {
+    payload: dict[str, Any] = {
         "user_id": user_id,
         "key_alias": alias,
         "metadata": {
@@ -213,6 +227,11 @@ async def key_generate(user_id: str, alias: str, project_id: str) -> dict[str, A
             PORTAL_PROJECT_METADATA_KEY: project_id,
         },
     }
+    # Reviewed issuance guardrails (max_budget/tpm_limit/rpm_limit/duration):
+    # resolved from validated startup config only — the browser request can
+    # never raise, lower, or remove them. Admins retune individual keys later
+    # through the separately gated admin key inventory.
+    payload.update(settings.key_limits_for_project(project_id))
     try:
         async with httpx.AsyncClient(
             timeout=10, trust_env=False, follow_redirects=False
@@ -242,6 +261,187 @@ async def key_deactivate(key: str) -> dict[str, Any]:
     url = settings.litellm_url.rstrip("/") + "/key/update"
     payload = {"key": key, "blocked": True}
 
+    try:
+        async with httpx.AsyncClient(
+            timeout=10, trust_env=False, follow_redirects=False
+        ) as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+    except httpx.HTTPError as exc:
+        raise LiteLLMError(f"could not reach LiteLLM: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise LiteLLMError(f"key/update failed: HTTP {resp.status_code}")
+
+    data = _response_json(resp, "key/update")
+    if not isinstance(data, dict):
+        raise LiteLLMError("key/update returned an invalid response shape")
+    return data
+
+
+def _validated_key_identifier(value: Any) -> str:
+    """Accept only a bounded, control-character-free persisted identifier."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 2048
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise LiteLLMError("key identifier is invalid")
+    return value
+
+
+async def _admin_key_query(params: dict[str, Any]) -> dict[str, Any]:
+    """One master-key GET /key/list with the fixed outbound boundary."""
+    url = settings.litellm_url.rstrip("/") + "/key/list"
+    try:
+        async with httpx.AsyncClient(
+            timeout=10, trust_env=False, follow_redirects=False
+        ) as client:
+            resp = await client.get(url, headers=_headers(), params=params)
+    except httpx.HTTPError as exc:
+        raise LiteLLMError(f"could not reach LiteLLM: {exc}") from exc
+    if resp.status_code >= 400:
+        raise LiteLLMError(f"key/list failed: HTTP {resp.status_code}")
+    data = _response_json(resp, "key/list")
+    if not isinstance(data, dict):
+        raise LiteLLMError("key/list returned an invalid response shape")
+    return data
+
+
+def _admin_page_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = data.get("keys")
+    if rows is None:
+        rows = data.get("data", [])
+    if not isinstance(rows, list) or any(
+        not isinstance(entry, dict) for entry in rows
+    ):
+        raise LiteLLMError("key/list returned a non-object key entry")
+    return rows
+
+
+async def admin_key_list_page(page: int) -> dict[str, Any]:
+    """Read one counter-checked GLOBAL /key/list page for the admin inventory.
+
+    Unlike ``key_list`` this deliberately has no owner filter: it exists so an
+    administrator can review every static bearer credential the gateway has
+    issued. It requires LiteLLM's native pagination counters (v1.91.3 always
+    supplies them) so a short or repeated page cannot silently hide keys, and
+    it is display-only — mutations re-resolve their exact target through
+    ``admin_key_lookup`` instead of trusting anything rendered from here.
+    """
+    if (
+        not isinstance(page, int)
+        or isinstance(page, bool)
+        or not 1 <= page <= ADMIN_KEY_LIST_MAX_PAGE
+    ):
+        raise LiteLLMError("key inventory page is invalid")
+
+    data = await _admin_key_query(
+        {
+            "return_full_object": "true",
+            "page": page,
+            "size": ADMIN_KEY_LIST_PAGE_SIZE,
+        }
+    )
+    rows = _admin_page_rows(data)
+    current_page = _declared_page_number(data, "current_page")
+    total_pages = _declared_page_number(data, "total_pages")
+    total_count = _declared_page_number(data, "total_count")
+    if current_page is None or total_pages is None or total_count is None:
+        raise LiteLLMError("global key/list returned no pagination counters")
+    if current_page != page:
+        raise LiteLLMError("key/list returned an unexpected page")
+    expected_total_pages = (
+        total_count + ADMIN_KEY_LIST_PAGE_SIZE - 1
+    ) // ADMIN_KEY_LIST_PAGE_SIZE
+    if total_pages != expected_total_pages:
+        raise LiteLLMError("key/list returned inconsistent page counters")
+    if total_pages == 0:
+        if page != 1 or rows:
+            raise LiteLLMError("key/list returned inconsistent page counters")
+    elif page > total_pages:
+        raise LiteLLMError("key/list returned an unexpected page")
+    elif (
+        len(rows)
+        != min(
+            ADMIN_KEY_LIST_PAGE_SIZE,
+            total_count - ((page - 1) * ADMIN_KEY_LIST_PAGE_SIZE),
+        )
+    ):
+        raise LiteLLMError("key/list ended before its declared final page")
+
+    return {
+        "keys": rows,
+        "page": page,
+        "total_pages": total_pages,
+        "total_count": total_count,
+    }
+
+
+async def admin_key_lookup(key_hash: str) -> dict[str, Any]:
+    """Resolve exactly one full key object by its persisted token hash.
+
+    Every admin mutation authorizes against this exact-hash lookup rather
+    than a rendered listing, so a stale or tampered form field can only ever
+    name a key that still exists — and the effect of a mutation is verified
+    with the same query afterwards.
+    """
+    identifier = _validated_key_identifier(key_hash)
+    data = await _admin_key_query(
+        {
+            "return_full_object": "true",
+            "key_hash": identifier,
+            "page": 1,
+            "size": ADMIN_KEY_LIST_PAGE_SIZE,
+        }
+    )
+    rows = _admin_page_rows(data)
+    total_count = _declared_page_number(data, "total_count")
+    if total_count != 1 or len(rows) != 1:
+        raise LiteLLMError("key lookup did not resolve exactly one key")
+    entry = rows[0]
+    if entry.get("token") != identifier:
+        raise LiteLLMError("key lookup returned a different key")
+    return entry
+
+
+async def key_update(key: str, updates: dict[str, Any]) -> dict[str, Any]:
+    """Apply an allowlisted admin mutation to one pre-resolved key.
+
+    Callers must first resolve ``key`` via ``admin_key_lookup`` (or the
+    owner-validated inventory). Only the reviewed budget/rate/lifetime/block
+    fields may ever be sent; every value is re-validated here so a route bug
+    cannot smuggle an unreviewed field to the master-key endpoint.
+    """
+    identifier = _validated_key_identifier(key)
+    if not isinstance(updates, dict) or not updates:
+        raise LiteLLMError("key/update requires at least one field")
+    if not set(updates) <= KEY_UPDATE_MUTABLE_FIELDS:
+        raise LiteLLMError("key/update field is not allowlisted")
+    for field, value in updates.items():
+        if field == "blocked":
+            if not isinstance(value, bool):
+                raise LiteLLMError("blocked must be a boolean")
+        elif field == "duration":
+            if not isinstance(value, str) or KEY_DURATION_RE.fullmatch(value) is None:
+                raise LiteLLMError("duration is invalid")
+        elif field == "max_budget":
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 < value <= 1_000_000
+            ):
+                raise LiteLLMError("max_budget is invalid")
+        else:  # tpm_limit / rpm_limit
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 < value <= 1_000_000_000
+            ):
+                raise LiteLLMError(f"{field} is invalid")
+
+    url = settings.litellm_url.rstrip("/") + "/key/update"
+    payload = {"key": identifier, **updates}
     try:
         async with httpx.AsyncClient(
             timeout=10, trust_env=False, follow_redirects=False

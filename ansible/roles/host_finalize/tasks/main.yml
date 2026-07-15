@@ -15,3 +15,21 @@
   ansible.builtin.file:
     path: "{{ aigw_docker_host_pending_marker }}"
     state: absent
+
+# Custody pointer only — the credential value itself is deliberately NEVER
+# printed by any converge output. This mirrors how the Keycloak break-glass
+# administrator is surfaced (a pointer to its Vault escrow, never the secret).
+- name: Finalize — surface the LiteLLM UI break-glass credential custody pointer
+  ansible.builtin.debug:
+    msg: >-
+      DEPLOY-END NOTICE — LiteLLM admin UI break-glass credential: the native
+      LiteLLM admin UI stays active at https://litellm-admin.{{ aigw_domain }}/ui
+      behind the ADM-only OIDC gate. Its browser sign-in is username
+      'litellm-breakglass' with the encrypted-inventory secret
+      'litellm_ui_breakglass_password' — a dedicated break-glass credential;
+      the LiteLLM master key is never typed into a browser. Retrieve the value
+      on the controller only when needed, e.g.
+      ansible -i <your inventory> {{ inventory_hostname }} -m debug -a
+      var=litellm_ui_breakglass_password --vault-id <label>@<password-file>
+      (lab inventories may use --ask-vault-pass). Never echo it into shell
+      history or logs.
