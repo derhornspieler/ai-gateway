@@ -105,6 +105,37 @@ class ChatCapabilityContractTest(unittest.TestCase):
         self.assertIn("BEFORE the converge", operations)
         self.assertIn("break-glass master administrator", operations)
 
+    def test_verify_role_fails_loud_on_a_missing_chat_migration(self) -> None:
+        verify = (ROOT / "ansible/roles/verify/tasks/main.yml").read_text(
+            encoding="utf-8"
+        )
+        # Runs on every converge, both profiles (no profile guard), gated only
+        # on an initialized Vault so a genuinely fresh pre-bootstrap converge
+        # is skipped.
+        self.assertIn(
+            "Verify — prove the dedicated aigw-chat gate is wired "
+            "(no silent chat brick)",
+            verify,
+        )
+        self.assertIn("/identity/chat-capability-health", verify)
+        self.assertIn("AIGW_CHAT_GATE_BRICK", verify)
+        # The loud failure must point the operator at the break-glass SOP.
+        self.assertIn("Migrating an existing realm to ", verify)
+        self.assertIn(
+            "(vault_public_status.stdout | from_json).initialized | bool", verify
+        )
+        # The health read must be an admin-token surface, never in the portal
+        # identity token's route allowlist.
+        rotator_main = (
+            ROOT / "services/key-rotator/app/main.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('@app.get("/identity/chat-capability-health")', rotator_main)
+        self.assertIn(
+            "def chat_capability_health", (
+                ROOT / "services/key-rotator/app/identity.py"
+            ).read_text(encoding="utf-8")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

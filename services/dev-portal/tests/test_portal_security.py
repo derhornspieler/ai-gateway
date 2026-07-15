@@ -2544,6 +2544,21 @@ def test_project_policy_save_retunes_existing_project_keys(
     }
 
     async def rotator_get(path):
+        if path == "/identity/groups":
+            return [
+                {
+                    "id": "group-1",
+                    "name": "ai-gateway",
+                    "capabilities": ["aigw-developers"],
+                    "member_count": 1,
+                    "policy": {
+                        "tpm_limit": None,
+                        "rpm_limit": None,
+                        "allowed_models": None,
+                        "default_model": None,
+                    },
+                }
+            ]
         return {"admin": True}
 
     async def rotator_put(path, payload):
@@ -2620,12 +2635,31 @@ def test_project_policy_save_retunes_existing_project_keys(
     assert "1 existing keys re-tuned" in response.text
 
 
+def _unlimited_group(group_id="group-1", name="ai-gateway", **policy_overrides):
+    policy = {
+        "tpm_limit": None,
+        "rpm_limit": None,
+        "allowed_models": None,
+        "default_model": None,
+    }
+    policy.update(policy_overrides)
+    return {
+        "id": group_id,
+        "name": name,
+        "capabilities": ["aigw-developers"],
+        "member_count": 1,
+        "policy": policy,
+    }
+
+
 def test_project_policy_rejects_unconfigured_models_before_the_controller(
     admin_client, set_admin_session, monkeypatch
 ):
     called = False
 
     async def rotator_get(path):
+        if path == "/identity/groups":
+            return [_unlimited_group()]
         return {"admin": True}
 
     async def rotator_put(path, payload):
@@ -2648,7 +2682,7 @@ def test_project_policy_rejects_unconfigured_models_before_the_controller(
         {"allowed_models": "gpt-4o"},
         {"tpm_limit": "-5"},
         {"tpm_limit": "0"},
-        {"default_model": "claude-opus"},
+        {"allowed_models": "claude-haiku", "default_model": "claude-opus"},
     ):
         response = admin_client.post(
             "/admin/identity/groups/group-1/policy",
@@ -2664,3 +2698,113 @@ def test_project_policy_rejects_unconfigured_models_before_the_controller(
             }
         )
     assert called is False
+
+
+def test_project_policy_refuses_silent_widening_of_deconfigured_restriction(
+    admin_client, set_admin_session, monkeypatch
+):
+    """A stored restriction to a now-deconfigured model cannot be silently widened."""
+
+    put_called = False
+
+    async def rotator_get(path):
+        if path == "/identity/groups":
+            # Restricted to a model that is no longer in the live model list
+            # (conftest reports only claude-haiku/claude-sonnet).
+            return [
+                _unlimited_group(
+                    allowed_models=["claude-opus"], default_model="claude-opus"
+                )
+            ]
+        return {"admin": True}
+
+    async def rotator_put(path, payload):
+        nonlocal put_called
+        put_called = True
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    # A plain submit (e.g. just changing TPM) must be refused, not silently
+    # widen the model restriction to unlimited.
+    response = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={"tpm_limit": "1000", "csrf_token": csrf},
+        follow_redirects=True,
+    )
+    assert put_called is False
+    assert "no longer configured in LiteLLM" in response.text
+    assert "claude-opus" in response.text
+
+
+def test_project_policy_widens_deconfigured_restriction_only_with_explicit_optout(
+    admin_client, set_admin_session, monkeypatch
+):
+    puts = []
+
+    async def rotator_get(path):
+        if path == "/identity/groups":
+            return [
+                _unlimited_group(
+                    allowed_models=["claude-opus"], default_model="claude-opus"
+                )
+            ]
+        return {"admin": True}
+
+    async def rotator_put(path, payload):
+        puts.append(payload)
+        return {
+            "id": "group-1",
+            "name": "ai-gateway",
+            "policy": {
+                "tpm_limit": 1000,
+                "rpm_limit": None,
+                "allowed_models": None,
+                "default_model": None,
+            },
+        }
+
+    async def admin_key_list_page(page):
+        return {"keys": [], "page": 1, "total_pages": 1, "total_count": 0}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={
+            "tpm_limit": "1000",
+            "remove_model_restrictions": "1",
+            "csrf_token": csrf,
+        },
+        follow_redirects=True,
+    )
+
+    # The explicit opt-out widens deliberately: allowed_models cleared to None.
+    assert puts == [
+        {
+            "tpm_limit": 1000,
+            "rpm_limit": None,
+            "allowed_models": None,
+            "default_model": None,
+        }
+    ]
+    assert "Project policy saved" in response.text

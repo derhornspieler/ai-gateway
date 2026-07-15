@@ -2608,6 +2608,23 @@ async def _retune_project_keys(
             )
 
 
+async def _current_group_policy(group_id: str) -> dict[str, Any] | None:
+    """Authoritatively re-read one managed group's stored issuance policy.
+
+    Used at policy-save time to decide whether a full-replace form could
+    faithfully represent the CURRENT model restriction. Reads the live
+    controller state (never a hidden form field), so a tampered or stale
+    browser cannot suppress the anti-widening guard below. Returns None only
+    when the group is genuinely absent; a malformed/unreadable response
+    raises so the caller fails closed.
+    """
+    groups = _safe_identity_groups(await _rotator_get("/identity/groups"))
+    for group in groups:
+        if group["id"] == group_id:
+            return group.get("policy")
+    return None
+
+
 @admin_app.post("/admin/identity/groups/{group_id}/policy")
 async def admin_identity_set_group_policy(
     request: Request,
@@ -2617,6 +2634,7 @@ async def admin_identity_set_group_policy(
     rpm_limit: str = Form("", max_length=32),
     allowed_models: list[str] = Form(default=[]),
     default_model: str = Form("", max_length=128),
+    remove_model_restrictions: str | None = Form(None),
     csrf_token: str = Form(..., min_length=32, max_length=128),
 ):
     redirect = RedirectResponse(
@@ -2655,11 +2673,58 @@ async def admin_identity_set_group_policy(
         )
         return redirect
 
+    clear_restrictions = remove_model_restrictions is not None
     selected = sorted({model.strip() for model in allowed_models if model.strip()})
     if any(model not in available for model in selected):
         auth.flash(request, "Choose only configured models.", "error")
         return redirect
-    clean_default = default_model.strip() or None
+
+    # Anti-silent-widening guard. The model checkboxes render ONLY from the
+    # live LiteLLM model list, so if this project is currently restricted to a
+    # model that has since been removed from LiteLLM's config, that model has
+    # no checkbox and the full-replace form physically cannot re-express the
+    # restriction — submitting (even just to change a rate limit) would
+    # silently widen it. Re-read the authoritative stored policy and REFUSE to
+    # widen unless the operator explicitly opts to remove all model
+    # restrictions. Same rule for a deconfigured default model.
+    try:
+        stored_policy = await _current_group_policy(group_id)
+    except Exception:  # noqa: BLE001 - unreadable current policy is unsafe
+        _audit("identity.group.policy", "failure", user)
+        auth.flash(
+            request,
+            "Could not read the project's current policy; it was not changed.",
+            "error",
+        )
+        return redirect
+    if stored_policy is None:
+        auth.flash(request, "That project group no longer exists.", "error")
+        return redirect
+    stored_allowed = stored_policy.get("allowed_models")
+    stored_default = stored_policy.get("default_model")
+    deconfigured = sorted(
+        set(stored_allowed or [])
+        .union([stored_default] if stored_default else [])
+        - set(available)
+    )
+    if deconfigured and not clear_restrictions:
+        auth.flash(
+            request,
+            "This project is restricted to model(s) "
+            + ", ".join(deconfigured)
+            + " which are no longer configured in LiteLLM, so this form cannot "
+            "preserve the restriction. Re-add the model(s) to LiteLLM, or check "
+            "'Remove all model restrictions' to widen the project deliberately.",
+            "error",
+        )
+        return redirect
+
+    if clear_restrictions:
+        # Explicit operator decision: drop every model restriction.
+        selected = []
+        clean_default = None
+    else:
+        clean_default = default_model.strip() or None
     if clean_default is not None and clean_default not in (selected or available):
         auth.flash(
             request,

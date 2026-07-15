@@ -103,6 +103,10 @@ POLICY_ATTRIBUTES = frozenset(
 MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}")
 MAX_POLICY_MODELS = 32
 POLICY_LIMIT_MAX = 1_000_000_000
+# The dedicated Open WebUI chat gate role. Open WebUI's OAUTH_ALLOWED_ROLES is
+# pinned to exactly this role, so a realm that lacks it (or a client that does
+# not map it) silently 403s every non-admin chat login.
+CHAT_CAPABILITY_ROLE = "aigw-chat"
 BOOTSTRAP_IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
 FEDERATION_PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,127}")
 MANAGED_ROOT_ATTRIBUTE = "aigw.managed-root"
@@ -3724,6 +3728,69 @@ class KeycloakAdmin:
                 raise IdentityError("Keycloak project group was invalid")
             policies[project_id] = self._group_policy(group)
         return {"projects": sorted(bindings), "policies": policies}
+
+    async def chat_capability_health(self) -> dict[str, Any]:
+        """Report whether the live realm wires the dedicated aigw-chat gate.
+
+        Open WebUI's OAUTH_ALLOWED_ROLES is pinned to ``aigw-chat``. A realm
+        bootstrapped before that role existed carries neither the realm role,
+        the client scope mapping, nor a group grant, so flipping the gate
+        silently 403s every non-admin chat login. The converge's verify role
+        turns that into a loud failure that points at the break-glass realm
+        migration SOP. This read is authoritative for the realm-role gate and
+        best-effort for the client scope mapping (the durable controller holds
+        view-realm, which reads realm roles and groups, but not necessarily
+        the client detail needed for a scope-mapping read — an unreadable
+        mapping is reported, never guessed).
+        """
+        token = await self._controller_token()
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+
+        role_response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}/roles/{CHAT_CAPABILITY_ROLE}",
+            token=token,
+            expected=(200, 404),
+        )
+        chat_role_present = role_response.status_code == 200
+        if chat_role_present:
+            role = self._json(role_response, "chat capability role")
+            if not isinstance(role, dict) or role.get("name") != CHAT_CAPABILITY_ROLE:
+                raise IdentityError("Keycloak chat capability role was invalid")
+
+        open_webui_scope_readable = False
+        open_webui_scope_ok = False
+        if chat_role_present:
+            try:
+                client = await self._find_client(realm, "open-webui", token)
+                if client is not None:
+                    mappings = await self._client_realm_role_scope_mappings(
+                        realm, client, token
+                    )
+                    open_webui_scope_readable = True
+                    open_webui_scope_ok = any(
+                        str(role.get("name")) == CHAT_CAPABILITY_ROLE
+                        for role in mappings
+                    )
+            except IdentityError:
+                # view-realm may not cover the client scope-mapping sub-resource
+                # on every Keycloak build. Report unreadable rather than fail:
+                # the realm-role gate above already proves the migration ran,
+                # and the same SOP step adds the client mapping.
+                open_webui_scope_readable = False
+
+        chat_groups = sorted(
+            group["name"]
+            for group in await self.list_groups()
+            if CHAT_CAPABILITY_ROLE in group.get("capabilities", [])
+        )
+
+        return {
+            "chat_role_present": chat_role_present,
+            "open_webui_scope_readable": open_webui_scope_readable,
+            "open_webui_scope_ok": open_webui_scope_ok,
+            "chat_groups": chat_groups,
+        }
 
     async def _user_project_bindings(
         self, user_id: str, token: str

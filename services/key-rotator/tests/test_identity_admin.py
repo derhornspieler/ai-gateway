@@ -1800,3 +1800,104 @@ async def test_user_project_policies_reads_fresh_authoritative_groups() -> None:
             }
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_chat_capability_health_reports_wired_realm() -> None:
+    cfg = settings()
+    vault = FakeVault(
+        {
+            cfg.identity_state_vault_path: {
+                "managed_root_group_id": "managed-root",
+                "federation_provider_id": "ldap-provider",
+            }
+        }
+    )
+
+    class HealthAdmin(KeycloakAdmin):
+        def __init__(self, *args, chat_role=True, scope_has_chat=True, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.chat_role = chat_role
+            self.scope_has_chat = scope_has_chat
+
+        async def _controller_token(self):
+            return "controller-token"
+
+        async def _request(self, method, path, **kwargs):
+            if path.endswith("/roles/aigw-chat"):
+                if not self.chat_role:
+                    return httpx.Response(404, json={})
+                return httpx.Response(200, json={"id": "chat-id", "name": "aigw-chat"})
+            if path.endswith("/clients"):
+                return httpx.Response(
+                    200, json=[{"id": "owui-uuid", "clientId": "open-webui"}]
+                )
+            if path.endswith("/clients/owui-uuid/scope-mappings/realm"):
+                roles = [{"id": "a", "name": "aigw-admins"}]
+                if self.scope_has_chat:
+                    roles.append({"id": "c", "name": "aigw-chat"})
+                return httpx.Response(200, json=roles)
+            raise AssertionError(path)
+
+        async def list_groups(self):
+            return [
+                {"id": "g1", "name": "team-a", "capabilities": ["aigw-chat"], "member_count": 1},
+                {"id": "g2", "name": "ops", "capabilities": ["aigw-admins"], "member_count": 1},
+            ]
+
+    admin = HealthAdmin(cfg, vault, FakeDB())
+    assert await admin.chat_capability_health() == {
+        "chat_role_present": True,
+        "open_webui_scope_readable": True,
+        "open_webui_scope_ok": True,
+        "chat_groups": ["team-a"],
+    }
+
+    missing_role = HealthAdmin(cfg, vault, FakeDB(), chat_role=False)
+    health = await missing_role.chat_capability_health()
+    assert health["chat_role_present"] is False
+    # No client read is attempted when the role itself is absent.
+    assert health["open_webui_scope_readable"] is False
+
+    unmapped = HealthAdmin(cfg, vault, FakeDB(), scope_has_chat=False)
+    health = await unmapped.chat_capability_health()
+    assert health["chat_role_present"] is True
+    assert health["open_webui_scope_readable"] is True
+    assert health["open_webui_scope_ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_chat_capability_health_reports_unreadable_client_scope() -> None:
+    """A controller that cannot read the client scope mapping reports it."""
+
+    cfg = settings()
+    vault = FakeVault(
+        {
+            cfg.identity_state_vault_path: {
+                "managed_root_group_id": "managed-root",
+                "federation_provider_id": "ldap-provider",
+            }
+        }
+    )
+
+    class ForbiddenClientAdmin(KeycloakAdmin):
+        async def _controller_token(self):
+            return "controller-token"
+
+        async def _request(self, method, path, **kwargs):
+            if path.endswith("/roles/aigw-chat"):
+                return httpx.Response(200, json={"id": "chat-id", "name": "aigw-chat"})
+            if path.endswith("/clients"):
+                # view-realm without view-clients: the controller is denied.
+                raise IdentityError("client read forbidden")
+            raise AssertionError(path)
+
+        async def list_groups(self):
+            return []
+
+    admin = ForbiddenClientAdmin(cfg, vault, FakeDB())
+    health = await admin.chat_capability_health()
+    assert health["chat_role_present"] is True
+    assert health["open_webui_scope_readable"] is False
+    assert health["open_webui_scope_ok"] is False
+    assert health["chat_groups"] == []

@@ -1867,6 +1867,107 @@
       - "{{ prometheus_observability_ip }}"
   changed_when: false
 
+# Open WebUI's OAUTH_ALLOWED_ROLES is pinned to the dedicated aigw-chat role.
+# A realm bootstrapped BEFORE that role existed (any pre-migration deployment,
+# both profiles) carries neither the realm role, the client scope mapping, nor
+# a group grant — so the gate flip silently 403s every non-admin chat login
+# with nothing in the converge catching it. This turns that silent brick into
+# a loud, remediable converge failure. It runs on every converge (both
+# profiles) and skips only the genuinely fresh pre-bootstrap state, where the
+# realm was just imported from the current template and no identity exists yet.
+- name: Verify — prove the dedicated aigw-chat gate is wired (no silent chat brick)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - exec
+      - "{{ compose_project_name }}-key-rotator-1"
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import sys
+        import urllib.error
+        import urllib.request
+
+        baseline = json.loads(sys.argv[1])
+        expected_chat_groups = {
+            group["name"]
+            for group in baseline
+            if isinstance(group, dict)
+            and "aigw-chat" in (group.get("roles") or [])
+        }
+        token = os.environ.get("ROTATOR_INTERNAL_TOKEN", "")
+        if len(token) < 16:
+            raise SystemExit("rotator internal auth is unavailable")
+
+        def get(path):
+            request = urllib.request.Request(
+                "http://127.0.0.1:8080" + path,
+                headers={"X-Internal-Auth": token, "Accept": "application/json"},
+            )
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=15) as response:
+                return json.load(response)
+
+        # A genuinely fresh deployment has not run identity bootstrap yet; the
+        # realm was just imported from the current template, so skip rather
+        # than fail. The silent-brick hazard only exists once identity is
+        # configured (i.e. an existing realm that may predate aigw-chat).
+        if not get("/identity/status").get("configured"):
+            print("AIGW_CHAT_GATE=skipped (identity controller not configured)")
+            raise SystemExit(0)
+
+        health = get("/identity/chat-capability-health")
+        remediation = (
+            "Perform the one-time break-glass realm migration in "
+            "docs/identity-operations.md ('Migrating an existing realm to "
+            "aigw-chat') BEFORE this converge: create the aigw-chat realm role, "
+            "add it to all four first-party clients' realm-role scope mappings, "
+            "and grant it on every managed group that should have chat access. "
+            "Open WebUI's OAUTH_ALLOWED_ROLES is pinned to aigw-chat, so a realm "
+            "missing this wiring silently 403s every non-admin chat login."
+        )
+        if not health.get("chat_role_present"):
+            raise SystemExit(
+                "AIGW_CHAT_GATE_BRICK: the aigw realm has no aigw-chat role. "
+                + remediation
+            )
+        if health.get("open_webui_scope_readable") and not health.get(
+            "open_webui_scope_ok"
+        ):
+            raise SystemExit(
+                "AIGW_CHAT_GATE_BRICK: the open-webui client does not map the "
+                "aigw-chat role. " + remediation
+            )
+        chat_groups = set(health.get("chat_groups") or [])
+        missing = sorted(expected_chat_groups - chat_groups)
+        if missing:
+            raise SystemExit(
+                "AIGW_CHAT_GATE_BRICK: managed groups "
+                + str(missing)
+                + " do not grant aigw-chat. "
+                + remediation
+            )
+        print(
+            "AIGW_CHAT_GATE_OK role=present"
+            " scope_readable=" + str(health.get("open_webui_scope_readable"))
+            + " scope_ok=" + str(health.get("open_webui_scope_ok"))
+            + " chat_groups=" + str(sorted(chat_groups))
+        )
+      - "{{ aigw_pre_vault_identity_baseline_groups | default([]) | to_json }}"
+  register: aigw_chat_gate_health
+  changed_when: false
+  when: (vault_public_status.stdout | from_json).initialized | bool
+
+- name: Show the aigw-chat gate verification result
+  ansible.builtin.debug:
+    var: aigw_chat_gate_health.stdout_lines | default([])
+  when: (vault_public_status.stdout | from_json).initialized | bool
+
 - name: Egress canary — vendor reachable only via the pinned reverse proxy
   ansible.builtin.command:
     argv:

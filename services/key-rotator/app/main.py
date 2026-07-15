@@ -610,6 +610,21 @@ async def identity_groups() -> list[dict[str, Any]]:
         raise _identity_http_error(exc) from exc
 
 
+@app.get("/identity/chat-capability-health")
+async def identity_chat_capability_health() -> dict[str, Any]:
+    """Report whether the live realm wires the dedicated aigw-chat gate.
+
+    Admin-token only (the portal identity token's route allowlist never
+    matches this path). The verify role calls it every converge to turn a
+    silent non-admin chat brick into a loud, remediable converge failure.
+    """
+    identity: KeycloakAdmin = state["identity"]
+    try:
+        return await identity.chat_capability_health()
+    except IdentityError as exc:
+        raise _identity_http_error(exc) from exc
+
+
 @app.post("/identity/groups", status_code=201)
 async def identity_create_group(body: IdentityGroupCreate) -> dict[str, Any]:
     identity: KeycloakAdmin = state["identity"]

@@ -430,6 +430,12 @@ async def test_portal_token_is_limited_to_exact_project_membership_reads() -> No
                     json={"tpm_limit": 1000},
                 )
             ).status_code == 401
+            # The chat-capability health route is admin-token-only too.
+            assert (
+                await client.get(
+                    "/identity/chat-capability-health", headers=headers
+                )
+            ).status_code == 401
 
             admin = {"X-Internal-Auth": cfg.rotator_internal_token}
             assert (

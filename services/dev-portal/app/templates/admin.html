@@ -104,6 +104,12 @@
     {% for model in policy_models %}
     <label><input type="checkbox" name="allowed_models" value="{{ model }}"{% if group.policy.allowed_models and model in group.policy.allowed_models %} checked{% endif %}> {{ model }}</label>
     {% endfor %}
+    {% set stored_models = (group.policy.allowed_models or []) + ([group.policy.default_model] if group.policy.default_model else []) %}
+    {% set deconfigured = stored_models | reject('in', policy_models) | unique | list %}
+    {% if deconfigured %}
+    <p class="flash error" style="margin-top: 8px;">This project is restricted to <strong>{{ deconfigured | join(', ') }}</strong>, no longer configured in LiteLLM. This form cannot preserve that restriction. Re-add the model(s) to LiteLLM, or check the box below to widen the project deliberately.</p>
+    <label><input type="checkbox" name="remove_model_restrictions" value="1"> Remove all model restrictions (widen this project to every configured model)</label>
+    {% endif %}
     <label for="policy-default-{{ group.id }}">Default model (surfaced to developers)</label>
     <select id="policy-default-{{ group.id }}" name="default_model">
       <option value="">(none)</option>
