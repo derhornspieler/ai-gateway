@@ -356,19 +356,6 @@
     group: root
     mode: "0644"
 
-- name: Render the environment-specific authoritative DNS views
-  ansible.builtin.template:
-    src: "{{ item.src }}"
-    dest: "{{ stack_dir }}/services/lab-dns/{{ item.dest }}"
-    owner: root
-    group: root
-    mode: "0644"
-  loop:
-    - { src: Corefile.authoritative.j2, dest: Corefile }
-    - { src: db.aigw.aegisgroup.ch.j2, dest: db.aigw.aegisgroup.ch }
-    - { src: db.aigw.aegisgroup.ch.adm.j2, dest: db.aigw.aegisgroup.ch.adm }
-  when: platform_authoritative_dns_enabled | bool
-
 - name: Render mutually exclusive Cribl plaintext or verified-TLS client
   ansible.builtin.blockinfile:
     path: "{{ stack_dir }}/alloy/config.alloy"
@@ -471,6 +458,28 @@
     - item.state == 'file'
     - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.git|secrets)(/|$)')
     - item.path is regex('(^|/)(Dockerfile(?:\.open-webui)?|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch)|upstream-provenance\.json|oauth-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
+
+# Ansible vars are the single source of truth for the runtime DNS views. The
+# repo-committed services/lab-dns files staged above are reviewed defaults for
+# the build context; these templates overwrite them with the var-driven,
+# environment-specific content that the lab-dns container bind-mounts. This
+# render must stay after the build-context staging: the staging tasks create
+# {{ stack_dir }}/services/lab-dns on a fresh host (rendering earlier fails
+# there), and the file sync above would otherwise overwrite the rendered
+# Corefile with the static repo copy. The bind-source digest for these three
+# files is computed later over exactly this rendered content.
+- name: Render the environment-specific authoritative DNS views
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ stack_dir }}/services/lab-dns/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: Corefile.authoritative.j2, dest: Corefile }
+    - { src: db.aigw.aegisgroup.ch.j2, dest: db.aigw.aegisgroup.ch }
+    - { src: db.aigw.aegisgroup.ch.adm.j2, dest: db.aigw.aegisgroup.ch.adm }
+  when: platform_authoritative_dns_enabled | bool
 
 - name: Find stale unsafe build-context artifacts from older recursive syncs
   ansible.builtin.find:
