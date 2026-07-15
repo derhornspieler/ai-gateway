@@ -20,7 +20,7 @@ python3 -I -m unittest discover -v -s scripts/tests -p 'test_*.py' # infrastruct
 python3 -I scripts/validate-identity-policy.py                    # identity policy parity (only needed for keycloak/realm changes)
 ```
 
-All three run from the repo root. The scripts suite requires `ansible-vault`/`ansible-playbook` on PATH (some tests execute them).
+All three run from the repo root. The scripts suite requires `ansible-vault`/`ansible-playbook` on PATH (some tests execute them). Only `validate-compose.sh` needs a Docker daemon; to avoid a local Docker Desktop and validate against the deploy target's exact Compose version, run it on the VM: `scripts/validate-compose-on-vm.sh` (syncs the tree and runs the validator on the target's root Docker over SSH).
 
 ### Infrastructure tests (scripts/tests — stdlib unittest)
 

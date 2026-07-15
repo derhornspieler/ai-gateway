@@ -44,6 +44,7 @@ TARGETS=(
   scripts/state-restore.sh
   scripts/sign-vault-intermediate.sh
   scripts/validate-compose.sh
+  scripts/validate-compose-on-vm.sh
   scripts/validate-vault-config.sh
   scripts/vault-bootstrap.sh
   scripts/vault-pki-intermediate.sh
