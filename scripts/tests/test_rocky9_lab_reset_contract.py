@@ -43,6 +43,25 @@ def playbook_list(source: str, variable: str) -> list[str]:
     return re.findall(r"^      - ([A-Za-z0-9_.\-/]+)$", match.group("body"), re.MULTILINE)
 
 
+def playbook_network_specs(source: str, variable: str) -> list[tuple[str, str, str, str]]:
+    match = re.search(
+        rf"^    {re.escape(variable)}:\n(?P<body>(?:      - \{{ [^\n]+ \}}\n)+)",
+        source,
+        re.MULTILINE,
+    )
+    if match is None:
+        raise AssertionError(f"missing playbook network spec list {variable}")
+    specs = re.findall(
+        r"^      - \{ name: (net-[a-z0-9-]+), +bridge: (br-[a-z0-9-]+), +"
+        r"subnet: (172\.28\.[0-9]+\.0/24), +internal: (true|false) \}$",
+        match.group("body"),
+        re.MULTILINE,
+    )
+    if len(specs) != len(match.group("body").splitlines()):
+        raise AssertionError(f"malformed playbook network spec list {variable}")
+    return specs
+
+
 def playbook_image_mapping(source: str, variable: str) -> dict[str, str]:
     match = re.search(
         rf"^    {re.escape(variable)}:\n(?P<body>(?:      [^\n]+\n)+)",
@@ -142,6 +161,58 @@ class Rocky9LabResetContractTests(unittest.TestCase):
             r"^  - \{ name: (net-[a-z0-9-]+),", ALL_VARS.read_text(encoding="utf-8"), re.MULTILINE
         )
         self.assertEqual(playbook_list(self.source, "aigw_lab_reset_expected_networks"), configured_networks)
+
+    def test_legacy_network_graph_proof_uses_the_exact_frozen_snapshot_set(self) -> None:
+        # The unmarked legacy snapshot predates net-db-grafana, so the live
+        # network-graph proof must compare against this frozen 20-bridge
+        # legacy set — byte-exact as reviewed at snapshot time, never the
+        # evolving docker_networks model. Any bridge added after the snapshot
+        # must be consciously excluded here, exactly like net-db-grafana.
+        self.assertEqual(
+            playbook_network_specs(self.source, "aigw_lab_reset_legacy_expected_networks"),
+            [
+                ("net-egress", "br-egress", "172.28.0.0/24", "false"),
+                ("net-adm", "br-adm", "172.28.1.0/24", "false"),
+                ("net-internal", "br-internal", "172.28.2.0/24", "false"),
+                ("net-chat", "br-chat", "172.28.3.0/24", "true"),
+                ("net-portal", "br-portal", "172.28.4.0/24", "true"),
+                ("net-admin-app", "br-admin", "172.28.5.0/24", "true"),
+                ("net-grafana", "br-graf", "172.28.6.0/24", "true"),
+                ("net-vendor", "br-vendor", "172.28.7.0/24", "true"),
+                ("net-vault", "br-vault", "172.28.8.0/24", "true"),
+                ("net-db-litellm", "br-db-llm", "172.28.9.0/24", "true"),
+                ("net-db-keycloak", "br-db-kc", "172.28.10.0/24", "true"),
+                ("net-db-rotator", "br-db-rot", "172.28.11.0/24", "true"),
+                ("net-cache", "br-cache", "172.28.12.0/24", "true"),
+                ("net-telemetry", "br-otel", "172.28.13.0/24", "true"),
+                ("net-metrics", "br-metrics", "172.28.14.0/24", "true"),
+                ("net-observability", "br-obs", "172.28.15.0/24", "true"),
+                ("net-traces", "br-traces", "172.28.16.0/24", "true"),
+                ("net-identity", "br-ident", "172.28.17.0/24", "true"),
+                ("net-lab-dns", "br-lab-dns", "172.28.18.0/24", "false"),
+                ("net-int-edge", "br-int-edge", "172.28.19.0/24", "false"),
+            ],
+        )
+        legacy_names = [
+            spec[0]
+            for spec in playbook_network_specs(self.source, "aigw_lab_reset_legacy_expected_networks")
+        ]
+        current_names = playbook_list(self.source, "aigw_lab_reset_expected_networks")
+        self.assertIn("net-db-grafana", current_names)
+        self.assertEqual(
+            [name for name in current_names if name not in {"net-db-grafana"}], legacy_names
+        )
+        # The live graph proof consumes only the frozen legacy set; the
+        # current-topology assertion keeps pinning the evolving model.
+        self.assertIn(
+            '"{{ aigw_lab_reset_legacy_expected_networks | to_json }}"', self.source
+        )
+        self.assertNotIn('"{{ docker_networks | to_json }}"', self.source)
+        self.assertIn(
+            "docker_networks | map(attribute='name') | list == aigw_lab_reset_expected_networks",
+            self.source,
+        )
+        self.assertIn("Docker network graph is not the exact reviewed legacy set", self.source)
 
     def test_no_broad_prune_or_generic_reset_and_docker_root_is_graph_proven(self) -> None:
         lowered = self.source.lower()

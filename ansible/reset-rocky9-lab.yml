@@ -89,6 +89,34 @@
       - net-lab-dns
       - net-int-edge
       - net-db-grafana
+    # The unmarked snapshot also predates net-db-grafana (the Grafana spend-
+    # datasource DB bridge landed with the observability drop), so the live
+    # legacy Docker graph carries exactly these 20 reviewed bridges. The
+    # live network-graph proof therefore compares against this frozen legacy
+    # set — never the evolving ``docker_networks`` model, which the current-
+    # topology assertion above still pins — while still requiring exact set
+    # equality with the live host, never a subset or superset.
+    aigw_lab_reset_legacy_expected_networks:
+      - { name: net-egress,        bridge: br-egress,   subnet: 172.28.0.0/24,  internal: false }
+      - { name: net-adm,           bridge: br-adm,      subnet: 172.28.1.0/24,  internal: false }
+      - { name: net-internal,      bridge: br-internal, subnet: 172.28.2.0/24,  internal: false }
+      - { name: net-chat,          bridge: br-chat,     subnet: 172.28.3.0/24,  internal: true }
+      - { name: net-portal,        bridge: br-portal,   subnet: 172.28.4.0/24,  internal: true }
+      - { name: net-admin-app,     bridge: br-admin,    subnet: 172.28.5.0/24,  internal: true }
+      - { name: net-grafana,       bridge: br-graf,     subnet: 172.28.6.0/24,  internal: true }
+      - { name: net-vendor,        bridge: br-vendor,   subnet: 172.28.7.0/24,  internal: true }
+      - { name: net-vault,         bridge: br-vault,    subnet: 172.28.8.0/24,  internal: true }
+      - { name: net-db-litellm,    bridge: br-db-llm,   subnet: 172.28.9.0/24,  internal: true }
+      - { name: net-db-keycloak,   bridge: br-db-kc,    subnet: 172.28.10.0/24, internal: true }
+      - { name: net-db-rotator,    bridge: br-db-rot,   subnet: 172.28.11.0/24, internal: true }
+      - { name: net-cache,         bridge: br-cache,    subnet: 172.28.12.0/24, internal: true }
+      - { name: net-telemetry,     bridge: br-otel,     subnet: 172.28.13.0/24, internal: true }
+      - { name: net-metrics,       bridge: br-metrics,  subnet: 172.28.14.0/24, internal: true }
+      - { name: net-observability, bridge: br-obs,      subnet: 172.28.15.0/24, internal: true }
+      - { name: net-traces,        bridge: br-traces,   subnet: 172.28.16.0/24, internal: true }
+      - { name: net-identity,      bridge: br-ident,    subnet: 172.28.17.0/24, internal: true }
+      - { name: net-lab-dns,       bridge: br-lab-dns,  subnet: 172.28.18.0/24, internal: false }
+      - { name: net-int-edge,      bridge: br-int-edge, subnet: 172.28.19.0/24, internal: false }
     aigw_lab_reset_expected_volumes:
       - pg_data
       - openwebui_data
@@ -861,7 +889,7 @@
           - /var/lib/docker
           - "{{ offline_image_seed_manifest_remote_path }}"
           - "{{ aigw_lab_reset_legacy_expected_services | to_json }}"
-          - "{{ docker_networks | to_json }}"
+          - "{{ aigw_lab_reset_legacy_expected_networks | to_json }}"
           - "{{ aigw_lab_reset_expected_volumes | to_json }}"
           - "{{ aigw_lab_reset_legacy_local_image_tags | to_json }}"
           - "{{ aigw_lab_reset_legacy_seed_image_tags | to_json }}"
