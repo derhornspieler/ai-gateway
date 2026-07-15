@@ -18,6 +18,8 @@ regexes = [
   '''^PortalOIDCSecret_0123456789_ABCDEFGH$''',
   '''^AdminPortalOIDCSecret_0123456789_ABCDE$''',
   '''^OAuth2ProxySecret_0123456789_ABCDEFGHI$''',
+  '''^VaultOIDCSecret_0123456789_ABCDEFGHIJK$''',
+  '''^ValidationVaultOIDCSecret0123456789ABC$''',
   '''^WebuiOIDCSecret!0123456789-ABCDEFGHI$''',
   '''^PortalOIDCSecret!0123456789-ABCDEFGH$''',
   '''^AdminPortalOIDCSecret!0123456789-ABCDE$''',
