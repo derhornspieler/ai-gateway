@@ -30,15 +30,16 @@ using all 20 bridges.
 
 ## Production-readiness warning
 
-The current stack is a security-focused prototype. It now enforces encrypted
-backing for generic/customer state, reconciles existing PostgreSQL role
-passwords, bounds Redis and Loki memory behavior, rotates the Vault audit file,
-and has explicit in-container health checks on every long-running base/lab
-service. Do not admit production data until the following remaining controls
-are implemented and rehearsed:
+The current stack is a security-focused prototype. It warns loudly when
+generic/customer state is not on LUKS-encrypted backing, reconciles existing
+PostgreSQL role passwords, bounds Redis and Loki memory behavior, rotates the
+Vault audit file, and has explicit in-container health checks on every
+long-running base/lab service. Do not admit production data until the following
+remaining controls are implemented and rehearsed:
 
 - operator-provisioned/unlocked LUKS backing for both configured sensitive
-  paths; Ansible verifies it but does not create or unlock it;
+  paths; Ansible warns when it is absent but does not create, unlock, or require
+  it — LUKS is a build-time disk-provisioning task the converge does not manage;
 - a successful age-encrypted backup to independent/off-host storage and an
   isolated customer restore rehearsal using the provided scripts; the local
   replacement-VM lab has passed corrected offline restore, unseal/runtime, one
@@ -245,14 +246,18 @@ recreates only the affected consumer.
 |---|---|---|
 | `docker_data_root` | `/var/lib/docker` | must match Docker's live `DockerRootDir` after converge |
 | `encrypted_state_paths` | Docker data root and `/opt/ai-gateway` | each path is resolved to its backing block-device ancestry |
-| `require_encrypted_state` | `true` | refuses full and stack-only customer deployment unless every path has a `crypto_LUKS` ancestor |
+| `require_encrypted_state` | `true` | when a path has no `crypto_LUKS` ancestor the preflight **warns and continues** (`AIGW_ENCRYPTED_STATE_WARNING`) — it does not refuse; LUKS is a build-time disk-provisioning concern the converge does not manage |
 | `require_preupgrade_backup` | `true` | refuses changed stateful direct-image references or custom build-input/image-ID drift without an available, hash-matching backup receipt no older than 24 hours |
 
-Only `ansible/inventory/host_vars/lab-aigw01.yml` disables encrypted-state and
+Only `ansible/inventory/host_vars/lab-aigw01.yml` opts out of the encrypted-state
+warning (`require_encrypted_state: false`, which skips the check entirely) and
 pre-upgrade-backup enforcement. Do not copy those opt-outs into a customer
-inventory. If the customer uses different mount points, update the complete path
-list; do not merely change Docker's root and leave rendered secrets,
-certificates, or backup staging under unencrypted `/opt`.
+inventory: on a customer profile the check should stay on so a missing LUKS
+volume is surfaced loudly. The operator custodies the LUKS passphrase themselves
+(offline or in their own vault); the gateway never sees it. If the customer uses
+different mount points, update the complete path list; do not merely change
+Docker's root and leave rendered secrets, certificates, or backup staging under
+unencrypted `/opt`.
 
 ### Cribl export
 
@@ -404,11 +409,18 @@ the only ADM UI that uses application-native OIDC directly rather than an
 oauth2-proxy gate.
 
 The same wildcard certificate covers both Traefik instances. Ansible creates a
-seven-day self-signed placeholder only so the first stack can start. The lab
-Vault script replaces it with a test-root-issued certificate. Production must
-provide a customer-rooted chain and a renewal procedure before access is opened.
-Traefik currently consumes certificate files; Vault ACME is a design option, not
-implemented configuration.
+seven-day self-signed placeholder only so the first stack can start; the real
+certificate is produced by one of four fail-closed edge-TLS modes selected with
+`aigw_edge_tls_mode`. Production chooses `customer-supplied` (you hand over a
+ready leaf + private key + chain), `vault-intermediate` (Vault mints an
+intermediate key internally and your CA signs its CSR offline), or
+`customer-intermediate` (you hand over an intermediate CA certificate **and its
+private key** plus the full chain, and Vault issues every leaf from it). The
+self-signed `lab` test-root mode is legal only on `rocky9-lab`. Each production
+mode has a fail-closed preflight and an on-host ceremony — see
+[Production edge TLS](operations.md#production-edge-tls) for the mode table, when
+to use each, and the exact commands. Traefik currently consumes certificate
+files; Vault ACME is a design option, not implemented configuration.
 
 The lab overlay supplies this split view through an authoritative,
 non-recursive `aigw.aegisgroup.ch` CoreDNS service. It publishes TCP and UDP 53 on
@@ -482,8 +494,8 @@ decouples OS host preparation from stack rollout. The role order across the
 composition is deliberate:
 
 1. preflight requires Rocky `targeted` SELinux to be enabled and enforcing,
-   then validates topology, collision constraints, and encrypted backing for
-   every configured sensitive state path;
+   then validates topology and collision constraints, and warns (does not fail)
+   if any configured sensitive state path lacks LUKS-encrypted backing;
 2. policy routing installs additive tables/rules and persistence;
 3. firewalld persists only the active profiles' `connection.zone` values, then
    native nftables and atomic `DOCKER-USER` protection go live;

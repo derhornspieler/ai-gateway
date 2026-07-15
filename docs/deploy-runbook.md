@@ -37,13 +37,19 @@ the VM and compare.
 | 2 | Three network interfaces, each already configured with its own IP address: one for internet egress, one for administrators (ADM), one for internal users | `ip -br -4 address` | Three interfaces, each with an IPv4 address |
 | 3 | Exactly one default route, on the egress interface | `ip -4 route show table main` | One line starting `default via …` naming the egress interface |
 | 4 | SELinux enforcing | `getenforce` | `Enforcing` |
-| 5 | Encrypted disk under Docker and the install directory | `lsblk -o NAME,FSTYPE \| grep crypto_LUKS` | At least one `crypto_LUKS` entry backing the root/data volume |
+| 5 | Encrypted disk under Docker and the install directory (**strongly recommended**, see note) | `lsblk -o NAME,FSTYPE \| grep crypto_LUKS` | At least one `crypto_LUKS` entry backing the root/data volume |
 | 6 | Clock synchronized | `chronyc tracking \| head -2` | A reference server and a small offset (under 5 seconds) |
 | 7 | A login account with sudo that accepts your SSH key | `ssh <user>@<vm> sudo -n true` from the controller | No password prompt, no error |
 | 8 | Enough resources | — | At least 4 vCPU / 24 GiB RAM / 100 GB disk for a pilot; the services alone reserve ~20 GiB of memory |
 
 If any row fails, stop and fix it first — the automation checks all of these
-and will refuse to proceed.
+and will refuse to proceed, **except the encrypted-disk check (row 5)**. LUKS
+(full-disk encryption) is a build-time disk task the converge does not manage:
+if the disk is not encrypted the converge prints a loud
+`AIGW_ENCRYPTED_STATE_WARNING` and a `WARNING: … NOT on LUKS-encrypted storage`
+line and then continues. Provision the encrypted disk when the VM is built and
+keep the passphrase yourself; do not treat the warning as permission to skip
+encryption for real customer data.
 
 Write down these values now; you will need them in Part 3:
 
