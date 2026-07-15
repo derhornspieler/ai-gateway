@@ -21,12 +21,12 @@ UUID and without cycling or reactivating the connection.
 One converge brings up a single Compose project. The base stack defines 25
 services: one `volume-init` one-shot plus 24 long-running services (two of
 which — the optional Vault browser UI pair — run only when
-`aigw_vault_ui_enabled` is set), spread across 18 of the 20 pre-created
+`aigw_vault_ui_enabled` is set), spread across 19 of the 21 pre-created
 Docker bridges, fronted by two Traefik instances, gated by up to four
 oauth2-proxy OIDC reverse proxies, and served through two portals. The
 lab overlay adds a Samba AD directory, and the platform-DNS overlay an
 authoritative DNS service, growing the long-running graph beyond `volume-init` and
-using all 20 bridges.
+using all 21 bridges.
 
 ## Production-readiness warning
 
@@ -502,8 +502,8 @@ composition is deliberate:
 3. firewalld persists only the active profiles' `connection.zone` values, then
    native nftables and atomic `DOCKER-USER` protection go live;
 4. Docker is installed/configured and then started behind that policy;
-5. all 20 segmented bridges are created and pinned to stable bridge names (the
-   base stack uses 18 of them; `net-identity` and `net-lab-dns` are lab-only);
+5. all 21 segmented bridges are created and pinned to stable bridge names (the
+   base stack uses 19 of them; `net-identity` and `net-lab-dns` are lab-only);
    two bridges are no-peer port-publication bridges whose container egress
    remains denied;
 6. stack configuration is rendered; exact read-only bind-source file-context
@@ -733,7 +733,7 @@ ansible-playbook -i <inventory> ansible/os-prep.yml \
 
 It performs the full read-only input/topology validation and runs
 `host_preflight` through `docker_networks`, leaving routing, firewall, SELinux,
-Docker, and all 20 bridges live but starting no containers. On a first
+Docker, and all 21 bridges live but starting no containers. On a first
 converge it leaves the pending dedicated-Docker-host ownership marker
 (`/etc/ai-gateway/dedicated-docker-host-v1.pending`) as the host-prep-done
 signal that `deploy-stack-only.yml` requires.

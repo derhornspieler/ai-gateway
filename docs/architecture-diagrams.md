@@ -60,7 +60,7 @@ flowchart LR
     A2[net-vendor<br/>LiteLLM, key-rotator → Envoy]
   end
   subgraph data [Data planes]
-    D1[net-db-litellm / net-db-keycloak / net-db-rotator<br/>three isolated paths to Postgres]
+    D1[net-db-litellm / net-db-keycloak / net-db-rotator / net-db-grafana<br/>four isolated paths to Postgres]
     D2[net-cache — Redis]
     D3[net-vault — Vault + key-rotator + Vault gate]
   end

@@ -311,6 +311,8 @@
         'ai-gateway-live-logs.json',
         'ai-gateway-overview.json',
         'ai-gateway-request-audit.json',
+        'ai-gateway-top-projects.json',
+        'ai-gateway-top-users.json',
         'edge-identity-services.json',
         'grafana-lgtm-stack.json',
         'rocky9-host.json'
@@ -339,11 +341,14 @@
     - grafana/provisioning/dashboards/json/ai-gateway-live-logs.json
     - grafana/provisioning/dashboards/json/ai-gateway-overview.json
     - grafana/provisioning/dashboards/json/ai-gateway-request-audit.json
+    - grafana/provisioning/dashboards/json/ai-gateway-top-projects.json
+    - grafana/provisioning/dashboards/json/ai-gateway-top-users.json
     - grafana/provisioning/dashboards/json/edge-identity-services.json
     - grafana/provisioning/dashboards/json/grafana-lgtm-stack.json
     - grafana/provisioning/dashboards/json/rocky9-host.json
     - grafana/provisioning/datasources/datasources.yml
     - grafana/provisioning/plugins/empty.yml
+    - grafana/provisioning/plugins/loki-drilldown.yml
     - litellm/config.yaml
     - loki/config.yml
     - postgres/init/01-init-databases.sh
@@ -465,7 +470,7 @@
   when:
     - item.state == 'file'
     - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.git|secrets)(/|$)')
-    - item.path is regex('(^|/)(Dockerfile(?:\.open-webui)?|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch)|upstream-provenance\.json|oauth-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
+    - item.path is regex('(^|/)(Dockerfile(?:\.open-webui|\.grafana)?|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch)|upstream-provenance\.json|oauth-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
 
 # Ansible vars are the single source of truth for the runtime DNS views. The
 # repo-committed services/lab-dns files staged above are reviewed defaults for
@@ -966,6 +971,7 @@
     - { name: pg_litellm_password, min_length: 24 }
     - { name: pg_keycloak_password, min_length: 24 }
     - { name: pg_rotator_password, min_length: 24 }
+    - { name: pg_grafana_ro_password, min_length: 24 }
     - { name: kc_admin_password, min_length: 24 }
     - { name: litellm_master_key, min_length: 32 }
     - { name: litellm_salt_key, min_length: 32 }
@@ -2574,7 +2580,7 @@
         SELECT role_name || '|' || db_name || '|' ||
                CASE WHEN has_database_privilege(role_name, db_name, 'CONNECT')
                     THEN 'true' ELSE 'false' END
-          FROM unnest(ARRAY['keycloak','litellm','rotator']) AS role_name
+          FROM unnest(ARRAY['grafana_ro','keycloak','litellm','rotator']) AS role_name
          CROSS JOIN unnest(ARRAY['keycloak','litellm','rotator','postgres']) AS db_name
          ORDER BY role_name, db_name;
         SELECT 'postgres|postgres|' ||
@@ -2591,14 +2597,14 @@
                          (rolvaliduntil IS NULL OR rolvaliduntil = 'infinity'::timestamptz)
                     THEN 'true' ELSE 'false' END
           FROM pg_roles
-         WHERE rolname IN ('keycloak','litellm','rotator')
+         WHERE rolname IN ('grafana_ro','keycloak','litellm','rotator')
          ORDER BY rolname;
         SELECT 'membership|' || count(*)
           FROM pg_auth_members membership
           JOIN pg_roles granted_role ON granted_role.oid = membership.roleid
           JOIN pg_roles member_role ON member_role.oid = membership.member
-         WHERE granted_role.rolname IN ('keycloak','litellm','rotator')
-            OR member_role.rolname IN ('keycloak','litellm','rotator');
+         WHERE granted_role.rolname IN ('grafana_ro','keycloak','litellm','rotator')
+            OR member_role.rolname IN ('grafana_ro','keycloak','litellm','rotator');
   args:
     chdir: "{{ stack_dir }}"
   environment:
@@ -2618,6 +2624,10 @@
       to their own database; postgres alone retains maintenance access.
   vars:
     expected_postgres_connect_matrix:
+      - grafana_ro|keycloak|false
+      - grafana_ro|litellm|true
+      - grafana_ro|postgres|false
+      - grafana_ro|rotator|false
       - keycloak|keycloak|true
       - keycloak|litellm|false
       - keycloak|postgres|false
@@ -2634,6 +2644,7 @@
       - owner|keycloak|keycloak
       - owner|litellm|litellm
       - owner|rotator|rotator
+      - role|grafana_ro|true
       - role|keycloak|true
       - role|litellm|true
       - role|rotator|true

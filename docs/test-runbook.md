@@ -271,9 +271,9 @@ SSH and the independent Docker forward guards reduced exposure.
 ## 4. Docker segmentation and negative packet tests
 
 The base stack has 23 long-running services plus one successful one-shot
-`volume-init`, and uses 18 of the 20 pre-created networks. The lab overlay adds
+`volume-init`, and uses 19 of the 21 pre-created networks. The lab overlay adds
 two long-running services — Samba AD on `net-identity` and authoritative DNS on
-`net-lab-dns` — bringing every one of the 20 bridges into use and the total to
+`net-lab-dns` — bringing every one of the 21 bridges into use and the total to
 25 long-running services plus `volume-init`. On the lab always use the merged
 command:
 
@@ -286,7 +286,7 @@ docker compose -f docker-compose.yml -f docker-compose.lab.yml \
 docker network ls --filter label=com.docker.compose.project=ai-gateway
 ```
 
-Inspect all 20 networks and confirm the exact subnet, the `.128/25` container
+Inspect all 21 networks and confirm the exact subnet, the `.128/25` container
 `IPRange` half, the stable `br-*` name, `EnableIPv6=false`, and the `Internal`
 flag match Ansible. `net-egress`, `net-adm`, `net-internal`, `net-int-edge`, and
 `net-lab-dns` are non-internal. The last

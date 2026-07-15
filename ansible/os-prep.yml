@@ -295,6 +295,7 @@
                 "net-identity": ("br-ident", "172.28.17.0/24", True),
                 "net-lab-dns": ("br-lab-dns", "172.28.18.0/24", False),
                 "net-int-edge": ("br-int-edge", "172.28.19.0/24", False),
+                "net-db-grafana": ("br-db-graf", "172.28.20.0/24", True),
             }
             errors = []
             if not isinstance(networks, list):

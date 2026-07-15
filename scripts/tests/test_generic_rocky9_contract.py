@@ -54,6 +54,7 @@ class GenericRocky9ContractTests(unittest.TestCase):
                 "pg_litellm_password",
                 "pg_keycloak_password",
                 "pg_rotator_password",
+                "pg_grafana_ro_password",
                 "kc_admin_password",
                 "litellm_master_key",
                 "litellm_salt_key",

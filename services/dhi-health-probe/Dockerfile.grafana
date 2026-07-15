@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+ARG BASE_IMAGE
+
+# Grafana derivative: the shared health probe PLUS the vendored Grafana Loki
+# drilldown app (grafana-lokiexplore-app), version- and checksum-pinned. The
+# plugin archive is fetched by BuildKit's daemon-side HTTP source with a
+# mandatory sha256 (the fetch fails closed on any byte drift; RUN steps stay
+# --network=none), re-verified with sha256sum, and unpacked by the reviewed
+# stdlib-only extractor, which refuses traversal/link/foreign-root entries,
+# enforces size bounds, and proves the plugin id/version before the inventory
+# summary below is asserted byte-for-byte. Grafana loads it from a read-only,
+# root-owned image path and never downloads plugins at runtime
+# (GF_PLUGINS_* download/admin surfaces stay disabled in Compose); the
+# archive is signatureType "grafana", so Grafana's own embedded-key signature
+# verification still applies at load.
+FROM dhi.io/golang:1.25.12-alpine-dev@sha256:4411028e8461d5a111cdbf0aa172db17342557590f7727a4dd4649440bb411c2 AS probe-builder
+WORKDIR /src
+COPY go.mod main.go main_test.go ./
+COPY cmd ./cmd
+RUN --network=none go test ./... \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/aigw-health-probe . \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/aigw-extract-plugin ./cmd/extract-plugin
+
+ADD --checksum=sha256:fce6beb37d0fb2fef9b24d307a8ed9d9d1dca9309ba1f7b2370f16041eb23f4a \
+    https://grafana.com/api/plugins/grafana-lokiexplore-app/versions/2.2.1/download \
+    /aigw/grafana-lokiexplore-app-2.2.1.zip
+
+RUN --network=none set -eu; \
+    echo 'fce6beb37d0fb2fef9b24d307a8ed9d9d1dca9309ba1f7b2370f16041eb23f4a  /aigw/grafana-lokiexplore-app-2.2.1.zip' | sha256sum -c -; \
+    result="$(/out/aigw-extract-plugin /aigw/grafana-lokiexplore-app-2.2.1.zip /out/grafana-plugins grafana-lokiexplore-app 2.2.1)"; \
+    expected="$(printf '%s\n' \
+      'plugin=grafana-lokiexplore-app' \
+      'version=2.2.1' \
+      'entries=193' \
+      'files=171' \
+      'directories=22' \
+      'bytes=18091195')"; \
+    test "$result" = "$expected"; \
+    find /out/grafana-plugins -type d -exec chmod 0755 {} + ; \
+    find /out/grafana-plugins -type f -exec chmod 0644 {} +
+
+# The final stage is the exact Grafana DHI passed by BASE_IMAGE and retains
+# that image's entrypoint, command, and non-root user. The vendored plugin
+# tree is root-owned and world-readable only: the uid-65532 runtime can load
+# but never mutate it, and GF_PATHS_PLUGINS points here in Compose.
+FROM ${BASE_IMAGE}
+COPY --from=probe-builder --chmod=0555 /out/aigw-health-probe /usr/local/bin/aigw-health-probe
+COPY --from=probe-builder --chown=0:0 /out/grafana-plugins /usr/share/aigw/grafana-plugins

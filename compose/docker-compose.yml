@@ -27,6 +27,11 @@ networks:
   net-db-litellm:   { external: true }
   net-db-keycloak:  { external: true }
   net-db-rotator:   { external: true }
+  # Owner-approved admin observability path: Grafana's read-only LiteLLM spend
+  # datasource reaches Postgres over its own dedicated per-client DB bridge,
+  # matching the litellm/keycloak/rotator isolation pattern. Grafana still has
+  # no route to LiteLLM's API and LiteLLM has no route to Grafana.
+  net-db-grafana:   { external: true }
   net-cache:        { external: true }
   net-telemetry:    { external: true }
   net-metrics:      { external: true }
@@ -1019,11 +1024,14 @@ services:
       PG_LITELLM_PASSWORD: ${PG_LITELLM_PASSWORD:?PG_LITELLM_PASSWORD must be set}
       PG_KEYCLOAK_PASSWORD: ${PG_KEYCLOAK_PASSWORD:?PG_KEYCLOAK_PASSWORD must be set}
       PG_ROTATOR_PASSWORD: ${PG_ROTATOR_PASSWORD:?PG_ROTATOR_PASSWORD must be set}
+      # Read-only Grafana spend-reporting role: SELECT on the reviewed LiteLLM
+      # spend/token/user tables only, CONNECT to the litellm database only.
+      PG_GRAFANA_RO_PASSWORD: ${PG_GRAFANA_RO_PASSWORD:?PG_GRAFANA_RO_PASSWORD must be set}
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
     volumes:
       - pg_data:/var/lib/postgresql/16/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro,Z
-    networks: [net-db-litellm, net-db-keycloak, net-db-rotator]
+    networks: [net-db-litellm, net-db-keycloak, net-db-rotator, net-db-grafana]
     healthcheck:
       test: [CMD, pg_isready, --username, postgres, --dbname, postgres]
       interval: 5s
@@ -1351,12 +1359,19 @@ services:
     labels:
       <<: *selinux-labels
       com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_GRAFANA:?AIGW_BIND_DIGEST_GRAFANA must be set}
+    # Dockerfile.grafana layers the health probe AND the vendored, pinned
+    # Grafana Loki drilldown app (grafana-lokiexplore-app 2.2.1, fetched by
+    # BuildKit's daemon-side HTTP source with a mandatory sha256 checksum and
+    # re-verified plus safely extracted by a stdlib-only Go tool under
+    # --network=none) onto the immutable read-only rootfs. Grafana never
+    # downloads plugins at runtime.
     build:
       context: ./services/dhi-health-probe
+      dockerfile: Dockerfile.grafana
       network: none
       args:
         BASE_IMAGE: dhi.io/grafana:12.4.5@sha256:bf28b93e5f122d0d93574f865df15ba01ca630e91e9af1138c4bfd3461e8619e
-    image: ai-gateway/dhi-grafana:12.4.5-probe
+    image: ai-gateway/dhi-grafana:12.4.5-aigw1
     read_only: true
     # Grafana probes its plugin path even when installation is disabled. Keep
     # that path writable but ephemeral and non-executable: this deployment
@@ -1393,7 +1408,9 @@ services:
       # DHI stays deterministic/offline. Grafana 12's built-in app preinstall
       # list remains active even when the explicit list is empty, so disable
       # that mechanism and every online update/signature lookup. The built-in
-      # Prometheus, Loki, and Tempo datasources require no downloaded plugin.
+      # Prometheus, Loki, Tempo, and PostgreSQL datasources require no
+      # downloaded plugin; the sole app plugin (Loki drilldown) is baked into
+      # the image below and served from an immutable read-only rootfs path.
       GF_PLUGINS_PREINSTALL: ""
       GF_PLUGINS_PREINSTALL_DISABLED: "true"
       GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
@@ -1401,10 +1418,20 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      # Load plugins only from the image-baked, root-owned, read-only vendor
+      # directory. Grafana's default plugin path stays masked by the hardened
+      # ephemeral tmpfs above, so no runtime-writable plugin path exists.
+      GF_PATHS_PLUGINS: /usr/share/aigw/grafana-plugins
+      # Read-only least-privilege PostgreSQL credential for the provisioned
+      # LiteLLM spend datasource (secureJsonData $__env expansion). Deliberate
+      # owner decision: admins get per-user/project cost visibility from
+      # LiteLLM's own computed spend rows instead of high-cardinality
+      # Prometheus labels.
+      AIGW_PG_GRAFANA_RO_PASSWORD: ${PG_GRAFANA_RO_PASSWORD:?PG_GRAFANA_RO_PASSWORD must be set}
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro,Z
       - grafana_data:/var/lib/grafana
-    networks: [net-grafana, net-observability]
+    networks: [net-grafana, net-observability, net-db-grafana]
     healthcheck:
       test: [CMD, /usr/local/bin/aigw-health-probe, http, --url, http://127.0.0.1:3000/api/health]
       interval: 10s

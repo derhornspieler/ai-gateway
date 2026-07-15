@@ -88,6 +88,7 @@
       - net-identity
       - net-lab-dns
       - net-int-edge
+      - net-db-grafana
     aigw_lab_reset_expected_volumes:
       - pg_data
       - openwebui_data

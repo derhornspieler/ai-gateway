@@ -34,3 +34,29 @@ datasources:
         filterByTraceID: true
         spanStartTimeShift: -5m
         spanEndTimeShift: 5m
+  # Owner-approved admin cost/usage path: a READ-ONLY PostgreSQL datasource
+  # over LiteLLM's own computed spend rows (metadata only — prompt storage in
+  # spend logs is pinned off). The grafana_ro role may CONNECT only to the
+  # litellm database and SELECT only the reviewed spend/token/user tables;
+  # dashboards use bounded top-N SQL instead of high-cardinality per-user or
+  # per-key Prometheus labels. The credential arrives via container
+  # environment ($__env) from the encrypted inventory — never from this file.
+  - name: LiteLLM Spend
+    type: grafana-postgresql-datasource
+    uid: litellm-spend
+    access: proxy
+    url: postgres:5432
+    user: grafana_ro
+    editable: false
+    jsonData:
+      database: litellm
+      # Plaintext on the dedicated internal-only net-db-grafana bridge matches
+      # the platform's container-to-container transport posture.
+      sslmode: disable
+      maxOpenConns: 4
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+      postgresVersion: 1600
+      timescaledb: false
+    secureJsonData:
+      password: $__env{AIGW_PG_GRAFANA_RO_PASSWORD}

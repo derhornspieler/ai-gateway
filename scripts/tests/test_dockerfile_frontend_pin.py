@@ -10,6 +10,7 @@ EXPECTED_FRONTEND = (
 EXPECTED_DOCKERFILES = {
     Path("services/dev-portal/Dockerfile"),
     Path("services/dhi-health-probe/Dockerfile"),
+    Path("services/dhi-health-probe/Dockerfile.grafana"),
     Path("services/dhi-health-probe/Dockerfile.open-webui"),
     Path("services/egress-proxy/Dockerfile"),
     Path("services/key-rotator/Dockerfile"),

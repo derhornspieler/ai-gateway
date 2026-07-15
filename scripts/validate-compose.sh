@@ -156,11 +156,14 @@ for relative in (
     "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
     "grafana/provisioning/dashboards/json/ai-gateway-overview.json",
     "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
+    "grafana/provisioning/dashboards/json/ai-gateway-top-projects.json",
+    "grafana/provisioning/dashboards/json/ai-gateway-top-users.json",
     "grafana/provisioning/dashboards/json/edge-identity-services.json",
     "grafana/provisioning/dashboards/json/grafana-lgtm-stack.json",
     "grafana/provisioning/dashboards/json/rocky9-host.json",
     "grafana/provisioning/datasources/datasources.yml",
     "grafana/provisioning/plugins/empty.yml",
+    "grafana/provisioning/plugins/loki-drilldown.yml",
 ):
     path = root / relative
     assert path.is_file() and not path.is_symlink(), relative
@@ -1078,6 +1081,7 @@ env \
   PG_LITELLM_PASSWORD=ValidationLiteLLMPassword_0123456789 \
   PG_KEYCLOAK_PASSWORD=ValidationKeycloakPassword_0123456789 \
   PG_ROTATOR_PASSWORD=ValidationRotatorPassword_0123456789 \
+  PG_GRAFANA_RO_PASSWORD=ValidationGrafanaRoPassword_0123456789 \
   KC_ADMIN_PASSWORD=ValidationKeycloakAdmin_0123456789 \
   KC_BOOTSTRAP_ADMIN_CLIENT_SECRET=ValidationKeycloakBootstrapSecret01234567 \
   LITELLM_MASTER_KEY=sk-ValidationMasterKey_0123456789ABCDEF \
@@ -1476,6 +1480,32 @@ assert grafana["environment"]["GF_PLUGINS_PREINSTALL"] == ""
 assert grafana["environment"]["GF_AUTH_PROXY_WHITELIST"] == "172.28.6.3"
 assert grafana["environment"]["GF_AUTH_BASIC_ENABLED"] == "false"
 assert grafana["environment"]["GF_AUTH_DISABLE_LOGIN_FORM"] == "true"
+# Runtime plugin download/admin stays disabled; the only app plugin is the
+# vendored, checksum-pinned Loki drilldown baked into the derived image and
+# loaded from an immutable read-only rootfs path.
+assert grafana["environment"]["GF_PLUGINS_PREINSTALL_DISABLED"] == "true"
+assert grafana["environment"]["GF_PLUGINS_PLUGIN_ADMIN_ENABLED"] == "false"
+assert grafana["environment"]["GF_PATHS_PLUGINS"] == "/usr/share/aigw/grafana-plugins"
+assert grafana["build"]["dockerfile"] == "Dockerfile.grafana"
+assert grafana["build"]["network"] == "none"
+assert grafana["image"] == "ai-gateway/dhi-grafana:12.4.5-aigw1"
+# Owner-approved admin cost path: the read-only spend credential reaches the
+# provisioned datasource only through this exact environment variable.
+assert grafana["environment"]["AIGW_PG_GRAFANA_RO_PASSWORD"] == (
+    "ValidationGrafanaRoPassword_0123456789"
+)
+# The Grafana->Postgres route is a dedicated per-client DB bridge; neither
+# side gains any other adjacency from it.
+assert set(grafana["networks"]) == {
+    "net-grafana", "net-observability", "net-db-grafana",
+}
+assert set(services["postgres"]["networks"]) == {
+    "net-db-litellm", "net-db-keycloak", "net-db-rotator", "net-db-grafana",
+}
+assert [
+    name for name, service in sorted(services.items())
+    if "net-db-grafana" in service.get("networks", {})
+] == ["grafana", "postgres"]
 grafana_tmpfs = {
     entry.split(":", 1)[0]: set(entry.split(":", 1)[1].split(","))
     for entry in grafana["tmpfs"]

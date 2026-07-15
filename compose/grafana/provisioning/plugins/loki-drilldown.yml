@@ -1,0 +1,10 @@
+# Pins the vendored Grafana Loki drilldown app (grafana-lokiexplore-app
+# 2.2.1) explicitly enabled. The plugin itself is baked into the pinned
+# ai-gateway/dhi-grafana image (services/dhi-health-probe/Dockerfile.grafana,
+# sha256-verified) and loaded from the read-only GF_PATHS_PLUGINS vendor
+# directory — Grafana never downloads plugins at runtime on this deployment.
+apiVersion: 1
+apps:
+  - type: grafana-lokiexplore-app
+    org_id: 1
+    disabled: false

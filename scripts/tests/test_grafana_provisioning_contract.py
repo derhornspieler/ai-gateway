@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -56,12 +57,14 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
                 "ai-gateway-live-logs.json",
                 "ai-gateway-overview.json",
                 "ai-gateway-request-audit.json",
+                "ai-gateway-top-projects.json",
+                "ai-gateway-top-users.json",
                 "edge-identity-services.json",
                 "grafana-lgtm-stack.json",
                 "rocky9-host.json",
             },
         )
-        self.assertEqual(len(self.dashboards), 6)
+        self.assertEqual(len(self.dashboards), 8)
 
     def test_exact_dashboard_inventory_is_deterministic(self) -> None:
         self.assertEqual(
@@ -70,6 +73,8 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
                 "aigw-live-logs": "AI Gateway Live Logs",
                 "aigw-overview": "AI Gateway Overview",
                 "aigw-request-audit": "AI Gateway Request Audit",
+                "aigw-top-projects": "AI Gateway Top Projects",
+                "aigw-top-users": "AI Gateway Top Users",
                 "aigw-edge-identity": "Edge, Egress and Identity Services",
                 "aigw-grafana-lgtm": "Grafana LGTM Stack",
                 "aigw-rocky9-host": "Rocky 9 Host (Node Exporter)",
@@ -81,7 +86,13 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             self.assertGreaterEqual(dashboard["schemaVersion"], 41)
 
     def test_panels_use_only_the_provisioned_builtin_datasource_uids(self) -> None:
-        allowed = {("prometheus", "prometheus"), ("loki", "loki"), ("tempo", "tempo")}
+        allowed = {
+            ("prometheus", "prometheus"),
+            ("loki", "loki"),
+            ("tempo", "tempo"),
+            # Owner-approved read-only LiteLLM spend datasource (grafana_ro).
+            ("grafana-postgresql-datasource", "litellm-spend"),
+        }
         observed: set[tuple[str, str]] = set()
         for dashboard in self.dashboards:
             for panel in panels(dashboard):
@@ -102,6 +113,7 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertIn(("prometheus", "prometheus"), observed)
         self.assertIn(("loki", "loki"), observed)
         self.assertIn(("tempo", "tempo"), observed)
+        self.assertIn(("grafana-postgresql-datasource", "litellm-spend"), observed)
 
     def test_request_audit_keeps_required_fields_on_one_tempo_span(self) -> None:
         dashboard = next(
@@ -249,10 +261,13 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
             "grafana/provisioning/dashboards/json/ai-gateway-overview.json",
             "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
+            "grafana/provisioning/dashboards/json/ai-gateway-top-projects.json",
+            "grafana/provisioning/dashboards/json/ai-gateway-top-users.json",
             "grafana/provisioning/dashboards/json/edge-identity-services.json",
             "grafana/provisioning/dashboards/json/grafana-lgtm-stack.json",
             "grafana/provisioning/dashboards/json/rocky9-host.json",
             "grafana/provisioning/plugins/empty.yml",
+            "grafana/provisioning/plugins/loki-drilldown.yml",
         }
         for relative in expected:
             self.assertIn(relative, self.stack)
@@ -261,6 +276,8 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "aigw-overview",
             "aigw-live-logs",
             "aigw-request-audit",
+            "aigw-top-projects",
+            "aigw-top-users",
             "aigw-edge-identity",
             "aigw-grafana-lgtm",
             "aigw-rocky9-host",
@@ -286,6 +303,8 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "ai-gateway-live-logs.json",
             "ai-gateway-overview.json",
             "ai-gateway-request-audit.json",
+            "ai-gateway-top-projects.json",
+            "ai-gateway-top-users.json",
             "edge-identity-services.json",
             "grafana-lgtm-stack.json",
             "rocky9-host.json",
@@ -308,6 +327,9 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             'GF_ANALYTICS_REPORTING_ENABLED: "false"',
             'GF_ANALYTICS_CHECK_FOR_UPDATES: "false"',
             'GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"',
+            # Plugins load only from the image-baked, root-owned vendor path;
+            # Grafana's default (tmpfs-masked) plugin path stays unreferenced.
+            "GF_PATHS_PLUGINS: /usr/share/aigw/grafana-plugins",
         ):
             self.assertIn(setting, grafana)
         self.assertIn(
@@ -318,6 +340,192 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "  traefik-int:\n", 1
         )[0]
         self.assertNotIn("/state/grafana/plugins", volume_init)
+
+    def test_loki_drilldown_app_is_vendored_version_and_checksum_pinned(self) -> None:
+        """Air-gap contract: the sole Grafana app plugin is fetched at image
+        build with a mandatory sha256, safely re-extracted by the reviewed
+        stdlib-only tool, and byte-inventory asserted — never downloaded by
+        Grafana at runtime."""
+        dockerfile = (
+            ROOT / "services/dhi-health-probe/Dockerfile.grafana"
+        ).read_text()
+        for required in (
+            "ADD --checksum=sha256:"
+            "fce6beb37d0fb2fef9b24d307a8ed9d9d1dca9309ba1f7b2370f16041eb23f4a",
+            "https://grafana.com/api/plugins/grafana-lokiexplore-app/versions/2.2.1/download",
+            "sha256sum -c -",
+            "/out/aigw-extract-plugin /aigw/grafana-lokiexplore-app-2.2.1.zip",
+            "'plugin=grafana-lokiexplore-app'",
+            "'version=2.2.1'",
+            "'entries=193'",
+            "'files=171'",
+            "'directories=22'",
+            "'bytes=18091195'",
+            'test "$result" = "$expected"',
+            "RUN --network=none",
+        ):
+            self.assertIn(required, dockerfile)
+        self.assertNotIn("GF_INSTALL_PLUGINS", dockerfile)
+        extractor = (
+            ROOT / "services/dhi-health-probe/cmd/extract-plugin/main.go"
+        ).read_text()
+        for required in (
+            "maxEntries",
+            "maxTotalBytes",
+            "safeRelative",
+            "os.O_WRONLY|os.O_CREATE|os.O_EXCL",
+            "io.LimitReader",
+            "neither a regular file nor a directory",
+        ):
+            self.assertIn(required, extractor)
+        grafana = self.compose.split("  grafana:\n", 1)[1].split(
+            "  cribl-mock:\n", 1
+        )[0]
+        self.assertIn("dockerfile: Dockerfile.grafana", grafana)
+        self.assertIn("image: ai-gateway/dhi-grafana:12.4.5-aigw1", grafana)
+        apps = (
+            ROOT / "compose/grafana/provisioning/plugins/loki-drilldown.yml"
+        ).read_text()
+        self.assertIn("type: grafana-lokiexplore-app", apps)
+        self.assertIn("disabled: false", apps)
+        self.assertIn("plugin_setting", self.verify)
+        self.assertIn("grafana-lokiexplore-app", self.verify)
+
+    def test_spend_datasource_is_readonly_env_credential_and_pinned(self) -> None:
+        datasources = (
+            ROOT / "compose/grafana/provisioning/datasources/datasources.yml"
+        ).read_text()
+        for required in (
+            "name: LiteLLM Spend",
+            "type: grafana-postgresql-datasource",
+            "uid: litellm-spend",
+            "url: postgres:5432",
+            "user: grafana_ro",
+            "database: litellm",
+            "password: $__env{AIGW_PG_GRAFANA_RO_PASSWORD}",
+        ):
+            self.assertIn(required, datasources)
+        # The credential reaches Grafana only through the environment; the
+        # provisioning file must never carry a literal secret, and every
+        # provisioned datasource stays UI-immutable.
+        self.assertEqual(datasources.count("password:"), 1)
+        self.assertEqual(
+            datasources.count("editable: false"), datasources.count("- name: ")
+        )
+        grafana = self.compose.split("  grafana:\n", 1)[1].split(
+            "  cribl-mock:\n", 1
+        )[0]
+        self.assertIn(
+            "AIGW_PG_GRAFANA_RO_PASSWORD: ${PG_GRAFANA_RO_PASSWORD:?PG_GRAFANA_RO_PASSWORD must be set}",
+            grafana,
+        )
+        self.assertIn(
+            "networks: [net-grafana, net-observability, net-db-grafana]", grafana
+        )
+
+    def test_spend_dashboards_use_bounded_top_n_over_litellm_computed_spend(self) -> None:
+        """Cardinality/cost contract: cost panels read LiteLLM's own computed
+        dollar `spend` (which already prices Anthropic prompt-cache reads and
+        writes correctly) with bounded LIMIT top-N SQL — never an unbounded
+        per-user/per-key metric label and never tokens multiplied by a flat
+        price."""
+        granted_tables = {
+            "LiteLLM_SpendLogs",
+            "LiteLLM_VerificationToken",
+            "LiteLLM_UserTable",
+            "LiteLLM_DailyUserSpend",
+        }
+        limits = {"aigw-top-projects": "LIMIT 5", "aigw-top-users": "LIMIT 10"}
+        for uid, limit in limits.items():
+            dashboard = next(item for item in self.dashboards if item["uid"] == uid)
+            queries = [
+                target["rawSql"]
+                for panel in panels(dashboard)
+                for target in panel.get("targets", [])
+            ]
+            self.assertTrue(queries)
+            for query in queries:
+                self.assertTrue(
+                    query.startswith(("SELECT", "WITH")), query.splitlines()[0]
+                )
+                referenced = set(re.findall(r'"(LiteLLM_[A-Za-z]+)"', query))
+                self.assertTrue(referenced)
+                self.assertLessEqual(referenced, granted_tables)
+                upper = query.upper()
+                for forbidden in (
+                    "INSERT", "UPDATE ", "DELETE", "DROP", "ALTER", "GRANT",
+                    "CREATE ", "TRUNCATE", "COPY ",
+                ):
+                    self.assertNotIn(forbidden, upper, query)
+                # Aggregate queries stay time-bounded and top-N bounded; the
+                # daily cache panels aggregate a bounded daily table instead.
+                if '"LiteLLM_SpendLogs"' in query:
+                    self.assertIn('$__timeFilter(sl."startTime")', query)
+                    self.assertIn(limit, query)
+                # Prompt bodies are not stored in spend rows, and no query may
+                # even reference those columns.
+                for forbidden_column in ("messages", "response", "proxy_server_request"):
+                    self.assertNotIn(forbidden_column, query)
+            rendered = "\n".join(queries)
+            self.assertIn('SUM(sl.spend)', rendered)
+            self.assertNotIn("* 0.", rendered)
+        users = next(item for item in self.dashboards if item["uid"] == "aigw-top-users")
+        cache_queries = "\n".join(
+            target["rawSql"]
+            for panel in panels(users)
+            for target in panel.get("targets", [])
+            if "LiteLLM_DailyUserSpend" in target.get("rawSql", "")
+        )
+        self.assertIn("cache_read_input_tokens", cache_queries)
+        self.assertIn("cache_creation_input_tokens", cache_queries)
+
+    def test_postgres_reporting_role_is_least_privilege_and_matrix_pinned(self) -> None:
+        init = (ROOT / "compose/postgres/init/01-init-databases.sh").read_text()
+        for required in (
+            "SELECT 'CREATE USER grafana_ro'",
+            "ALTER ROLE grafana_ro WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE",
+            "GRANT CONNECT ON DATABASE litellm TO grafana_ro;",
+            "GRANT SELECT ON TABLE public.%I TO grafana_ro",
+            "'LiteLLM_SpendLogs','LiteLLM_VerificationToken',",
+            "'LiteLLM_UserTable','LiteLLM_DailyUserSpend'",
+        ):
+            self.assertIn(required, init)
+        # Never a blanket or self-widening grant path for the reporting role.
+        self.assertNotIn("GRANT ALL", init)
+        self.assertNotIn("ALTER DEFAULT PRIVILEGES", init)
+        self.assertNotIn("GRANT CONNECT ON DATABASE keycloak TO grafana_ro", init)
+        self.assertNotIn("GRANT CONNECT ON DATABASE rotator TO grafana_ro", init)
+        self.assertNotIn("GRANT CONNECT ON DATABASE postgres TO grafana_ro", init)
+        for expected_row in (
+            "- grafana_ro|keycloak|false",
+            "- grafana_ro|litellm|true",
+            "- grafana_ro|postgres|false",
+            "- grafana_ro|rotator|false",
+            "- role|grafana_ro|true",
+        ):
+            self.assertIn(expected_row, self.stack)
+        self.assertIn("name: pg_grafana_ro_password", self.stack)
+
+    def test_db_grafana_bridge_abi_is_synchronized(self) -> None:
+        """net-db-grafana is a firewall-ABI addition: inventory topology, the
+        os-prep exact-topology gate, the lab reset pin, and both Compose
+        attachments must move together."""
+        group_vars = (ROOT / "ansible/group_vars/all.yml").read_text()
+        self.assertIn(
+            "{ name: net-db-grafana,    bridge: br-db-graf, subnet: 172.28.20.0/24, internal: true }",
+            group_vars,
+        )
+        os_prep = (ROOT / "ansible/os-prep.yml").read_text()
+        self.assertIn(
+            '"net-db-grafana": ("br-db-graf", "172.28.20.0/24", True),', os_prep
+        )
+        reset = (ROOT / "ansible/reset-rocky9-lab.yml").read_text()
+        self.assertIn("- net-db-grafana", reset)
+        self.assertIn("net-db-grafana:   { external: true }", self.compose)
+        self.assertIn(
+            "networks: [net-db-litellm, net-db-keycloak, net-db-rotator, net-db-grafana]",
+            self.compose,
+        )
 
     def test_runtime_plugin_tmpfs_contract_is_engine_normalization_neutral(self) -> None:
         """Compose v5 / Engine 29 echo the reviewed tmpfs option string

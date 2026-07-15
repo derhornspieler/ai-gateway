@@ -1,8 +1,13 @@
 *
 !Dockerfile
 !Dockerfile.open-webui
+!Dockerfile.grafana
 !go.mod
 !main.go
 !main_test.go
+!cmd/
+!cmd/extract-plugin/
+!cmd/extract-plugin/main.go
+!cmd/extract-plugin/main_test.go
 !patch_openwebui_oauth.py
 !verify_openwebui_oauth.py

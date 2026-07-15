@@ -205,6 +205,11 @@ docker_networks:
   # `internal: true`. This ordinary no-peer bridge exists only for traefik-int;
   # DOCKER-USER and the native nft guard deny every bridge-originated egress.
   - { name: net-int-edge,      bridge: br-int-edge, subnet: 172.28.19.0/24, internal: false }
+  # Owner-approved admin observability path: Grafana's read-only LiteLLM spend
+  # datasource reaches Postgres over its own dedicated per-client DB bridge
+  # (same isolation pattern as net-db-litellm/keycloak/rotator). Grafana still
+  # has no route to LiteLLM's API and LiteLLM none to Grafana.
+  - { name: net-db-grafana,    bridge: br-db-graf, subnet: 172.28.20.0/24, internal: true }
 
 net_egress_subnet: 172.28.0.0/24
 
@@ -425,7 +430,8 @@ aigw_seed_test_users: false
 #
 # ── Overlay MUST define ALL of these ────────────────────────────────────
 #   pg_super_password         pg_litellm_password        pg_keycloak_password
-#   pg_rotator_password       kc_admin_password          litellm_master_key
+#   pg_rotator_password       pg_grafana_ro_password
+#   kc_admin_password         litellm_master_key
 #   litellm_salt_key          redis_password             webui_litellm_key
 #   webui_secret_key          webui_oidc_client_secret
 #   portal_oidc_client_secret admin_portal_oidc_client_secret
@@ -447,6 +453,9 @@ aigw_seed_test_users: false
 # pg_litellm_password:        <vault overlay only>
 # pg_keycloak_password:       <vault overlay only>
 # pg_rotator_password:        <vault overlay only>
+# pg_grafana_ro_password:     <vault overlay only>  # READ-ONLY reporting role:
+#     Grafana's provisioned LiteLLM spend datasource. SELECT on the reviewed
+#     spend/token/user tables only; never a write-capable credential.
 # kc_admin_password:          <vault overlay only>
 # litellm_master_key:         <vault overlay only>
 # litellm_salt_key:           <vault overlay only>

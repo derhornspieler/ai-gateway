@@ -1378,6 +1378,8 @@
             "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/ai-gateway-overview.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/ai-gateway-top-projects.json": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/ai-gateway-top-users.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/edge-identity-services.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/grafana-lgtm-stack.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/rocky9-host.json": ("file", 0, 0, 0o644),
@@ -1385,6 +1387,7 @@
             "grafana/provisioning/datasources/datasources.yml": ("file", 0, 0, 0o644),
             "grafana/provisioning/plugins": ("dir", 0, 0, 0o755),
             "grafana/provisioning/plugins/empty.yml": ("file", 0, 0, 0o644),
+            "grafana/provisioning/plugins/loki-drilldown.yml": ("file", 0, 0, 0o644),
             "keycloak/realms": ("dir", 0, 65532, 0o750),
             "keycloak/realms/aigw-realm.json": ("file", 0, 65532, 0o640),
             "keycloak/realms/anthropic-wif-realm.json": ("file", 0, 65532, 0o640),
@@ -1605,9 +1608,24 @@
             ("Prometheus", "prometheus", "prometheus", "http://prometheus:9090"),
             ("Loki", "loki", "loki", "http://loki:3100"),
             ("Tempo", "tempo", "tempo", "http://tempo:3200"),
+            # Owner-approved read-only LiteLLM spend path (grafana_ro role,
+            # SELECT-only grants) over the dedicated net-db-grafana bridge.
+            (
+                "LiteLLM Spend",
+                "litellm-spend",
+                "grafana-postgresql-datasource",
+                "postgres:5432",
+            ),
         }
         if actual != expected:
             raise SystemExit("Grafana datasource graph does not match the reviewed provisioning")
+        # The sole permitted app plugin is the vendored, image-baked Loki
+        # drilldown, provisioned enabled; plugin download/admin stays off.
+        plugin_rows = set(
+            database.execute("SELECT plugin_id, enabled FROM plugin_setting")
+        )
+        if plugin_rows != {("grafana-lokiexplore-app", 1)}:
+            raise SystemExit("Grafana plugin inventory does not match the reviewed provisioning")
         # Grafana 12 file provisioning writes dashboards to unified storage;
         # the legacy dashboard/dashboard_provisioning tables remain empty.
         # Parse the stored resource JSON in Python so verification does not
@@ -1625,7 +1643,7 @@
                 """
             )
         )
-        if len(resources) != 7:
+        if len(resources) != 9:
             raise SystemExit("Grafana unified-storage resource inventory is not exact")
 
         expected_dashboards = {
@@ -1640,6 +1658,14 @@
             "aigw-request-audit": (
                 "AI Gateway Request Audit",
                 "/etc/grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
+            ),
+            "aigw-top-projects": (
+                "AI Gateway Top Projects",
+                "/etc/grafana/provisioning/dashboards/json/ai-gateway-top-projects.json",
+            ),
+            "aigw-top-users": (
+                "AI Gateway Top Users",
+                "/etc/grafana/provisioning/dashboards/json/ai-gateway-top-users.json",
             ),
             "aigw-edge-identity": (
                 "Edge, Egress and Identity Services",

@@ -371,11 +371,11 @@ inside the edge process.
 
 ## Docker network segmentation
 
-There is no flat `net-backend`. The `docker_networks` role pre-creates all 20
+There is no flat `net-backend`. The `docker_networks` role pre-creates all 21
 bridges (`172.28.0.0/24` through `172.28.19.0/24`) as `external: true` with
 stable, sub-16-character Linux bridge names and IPv6 disabled; each container
 receives the `.128/25` half of its subnet. The base Compose project attaches to
-18 of them, and the lab overlay adds `net-identity` and `net-lab-dns`.
+19 of them, and the lab overlay adds `net-identity` and `net-lab-dns`.
 Five bridges are ordinary `internal: false` — the three physical planes
 (`net-egress`, `net-adm`, `net-internal`) plus the two no-peer port-publication
 bridges (`net-int-edge`, `net-lab-dns`) — while every application/data plane is
@@ -397,6 +397,7 @@ host firewall layers still deny their container-originated egress.
 | `net-db-litellm` / `br-db-llm` | `172.28.9.0/24` | LiteLLM, Postgres |
 | `net-db-keycloak` / `br-db-kc` | `172.28.10.0/24` | Keycloak, Postgres |
 | `net-db-rotator` / `br-db-rot` | `172.28.11.0/24` | key-rotator, Postgres |
+| `net-db-grafana` / `br-db-graf` | `172.28.20.0/24` | Grafana (read-only spend datasource), Postgres |
 | `net-cache` / `br-cache` | `172.28.12.0/24` | LiteLLM, Redis |
 | `net-telemetry` / `br-otel` | `172.28.13.0/24` | LiteLLM, dev/admin portals, key-rotator, Alloy (`.2`) |
 | `net-metrics` / `br-metrics` | `172.28.14.0/24` | both Traefik instances, Keycloak, Envoy, Prometheus, node-exporter |

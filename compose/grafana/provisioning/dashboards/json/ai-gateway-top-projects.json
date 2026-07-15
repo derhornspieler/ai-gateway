@@ -1,0 +1,275 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Top-5 projects by LiteLLM-computed dollar spend and token volume over the selected time range. Source of truth is LiteLLM's own metadata-only spend ledger (read-only grafana_ro PostgreSQL datasource); every query is bounded top-N SQL, never a high-cardinality metric label.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "AI Gateway Top Users",
+      "type": "link",
+      "url": "/d/aigw-top-users/ai-gateway-top-users"
+    },
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "AI Gateway Overview",
+      "type": "link",
+      "url": "/d/aigw-overview/ai-gateway-overview"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "LiteLLM-computed spend per project (LiteLLM_SpendLogs joined to the issuing key's aigw_project_id metadata). Keys without portal project metadata report as 'unattributed'.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "decimals": 4,
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 60,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "top",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^spend_usd$/",
+          "values": true
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(NULLIF(vt.metadata ->> 'aigw_project_id', ''), 'unattributed') AS \"project\",\n  SUM(sl.spend) AS \"spend_usd\"\nFROM \"LiteLLM_SpendLogs\" sl\nLEFT JOIN \"LiteLLM_VerificationToken\" vt ON vt.token = sl.api_key\nWHERE $__timeFilter(sl.\"startTime\")\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 5",
+          "refId": "A"
+        }
+      ],
+      "title": "Top 5 Projects by Spend",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "Total tokens (prompt + completion) per project over the selected range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 60,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "top",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^total_tokens$/",
+          "values": true
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(NULLIF(vt.metadata ->> 'aigw_project_id', ''), 'unattributed') AS \"project\",\n  SUM(sl.total_tokens) AS \"total_tokens\"\nFROM \"LiteLLM_SpendLogs\" sl\nLEFT JOIN \"LiteLLM_VerificationToken\" vt ON vt.token = sl.api_key\nWHERE $__timeFilter(sl.\"startTime\")\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 5",
+          "refId": "A"
+        }
+      ],
+      "title": "Top 5 Projects by Token Volume",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "Spend over time for the five projects with the highest spend in the selected range (bounded CTE — the series set can never exceed six).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 1,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "decimals": 4,
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "WITH top_projects AS (\n  SELECT COALESCE(NULLIF(vt.metadata ->> 'aigw_project_id', ''), 'unattributed') AS project\n  FROM \"LiteLLM_SpendLogs\" sl\n  LEFT JOIN \"LiteLLM_VerificationToken\" vt ON vt.token = sl.api_key\n  WHERE $__timeFilter(sl.\"startTime\")\n  GROUP BY 1\n  ORDER BY SUM(sl.spend) DESC\n  LIMIT 5\n)\nSELECT\n  $__timeGroupAlias(sl.\"startTime\", $__interval),\n  COALESCE(NULLIF(vt.metadata ->> 'aigw_project_id', ''), 'unattributed') AS \"metric\",\n  SUM(sl.spend) AS \"spend_usd\"\nFROM \"LiteLLM_SpendLogs\" sl\nLEFT JOIN \"LiteLLM_VerificationToken\" vt ON vt.token = sl.api_key\nWHERE $__timeFilter(sl.\"startTime\")\n  AND COALESCE(NULLIF(vt.metadata ->> 'aigw_project_id', ''), 'unattributed')\n      IN (SELECT project FROM top_projects)\nGROUP BY 1, 2\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Top-5 Project Spend Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "Request, token, and spend detail for the top five projects by spend.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "spend_usd"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 4,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(NULLIF(vt.metadata ->> 'aigw_project_id', ''), 'unattributed') AS \"project\",\n  COUNT(*) AS \"requests\",\n  SUM(sl.prompt_tokens) AS \"prompt_tokens\",\n  SUM(sl.completion_tokens) AS \"completion_tokens\",\n  SUM(sl.total_tokens) AS \"total_tokens\",\n  SUM(sl.spend) AS \"spend_usd\"\nFROM \"LiteLLM_SpendLogs\" sl\nLEFT JOIN \"LiteLLM_VerificationToken\" vt ON vt.token = sl.api_key\nWHERE $__timeFilter(sl.\"startTime\")\nGROUP BY 1\nORDER BY 6 DESC\nLIMIT 5",
+          "refId": "A"
+        }
+      ],
+      "title": "Top 5 Projects — Detail",
+      "type": "table"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 42,
+  "tags": [
+    "ai-gateway",
+    "cost",
+    "litellm"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AI Gateway Top Projects",
+  "uid": "aigw-top-projects",
+  "version": 1,
+  "weekStart": ""
+}

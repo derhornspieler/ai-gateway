@@ -1,0 +1,390 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Top-10 users by LiteLLM-computed dollar spend and token volume over the selected time range. Source of truth is LiteLLM's own metadata-only spend ledger (read-only grafana_ro PostgreSQL datasource); every query is bounded top-N SQL, never a high-cardinality metric label. Open WebUI traffic reports under its shared svc-open-webui service identity, not per browser user.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "AI Gateway Top Projects",
+      "type": "link",
+      "url": "/d/aigw-top-projects/ai-gateway-top-projects"
+    },
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "AI Gateway Overview",
+      "type": "link",
+      "url": "/d/aigw-overview/ai-gateway-overview"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "LiteLLM-computed spend per authenticated key owner (LiteLLM_SpendLogs.\"user\", alias from LiteLLM_UserTable when present).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "decimals": 4,
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 40,
+        "minVizHeight": 12,
+        "minVizWidth": 8,
+        "namePlacement": "top",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^spend_usd$/",
+          "values": true
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(NULLIF(ut.user_alias, ''), NULLIF(sl.\"user\", ''), 'unattributed') AS \"user\",\n  SUM(sl.spend) AS \"spend_usd\"\nFROM \"LiteLLM_SpendLogs\" sl\nLEFT JOIN \"LiteLLM_UserTable\" ut ON ut.user_id = sl.\"user\"\nWHERE $__timeFilter(sl.\"startTime\")\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 10",
+          "refId": "A"
+        }
+      ],
+      "title": "Top 10 Users by Spend",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "Total tokens (prompt + completion) per user over the selected range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 40,
+        "minVizHeight": 12,
+        "minVizWidth": 8,
+        "namePlacement": "top",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^total_tokens$/",
+          "values": true
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(NULLIF(ut.user_alias, ''), NULLIF(sl.\"user\", ''), 'unattributed') AS \"user\",\n  SUM(sl.total_tokens) AS \"total_tokens\"\nFROM \"LiteLLM_SpendLogs\" sl\nLEFT JOIN \"LiteLLM_UserTable\" ut ON ut.user_id = sl.\"user\"\nWHERE $__timeFilter(sl.\"startTime\")\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 10",
+          "refId": "A"
+        }
+      ],
+      "title": "Top 10 Users by Token Volume",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "Spend over time for the ten users with the highest spend in the selected range (bounded CTE — the series set can never exceed eleven).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 1,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "decimals": 4,
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 10
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "WITH top_users AS (\n  SELECT COALESCE(NULLIF(sl.\"user\", ''), 'unattributed') AS user_id\n  FROM \"LiteLLM_SpendLogs\" sl\n  WHERE $__timeFilter(sl.\"startTime\")\n  GROUP BY 1\n  ORDER BY SUM(sl.spend) DESC\n  LIMIT 10\n)\nSELECT\n  $__timeGroupAlias(sl.\"startTime\", $__interval),\n  COALESCE(NULLIF(ut.user_alias, ''), NULLIF(sl.\"user\", ''), 'unattributed') AS \"metric\",\n  SUM(sl.spend) AS \"spend_usd\"\nFROM \"LiteLLM_SpendLogs\" sl\nLEFT JOIN \"LiteLLM_UserTable\" ut ON ut.user_id = sl.\"user\"\nWHERE $__timeFilter(sl.\"startTime\")\n  AND COALESCE(NULLIF(sl.\"user\", ''), 'unattributed') IN (SELECT user_id FROM top_users)\nGROUP BY 1, 2\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Top-10 User Spend Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "Request, token, and spend detail for the top ten users by spend.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "spend_usd"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 19
+      },
+      "id": 4,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(NULLIF(ut.user_alias, ''), NULLIF(sl.\"user\", ''), 'unattributed') AS \"user\",\n  COUNT(*) AS \"requests\",\n  SUM(sl.prompt_tokens) AS \"prompt_tokens\",\n  SUM(sl.completion_tokens) AS \"completion_tokens\",\n  SUM(sl.total_tokens) AS \"total_tokens\",\n  SUM(sl.spend) AS \"spend_usd\"\nFROM \"LiteLLM_SpendLogs\" sl\nLEFT JOIN \"LiteLLM_UserTable\" ut ON ut.user_id = sl.\"user\"\nWHERE $__timeFilter(sl.\"startTime\")\nGROUP BY 1\nORDER BY 6 DESC\nLIMIT 10",
+          "refId": "A"
+        }
+      ],
+      "title": "Top 10 Users — Detail",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "Share of input-side tokens served from the Anthropic prompt cache over the selected range (LiteLLM daily aggregates). Dollar spend on this dashboard already prices cache reads/writes correctly because it is LiteLLM's own computed spend, never tokens times a flat price.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 28
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^cache_read_share$/",
+          "values": true
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  SUM(dus.cache_read_input_tokens)::float8 /\n    NULLIF(SUM(dus.prompt_tokens + dus.cache_read_input_tokens + dus.cache_creation_input_tokens), 0)\n    AS \"cache_read_share\"\nFROM \"LiteLLM_DailyUserSpend\" dus\nWHERE dus.date::date >= $__timeFrom()::date\n  AND dus.date::date <= $__timeTo()::date",
+          "refId": "A"
+        }
+      ],
+      "title": "Prompt-Cache Read Share of Input Tokens",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "litellm-spend"
+      },
+      "description": "Daily input-side token split: fresh prompt tokens vs prompt-cache reads (priced ~0.1x) vs prompt-cache writes (priced ~1.25x). Surfaces the caching benefit without recomputing cost — spend panels stay on LiteLLM's cache-aware computed spend.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 1,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 18,
+        "x": 6,
+        "y": 28
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  dus.date::timestamp AS \"time\",\n  SUM(dus.prompt_tokens) AS \"fresh_prompt_tokens\",\n  SUM(dus.cache_read_input_tokens) AS \"cache_read_tokens\",\n  SUM(dus.cache_creation_input_tokens) AS \"cache_creation_tokens\"\nFROM \"LiteLLM_DailyUserSpend\" dus\nWHERE dus.date::date >= $__timeFrom()::date\n  AND dus.date::date <= $__timeTo()::date\nGROUP BY 1\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Cached vs Fresh Input Tokens (Daily)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 42,
+  "tags": [
+    "ai-gateway",
+    "cost",
+    "litellm"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AI Gateway Top Users",
+  "uid": "aigw-top-users",
+  "version": 1,
+  "weekStart": ""
+}

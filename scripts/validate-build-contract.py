@@ -15,6 +15,7 @@ DOCKERFILE_FRONTEND = (
 FRONTEND_DOCKERFILES = {
     "services/dev-portal/Dockerfile",
     "services/dhi-health-probe/Dockerfile",
+    "services/dhi-health-probe/Dockerfile.grafana",
     "services/dhi-health-probe/Dockerfile.open-webui",
     "services/egress-proxy/Dockerfile",
     "services/key-rotator/Dockerfile",
@@ -127,10 +128,15 @@ def main() -> None:
         "services/dhi-health-probe": {
             "*",
             "!Dockerfile",
+            "!Dockerfile.grafana",
             "!Dockerfile.open-webui",
             "!go.mod",
             "!main.go",
             "!main_test.go",
+            "!cmd/",
+            "!cmd/extract-plugin/",
+            "!cmd/extract-plugin/main.go",
+            "!cmd/extract-plugin/main_test.go",
             "!patch_openwebui_oauth.py",
             "!verify_openwebui_oauth.py",
         },

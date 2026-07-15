@@ -39,6 +39,7 @@
     {"name": "pg_litellm_password", "min_length": 24, "alphabet": "safe"},
     {"name": "pg_keycloak_password", "min_length": 24, "alphabet": "safe"},
     {"name": "pg_rotator_password", "min_length": 24, "alphabet": "safe"},
+    {"name": "pg_grafana_ro_password", "min_length": 24, "alphabet": "safe"},
     {"name": "kc_admin_password", "min_length": 24, "alphabet": "safe"},
     {"name": "litellm_master_key", "min_length": 32, "alphabet": "safe"},
     {"name": "litellm_salt_key", "min_length": 32, "alphabet": "safe"},
