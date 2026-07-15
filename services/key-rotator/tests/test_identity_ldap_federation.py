@@ -233,6 +233,9 @@ class RecordingKeycloak:
         self.probe_actions: list[str] = []
         self.created: dict | None = None
         self.deleted: list[str] = []
+        # Config-drift reconcile bookkeeping (LDAP-CONNURL).
+        self.updated: list[dict] = []
+        self.user_cache_cleared = False
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -243,6 +246,18 @@ class RecordingKeycloak:
             self.probe_actions.append(json.loads(request.content)["action"])
             if self.probe_status != 204:
                 return httpx.Response(self.probe_status, json={"error": "denied"})
+            return httpx.Response(204)
+        if request.method == "POST" and path.endswith("/clear-user-cache"):
+            self.user_cache_cleared = True
+            return httpx.Response(204)
+        if request.method == "PUT" and "/components/" in path:
+            import json
+
+            body = json.loads(request.content)
+            # The reconcile PUTs the full representation; adopt it so a
+            # subsequent re-fetch reflects the reconciled managed config.
+            self.existing = body
+            self.updated.append(body)
             return httpx.Response(204)
         if request.method == "GET" and path.endswith("/components"):
             # The mapper enumeration is a parent+type filtered lookup; keep it
@@ -497,6 +512,90 @@ async def test_an_existing_lab_provider_is_not_reproved() -> None:
     assert keycloak.probe_actions == []
     assert not any(path.endswith("/testLDAPConnection") for _, path in keycloak.calls)
     assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+    # Config already matched the desired spec: no drift reconcile, no PUT, no
+    # user-cache clear.
+    assert keycloak.updated == []
+    assert keycloak.user_cache_cleared is False
+
+
+def _drifted_lab_component(resolved: Settings, connection_url: str) -> dict:
+    return {
+        "id": "existing-uuid",
+        "name": LAB_LDAP_PROVIDER_NAME,
+        "providerId": "ldap",
+        "providerType": "org.keycloak.storage.UserStorageProvider",
+        "config": {
+            "enabled": ["true"],
+            "editMode": ["READ_ONLY"],
+            "importEnabled": ["true"],
+            "syncRegistrations": ["false"],
+            "authType": ["simple"],
+            "searchScope": ["2"],
+            "useTruststoreSpi": ["always"],
+            "startTls": ["false"],
+            "allowKerberosAuthentication": ["false"],
+            "useKerberosForPasswordAuthentication": ["false"],
+            "vendor": ["ad"],
+            "usernameLDAPAttribute": ["sAMAccountName"],
+            "rdnLDAPAttribute": ["cn"],
+            "uuidLDAPAttribute": ["objectGUID"],
+            "userObjectClasses": ["person, organizationalPerson, user"],
+            "connectionUrl": [connection_url],
+            "usersDn": [resolved.lab_samba_users_dn],
+            "bindDn": [resolved.lab_samba_bind_dn],
+            "bindCredential": ["**********"],
+            "customUserSearchFilter": [
+                "(&(objectCategory=person)(objectClass=user)"
+                "(!(sAMAccountName=svc-keycloak-ldap)))"
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_existing_lab_provider_drifted_connection_url_is_reconciled() -> None:
+    """LDAP-CONNURL (proved live): after the Samba LDAPS endpoint moved from the
+    bare host `samba-ad` to its FQDN, the live lab-samba-ad provider still held
+    ``ldaps://samba-ad:636`` and every federated login failed hostname
+    verification. A create-or-verify that never mutates leaves that drift in
+    place (pre-fix it instead RAISED "inventory-bound"). The reconcile now pushes
+    the desired managed config back onto the existing component and clears the
+    user cache, preserving the component id/name/providerId and the READ_ONLY /
+    syncRegistrations=false posture.
+    """
+    resolved = settings(LAB_SAMBA_LDAP_ENABLED=True)
+    desired_url = resolved.lab_samba_ldap_url
+    assert desired_url == "ldaps://samba-ad.aigw.aegisgroup.ch:636"
+    keycloak = RecordingKeycloak(
+        existing=_drifted_lab_component(resolved, "ldaps://samba-ad:636"),
+        mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS,
+    )
+    admin = admin_for(keycloak, resolved)
+
+    # The lab needs no bind password and no live directory probe.
+    assert await admin._ensure_ldap_federation("bootstrap-token", None) == "existing-uuid"
+    assert keycloak.probe_actions == []
+    # Exactly one PUT that fixes the connectionUrl, plus a user-cache clear.
+    assert len(keycloak.updated) == 1
+    put = keycloak.updated[0]
+    assert put["id"] == "existing-uuid"
+    assert put["name"] == LAB_LDAP_PROVIDER_NAME
+    assert put["providerId"] == "ldap"
+    assert put["config"]["connectionUrl"] == [desired_url]
+    # Preserved posture and secret handling.
+    assert put["config"]["editMode"] == ["READ_ONLY"]
+    assert put["config"]["syncRegistrations"] == ["false"]
+    assert put["config"]["bindCredential"] == ["**********"]
+    assert keycloak.user_cache_cleared is True
+    # Never re-created.
+    assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+
+    # Idempotent: a second converge now sees no drift and issues no further PUT
+    # or cache clear.
+    keycloak.user_cache_cleared = False
+    assert await admin._ensure_ldap_federation("bootstrap-token", None) == "existing-uuid"
+    assert len(keycloak.updated) == 1
+    assert keycloak.user_cache_cleared is False
 
 
 @pytest.mark.parametrize(

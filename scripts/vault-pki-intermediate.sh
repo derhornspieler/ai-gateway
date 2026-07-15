@@ -461,12 +461,15 @@ EOF
     require_key_input  "$INTERMEDIATE_KEY" "--intermediate-key"
 
     # FULL crypto validation BEFORE any Vault mutation. edge-tls.py proves the
-    # supplied cert is a non-self-signed CA that can sign, the key matches THAT
-    # cert (a supplied root key fails here), the key file holds exactly one
-    # private key (a smuggled root key is refused), the chain verifies to a
-    # self-signed root, and -- because this mode holds the intermediate key -- an
-    # offline test leaf proves aigw_domain (and samba-ad.$DOMAIN) fall inside the
-    # CA name-constraint subtree. A failure aborts before Vault is touched.
+    # supplied --intermediate file holds exactly ONE non-self-signed CA cert that
+    # can sign (a multi-cert intermediate+root file is refused so the root can
+    # never be imported as a keyless issuer), the key matches THAT cert (a
+    # supplied root key fails here), the key file holds exactly one private key (a
+    # smuggled root key is refused), the chain verifies to a self-signed root,
+    # and -- because this mode holds the intermediate key -- an offline test leaf
+    # (*.$DOMAIN + apex $DOMAIN, exactly what Vault issues) proves aigw_domain
+    # falls inside the CA name-constraint subtree. A failure aborts before Vault
+    # is touched.
     python3 -I "$STACK_DIR/scripts/edge-tls.py" validate-intermediate \
         --intermediate      "$INTERMEDIATE" \
         --intermediate-key  "$INTERMEDIATE_KEY" \
@@ -484,14 +487,26 @@ EOF
     # Import the operator intermediate (KEY then CERT, exactly two blocks) over
     # STDIN. issuers/import/bundle imports every certificate it finds as an
     # issuer, so the customer ROOT is deliberately NOT included: it would import
-    # the root as a keyless Vault issuer -- unwanted trust surface. The key bytes
-    # reach Vault only through this pipe, never argv, never an env var, never a
-    # log. import returns the created issuer id in imported_issuers[0].
+    # the root as a keyless Vault issuer -- unwanted trust surface. edge-tls.py
+    # validate-intermediate already rejects a multi-cert --intermediate file, and
+    # as defense in depth we forward ONLY the first PEM certificate block here, so
+    # a concatenated intermediate+root can never reach Vault even if validation is
+    # bypassed. The key bytes reach Vault only through this pipe, never argv, never
+    # an env var, never a log. import returns the created issuer id in
+    # imported_issuers[0].
     imported="$(
       INT_KEY="$INTERMEDIATE_KEY" INT_CERT="$INTERMEDIATE" python3 -I -c '
 import os, sys
 key = open(os.environ["INT_KEY"], encoding="ascii").read().rstrip("\n") + "\n"
-cert = open(os.environ["INT_CERT"], encoding="ascii").read().rstrip("\n") + "\n"
+raw = open(os.environ["INT_CERT"], encoding="ascii").read()
+BEGIN = "-----BEGIN CERTIFICATE-----"
+END = "-----END CERTIFICATE-----"
+start = raw.find(BEGIN)
+end = raw.find(END, start)
+if start < 0 or end < 0:
+    raise SystemExit("no PEM certificate block in the intermediate file")
+# ONLY the first certificate block: never a trailing root concatenated after it.
+cert = raw[start:end + len(END)].rstrip("\n") + "\n"
 sys.stdout.write(key + cert)
 ' \
       | vlt write -format=json pki_int/issuers/import/bundle pem_bundle=- \

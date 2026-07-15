@@ -161,6 +161,19 @@ class IdentityConflict(IdentityError):
     pass
 
 
+class TransientIdentityError(IdentityError):
+    """A transient Keycloak-side failure (a 5xx / server error).
+
+    Distinct from a semantic refusal so a caller that must not mistake a network
+    blip or server error for a definitive answer can fail loudly instead of
+    drawing a wrong conclusion. It is a subclass of :class:`IdentityError`, so
+    every existing ``except IdentityError`` still catches it unchanged; only a
+    handler that explicitly distinguishes it (the prebootstrap OIDC
+    redirect-URI reconcile, which otherwise reads a definitive refusal as "the
+    temporary bootstrap client was consumed") behaves differently.
+    """
+
+
 PortalKeyRevoker = Callable[[str, str], Awaitable[None]]
 
 
@@ -227,10 +240,18 @@ class KeycloakAdmin:
         if response.status_code not in expected:
             # Keycloak error bodies can echo DNs, usernames, or credential
             # configuration. Keep those out of portal errors and telemetry.
-            raise IdentityError(
+            detail = (
                 f"Keycloak rejected {method.upper()} {path} "
                 f"(HTTP {response.status_code})"
             )
+            if 500 <= response.status_code < 600:
+                # A 5xx is a transient server-side failure, never a definitive
+                # semantic answer. Surface it as the transient subclass so a
+                # caller that must not confuse it with a genuine refusal (e.g. a
+                # deleted bootstrap client) can fail loudly rather than draw a
+                # wrong conclusion.
+                raise TransientIdentityError(detail)
+            raise IdentityError(detail)
         return response
 
     @staticmethod
@@ -757,13 +778,23 @@ class KeycloakAdmin:
             return "rebootstrap_required"
         try:
             admin_token = await self._bootstrap_token()
+        except TransientIdentityError:
+            # A Keycloak 5xx at the token endpoint is a transient server-side
+            # failure, NOT proof the temporary bootstrap client was consumed.
+            # Failing closed to rebootstrap_required here would go GREEN with
+            # stale SSO callbacks and misdirect the operator to re-run the
+            # identity bootstrap when the real cause was a blip. Fail the
+            # converge loudly instead so it is retried. (A connection error or
+            # timeout is likewise not an IdentityError and already propagates
+            # loudly past this handler.)
+            raise
         except IdentityError:
-            # The temporary master-realm client has been deleted by the
-            # interactive bootstrap ceremony (or Keycloak is transiently
-            # unreachable — the converge waits for Keycloak health first).
-            # Either way this routine converge cannot manage clients; report the
-            # required operator ceremony instead of failing or falsely claiming
-            # success while SSO stays broken.
+            # The temporary master-realm client answered definitively that it no
+            # longer exists / is unauthorized (e.g. 401 invalid_client): the
+            # interactive bootstrap ceremony has consumed it. This routine
+            # converge holds no client-management authority; report the required
+            # operator ceremony instead of failing or falsely claiming success
+            # while SSO stays broken. This is the designed non-fatal path.
             return "rebootstrap_required"
         changed = await self._reconcile_relying_party_redirect_uris(admin_token)
         return "applied" if changed else "verified"
@@ -1918,6 +1949,73 @@ class KeycloakAdmin:
                     "the directory connection or bind credential failed verification"
                 ) from exc
 
+    async def _clear_realm_user_cache(self, admin_token: str) -> None:
+        """Evict already-imported federated users for the realm.
+
+        A changed connection/config only takes effect for users Keycloak has
+        already imported once the realm user cache is cleared; without this a
+        reconciled connectionUrl keeps serving the stale cached user and the
+        LDAPS endpoint move appears not to have taken.
+        """
+        safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        await self._request(
+            "POST",
+            f"/admin/realms/{safe_realm}/clear-user-cache",
+            token=admin_token,
+            expected=(204,),
+        )
+
+    async def _reconcile_ldap_component_config(
+        self, existing: dict[str, Any], spec: LdapFederationSpec, admin_token: str
+    ) -> str:
+        """Push the spec-owned managed LDAP config onto an existing provider.
+
+        Only the non-secret, inventory-owned fields in
+        :meth:`_managed_ldap_config` are managed; the component id, name,
+        providerId, parentId, and every unmanaged/secret field (Keycloak masks
+        ``bindCredential`` on reads) are preserved untouched. Idempotent: no PUT
+        is issued when the managed fields already match, so a correctly
+        provisioned provider never churns and no user cache is cleared. When a
+        field DID drift, the update is applied, the realm user cache is cleared,
+        and the component is re-fetched, then the strict inventory-bound + mapper
+        verification runs against the reconciled representation.
+        """
+        safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        component_id = path_segment(existing.get("id"), label="LDAP provider UUID")
+        current_config = existing.get("config")
+        current_config = (
+            dict(current_config) if isinstance(current_config, dict) else {}
+        )
+        desired = {
+            name: [value] for name, value in self._managed_ldap_config(spec).items()
+        }
+        changed = any(
+            current_config.get(name) != value for name, value in desired.items()
+        )
+        if changed:
+            merged = dict(current_config)
+            merged.update(desired)
+            updated = dict(existing)
+            updated["config"] = merged
+            await self._request(
+                "PUT",
+                f"/admin/realms/{safe_realm}/components/{component_id}",
+                token=admin_token,
+                json_body=updated,
+                expected=(204,),
+            )
+            await self._clear_realm_user_cache(admin_token)
+            refreshed = await self._find_component(
+                self.settings.identity_realm, spec.provider_name, admin_token
+            )
+            if refreshed is None:
+                raise IdentityError(
+                    "the LDAP federation component vanished during reconcile"
+                )
+        else:
+            refreshed = existing
+        return await self._verify_bound_ldap_component(refreshed, admin_token)
+
     def _require_ldap_bind_password(self, bind_password: str | None) -> str:
         if (
             not isinstance(bind_password, str)
@@ -1938,11 +2036,25 @@ class KeycloakAdmin:
             self.settings.identity_realm, spec.provider_name, admin_token
         )
         if existing is not None:
-            component_id = await self._verify_bound_ldap_component(
-                existing, admin_token
+            # Reconcile drifted MANAGED config on an already-existing provider
+            # BEFORE verifying it. The live regression (LDAP-CONNURL): after the
+            # lab DC's LDAPS endpoint moved from the bare host `samba-ad` to its
+            # FQDN (so the customer-CA leaf's only SAN is the FQDN), the persisted
+            # connectionUrl `ldaps://samba-ad:636` broke Keycloak's hostname
+            # verification on EVERY federated login ("No subject alternative DNS
+            # name matching samba-ad found") while the component still "looked"
+            # provisioned. A create-or-verify that never mutates leaves that drift
+            # in place. Push the spec-owned managed fields (connectionUrl,
+            # editMode, vendor, usersDn, bindDn, useTruststoreSpi, ...) to the
+            # desired values, clearing the realm user cache when anything changed
+            # so the new connection takes effect for already-imported users, then
+            # run the strict inventory-bound + mapper verification (which now
+            # matches).
+            component_id = await self._reconcile_ldap_component_config(
+                existing, spec, admin_token
             )
-            # An EXISTING external provider whose top-level config still equals
-            # the inventory contract is NOT proof that a login will succeed: a
+            # An EXISTING external provider whose managed config equals the
+            # inventory contract is still NOT proof that a login will succeed: a
             # rotated DC certificate, a swapped/wrong CA truststore, or a
             # rotated bind credential all keep the persisted config identical
             # while breaking the live LDAPS handshake or bind. Re-exercise the
@@ -2055,6 +2167,42 @@ class KeycloakAdmin:
             raise
         return component_id
 
+    @staticmethod
+    def _managed_ldap_config(spec: LdapFederationSpec) -> dict[str, str]:
+        """The exact spec-owned, NON-SECRET LDAP config fields this controller
+        manages, as scalar values.
+
+        Single source of truth for both the strict inventory-bound verification
+        (:meth:`_verify_ldap_component`) and the drift reconcile
+        (:meth:`_reconcile_ldap_component_config`), so a reconcile always
+        converges to a state the verification accepts, with no churn. The bind
+        credential is deliberately excluded: Keycloak masks it on reads, so it
+        can neither be verified nor idempotently reconciled here.
+        """
+        return {
+            "enabled": "true",
+            # Security-critical values stay literal: a drifted provider that
+            # writes back to the directory or self-registers users is refused.
+            "editMode": "READ_ONLY",
+            "importEnabled": "true",
+            "syncRegistrations": "false",
+            "authType": "simple",
+            "searchScope": "2",
+            "useTruststoreSpi": "always",
+            "startTls": "false",
+            "allowKerberosAuthentication": "false",
+            "useKerberosForPasswordAuthentication": "false",
+            "vendor": spec.vendor,
+            "usernameLDAPAttribute": spec.username_attribute,
+            "rdnLDAPAttribute": spec.rdn_attribute,
+            "uuidLDAPAttribute": spec.uuid_attribute,
+            "userObjectClasses": spec.user_object_classes,
+            "connectionUrl": spec.connection_url,
+            "usersDn": spec.users_dn,
+            "bindDn": spec.bind_dn,
+            "customUserSearchFilter": spec.user_filter,
+        }
+
     def _verify_ldap_component(self, component: dict[str, Any]) -> str:
         """Fail closed if the inventory-bound federation name points elsewhere.
 
@@ -2080,29 +2228,7 @@ class KeycloakAdmin:
         config = component.get("config")
         if not isinstance(config, dict):
             raise IdentityConflict("the LDAP federation is not inventory-bound")
-        expected = {
-            "enabled": "true",
-            # Security-critical values stay literal: a drifted provider that
-            # writes back to the directory or self-registers users is refused.
-            "editMode": "READ_ONLY",
-            "importEnabled": "true",
-            "syncRegistrations": "false",
-            "authType": "simple",
-            "searchScope": "2",
-            "useTruststoreSpi": "always",
-            "startTls": "false",
-            "allowKerberosAuthentication": "false",
-            "useKerberosForPasswordAuthentication": "false",
-            "vendor": spec.vendor,
-            "usernameLDAPAttribute": spec.username_attribute,
-            "rdnLDAPAttribute": spec.rdn_attribute,
-            "uuidLDAPAttribute": spec.uuid_attribute,
-            "userObjectClasses": spec.user_object_classes,
-            "connectionUrl": spec.connection_url,
-            "usersDn": spec.users_dn,
-            "bindDn": spec.bind_dn,
-            "customUserSearchFilter": spec.user_filter,
-        }
+        expected = self._managed_ldap_config(spec)
         if any(config.get(name) != [value] for name, value in expected.items()):
             raise IdentityConflict("the LDAP federation is not inventory-bound")
         return path_segment(component.get("id"), label="LDAP provider UUID")

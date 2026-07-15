@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import sys
 
+import httpx
 import pytest
 
 from app import reconcile_oidc_redirect_uris
@@ -20,6 +21,7 @@ from app.identity import (
     RELYING_PARTY_CLIENT_IDS,
     IdentityError,
     KeycloakAdmin,
+    TransientIdentityError,
 )
 
 
@@ -203,6 +205,48 @@ async def test_missing_managed_client_fails_loudly_not_silently() -> None:
     del admin.clients["admin-ui"]
     with pytest.raises(IdentityError, match="admin-ui is missing"):
         await admin.reconcile_prebootstrap_relying_party_redirect_uris()
+
+
+@pytest.mark.asyncio
+async def test_transient_5xx_token_failure_fails_loudly_not_rebootstrap() -> None:
+    """SSO-LOW: a Keycloak 5xx at the master-realm token endpoint is a TRANSIENT
+    failure, NOT proof the temporary bootstrap client was consumed.
+
+    Treating it as ``rebootstrap_required`` (rc 0) would let the converge go
+    GREEN with stale SSO callbacks and misdirect the operator to re-run the
+    identity bootstrap when the real cause was a blip. It must fail the converge
+    loudly. Driven through the real ``_request`` -> ``_bootstrap_token`` chain so
+    the classification the fix adds is exercised end to end.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/protocol/openid-connect/token")
+        return httpx.Response(503, json={"error": "server_error"})
+
+    admin = KeycloakAdmin(
+        settings(), VaultMustNotBeUsed(), None, transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(TransientIdentityError):
+        await admin.reconcile_prebootstrap_relying_party_redirect_uris()
+
+
+@pytest.mark.asyncio
+async def test_genuine_invalid_client_still_maps_to_rebootstrap_required() -> None:
+    """SSO-LOW: a definitive 401 invalid_client (the interactive bootstrap
+    ceremony deleted the temporary client) stays the DESIGNED non-fatal path and
+    still reports ``rebootstrap_required`` (rc 0), never failing the converge."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/protocol/openid-connect/token")
+        return httpx.Response(401, json={"error": "invalid_client"})
+
+    admin = KeycloakAdmin(
+        settings(), VaultMustNotBeUsed(), None, transport=httpx.MockTransport(handler)
+    )
+    assert (
+        await admin.reconcile_prebootstrap_relying_party_redirect_uris()
+        == "rebootstrap_required"
+    )
 
 
 def test_post_bootstrap_controller_never_gains_manage_clients() -> None:

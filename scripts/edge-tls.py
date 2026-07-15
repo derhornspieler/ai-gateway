@@ -53,6 +53,13 @@ CHAIN_NEEDS_ROOT_HINT = (
     "root CA certificate; a leaf+intermediate bundle is not sufficient"
 )
 
+# The single synthetic one-label host used to exercise the wildcard in the
+# name-constraint self-test. It stands in for "any *.DOMAIN leaf Vault's aigw
+# role issues"; it is never a real published vhost, so the self-test never
+# demands that a specific service name (e.g. samba-ad) be permitted by the
+# customer CA -- the gateway only issues *.DOMAIN and the apex DOMAIN.
+NAME_CONSTRAINT_PROBE_LABEL = "aigw-nc-probe"
+
 
 class CheckFailure(Exception):
     """A named validation check refused the supplied material."""
@@ -505,10 +512,19 @@ def check_intermediate_name_constraints(
 
     Because this mode holds the intermediate's PRIVATE KEY, it can do what no
     other mode can: sign a throwaway test leaf under the SUPPLIED intermediate
-    and run the exact `openssl verify` the real edge and Samba leaves get. If
-    the root (or the intermediate itself) carries DNS name constraints that do
-    not permit `domain`, OpenSSL returns error 47 and its verbatim "permitted
-    subtree violation" is surfaced -- fail closed BEFORE any Vault mutation.
+    and run the exact `openssl verify` the real edge leaves get. If the root (or
+    the intermediate itself) carries DNS name constraints that do not permit
+    `domain`, OpenSSL returns error 47 and its verbatim "permitted subtree
+    violation" is surfaced -- fail closed BEFORE any Vault mutation.
+
+    The test leaf mirrors EXACTLY what Vault's `aigw` role issues: the wildcard
+    `*.DOMAIN` and the apex `DOMAIN`, and nothing else. A one-label probe host
+    under the wildcard plus the apex together exercise the whole namespace the
+    gateway ever certifies. It deliberately does NOT probe a specific service
+    host such as `samba-ad.DOMAIN`: that leaf is lab-only, is covered by the
+    wildcard when issued, and pinning it here would false-reject a production
+    intermediate whose name constraints exclude that one host even though the
+    gateway never issues it.
 
     The intermediate's private key reaches openssl only as `-CAkey <path>`; the
     signed test leaf is written to the temp dir, never to a stream this process
@@ -536,7 +552,7 @@ def check_intermediate_name_constraints(
             check_name="name-constraints",
         )
         test_ext.write_text(
-            f"subjectAltName=DNS:*.{domain},DNS:{domain},DNS:samba-ad.{domain}\n"
+            f"subjectAltName=DNS:*.{domain},DNS:{domain}\n"
             "extendedKeyUsage=serverAuth\n"
             "basicConstraints=critical,CA:FALSE\n",
             encoding="utf-8",
@@ -551,7 +567,7 @@ def check_intermediate_name_constraints(
             "verify", "-CAfile", str(roots_file), "-untrusted", str(untrusted_file),
             "-purpose", "sslserver",
         ]
-        for hostname in (f"portal.{domain}", f"samba-ad.{domain}"):
+        for hostname in (f"{NAME_CONSTRAINT_PROBE_LABEL}.{domain}", domain):
             code, out, err = openssl.try_run(*base, "-verify_hostname", hostname, str(test_leaf))
             if code != 0:
                 fail(
@@ -835,6 +851,20 @@ def command_validate_intermediate(arguments: argparse.Namespace) -> int:
     # 2. no smuggled private key in either public file (the root/issuing key must
     #    never be supplied); read_certificate_file refuses `PRIVATE KEY`.
     intermediate_pems = read_certificate_file(intermediate, "--intermediate")
+    # EXACTLY ONE certificate. A multi-cert --intermediate file (intermediate+root
+    # concatenated, which many CA tools emit) would be piped whole into
+    # pki_int/issuers/import/bundle by the shell ceremony, storing the customer
+    # ROOT as a keyless Vault issuer -- the exact "unwanted trust surface" the
+    # ceremony forbids. The root belongs in --chain, never in --intermediate.
+    if len(intermediate_pems) != 1:
+        fail(
+            "single-intermediate",
+            f"--intermediate must contain exactly one certificate; found "
+            f"{len(intermediate_pems)}. A multi-cert intermediate file (e.g. "
+            "intermediate+root concatenated) would import the customer root into "
+            "Vault as a keyless issuer. Supply the intermediate alone; put the "
+            "root (and any parent CAs) in --chain.",
+        )
     chain_pems = read_certificate_file(chain, "--chain")
     validate_intermediate_material(
         openssl,

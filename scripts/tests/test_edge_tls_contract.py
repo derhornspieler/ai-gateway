@@ -334,6 +334,10 @@ class EdgeTlsContractTests(unittest.TestCase):
             "validate-intermediate",
             # imported over the modern multi-issuer endpoint, KEY+CERT bundle on stdin
             "pki_int/issuers/import/bundle pem_bundle=-",
+            # PKI-B1 defense in depth: only the FIRST PEM certificate block of the
+            # --intermediate file is forwarded, so a concatenated intermediate+root
+            # can never reach Vault as a keyless issuer even if validation is bypassed.
+            "ONLY the first certificate block",
             "imported_issuers",
             # promotion + proof-by-fingerprint, mirroring install-signed
             "default_follows_latest_issuer=false",
@@ -375,13 +379,25 @@ class EdgeTlsContractTests(unittest.TestCase):
             "refusing to import a self-signed root CA",
             # exactly one private key block; a smuggled root key is refused
             "the intermediate key file must contain exactly one private key",
+            # PKI-B1: the --intermediate FILE must hold exactly one certificate;
+            # a multi-cert intermediate+root file (which would import the root as
+            # a keyless Vault issuer) is refused.
+            '"single-intermediate"',
+            "--intermediate must contain exactly one certificate",
             # Certificate Sign is required to issue leaves
             "Certificate Sign",
             # the offline test leaf runs the SAME verification the real leaves get
             "-verify_hostname",
             "permitted name-constraint subtree",
+            # PKI-B2: the name-constraint self-test uses a representative one-label
+            # probe host, not a pinned samba-ad hostname the gateway never issues
+            # in production.
+            "NAME_CONSTRAINT_PROBE_LABEL",
         ):
             self.assertIn(required, source)
+        # PKI-B2: the self-test no longer pins the lab-only samba-ad host, which
+        # would false-reject a production intermediate that excludes it.
+        self.assertNotIn("DNS:samba-ad.{domain}", source)
 
     def test_vault_bootstrap_accepts_customer_intermediate_and_defers_its_edge(self) -> None:
         text = VAULT_BOOTSTRAP.read_text(encoding="utf-8")
@@ -801,9 +817,14 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
             argv.extend([key, value])
         return self.run_edge_tls(*argv)
 
-    def _build_constrained_pki(self, permitted: str) -> tuple[Path, Path, Path]:
-        """Build root(nameConstraints permitted;DNS:<permitted>) -> intermediate.
-        Returns (intermediate_cert, intermediate_key, chain)."""
+    def _build_name_constrained_pki(self, constraints: str) -> tuple[Path, Path, Path]:
+        """Build root(nameConstraints=critical,<constraints>) -> intermediate.
+
+        ``constraints`` is the full OpenSSL nameConstraints value, so a caller
+        can supply both permitted and excluded subtrees (e.g.
+        ``permitted;DNS:aegisgroup.ch,excluded;DNS:samba-ad.aigw.aegisgroup.ch``).
+        Returns (intermediate_cert, intermediate_key, chain).
+        """
         work = Path(tempfile.mkdtemp(prefix="edge-tls-nc-pki-"))
         self.addCleanup(shutil.rmtree, work, ignore_errors=True)
         root = work / "root.pem"
@@ -813,7 +834,7 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
             "-subj", "/CN=Constrained Root CA",
             "-addext", "basicConstraints=critical,CA:TRUE",
             "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-            "-addext", f"nameConstraints=critical,permitted;DNS:{permitted}",
+            "-addext", f"nameConstraints=critical,{constraints}",
             "-keyout", str(root_key), "-out", str(root),
         )
         int_cert = work / "intermediate.pem"
@@ -842,6 +863,11 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
             encoding="utf-8",
         )
         return int_cert, int_key, chain
+
+    def _build_constrained_pki(self, permitted: str) -> tuple[Path, Path, Path]:
+        """Build root(nameConstraints permitted;DNS:<permitted>) -> intermediate.
+        Returns (intermediate_cert, intermediate_key, chain)."""
+        return self._build_name_constrained_pki(f"permitted;DNS:{permitted}")
 
     def test_valid_intermediate_passes(self) -> None:
         result = self.validate_intermediate()
@@ -968,6 +994,50 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
         self.assertEqual(inside.returncode, 0, inside.stderr)
         self.assertIn("edge-tls=valid", inside.stdout)
         self.assert_no_key_bytes(inside)
+
+    def test_multi_cert_intermediate_file_rejected(self) -> None:
+        # PKI-B1: a multi-cert --intermediate file (intermediate+root
+        # concatenated, which many CA tools emit) must be REFUSED. The shell
+        # ceremony pipes the whole --intermediate file into
+        # pki_int/issuers/import/bundle, so a trailing root would be stored as a
+        # keyless Vault issuer -- the exact "unwanted trust surface" the ceremony
+        # forbids. Pre-fix the validator inspected only intermediate_pems[0] and
+        # accepted the file (returncode 0); the fix rejects it.
+        two_cert = self.workspace / "intermediate-plus-root.pem"
+        two_cert.write_text(
+            self.intermediate.read_text(encoding="utf-8")
+            + self.root_cert.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        result = self.validate_intermediate(**{"--intermediate": str(two_cert)})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("single-intermediate", result.stderr)
+        self.assertIn("exactly one certificate", result.stderr)
+        self.assert_no_key_bytes(result)
+
+    def test_excluded_service_host_does_not_false_reject_intermediate(self) -> None:
+        # PKI-B2: the name-constraint self-test must reflect ONLY what Vault's
+        # aigw role issues -- the wildcard *.DOMAIN and the apex DOMAIN. A
+        # production CA can permit the whole one-label DOMAIN namespace yet
+        # EXCLUDE a specific service host the gateway never issues (here
+        # samba-ad.DOMAIN; Samba is a lab-only ceremony). Pre-fix the self-test
+        # probed samba-ad.DOMAIN and was false-rejected (returncode 1); the fix
+        # no longer probes it, so a leaf the gateway will actually issue verifies.
+        domain = "aigw.aegisgroup.ch"
+        int_cert, int_key, chain = self._build_name_constrained_pki(
+            f"permitted;DNS:aegisgroup.ch,excluded;DNS:samba-ad.{domain}"
+        )
+        result = self.validate_intermediate(
+            **{
+                "--intermediate": str(int_cert),
+                "--intermediate-key": str(int_key),
+                "--chain": str(chain),
+                "--domain": domain,
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("edge-tls=valid", result.stdout)
+        self.assert_no_key_bytes(result)
 
     def test_leaves_signed_by_intermediate_chain_to_the_customer_root(self) -> None:
         # Prove the promise: after import, both the edge wildcard and the Samba
