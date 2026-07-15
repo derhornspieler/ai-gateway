@@ -2,11 +2,13 @@ misconfigurations:
   - id: AVD-DS-0002
     paths:
       - services/dhi-health-probe/Dockerfile
+      - services/dhi-health-probe/Dockerfile.grafana
     expired_at: 2027-07-13
     statement: >-
       The final image is a caller-supplied immutable DHI that retains its
       reviewed non-root user; a literal USER would override service-specific
-      DHI identities such as Postgres.
+      DHI identities such as Postgres. Dockerfile.grafana's final stage is
+      FROM the Grafana DHI (uid 472) for the same reason.
 
   - id: AVD-DS-0002
     paths:
