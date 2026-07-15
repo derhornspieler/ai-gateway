@@ -62,9 +62,9 @@ class PreVaultIdentityReconciliationContractTests(unittest.TestCase):
             "aigw_pre_vault_identity_baseline_reconciliation: true",
             "aigw_pre_vault_identity_baseline_reconciliation_ack: "
             "RECONCILE_PRE_VAULT_MANAGED_IDENTITY_BASELINE",
-            "- { name: lab-admins, roles: [aigw-admins] }",
-            "- { name: lab-developers, roles: [aigw-developers] }",
-            "- { name: lab-users, roles: [aigw-users] }",
+            "- { name: lab-admins, roles: [aigw-admins, aigw-chat] }",
+            "- { name: lab-developers, roles: [aigw-chat, aigw-developers] }",
+            "- { name: lab-users, roles: [aigw-chat, aigw-users] }",
             "- username: lab-admin",
             "group: lab-admins",
             "federation_provider: lab-samba-ad",

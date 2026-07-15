@@ -19,8 +19,9 @@
   "roles": {
     "realm": [
       { "name": "aigw-admins", "description": "Admin portal + Grafana + rotation control" },
+      { "name": "aigw-chat", "description": "Open WebUI chat access" },
       { "name": "aigw-developers", "description": "dev-portal self-service key issuance" },
-      { "name": "aigw-users", "description": "Open WebUI chat access" }
+      { "name": "aigw-users", "description": "DEPRECATED — no longer gates chat (aigw-chat does); retained for existing assignments" }
     ]
   },
 {# Test users are seeded ONLY when aigw_seed_test_users is explicitly enabled
@@ -36,7 +37,7 @@
       "firstName": "Test",
       "lastName": "Admin",
       "credentials": [{ "type": "password", "value": {{ aigw_test_admin_password | mandatory("aigw_test_admin_password must be set (vault overlay) when aigw_seed_test_users is true") | to_json }}, "temporary": false }],
-      "realmRoles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "realmRoles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "username": "testuser",
@@ -46,7 +47,7 @@
       "firstName": "Test",
       "lastName": "User",
       "credentials": [{ "type": "password", "value": {{ aigw_test_user_password | mandatory("aigw_test_user_password must be set (vault overlay) when aigw_seed_test_users is true") | to_json }}, "temporary": false }],
-      "realmRoles": ["aigw-developers", "aigw-users"]
+      "realmRoles": ["aigw-chat", "aigw-developers", "aigw-users"]
     }
   ],
 {% endif %}
@@ -219,23 +220,23 @@
   "scopeMappings": [
     {
       "client": "open-webui",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "client": "dev-portal",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "client": "admin-portal",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "client": "admin-ui",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "client": "vault",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     }
   ]
 }

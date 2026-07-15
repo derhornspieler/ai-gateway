@@ -569,7 +569,8 @@ command history.
 |---|---|
 | no session | redirected to Keycloak or rejected; no protected content |
 | user without AI Gateway role | denied chat, developer, and admin functions |
-| `aigw-users` only | chat allowed; key and admin functions denied |
+| `aigw-chat` only | chat allowed; key and admin functions denied |
+| `aigw-users` only (deprecated) | everything denied — it no longer gates chat |
 | `aigw-developers` | own key list/mint/revoke and snippets allowed; admin denied |
 | `aigw-admins` | developer functions plus portal admin; ADM gates allowed |
 

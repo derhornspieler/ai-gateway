@@ -57,7 +57,11 @@ VENDOR_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
 VENDOR_RE = re.compile(VENDOR_PATTERN)
 IDENTITY_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
 IDENTITY_ID_RE = re.compile(IDENTITY_ID_PATTERN)
-IDENTITY_CAPABILITIES = frozenset({"aigw-users", "aigw-developers", "aigw-admins"})
+# aigw-chat is the dedicated Open WebUI chat capability; aigw-users is
+# deprecated for chat but stays assignable for existing deployments.
+IDENTITY_CAPABILITIES = frozenset(
+    {"aigw-users", "aigw-developers", "aigw-admins", "aigw-chat"}
+)
 PROVIDER_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
 PROVIDER_IDENTIFIER_RE = re.compile(PROVIDER_IDENTIFIER_PATTERN)
 PROVIDER_STATES = frozenset(

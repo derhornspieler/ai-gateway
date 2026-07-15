@@ -34,7 +34,7 @@ vs *machine identities*.
 | Realm | Purpose | Who/what lives there |
 |---|---|---|
 | `master` | Keycloak administration | The `keycloak-admins` group, mapped to master's full `admin` composite role; the durable `break-glass-admin` user, password escrowed in Vault; optionally, admins federated from a designated AD admin group. Temporary bootstrap principals exist only between first start and the identity ceremony. |
-| `aigw` | People and applications | Human users (federated from AD over LDAPS — lab Samba or the customer directory); the app clients `open-webui`, `dev-portal`, `admin-portal`, `admin-ui`, `vault`; the realm roles `aigw-users`, `aigw-developers`, `aigw-admins`; the managed group tree under `/aigw-managed`; the durable `aigw-identity-controller` service client. |
+| `aigw` | People and applications | Human users (federated from AD over LDAPS — lab Samba or the customer directory); the app clients `open-webui`, `dev-portal`, `admin-portal`, `admin-ui`, `vault`; the realm roles `aigw-chat`, `aigw-users` (deprecated for chat), `aigw-developers`, `aigw-admins`; the managed group tree under `/aigw-managed`; the durable `aigw-identity-controller` service client. |
 | `anthropic-wif` | Machine / workload identity | The `anthropic-token-broker` service client used for the Anthropic workload-identity-federation token exchange. No human users, no roles. See [anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md). |
 
 `master` keeps its built-in name: in Keycloak, administering *other* realms
@@ -50,7 +50,7 @@ flowchart LR
 
   subgraph KC [Keycloak]
     M["realm: master — administration<br/>group keycloak-admins → admin role<br/>user break-glass-admin"]
-    A["realm: aigw<br/>human users + app clients<br/>roles: aigw-users / -developers / -admins"]
+    A["realm: aigw<br/>human users + app clients<br/>roles: aigw-chat / -users / -developers / -admins"]
     W["realm: anthropic-wif<br/>machine identity<br/>anthropic-token-broker"]
   end
 

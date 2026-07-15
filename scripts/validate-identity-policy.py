@@ -31,7 +31,12 @@ KEYCLOAK_POLICY = {
     "maxFailureWaitSeconds": 900,
     "maxDeltaTimeSeconds": 43200,
 }
-CAPABILITY_ROLE_SCOPE = ["aigw-admins", "aigw-developers", "aigw-users"]
+CAPABILITY_ROLE_SCOPE = [
+    "aigw-admins",
+    "aigw-chat",
+    "aigw-developers",
+    "aigw-users",
+]
 FIRST_PARTY_OIDC_CLIENTS = {
     "open-webui",
     "dev-portal",
@@ -224,7 +229,7 @@ if source_layout:
     for client_id in FIRST_PARTY_OIDC_CLIENTS:
         pattern = (
             rf'"client"\s*:\s*"{re.escape(client_id)}"\s*,\s*'
-            r'"roles"\s*:\s*\[\s*"aigw-admins"\s*,\s*'
+            r'"roles"\s*:\s*\[\s*"aigw-admins"\s*,\s*"aigw-chat"\s*,\s*'
             r'"aigw-developers"\s*,\s*"aigw-users"\s*\]'
         )
         assert len(re.findall(pattern, realm_template, flags=re.DOTALL)) == 1, (

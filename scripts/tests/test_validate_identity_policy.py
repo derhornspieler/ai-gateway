@@ -75,6 +75,7 @@ class DeployedIdentityPolicyValidationTests(unittest.TestCase):
                 "client": "open-webui",
                 "roles": [
                     "aigw-admins",
+                    "aigw-chat",
                     "aigw-developers",
                     "aigw-users",
                     "unexpected-role",

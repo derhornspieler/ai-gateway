@@ -333,7 +333,7 @@ async def test_relying_party_scope_reconciliation_converges_exact_role_ids() -> 
 
     assert admin.calls == [
         ("DELETE", ["legacy-broad-role"]),
-        ("POST", ["aigw-admins", "aigw-developers"]),
+        ("POST", ["aigw-admins", "aigw-chat", "aigw-developers"]),
     ]
     assert {
         (role["name"], role["id"])

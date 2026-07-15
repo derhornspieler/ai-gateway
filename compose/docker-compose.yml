@@ -605,7 +605,12 @@ services:
       OAUTH_USERNAME_CLAIM: preferred_username
       ENABLE_OAUTH_ROLE_MANAGEMENT: "true"
       OAUTH_ROLES_CLAIM: "roles"
-      OAUTH_ALLOWED_ROLES: "aigw-users,aigw-developers,aigw-admins"
+      # Chat access is gated by the DEDICATED aigw-chat capability (owner
+      # decision): neither aigw-users (deprecated for chat) nor developer/
+      # admin roles grant chat by themselves. OAUTH_ADMIN_ROLES maps
+      # aigw-admins onto Open WebUI's local admin role; note Open WebUI has
+      # no admin-without-access concept, so that mapping still admits admins.
+      OAUTH_ALLOWED_ROLES: "aigw-chat"
       OAUTH_ADMIN_ROLES: "aigw-admins"
       REQUESTS_CA_BUNDLE: /etc/ssl/certs/aigw-ca.pem   # trust internal CA for OIDC discovery
       # Open WebUI's OIDC client is httpx/Authlib, which follows OpenSSL's

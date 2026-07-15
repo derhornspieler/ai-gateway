@@ -47,7 +47,12 @@ def main() -> int:
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,63}", args.group):
         raise SystemExit("invalid acceptance group name")
-    if args.capability not in {"aigw-users", "aigw-developers", "aigw-admins"}:
+    if args.capability not in {
+        "aigw-users",
+        "aigw-developers",
+        "aigw-admins",
+        "aigw-chat",
+    }:
         raise SystemExit("invalid acceptance capability")
     if not re.fullmatch(r"lab-(?:admin|developer|user)", args.directory_user):
         raise SystemExit("invalid acceptance directory user")

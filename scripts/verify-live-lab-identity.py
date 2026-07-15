@@ -11,10 +11,12 @@ import urllib.request
 
 
 BASE = "http://key-rotator:8080"
+# Post-aigw-chat migration state: every retained lab group also carries the
+# dedicated chat capability (sorted, as the rotator reports capabilities).
 EXPECTED = {
-    "lab-admins": ("aigw-admins", "lab-admin"),
-    "lab-developers": ("aigw-developers", "lab-developer"),
-    "lab-users": ("aigw-users", "lab-user"),
+    "lab-admins": (["aigw-admins", "aigw-chat"], "lab-admin"),
+    "lab-developers": (["aigw-chat", "aigw-developers"], "lab-developer"),
+    "lab-users": (["aigw-chat", "aigw-users"], "lab-user"),
 }
 
 
@@ -111,8 +113,8 @@ def main() -> int:
     if {group.get("name") for group in groups} != set(EXPECTED) or len(groups) != 3:
         raise RuntimeError("managed group inventory is not the retained three groups")
     for group in groups:
-        capability, username = EXPECTED[group["name"]]
-        if group.get("capabilities") != [capability] or group.get("member_count") != 1:
+        capabilities, username = EXPECTED[group["name"]]
+        if group.get("capabilities") != capabilities or group.get("member_count") != 1:
             raise RuntimeError("managed group capability or count drifted")
         members = get(f"/identity/groups/{group['id']}/members")
         if len(members) != 1 or members[0].get("username") != username:

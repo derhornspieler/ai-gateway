@@ -106,7 +106,8 @@ flowchart LR
 ## 4. Authentication flow — browser OIDC and admin gates
 
 All human access authenticates against Keycloak realm `aigw`, which emits
-the three realm roles (`aigw-users`, `aigw-developers`, `aigw-admins`) in a
+the four realm roles (`aigw-chat`, `aigw-users` (deprecated for chat),
+`aigw-developers`, `aigw-admins`) in a
 `roles` claim. Admin UIs sit behind dedicated oauth2-proxy instances.
 
 ```mermaid

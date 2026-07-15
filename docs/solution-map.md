@@ -301,7 +301,8 @@ flowchart LR
 
 The `aigw` realm emits realm roles in a multivalued `roles` claim:
 
-- `aigw-users`: Open WebUI access;
+- `aigw-chat`: Open WebUI access (the dedicated chat gate);
+- `aigw-users`: DEPRECATED — no longer gates chat; retained for existing assignments;
 - `aigw-developers`: dev-portal key issuance and tool snippets;
 - `aigw-admins`: developer functions plus the ADM admin portal, LiteLLM Admin
   UI, Grafana, Prometheus, and Vault edge gates.

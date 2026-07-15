@@ -33,7 +33,9 @@ class InertLog:
 RUNTIME_CONFIG = SimpleNamespace(
     ENABLE_OAUTH_ROLE_MANAGEMENT=True,
     OAUTH_ROLES_CLAIM="roles",
-    OAUTH_ALLOWED_ROLES=["aigw-users", "aigw-developers", "aigw-admins"],
+    # Chat access is the dedicated aigw-chat capability only; the legacy
+    # aigw-users role and the developer role no longer admit a session.
+    OAUTH_ALLOWED_ROLES=["aigw-chat"],
     OAUTH_ADMIN_ROLES=["aigw-admins"],
     DEFAULT_USER_ROLE="user",
 )
@@ -86,7 +88,15 @@ async def verify(source_path: Path) -> None:
     get_user_role = load_reviewed_method(source_path)
     manager = object()
 
-    rejected_claims = ({}, {"roles": []}, {"roles": ["unapproved"]})
+    rejected_claims = (
+        {},
+        {"roles": []},
+        {"roles": ["unapproved"]},
+        # The pre-aigw-chat roles must no longer admit a chat session.
+        {"roles": ["aigw-users"]},
+        {"roles": ["aigw-developers"]},
+        {"roles": ["aigw-users", "aigw-developers"]},
+    )
     for claims in rejected_claims:
         try:
             await get_user_role(manager, None, claims)
@@ -96,7 +106,7 @@ async def verify(source_path: Path) -> None:
         else:
             raise AssertionError(f"unapproved role claim was accepted: {claims!r}")
 
-    first_non_admin = await get_user_role(manager, None, {"roles": ["aigw-users"]})
+    first_non_admin = await get_user_role(manager, None, {"roles": ["aigw-chat"]})
     if first_non_admin != "user":
         raise AssertionError("first allowed non-admin identity was promoted")
 

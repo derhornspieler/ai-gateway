@@ -36,7 +36,11 @@ from app.security import (
     validate_wif_token_claims,
 )
 
-CAPABILITY_ROLES = frozenset({"aigw-users", "aigw-developers", "aigw-admins"})
+# aigw-chat is the DEDICATED Open WebUI chat capability (aigw-users no
+# longer gates chat and is retained only for existing assignments).
+CAPABILITY_ROLES = frozenset(
+    {"aigw-users", "aigw-developers", "aigw-admins", "aigw-chat"}
+)
 # These are the only browser-facing OIDC clients managed by this controller.
 # Keep this explicit rather than deriving it from a Keycloak search result: a
 # temporary bootstrap administrator is intentionally powerful, so a recovery

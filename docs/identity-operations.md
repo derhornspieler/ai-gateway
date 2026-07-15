@@ -69,14 +69,35 @@ credential.
 
 ## Authorization model
 
-The `aigw` realm defines exactly three realm roles, and these are the only
+The `aigw` realm defines exactly four realm roles, and these are the only
 capabilities the portals honor:
 
 | Realm role | Capability |
 |---|---|
-| `aigw-users` | Open WebUI chat |
+| `aigw-chat` | Open WebUI chat access (the dedicated chat gate) |
+| `aigw-users` | DEPRECATED — no longer gates chat (`aigw-chat` does). Retained for existing assignments; nothing in the stack keys off it any more. Do not grant it to new groups. |
 | `aigw-developers` | dev-portal self-service LiteLLM keys and coding-tool snippets |
-| `aigw-admins` | developer functions plus rotation, identity administration, the LiteLLM Admin UI, and Grafana edge access |
+| `aigw-admins` | developer functions plus rotation, identity administration, the LiteLLM Admin UI, and Grafana edge access. Note: Open WebUI maps `aigw-admins` to its local admin role, and Open WebUI has no admin-without-access concept, so administrators can still open chat through that mapping even without `aigw-chat`. |
+
+**Migrating an existing realm to `aigw-chat`.** Realm JSON imports only into
+an empty database, and the durable identity controller deliberately cannot
+create realm roles or edit client scope mappings, so an already-bootstrapped
+realm (for example the rebuilt lab) must be migrated once BEFORE the converge
+that flips Open WebUI's `OAUTH_ALLOWED_ROLES` to `aigw-chat` — otherwise every
+non-admin chat login fails with 403 until the migration completes. Using the
+break-glass master administrator (retrieval ceremony above):
+
+1. In realm `aigw`, create the realm role `aigw-chat` with description
+   "Open WebUI chat access".
+2. Add `aigw-chat` to the realm-role scope mappings of ALL FOUR first-party
+   clients (`open-webui`, `dev-portal`, `admin-portal`, `admin-ui`) — the
+   reviewed policy requires the four clients to carry the identical
+   capability scope set (`scripts/validate-identity-policy.py` pins it).
+3. Grant `aigw-chat` as a group role mapping on every managed group whose
+   members should chat (lab: `lab-admins`, `lab-developers`, `lab-users`).
+4. Run the converge; then prove a non-admin chat login and run
+   `scripts/verify-live-lab-identity.py` (lab), which now asserts the
+   migrated capability sets.
 
 Authorization is carried as a realm-role claim, not a group claim: each of the
 five first-party OIDC clients (`open-webui`, `dev-portal`, `admin-portal`,
@@ -706,9 +727,10 @@ Do not remove the disposable users before the Samba login and role claim have
 both been proved.
 
 The verified retained lab topology is three managed groups, each with exactly
-one federated member: `lab-admins` (capability `aigw-admins`, member `lab-admin`),
-`lab-developers` (`aigw-developers`, `lab-developer`), and `lab-users`
-(`aigw-users`, `lab-user`). `scripts/verify-live-lab-identity.py` asserts that
+one federated member: `lab-admins` (capabilities `aigw-admins` + `aigw-chat`,
+member `lab-admin`), `lab-developers` (`aigw-chat` + `aigw-developers`,
+`lab-developer`), and `lab-users` (`aigw-chat` + `aigw-users`, `lab-user`).
+`scripts/verify-live-lab-identity.py` asserts that
 exact state — three federated users, three groups, `configured=true`,
 `controller_usable=true`, `bootstrap_available=false`, and
 `bootstrap_cleanup_required=false`.

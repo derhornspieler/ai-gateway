@@ -453,7 +453,7 @@ An internal client should reach
 `https://auth.<domain>/realms/aigw/.well-known/openid-configuration` while the
 Keycloak admin console stays denied there;
 `https://api.<domain>/health/liveliness` and `/health/readiness` are allowed
-while a management path such as `/key/list` is denied at Traefik. An `aigw-users`
+while a management path such as `/key/list` is denied at Traefik. An `aigw-chat`
 member can reach chat and an unauthorized user cannot; an `aigw-developers`
 member can list, mint, and revoke only keys owned by that OIDC subject. The
 LiteLLM Admin UI, Grafana, and the Prometheus UI first require `aigw-admins`

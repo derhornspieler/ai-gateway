@@ -20,7 +20,8 @@
     "realm": [
       { "name": "aigw-admins", "description": "Admin portal + Grafana + rotation control" },
       { "name": "aigw-developers", "description": "dev-portal self-service key issuance" },
-      { "name": "aigw-users", "description": "Open WebUI chat access" }
+      { "name": "aigw-chat", "description": "Open WebUI chat access" },
+      { "name": "aigw-users", "description": "DEPRECATED — no longer gates chat (aigw-chat does); retained for existing assignments" }
     ]
   },
   "clients": [
@@ -192,23 +193,23 @@
   "scopeMappings": [
     {
       "client": "open-webui",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "client": "dev-portal",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "client": "admin-portal",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "client": "admin-ui",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     },
     {
       "client": "vault",
-      "roles": ["aigw-admins", "aigw-developers", "aigw-users"]
+      "roles": ["aigw-admins", "aigw-chat", "aigw-developers", "aigw-users"]
     }
   ]
 }

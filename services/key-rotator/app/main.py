@@ -92,7 +92,7 @@ class IdentityBootstrapRequest(BaseModel):
 
 class IdentityGroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
-    capabilities: list[str] = Field(min_length=1, max_length=3)
+    capabilities: list[str] = Field(min_length=1, max_length=4)
 
 
 class IdentityGroupPolicyUpdate(BaseModel):
