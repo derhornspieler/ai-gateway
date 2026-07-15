@@ -32,6 +32,7 @@ TARGETS=(
   .github/scripts/run-shellcheck.sh
   ansible/inventory/examples/production-rocky9.first-init.sh.example
   ansible/inventory/examples/rocky9-lab.first-init.sh.example
+  ansible/inventory/examples/rocky9-lab.stage-customer-intermediate.sh.example
   ansible/roles/network_routing/files/90-aigw-policy-routing
   compose/postgres/init/01-init-databases.sh
   scripts/aigw-compose.sh
