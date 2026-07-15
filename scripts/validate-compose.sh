@@ -1969,6 +1969,36 @@ assert text.count("router_settings:") == 1
 general = text.split("general_settings:", 1)[1].split("router_settings:", 1)[0]
 assert len(re.findall(r"(?m)^  store_prompts_in_spend_logs: false$", general)) == 1
 assert "store_prompts_in_spend_logs: true" not in text
+
+# Per-project default-model enforcement is a pre-call hook registered in
+# litellm_settings.callbacks. Dropping the registration (or the otel export
+# beside it) would silently disable a reviewed policy control, so pin the
+# exact callback list.
+assert len(re.findall(
+    r'(?m)^  callbacks: \["otel", '
+    r'"aigw_default_model_hook\.aigw_default_model_enforcer"\]$',
+    text,
+)) == 1
+
+# The hook module itself is reviewed policy code bind-mounted into LiteLLM:
+# it must parse, keep its fail-closed denials, and never grow a network or
+# process-execution import surface.
+hook = Path(sys.argv[1]).parent / "aigw_default_model_hook.py"
+hook_source = hook.read_text()
+compile(hook_source, str(hook), "exec")
+for required in (
+    "class AIGWDefaultModelEnforcer(CustomLogger):",
+    "async def async_pre_call_hook(",
+    "aigw_default_model_enforcer = AIGWDefaultModelEnforcer()",
+    'DEFAULT_MODEL_METADATA_KEY = "aigw_default_model"',
+    'DEFAULT_MODEL_SENTINEL = "aigw-default"',
+    "raise _deny(",
+    "HTTPException(status_code=400",
+    'MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")',
+):
+    assert required in hook_source, required
+for forbidden in ("subprocess", "socket", "urllib", "requests", "http.client"):
+    assert f"import {forbidden}" not in hook_source, forbidden
 PY
 
 python3 -I - "$COMPOSE_DIR/alloy/config.alloy" <<'PY'

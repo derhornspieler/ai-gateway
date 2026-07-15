@@ -688,6 +688,15 @@ async def _generate_project_key(
                 raise litellm_client.LiteLLMError(
                     "post-generate inventory violated the one-active-key invariant"
                 )
+            # Verify the enforced default actually landed on the minted key's
+            # metadata (the LiteLLM pre-call hook reads it from there). A key
+            # that cannot prove its policy stamp is never disclosed.
+            if project_policy is not None and _key_metadata(active[0]).get(
+                litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY
+            ) != project_policy.get("default_model"):
+                raise litellm_client.LiteLLMError(
+                    "minted key did not verify the project's default model"
+                )
         except Exception:
             # Never disclose a key that could not be proven unique/manageable.
             # /key/update accepts either plaintext or its stored hash. If the
@@ -2540,6 +2549,29 @@ async def admin_key_limits(
 RETUNE_MAX_PAGES = 40
 
 
+def _retuned_key_metadata(
+    entry: dict[str, Any], policy: dict[str, Any]
+) -> dict[str, Any]:
+    """Rebuild one portal key's metadata with exactly the policy's default.
+
+    LiteLLM's /key/update replaces the whole metadata object, so every field
+    other than the managed default is preserved byte-for-byte from the entry
+    whose portal provenance the caller has just verified — dropping anything
+    here would erase the provenance that authorizes later key decisions.
+    """
+
+    metadata = {
+        name: value
+        for name, value in _key_metadata(entry).items()
+        if name != litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY
+    }
+    if policy["default_model"] is not None:
+        metadata[litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY] = policy[
+            "default_model"
+        ]
+    return metadata
+
+
 async def _retune_project_keys(
     project_id: str, policy: dict[str, Any]
 ) -> tuple[int, int]:
@@ -2552,7 +2584,7 @@ async def _retune_project_keys(
     and the operation is idempotent, so a partial failure is retried by
     simply resubmitting the policy.
     """
-    updates: dict[str, Any] = {
+    base_updates: dict[str, Any] = {
         "tpm_limit": policy["tpm_limit"],
         "rpm_limit": policy["rpm_limit"],
         # An unrestricted policy clears the per-key model list ([] means "no
@@ -2581,6 +2613,11 @@ async def _retune_project_keys(
                 failed += 1
                 continue
             try:
+                updates = dict(base_updates)
+                # The enforced default travels on key metadata (read by the
+                # LiteLLM pre-call hook), so the re-tune re-stamps it in the
+                # same update that re-tunes the model list.
+                updates["metadata"] = _retuned_key_metadata(entry, policy)
                 await litellm_client.key_update(concrete, updates)
                 after = await litellm_client.admin_key_lookup(concrete)
                 if (
@@ -2592,6 +2629,11 @@ async def _retune_project_keys(
                         if isinstance(model, str)
                     )
                     != updates["models"]
+                    or _key_metadata(after).get(
+                        litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY
+                    )
+                    != policy["default_model"]
+                    or _entry_project_id(after) != project_id
                 ):
                     raise litellm_client.LiteLLMError(
                         "key policy re-tune did not verify"

@@ -206,7 +206,9 @@ async def test_key_generate_applies_the_runtime_project_policy(monkeypatch):
     assert body["tpm_limit"] == 50000
     assert body["rpm_limit"] == 30
     assert body["models"] == ["claude-haiku", "claude-sonnet"]
-    # The default model is a portal-surfaced concept, never a key field.
+    # The enforced default travels on key metadata, where the LiteLLM
+    # pre-call hook reads it — never as a native key field.
+    assert body["metadata"]["aigw_default_model"] == "claude-haiku"
     assert "default_model" not in body
     assert "max_budget" not in body
 
@@ -227,6 +229,11 @@ async def test_key_generate_rejects_malformed_runtime_policy(monkeypatch):
         {"rpm_limit": True},
         {"allowed_models": []},
         {"allowed_models": ["bad model"]},
+        # Fail closed on a default outside (or without) a valid grammar/set:
+        # an unenforceable default must never mint a key without its stamp.
+        {"default_model": "bad model"},
+        {"default_model": 7},
+        {"allowed_models": ["claude-sonnet"], "default_model": "claude-opus"},
         "restricted",
     ):
         with pytest.raises(litellm_client.LiteLLMError):
@@ -397,11 +404,32 @@ async def test_key_update_allows_only_reviewed_fields_and_bounded_values(
 
     _mock_client(monkeypatch, handler)
 
+    provenance = {"created_via": "dev-portal", "aigw_project_id": "ai-gateway"}
     for updates in (
         {},
         {"models": "all"},
         {"models": ["bad model"]},
+        # Metadata replacement is only legal when it provably preserves the
+        # portal's provenance fields and every reviewed bound.
+        {"metadata": "not-a-dict"},
         {"metadata": {"created_via": "dev-portal"}},
+        {"metadata": {"aigw_project_id": "ai-gateway"}},
+        {"metadata": {**provenance, "created_via": "operator"}},
+        {"metadata": {**provenance, "aigw_project_id": "Bad Project"}},
+        {"metadata": {**provenance, "nested": {"a": 1}}},
+        {"metadata": {**provenance, "big": "x" * 513}},
+        {"metadata": {**provenance, **{str(i): i for i in range(40)}}},
+        # A default may only be stamped beside the model list it must be a
+        # member of — and must actually be a member of it.
+        {"metadata": {**provenance, "aigw_default_model": "claude-haiku"}},
+        {
+            "models": ["claude-sonnet"],
+            "metadata": {**provenance, "aigw_default_model": "claude-haiku"},
+        },
+        {
+            "models": ["claude-haiku"],
+            "metadata": {**provenance, "aigw_default_model": "bad model"},
+        },
         {"user_id": "someone-else"},
         {"blocked": "true"},
         {"max_budget": -1},
@@ -440,6 +468,47 @@ async def test_key_update_sends_allowlisted_payload(monkeypatch):
         "rpm_limit": 120,
         "blocked": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_key_update_sends_provenance_preserving_default_restamp(
+    monkeypatch,
+):
+    body = None
+
+    def handler(request: httpx.Request):
+        nonlocal body
+        assert request.url.path == "/key/update"
+        body = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    _mock_client(monkeypatch, handler)
+
+    metadata = {
+        "created_via": "dev-portal",
+        "aigw_project_id": "ai-gateway",
+        "aigw_default_model": "claude-haiku",
+    }
+    await litellm_client.key_update(
+        "hash-abc", {"models": ["claude-haiku"], "metadata": dict(metadata)}
+    )
+    assert body == {
+        "key": "hash-abc",
+        "models": ["claude-haiku"],
+        "metadata": metadata,
+    }
+
+    # An unrestricted re-tune ([] = no model restriction) may still stamp a
+    # default, and clearing the default keeps the provenance untouched.
+    await litellm_client.key_update(
+        "hash-abc", {"models": [], "metadata": dict(metadata)}
+    )
+    assert body["models"] == [] and body["metadata"] == metadata
+    cleared = {"created_via": "dev-portal", "aigw_project_id": "ai-gateway"}
+    await litellm_client.key_update(
+        "hash-abc", {"models": [], "metadata": dict(cleared)}
+    )
+    assert body["metadata"] == cleared
 
 
 def test_settings_fail_closed_on_malformed_key_guardrails():

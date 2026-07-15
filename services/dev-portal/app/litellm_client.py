@@ -28,6 +28,13 @@ ADMIN_KEY_LIST_MAX_PAGE = 10_000
 PORTAL_KEY_CREATOR_FIELD = "created_via"
 PORTAL_KEY_CREATOR_VALUE = "dev-portal"
 PORTAL_PROJECT_METADATA_KEY = "aigw_project_id"
+# Carries the project's admin-set default model on every portal key; the
+# LiteLLM pre-call hook (compose/litellm/aigw_default_model_hook.py) reads it
+# to resolve requests that omit a model. Kept textually identical there.
+PORTAL_DEFAULT_MODEL_METADATA_KEY = "aigw_default_model"
+MAX_KEY_METADATA_FIELDS = 32
+MAX_KEY_METADATA_STRING_LENGTH = 512
+MAX_KEY_METADATA_LIST_ITEMS = 32
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 # LiteLLM key-lifetime grammar (e.g. 30d, 12h). Kept textually identical to
 # config._KEY_DURATION_RE (config cannot import this module without a cycle).
@@ -38,13 +45,72 @@ MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")
 MAX_POLICY_MODELS = 32
 RATE_LIMIT_MAX = 1_000_000_000
 # The only /key/update fields this portal may ever send. Everything else on
-# that endpoint (owner, team, metadata, aliases, rotation) is reserved for
-# the operator path; widening this set is a reviewed security decision.
+# that endpoint (owner, team, aliases, rotation) is reserved for the operator
+# path; widening this set is a reviewed security decision.
 # `models` joined the set with the runtime per-project policy so an admin
-# policy change can re-tune the model set on existing keys.
+# policy change can re-tune the model set on existing keys. `metadata` joined
+# it with default-model enforcement so the same re-tune can re-stamp the
+# project's default; it is guarded by _validated_retune_metadata, which only
+# admits a provenance-preserving portal payload.
 KEY_UPDATE_MUTABLE_FIELDS = frozenset(
-    {"blocked", "max_budget", "tpm_limit", "rpm_limit", "duration", "models"}
+    {"blocked", "max_budget", "tpm_limit", "rpm_limit", "duration", "models",
+     "metadata"}
 )
+
+
+def _validated_retune_metadata(metadata: Any, updates: dict[str, Any]) -> None:
+    """Admit only a provenance-preserving portal metadata replacement.
+
+    LiteLLM's /key/update REPLACES the whole metadata object, and that object
+    carries the portal's immutable provenance (created_via + aigw_project_id)
+    that every later authorization decision reads. This gate refuses any
+    payload that could strip provenance, exceed reviewed bounds, or stamp a
+    default model that the same update's model allowlist does not contain.
+    """
+
+    if (
+        not isinstance(metadata, dict)
+        or len(metadata) > MAX_KEY_METADATA_FIELDS
+        or metadata.get(PORTAL_KEY_CREATOR_FIELD) != PORTAL_KEY_CREATOR_VALUE
+    ):
+        raise LiteLLMError("key metadata update is invalid")
+    project_id = metadata.get(PORTAL_PROJECT_METADATA_KEY)
+    if not isinstance(project_id, str) or PROJECT_ID_RE.fullmatch(project_id) is None:
+        raise LiteLLMError("key metadata update is invalid")
+    for name, value in metadata.items():
+        if not isinstance(name, str) or not 1 <= len(name) <= 128:
+            raise LiteLLMError("key metadata update is invalid")
+        if isinstance(value, str):
+            if len(value) > MAX_KEY_METADATA_STRING_LENGTH:
+                raise LiteLLMError("key metadata update is invalid")
+        elif isinstance(value, list):
+            if len(value) > MAX_KEY_METADATA_LIST_ITEMS or any(
+                not isinstance(item, str)
+                or len(item) > MAX_KEY_METADATA_STRING_LENGTH
+                for item in value
+            ):
+                raise LiteLLMError("key metadata update is invalid")
+        elif value is not None and not isinstance(value, (bool, int, float)):
+            raise LiteLLMError("key metadata update is invalid")
+    if PORTAL_DEFAULT_MODEL_METADATA_KEY in metadata:
+        default_model = metadata[PORTAL_DEFAULT_MODEL_METADATA_KEY]
+        if (
+            not isinstance(default_model, str)
+            or MODEL_NAME_RE.fullmatch(default_model) is None
+        ):
+            raise LiteLLMError("key metadata default model is invalid")
+        # A default may only be (re-)stamped together with the model list it
+        # must be a member of; validating them as one update keeps the
+        # policy invariant (default ∈ allowed_models) checkable right here.
+        models = updates.get("models")
+        if "models" not in updates or not isinstance(models, list):
+            raise LiteLLMError(
+                "a default-model update requires the same update's model list"
+            )
+        if models and default_model not in models:
+            raise LiteLLMError(
+                "key default model is outside the updated model allowlist"
+            )
 
 
 def _validated_model_list(models: Any, *, allow_empty: bool) -> list[str]:
@@ -282,6 +348,22 @@ async def key_generate(
         models = project_policy.get("allowed_models")
         if models is not None:
             limits["models"] = _validated_model_list(models, allow_empty=False)
+        default_model = project_policy.get("default_model")
+        if default_model is not None:
+            # The default is enforced server-side by the LiteLLM pre-call
+            # hook, which reads it from this key metadata field. It must be
+            # well-formed and inside the same mint's model restriction, or
+            # the mint fails closed.
+            if (
+                not isinstance(default_model, str)
+                or MODEL_NAME_RE.fullmatch(default_model) is None
+            ):
+                raise LiteLLMError("project policy default model is invalid")
+            if "models" in limits and default_model not in limits["models"]:
+                raise LiteLLMError(
+                    "project default model is outside its allowed models"
+                )
+            payload["metadata"][PORTAL_DEFAULT_MODEL_METADATA_KEY] = default_model
     payload.update(limits)
     try:
         async with httpx.AsyncClient(
@@ -488,6 +570,8 @@ async def key_update(key: str, updates: dict[str, Any]) -> dict[str, Any]:
             # deliberate re-tune value when a project policy clears its
             # allowed-models set.
             _validated_model_list(value, allow_empty=True)
+        elif field == "metadata":
+            _validated_retune_metadata(value, updates)
         else:  # tpm_limit / rpm_limit
             if value is not None and (
                 isinstance(value, bool)

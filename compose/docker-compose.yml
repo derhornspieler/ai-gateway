@@ -520,6 +520,9 @@ services:
       OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: SPAN_ONLY
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro,Z
+      # Per-project default-model pre-call hook, registered in config.yaml's
+      # litellm_settings.callbacks and resolved relative to /app/config.yaml.
+      - ./litellm/aigw_default_model_hook.py:/app/aigw_default_model_hook.py:ro,Z
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     networks:
       [net-chat, net-portal, net-admin-app, net-vendor, net-db-litellm,

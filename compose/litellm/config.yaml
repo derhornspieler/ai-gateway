@@ -37,7 +37,14 @@ model_list:
       litellm_credential_name: openai-primary
 
 litellm_settings:
-  callbacks: ["otel"]          # prompt-bearing spans -> Alloy -> Tempo/Cribl (§9.7)
+  # otel: prompt-bearing spans -> Alloy -> Tempo/Cribl (§9.7).
+  # aigw_default_model_hook: server-side per-project default-model
+  # enforcement. The pre-call hook resolves a request that omits `model`
+  # (or sends the `aigw-default` sentinel) to the project's admin-set
+  # default from the key's `aigw_default_model` metadata, and DENIES on a
+  # malformed default or one outside the key's model allowlist. The module
+  # is bind-mounted next to this file and resolved relative to it.
+  callbacks: ["otel", "aigw_default_model_hook.aigw_default_model_enforcer"]
   drop_params: true
   num_retries: 2
   request_timeout: 600

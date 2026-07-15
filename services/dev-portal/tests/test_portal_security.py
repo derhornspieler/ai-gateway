@@ -32,17 +32,21 @@ def portal_key(
     project: str = "ai-gateway",
     blocked: bool | None = None,
     expires: str | None = None,
+    default_model: str | None = None,
 ) -> dict:
+    metadata = {
+        "created_via": "dev-portal",
+        "aigw_project_id": project,
+    }
+    if default_model is not None:
+        metadata["aigw_default_model"] = default_model
     return {
         "token": token,
         "key_alias": alias,
         "user_id": owner,
         "blocked": blocked,
         "expires": expires,
-        "metadata": {
-            "created_via": "dev-portal",
-            "aigw_project_id": project,
-        },
+        "metadata": metadata,
     }
 
 
@@ -2298,7 +2302,12 @@ def test_key_mint_carries_the_projects_runtime_policy(
     async def key_generate(user_id, alias, project_id, project_policy=None):
         generated.append(project_policy)
         inventory.append(
-            portal_key(owner=user_id, token="minted-hash", alias=alias)
+            portal_key(
+                owner=user_id,
+                token="minted-hash",
+                alias=alias,
+                default_model=(project_policy or {}).get("default_model"),
+            )
         )
         return {"key": "sk-minted-once", "key_alias": alias}
 
@@ -2625,14 +2634,143 @@ def test_project_policy_save_retunes_existing_project_keys(
         )
     ]
     # Retroactive re-tune touches exactly the project's portal keys — never
-    # operator keys or other projects.
+    # operator keys or other projects — and re-stamps the enforced default
+    # onto the key metadata the LiteLLM pre-call hook reads, preserving the
+    # portal provenance fields byte-for-byte.
     assert key_updates == [
         (
             "portal-1",
-            {"tpm_limit": 50000, "rpm_limit": 30, "models": ["claude-haiku"]},
+            {
+                "tpm_limit": 50000,
+                "rpm_limit": 30,
+                "models": ["claude-haiku"],
+                "metadata": {
+                    "created_via": "dev-portal",
+                    "aigw_project_id": "ai-gateway",
+                    "aigw_default_model": "claude-haiku",
+                },
+            },
         )
     ]
     assert "1 existing keys re-tuned" in response.text
+
+
+def test_key_mint_is_not_disclosed_when_the_default_model_stamp_is_missing(
+    client, set_session, monkeypatch
+):
+    """A minted key that cannot prove its enforced default is revoked, not shown."""
+
+    deactivated: list[str] = []
+    inventory: list[dict] = []
+
+    async def live_policies(_request, _user, project_ids):
+        return {project_id: dict(RESTRICTED_POLICY) for project_id in project_ids}
+
+    async def key_list(user_id):
+        return [dict(entry) for entry in inventory]
+
+    async def key_generate(user_id, alias, project_id, project_policy=None):
+        # Upstream drops the metadata stamp the pre-call hook enforces from.
+        inventory.append(
+            portal_key(owner=user_id, token="minted-hash", alias=alias)
+        )
+        return {"key": "sk-unstamped", "key_alias": alias}
+
+    async def key_deactivate(key):
+        deactivated.append(key)
+        return {}
+
+    monkeypatch.setattr(main, "_live_project_policies", live_policies)
+    monkeypatch.setattr(litellm_client, "key_list", key_list)
+    monkeypatch.setattr(litellm_client, "key_generate", key_generate)
+    monkeypatch.setattr(litellm_client, "key_deactivate", key_deactivate)
+    csrf = "c" * 43
+    set_session({"user": portal_user(), "csrf_token": csrf})
+
+    response = client.post(
+        "/keys",
+        data={"alias": "laptop", "project_id": "ai-gateway", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert deactivated == ["sk-unstamped"]
+    assert "sk-unstamped" not in response.text
+
+
+def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
+    admin_client, set_admin_session, monkeypatch
+):
+    """A re-tune whose default stamp does not land verifies closed, not silent."""
+
+    key_state = {
+        "portal-1": full_key_object(
+            token="portal-1",
+            user_id="dev-a",
+            tpm_limit=50000,
+            rpm_limit=30,
+            models=["claude-haiku"],
+            metadata={"created_via": "dev-portal", "aigw_project_id": "ai-gateway"},
+        ),
+    }
+
+    async def rotator_get(path):
+        if path == "/identity/groups":
+            return [_unlimited_group()]
+        return {"admin": True}
+
+    async def rotator_put(path, payload):
+        return {
+            "id": "group-1",
+            "name": "ai-gateway",
+            "policy": {
+                "tpm_limit": 50000,
+                "rpm_limit": 30,
+                "allowed_models": ["claude-haiku"],
+                "default_model": "claude-haiku",
+            },
+        }
+
+    async def admin_key_list_page(page):
+        keys = [dict(entry) for entry in key_state.values()]
+        return {"keys": keys, "page": 1, "total_pages": 1, "total_count": len(keys)}
+
+    async def key_update(key, updates):
+        # Upstream accepts the update but silently drops the metadata stamp.
+        applied = {name: value for name, value in updates.items() if name != "metadata"}
+        key_state[key].update(applied)
+        return {}
+
+    async def admin_key_lookup(token):
+        return dict(key_state[token])
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={
+            "tpm_limit": "50000",
+            "rpm_limit": "30",
+            "allowed_models": "claude-haiku",
+            "default_model": "claude-haiku",
+            "csrf_token": csrf,
+        },
+        follow_redirects=True,
+    )
+
+    assert "1 could not be verified" in response.text
 
 
 def _unlimited_group(group_id="group-1", name="ai-gateway", **policy_overrides):

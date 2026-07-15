@@ -350,6 +350,7 @@
     - grafana/provisioning/plugins/empty.yml
     - grafana/provisioning/plugins/loki-drilldown.yml
     - litellm/config.yaml
+    - litellm/aigw_default_model_hook.py
     - loki/config.yml
     - postgres/init/01-init-databases.sh
     - prometheus/prometheus.yml
@@ -2013,6 +2014,7 @@
           {'path': stack_dir ~ '/cribl-mock/config.yaml', 'recursive': false},
           {'path': stack_dir ~ '/grafana/provisioning', 'recursive': true},
           {'path': stack_dir ~ '/keycloak/realms', 'recursive': true},
+          {'path': stack_dir ~ '/litellm/aigw_default_model_hook.py', 'recursive': false},
           {'path': stack_dir ~ '/litellm/config.yaml', 'recursive': false},
           {'path': stack_dir ~ '/loki/config.yml', 'recursive': false},
           {'path': stack_dir ~ '/postgres/init', 'recursive': true},
