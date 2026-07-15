@@ -12,22 +12,24 @@ see [solution-map.md](solution-map.md).
 
 ## What the seed carries
 
-The archive holds only the external images the converge would otherwise pull:
-the directly run DHI pins (`busybox`, `postgres`, `tempo`), the DHI base images
-that each locally built `ai-gateway/dhi-*:<ver>-probe` derivative is built FROM
-(oauth2-proxy, keycloak, vault, redis, alloy, prometheus, node-exporter, loki,
-grafana, and the OpenTelemetry Collector, plus both the DHI Traefik runtime base
-and the upstream Traefik binary source that the patched Traefik image combines),
-and the two non-DHI upstream bases for the application exceptions LiteLLM and
-Open WebUI.
+The archive holds every literal digest-pinned external image in the reviewed
+Compose and Dockerfile sources — exactly the set
+`scripts/rebuild-offline-image-seed.py` collects: the directly run DHI pins
+(`busybox`, `postgres`, `tempo`), the DHI base images that each locally built
+`ai-gateway/dhi-*:<ver>-probe` derivative is built FROM (oauth2-proxy,
+keycloak, vault, redis, alloy, prometheus, node-exporter, loki, grafana, and
+the OpenTelemetry Collector, plus both the DHI Traefik runtime base and the
+upstream Traefik binary source that the patched Traefik image combines), the
+two non-DHI upstream bases for the application exceptions LiteLLM and Open
+WebUI, the upstream `hashicorp/vault` release image that the `vault-ui-proxy`
+build parses for its embedded UI assets, the pinned BuildKit Dockerfile
+frontend, and the public Debian base for the lab-only Samba build.
 
 By assertion it carries no `ai-gateway/*` image: the `-probe` derivatives, the
 two Traefik edges, and the portals are always built on the VM from the seeded
-bases. The public, digest-pinned Debian base for the lab-only Samba build is
-also intentionally excluded — it needs no registry credential and is pulled from
-Docker Hub during the build. A generic/customer inventory must make its own
-reviewed decision about which of these external images to pre-stage and must
-never copy the lab paths or hashes by habit.
+bases. A generic/customer inventory must make its own reviewed decision about
+which of these external images to pre-stage and must never copy the lab paths
+or hashes by habit.
 
 ## Enabling the feature
 
@@ -91,26 +93,36 @@ retired. Because the loader clears its environment and runs on a fixed system
 
 ## Current lab rehearsal artifact
 
-The 2026-07-13 rebuild uses this manifest-backed, secret-free seed from the
-recovery workstation, matching the hashes committed in
-`inventory/host_vars/lab-aigw01.yml`:
+The current lab seed was rebuilt on 2026-07-15 with
+`scripts/rebuild-offline-image-seed.py` running as root on the lab VM's own
+root Docker daemon (linux/arm64, containerd image store), matching the hashes
+committed in `inventory/host_vars/lab-aigw01.yml` and staged root-owned mode
+`0600` at the pinned `/var/tmp` paths:
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `aigw-external-images-linux-arm64-20260713.docker.tar.zst` | 3,304,886,294 bytes | `e418ac9299351254412028b3a1481eccaf8791a4847e931d724a4882de2defde` |
-| `aigw-external-images-linux-arm64-20260713.manifest.json` | 7,206 bytes | `ebde9dd8a2f8053666414e665be03acbfcf3b841af94d9e7b26e3da9ed6b5515` |
+| `aigw-external-images-linux-arm64-20260715-vaultui.docker.tar.zst` | 3,347,684,377 bytes | `4cd1d451a4654d1f183127cafc8e9dbfe7a04ade891e2a42928401586e160470` |
+| `aigw-external-images-linux-arm64-20260715-vaultui.manifest.json` | 5,190 bytes | `3eeb68d8581e1cba995574a6a0a3e244947378b5a4a1efd4dfabdcf24233865d` |
 
-Both files are retained mode `0600` beneath
-`/Users/jamesrudisill/.aigw-lab-dr/20260713-pre-rebuild`. The archive passed
-zstd integrity verification. Its manifest records 22 exact Linux/ARM64 external
-`tag@sha256` references and immutable image IDs, including both the DHI Traefik
-runtime and the patched upstream binary source, and asserts that no locally
-built `ai-gateway/*` image is present. Every recorded RepoDigest and image ID
-was verified before export. These checks establish a reviewed bootstrap input.
-The replacement VM's G3 converge subsequently passed the live load/post-load
-exact-reference verification using this seed. That proves the external-image
-bootstrap lane only; it does not prove the later final-source G7 converge,
-custom-image rollback, runtime, or unchanged-converge gates.
+Both files are also retained mode `0600` beneath
+`/Users/jamesrudisill/.aigw-lab-dr/20260715-vaultui-seed`. The archive passed
+zstd integrity and OCI-metadata validation during export. Its manifest records
+25 exact Linux/ARM64 external `tag@sha256` references and immutable image IDs
+— the complete digest-pinned source set of the checkout it was built from,
+including the upstream `hashicorp/vault` Vault UI source added for the
+optional Vault UI feature — and asserts that no locally built `ai-gateway/*`
+image is present. Every recorded RepoDigest and image ID was verified against
+the daemon before export, and the identical map is frozen in
+`ansible/reset-rocky9-lab.yml` (`aigw_lab_reset_legacy_seed_image_tags`),
+which the lab reset requires the staged manifest to equal exactly.
+
+The superseded 2026-07-13 seed
+(`aigw-external-images-linux-arm64-20260713.docker.tar.zst`,
+`e418ac9299351254412028b3a1481eccaf8791a4847e931d724a4882de2defde`, 22 images,
+no `hashicorp/vault` UI source) remains retained beneath
+`/Users/jamesrudisill/.aigw-lab-dr/20260713-pre-rebuild` for the recorded G3
+rehearsal history, but no longer matches the inventory pins and must not be
+re-staged.
 
 To validate this feature locally without contacting a VM or loading images:
 

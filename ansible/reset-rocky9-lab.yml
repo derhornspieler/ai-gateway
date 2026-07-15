@@ -123,12 +123,12 @@
       ai-gateway/lab-dns:1.14.4: sha256:61630837e2d654bfef6189642a0c1ac59324d3c823ad0dbfa6a7ef1d078eba77
       ai-gateway/dhi-traefik:3.7.7-patched: sha256:604b9569668f8df7592600298d660f7527602e60633e71ec7275b61aca3b81ee
     # Exact external tags/IDs in the reviewed staged seed archive. Most are
-    # tagged in the legacy Docker root as well. The two BuildKit support
-    # images called out below are archive-only: they are needed to rebuild
-    # patched images offline, but are not tagged in the frozen legacy root.
-    # A rebuilt seed can legitimately introduce newer manifest identities, so
-    # the proof uses the union of this frozen snapshot map and the
-    # inventory-pinned manifest.
+    # tagged in the legacy Docker root as well. The archive-only images
+    # called out below are additional offline build inputs (the BuildKit
+    # frontend, the lab Samba base, and the upstream Vault UI source) that
+    # the frozen legacy converge state never tagged itself. The staged
+    # manifest must equal this map exactly, so a rebuilt seed with a changed
+    # image set requires updating this reviewed snapshot in the same change.
     aigw_lab_reset_legacy_seed_image_tags:
       dhi.io/grafana:12.4.5: sha256:bf28b93e5f122d0d93574f865df15ba01ca630e91e9af1138c4bfd3461e8619e
       ghcr.io/berriai/litellm:v1.91.3: sha256:b6e44a97d551dfaa37a13dd02c0d05b2e7e38f5e900aaaea6fd39431ff6207fa
@@ -154,14 +154,17 @@
       dhi.io/oauth2-proxy:7.15.3: sha256:3e225291283ad41745327dcbd2e97b8a6aed461d38e9e84d1e664092b53f1158
       dhi.io/redis:7.4.9: sha256:4feb8a348f13e623392857774371cc9a2e1d8f8c6f897645410a527dfea83397
       dhi.io/postgres:16.14: sha256:5b1b603cbb414af8ee417d0f6b4c170be7fed0b7e433c137f1b9f2a63ba313cd
+      hashicorp/vault:2.0.3: sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54
     # These are the only reviewed archive tags which may be absent from the
     # legacy Docker root. Their exact tag-to-ID mappings are still required in
     # the staged manifest, and no other missing or foreign tag is accepted.
-    # They may be present when Docker retained BuildKit metadata, so the graph
-    # proof accepts either absence or this exact identity.
+    # They may be present when the seed was rebuilt on this host or Docker
+    # retained BuildKit metadata, so the graph proof accepts either absence
+    # or this exact identity.
     aigw_lab_reset_legacy_archive_only_seed_image_tags:
       debian:13-slim: sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
       docker/dockerfile:1.7: sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+      hashicorp/vault:2.0.3: sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54
     # Exact SHA-256 proofs for the unmarked legacy VM snapshot.  This
     # playbook removes a file only if it is one of these root-owned known
     # bytes; a similarly named or modified artifact remains a hard stop for

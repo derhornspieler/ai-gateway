@@ -189,6 +189,7 @@ class Rocky9LabResetContractTests(unittest.TestCase):
             {
                 "debian:13-slim": "sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2",
                 "docker/dockerfile:1.7": "sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
+                "hashicorp/vault:2.0.3": "sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54",
             },
         )
         self.assertTrue(archive_only_tags.items() <= seed_tags.items())

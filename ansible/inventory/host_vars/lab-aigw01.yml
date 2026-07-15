@@ -36,10 +36,10 @@ aigw_adm_socks_trusted_operator_ack: I_UNDERSTAND_SOCKS_REACHES_ALL_HOST_ROUTES
 # The role validates its digest and loads it before any Compose build. Generic
 # inventory remains disabled/pathless and does not inherit this lab exception.
 offline_image_seed_enabled: true
-offline_image_seed_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260713-vaultui.docker.tar.zst
-offline_image_seed_sha256: 73e565c2c1bf849bd1fc8e5815a06bc64a233b22c8ac3319a2a532294e9f310f
-offline_image_seed_manifest_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260713-vaultui.manifest.json
-offline_image_seed_manifest_sha256: 87857a76881bf70cb9cd12e37f736a73bb0128554c9b55aa1463c25783c38682
+offline_image_seed_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260715-vaultui.docker.tar.zst
+offline_image_seed_sha256: 4cd1d451a4654d1f183127cafc8e9dbfe7a04ade891e2a42928401586e160470
+offline_image_seed_manifest_remote_path: /var/tmp/aigw-external-images-linux-arm64-20260715-vaultui.manifest.json
+offline_image_seed_manifest_sha256: 3eeb68d8581e1cba995574a6a0a3e244947378b5a4a1efd4dfabdcf24233865d
 # One Keycloak-local administrator is required only to enter the portal before
 # Samba federation exists. After assigning lab-admin to an aigw-admins managed
 # group, remove this disposable bootstrap identity through Keycloak recovery
