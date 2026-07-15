@@ -494,9 +494,12 @@ one valid selection.
 
 | mode | who | how the edge key is produced |
 |---|---|---|
-| `vault-intermediate` | production **and** the lab | Vault generates the intermediate key **internally**, emits a CSR, the customer CA signs it **offline**, the signed cert + chain are imported back. Vault then issues the edge leaf. |
-| `customer-supplied` | production | The operator supplies an existing leaf + private key + complete chain as controller-local files. |
+| `customer-supplied` | production | You hand over an existing leaf certificate + its private key + the complete chain as controller-local files. Use when you already hold a wildcard certificate issued for `*.<domain>`. |
+| `vault-intermediate` | production **and** the lab | Vault generates the intermediate key **internally** and it never leaves Vault; a CSR goes out, your CA signs it **offline**, the signed cert + chain are imported back. Vault then issues the edge leaf. Use when you want an intermediate under your root but do **not** want the gateway to hold intermediate key material. |
+| `customer-intermediate` | production **and** the lab | You hand over an intermediate CA certificate **and its private key** plus the full chain. Vault imports that intermediate, promotes it to the default issuer, and issues every leaf from it. Use when your CA can issue a constrained intermediate + key and you accept the gateway holding a live signing key. |
 | `lab` | `rocky9-lab` only | `vault-bootstrap.sh` mints a self-signed **TEST** root. No browser or customer trusts it. Fallback for a disposable lab with no real CA. |
+
+*Glossary: **leaf** — the actual server certificate a browser sees; **intermediate CA** — a signing certificate that sits between your root and the leaf; **root** — the top of the trust chain, whose private key you keep offline; **chain** — the ordered set of certificates from the intermediate up to the root.*
 
 **The customer's root/issuing private key is never requested, transported, or
 stored by this platform.** In `vault-intermediate` the only thing that crosses
@@ -537,6 +540,107 @@ validates everything *before* touching the live certificate store, then
 force-recreates the edge consumers. Then run the second `site.yml` converge.
 
 Leaf renewal later: `sudo scripts/vault-pki-intermediate.sh renew-leaf`.
+
+### Mode 3 ceremony (`customer-intermediate`)
+
+Here you hand the gateway an **intermediate CA certificate, its private key, and
+the full `intermediate + root` chain**, plus `aigw_domain`. Vault imports the
+intermediate, promotes it to the default issuer, pins the `aigw` issuing role to
+it, then issues every edge leaf (`*.<domain>`/`<domain>`, and the lab Samba LDAPS
+certificate) from it. **The customer root private key is still never supplied,
+transported, or stored** — only an intermediate that your root constrains.
+
+**Where the material comes from — two paths, one mode.** The mode is identical
+for lab and production; only the source of the three files differs.
+
+* **Production:** the deploying engineer sets four inventory values —
+  `aigw_edge_tls_mode: customer-intermediate`, `aigw_domain`, and the three
+  controller-local PEM paths `aigw_edge_tls_intermediate_cert_file` /
+  `aigw_edge_tls_intermediate_key_file` /
+  `aigw_edge_tls_intermediate_chain_file`. The key file must be `0600` and a
+  regular, non-symlink, single-link file. The controller preflight **fails
+  closed** — before any host is touched — if the set is incomplete or the key is
+  group-readable or a symlink. Start from
+  [`production-rocky9.host-vars.yml.example`](../ansible/inventory/examples/production-rocky9.host-vars.yml.example).
+* **Lab:** stage a local intermediate once (for example from the `aegisgroup.ch`
+  PKI), then converge normally. The template
+  [`rocky9-lab.customer-intermediate.host-vars.yml.example`](../ansible/inventory/examples/rocky9-lab.customer-intermediate.host-vars.yml.example)
+  points the three paths at the **gitignored** `ansible/inventory/local-pki/`
+  directory, and
+  [`rocky9-lab.stage-customer-intermediate.sh.example`](../ansible/inventory/examples/rocky9-lab.stage-customer-intermediate.sh.example)
+  copies your intermediate cert + key + chain into it (run once, from the repo
+  root):
+
+  ```bash
+  AIGW_LOCAL_PKI_INT_CERT=/path/to/intermediate.pem \
+  AIGW_LOCAL_PKI_INT_KEY=/path/to/intermediate.key \
+  AIGW_LOCAL_PKI_CHAIN=/path/to/ca-chain.pem \
+    bash ansible/inventory/examples/rocky9-lab.stage-customer-intermediate.sh.example
+  ```
+
+  This writes `ansible/inventory/local-pki/{intermediate.pem,intermediate.key,ca-chain.pem}`
+  (key `0600`) — material that never enters git.
+
+**The ordered ceremony** (the same two-pass converge as every mode, plus one
+import step on the VM):
+
+1. **Converge, pass 1** (`site.yml`). Ansible stages the three files into
+   `/opt/ai-gateway/secrets/` on the VM over the `no_log` SSH pipe
+   (`aigw-intermediate-import.pem`, `aigw-intermediate-import.key` at `0600 root`,
+   `aigw-intermediate-import-chain.pem`), installs the self-signed **placeholder**
+   so Traefik can start, and leaves Vault uninitialized. This is expected, not a
+   failure.
+2. **Initialize Vault.** Lab: `sudo scripts/vault-bootstrap.sh`, which in this
+   mode enables `pki_int` and **defers** the edge — no test root. Production: the
+   reviewed operator ceremony plus `scripts/store-vault-unseal-key.py` on the
+   controller.
+3. **Converge, pass 2** (`site.yml`). The placeholder is still served; the
+   production reject-self-signed gate stays dormant because no ceremony marker
+   exists yet.
+4. **Import ceremony**, on the VM from `/opt/ai-gateway`, with the Vault token on
+   stdin only:
+
+   ```bash
+   read -rsp 'Vault token: ' TOK; printf '\n'
+   printf '%s\n' "$TOK" | sudo scripts/vault-pki-intermediate.sh import-intermediate \
+       --intermediate      secrets/aigw-intermediate-import.pem \
+       --intermediate-key  secrets/aigw-intermediate-import.key \
+       --chain             secrets/aigw-intermediate-import-chain.pem
+   unset TOK
+   ```
+
+   This validates the material fail-closed (`edge-tls.py validate-intermediate`),
+   imports the intermediate over stdin (`pki_int/issuers/import/bundle`), promotes
+   it and *proves* it is the mount's default issuer, pins the `aigw` role, issues
+   and installs the edge leaf, writes the `.state/edge-tls-issued` marker, and
+   finally **shreds the staged private key** — after which the intermediate key
+   lives only inside Vault (encrypted at rest).
+
+Leaf renewal later: `sudo scripts/vault-pki-intermediate.sh renew-leaf`.
+Re-running the import ceremony requires **another converge first** to re-stage the
+files, because the ceremony shreds them on success and the staging step is skipped
+once the marker exists.
+
+> **Name constraints are load-bearing here.** Before touching Vault, the ceremony
+> signs a throwaway test leaf with your supplied intermediate and runs the exact
+> `openssl verify` the real leaves get — for both `portal.<domain>` and
+> `samba-ad.<domain>`. If `aigw_domain` is **outside** the permitted DNS subtree
+> your root/intermediate constrains (for example an `aegisgroup.ch`-constrained
+> intermediate with `aigw_domain=foo.example.com`), OpenSSL reports
+> `permitted subtree violation` and the ceremony **fails closed** before any
+> import. The domain has to fall inside the CA's permitted subtree — move the
+> domain, not the check.
+
+> **`customer-intermediate` is a higher-trust posture than `vault-intermediate`.**
+> In `vault-intermediate` the intermediate private key is generated inside Vault
+> and never leaves it. In `customer-intermediate` you deliberately hand the
+> gateway a live intermediate signing key: it transits the `no_log` Ansible pipe,
+> sits at `secrets/aigw-intermediate-import.key` (`0600 root`) between the staging
+> converge and the import ceremony, is imported into Vault over stdin, and is then
+> shredded from disk. Anyone who can read Vault's storage/seal or gain root on the
+> gateway before the shred can recover an issuing key for your `aigw_domain`
+> subtree. Choose it only when you accept that; otherwise prefer
+> `vault-intermediate`, where the key never leaves Vault.
 
 ### Mode 1 (`customer-supplied`)
 
@@ -585,11 +689,13 @@ explicit `vault status -address=... -format=json` seal-state probe belongs to
 the Ansible converge, not this script.)
 
 **Edge PKI depends on `aigw_edge_tls_mode`.** When the mode is
-`vault-intermediate` (what the committed lab now uses), `vault-bootstrap.sh`
-deliberately creates **no** root mount, **no** test root, and **no** edge
-certificate — the customer CA owns the edge, and `vault-pki-intermediate.sh`
-performs the ceremony. Only the explicit `lab` fallback mints the self-signed
-test root plus a 90-day wildcard certificate.
+`vault-intermediate` (what the committed lab uses) or `customer-intermediate`,
+`vault-bootstrap.sh` deliberately creates **no** root mount, **no** test root,
+and **no** edge certificate — the customer CA owns the edge, and
+`vault-pki-intermediate.sh` performs the ceremony (`csr` + `install-signed` for
+`vault-intermediate`, `import-intermediate` for `customer-intermediate`). Only the
+explicit `lab` fallback mints the self-signed test root plus a 90-day wildcard
+certificate.
 
 This is not production-safe merely because the listener is isolated: production
 still needs TLS on the Vault listener, multiple custodians or an approved

@@ -185,3 +185,71 @@ profiles. (PARTIAL — automatic repair landed; re-bootstrap path still thin)**
 - *Fix:* a customer break-glass runbook from the identity workstream covering
   domain migration on an already-bootstrapped host, aligned with the production
   Vault/PKI ceremony gaps in items 9–10.
+
+## Gaps found in the PKI + playbook-split pass (2026-07-14, customer-intermediate wave)
+
+New ambiguities hit while documenting the three-playbook split, the
+`customer-intermediate` edge-TLS mode, and the LUKS warn-only change
+(`operations.md`, `deploy-guide.md`, `deploy-runbook.md`, `os-security.md`).
+
+**13. The lab `customer-intermediate` example is host-vars only — no runnable
+inventory wiring.**
+- *Doc + section:* `ansible/inventory/examples/rocky9-lab.customer-intermediate.host-vars.yml.example`;
+  `operations.md` "Mode 3 ceremony".
+- *Unclear/missing:* the example is a **host_vars document**, but there is no
+  matching `hosts.yml`/inventory example showing where it plugs in. The committed
+  lab inventory (`ansible/inventory/lab.yml`) uses `vault-intermediate`, so an
+  operator who wants to exercise `customer-intermediate` in the lab has no
+  documented "assemble these files into a runnable inventory" step. The staging
+  script echoes `ansible-playbook -i <lab inventory> ansible/site.yml` but never
+  says how to build `<lab inventory>` from the example host-vars.
+- *Fix:* a short "wiring the customer-intermediate lab inventory" snippet, or a
+  companion committed `hosts.yml` example that references the host-vars document.
+
+**14. Re-running the import ceremony silently requires another converge first.**
+- *Doc + section:* `operations.md` "Mode 3 ceremony"; `scripts/vault-pki-intermediate.sh`
+  `import-intermediate`.
+- *Unclear/missing:* `import-intermediate` `shred`s
+  `secrets/aigw-intermediate-import.key` (and removes the staged cert/chain copies)
+  on success. The subcommand is idempotent against Vault, but the staged inputs it
+  reads are gone after the first run, and the Ansible staging step is **gated on
+  the ceremony marker being absent** — so a post-ceremony `site.yml` will not
+  re-stage either. Recovering or re-running the ceremony therefore means removing
+  the `.state/edge-tls-issued` marker *and* re-converging, which nothing states.
+  I documented "another converge first," but the exact marker-clear + re-stage
+  recovery path is still thin.
+- *Fix:* an explicit "how to re-run or roll back the import ceremony" note (which
+  marker to clear, that re-staging is marker-gated), ideally with a supported
+  `--regenerate`-style flow rather than manual marker surgery.
+
+**15. No switch turns the LUKS warning back into a hard failure for customers who
+want it enforced.**
+- *Doc + section:* `deploy-runbook.md` Part 1 (row 5); `deploy-guide.md`
+  "Sensitive state backing"; `os-security.md` §3.
+- *Unclear/missing:* the encrypted-state preflight now only **warns** on missing
+  LUKS (`AIGW_ENCRYPTED_STATE_WARNING`) even on a customer profile with
+  `require_encrypted_state: true`; `false` merely skips the check. There is no
+  inventory value that makes a missing LUKS volume fail closed. A customer whose
+  policy requires encrypted state at rest has no way to make the converge enforce
+  it, and an entry-level operator cannot judge whether proceeding past the warning
+  is acceptable — that is a risk-acceptance decision the docs cannot make for them.
+- *Fix:* either a documented `require_encrypted_state`-style "hard fail" option, or
+  a clear risk-acceptance note naming who signs off on deploying customer data
+  without LUKS.
+
+**16. The `customer-intermediate` name-constraint check always tests
+`samba-ad.<domain>`, even in production where Samba is not deployed.**
+- *Doc + section:* `scripts/edge-tls.py` `validate-intermediate`; `operations.md`
+  "Mode 3 ceremony" name-constraints callout.
+- *Unclear/missing:* the offline test-leaf verification exercises **both**
+  `portal.<domain>` and `samba-ad.<domain>` against the supplied intermediate,
+  regardless of deployment profile. In production (no Samba) the `samba-ad`
+  hostname is still validated, so an intermediate whose name constraints permit
+  `<domain>` but somehow exclude `samba-ad.<domain>` would fail the ceremony for a
+  certificate the production edge never serves. In practice a subtree permitting
+  `<domain>` covers `samba-ad.<domain>`, so this is usually moot — but it is
+  undocumented, and an operator with an unusual constraint set could hit a
+  confusing failure.
+- *Fix:* note in the ceremony docs that validation always checks a wildcard-covering
+  set including `samba-ad.<domain>`, so the permitted subtree must cover the whole
+  `<domain>` one-level namespace, not just the apex.

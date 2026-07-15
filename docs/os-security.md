@@ -92,13 +92,26 @@ depend on trustworthy time.
 
 ## 3. Encrypted state storage
 
-With `require_encrypted_state: true` (the default), both Docker's data root
-and `/opt/ai-gateway` must resolve through a block device whose ancestry
-includes a `crypto_LUKS` volume, verified via `findmnt`/`lsblk` before any
-mutation. Only the disposable lab inventory opts out. State backups are
-encrypted with `age` (X25519) to an operator-supplied recipient; stateful
-image upgrades are refused unless a hash-verified backup receipt younger
-than 24 hours exists (`require_preupgrade_backup: true`).
+LUKS (Linux Unified Key Setup — full-disk encryption) is a **build-time,
+disk-provisioning** concern that the converge deliberately does not manage: it
+never creates the encrypted volume, never unlocks it, and never holds the
+passphrase. The operator provisions the encrypted disk when the VM is built and
+**custodies the passphrase themselves** (offline, or in their own vault); the
+gateway never sees it.
+
+With `require_encrypted_state: true` (the default), a read-only preflight
+resolves both Docker's data root and `/opt/ai-gateway` to their backing block
+device and checks (via `findmnt`/`lsblk`) that the ancestry includes a
+`crypto_LUKS` volume. When a path is not on LUKS, the check **warns and
+continues** rather than failing closed: it emits
+`AIGW_ENCRYPTED_STATE_WARNING: …` and then a plain-language `WARNING: sensitive
+AI Gateway state is NOT on LUKS-encrypted storage …` line, and the converge
+proceeds. Both the host-prep phase (`os-prep.yml`) and the stack phase
+(`deploy-stack-only.yml`) run this same warn-only check. Only the disposable lab
+inventory opts out entirely (`require_encrypted_state: false`). State backups are
+encrypted with `age` (X25519) to an operator-supplied recipient; stateful image
+upgrades are refused unless a hash-verified backup receipt younger than 24 hours
+exists (`require_preupgrade_backup: true`).
 
 ## 4. Package hygiene
 
