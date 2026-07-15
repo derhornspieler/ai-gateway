@@ -237,7 +237,7 @@ path "kv/destroy/*" { capabilities = ["update"] }
 # (kv/metadata), per-version soft-delete (kv/delete), undelete (kv/undelete),
 # permanent per-version destroy (kv/destroy), and subkey-structure reads
 # (kv/subkeys) at SEPARATE paths. A deny on only kv/data/X + kv/metadata/X
-# would leave `vault kv delete -versions=N` and `vault kv destroy -versions=N`
+# would leave \`vault kv delete -versions=N\` and \`vault kv destroy -versions=N\`
 # falling through to the wildcard grants above and irreversibly wiping the
 # break-glass recovery credential (or a rotator private key). So each protected
 # record is denied on all six sub-APIs. (kv/subkeys has no matching grant above
