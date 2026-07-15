@@ -82,7 +82,7 @@ stage.
 | `oauth2-proxy-prometheus` | Keycloak `aigw-admins` gate for Prometheus | internal to `net-admin-app`/`net-observability` |
 | `oauth2-proxy-vault` | Keycloak `aigw-admins` gate before Vault's own login | internal to `net-admin-app`/`net-vault` |
 | `litellm` | OpenAI/Anthropic-compatible gateway, virtual keys, provider routing | inference allow-list through `api.<domain>`; DB in `pg_data` |
-| `open-webui` | OIDC browser chat | `chat.<domain>` on the ADM edge; `openwebui_data` |
+| `open-webui` | OIDC browser chat | `chat.<domain>` dual-homed on the ADM and internal edges (one OIDC client, `aigw-chat` gate); `openwebui_data` |
 | `keycloak` | `aigw` user realm and isolated `anthropic-wif` realm | `auth.<domain>` scoped to the `aigw` realm on the internal leg; full console and master realm through the same `auth.<domain>` host on the ADM leg; DB in `pg_data` |
 | `dev-portal` | OIDC self-service gateway keys and tool snippets; no admin route | `portal.<domain>` on the internal edge |
 | `admin-portal` | separate OIDC application for managed Keycloak projects/users and provider rotation | `admin.<domain>` on the ADM edge |
@@ -236,7 +236,9 @@ Docker-socket discovery. `traefik-int` binds `${ETH2_IP}:443` and routes
 `api.<domain>` to LiteLLM (only the inference,
 model, and liveness/readiness paths; any other path on the api host hits an
 explicit deny-all `403`), the `aigw`-realm-scoped `auth.<domain>` to Keycloak,
-and `portal.<domain>` to the dev portal. `traefik-adm` binds `${ETH1_IP}:443`
+`portal.<domain>` to the dev portal, and `chat.<domain>` to Open WebUI
+(owner decision: LAN reachability; the same OIDC client and `aigw-chat` gate
+apply on both edges). `traefik-adm` binds `${ETH1_IP}:443`
 and routes `chat.<domain>` to Open WebUI, `litellm-admin.<domain>` through
 `oauth2-proxy` to the LiteLLM Admin UI, `admin.<domain>` to the admin portal, `grafana.<domain>` through
 `oauth2-proxy-grafana`, `prometheus.<domain>` through `oauth2-proxy-prometheus`,
@@ -255,6 +257,7 @@ flowchart LR
   A[VPN administrator] -->|ADM IP:443| TA[traefik-adm]
 
   TA -->|chat| OW[Open WebUI]
+  TI -->|chat| OW
   TI -->|inference paths only| LL[LiteLLM]
   TI -->|aigw realm only| KC[Keycloak]
   TI -->|portal| DP[dev-portal]

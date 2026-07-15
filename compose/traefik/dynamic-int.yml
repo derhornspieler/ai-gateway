@@ -49,6 +49,17 @@ http:
       entryPoints: [websecure]
       service: dev-portal
       tls: {}
+    chat:
+      # Owner decision: Open WebUI is ALSO published to LAN users on the
+      # internal edge. This is a second reachability path only — the
+      # application keeps its single Keycloak OIDC client and the dedicated
+      # aigw-chat role gate, and the source-restricted ADM/VPN listener in
+      # dynamic-adm.yml stays as-is. traefik-int reaches the backend over its
+      # existing net-chat attachment; no new bridge or alias is involved.
+      rule: 'Host(`chat.{{ env "DOMAIN" }}`)'
+      entryPoints: [websecure]
+      service: open-webui
+      tls: {}
 
   middlewares:
     # 403-everything middleware: an allow-list containing only IPv4's
@@ -68,6 +79,9 @@ http:
     dev-portal:
       loadBalancer:
         servers: [{ url: "http://dev-portal:8080" }]
+    open-webui:
+      loadBalancer:
+        servers: [{ url: "http://open-webui:8080" }]
 
 tls:
   certificates:

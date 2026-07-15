@@ -850,6 +850,8 @@ if ansible.is_file():
     for required in (
         '{ address: "{{ traefik_int_portal_ip }}", hostname: "portal.',
         '{ address: "{{ traefik_int_chat_ip }}", hostname: "api.',
+        '{ address: "{{ traefik_int_chat_ip }}", hostname: "chat.',
+        'hostname: "chat.{{ aigw_domain }}", path: /oauth/oidc/login, status: "302"',
         '{ address: "{{ traefik_adm_admin_ip }}", hostname: "admin.',
         '{ address: "{{ traefik_adm_admin_ip }}", hostname: "admin-portal.',
         '{ address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.',

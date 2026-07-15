@@ -10,7 +10,7 @@
 #   B. every ADMIN-plane FQDN answers on the ADM edge and 404s on the internal
 #      edge (curl --resolve against both plane IPs);
 #   C. every USER/internal-plane FQDN answers on the internal edge and 404s on
-#      the ADM edge; the dual-homed auth. host answers on both;
+#      the ADM edge; the dual-homed auth. and chat. hosts answer on both;
 #   D. the Keycloak authorization endpoint returns 200 (login page) for every
 #      OIDC client's registered redirect_uri (SSO is wired);
 #   E. (optional, --ssh) the live DOCKER-USER + nft aigw_guard prove Envoy
@@ -85,8 +85,11 @@ command -v openssl >/dev/null || fatal "openssl is required"
 # FQDN-to-plane map. Source of truth: compose/traefik/dynamic-adm.yml (ADM edge,
 # published on ETH1_IP) and compose/traefik/dynamic-int.yml (internal edge,
 # published on ETH2_IP). auth. is served on BOTH edges (full admin console on
-# ADM; the browser OIDC subset on internal).
-ADMIN_LABELS=(chat admin admin-portal litellm-admin grafana prometheus)
+# ADM; the browser OIDC subset on internal). chat. is likewise dual-homed
+# (owner decision): the source-restricted ADM/VPN listener stays, and LAN
+# users reach the same Open WebUI — same OIDC client, same aigw-chat gate —
+# on the internal edge.
+ADMIN_LABELS=(admin admin-portal litellm-admin grafana prometheus)
 if [[ "$VAULT_UI" == "true" ]]; then
   ADMIN_LABELS+=(vault)
 fi
@@ -166,6 +169,8 @@ for label in "${ADMIN_LABELS[@]}"; do verify_cert_on_edge "$label" "$ADM_IP" "AD
 for label in "${USER_LABELS[@]}"; do verify_cert_on_edge "$label" "$INTERNAL_IP" "internal"; done
 verify_cert_on_edge "auth" "$ADM_IP" "ADM"
 verify_cert_on_edge "auth" "$INTERNAL_IP" "internal"
+verify_cert_on_edge "chat" "$ADM_IP" "ADM"
+verify_cert_on_edge "chat" "$INTERNAL_IP" "internal"
 
 # ── B. Admin FQDNs: answer on ADM, 404 on internal ──────────────────────────
 section "B. Admin FQDNs answer on the ADM edge and 404 on the internal edge"
@@ -216,6 +221,30 @@ if [[ "$HTTP_CODE" != "000" && "$HTTP_CODE" != "404" ]]; then
   pass "auth.${DOMAIN} serves the admin console on the ADM edge (HTTP ${HTTP_CODE})"
 else
   fail "auth.${DOMAIN} admin console on ADM edge returned HTTP ${HTTP_CODE}"
+fi
+# chat. is dual-homed (owner decision): Open WebUI answers on BOTH edges. The
+# internal path is reachability only — unauthenticated entry must still hand
+# off to the Keycloak OIDC gate (3xx redirect), and role authorization
+# (aigw-chat; wrong-role 403) is enforced by the application after the code
+# exchange, proven by the build-time OAuth harness and the converge's verify
+# role — this read-only script never holds credentials to exercise it.
+probe_http "chat.${DOMAIN}" "$ADM_IP" "/health"
+if [[ "$HTTP_CODE" == "200" ]]; then
+  pass "chat.${DOMAIN} answers on the ADM edge (HTTP 200 /health)"
+else
+  fail "chat.${DOMAIN} /health on ADM edge returned HTTP ${HTTP_CODE}"
+fi
+probe_http "chat.${DOMAIN}" "$INTERNAL_IP" "/health"
+if [[ "$HTTP_CODE" == "200" ]]; then
+  pass "chat.${DOMAIN} answers on the internal edge (HTTP 200 /health)"
+else
+  fail "chat.${DOMAIN} /health on internal edge returned HTTP ${HTTP_CODE}"
+fi
+probe_http "chat.${DOMAIN}" "$INTERNAL_IP" "/oauth/oidc/login"
+if [[ "$HTTP_CODE" =~ ^30[0-9]$ ]]; then
+  pass "chat.${DOMAIN} unauthenticated login on internal edge redirects into OIDC (HTTP ${HTTP_CODE})"
+else
+  fail "chat.${DOMAIN} internal-edge login did not redirect into OIDC (HTTP ${HTTP_CODE})"
 fi
 
 # ── D. OIDC authorization endpoint renders the login page per client ─────────

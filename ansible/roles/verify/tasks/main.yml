@@ -1127,6 +1127,9 @@
     - { name: "portal.{{ aigw_domain }}", transport: +notcp }
     - { name: "auth.{{ aigw_domain }}", transport: +tcp }
     - { name: "api.{{ aigw_domain }}", transport: +notcp }
+    # Owner decision: chat is dual-homed — the internal view resolves it to
+    # the internal edge for LAN users while the ADM view keeps the VPN path.
+    - { name: "chat.{{ aigw_domain }}", transport: +tcp }
   register: lab_dns_restricted_queries
   changed_when: false
   failed_when: >-
@@ -1545,6 +1548,12 @@
     - { address: "{{ traefik_int_portal_ip }}", hostname: "portal.{{ aigw_domain }}", path: /healthz, status: "200" }
     - { address: "{{ traefik_int_portal_ip }}", hostname: "auth.{{ aigw_domain }}", path: /realms/aigw/.well-known/openid-configuration, status: "200" }
     - { address: "{{ traefik_int_chat_ip }}", hostname: "api.{{ aigw_domain }}", path: /ui, status: "403" }
+    # Owner decision: chat is reachable on the internal edge. /health proves
+    # the internal chat router terminates at Open WebUI; the unauthenticated
+    # login entrypoint must still hand off to the Keycloak OIDC gate (302),
+    # proving added reachability did not bypass the aigw-chat authorization.
+    - { address: "{{ traefik_int_chat_ip }}", hostname: "chat.{{ aigw_domain }}", path: /health, status: "200" }
+    - { address: "{{ traefik_int_chat_ip }}", hostname: "chat.{{ aigw_domain }}", path: /oauth/oidc/login, status: "302" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin.{{ aigw_domain }}", path: /, status: "303" }
     # Traefik v3 RedirectRegex emits 301 for permanent redirects and 302 for
     # temporary redirects. Verify the implementation's actual contract.

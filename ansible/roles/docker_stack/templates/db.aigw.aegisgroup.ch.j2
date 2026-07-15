@@ -2,7 +2,7 @@ $ORIGIN {{ aigw_domain }}.
 $TTL 60
 
 @       IN SOA  dns.{{ aigw_domain }}. hostmaster.{{ aigw_domain }}. (
-                    2026071401 3600 900 604800 60
+                    2026071501 3600 900 604800 60
                 )
         IN NS   dns.{{ aigw_domain }}.
         IN A    {{ eth2_ip }}
@@ -11,3 +11,4 @@ dns     IN A    {{ eth2_ip }}
 api     IN A    {{ eth2_ip }}
 portal  IN A    {{ eth2_ip }}
 auth    IN A    {{ eth2_ip }}
+chat    IN A    {{ eth2_ip }}

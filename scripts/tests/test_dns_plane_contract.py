@@ -252,7 +252,9 @@ class DnsPlaneContractTests(unittest.TestCase):
             ROOT
             / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.adm.j2"
         ).read_text()
-        for name in ("api", "portal", "auth"):
+        # Owner decision: chat is dual-homed. The internal view resolves it to
+        # the internal edge for LAN users; the ADM view keeps the VPN path.
+        for name in ("api", "portal", "auth", "chat"):
             self.assertRegex(internal, rf"(?m)^{name}\s+IN A\s+{{{{ eth2_ip }}}}$")
         for admin_only in (
             "admin",
@@ -261,10 +263,10 @@ class DnsPlaneContractTests(unittest.TestCase):
             "grafana",
             "prometheus",
             "vault",
-            "chat",
         ):
             self.assertNotRegex(internal, rf"(?m)^{admin_only}\s+IN A")
         self.assertRegex(adm, r"(?m)^auth\s+IN A \{\{ eth1_ip \}\}$")
+        self.assertRegex(adm, r"(?m)^chat\s+IN A \{\{ eth1_ip \}\}$")
         self.assertRegex(adm, r"(?m)^portal\s+IN A \{\{ eth2_ip \}\}$")
 
     def test_verify_exercises_routable_and_isolated_resolver_modes(self) -> None:

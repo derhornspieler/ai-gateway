@@ -751,6 +751,8 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         self.assertIn('"portal.{{ aigw_domain }}"', restricted)
         self.assertIn('"auth.{{ aigw_domain }}"', restricted)
         self.assertIn('"api.{{ aigw_domain }}"', restricted)
+        # Owner decision: the internal view serves the dual-homed chat name.
+        self.assertIn('"chat.{{ aigw_domain }}"', restricted)
         self.assertNotIn('"admin.{{ aigw_domain }}"', restricted)
         self.assertIn("lab_dns_restricted_queries.stdout | trim != eth2_ip", restricted)
 

@@ -167,6 +167,45 @@ class AdminSurfaceContractTests(unittest.TestCase):
             clients["admin-ui"]["redirectUris"],
         )
 
+    def test_chat_is_dual_homed_without_widening_the_internal_edge(self) -> None:
+        # Owner decision: Open WebUI chat is ALSO published on the internal
+        # edge for LAN users. Reachability only — the single Keycloak OIDC
+        # client and the dedicated aigw-chat gate stay authoritative, and the
+        # source-restricted ADM/VPN listener remains in dynamic-adm.yml.
+        self.assertIn('rule: \'Host(`chat.{{ env "DOMAIN" }}`)\'', self.traefik)
+        self.assertIn(
+            'rule: \'Host(`chat.{{ env "DOMAIN" }}`)\'', self.internal_traefik
+        )
+        self.assertIn(
+            'servers: [{ url: "http://open-webui:8080" }]', self.internal_traefik
+        )
+        # Only chat gained internal reachability: every admin-plane vhost
+        # must stay off the internal edge.
+        for admin_host in (
+            "admin.",
+            "admin-portal.",
+            "litellm-admin.",
+            "grafana.",
+            "prometheus.",
+            "vault.",
+        ):
+            self.assertNotIn(f"Host(`{admin_host}", self.internal_traefik)
+        # The internal chat router terminates at Open WebUI and the
+        # unauthenticated login entrypoint still hands off to Keycloak OIDC.
+        self.assertIn(
+            '{ address: "{{ traefik_int_chat_ip }}", hostname: '
+            '"chat.{{ aigw_domain }}", path: /health, status: "200" }',
+            self.verify,
+        )
+        self.assertIn(
+            '{ address: "{{ traefik_int_chat_ip }}", hostname: '
+            '"chat.{{ aigw_domain }}", path: /oauth/oidc/login, status: "302" }',
+            self.verify,
+        )
+        # Both split-horizon views serve the dual-homed name.
+        self.assertRegex(self.internal_zone, r"(?m)^chat\s+IN A\s+\{\{ eth2_ip \}\}$")
+        self.assertRegex(self.adm_zone, r"(?m)^chat\s+IN A \{\{ eth1_ip \}\}$")
+
     def test_litellm_admin_dns_is_adm_only_and_wildcard_certificate_covers_it(self) -> None:
         self.assertRegex(
             self.adm_zone,
