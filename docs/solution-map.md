@@ -372,7 +372,7 @@ inside the edge process.
 ## Docker network segmentation
 
 There is no flat `net-backend`. The `docker_networks` role pre-creates all 21
-bridges (`172.28.0.0/24` through `172.28.19.0/24`) as `external: true` with
+bridges (`172.28.0.0/24` through `172.28.20.0/24`) as `external: true` with
 stable, sub-16-character Linux bridge names and IPv6 disabled; each container
 receives the `.128/25` half of its subnet. The base Compose project attaches to
 19 of them, and the lab overlay adds `net-identity` and `net-lab-dns`.
