@@ -39,13 +39,16 @@ RP_SECRETS = {
 
 
 def baseline_spec() -> dict:
+    # Mirrors ansible/inventory/host_vars/lab-aigw01.yml exactly: the unit
+    # fixture drifting behind the shipped inventory is precisely how the
+    # aigw-chat fresh-converge regression stayed green in CI.
     return {
         "schema": 1,
         "ensure_lab_federation": False,
         "groups": [
-            {"name": "lab-admins", "roles": ["aigw-admins"]},
-            {"name": "lab-developers", "roles": ["aigw-developers"]},
-            {"name": "lab-users", "roles": ["aigw-users"]},
+            {"name": "lab-admins", "roles": ["aigw-admins", "aigw-chat"]},
+            {"name": "lab-developers", "roles": ["aigw-chat", "aigw-developers"]},
+            {"name": "lab-users", "roles": ["aigw-chat", "aigw-users"]},
         ],
         "bootstrap_admin_identities": [
             {
@@ -341,9 +344,9 @@ async def test_pre_vault_baseline_is_narrow_idempotent_and_never_uses_vault() ->
     unrelated_before = copy.deepcopy(admin.groups["operator-project"])
 
     assert await admin.reconcile_pre_vault_identity_baseline(baseline_spec()) is True
-    assert admin.groups["lab-admins"]["roles"] == {"aigw-admins"}
-    assert admin.groups["lab-developers"]["roles"] == {"aigw-developers"}
-    assert admin.groups["lab-users"]["roles"] == {"aigw-users"}
+    assert admin.groups["lab-admins"]["roles"] == {"aigw-admins", "aigw-chat"}
+    assert admin.groups["lab-developers"]["roles"] == {"aigw-chat", "aigw-developers"}
+    assert admin.groups["lab-users"]["roles"] == {"aigw-chat", "aigw-users"}
     assert admin.groups["lab-admins"]["members"] == {"lab-admin-uuid"}
     assert admin.groups["operator-project"] == unrelated_before
     assert all(method != "DELETE" for method, _ in admin.mutations)
@@ -502,6 +505,56 @@ async def test_pre_vault_baseline_does_not_grant_roles_to_undeclared_members() -
     assert all(method != "DELETE" for method, _ in admin.mutations)
 
 
+def test_pre_vault_spec_accepts_the_shipped_lab_inventory_admin_group() -> None:
+    """Regression guard for the aigw-chat fresh-converge failure.
+
+    b5bcb96 moved the lab inventory's bootstrap-admin group to
+    ``[aigw-admins, aigw-chat]`` but the validator still pinned exactly
+    ``{aigw-admins}``, so every fresh lab converge raised IdentityConflict
+    during pure spec validation — before any Keycloak request — and the
+    one-shot printed only PRE_VAULT_IDENTITY_BASELINE_RECONCILIATION_FAILED.
+    """
+
+    groups, identities, ensure_lab_federation = (
+        KeycloakAdmin._validate_pre_vault_identity_spec(baseline_spec())
+    )
+    assert [group["name"] for group in groups] == [
+        "lab-admins",
+        "lab-developers",
+        "lab-users",
+    ]
+    assert groups[0]["roles"] == ["aigw-admins", "aigw-chat"]
+    assert identities == [
+        {
+            "username": "lab-admin",
+            "group": "lab-admins",
+            "federation_provider": LAB_LDAP_PROVIDER_NAME,
+        }
+    ]
+    assert ensure_lab_federation is False
+
+
+@pytest.mark.parametrize(
+    "admin_group_roles",
+    [
+        # Chat alone is not an admin gate.
+        ["aigw-chat"],
+        # Only the dedicated chat capability may accompany aigw-admins on the
+        # bootstrap identity's group; any other capability stays rejected.
+        ["aigw-admins", "aigw-developers"],
+        ["aigw-admins", "aigw-users"],
+        ["aigw-admins", "aigw-chat", "aigw-developers"],
+    ],
+)
+def test_pre_vault_bootstrap_admin_group_must_stay_a_pure_admin_gate(
+    admin_group_roles,
+) -> None:
+    spec = baseline_spec()
+    spec["groups"][0]["roles"] = sorted(admin_group_roles)
+    with pytest.raises(IdentityConflict, match="bootstrap identity is invalid"):
+        KeycloakAdmin._validate_pre_vault_identity_spec(spec)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutate",
@@ -509,6 +562,9 @@ async def test_pre_vault_baseline_does_not_grant_roles_to_undeclared_members() -
         lambda value: value.update({"unexpected": True}),
         lambda value: value.update({"groups": []}),
         lambda value: value["groups"][0].update({"roles": ["manage-realm"]}),
+        lambda value: value["groups"][0].update(
+            {"roles": ["aigw-admins", "aigw-developers"]}
+        ),
         lambda value: value["bootstrap_admin_identities"][0].update(
             {"group": "lab-users"}
         ),

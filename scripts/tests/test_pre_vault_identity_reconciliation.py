@@ -114,6 +114,31 @@ class PreVaultIdentityReconciliationContractTests(unittest.TestCase):
         self.assertNotIn("VaultClient", self.runner)
         self.assertNotIn("traceback", self.runner.lower())
 
+    def test_validator_admits_the_pinned_lab_admin_group_capability_set(self) -> None:
+        """The runner-side validator must accept the inventory pinned above.
+
+        The lab bootstrap-admin group carries [aigw-admins, aigw-chat] since
+        the dedicated chat capability landed (b5bcb96). The validator's rule is
+        therefore: aigw-admins mandatory, only the dedicated chat capability
+        may accompany it. The previous exact-set pin {aigw-admins} rejected the
+        shipped inventory during pure spec validation, so every fresh lab
+        converge failed before its first Keycloak request.
+        """
+        validator_start = self.identity.index(
+            "    def _validate_pre_vault_identity_spec("
+        )
+        validator_end = self.identity.index(
+            "    async def _pre_vault_direct_child(", validator_start
+        )
+        validator = self.identity[validator_start:validator_end]
+        self.assertIn('"aigw-admins" not in group_roles[group]', validator)
+        self.assertIn('{"aigw-admins", CHAT_CAPABILITY_ROLE}', validator)
+        # The pre-aigw-chat exact-set pin must not silently return: it is
+        # value-incompatible with the lab inventory lines asserted above.
+        self.assertNotIn(
+            'group_roles[group] != frozenset({"aigw-admins"})', validator
+        )
+
     def test_mutator_never_reads_vault_or_deletes_keycloak_state(self) -> None:
         for required in (
             "_validate_pre_vault_identity_spec(spec)",

@@ -942,7 +942,14 @@ class KeycloakAdmin:
                 or username in seen_users
                 or not isinstance(group, str)
                 or group not in group_roles
-                or group_roles[group] != frozenset({"aigw-admins"})
+                # The bootstrap identity's group must be a pure admin gate:
+                # aigw-admins is mandatory, and only the dedicated aigw-chat
+                # capability may accompany it now that chat is its own
+                # assignable capability granted to admin groups as well.
+                or "aigw-admins" not in group_roles[group]
+                or not group_roles[group] <= frozenset(
+                    {"aigw-admins", CHAT_CAPABILITY_ROLE}
+                )
                 or not isinstance(provider, str)
                 or FEDERATION_PROVIDER_RE.fullmatch(provider) is None
             ):
