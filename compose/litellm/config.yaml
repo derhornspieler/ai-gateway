@@ -8,16 +8,26 @@ model_list:
   # LiteLLM appends "/v1/messages" without normalizing, and envoy's
   # prefix_rewrite would otherwise emit a double slash. (openai/ is immune.)
   # ── Anthropic (native /v1/messages passthrough for Claude Code) ──────
+  # Auto-Inject Prompt Caching: LiteLLM stamps Anthropic cache_control at the
+  # proxy, so every client (Open WebUI, dev-portal, Claude Code) benefits with
+  # no client change.  Conservative first cut: cache only the system message.
+  # After measuring the cache-hit ratio in spend logs, a conversation-turn
+  # point ({location: message, index: -2}) can be added below to also cache the
+  # growing chat history — deferred so the rollout is measured, not assumed.
+  # Requires optional_pre_call_checks in router_settings.
+  # Rationale + rollout plan: docs/research/openwebui-prompt-caching.md.
   - model_name: claude-sonnet
     litellm_params:
       model: anthropic/claude-sonnet-4-5
       api_base: http://envoy-egress:8080/anthropic
       litellm_credential_name: anthropic-primary
+      cache_control_injection_points: [{location: message, role: system}]
   - model_name: claude-haiku
     litellm_params:
       model: anthropic/claude-haiku-4-5
       api_base: http://envoy-egress:8080/anthropic
       litellm_credential_name: anthropic-primary
+      cache_control_injection_points: [{location: message, role: system}]
 
   # ── OpenAI ───────────────────────────────────────────────────────────
   - model_name: gpt
@@ -45,3 +55,8 @@ general_settings:
 router_settings:
   redis_host: os.environ/REDIS_HOST
   redis_password: os.environ/REDIS_PASSWORD
+  # Activates the PromptCachingDeploymentCheck that makes the per-model
+  # cache_control_injection_points above take effect (auto-injection is a no-op
+  # without it).  Only the Anthropic models declare injection points; the
+  # openai model is untouched, so this check is inert for it.
+  optional_pre_call_checks: ["prompt_caching"]
