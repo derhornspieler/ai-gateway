@@ -630,6 +630,14 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
         async def _ensure_broker(self, admin_token):
             return {"certificate_sha256": "b" * 64}
 
+        async def _ensure_break_glass_admin(self, admin_token):
+            events.append(("keycloak", "break_glass_ensured"))
+            return {
+                "username": "break-glass-admin",
+                "group": "keycloak-admins",
+                "escrowed_at": "2026-01-01T00:00:00+00:00",
+            }
+
         async def _delete_bootstrap_principals(self, admin_token):
             events.append(("keycloak", "bootstrap_deleted"))
 
@@ -638,11 +646,14 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
 
     result = await OrderedAdmin(settings(), vault, FakeDB()).bootstrap()
     assert result == {"configured": True}
+    break_glass = events.index(("keycloak", "break_glass_ensured"))
     state_write = events.index(
         ("vault_write", "ai-gateway/keycloak/identity-state")
     )
     admin_delete = events.index(("keycloak", "bootstrap_deleted"))
-    assert state_write < admin_delete
+    # The durable break-glass administrator must be proven before the state
+    # write, and the temporary admin destroyed only after both.
+    assert break_glass < state_write < admin_delete
 
 
 @pytest.mark.asyncio
@@ -1344,21 +1355,36 @@ async def test_cleanup_refuses_unmarked_master_administrator() -> None:
 
 @pytest.mark.asyncio
 async def test_cleanup_deletes_only_marked_temporary_bootstrap_principals() -> None:
-    """A normal post-bootstrap cleanup removes both Keycloak temporary grants."""
+    """A normal post-bootstrap cleanup removes both Keycloak temporary grants.
+
+    The master realm also holds the durable, marked break-glass administrator
+    by this point. Teardown looks up only the exact bootstrap username, so the
+    break-glass user must never even be queried, let alone deleted.
+    """
 
     calls: list[tuple[str, str]] = []
+    directory = [
+        {
+            "id": "temporary-user",
+            "username": "admin",
+            "attributes": {"is_temporary_admin": ["true"]},
+        },
+        {
+            "id": "break-glass-user",
+            "username": "break-glass-admin",
+            "attributes": {"aigw.break-glass": ["true"]},
+        },
+    ]
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append((request.method, request.url.path))
+        assert "break-glass-user" not in request.url.path
         if request.url.path == "/admin/realms/master/users":
+            requested = request.url.params.get("username")
             return httpx.Response(
                 200,
                 json=[
-                    {
-                        "id": "temporary-user",
-                        "username": "admin",
-                        "attributes": {"is_temporary_admin": ["true"]},
-                    }
+                    user for user in directory if user["username"] == requested
                 ],
             )
         if request.url.path == "/admin/realms/master/users/temporary-user":

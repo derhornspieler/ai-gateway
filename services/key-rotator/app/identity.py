@@ -74,6 +74,34 @@ PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 BOOTSTRAP_IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
 FEDERATION_PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,127}")
 MANAGED_ROOT_ATTRIBUTE = "aigw.managed-root"
+# Durable master-realm administration objects are marked like the managed
+# root: automation only ever adopts or mutates an object it provably owns.
+MANAGED_ADMIN_GROUP_ATTRIBUTE = "aigw.managed-admin-group"
+BREAK_GLASS_ATTRIBUTE = "aigw.break-glass"
+BREAK_GLASS_SCHEMA = 1
+# Master's built-in composite role. The break-glass group is the instance
+# recovery principal: repairing a broken federation, the WIF realm, or the
+# bootstrap client requires cross-realm authority that only master-realm
+# principals can hold, so a fine-grained subset would defeat its purpose.
+MASTER_ADMIN_ROLE = "admin"
+# Pinned password-spray policy, value-equal to KEYCLOAK_POLICY in
+# scripts/validate-identity-policy.py (that validator asserts the parity).
+# Only the two imported realm files carry the policy via --import-realm; the
+# master realm is never file-imported, so without this reconcile it runs with
+# Keycloak's default (brute-force detection OFF) — untenable once master
+# holds a password-backed break-glass administrator.
+MASTER_BRUTE_FORCE_POLICY: dict[str, Any] = {
+    "bruteForceProtected": True,
+    "permanentLockout": False,
+    "maxTemporaryLockouts": 0,
+    "bruteForceStrategy": "MULTIPLE",
+    "failureFactor": 5,
+    "waitIncrementSeconds": 60,
+    "quickLoginCheckMilliSeconds": 1000,
+    "minimumQuickLoginWaitSeconds": 60,
+    "maxFailureWaitSeconds": 900,
+    "maxDeltaTimeSeconds": 43200,
+}
 BROKER_SUBJECT_MAPPER_NAME = "anthropic-stable-subject"
 # The lab federation's user filter, kept byte-identical to the representation
 # that existing lab components already carry. Changing it would make an
@@ -2383,6 +2411,333 @@ class KeycloakAdmin:
         )
         return await self._root_group(admin_token, create=False)
 
+    async def _master_group_by_name(
+        self, name: str, admin_token: str
+    ) -> dict[str, Any] | None:
+        response = await self._request(
+            "GET",
+            "/admin/realms/master/groups",
+            token=admin_token,
+            params={
+                "search": name,
+                "exact": "true",
+                "first": 0,
+                "max": 20,
+                "briefRepresentation": "false",
+            },
+            expected=(200,),
+        )
+        payload = self._json(response, "master admin group lookup")
+        if not isinstance(payload, list):
+            raise IdentityError("Keycloak master group lookup was not a list")
+        matches = [
+            group
+            for group in payload
+            if isinstance(group, dict)
+            and group.get("name") == name
+            and group.get("path") in (None, "/" + name)
+        ]
+        if len(matches) > 1:
+            raise IdentityConflict("multiple master-realm administrator groups exist")
+        return matches[0] if matches else None
+
+    async def _ensure_break_glass_group(self, admin_token: str) -> str:
+        name = self.settings.break_glass_admin_group
+        group = await self._master_group_by_name(name, admin_token)
+        if group is None:
+            await self._request(
+                "POST",
+                "/admin/realms/master/groups",
+                token=admin_token,
+                json_body={
+                    "name": name,
+                    "attributes": {MANAGED_ADMIN_GROUP_ATTRIBUTE: ["true"]},
+                },
+                expected=(201, 204),
+            )
+            group = await self._master_group_by_name(name, admin_token)
+        if group is None:
+            raise IdentityError("the master administrators group was not created")
+        attributes = group.get("attributes") or {}
+        if attributes.get(MANAGED_ADMIN_GROUP_ATTRIBUTE) not in (["true"], "true"):
+            raise IdentityConflict(
+                "refusing to adopt an unmarked master-realm administrators group"
+            )
+        group_id = path_segment(group.get("id"), label="master admin group UUID")
+        # Group membership is the single source of administrative authority:
+        # the composite admin role rides the marked group, never a user.
+        role_response = await self._request(
+            "GET",
+            f"/admin/realms/master/roles/{MASTER_ADMIN_ROLE}",
+            token=admin_token,
+            expected=(200,),
+        )
+        role = self._json(role_response, "master admin role")
+        if not isinstance(role, dict) or role.get("name") != MASTER_ADMIN_ROLE:
+            raise IdentityError("the master admin composite role is missing")
+        mappings_path = f"/admin/realms/master/groups/{group_id}/role-mappings/realm"
+        mapped = self._json(
+            await self._request(
+                "GET", mappings_path, token=admin_token, expected=(200,)
+            ),
+            "master admin group roles",
+        )
+        mapped_names = (
+            {entry.get("name") for entry in mapped if isinstance(entry, dict)}
+            if isinstance(mapped, list)
+            else set()
+        )
+        if MASTER_ADMIN_ROLE not in mapped_names:
+            await self._request(
+                "POST",
+                mappings_path,
+                token=admin_token,
+                json_body=[{"id": role.get("id"), "name": MASTER_ADMIN_ROLE}],
+                expected=(204,),
+            )
+            verified = self._json(
+                await self._request(
+                    "GET", mappings_path, token=admin_token, expected=(200,)
+                ),
+                "master admin group roles",
+            )
+            verified_names = (
+                {entry.get("name") for entry in verified if isinstance(entry, dict)}
+                if isinstance(verified, list)
+                else set()
+            )
+            if MASTER_ADMIN_ROLE not in verified_names:
+                raise IdentityError(
+                    "Keycloak did not verify the master admin role mapping"
+                )
+        return group_id
+
+    async def _ensure_master_brute_force_policy(self, admin_token: str) -> None:
+        realm = self._json(
+            await self._request(
+                "GET", "/admin/realms/master", token=admin_token, expected=(200,)
+            ),
+            "master realm",
+        )
+        if not isinstance(realm, dict):
+            raise IdentityError("Keycloak master realm representation was invalid")
+        if all(
+            realm.get(key) == value
+            for key, value in MASTER_BRUTE_FORCE_POLICY.items()
+        ):
+            return
+        updated = dict(realm)
+        updated.update(MASTER_BRUTE_FORCE_POLICY)
+        await self._request(
+            "PUT",
+            "/admin/realms/master",
+            token=admin_token,
+            json_body=updated,
+            expected=(204,),
+        )
+        verified = self._json(
+            await self._request(
+                "GET", "/admin/realms/master", token=admin_token, expected=(200,)
+            ),
+            "master realm",
+        )
+        if not isinstance(verified, dict) or any(
+            verified.get(key) != value
+            for key, value in MASTER_BRUTE_FORCE_POLICY.items()
+        ):
+            raise IdentityError(
+                "Keycloak did not verify the master brute-force policy"
+            )
+
+    async def _master_user_by_username(
+        self, username: str, admin_token: str
+    ) -> dict[str, Any] | None:
+        response = await self._request(
+            "GET",
+            "/admin/realms/master/users",
+            token=admin_token,
+            params={
+                "username": username,
+                "exact": "true",
+                "first": 0,
+                "max": 20,
+                "briefRepresentation": "false",
+            },
+            expected=(200,),
+        )
+        users = self._json(response, "break-glass user lookup")
+        if not isinstance(users, list):
+            raise IdentityError("Keycloak break-glass user lookup was invalid")
+        matches = [
+            user
+            for user in users
+            if isinstance(user, dict) and user.get("username") == username
+        ]
+        if len(matches) > 1:
+            raise IdentityConflict("multiple break-glass administrator users exist")
+        return matches[0] if matches else None
+
+    def _break_glass_escrow_doc(self) -> dict[str, Any] | None:
+        try:
+            doc = self.vault.read(self.settings.break_glass_admin_vault_path)
+        except Exception as exc:  # noqa: BLE001
+            raise IdentityError(
+                "could not read the break-glass escrow from Vault"
+            ) from exc
+        if (
+            isinstance(doc, dict)
+            and doc.get("schema_version") == BREAK_GLASS_SCHEMA
+            and doc.get("username") == self.settings.break_glass_admin_username
+            and isinstance(doc.get("password"), str)
+            and len(doc["password"]) >= 32
+        ):
+            return doc
+        return None
+
+    async def _set_break_glass_enabled(
+        self, user: dict[str, Any], enabled: bool, admin_token: str
+    ) -> None:
+        user_id = path_segment(user.get("id"), label="break-glass user UUID")
+        representation = dict(user)
+        representation["enabled"] = enabled
+        await self._request(
+            "PUT",
+            f"/admin/realms/master/users/{user_id}",
+            token=admin_token,
+            json_body=representation,
+            expected=(204,),
+        )
+
+    async def _ensure_break_glass_admin(
+        self, admin_token: str
+    ) -> dict[str, Any] | None:
+        """Provision the durable, group-gated master-realm administrator.
+
+        Runs only inside the one-time bootstrap window: the durable aigw
+        controller deliberately holds no master-realm authority, so
+        out-of-band drift is repaired by re-running this ceremony, never by
+        widening the controller. Fail-closed credential ordering: the user is
+        created disabled, the generated password is escrowed to Vault with a
+        verified write, and only then is the account enabled. Any failure
+        disables the account and fails bootstrap. The password exists only in
+        the Vault escrow document — never in logs, audit records, status
+        output, or the process environment.
+        """
+        if not self.settings.break_glass_admin_enabled:
+            return None
+        username = self.settings.break_glass_admin_username
+        if username == self.settings.keycloak_bootstrap_admin_username:
+            # Settings already refuses this; re-check so no alternate
+            # construction path can race teardown's exact-username lookup.
+            raise IdentityConflict(
+                "the break-glass username collides with the bootstrap admin"
+            )
+        group_id = await self._ensure_break_glass_group(admin_token)
+        await self._ensure_master_brute_force_policy(admin_token)
+
+        user = await self._master_user_by_username(username, admin_token)
+        if user is None:
+            await self._request(
+                "POST",
+                "/admin/realms/master/users",
+                token=admin_token,
+                json_body={
+                    "username": username,
+                    "enabled": False,
+                    "attributes": {BREAK_GLASS_ATTRIBUTE: ["true"]},
+                },
+                expected=(201, 204),
+            )
+            user = await self._master_user_by_username(username, admin_token)
+        if user is None:
+            raise IdentityError("the break-glass administrator was not created")
+        attributes = user.get("attributes") or {}
+        if attributes.get(BREAK_GLASS_ATTRIBUTE) not in (["true"], "true"):
+            raise IdentityConflict(
+                "refusing to adopt an unmarked master-realm user as break-glass"
+            )
+        user_id = path_segment(user.get("id"), label="break-glass user UUID")
+
+        try:
+            await self._request(
+                "PUT",
+                f"/admin/realms/master/users/{user_id}/groups/{group_id}",
+                token=admin_token,
+                expected=(204,),
+            )
+            memberships = self._json(
+                await self._request(
+                    "GET",
+                    f"/admin/realms/master/users/{user_id}/groups",
+                    token=admin_token,
+                    expected=(200,),
+                ),
+                "break-glass groups",
+            )
+            member_ids = (
+                {group.get("id") for group in memberships if isinstance(group, dict)}
+                if isinstance(memberships, list)
+                else set()
+            )
+            if group_id not in member_ids:
+                raise IdentityError(
+                    "Keycloak did not verify break-glass group membership"
+                )
+
+            escrow = self._break_glass_escrow_doc()
+            if escrow is None:
+                if user.get("enabled"):
+                    await self._set_break_glass_enabled(user, False, admin_token)
+                password = secrets.token_urlsafe(48)
+                await self._request(
+                    "PUT",
+                    f"/admin/realms/master/users/{user_id}/reset-password",
+                    token=admin_token,
+                    json_body={
+                        "type": "password",
+                        "value": password,
+                        "temporary": False,
+                    },
+                    expected=(204,),
+                )
+                escrow = {
+                    "schema_version": BREAK_GLASS_SCHEMA,
+                    "username": username,
+                    "password": password,
+                    "group": self.settings.break_glass_admin_group,
+                    "realm": "master",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                try:
+                    written = self.vault.write_verified(
+                        self.settings.break_glass_admin_vault_path, escrow
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise IdentityError(
+                        "Vault rejected the break-glass escrow"
+                    ) from exc
+                if not written:
+                    raise IdentityError(
+                        "Vault did not verify the break-glass escrow write"
+                    )
+                await self._set_break_glass_enabled(user, True, admin_token)
+            elif not user.get("enabled"):
+                await self._set_break_glass_enabled(user, True, admin_token)
+        except Exception:
+            # Never leave a password-backed master administrator enabled
+            # without a proven Vault escrow. Best-effort disable, then fail.
+            try:
+                await self._set_break_glass_enabled(user, False, admin_token)
+            except Exception:  # noqa: BLE001 - the original failure wins
+                pass
+            raise
+
+        return {
+            "username": username,
+            "group": self.settings.break_glass_admin_group,
+            "escrowed_at": str(escrow.get("created_at", "")),
+        }
+
     async def _delete_bootstrap_principals(self, admin_token: str) -> bool:
         """Delete temporary principals; optionally retain a lab UI operator.
 
@@ -2524,6 +2879,10 @@ class KeycloakAdmin:
                 )
                 federation_spec = ldap_federation_spec(self.settings)
                 broker_key = await self._ensure_broker(admin_token)
+                # Ensured strictly before the verified state write and the
+                # bootstrap teardown below: the temporary administrator is
+                # never destroyed until the durable one is proven and escrowed.
+                break_glass = await self._ensure_break_glass_admin(admin_token)
                 state_doc = {
                     "schema_version": IDENTITY_STATE_SCHEMA,
                     "managed_root_group_id": path_segment(
@@ -2545,6 +2904,12 @@ class KeycloakAdmin:
                         "certificate_sha256", ""
                     ),
                     "relying_parties_reconciled": True,
+                    "break_glass_username": (
+                        break_glass["username"] if break_glass else ""
+                    ),
+                    "break_glass_escrowed_at": (
+                        break_glass["escrowed_at"] if break_glass else ""
+                    ),
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                 }
                 if not self.vault.write_verified(
@@ -2562,6 +2927,7 @@ class KeycloakAdmin:
                         "federation_configured": bool(federation_id),
                         "temporary_bootstrap_service_deleted": True,
                         "lab_recovery_operator_retained": bootstrap_user_retained,
+                        "break_glass_admin_ensured": bool(break_glass),
                     },
                 )
                 return await self.status()
@@ -2579,6 +2945,9 @@ class KeycloakAdmin:
             )
             broker_key = self.vault.read(
                 self.settings.kc_client_assertion_key_vault_path
+            )
+            break_glass_doc = self.vault.read(
+                self.settings.break_glass_admin_vault_path
             )
         except Exception as exc:  # noqa: BLE001
             raise IdentityError("could not read identity status from Vault") from exc
@@ -2619,6 +2988,18 @@ class KeycloakAdmin:
                 broker_key.get("certificate_sha256", "")
                 if isinstance(broker_key, dict)
                 else ""
+            ),
+            # The durable controller has no master-realm authority, so
+            # presence of a valid Vault escrow is the honest observable for
+            # the break-glass administrator. Booleans only — the escrow
+            # document itself never leaves Vault through this API.
+            "break_glass_escrowed": (
+                isinstance(break_glass_doc, dict)
+                and break_glass_doc.get("schema_version") == BREAK_GLASS_SCHEMA
+                and break_glass_doc.get("username")
+                == self.settings.break_glass_admin_username
+                and isinstance(break_glass_doc.get("password"), str)
+                and len(break_glass_doc["password"]) >= 32
             ),
         }
 

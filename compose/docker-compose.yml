@@ -870,6 +870,10 @@ services:
       ADMIN_PORTAL_OIDC_CLIENT_SECRET: ${ADMIN_PORTAL_OIDC_CLIENT_SECRET:?ADMIN_PORTAL_OIDC_CLIENT_SECRET must be set}
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET must be set}
       RETAIN_BOOTSTRAP_ADMIN_USER: ${RETAIN_BOOTSTRAP_ADMIN_USER:-false}
+      # Durable group-gated master-realm administration. No secret: the
+      # rotator generates the break-glass password and escrows it in Vault.
+      BREAK_GLASS_ADMIN_ENABLED: ${BREAK_GLASS_ADMIN_ENABLED:-true}
+      BREAK_GLASS_ADMIN_VAULT_PATH: ${BREAK_GLASS_ADMIN_VAULT_PATH:-ai-gateway/keycloak/break-glass-admin}
       KC_CLIENT_ASSERTION_KEY_VAULT_PATH: ${KC_CLIENT_ASSERTION_KEY_VAULT_PATH:-ai-gateway/anthropic-wif-client-key}
       ANTHROPIC_WIF_ALLOW_INSECURE_CLIENT_SECRET: "false"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318

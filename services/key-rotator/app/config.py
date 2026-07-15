@@ -239,6 +239,33 @@ class Settings(BaseSettings):
     retain_bootstrap_admin_user: bool = Field(
         default=False, alias="RETAIN_BOOTSTRAP_ADMIN_USER"
     )
+    # Durable group-gated Keycloak administration. During the one-time
+    # bootstrap window the rotator provisions a marked master-realm
+    # administrators group carrying master's composite admin role plus a
+    # marked break-glass user whose generated password is escrowed in Vault
+    # before the account is enabled. Unlike RETAIN_BOOTSTRAP_ADMIN_USER this
+    # applies to every profile: without it no interactive Keycloak
+    # administrator exists after the temporary principals are deleted.
+    break_glass_admin_enabled: bool = Field(
+        default=True, alias="BREAK_GLASS_ADMIN_ENABLED"
+    )
+    break_glass_admin_username: str = Field(
+        default="break-glass-admin", alias="BREAK_GLASS_ADMIN_USERNAME"
+    )
+    break_glass_admin_group: str = Field(
+        default="keycloak-admins", alias="BREAK_GLASS_ADMIN_GROUP"
+    )
+    break_glass_admin_vault_path: str = Field(
+        default="ai-gateway/keycloak/break-glass-admin",
+        alias="BREAK_GLASS_ADMIN_VAULT_PATH",
+    )
+    # Reserved: master-realm directory federation for per-person Keycloak
+    # administrators. The ensure path is not implemented; enabling the flag
+    # must fail at configuration time rather than deploy without the
+    # promised directory gate.
+    admin_realm_ldap_enabled: bool = Field(
+        default=False, alias="ADMIN_REALM_LDAP_ENABLED"
+    )
     wif_realm: str = Field(default="anthropic-wif", alias="WIF_REALM")
     wif_broker_client_id: str = Field(
         default="anthropic-token-broker", alias="WIF_BROKER_CLIENT_ID"
@@ -399,6 +426,8 @@ class Settings(BaseSettings):
     @field_validator(
         "keycloak_bootstrap_admin_client_id",
         "keycloak_bootstrap_admin_username",
+        "break_glass_admin_username",
+        "break_glass_admin_group",
         "identity_realm",
         "identity_managed_root_group",
         "identity_controller_client_id",
@@ -410,6 +439,29 @@ class Settings(BaseSettings):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
             raise ValueError(f"{info.field_name} contains unsupported characters")
         return value
+
+    @model_validator(mode="after")
+    def validate_break_glass_admin_boundary(self) -> "Settings":
+        """Refuse break-glass configuration that collides with teardown.
+
+        Bootstrap teardown looks up the temporary administrator by the exact
+        bootstrap username and hard-fails on an unmarked match, so a durable
+        break-glass user sharing that name would brick every idempotent
+        bootstrap re-run. The collision is refused even while the feature is
+        disabled: the names are deployment contract, not runtime state.
+        """
+        if self.break_glass_admin_username == self.keycloak_bootstrap_admin_username:
+            raise ValueError(
+                "BREAK_GLASS_ADMIN_USERNAME must differ from "
+                "KC_BOOTSTRAP_ADMIN_USERNAME"
+            )
+        if self.admin_realm_ldap_enabled:
+            raise ValueError(
+                "ADMIN_REALM_LDAP_ENABLED is reserved and not implemented; "
+                "master-realm administrators are the Vault-escrowed "
+                "break-glass user until the directory overlay ships"
+            )
+        return self
 
     @field_validator("aigw_domain")
     @classmethod
@@ -429,6 +481,7 @@ class Settings(BaseSettings):
     @field_validator(
         "identity_controller_key_vault_path",
         "identity_state_vault_path",
+        "break_glass_admin_vault_path",
     )
     @classmethod
     def validate_identity_vault_paths(cls, value: str, info) -> str:

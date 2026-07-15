@@ -40,6 +40,9 @@ def main() -> int:
         "bootstrap_available": False,
         "bootstrap_cleanup_required": False,
         "ldap_configured": True,
+        # The durable break-glass administrator's credential must be escrowed
+        # in Vault; the boolean is derived from the escrow document alone.
+        "break_glass_escrowed": True,
     }
     for field, expected in expected_status.items():
         if status.get(field) is not expected:

@@ -607,9 +607,19 @@ This section applies only to the lab overlay.
 2. Sign into `admin-portal.<domain>/admin` as disposable `testadmin`, select
    **Reauthenticate with Keycloak**, then submit `INITIALIZE`.
 3. Confirm status shows the durable controller and WIF broker ready, the lab
-   LDAP provider ready, certificate fingerprints, and no
-   `bootstrap_cleanup_required`. Private keys, bootstrap tokens, PKCS#12 data,
-   and LDAP credentials must never appear.
+   LDAP provider ready, certificate fingerprints, `break_glass_escrowed` true,
+   and no `bootstrap_cleanup_required`. Private keys, bootstrap tokens,
+   PKCS#12 data, LDAP credentials, and the break-glass password must never
+   appear.
+3a. Prove the durable break-glass administrator: retrieve the escrowed
+   credential with the root Vault ceremony in
+   [identity operations](identity-operations.md#break-glass-administrator),
+   sign in to `https://auth.<domain>/admin` as `break-glass-admin` from the
+   ADM leg, and confirm the master realm shows the marked `keycloak-admins`
+   group carrying the composite `admin` role plus the pinned brute-force
+   policy (`bruteForceProtected` on, failure factor 5). Confirm the same
+   console URL is refused on the internal edge. Rotate the credential
+   afterwards per the documented ceremony.
 4. Confirm only the three seeded Samba users are imported from the dedicated
    AI Gateway user OU; `svc-keycloak-ldap` must not appear.
 5. Create capability groups below `/aigw-managed`, assign imported users, and

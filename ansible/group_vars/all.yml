@@ -480,3 +480,12 @@ rotator_vault_token: ""
 kc_client_assertion_key_vault_path: "ai-gateway/anthropic-wif-client-key"
 identity_controller_key_vault_path: "ai-gateway/keycloak/identity-controller-key"
 identity_state_vault_path: "ai-gateway/keycloak/identity-state"
+# Durable group-gated Keycloak administration (every profile): during the
+# one-time identity bootstrap the rotator provisions a marked master-realm
+# `keycloak-admins` group carrying master's composite admin role plus a
+# marked `break-glass-admin` user whose rotator-generated password is
+# escrowed in Vault before the account is enabled. No operator secret is
+# introduced — the retrieval/rotation ceremony is documented in
+# docs/identity-operations.md.
+break_glass_admin_enabled: true
+break_glass_admin_vault_path: "ai-gateway/keycloak/break-glass-admin"

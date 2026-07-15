@@ -106,6 +106,8 @@ IDENTITY_CONTROLLER_KEY_VAULT_PATH="$(grep -E '^IDENTITY_CONTROLLER_KEY_VAULT_PA
 IDENTITY_CONTROLLER_KEY_VAULT_PATH="${IDENTITY_CONTROLLER_KEY_VAULT_PATH:-ai-gateway/keycloak/identity-controller-key}"
 IDENTITY_STATE_VAULT_PATH="$(grep -E '^IDENTITY_STATE_VAULT_PATH=' .env | cut -d= -f2-)"
 IDENTITY_STATE_VAULT_PATH="${IDENTITY_STATE_VAULT_PATH:-ai-gateway/keycloak/identity-state}"
+BREAK_GLASS_ADMIN_VAULT_PATH="$(grep -E '^BREAK_GLASS_ADMIN_VAULT_PATH=' .env | cut -d= -f2-)"
+BREAK_GLASS_ADMIN_VAULT_PATH="${BREAK_GLASS_ADMIN_VAULT_PATH:-ai-gateway/keycloak/break-glass-admin}"
 
 validate_vault_path() {
   local label="$1" value="$2"
@@ -122,6 +124,7 @@ validate_vault_path() {
 validate_vault_path KC_CLIENT_ASSERTION_KEY_VAULT_PATH "$KC_CLIENT_ASSERTION_KEY_VAULT_PATH"
 validate_vault_path IDENTITY_CONTROLLER_KEY_VAULT_PATH "$IDENTITY_CONTROLLER_KEY_VAULT_PATH"
 validate_vault_path IDENTITY_STATE_VAULT_PATH "$IDENTITY_STATE_VAULT_PATH"
+validate_vault_path BREAK_GLASS_ADMIN_VAULT_PATH "$BREAK_GLASS_ADMIN_VAULT_PATH"
 mkdir -p secrets certs
 
 # VAULT_TOKEN is forwarded by NAME only (`-e VAULT_TOKEN`): docker takes the
@@ -379,11 +382,15 @@ path "kv/metadata/ai-gateway/anthropic-wif" { capabilities = ["read", "delete"] 
 path "kv/data/ai-gateway/openai-admin" { capabilities = ["read"] }
 path "kv/data/ai-gateway/vendors/anthropic" { capabilities = ["read"] }
 
-# The identity setup controller writes only its three exact, prevalidated
-# records. It cannot enumerate or mutate any neighboring Vault subtree.
+# The identity setup controller writes only its four exact, prevalidated
+# records. It cannot enumerate or mutate any neighboring Vault subtree. The
+# break-glass record is the escrowed master-realm administrator credential;
+# operators read it through the documented root ceremony, never through the
+# rotator API, which reports only a presence boolean.
 path "kv/data/${KC_CLIENT_ASSERTION_KEY_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
 path "kv/data/${IDENTITY_CONTROLLER_KEY_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
 path "kv/data/${IDENTITY_STATE_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
+path "kv/data/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["create", "read", "update"] }
 
 # OpenAI's driver rotates these two exact records.
 path "kv/data/ai-gateway/vendors/openai" { capabilities = ["create", "read", "update"] }
