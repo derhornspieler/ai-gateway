@@ -37,6 +37,7 @@ TARGETS=(
   compose/postgres/init/01-init-databases.sh
   scripts/aigw-compose.sh
   scripts/aigw-runtime-up.sh
+  scripts/e2e-fresh-vm-check.sh
   scripts/pre-upgrade-check.sh
   scripts/rotate-vault-audit.sh
   scripts/state-backup.sh
