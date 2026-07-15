@@ -118,11 +118,26 @@ exists (`require_preupgrade_backup: true`).
 The baseline installs from Docker's GPG-checked official repository and
 Rocky's signed EPEL: Docker CE + Compose plugin, `containerd.io`,
 `container-selinux`, `audit`, `openssl`, `bind-utils`, `acl`, `zstd`, and
-supporting Python tooling. Two dependencies are exact-pinned by policy — the
-`age-1.3.1-1.el9` package and the `docker==7.2.0` Python SDK — so a
-privileged converge can never resolve an unbounded future version. No
-automatic-update service is configured; updates are an operator action
-executed through the reviewed converge and its backup gates.
+supporting Python tooling. The four runtime packages that decide the live
+Docker/Compose behaviour are pinned to the exact NEVRA the verify/e2e suite
+proved green — `docker-ce`/`docker-ce-cli` `29.6.1-1.el9`, `containerd.io`
+`2.2.6-1.el9`, and `docker-compose-plugin` `5.3.1-1.el9` — set once in
+`ansible/group_vars/all.yml` (`aigw_docker_ce_version` and its siblings,
+overridable per `host_vars`). An unpinned `docker-ce-stable` install twice
+adopted a Compose-v5 release that broke a live converge, so the pin is a
+stability control, not cosmetic. `state: present` on an exact version makes
+the converge fail loudly if the mirror no longer offers that NEVRA (it never
+silently installs the newest), and `allow_downgrade: false` makes it refuse
+to roll a host that already drifted newer back under a running stack rather
+than downgrade Docker automatically. Two further dependencies are exact-pinned
+the same way — the `age-1.3.1-1.el9` package and the `docker==7.2.0` Python
+SDK — so a privileged converge can never resolve an unbounded future version.
+There is deliberately no `dnf versionlock`: the converge re-asserts every pin
+on each run and is the sole sanctioned change path on a dedicated host,
+matching how the repo pins the `age`/SDK packages and every container image
+(tag + digest). No automatic-update service is configured; a version bump is
+an operator action executed through the reviewed converge and its backup
+gates — see the deliberate-upgrade path in `docs/operations.md`.
 
 ## 5. Auditing and scheduled maintenance
 

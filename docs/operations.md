@@ -967,6 +967,37 @@ ansible-playbook -i ansible/inventory/lab.yml ansible/site.yml \
   --syntax-check --ask-vault-pass
 ```
 
+### Docker Engine and Compose plugin version bumps
+
+The Docker Engine, CLI, `containerd.io`, and Compose plugin are installed at
+the exact NEVRA pinned in `ansible/group_vars/all.yml`
+(`aigw_docker_ce_version`, `aigw_docker_ce_cli_version`,
+`aigw_containerd_version`, `aigw_docker_compose_plugin_version`). They are
+pinned because an unpinned `docker-ce-stable` install twice adopted a
+Compose-v5 release that broke a live converge. Bumping them is a small,
+sequenced procedure — never an ad-hoc `dnf upgrade docker-ce` on a host, and
+never a blind `docker compose` self-update:
+
+1. Read the upstream Docker Engine and Compose release notes for the candidate
+   versions, then bump the four pins in `ansible/group_vars/all.yml` (or in the
+   target's `host_vars` for a single host) to the candidate NEVRA.
+2. Run the `runtime-skew.yml` canary from the Actions tab with `strict: true`
+   and `compose_version` set to the candidate Compose tag. It starts real
+   containers and asserts the same runtime contracts the `verify` role checks,
+   so it proves the candidate Compose before any host changes. Left on its
+   default schedule the canary already exercises the newest upstream release —
+   with the pin in place that upstream leg is the early warning that a *future*
+   bump is safe, not the version a converge silently installs.
+3. Converge the lab with the two-pass `site.yml` flow and let `verify` pass on
+   the live stack.
+4. Only then bump the pins for customer/production inventory and converge,
+   behind the usual pre-upgrade backup gate.
+
+The converge fails closed if the mirror no longer offers the pinned NEVRA, and
+`allow_downgrade: false` makes it refuse to roll a drifted-newer host back
+under a running stack — downgrading Docker is a deliberate, separately
+sequenced operation, not something a converge does on its own.
+
 Use `deploy-stack-only.yml` only after its dedicated-host-marker and live
 firewall/network preflights pass; otherwise run the full converge (host-level
 inventory changes alone can use `os-prep.yml`, which converges the host up to

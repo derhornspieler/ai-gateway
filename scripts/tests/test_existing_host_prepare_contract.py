@@ -354,6 +354,38 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         self.assertIn("does not byte-match the current /etc/docker/daemon.json", self.os_baseline)
         self.assertIn("force: false", self.os_baseline)
 
+    def test_docker_engine_and_compose_plugin_are_nevra_pinned(self) -> None:
+        # An unpinned docker-ce-stable install twice adopted a Compose-v5 release
+        # that broke a live converge. The exact NEVRA proven green by the
+        # verify/e2e suite is the single source of truth in group_vars/all.yml,
+        # consumed by the os_baseline install task via a name-version spec.
+        for pin in (
+            'aigw_docker_ce_version: "29.6.1-1.el9"',
+            'aigw_docker_ce_cli_version: "29.6.1-1.el9"',
+            'aigw_containerd_version: "2.2.6-1.el9"',
+            'aigw_docker_compose_plugin_version: "5.3.1-1.el9"',
+        ):
+            self.assertIn(pin, self.group)
+        for spec in (
+            '- "docker-ce-{{ aigw_docker_ce_version }}"',
+            '- "docker-ce-cli-{{ aigw_docker_ce_cli_version }}"',
+            '- "containerd.io-{{ aigw_containerd_version }}"',
+            '- "docker-compose-plugin-{{ aigw_docker_compose_plugin_version }}"',
+        ):
+            self.assertIn(spec, self.os_baseline)
+        # state: present on an exact version fails closed if the mirror lacks the
+        # pin; allow_downgrade: false refuses to auto-downgrade a drifted host.
+        self.assertIn("allow_downgrade: false", self.os_baseline)
+        # The bare unpinned package names must be gone from the install list, so
+        # a converge can never silently resolve the newest Docker/Compose.
+        for bare in (
+            "      - docker-ce\n",
+            "      - docker-ce-cli\n",
+            "      - containerd.io\n",
+            "      - docker-compose-plugin\n",
+        ):
+            self.assertNotIn(bare, self.os_baseline)
+
     def test_existing_docker_daemon_requires_local_reviewed_systemd_boundary(self) -> None:
         for required in (
             "canonical root-owned /usr/bin/docker binary",

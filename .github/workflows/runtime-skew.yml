@@ -11,12 +11,14 @@ name: Docker and Compose runtime skew
 #     token, so `ansible/roles/verify/tasks/main.yml` failed its live-container
 #     assertions with the stack already up.
 #
-# Neither had a repository change behind it. `ansible/roles/os_baseline` installs
-# `docker-ce` and `docker-compose-plugin` from `docker-ce-stable` with no version
-# pin, so a customer converge silently adopts whatever Compose shipped that week.
-# This workflow therefore runs the real runtime contracts against two Composes:
-# the one CI validates everything else with, and the newest upstream release —
-# the one the next converge will actually install.
+# Neither had a repository change behind it. `ansible/roles/os_baseline` now
+# installs `docker-ce`/`containerd.io`/`docker-compose-plugin` at the exact
+# NEVRA pinned in `ansible/group_vars/all.yml`, so a converge no longer silently
+# adopts whatever Compose shipped that week. This workflow still runs the real
+# runtime contracts against two Composes: the one CI validates everything else
+# with, and the newest upstream release — the version a *future* deliberate pin
+# bump would adopt. With the pin in place that upstream leg is the early warning
+# that the next bump is safe, before anyone makes it.
 #
 # It is ADVISORY on purpose. Upstream can break us on a day nobody pushed, and
 # that must not red-wall unrelated pull requests. It compensates by being loud:
@@ -84,9 +86,10 @@ jobs:
           # rate-limited. There is no module graph here to cache.
           cache: false
 
-      # The customer host installs an unpinned docker-compose-plugin, so the
-      # release most likely to break the next converge is the newest one. Verify
-      # the published checksum before trusting the binary.
+      # The customer host installs a pinned docker-compose-plugin, but the newest
+      # upstream release is the version a future pin bump would adopt, so it is
+      # the leg worth exercising ahead of time. Verify the published checksum
+      # before trusting the binary.
       - name: Install the upstream Compose release
         if: matrix.channel == 'upstream'
         env:

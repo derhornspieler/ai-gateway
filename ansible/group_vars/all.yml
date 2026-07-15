@@ -322,6 +322,25 @@ aigw_vault_ui_enabled: false
 # ── Stack ───────────────────────────────────────────────────────────────
 stack_dir: /opt/ai-gateway
 docker_data_root: /var/lib/docker
+# ── Docker Engine + Compose plugin version pins ───────────────────────
+# Exact NEVRA (name-version-release; the arch resolves from $basearch, and the
+# rpm epoch is matched automatically) of the four Docker packages that decide
+# live runtime behaviour. These are the versions the verify + e2e suite last
+# proved green (2026-07-15). An unpinned docker-ce-stable install twice adopted
+# a Compose-v5 release that broke a live converge (see docs/os-security.md §4
+# and the runtime-skew canary), so this is a stability control, not cosmetic.
+# os_baseline installs `state: present` on these exact versions, so the converge
+# fails LOUDLY if the mirror no longer offers the pinned NEVRA (it never
+# silently installs the newest), and `allow_downgrade: false` makes it REFUSE to
+# roll a host that already drifted newer back under a running stack. A deliberate
+# upgrade bumps these here (or per host_vars) and follows the version-bump path
+# in docs/operations.md. There is intentionally no dnf versionlock: the converge
+# re-asserts these on every run and is the sole sanctioned change path on a
+# dedicated host, matching the inline age/SDK pins and the image tag+digest pins.
+aigw_docker_ce_version: "29.6.1-1.el9"
+aigw_docker_ce_cli_version: "29.6.1-1.el9"
+aigw_containerd_version: "2.2.6-1.el9"
+aigw_docker_compose_plugin_version: "5.3.1-1.el9"
 # Optional pre-staged Docker image archive. Generic/customer deployments are
 # disabled and pathless by default. An environment-specific inventory may opt
 # in with a remote target path and a separately reviewed exact SHA-256. The

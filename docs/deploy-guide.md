@@ -114,10 +114,12 @@ For a generic/customer profile, `/var/lib/docker` (or the configured
 device with a `crypto_LUKS` ancestor before Ansible runs. The explicit
 disposable lab inventory is the only committed opt-out.
 
-The baseline role installs Docker CE, the Compose plugin, firewalld/nftables
-dependencies, OpenSSL, `container-selinux`, SELinux policy tooling, the audit
-client, the pinned Python Docker SDK, and signed EPEL's pinned
-`age-1.3.1-1.el9` backup-encryption package. It validates Docker's daemon
+The baseline role installs Docker CE, the Compose plugin, and `containerd.io`
+at the exact NEVRA pinned in `ansible/group_vars/all.yml`
+(`aigw_docker_ce_version` and siblings), firewalld/nftables dependencies,
+OpenSSL, `container-selinux`, SELinux policy tooling, the audit client, the
+pinned Python Docker SDK, and signed EPEL's pinned `age-1.3.1-1.el9`
+backup-encryption package. It validates Docker's daemon
 configuration with `dockerd --validate`, explicitly enables Docker SELinux
 integration, and does not start Docker until the host packet policy is live.
 

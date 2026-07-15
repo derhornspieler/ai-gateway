@@ -250,8 +250,8 @@ class NewWorkflowsFollowTheHouseSupplyChainStyle(unittest.TestCase):
         self.assertIn("if: steps.canary.outputs.code == '1' && inputs.strict", SKEW)
         self.assertIn("::error title=Canary harness fault::", SKEW)
         self.assertIn("channel: [runner, upstream]", SKEW)
-        # The customer host installs an unpinned docker-compose-plugin, so the
-        # upstream leg must verify what it downloads.
+        # The upstream leg fetches a release binary over the network (the version
+        # a future pin bump would adopt), so it must verify what it downloads.
         self.assertIn('sha256sum -c "$asset.sha256"', SKEW)
 
     def test_scorecard_does_not_publish_this_prototype_externally(self) -> None:

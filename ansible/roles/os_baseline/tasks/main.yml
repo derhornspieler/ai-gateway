@@ -622,12 +622,24 @@
     gpgcheck: true
     gpgkey: https://download.docker.com/linux/rhel/gpg
 
+# Docker Engine, CLI, containerd, and the Compose plugin install at the exact
+# NEVRA proven green by the verify/e2e suite — the single source of truth is
+# group_vars/all.yml (aigw_docker_ce_version and its siblings), overridable per
+# host_vars. An unpinned docker-ce-stable install twice adopted a Compose-v5
+# release that broke a live converge. state: present on an exact version fails
+# the converge LOUDLY if the mirror no longer offers that NEVRA (it never
+# silently installs the newest); allow_downgrade: false REFUSES to roll a host
+# that already drifted newer back under a running stack — an intentional Docker
+# downgrade is a deliberate, separately sequenced operation, not a converge side
+# effect. Deliberate upgrades bump the group_vars pins (see docs/operations.md).
+# The remaining packages are Rocky base/EPEL supporting tooling taken at the
+# newest signed version on purpose.
 - name: Install Docker Engine + compose plugin
   ansible.builtin.dnf:
     name:
-      - docker-ce
-      - docker-ce-cli
-      - containerd.io
+      - "docker-ce-{{ aigw_docker_ce_version }}"
+      - "docker-ce-cli-{{ aigw_docker_ce_cli_version }}"
+      - "containerd.io-{{ aigw_containerd_version }}"
       # Docker CE on Rocky does not enable SELinux integration merely because
       # the host policy is enforcing. Keep the policy package explicit so the
       # daemon's mandatory-access-control contract cannot disappear with an
@@ -635,7 +647,7 @@
       - container-selinux
       - policycoreutils-python-utils  # persistent reviewed bind-source fcontexts
       - audit                     # bounded post-converge AVC/USER_AVC gate
-      - docker-compose-plugin
+      - "docker-compose-plugin-{{ aigw_docker_compose_plugin_version }}"
       - python3-requests          # community.docker API backend
       - python3-pip
       # The SELinux-confined ACL reconciler queries Docker's local Unix API
@@ -647,6 +659,10 @@
       - acl                       # least-privilege Alloy access to Docker logs
       - zstd                      # exact-verified offline Docker image seeds
     state: present
+    # Refuse to auto-downgrade a host that already drifted to a newer Docker;
+    # rolling Docker back under a live stack is an operator decision, not a
+    # converge side effect. Explicit so a future Ansible default cannot loosen it.
+    allow_downgrade: false
 
 # Rocky 9's signed EPEL build supplies age for independently encrypted state
 # backups. Pin the reviewed NEVRA rather than resolving an unbounded future
