@@ -12,6 +12,7 @@ rotator's Vault authority.
 from __future__ import annotations
 
 import pathlib
+import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -63,15 +64,46 @@ class BreakGlassContractTest(unittest.TestCase):
             '"$BREAK_GLASS_ADMIN_VAULT_PATH"',
             bootstrap,
         )
-        self.assertIn(
-            'path "kv/data/${BREAK_GLASS_ADMIN_VAULT_PATH}" '
-            '{ capabilities = ["create", "read", "update"] }',
-            bootstrap,
+        # Parse the rotator policy heredoc and prove the PROPERTY (the escrow
+        # path is granted exactly create/read/update, once, with no delete and
+        # no metadata authority), not one exact capability string — a
+        # reordered or duplicated grant elsewhere in the policy must fail.
+        policy_match = re.search(
+            r"vlt policy write rotator - <<HCL\n(.*?)\nHCL", bootstrap, re.DOTALL
         )
-        # The rotator must not be able to destroy its own escrow record.
-        self.assertNotIn(
-            'path "kv/data/${BREAK_GLASS_ADMIN_VAULT_PATH}" '
-            '{ capabilities = ["create", "read", "update", "delete"] }',
+        self.assertIsNotNone(policy_match, "rotator policy heredoc is missing")
+        policy = policy_match.group(1)
+        escrow_stanzas = re.findall(
+            r'^path\s+"([^"]*BREAK_GLASS_ADMIN_VAULT_PATH[^"]*)"\s*'
+            r"\{\s*capabilities\s*=\s*\[([^\]]*)\]\s*\}",
+            policy,
+            re.MULTILINE,
+        )
+        self.assertEqual(
+            len(escrow_stanzas),
+            1,
+            "the escrow path must appear in exactly one policy stanza",
+        )
+        stanza_path, capabilities = escrow_stanzas[0]
+        self.assertEqual(stanza_path, "kv/data/${BREAK_GLASS_ADMIN_VAULT_PATH}")
+        granted = {
+            token.strip().strip('"') for token in capabilities.split(",")
+        }
+        self.assertEqual(granted, {"create", "read", "update"})
+        # No other line of the policy may mention the escrow path (that
+        # includes kv/metadata: the version-retention bound below must stay
+        # root-owned).
+        mentions = [
+            line
+            for line in policy.splitlines()
+            if "BREAK_GLASS_ADMIN_VAULT_PATH" in line
+        ]
+        self.assertEqual(len(mentions), 1, mentions)
+        # Version-destruction resistance: KV v2's default max_versions (10)
+        # would let ten rotator writes expire the real credential version.
+        self.assertIn(
+            'vlt kv metadata put -max-versions=100 '
+            '"kv/${BREAK_GLASS_ADMIN_VAULT_PATH}"',
             bootstrap,
         )
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import pathlib
@@ -66,27 +67,31 @@ for filename in ("aigw-realm.json", "anthropic-wif-realm.json"):
         require_keycloak_policy(SOURCE_TEMPLATES / f"{filename}.j2", template=True)
 
 # The master realm is never file-imported, so its brute-force policy is
-# reconciled at bootstrap by the identity controller. Pin that copy to the
-# same values: a drifted MASTER_BRUTE_FORCE_POLICY would silently weaken the
-# only realm holding a password-backed break-glass administrator. The
-# key-rotator source only ships in the source layout.
+# reconciled at bootstrap by the identity controller. Pin the LIVE constant
+# to the same values by parsing the assignment itself — a substring count
+# would accept a weakened constant shadowed by dead text elsewhere in the
+# module. The key-rotator source only ships in the source layout.
 if source_layout:
-    controller_text = (
+    controller_source = (
         ROOT / "services/key-rotator/app/identity.py"
     ).read_text()
-    for key, expected in KEYCLOAK_POLICY.items():
-        if expected is True:
-            literal = "True"
-        elif expected is False:
-            literal = "False"
-        elif isinstance(expected, str):
-            literal = json.dumps(expected)
-        else:
-            literal = str(expected)
-        needle = f'"{key}": {literal},'
-        assert controller_text.count(needle) == 1, (
-            f"identity.py: MASTER_BRUTE_FORCE_POLICY must pin exactly {needle}"
-        )
+    master_policies = []
+    for node in ast.walk(ast.parse(controller_source)):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        for target in targets:
+            if getattr(target, "id", "") == "MASTER_BRUTE_FORCE_POLICY":
+                master_policies.append(ast.literal_eval(node.value))
+    assert len(master_policies) == 1, (
+        "identity.py must define MASTER_BRUTE_FORCE_POLICY exactly once"
+    )
+    assert master_policies[0] == KEYCLOAK_POLICY, (
+        "identity.py MASTER_BRUTE_FORCE_POLICY drifted from the pinned "
+        f"brute-force policy: {master_policies[0]}"
+    )
 
 static_realm = json.loads((realm_dir / "aigw-realm.json").read_text())
 if source_layout:

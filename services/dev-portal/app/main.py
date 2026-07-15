@@ -1206,6 +1206,13 @@ def _safe_identity_status(raw: Any) -> dict[str, Any] | None:
         "bootstrap_available": raw.get("bootstrap_available") is True,
         "bootstrap_cleanup_required": (raw.get("bootstrap_cleanup_required") is True),
         "ldap_configured": raw.get("ldap_configured") is True,
+        # Booleans only: the break-glass escrow document itself never crosses
+        # this boundary. `readable` false means the rotator's Vault policy
+        # predates the escrow path (brownfield upgrade pending).
+        "break_glass_escrowed": raw.get("break_glass_escrowed") is True,
+        "break_glass_escrow_readable": (
+            raw.get("break_glass_escrow_readable") is not False
+        ),
         "controller_certificate_sha256": fingerprint("controller_certificate_sha256"),
         "broker_certificate_sha256": fingerprint("broker_certificate_sha256"),
     }

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -26,10 +27,23 @@ def get(path: str):
         headers={"X-Internal-Auth": token, "Accept": "application/json"},
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=15) as response:
-        if response.status != 200:
-            raise RuntimeError("identity API returned a non-success status")
-        return json.load(response)
+    try:
+        with opener.open(request, timeout=15) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"identity API {path} returned HTTP {response.status}"
+                )
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        # Endpoint-level failure, distinct from a boolean assertion below:
+        # the rotator could not compute the answer at all (Vault sealed or
+        # unreachable, or a control-plane fault) — remediation starts at the
+        # rotator/Vault, not at Keycloak.
+        raise RuntimeError(
+            f"identity API {path} failed with HTTP {error.code}: the rotator "
+            "could not compute identity status (check Vault health and the "
+            "rotator logs)"
+        ) from error
 
 
 def main() -> int:
@@ -45,8 +59,27 @@ def main() -> int:
         "break_glass_escrowed": True,
     }
     for field, expected in expected_status.items():
-        if status.get(field) is not expected:
-            raise RuntimeError(f"unexpected identity status field: {field}")
+        actual = status.get(field)
+        if actual is not expected:
+            hint = ""
+            if field == "break_glass_escrowed":
+                if status.get("break_glass_escrow_readable") is False:
+                    hint = (
+                        " — the rotator's Vault policy predates the escrow "
+                        "path; run the one-time policy amendment, then the "
+                        "re-initialization ceremony (docs/identity-operations"
+                        ".md, 'Upgrading an existing deployment')"
+                    )
+                else:
+                    hint = (
+                        " — no valid escrow document; re-run the identity "
+                        "initialization ceremony (docs/identity-operations.md"
+                        ", 'Break-glass administrator')"
+                    )
+            raise RuntimeError(
+                "unexpected identity status field: "
+                f"{field} (expected {expected}, got {actual}){hint}"
+            )
 
     users = get("/identity/users?" + urllib.parse.urlencode({"search": ""}))
     if {user.get("username") for user in users} != {

@@ -461,6 +461,34 @@ class Settings(BaseSettings):
                 "master-realm administrators are the Vault-escrowed "
                 "break-glass user until the directory overlay ships"
             )
+        # The four identity Vault paths must be pairwise distinct. An aliased
+        # escrow path is silently destructive: bootstrap overwrites the state
+        # and key documents after the escrow is written, and the
+        # ai-gateway/anthropic-wif enrollment record is the one rotator path
+        # whose policy permits deletion — an escrow parked there could be
+        # permanently destroyed by the provider teardown flow.
+        identity_paths = {
+            "IDENTITY_CONTROLLER_KEY_VAULT_PATH": (
+                self.identity_controller_key_vault_path
+            ),
+            "IDENTITY_STATE_VAULT_PATH": self.identity_state_vault_path,
+            "KC_CLIENT_ASSERTION_KEY_VAULT_PATH": (
+                self.kc_client_assertion_key_vault_path
+            ),
+            "BREAK_GLASS_ADMIN_VAULT_PATH": self.break_glass_admin_vault_path,
+        }
+        if len(set(identity_paths.values())) != len(identity_paths):
+            raise ValueError(
+                "identity Vault paths must be pairwise distinct: "
+                + ", ".join(sorted(identity_paths))
+            )
+        for alias, value in identity_paths.items():
+            for reserved in ("ai-gateway/anthropic-wif",):
+                if value == reserved or value.startswith(reserved + "/"):
+                    raise ValueError(
+                        f"{alias} must not alias the deletable reserved "
+                        f"record {reserved}"
+                    )
         return self
 
     @field_validator("aigw_domain")

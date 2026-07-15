@@ -611,34 +611,35 @@ This section applies only to the lab overlay.
    and no `bootstrap_cleanup_required`. Private keys, bootstrap tokens,
    PKCS#12 data, LDAP credentials, and the break-glass password must never
    appear.
-3a. Prove the durable break-glass administrator: retrieve the escrowed
+4. Prove the durable break-glass administrator: retrieve the escrowed
    credential with the root Vault ceremony in
    [identity operations](identity-operations.md#break-glass-administrator),
    sign in to `https://auth.<domain>/admin` as `break-glass-admin` from the
    ADM leg, and confirm the master realm shows the marked `keycloak-admins`
-   group carrying the composite `admin` role plus the pinned brute-force
-   policy (`bruteForceProtected` on, failure factor 5). Confirm the same
-   console URL is refused on the internal edge. Rotate the credential
-   afterwards per the documented ceremony.
-4. Confirm only the three seeded Samba users are imported from the dedicated
+   group carrying the composite `admin` role — with its effective (composite)
+   authority intact, not just the name — plus the pinned brute-force policy
+   (`bruteForceProtected` on, failure factor 5). Confirm the same console URL
+   is refused on the internal edge. Rotate the credential afterwards per the
+   documented ceremony (disable → delete escrow version → re-initialize).
+5. Confirm only the three seeded Samba users are imported from the dedicated
    AI Gateway user OU; `svc-keycloak-ldap` must not appear.
-5. Create capability groups below `/aigw-managed`, assign imported users, and
+6. Create capability groups below `/aigw-managed`, assign imported users, and
    prove fresh login changes the emitted roles and access matrix.
-6. Prove an out-of-tree group, unknown capability, non-federated user,
+7. Prove an out-of-tree group, unknown capability, non-federated user,
    non-empty group deletion, and removal of the final managed administrator
    are rejected.
-7. Adversarially race deletion of an empty recovery-admin group, addition of a
+8. Adversarially race deletion of an empty recovery-admin group, addition of a
    recovery administrator to it, and removal of the existing last
    administrator. Pass only if the process-local topology lock serializes all
    three operations and at least one conflicting mutation fails without
    leaving zero managed administrators. This is single-worker evidence, not a
    multi-replica guarantee.
-8. Create a second durable directory administrator for the lab, synchronize
+9. Create a second durable directory administrator for the lab, synchronize
    users, assign both durable administrators, and prove both can log in using
    Samba-owned passwords.
-9. Remove disposable `testadmin` through the controlled Keycloak ADM process,
-   sign out its sessions, and prove it can no longer authenticate. Do not leave
-   seeded Keycloak-local identities in a customer deployment.
+10. Remove disposable `testadmin` through the controlled Keycloak ADM process,
+    sign out its sessions, and prove it can no longer authenticate. Do not
+    leave seeded Keycloak-local identities in a customer deployment.
 
 Run Samba consistency and LDAPS checks without exposing passwords:
 

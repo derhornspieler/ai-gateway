@@ -2475,6 +2475,36 @@ class KeycloakAdmin:
         role = self._json(role_response, "master admin role")
         if not isinstance(role, dict) or role.get("name") != MASTER_ADMIN_ROLE:
             raise IdentityError("the master admin composite role is missing")
+        # A role merely NAMED admin proves nothing: composite mappings can be
+        # stripped, leaving the group without functional authority while every
+        # name-based check still passes. Require the effective composite to
+        # carry `create-realm` (the stable realm-role member of master's
+        # built-in admin composite) plus at least one per-realm client role.
+        # Full authority is additionally proven live by the acceptance step in
+        # docs/test-runbook.md (console shows the group's effective roles).
+        composites = self._json(
+            await self._request(
+                "GET",
+                f"/admin/realms/master/roles/{MASTER_ADMIN_ROLE}/composites",
+                token=admin_token,
+                expected=(200,),
+            ),
+            "master admin composite roles",
+        )
+        composite_entries = (
+            [entry for entry in composites if isinstance(entry, dict)]
+            if isinstance(composites, list)
+            else []
+        )
+        if not any(
+            entry.get("name") == "create-realm" for entry in composite_entries
+        ) or not any(
+            entry.get("clientRole") is True for entry in composite_entries
+        ):
+            raise IdentityError(
+                "the master admin composite role has been stripped of its "
+                "cross-realm authority"
+            )
         mappings_path = f"/admin/realms/master/groups/{group_id}/role-mappings/realm"
         mapped = self._json(
             await self._request(
@@ -2608,6 +2638,101 @@ class KeycloakAdmin:
             expected=(204,),
         )
 
+    async def _ensure_master_profile_marker(self, admin_token: str) -> None:
+        """Declare the break-glass marker in master's user profile.
+
+        Keycloak 24+ runs every realm under the declarative user profile, and
+        the master realm — never file-imported — keeps the default
+        unmanaged-attribute policy, under which an undeclared custom attribute
+        supplied on an admin user create/update is silently dropped. Without
+        this declaration the marker never persists, the read-back ownership
+        check refuses the freshly created user, and every bootstrap bricks.
+        Declared admin-only, so only master administrators can see or edit it.
+        Read-back verified: the marker either provably persists or bootstrap
+        fails loudly before any user is created.
+        """
+        profile = self._json(
+            await self._request(
+                "GET",
+                "/admin/realms/master/users/profile",
+                token=admin_token,
+                expected=(200,),
+            ),
+            "master user profile",
+        )
+        if not isinstance(profile, dict):
+            raise IdentityError("Keycloak master user profile was invalid")
+        declared = profile.get("attributes")
+        declared = declared if isinstance(declared, list) else []
+        if any(
+            isinstance(entry, dict) and entry.get("name") == BREAK_GLASS_ATTRIBUTE
+            for entry in declared
+        ):
+            return
+        updated = dict(profile)
+        updated["attributes"] = [
+            *declared,
+            {
+                "name": BREAK_GLASS_ATTRIBUTE,
+                "displayName": "AI Gateway break-glass marker",
+                "multivalued": False,
+                "permissions": {"view": ["admin"], "edit": ["admin"]},
+            },
+        ]
+        await self._request(
+            "PUT",
+            "/admin/realms/master/users/profile",
+            token=admin_token,
+            json_body=updated,
+            expected=(200, 204),
+        )
+        verified = self._json(
+            await self._request(
+                "GET",
+                "/admin/realms/master/users/profile",
+                token=admin_token,
+                expected=(200,),
+            ),
+            "master user profile",
+        )
+        verified_attributes = (
+            verified.get("attributes") if isinstance(verified, dict) else None
+        )
+        if not isinstance(verified_attributes, list) or not any(
+            isinstance(entry, dict) and entry.get("name") == BREAK_GLASS_ATTRIBUTE
+            for entry in verified_attributes
+        ):
+            raise IdentityError(
+                "Keycloak did not verify the master user profile marker"
+            )
+
+    async def _break_glass_has_password(
+        self, user_id: str, admin_token: str
+    ) -> bool:
+        """Whether the master-realm user holds any password credential.
+
+        A recreated or asymmetrically restored account can coexist with a
+        shape-valid Vault escrow that no longer corresponds to any installed
+        credential. Enabling such an account would leave a dead break-glass
+        reporting healthy, so credential absence forces a rotation.
+        """
+        safe_user = path_segment(user_id, label="break-glass user UUID")
+        credentials = self._json(
+            await self._request(
+                "GET",
+                f"/admin/realms/master/users/{safe_user}/credentials",
+                token=admin_token,
+                expected=(200,),
+            ),
+            "break-glass credentials",
+        )
+        if not isinstance(credentials, list):
+            raise IdentityError("Keycloak break-glass credential list was invalid")
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "password"
+            for entry in credentials
+        )
+
     async def _ensure_break_glass_admin(
         self, admin_token: str
     ) -> dict[str, Any] | None:
@@ -2632,10 +2757,18 @@ class KeycloakAdmin:
             raise IdentityConflict(
                 "the break-glass username collides with the bootstrap admin"
             )
-        group_id = await self._ensure_break_glass_group(admin_token)
+        # Ordering is load-bearing. The brute-force policy is proven FIRST:
+        # every later step either restores authority (group role mapping,
+        # membership) or installs a password, and none of those may land on a
+        # master realm whose lockout protection is still Keycloak's default
+        # (off). The profile marker declaration comes next, before any user
+        # exists to be marked.
         await self._ensure_master_brute_force_policy(admin_token)
+        await self._ensure_master_profile_marker(admin_token)
+        group_id = await self._ensure_break_glass_group(admin_token)
 
         user = await self._master_user_by_username(username, admin_token)
+        created_this_run = False
         if user is None:
             await self._request(
                 "POST",
@@ -2649,6 +2782,7 @@ class KeycloakAdmin:
                 expected=(201, 204),
             )
             user = await self._master_user_by_username(username, admin_token)
+            created_this_run = True
         if user is None:
             raise IdentityError("the break-glass administrator was not created")
         attributes = user.get("attributes") or {}
@@ -2659,6 +2793,25 @@ class KeycloakAdmin:
         user_id = path_segment(user.get("id"), label="break-glass user UUID")
 
         try:
+            # An escrow document is trustworthy only when the account still
+            # holds a credential this run can vouch for. A recreated user
+            # (this run) or one with no password credential (asymmetric
+            # restore) forces a rotation regardless of the document's shape.
+            escrow = self._break_glass_escrow_doc()
+            has_password = await self._break_glass_has_password(
+                user_id, admin_token
+            )
+            needs_rotation = (
+                escrow is None or created_this_run or not has_password
+            )
+            if needs_rotation and user.get("enabled"):
+                await self._set_break_glass_enabled(user, False, admin_token)
+                user["enabled"] = False
+
+            # Membership is the authority grant, so it is attached only after
+            # the account is proven disabled-or-escrowed: at this point the
+            # user is either disabled (rotation pending) or carries a
+            # credential whose escrow was just validated.
             await self._request(
                 "PUT",
                 f"/admin/realms/master/users/{user_id}/groups/{group_id}",
@@ -2684,10 +2837,7 @@ class KeycloakAdmin:
                     "Keycloak did not verify break-glass group membership"
                 )
 
-            escrow = self._break_glass_escrow_doc()
-            if escrow is None:
-                if user.get("enabled"):
-                    await self._set_break_glass_enabled(user, False, admin_token)
+            if needs_rotation:
                 password = secrets.token_urlsafe(48)
                 await self._request(
                     "PUT",
@@ -2722,6 +2872,9 @@ class KeycloakAdmin:
                     )
                 await self._set_break_glass_enabled(user, True, admin_token)
             elif not user.get("enabled"):
+                # Escrow valid and a credential is installed; the only writer
+                # of that credential is this flow, which escrows immediately
+                # after setting it, so re-enabling is safe.
                 await self._set_break_glass_enabled(user, True, admin_token)
         except Exception:
             # Never leave a password-backed master administrator enabled
@@ -2883,6 +3036,16 @@ class KeycloakAdmin:
                 # bootstrap teardown below: the temporary administrator is
                 # never destroyed until the durable one is proven and escrowed.
                 break_glass = await self._ensure_break_glass_admin(admin_token)
+                if break_glass is None:
+                    # The durable administrator is mandatory in every profile.
+                    # A disabled flag may park the bootstrap; it must never be
+                    # able to produce an instance with no interactive
+                    # administrator at all.
+                    raise IdentityConflict(
+                        "refusing to consume the bootstrap without a durable "
+                        "administrator: BREAK_GLASS_ADMIN_ENABLED must remain "
+                        "true"
+                    )
                 state_doc = {
                     "schema_version": IDENTITY_STATE_SCHEMA,
                     "managed_root_group_id": path_segment(
@@ -2946,11 +3109,22 @@ class KeycloakAdmin:
             broker_key = self.vault.read(
                 self.settings.kc_client_assertion_key_vault_path
             )
+        except Exception as exc:  # noqa: BLE001
+            raise IdentityError("could not read identity status from Vault") from exc
+        break_glass_doc = None
+        break_glass_escrow_readable = True
+        try:
             break_glass_doc = self.vault.read(
                 self.settings.break_glass_admin_vault_path
             )
-        except Exception as exc:  # noqa: BLE001
-            raise IdentityError("could not read identity status from Vault") from exc
+        except Exception:  # noqa: BLE001
+            # A pre-feature rotator Vault policy cannot read the escrow path
+            # (permission denied, not path-missing). The three reads above
+            # already proved Vault itself is reachable, so degrade to honest
+            # booleans instead of failing the whole status endpoint — a
+            # brownfield host must keep converging while the documented
+            # policy-amendment ceremony is pending.
+            break_glass_escrow_readable = False
         controller_usable = False
         if isinstance(controller_key, dict):
             try:
@@ -2992,9 +3166,13 @@ class KeycloakAdmin:
             # The durable controller has no master-realm authority, so
             # presence of a valid Vault escrow is the honest observable for
             # the break-glass administrator. Booleans only — the escrow
-            # document itself never leaves Vault through this API.
+            # document itself never leaves Vault through this API. The
+            # readable flag distinguishes "no escrow yet" from "this rotator's
+            # Vault policy predates the escrow path" (brownfield upgrade).
+            "break_glass_escrow_readable": break_glass_escrow_readable,
             "break_glass_escrowed": (
-                isinstance(break_glass_doc, dict)
+                break_glass_escrow_readable
+                and isinstance(break_glass_doc, dict)
                 and break_glass_doc.get("schema_version") == BREAK_GLASS_SCHEMA
                 and break_glass_doc.get("username")
                 == self.settings.break_glass_admin_username

@@ -396,6 +396,13 @@ path "kv/data/${BREAK_GLASS_ADMIN_VAULT_PATH}" { capabilities = ["create", "read
 path "kv/data/ai-gateway/vendors/openai" { capabilities = ["create", "read", "update"] }
 path "kv/data/ai-gateway/openai-state" { capabilities = ["create", "read", "update"] }
 HCL
+# Destruction resistance for the escrowed break-glass credential: KV v2's
+# default max_versions (10) would let ten rotator writes permanently expire
+# the version holding the real password. The bound is root-pinned here; the
+# rotator policy grants no kv/metadata capability on this path, so it cannot
+# lower it. Recovery of an accidentally superseded escrow:
+#   vault kv get -version=<N> kv/${BREAK_GLASS_ADMIN_VAULT_PATH}
+vlt kv metadata put -max-versions=100 "kv/${BREAK_GLASS_ADMIN_VAULT_PATH}" >/dev/null
 ROTATOR_TOKEN="$(vlt token create -policy=rotator -period=768h -field=token)"
 
 # ── 6: optional vendor key seeding (static_seed driver picks these up) ──

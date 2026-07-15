@@ -1715,3 +1715,69 @@ def test_identity_upstream_group_ambiguity_fails_closed(
     assert "safe-group-id" not in response.text
     assert "Could not reach the identity controller" in response.text
     assert "PRIVATE KEY" not in response.text
+
+
+def test_admin_page_surfaces_break_glass_escrow_state(
+    admin_client, set_admin_session, monkeypatch
+):
+    """The runbook's portal confirmation step needs the escrow state visible,
+    and a brownfield policy gap must render as actionable, not as healthy."""
+
+    status = {
+        "configured": True,
+        "controller_usable": True,
+        "bootstrap_available": False,
+        "ldap_configured": True,
+        "break_glass_escrowed": True,
+        "break_glass_escrow_readable": True,
+        "controller_certificate_sha256": "a" * 64,
+        "broker_certificate_sha256": "b" * 64,
+    }
+
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        if path in {"/status", "/settings"} or path.startswith("/history"):
+            return []
+        if path == "/identity/status":
+            return dict(status)
+        if path == "/identity/groups" or path.startswith("/identity/users?"):
+            return []
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    escrowed = admin_client.get("/admin")
+    assert escrowed.status_code == 200
+    assert "Break-glass escrow: escrowed" in escrowed.text
+
+    status["break_glass_escrowed"] = False
+    status["break_glass_escrow_readable"] = False
+    unreadable = admin_client.get("/admin")
+    assert unreadable.status_code == 200
+    assert "rotator Vault policy predates the escrow path" in unreadable.text
+
+    status["break_glass_escrow_readable"] = True
+    missing = admin_client.get("/admin")
+    assert missing.status_code == 200
+    assert "Break-glass escrow: not escrowed" in missing.text
+
+
+def test_safe_identity_status_maps_break_glass_booleans_only():
+    mapped = main._safe_identity_status(
+        {
+            "configured": True,
+            "break_glass_escrowed": True,
+            "break_glass_escrow_readable": False,
+            "password": "must-never-cross",
+        }
+    )
+    assert mapped["break_glass_escrowed"] is True
+    assert mapped["break_glass_escrow_readable"] is False
+    assert "password" not in mapped
+    # A pre-upgrade rotator that omits the readable field must not render as
+    # a policy gap: absence defaults to readable.
+    legacy = main._safe_identity_status({"configured": True})
+    assert legacy["break_glass_escrowed"] is False
+    assert legacy["break_glass_escrow_readable"] is True
