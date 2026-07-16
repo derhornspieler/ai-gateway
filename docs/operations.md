@@ -458,15 +458,15 @@ nft list table inet aigw_guard
 iptables -S DOCKER-USER
 ```
 
-Repeat the saved/runtime/permanent comparison afterward: a physical leg in
-`public`, even with key-only SSH and intact Docker forward guards, is a failed
-host-input boundary. Verify the exact fixed Envoy source, DNS `/32`, vendor
-TCP/443 allow, optional exact Alloy-to-Cribl rule, reply-direction state rule,
-cross-plane drops, and final bridge-origin default drop are all still present;
-do not settle for confirming that the chains and tables merely exist. If rules
-are absent, fail closed, restart the three policy units, then rerun the full
-`ansible/site.yml`. Do not start or recreate application containers while the
-policy is absent.
+**What success looks like:** the three policy units report `active` after
+`firewall-cmd --reload`, and both `nft list table inet aigw_guard` and
+`iptables -S DOCKER-USER` still print their rules.
+
+- Repeat the saved/runtime/permanent comparison afterward: a physical leg in `public`, even with key-only SSH and intact Docker forward guards, is a failed host-input boundary.
+- Verify the exact fixed Envoy source, DNS `/32`, vendor TCP/443 allow, optional exact Alloy-to-Cribl rule, reply-direction state rule, cross-plane drops, and final bridge-origin default drop are all still present; do not settle for confirming that the chains and tables merely exist.
+- If rules are absent, fail closed, restart the three policy units, then rerun the full `ansible/site.yml`.
+
+Do not start or recreate application containers while the policy is absent.
 
 ```bash
 systemctl restart aigw-host-input-rules.service
@@ -818,18 +818,14 @@ production hardening above (listener TLS and either multiple custodians or a
 reviewed KMS auto-unseal) is still required before this single-share replay is
 treated as sufficient.
 
-Vault audit writes to `vault_audit`, and `aigw-vault-audit-rotate.timer` checks
-every 15 minutes. `scripts/rotate-vault-audit.sh` runs a locked, networkless,
-read-only helper under Vault's audit-volume UID/GID, rotates at 100 MiB by
-default, HUPs Vault to reopen the file, compresses the old inode, and keeps 14
-rotations; the verify role requires the timer active. Those bounds are
-configurable through `VAULT_AUDIT_MAX_BYTES` and `VAULT_AUDIT_KEEP_FILES`, but
-the installed unit uses the defaults. Rotation uses the same digest-pinned DHI
-BusyBox image as `volume-init` rather than assuming an application image has a
-shell, and it deliberately defers when Vault is unavailable, so monitor the
-actual audit-volume size as well as timer state. Never pass root tokens, unseal
-shares, provider keys, Samba passwords, or private keys as command-line values,
-and never copy Vault private-key records into the portal or a ticketing system.
+Vault audit rotation:
+
+- Vault audit writes to `vault_audit`, and `aigw-vault-audit-rotate.timer` checks every 15 minutes.
+- `scripts/rotate-vault-audit.sh` runs a locked, networkless, read-only helper under Vault's audit-volume UID/GID, rotates at 100 MiB by default, HUPs Vault to reopen the file, compresses the old inode, and keeps 14 rotations; the verify role requires the timer active.
+- Those bounds are configurable through `VAULT_AUDIT_MAX_BYTES` and `VAULT_AUDIT_KEEP_FILES`, but the installed unit uses the defaults.
+- Rotation uses the same digest-pinned DHI BusyBox image as `volume-init` rather than assuming an application image has a shell, and it deliberately defers when Vault is unavailable, so monitor the actual audit-volume size as well as timer state.
+
+Never pass root tokens, unseal shares, provider keys, Samba passwords, or private keys as command-line values, and never copy Vault private-key records into the portal or a ticketing system.
 
 ## State inventory and backup
 
@@ -849,29 +845,6 @@ and never copy Vault private-key records into the portal or a ticketing system.
 | rendered secrets/certs | `/opt/ai-gateway/.env`, `certs/`, `secrets/` | highly sensitive; encrypt and control separately |
 
 ### Create an encrypted backup
-
-`scripts/state-backup.sh` requires root plus the pinned `age`/`age-inspect`
-tools. It refuses output on the stack's backing filesystem, an existing or
-symlink output, an unverifiable or in-progress credential rotation, and any
-co-located `secrets/vault-init.json`. It records the exact containers running
-before quiesce, stops every writer, takes PostgreSQL globals and custom-format
-logical dumps of the `litellm`, `keycloak`, and `rotator` databases, stops
-Postgres, archives every present allow-listed named volume with the digest-pinned
-DHI BusyBox `tar` under numeric ownership, and archives the reviewed rendered
-stack, configuration, and secrets. It then age-encrypts and validates the
-artifact, atomically installs it, writes `.state/last-backup.json`, and restarts
-exactly the captured container IDs directly rather than asking Compose to
-traverse dependencies, because that would rerun the successful exited
-`volume-init` one-shot.
-
-`openwebui_data/cache` is the one intentional volume exclusion: it holds
-regenerable downloaded embedding-model objects whose upstream layout uses
-symlinks, which the hostile-archive restore gate rejects before any mutation. The
-durable Open WebUI database and application data remain in the backup, so
-authenticated chat works after restore, but because Open WebUI has no approved
-external egress here, embedding and RAG assets are not re-downloaded
-automatically: restore requires a reviewed offline model reseed or a future
-approved import path before those features return to service.
 
 Generate and custody the age identity separately, retain only its public X25519
 recipient on the gateway, and write to already-mounted independent, encrypted, or
@@ -897,6 +870,31 @@ sealed after the quiesced backup, so perform the normal manual unseal and a full
 Compose wait before declaring the gateway ready, using the merged files and
 profile in the lab.
 
+#### Why this works (reference)
+
+`scripts/state-backup.sh` requires root plus the pinned `age`/`age-inspect`
+tools. It refuses output on the stack's backing filesystem, an existing or
+symlink output, an unverifiable or in-progress credential rotation, and any
+co-located `secrets/vault-init.json`. It records the exact containers running
+before quiesce, stops every writer, takes PostgreSQL globals and custom-format
+logical dumps of the `litellm`, `keycloak`, and `rotator` databases, stops
+Postgres, archives every present allow-listed named volume with the digest-pinned
+DHI BusyBox `tar` under numeric ownership, and archives the reviewed rendered
+stack, configuration, and secrets. It then age-encrypts and validates the
+artifact, atomically installs it, writes `.state/last-backup.json`, and restarts
+exactly the captured container IDs directly rather than asking Compose to
+traverse dependencies, because that would rerun the successful exited
+`volume-init` one-shot.
+
+`openwebui_data/cache` is the one intentional volume exclusion: it holds
+regenerable downloaded embedding-model objects whose upstream layout uses
+symlinks, which the hostile-archive restore gate rejects before any mutation. The
+durable Open WebUI database and application data remain in the backup, so
+authenticated chat works after restore, but because Open WebUI has no approved
+external egress here, embedding and RAG assets are not re-downloaded
+automatically: restore requires a reviewed offline model reseed or a future
+approved import path before those features return to service.
+
 ### Restore an authenticated backup
 
 Restore is destructive. Build an isolated target with the firewall and network
@@ -912,22 +910,10 @@ sudo ./scripts/state-restore.sh \
   --confirm RESTORE_AI_GATEWAY_STATE
 ```
 
-The script authenticates the encrypted artifact checksum before decryption, then
-`restore_archive.py` validates the exact outer inventory, the manifest/checksum
-bijection, every nested archive path and type, and all profile volume names
-before a single service is stopped. Sparse maps are rejected even when
-represented as regular tar members. The hostile-input ceilings are 100,000
-stack-configuration members, 2,000,000 members and 1 TiB declared per volume,
-2 TiB declared across all volumes, and a mandatory 256 MiB free reserve, and the
-declared total must fit the live Docker data filesystem after staging. Volume
-wiping runs networkless and read-only with only `DAC_OVERRIDE` and `FOWNER`;
-numeric-owner extraction adds only `CHOWN`; both helpers drop every other
-capability and use `no-new-privileges`. The script replaces only manifest-listed
-project volumes, installs the safely staged configuration while the project stays
-offline, requires zero running project containers, writes
-`.state/restore-required-unseal` as an exact `root:root 0600` file containing only
-the authenticated backup SHA-256, removes any target-local `.state/bind-digest.key`
-as a new bind epoch, and exits zero without starting the captured graph.
+**What success looks like:** the script authenticates the encrypted artifact
+checksum before decryption, replaces only manifest-listed project volumes while
+the project stays offline, writes the `.state/restore-required-unseal` marker, and
+exits zero without starting the captured graph.
 
 Complete the restore in order: keep both ingress legs in maintenance and run the
 full `ansible/site.yml` converge from the designated current source while the
@@ -959,6 +945,25 @@ still-pending G7 disposition, are recorded in
 `docker compose down` preserves named volumes. `docker compose down -v` destroys
 all project databases, Vault, identity, and telemetry state; in the lab use the
 merged files and profile through `aigw-compose.sh` or Samba volumes can be missed.
+
+#### Why this works (reference)
+
+The script authenticates the encrypted artifact checksum before decryption, then
+`restore_archive.py` validates the exact outer inventory, the manifest/checksum
+bijection, every nested archive path and type, and all profile volume names
+before a single service is stopped. Sparse maps are rejected even when
+represented as regular tar members. The hostile-input ceilings are 100,000
+stack-configuration members, 2,000,000 members and 1 TiB declared per volume,
+2 TiB declared across all volumes, and a mandatory 256 MiB free reserve, and the
+declared total must fit the live Docker data filesystem after staging. Volume
+wiping runs networkless and read-only with only `DAC_OVERRIDE` and `FOWNER`;
+numeric-owner extraction adds only `CHOWN`; both helpers drop every other
+capability and use `no-new-privileges`. The script replaces only manifest-listed
+project volumes, installs the safely staged configuration while the project stays
+offline, requires zero running project containers, writes
+`.state/restore-required-unseal` as an exact `root:root 0600` file containing only
+the authenticated backup SHA-256, removes any target-local `.state/bind-digest.key`
+as a new bind epoch, and exits zero without starting the captured graph.
 
 ## Recovery order
 
@@ -1003,30 +1008,16 @@ reviewed change. Never force-create a colliding bridge.
 
 ## Pre-build rollback retention
 
-Current source runs `scripts/preserve-compose-rollbacks.py` after the shared
-build planner and before any planned custom-image build. For every planned
-service with an existing container it proves exactly one Compose instance is
-running, healthy, and at restart count zero; that the desired local tag and the
-container's immutable image ID agree; and that the local Docker socket is the one
-inspected. It then creates an immutable rollback reference from the
-project/service namespace plus the full source image digest, rechecks the
-container and both references for races, and atomically writes schema 2 of
-`.state/compose-build-rollbacks.json` as a single-link `root:root 0600` file.
-Previously recorded services are revalidated, a new generation never moves a
-reference named by the committed manifest, and a genuinely container-free first
-build is explicitly recorded as having no predecessor.
+- Current source runs `scripts/preserve-compose-rollbacks.py` after the shared build planner and before any planned custom-image build.
+- For every planned service with an existing container it proves exactly one Compose instance is running, healthy, and at restart count zero; that the desired local tag and the container's immutable image ID agree; and that the local Docker socket is the one inspected.
+- It then creates an immutable rollback reference from the project/service namespace plus the full source image digest, rechecks the container and both references for races, and atomically writes schema 2 of `.state/compose-build-rollbacks.json` as a single-link `root:root 0600` file.
+- Previously recorded services are revalidated, a new generation never moves a reference named by the committed manifest, and a genuinely container-free first build is explicitly recorded as having no predecessor.
 
-The shared build planner, `scripts/plan-compose-builds.py`, hashes a
-domain-separated version-2 stream in which every build definition, path, type,
-mode, and file or symlink payload carries explicit length framing and every
-regular file is checked for identity and metadata races while streaming. The old
-unframed digest is accepted only as a one-converge comparison for a pre-existing
-manifest; current source always persists the framed digest, which prevents a file
-payload from absorbing the next inventory record and suppressing a required
-rebuild without breaking SHA-256. Any malformed manifest, multiple container,
-missing health contract, unhealthy or restarted source, mismatched desired image,
-moved rollback tag, failed Docker enumeration, or inspect/tag race stops the
-build. Do not delete the manifest, move its tags, or manually bless a replacement
+- The shared build planner, `scripts/plan-compose-builds.py`, hashes a domain-separated version-2 stream in which every build definition, path, type, mode, and file or symlink payload carries explicit length framing and every regular file is checked for identity and metadata races while streaming.
+- The old unframed digest is accepted only as a one-converge comparison for a pre-existing manifest; current source always persists the framed digest, which prevents a file payload from absorbing the next inventory record and suppressing a required rebuild without breaking SHA-256.
+- Any malformed manifest, multiple container, missing health contract, unhealthy or restarted source, mismatched desired image, moved rollback tag, failed Docker enumeration, or inspect/tag race stops the build.
+
+Do not delete the manifest, move its tags, or manually bless a replacement
 image to bypass a failure; the manifest is non-secret evidence, not a substitute
 for the encrypted state backup or a schema-compatible rollback test. This control
 has passed focused source tests but has not completed its live deployment gate.
@@ -1198,13 +1189,9 @@ reload, but an outage can still occur if approved rules were not reasserted.
 
 ## Residual security boundary
 
-The packet policy constrains managed project bridges, not arbitrary root-owned
-host processes. Docker image pulls and other host-namespace traffic are outside
-`DOCKER-USER`; Envoy necessarily retains a DNS channel to one approved resolver;
-and unmanaged bridges whose names are outside the project inventory are outside
-the native container-input scope. Root on the VM, Docker daemon access, Compose
-file and entrypoint changes, and the encrypted secret overlay remain high-trust
-administrative boundaries.
+- The packet policy constrains managed project bridges, not arbitrary root-owned host processes.
+- Docker image pulls and other host-namespace traffic are outside `DOCKER-USER`; Envoy necessarily retains a DNS channel to one approved resolver; and unmanaged bridges whose names are outside the project inventory are outside the native container-input scope.
+- Root on the VM, Docker daemon access, Compose file and entrypoint changes, and the encrypted secret overlay remain high-trust administrative boundaries.
 
 ## Legacy lab reset
 
