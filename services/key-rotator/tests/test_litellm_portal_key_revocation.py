@@ -25,6 +25,77 @@ def settings(**overrides) -> Settings:
     return Settings(**values)
 
 
+@pytest.mark.asyncio
+async def test_upsert_credential_patch_uses_complete_litellm_credential_item(
+    caplog,
+) -> None:
+    secret = "sk-ant-oat-full-secret-value"
+    expected = {
+        "credential_name": "anthropic-primary",
+        "credential_values": {"api_key": secret},
+        "credential_info": {"managed_by": "key-rotator"},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PATCH"
+        assert request.url.path == "/credentials/anthropic-primary"
+        assert json.loads(request.content) == expected
+        return httpx.Response(200)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    with caplog.at_level("INFO", logger="key_rotator.litellm"):
+        await client.upsert_credential("anthropic-primary", {"api_key": secret})
+
+    assert secret not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_upsert_credential_patch_404_falls_back_to_complete_post_create() -> None:
+    expected = {
+        "credential_name": "anthropic-primary",
+        "credential_values": {"api_key": "anthropic-token"},
+        "credential_info": {"managed_by": "key-rotator"},
+    }
+    requests: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            (request.method, request.url.path, json.loads(request.content))
+        )
+        if request.method == "PATCH":
+            return httpx.Response(404)
+        return httpx.Response(201)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    await client.upsert_credential(
+        "anthropic-primary", {"api_key": "anthropic-token"}
+    )
+
+    assert requests == [
+        ("PATCH", "/credentials/anthropic-primary", expected),
+        ("POST", "/credentials", expected),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [422, 500])
+async def test_upsert_credential_non_404_patch_error_raises(status_code: int) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        return httpx.Response(status_code)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.upsert_credential(
+            "anthropic-primary", {"api_key": "anthropic-token"}
+        )
+
+    assert requests == ["PATCH"]
+
+
 def portal_key(
     token: str,
     owner: str,

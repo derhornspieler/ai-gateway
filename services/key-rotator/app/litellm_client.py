@@ -126,7 +126,11 @@ class LiteLLMClient:
         async with httpx.AsyncClient(**self._client_kwargs()) as client:
             resp = await client.patch(
                 f"{base}/credentials/{safe_name}",
-                json={"credential_values": values},
+                json={
+                    "credential_name": name,
+                    "credential_values": values,
+                    "credential_info": {"managed_by": "key-rotator"},
+                },
                 headers=self._headers(),
             )
 
