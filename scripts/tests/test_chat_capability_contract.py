@@ -27,6 +27,16 @@ class ChatCapabilityContractTest(unittest.TestCase):
         # The pre-aigw-chat gate must not silently return.
         self.assertNotIn('OAUTH_ALLOWED_ROLES: "aigw-users', compose)
 
+    def test_compose_bypasses_openwebui_internal_model_acl(self) -> None:
+        """Model authorization is the gateway's job (scoped workload key +
+        per-project runtime policy). Open WebUI 0.10's own model access
+        control defaults connection-derived models to admin-only visibility,
+        which locks every non-admin aigw-chat user out of chat — proven live
+        2026-07-16 (role=user saw zero models). The bypass must stay pinned
+        so an upgrade or edit cannot silently re-brick user chat."""
+        compose = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn('BYPASS_MODEL_ACCESS_CONTROL: "true"', compose)
+
     def test_realm_sources_define_and_scope_the_chat_role(self) -> None:
         for path in (
             ROOT

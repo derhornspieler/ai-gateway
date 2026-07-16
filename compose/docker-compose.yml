@@ -622,6 +622,12 @@ services:
       # Per solution-map FAQ: Open WebUI's own API keys stay disabled —
       # gateway keys come from dev-portal only.
       ENABLE_API_KEYS: "false"
+      # Model authorization lives at the gateway: the scoped workload key and
+      # the per-project runtime policy decide which models chat may reach.
+      # Open WebUI's own model access control is redundant on this path, and
+      # its 0.10 default hides connection-derived models from every non-admin
+      # user — which locked aigw-chat users out of chat entirely.
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
     volumes:
       - openwebui_data:/app/backend/data
       - ./certs/ca.pem:/etc/ssl/certs/aigw-ca.pem:ro,z
