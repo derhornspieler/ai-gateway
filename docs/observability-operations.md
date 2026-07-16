@@ -1,52 +1,64 @@
 # Observability and Sensitive-Telemetry Operations
 
-## Telemetry sanitization and scrape scope (enforced in configuration)
-
-Alloy is the sanitization chokepoint: it promotes only server-authenticated
-identity into safe span attributes (`aigw.user.id`, `aigw.api_key.id`,
-`aigw.project.id`, strictly validated), then strips secret- and
-identity-bearing keys from every OTLP signal before batching or export —
-authorization and API-key material, raw request headers, cookies,
-client/server addresses and ports, query strings, and e-mail addresses.
-Telemetry that cannot be sanitized is dropped rather than exported.
-
-Prometheus scrapes only reviewed metrics/observability-plane endpoints (the
-two Traefik edges, Envoy's read-only stats facade, Keycloak management,
-Alloy, Grafana, Tempo, Loki, node-exporter, and itself); Vault, Postgres,
-Redis, and LiteLLM are deliberately not scraped because exposing their
-metrics would weaken an authentication boundary. Alert rules live in
-Prometheus (`compose/prometheus/rules.yml`), not Grafana.
-
-Admin cost and usage visibility is a deliberate owner-approved exception to
-the former "no Grafana → LiteLLM data" isolation, implemented as data-plane
-reads rather than metrics: Grafana carries a fourth, read-only PostgreSQL
-datasource (`LiteLLM Spend`, uid `litellm-spend`) over the dedicated
-`net-db-grafana` bridge. The `grafana_ro` role may CONNECT only to the
-`litellm` database and SELECT only `LiteLLM_SpendLogs`,
-`LiteLLM_VerificationToken`, `LiteLLM_UserTable`, and
-`LiteLLM_DailyUserSpend` (metadata-only rows — prompt storage in spend logs
-stays pinned off). Dollar figures are LiteLLM's own computed `spend`, which
-already prices Anthropic prompt-cache reads and writes correctly; dashboards
-never recompute cost from tokens × flat price and never introduce per-user
-or per-key Prometheus labels (bounded `LIMIT` top-N SQL instead — the
-cardinality-DoS defense in Alloy is unchanged).
-
-Grafana is fully provisioned and immutable in the UI: eight reviewed
-dashboards (overview, live logs, request audit, top projects, top users,
-edge/identity, LGTM stack, Rocky 9 host) in the "AI Gateway" folder, exactly
-four datasources (Prometheus, Loki, Tempo, and the read-only LiteLLM Spend
-PostgreSQL datasource) with trace/log cross-linking, no runtime plugin
-downloads (the sole app plugin — Grafana Loki drilldown
-`grafana-lokiexplore-app` 2.2.1 — is version- and sha256-pinned into the
-Grafana image at build and loaded from a read-only rootfs path), and no
-alerting configured in Grafana itself.
-
 This is the operational contract for the local Grafana stack and the optional
 Cribl export. It is explicit because AI prompt capture changes the
 data-classification, capacity, and recovery requirements of an otherwise ordinary
 telemetry pipeline. It complements the operator guide in
 [operations.md](operations.md) and the architecture in
 [solution-map.md](solution-map.md).
+
+> **Verifying telemetry health?** Jump straight to
+> [Verification](#verification) for the render validator, the authenticated
+> Grafana datasource probe, and the post-authentication-flow log scans.
+
+## Telemetry sanitization and scrape scope (enforced in configuration)
+
+- **What Alloy strips.** Alloy is the sanitization chokepoint: it promotes
+  only server-authenticated
+  identity into safe span attributes (`aigw.user.id`, `aigw.api_key.id`,
+  `aigw.project.id`, strictly validated), then strips secret- and
+  identity-bearing keys from every OTLP signal before batching or export —
+  authorization and API-key material, raw request headers, cookies,
+  client/server addresses and ports, query strings, and e-mail addresses.
+  Telemetry that cannot be sanitized is dropped rather than exported.
+
+- **What Prometheus scrapes — and deliberately does not.** Prometheus scrapes
+  only reviewed metrics/observability-plane endpoints (the
+  two Traefik edges, Envoy's read-only stats facade, Keycloak management,
+  Alloy, Grafana, Tempo, Loki, node-exporter, and itself); Vault, Postgres,
+  Redis, and LiteLLM are deliberately not scraped because exposing their
+  metrics would weaken an authentication boundary. Alert rules live in
+  Prometheus (`compose/prometheus/rules.yml`), not Grafana.
+
+- **The Grafana cost-visibility exception.** Admin cost and usage visibility
+  is a deliberate owner-approved exception to
+  the former "no Grafana → LiteLLM data" isolation, implemented as data-plane
+  reads rather than metrics: Grafana carries a fourth, read-only PostgreSQL
+  datasource (`LiteLLM Spend`, uid `litellm-spend`) over the dedicated
+  `net-db-grafana` bridge. The `grafana_ro` role may CONNECT only to the
+  `litellm` database and SELECT only `LiteLLM_SpendLogs`,
+  `LiteLLM_VerificationToken`, `LiteLLM_UserTable`, and
+  `LiteLLM_DailyUserSpend` (metadata-only rows — prompt storage in spend logs
+  stays pinned off). Dollar figures are LiteLLM's own computed `spend`, which
+  already prices Anthropic prompt-cache reads and writes correctly; dashboards
+  never recompute cost from tokens × flat price and never introduce per-user
+  or per-key Prometheus labels (bounded `LIMIT` top-N SQL instead — the
+  cardinality-DoS defense in Alloy is unchanged).
+
+- **Dashboard and datasource inventory.** Grafana is fully provisioned and
+  immutable in the UI: eight reviewed
+  dashboards (overview, live logs, request audit, top projects, top users,
+  edge/identity, LGTM stack, Rocky 9 host) in the "AI Gateway" folder, exactly
+  four datasources (Prometheus, Loki, Tempo, and the read-only LiteLLM Spend
+  PostgreSQL datasource) with trace/log cross-linking, no runtime plugin
+  downloads (the sole app plugin — Grafana Loki drilldown
+  `grafana-lokiexplore-app` 2.2.1 — is version- and sha256-pinned into the
+  Grafana image at build and loaded from a read-only rootfs path), and no
+  alerting configured in Grafana itself.
+
+  This document is the authoritative source for the provisioned dashboard
+  count and list; [test-runbook.md](test-runbook.md) and
+  [deploy-runbook.md](deploy-runbook.md) defer to it.
 
 ## Collection and routing
 

@@ -12,6 +12,26 @@ disposable Samba AD overlay. For the trust-boundary architecture read
 read [operations.md](operations.md); for the current release posture read
 [project-status.md](project-status.md).
 
+## Contents
+
+- [Production-readiness warning](#production-readiness-warning)
+- [Prerequisites](#prerequisites)
+  - [Control node](#control-node)
+  - [Target VM](#target-vm)
+- [Inputs](#inputs)
+  - [Connection and topology](#connection-and-topology)
+  - [Rendered Compose environment](#rendered-compose-environment)
+  - [Sensitive state backing](#sensitive-state-backing)
+  - [Cribl export](#cribl-export)
+  - [Encrypted secret overlay](#encrypted-secret-overlay)
+  - [DNS and certificates](#dns-and-certificates)
+- [Generic Rocky 9 deployment](#generic-rocky-9-deployment)
+  - [Role order across the composition](#role-order-across-the-composition)
+- [Explicit lab deployment](#explicit-lab-deployment)
+- [First bootstrap after Compose starts](#first-bootstrap-after-compose-starts)
+- [Host-prep-only converge](#host-prep-only-converge)
+- [Stack-only rollout](#stack-only-rollout)
+
 Ansible configures an existing host. It does not provision a VM, create a NIC
 or NetworkManager profile, or change an address, route, gateway, DNS value, or
 interface binding. It does persist the expected firewalld zone in the single
@@ -292,6 +312,8 @@ The ordinary stack requires all of the following. The role validates lengths,
 rejects obvious placeholders, and generally permits only `[A-Za-z0-9_-]` so
 Compose interpolation and database URLs remain unambiguous.
 
+#### Secret overlay variables
+
 | Variable | Purpose / constraint |
 |---|---|
 | `pg_super_password` | Postgres superuser; 24+ characters |
@@ -484,6 +506,8 @@ ansible-playbook -i ansible/inventory/hosts.yml ansible/site.yml \
 >
 > If you invoke Ansible from another directory, export `ANSIBLE_PIPELINING=True`
 > (or `ANSIBLE_CONFIG=$PWD/ansible/ansible.cfg`) so the control still applies.
+
+### Role order across the composition
 
 `site.yml` is a pure composition of two playbooks that can also run
 separately with the same inventory arguments: `ansible/os-prep.yml` (host

@@ -15,9 +15,27 @@ See the [solution map](solution-map.md) for the architecture and trust
 boundaries this runbook exercises, and [project status](project-status.md) for
 the current implementation posture and the residuals that remain pending.
 
+## Contents
+
+1. [Static release checks](#1-static-release-checks)
+2. [Topology and clean converge](#2-topology-and-clean-converge)
+3. [Host routing, firewall, and listeners](#3-host-routing-firewall-and-listeners)
+4. [Docker segmentation and negative packet tests](#4-docker-segmentation-and-negative-packet-tests)
+5. [Vault and application readiness](#5-vault-and-application-readiness)
+6. [TLS, routing, and negative HTTP tests](#6-tls-routing-and-negative-http-tests)
+7. [OIDC and authorization matrix](#7-oidc-and-authorization-matrix)
+8. [Samba AD and identity-controller lab acceptance](#8-samba-ad-and-identity-controller-lab-acceptance)
+9. [Developer key isolation and model path](#9-developer-key-isolation-and-model-path)
+10. [Observability and sensitive-data handling](#10-observability-and-sensitive-data-handling)
+11. [LiteLLM capacity and scaling acceptance](#11-litellm-capacity-and-scaling-acceptance)
+12. [Stateful recovery and upgrade gate](#12-stateful-recovery-and-upgrade-gate)
+13. [Final disposition](#13-final-disposition)
+
 ## 1. Static release checks
 
 From the repository checkout on the control machine:
+
+**Run this: repository validators and infrastructure contract tests.**
 
 ```bash
 scripts/validate-compose.sh
@@ -33,7 +51,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
   scripts/tests/test_acl_reconciler_source.py \
   scripts/tests/test_safe_inventory_marker.py \
   scripts/tests/test_validate_identity_policy.py
+```
 
+**Run this: dev-portal suite in a clean virtual environment.**
+
+```bash
 python3.12 -m venv /tmp/aigw-dev-portal-test
 /tmp/aigw-dev-portal-test/bin/python -m pip install --require-hashes \
   -r services/dev-portal/requirements.lock
@@ -47,7 +69,11 @@ python3.12 -m venv /tmp/aigw-dev-portal-test
   --recursive services/dev-portal/app
 /tmp/aigw-dev-portal-test/bin/pip-audit \
   --path /tmp/aigw-dev-portal-test/lib/python3.12/site-packages
+```
 
+**Run this: key-rotator suite in a clean virtual environment.**
+
+```bash
 python3.12 -m venv /tmp/aigw-key-rotator-test
 /tmp/aigw-key-rotator-test/bin/python -m pip install --require-hashes \
   -r services/key-rotator/requirements.lock
@@ -61,7 +87,11 @@ python3.12 -m venv /tmp/aigw-key-rotator-test
   --recursive services/key-rotator/app
 /tmp/aigw-key-rotator-test/bin/pip-audit \
   --path /tmp/aigw-key-rotator-test/lib/python3.12/site-packages
+```
 
+**Run this: shell syntax and Samba AD lab image checks.**
+
+```bash
 bash -n scripts/*.sh services/samba-ad-lab/samba-ad-entrypoint \
   services/samba-ad-lab/samba-ad-healthcheck
 
@@ -69,6 +99,8 @@ docker build -t aigw-samba-ad:test services/samba-ad-lab
 sh services/samba-ad-lab/tests/test-secret-argv.sh aigw-samba-ad:test
 sh services/samba-ad-lab/tests/test-lockout-policy.sh aigw-samba-ad:test
 ```
+
+**What this proves:**
 
 `validate-compose.sh` is render-only and must not start containers. The two
 exact-pinned `requirements-dev.txt` files are release tooling only; do not add
@@ -110,6 +142,8 @@ gate. The ACL source tests must prove canonical inventory paths, traversal-only
 Docker-root verification, parent-before-child containers ACL repair, checked
 Docker enumeration, bounded walks, and a systemd write boundary limited to the
 containers subtree.
+
+**Run this: playbook syntax check.**
 
 Also run the playbook syntax check with access to the encrypted inventory:
 
@@ -763,10 +797,11 @@ Generate a uniquely tagged, synthetic prompt. In Grafana Explore, prove:
 - classify the shared Open WebUI key as service/project attribution only; do
   not claim its browser traffic is per-human until a trusted server-side
   identity propagation design has passed this matrix;
-- the Grafana "AI Gateway" folder loads all six provisioned dashboards
-  (AI Gateway Overview, Live Logs, Request Audit, and the new Rocky 9 Host,
-  Grafana LGTM Stack, and Edge/Egress/Identity Services), and the three new
-  component dashboards populate from scraped native metrics — node-exporter
+- the Grafana "AI Gateway" folder loads all provisioned dashboards (see
+  [observability operations](observability-operations.md) for the current
+  list — eight at the time of writing), and the three component dashboards
+  (Rocky 9 Host, Grafana LGTM Stack, and Edge/Egress/Identity Services)
+  populate from scraped native metrics — node-exporter
   host series, LGTM self-observability (`loki_*`, `tempo_*`, `otelcol_*`,
   `prometheus_*`), and Traefik/Keycloak/Envoy/JVM edge and identity series —
   with their component-health panels counting exact scrape targets (`== bool 5`

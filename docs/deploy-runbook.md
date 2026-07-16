@@ -320,15 +320,17 @@ printing it) and
 2. From an administrator machine (on the ADM network), open
    `https://admin.<domain>` and `https://grafana.<domain>` — both should
    redirect you to a login page and let the administrator in. In Grafana, the
-   "AI Gateway" folder should already hold six provisioned dashboards
-   (AI Gateway Overview, Live Logs, Request Audit, plus the new Rocky 9 Host,
-   Grafana LGTM Stack, and Edge/Egress/Identity Services); the newer dashboards
-   link back to AI Gateway Overview as their hub.
+   "AI Gateway" folder should already hold every provisioned dashboard (see
+   [observability operations](observability-operations.md) for the current
+   list — eight at the time of writing); the newer dashboards link back to
+   AI Gateway Overview as their hub.
 3. From a machine on the ADM network, open `https://chat.<domain>` — you
    should reach the chat login. From a user machine (on the internal
    network), open `https://portal.<domain>` — you should reach the
    developer portal login.
-4. Enroll the AI vendor credential (Anthropic) following
+4. Enroll the AI vendor credential (Anthropic) following the step-by-step
+   [Anthropic WIF setup SOP](sop/anthropic-wif-jwt-setup.md). The deep
+   reference behind that SOP is
    [anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md).
 5. Before opening access to real users, run the applicable sections of the
    [acceptance test runbook](test-runbook.md).

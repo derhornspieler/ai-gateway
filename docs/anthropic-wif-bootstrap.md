@@ -1,5 +1,9 @@
 # Anthropic Workload Identity Federation
 
+For the step-by-step operator procedure, start with the
+[Anthropic WIF setup SOP](sop/anthropic-wif-jwt-setup.md); this document is
+the authoritative reference behind it.
+
 This runbook describes the implemented Keycloak-to-Anthropic WIF path, which has
 two deliberately separate authority domains. AI Gateway automatically creates
 and proves the Keycloak broker's `private_key_jwt` key, mints short-lived

@@ -18,6 +18,61 @@ long-running services. Wherever a service count matters below it refers to that
 current topology; historical rehearsal receipts that recorded a smaller set are
 held in [lab-dr-rehearsal.md](archive/lab-dr-rehearsal.md).
 
+## Contents
+
+**Boot, runtime, and health**
+
+- [Compose command context](#compose-command-context)
+- [State-volume initialization contract](#state-volume-initialization-contract)
+- [SELinux and bind-mounted configuration](#selinux-and-bind-mounted-configuration)
+- [Normal boot and reboot](#normal-boot-and-reboot)
+  - [Health contracts](#health-contracts)
+  - [Reboot and remediation status](#reboot-and-remediation-status)
+- [Routine health checks](#routine-health-checks)
+  - [Host routing and listeners](#host-routing-and-listeners)
+  - [Firewall persistence and reload test](#firewall-persistence-and-reload-test)
+  - [Container boundary packet test](#container-boundary-packet-test)
+  - [Application checks](#application-checks)
+
+**SSH**
+
+- [SSH access and recovery](#ssh-access-and-recovery)
+
+**PKI ceremonies**
+
+- [Production edge TLS](#production-edge-tls)
+  - [Where TLS actually is (and is not)](#where-tls-actually-is-and-is-not)
+  - [Choosing a mode](#choosing-a-mode)
+  - [Mode 2 ceremony (`vault-intermediate`)](#mode-2-ceremony-vault-intermediate)
+  - [Mode 3 ceremony (`customer-intermediate`)](#mode-3-ceremony-customer-intermediate)
+  - [Mode 1 (`customer-supplied`)](#mode-1-customer-supplied)
+  - [What is validated before anything goes live](#what-is-validated-before-anything-goes-live)
+
+**Vault**
+
+- [Vault operations](#vault-operations)
+
+**Backup and restore**
+
+- [State inventory and backup](#state-inventory-and-backup)
+  - [Create an encrypted backup](#create-an-encrypted-backup)
+  - [Restore an authenticated backup](#restore-an-authenticated-backup)
+- [Recovery order](#recovery-order)
+
+**Upgrade**
+
+- [Pre-build rollback retention](#pre-build-rollback-retention)
+- [Upgrade procedure](#upgrade-procedure)
+  - [Docker Engine and Compose plugin version bumps](#docker-engine-and-compose-plugin-version-bumps)
+  - [PostgreSQL role and ACL reconciliation](#postgresql-role-and-acl-reconciliation)
+  - [Open WebUI service key](#open-webui-service-key)
+
+**Troubleshooting and reference**
+
+- [Troubleshooting](#troubleshooting)
+- [Residual security boundary](#residual-security-boundary)
+- [Legacy lab reset](#legacy-lab-reset)
+
 ## Compose command context
 
 Deployed operator scripts never call Compose directly. `scripts/aigw-compose.sh`
@@ -100,6 +155,8 @@ unchanged container on the old one. Post-converge verification therefore reads,
 but does not relabel, every source and Docker runtime root, and it fails on any
 AVC or USER_AVC recorded during the controlled converge window.
 
+### Why this works (reference)
+
 Linux bind mounts retain the inode selected at container creation, so a
 path-stable Compose model that atomically replaces a file can otherwise leave a
 running service reading stale bytes. The repository's exact
@@ -145,6 +202,10 @@ nft list table inet aigw_guard
 iptables -S DOCKER-USER
 ```
 
+**What success looks like:** every listed unit and timer reports `active`, and
+both the `aigw_guard` nftables table and the `DOCKER-USER` chain print their
+rules rather than an empty or missing result.
+
 Vault starts sealed by design after every restart. Two supported paths unlock
 it. From the controller, rerunning the full `site.yml` converge auto-unseals an
 initialized Vault from the encrypted `vault_unseal_key` (streamed to the
@@ -169,6 +230,10 @@ once per custodian share until the threshold is reached. The current lab
 bootstrap creates one share with a threshold of one; production requires a
 separately implemented custody model.
 
+**What success looks like:** the script prints only its fixed non-secret status
+text, and once the threshold is reached the `vault` healthcheck reports healthy
+(initialized and unsealed).
+
 After Vault is unsealed, wait for `key-rotator` and inspect status and recent
 errors. The patched scheduler must defer startup rotations while Vault is sealed
 without writing failed history, then retry after unseal. This sealed-start retry
@@ -183,6 +248,10 @@ scripts/aigw-compose.sh ps
 scripts/aigw-compose.sh logs --since=15m vault key-rotator keycloak litellm envoy-egress
 ```
 
+**What success looks like:** `key-rotator` reports healthy and its recent logs
+show no failed startup-rotation entries from the sealed-Vault window — the
+scheduler deferred those rotations rather than recording them as failures.
+
 Verify the Docker-log ACL boundary after every Docker restart, since a recreated
 `/var/lib/docker/containers` parent can lose its ACL until the reconciler runs:
 
@@ -190,6 +259,10 @@ Verify the Docker-log ACL boundary after every Docker restart, since a recreated
 sudo getfacl -cp /var/lib/docker /var/lib/docker/containers
 sudo systemctl --no-pager --full status aigw-docker-log-acl.timer
 ```
+
+**What success looks like:** `getfacl` shows uid 473 with traversal-only
+(`--x`) on the Docker data root and the reviewed `r-x` on the `containers`
+root, and `aigw-docker-log-acl.timer` reports `active`.
 
 The configured Docker root grants Alloy uid 473 traversal only (`--x`); the
 `containers` root grants the reviewed `r-x` plus the default traversal entry
@@ -429,6 +502,11 @@ print("internal service discovery succeeded")
 PY
 ```
 
+**What success looks like:** the probe prints `blocked as expected:` for both
+the gateway and internet targets and finishes with
+`internal service discovery succeeded`; any `UNEXPECTED CONNECTIVITY` line is a
+failed boundary.
+
 The verify role also sends an informational vendor canary through Envoy: a vendor
 HTTP 401 proves DNS, routing, Envoy path matching, and upstream TLS worked
 without a valid inference key, while a connection error points at resolver
@@ -539,7 +617,16 @@ The intermediate is signed with exactly
 validates everything *before* touching the live certificate store, then
 force-recreates the edge consumers. Then run the second `site.yml` converge.
 
-Leaf renewal later: `sudo scripts/vault-pki-intermediate.sh renew-leaf`.
+**What success looks like:** `install-signed` reports validation of the signed
+material before it touches the live certificate store, the edge consumers are
+force-recreated with the newly issued leaf, and the second `site.yml` converge
+completes.
+
+Leaf renewal later:
+
+```bash
+sudo scripts/vault-pki-intermediate.sh renew-leaf
+```
 
 ### Mode 3 ceremony (`customer-intermediate`)
 
@@ -616,7 +703,12 @@ import step on the VM):
    finally **shreds the staged private key** — after which the intermediate key
    lives only inside Vault (encrypted at rest).
 
-Leaf renewal later: `sudo scripts/vault-pki-intermediate.sh renew-leaf`.
+Leaf renewal later:
+
+```bash
+sudo scripts/vault-pki-intermediate.sh renew-leaf
+```
+
 Re-running the import ceremony requires **another converge first** to re-stage the
 files, because the ceremony shreds them on success and the staging step is skipped
 once the marker exists.
@@ -675,6 +767,13 @@ its own CA bundle.
 > not a bug — the domain has to move, not the check.
 
 ## Vault operations
+
+> **Plain-language note — "1-of-1" and "Shamir share".** Vault's unseal secret
+> can be split into several *Shamir* shares, each held by a different custodian,
+> with a threshold number of them required to unlock. "1-of-1" means a single
+> share with a threshold of one: one unseal key — the key that unlocks Vault
+> after every restart. The production custody requirements for moving beyond a
+> single share are stated later in this section.
 
 `scripts/vault-bootstrap.sh` is explicitly a lab/test initializer, run on the VM.
 It initializes file-backed Vault with 1-of-1 unseal, enables a file audit device,
@@ -784,6 +883,10 @@ sudo ./scripts/state-backup.sh \
   --recipient age1... \
   --output /independent-backup/aigw-$(date -u +%Y%m%dT%H%M%SZ).tar.gz.age
 ```
+
+**What success looks like:** the run exits zero, age-encrypts and validates the
+artifact, prints its SHA-256, writes `.state/last-backup.json`, and restarts
+exactly the containers that were running before the quiesce.
 
 The script prints the encrypted artifact's SHA-256; store that hash and the age
 identity through an authenticated path independent of the backup and the VM. The

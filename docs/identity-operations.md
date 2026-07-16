@@ -18,6 +18,52 @@ receive a Keycloak administration credential or a private key. See
 [solution-map.md](solution-map.md) for the trust boundaries and
 [deploy-guide.md](deploy-guide.md) for how the stack is brought up.
 
+## Contents
+
+- [Current deployment contract](#current-deployment-contract)
+- [Authorization model](#authorization-model)
+- [One-time identity-controller bootstrap](#one-time-identity-controller-bootstrap)
+  — [Prerequisites](#prerequisites) · [Portal procedure](#portal-procedure)
+- [Vault OIDC login for the aigw-admins operators](#vault-oidc-login-for-the-aigw-admins-operators)
+- [Domain migration on an existing realm](#domain-migration-on-an-existing-realm)
+- [Creating groups and assigning users](#creating-groups-and-assigning-users)
+- [Lab password and user operations](#lab-password-and-user-operations)
+- [Recovery](#recovery) — [Vault sealed](#vault-sealed-or-rotator-unavailable)
+  · [Break-glass administrator](#break-glass-administrator)
+  · [Break-glass upgrade](#upgrading-an-existing-deployment-to-the-break-glass-contract)
+  · [Temporary bootstrap client](#temporary-bootstrap-client-was-consumed-or-the-database-predates-it)
+  · [Administrator lockout](#administrator-lockout)
+  · [Remove lab-local users](#remove-disposable-lab-local-users)
+  · [Brute-force lockout](#brute-force-lockout-in-two-independent-layers)
+  · [LDAP/LDAPS failure](#ldap-or-ldaps-failure)
+  · [Restore consistency](#restore-consistency)
+  · [Bind-password rotation](#lab-ldap-bind-password-rotation)
+- [Bootstrap completion sequence](#bootstrap-completion-sequence)
+- [Auditing and acceptance](#auditing-and-acceptance)
+- [Continuous key reconciliation and pre-Vault identity baseline](#continuous-key-reconciliation-and-pre-vault-identity-baseline)
+- [Glossary](#glossary)
+
+## Glossary
+
+- **`client-jwt` / `private_key_jwt`** — a Keycloak client authentication
+  method where the client proves its identity by signing a short-lived JWT
+  with a private key instead of presenting a shared secret. The durable
+  identity controller and the WIF token broker both authenticate this way;
+  the private keys live only in Vault.
+- **Composite role** — a Keycloak role that bundles other roles: granting the
+  composite grants everything inside it. Master's `admin` composite is what
+  carries cross-realm administrative authority for the break-glass group.
+- **Break-glass marker attribute** — a custom Keycloak user/group attribute
+  the bootstrap stamps onto the objects it manages (the `break-glass-admin`
+  user and `keycloak-admins` group), so recovery tooling can recognize its
+  own principals and never touch look-alike objects it did not create.
+- **`federationLink`** — the Keycloak user field recording which user
+  federation (LDAP) provider a user was imported from. The controller uses it
+  to tell directory-imported users apart from Keycloak-local ones.
+- **Relying party** — an application (OIDC client) that relies on Keycloak to
+  authenticate its users. Here: `open-webui`, `dev-portal`, `admin-portal`,
+  `admin-ui`, and `vault`.
+
 ## Current deployment contract
 
 The base Compose stack runs both portals and the rotator identity controller.
@@ -148,16 +194,13 @@ rotator policy and token. That policy grants create/read/update only to the
 five identity records the controller uses, whose logical paths are configured
 by environment variable (defaults shown):
 
-- `ai-gateway/keycloak/identity-controller-key` (`IDENTITY_CONTROLLER_KEY_VAULT_PATH`)
-- `ai-gateway/keycloak/identity-state` (`IDENTITY_STATE_VAULT_PATH`)
-- `ai-gateway/anthropic-wif-client-key` (`KC_CLIENT_ASSERTION_KEY_VAULT_PATH`)
-- `ai-gateway/keycloak/break-glass-admin` (`BREAK_GLASS_ADMIN_VAULT_PATH`) —
-  the escrowed durable master-realm administrator credential; see
-  [Break-glass administrator](#break-glass-administrator)
-- `ai-gateway/keycloak/vault-oidc-rp` (`VAULT_OIDC_RP_VAULT_PATH`) — the
-  escrowed `vault` relying-party client secret consumed by the
-  `scripts/vault-oidc-setup.sh` root ceremony; see
-  [Vault OIDC login](#vault-oidc-login-for-the-aigw-admins-operators)
+| Logical path (default) | Environment variable | Purpose |
+|---|---|---|
+| `ai-gateway/keycloak/identity-controller-key` | `IDENTITY_CONTROLLER_KEY_VAULT_PATH` | The durable identity controller's `private_key_jwt` private key |
+| `ai-gateway/keycloak/identity-state` | `IDENTITY_STATE_VAULT_PATH` | Verified identity state plus the controller and broker certificate fingerprints |
+| `ai-gateway/anthropic-wif-client-key` | `KC_CLIENT_ASSERTION_KEY_VAULT_PATH` | The `anthropic-token-broker` `private_key_jwt` private key |
+| `ai-gateway/keycloak/break-glass-admin` | `BREAK_GLASS_ADMIN_VAULT_PATH` | the escrowed durable master-realm administrator credential; see [Break-glass administrator](#break-glass-administrator) |
+| `ai-gateway/keycloak/vault-oidc-rp` | `VAULT_OIDC_RP_VAULT_PATH` | the escrowed `vault` relying-party client secret consumed by the `scripts/vault-oidc-setup.sh` root ceremony; see [Vault OIDC login](#vault-oidc-login-for-the-aigw-admins-operators) |
 
 These are logical paths under the KV-v2 `kv/` mount; the configured default
 strings themselves carry no `kv/` prefix.
@@ -181,12 +224,33 @@ removed after the Samba `lab-admin` handoff.
 
 ### Portal procedure
 
+> **What you do** — four actions:
+>
+> 1. Open `https://admin-portal.<domain>` as the initial administrator.
+> 2. Choose **Reauthenticate with Keycloak** and complete the fresh login.
+> 3. In **Initialize identity control**, type `INITIALIZE` exactly.
+> 4. Submit.
+>
+> **Expected result:** the portal displays readiness booleans and two SHA-256
+> certificate fingerprints.
+
 Open `https://admin-portal.<domain>` as the initial administrator and choose
 **Reauthenticate with Keycloak**. The portal sends `prompt=login` and
 `max_age=0`, requires the same immutable subject and a current admin role, and
 grants a five-minute mutation window; ordinary page access is not sufficient for
 an identity change. In **Initialize identity control**, type `INITIALIZE`
 exactly and submit.
+
+The portal receives readiness booleans and the two SHA-256 certificate
+fingerprints, never a bootstrap secret, access token, PKCS#12 archive, or
+private key. Record the displayed fingerprints in the deployment evidence and
+compare them after a restore. If any of the controller or broker key generation,
+the Vault write, the `private_key_jwt` proof, or the lab full sync fails, the
+whole initialization fails closed and the affected durable client stays
+disabled; the operation is idempotent, so reauthenticating and running
+**Initialize identity control** again reuses proven state and retries.
+
+#### What happens internally (for troubleshooting and audit)
 
 The rotator then performs one ordered transaction, consuming the temporary
 bootstrap service client and establishing durable controls:
@@ -251,15 +315,6 @@ bootstrap service client and establishing durable controls:
     converted into a marked ADM-console recovery operator. Interactive
     Keycloak administration continues through the group-gated break-glass
     account established in step 8, whose credential never leaves Vault.
-
-The portal receives readiness booleans and the two SHA-256 certificate
-fingerprints, never a bootstrap secret, access token, PKCS#12 archive, or
-private key. Record the displayed fingerprints in the deployment evidence and
-compare them after a restore. If any of the controller or broker key generation,
-the Vault write, the `private_key_jwt` proof, or the lab full sync fails, the
-whole initialization fails closed and the affected durable client stays
-disabled; the operation is idempotent, so reauthenticating and running
-**Initialize identity control** again reuses proven state and retries.
 
 ## Vault OIDC login for the aigw-admins operators
 
@@ -436,6 +491,9 @@ Unseal Vault first and let key-rotator reconnect. Do not create a new Keycloak
 controller merely because Vault is sealed. Recheck the identity status once Vault
 and Postgres are healthy.
 
+**What success looks like:** with Vault unsealed and Postgres healthy, the
+identity status recheck comes back clean — no new controller was created.
+
 ### Break-glass administrator
 
 The identity bootstrap leaves exactly one durable interactive Keycloak
@@ -470,6 +528,9 @@ quickly expire the real credential):
 ... vault kv get -version=<N> -field=password kv/ai-gateway/keycloak/break-glass-admin
 ```
 
+**What success looks like:** the command prints the escrowed password, and a
+sign-in at `https://auth.<domain>/admin` as `break-glass-admin` succeeds.
+
 Sign in at `https://auth.<domain>/admin` as `break-glass-admin` — the console
 is served only on the ADM edge; the internal edge allowlists the `aigw` login
 paths and refuses the console. Master-realm logins are visible in Keycloak
@@ -495,6 +556,9 @@ previously retrieved password is unusable during the re-initialization window:
    recovery below. The ensure step sees the missing escrow and the disabled
    account, sets a fresh generated password, escrows it with a verified
    write, and re-enables the account.
+
+**What success looks like (rotation):** the account is re-enabled with a fresh
+generated password escrowed to Vault by a verified write.
 
 Never change the break-glass password in the console by hand — that leaves
 the Vault escrow stale, and the initialization treats a credential it cannot
@@ -585,6 +649,10 @@ cleanup. Do not delete an unmarked client because its name looks similar, and
 never leave a bootstrap service in place as a permanent administrator or fall
 back to a shared secret for the durable controller or WIF broker.
 
+**What success looks like:** the re-run **Initialize identity control**
+completes with verified state, the temporary client is deleted, and status no
+longer reports `bootstrap_cleanup_required`.
+
 ### Administrator lockout
 
 The portal protects the last managed administrator, but an out-of-band Keycloak
@@ -596,6 +664,9 @@ fall back to Keycloak's offline `bootstrap-admin user` or the
 temporary-service recovery above while normal Keycloak is stopped, restore a
 known administrator role or group, verify login, and remove the temporary
 principal. Record the incident and review Keycloak admin events.
+
+**What success looks like:** the restored administrator can log in again and
+no temporary principal remains.
 
 ### Remove disposable lab-local users
 
@@ -619,6 +690,10 @@ It prints `LOCAL_KEYCLOAK_TEST_USERS_REMOVED_PASS` on success. Then prove both
 old passwords are denied through the public OIDC login path. Do not run this
 before the retained directory administrator and the last-admin protection have
 both been verified.
+
+**What success looks like:** the tool prints
+`LOCAL_KEYCLOAK_TEST_USERS_REMOVED_PASS` and both old passwords are denied
+through the public OIDC login path.
 
 ### Brute-force lockout, in two independent layers
 
@@ -658,6 +733,9 @@ Keycloak and Samba track failures separately; clearing one layer does not clear
 the other, so inspect both before escalating to offline recovery, and unlock
 only a validated username.
 
+**What success looks like:** the account is no longer locked in either layer —
+Keycloak and Samba must each be checked.
+
 ### LDAP or LDAPS failure
 
 Check state and recent logs, in order:
@@ -675,6 +753,9 @@ it read-only, `KC_TRUSTSTORE_PATHS` points at it, the certificate SAN matches
 restart because Keycloak trusts that exact certificate. Never bypass hostname or
 certificate verification.
 
+**What success looks like:** every check above passes and Samba health reports
+green.
+
 ### Restore consistency
 
 Keycloak/Postgres, the Vault identity keys and state, and the Samba domain
@@ -684,6 +765,9 @@ will correctly fail `private_key_jwt` — use the temporary-service recovery flo
 rather than copying keys through a browser. Proactive controller and broker key
 rotation and a fully automated identity restore drill remain production blockers
 to implement and test.
+
+**What success looks like:** controller authentication works and the
+Vault-backed fingerprints match the live Keycloak client certificates.
 
 The 2026-07-13 replacement-VM G6 identity lane passed the retained-realm,
 LDAP-provider, managed-group, federated-user, service-account, Samba-object,
@@ -714,6 +798,9 @@ Keycloak LDAP credential through the ADM console, restart or reload the affected
 services, and prove an LDAP sync and a fresh user login. Keep a rollback value
 under the customer's secret-handling policy until the proof succeeds.
 Portal-driven atomic bind-password rotation is not implemented.
+
+**What success looks like:** an LDAP sync and a fresh user login both succeed
+with the new bind password.
 
 ## Bootstrap completion sequence
 
