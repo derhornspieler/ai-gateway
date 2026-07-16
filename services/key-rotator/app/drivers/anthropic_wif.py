@@ -90,6 +90,8 @@ def _assertion_alg_for_key(key: Any) -> str:
 
 class AnthropicWifDriver(BaseDriver):
     name = "anthropic"
+    credential_name = "anthropic-primary"
+    ensure_credential_present = True
 
     async def rotate(self, ctx: DriverContext) -> RotationResult:
         try:

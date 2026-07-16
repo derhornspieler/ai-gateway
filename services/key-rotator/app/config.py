@@ -398,6 +398,19 @@ class Settings(BaseSettings):
         alias="PORTAL_KEY_RECONCILE_INTERVAL_SECONDS",
     )
 
+    # How often to verify LiteLLM still holds its primary credentials in memory
+    # and re-mint any it dropped on a restart. Short by design: it bounds the
+    # inference outage after a restart (LiteLLM does not reload DB credentials
+    # into memory), and a tighter cadence restores the credential before enough
+    # 401s accumulate to trip LiteLLM's per-deployment cooldown. The probe is a
+    # single cheap GET /credentials.
+    litellm_credential_reconcile_interval_seconds: int = Field(
+        default=15,
+        ge=5,
+        le=600,
+        alias="LITELLM_CREDENTIAL_RECONCILE_INTERVAL_SECONDS",
+    )
+
     # OTel collector (Grafana Alloy) — OTLP HTTP/protobuf, docs/solution-map.md §1.8.
     otel_exporter_otlp_endpoint: str = Field(
         default="http://alloy:4318", alias="OTEL_EXPORTER_OTLP_ENDPOINT"

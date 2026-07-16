@@ -65,6 +65,8 @@ MAX_REVOKE_VERIFY_ATTEMPTS = 5
 
 class OpenAISvcAcctDriver(BaseDriver):
     name = "openai"
+    credential_name = "openai-primary"
+    ensure_credential_present = True
 
     async def rotate(self, ctx: DriverContext) -> RotationResult:
         # Preflight reads. A missing path is fine (returns None => disabled/

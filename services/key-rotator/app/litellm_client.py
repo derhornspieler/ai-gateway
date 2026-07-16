@@ -120,17 +120,37 @@ class LiteLLMClient:
             return {}
         return data if isinstance(data, dict) else {}
 
-    async def upsert_credential(self, name: str, values: dict[str, Any]) -> None:
-        """Try PATCH /credentials/{name}; if it does not exist, POST
-        /credentials to create it. `values` typically contains
-        {"api_key": "..."} — never logged in full, only a masked prefix.
+    async def in_memory_credential_names(self) -> set[str]:
+        """Names LiteLLM currently holds in its IN-MEMORY ``credential_list``.
 
-        LiteLLM v1.91.3's PATCH endpoint `return`s (instead of raising)
-        handle_exception_on_proxy(), so every PATCH failure — including
-        "Credential not found in DB." — arrives as HTTP 200 whose body is
-        the serialized ProxyException. A 2xx status therefore proves
-        nothing: only a body carrying success=true does. A masked 404 must
-        still fall back to create, and any other masked error must raise.
+        The router resolves ``litellm_credential_name`` from this in-memory
+        list, and ``GET /credentials`` reflects it (not the DB). A credential
+        whose DB row survives a proxy restart but was never reloaded into
+        memory therefore shows up here as ABSENT — which is exactly the state
+        in which inference fails ``x-api-key header is required`` even though
+        the credential "exists".
+        """
+        base = self._settings.litellm_url.rstrip("/")
+        async with httpx.AsyncClient(**self._client_kwargs()) as client:
+            return await self._in_memory_names(client, base, self._headers())
+
+    async def upsert_credential(self, name: str, values: dict[str, Any]) -> None:
+        """Ensure LiteLLM holds ``name`` in its IN-MEMORY credential list with
+        the given values. ``values`` typically contains {"api_key": "..."} —
+        never logged in full, only a masked prefix.
+
+        Restart-safe by design. LiteLLM v1.91.3 only syncs its in-memory
+        ``credential_list`` on PATCH when the credential is ALREADY in memory
+        ("skip if not in memory - e.g., proxy restarted"); after any LiteLLM
+        container restart the DB row can survive while memory is empty, so a
+        PATCH updates the DB but leaves the router blind and every request
+        fails ``x-api-key header is required`` forever. So: PATCH only when the
+        credential is confirmed present in memory; otherwise DELETE any DB-only
+        ghost and POST-create, which unconditionally loads it into memory.
+
+        Its PATCH endpoint also ``return``s (instead of raising)
+        handle_exception_on_proxy(), so a 2xx proves nothing — only a body
+        carrying success=true does; a masked 404 falls back to create.
         """
         masked = {k: (mask_secret(v) if isinstance(v, str) else v) for k, v in values.items()}
         base = self._settings.litellm_url.rstrip("/")
@@ -146,35 +166,63 @@ class LiteLLMClient:
         # a missing NO_PROXY entry would otherwise hand both to an ambient
         # proxy. Redirects are also kept off so credentials stay on-origin.
         async with httpx.AsyncClient(**self._client_kwargs()) as client:
-            resp = await client.patch(
-                f"{base}/credentials/{safe_name}",
-                json=credential_item,
-                headers=self._headers(),
-            )
+            # Only PATCH when we can CONFIRM the credential is in memory; on
+            # any doubt (absent, or the presence probe failed) recreate, which
+            # always resyncs memory. This is what makes a restart self-heal.
+            in_memory = False
+            try:
+                names = await self._in_memory_names(client, base, self._headers())
+                in_memory = name in names
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "litellm credential presence probe failed for %s (%s); "
+                    "recreating to be safe",
+                    name,
+                    type(exc).__name__,
+                )
 
-            not_found = resp.status_code == 404
-            if not not_found:
-                resp.raise_for_status()
-                data = self._json_object(resp)
-                if data.get("success") is True:
-                    logger.info(
-                        "updated litellm credential name=%s values=%s", name, masked
-                    )
-                    return
-                not_found = str(data.get("code")) == "404"
-                if not not_found:
-                    raise LiteLLMError(
-                        "LiteLLM credential update failed for %s: "
-                        "type=%s code=%s message=%s"
-                        % (
+            if in_memory:
+                resp = await client.patch(
+                    f"{base}/credentials/{safe_name}",
+                    json=credential_item,
+                    headers=self._headers(),
+                )
+                if resp.status_code != 404:
+                    resp.raise_for_status()
+                    data = self._json_object(resp)
+                    if data.get("success") is True:
+                        logger.info(
+                            "updated litellm credential name=%s values=%s",
                             name,
-                            data.get("type"),
-                            data.get("code"),
-                            str(data.get("message"))[:200],
+                            masked,
                         )
-                    )
+                        return
+                    if str(data.get("code")) != "404":
+                        raise LiteLLMError(
+                            "LiteLLM credential update failed for %s: "
+                            "type=%s code=%s message=%s"
+                            % (
+                                name,
+                                data.get("type"),
+                                data.get("code"),
+                                str(data.get("message"))[:200],
+                            )
+                        )
+                # Vanished between the probe and the PATCH — fall through.
+                logger.info(
+                    "litellm credential name=%s vanished mid-update, recreating", name
+                )
+            else:
+                logger.info(
+                    "litellm credential name=%s absent from memory, (re)creating", name
+                )
 
-            logger.info("litellm credential name=%s not found, creating", name)
+            # DELETE clears any DB-only ghost so the create is not rejected as a
+            # duplicate; the result is ignored (404 = already gone). POST-create
+            # unconditionally loads the credential into the in-memory list.
+            await client.request(
+                "DELETE", f"{base}/credentials/{safe_name}", headers=self._headers()
+            )
             resp = await client.post(
                 f"{base}/credentials",
                 json=credential_item,
@@ -194,6 +242,28 @@ class LiteLLMClient:
                     )
                 )
             logger.info("created litellm credential name=%s values=%s", name, masked)
+
+    @staticmethod
+    async def _in_memory_names(
+        client: httpx.AsyncClient, base: str, headers: dict[str, str]
+    ) -> set[str]:
+        """GET /credentials on an already-open client; parse the in-memory
+        credential names. Shared by upsert (presence gate) so a single open
+        connection covers the probe + write."""
+        resp = await client.get(f"{base}/credentials", headers=headers)
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except ValueError:
+            return set()
+        raw = payload.get("credentials") if isinstance(payload, dict) else payload
+        if not isinstance(raw, list):
+            return set()
+        return {
+            item["credential_name"]
+            for item in raw
+            if isinstance(item, dict) and isinstance(item.get("credential_name"), str)
+        }
 
     @staticmethod
     def _key_metadata(entry: dict[str, Any]) -> dict[str, Any]:

@@ -39,20 +39,34 @@ MASKED_NOT_FOUND = {
     "headers": {},
     "provider_specific_fields": None,
 }
+ITEM = {
+    "credential_name": "anthropic-primary",
+    "credential_values": {"api_key": "anthropic-token"},
+    "credential_info": {"managed_by": "key-rotator"},
+}
+
+
+def _present(names) -> httpx.Response:
+    """GET /credentials body reflecting LiteLLM's IN-MEMORY credential list."""
+    return httpx.Response(
+        200, json={"credentials": [{"credential_name": n} for n in names]}
+    )
 
 
 @pytest.mark.asyncio
-async def test_upsert_credential_patch_uses_complete_litellm_credential_item(
-    caplog,
-) -> None:
+async def test_upsert_credential_present_patches_complete_item(caplog) -> None:
+    """Steady state: the credential is already in LiteLLM's in-memory list, so
+    a PATCH (which then syncs both DB and memory) with the complete
+    CredentialItem is correct and there is no DELETE/POST churn."""
     secret = "sk-ant-oat-full-secret-value"
-    expected = {
-        "credential_name": "anthropic-primary",
-        "credential_values": {"api_key": secret},
-        "credential_info": {"managed_by": "key-rotator"},
-    }
+    expected = dict(ITEM, credential_values={"api_key": secret})
+    seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method)
+        if request.method == "GET":
+            assert request.url.path == "/credentials"
+            return _present(["anthropic-primary"])
         assert request.method == "PATCH"
         assert request.url.path == "/credentials/anthropic-primary"
         assert json.loads(request.content) == expected
@@ -62,77 +76,121 @@ async def test_upsert_credential_patch_uses_complete_litellm_credential_item(
     with caplog.at_level("INFO", logger="key_rotator.litellm"):
         await client.upsert_credential("anthropic-primary", {"api_key": secret})
 
+    assert seen == ["GET", "PATCH"]  # no DELETE/POST when already present
     assert secret not in caplog.text
     assert "<redacted>" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_upsert_credential_patch_404_falls_back_to_complete_post_create() -> None:
-    expected = {
-        "credential_name": "anthropic-primary",
-        "credential_values": {"api_key": "anthropic-token"},
-        "credential_info": {"managed_by": "key-rotator"},
-    }
-    requests: list[tuple[str, str, dict[str, object]]] = []
+async def test_upsert_credential_absent_from_memory_recreates() -> None:
+    """THE RESTART FIX. When the credential is missing from LiteLLM's in-memory
+    list (its DB row can survive a proxy restart but the router only reads
+    memory), a DB-only PATCH would leave the router blind — every request then
+    fails 'x-api-key required'. Instead DELETE any stale row and POST-create,
+    which unconditionally reloads it into memory. A PATCH must NEVER be sent."""
+    seq: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(
-            (request.method, request.url.path, json.loads(request.content))
-        )
-        if request.method == "PATCH":
+        seq.append((request.method, request.url.path))
+        if request.method == "GET":
+            return _present([])  # empty in-memory list = restarted proxy
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        assert request.method == "POST"
+        assert json.loads(request.content) == ITEM
+        return httpx.Response(200, json=CREATE_OK)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    await client.upsert_credential("anthropic-primary", {"api_key": "anthropic-token"})
+
+    assert seq == [
+        ("GET", "/credentials"),
+        ("DELETE", "/credentials/anthropic-primary"),
+        ("POST", "/credentials"),
+    ]
+    assert not any(m == "PATCH" for m, _ in seq)
+
+
+@pytest.mark.asyncio
+async def test_upsert_credential_probe_failure_recreates() -> None:
+    """If the in-memory presence probe itself fails, recreate rather than send
+    a blind PATCH that could silently leave the router without a credential."""
+    seq: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seq.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(503)
+        if request.method == "DELETE":
             return httpx.Response(404)
         return httpx.Response(200, json=CREATE_OK)
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
-    await client.upsert_credential(
-        "anthropic-primary", {"api_key": "anthropic-token"}
-    )
+    await client.upsert_credential("anthropic-primary", {"api_key": "anthropic-token"})
 
-    assert requests == [
-        ("PATCH", "/credentials/anthropic-primary", expected),
-        ("POST", "/credentials", expected),
-    ]
+    assert "PATCH" not in seq
+    assert seq == ["GET", "DELETE", "POST"]
 
 
 @pytest.mark.asyncio
-async def test_upsert_credential_masked_patch_404_falls_back_to_post_create() -> None:
-    """A missing credential arrives as HTTP 200 + serialized ProxyException
-    (code "404") on LiteLLM v1.91.3 — the create fallback must still fire.
-    This is the exact live body that left anthropic-primary permanently
-    absent while every rotation reported success."""
-    expected = {
-        "credential_name": "anthropic-primary",
-        "credential_values": {"api_key": "anthropic-token"},
-        "credential_info": {"managed_by": "key-rotator"},
-    }
-    requests: list[tuple[str, str, dict[str, object]]] = []
+async def test_upsert_credential_present_patch_404_falls_back_to_recreate() -> None:
+    """Credential vanished between the presence probe and the PATCH (real 404):
+    fall through to DELETE + POST-create."""
+    seq: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(
-            (request.method, request.url.path, json.loads(request.content))
-        )
+        seq.append((request.method, request.url.path))
+        if request.method == "GET":
+            return _present(["anthropic-primary"])
         if request.method == "PATCH":
-            return httpx.Response(200, json=MASKED_NOT_FOUND)
+            return httpx.Response(404)
+        if request.method == "DELETE":
+            return httpx.Response(404)
+        assert json.loads(request.content) == ITEM
         return httpx.Response(200, json=CREATE_OK)
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
-    await client.upsert_credential(
-        "anthropic-primary", {"api_key": "anthropic-token"}
-    )
+    await client.upsert_credential("anthropic-primary", {"api_key": "anthropic-token"})
 
-    assert requests == [
-        ("PATCH", "/credentials/anthropic-primary", expected),
-        ("POST", "/credentials", expected),
+    assert seq == [
+        ("GET", "/credentials"),
+        ("PATCH", "/credentials/anthropic-primary"),
+        ("DELETE", "/credentials/anthropic-primary"),
+        ("POST", "/credentials"),
     ]
 
 
 @pytest.mark.asyncio
-async def test_upsert_credential_masked_non_404_patch_error_raises() -> None:
-    masked_error = dict(MASKED_NOT_FOUND, code="500", openai_code=500)
-    requests = []
+async def test_upsert_credential_present_masked_patch_404_recreates() -> None:
+    """Masked 404 (HTTP 200 + serialized ProxyException, code '404') on a
+    present-then-gone credential must also recreate, not report false success."""
+    seq: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request.method)
+        seq.append(request.method)
+        if request.method == "GET":
+            return _present(["anthropic-primary"])
+        if request.method == "PATCH":
+            return httpx.Response(200, json=MASKED_NOT_FOUND)
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return httpx.Response(200, json=CREATE_OK)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    await client.upsert_credential("anthropic-primary", {"api_key": "anthropic-token"})
+
+    assert seq == ["GET", "PATCH", "DELETE", "POST"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_credential_present_masked_non_404_patch_error_raises() -> None:
+    masked_error = dict(MASKED_NOT_FOUND, code="500", openai_code=500)
+    seq: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seq.append(request.method)
+        if request.method == "GET":
+            return _present(["anthropic-primary"])
         return httpx.Response(200, json=masked_error)
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
@@ -141,18 +199,20 @@ async def test_upsert_credential_masked_non_404_patch_error_raises() -> None:
             "anthropic-primary", {"api_key": "anthropic-token"}
         )
 
-    assert requests == ["PATCH"]
+    assert seq == ["GET", "PATCH"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", [b"", b"null", b"[]", b"not-json"])
-async def test_upsert_credential_ambiguous_patch_2xx_raises(body: bytes) -> None:
-    """A 2xx without success=true proves nothing — fail closed rather than
-    report a rotation that may not have persisted."""
-    requests = []
+async def test_upsert_credential_present_ambiguous_patch_2xx_raises(body: bytes) -> None:
+    """A 2xx PATCH without success=true proves nothing — fail closed rather
+    than report a rotation that may not have persisted."""
+    seq: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request.method)
+        seq.append(request.method)
+        if request.method == "GET":
+            return _present(["anthropic-primary"])
         return httpx.Response(200, content=body)
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
@@ -161,14 +221,16 @@ async def test_upsert_credential_ambiguous_patch_2xx_raises(body: bytes) -> None
             "anthropic-primary", {"api_key": "anthropic-token"}
         )
 
-    assert requests == ["PATCH"]
+    assert seq == ["GET", "PATCH"]
 
 
 @pytest.mark.asyncio
-async def test_upsert_credential_create_without_success_body_raises() -> None:
+async def test_upsert_credential_recreate_without_success_body_raises() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "PATCH":
-            return httpx.Response(404)
+        if request.method == "GET":
+            return _present([])
+        if request.method == "DELETE":
+            return httpx.Response(200)
         return httpx.Response(200, json=MASKED_NOT_FOUND)
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
@@ -180,11 +242,15 @@ async def test_upsert_credential_create_without_success_body_raises() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [422, 500])
-async def test_upsert_credential_non_404_patch_error_raises(status_code: int) -> None:
-    requests = []
+async def test_upsert_credential_present_non_404_patch_error_raises(
+    status_code: int,
+) -> None:
+    seq: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request.method)
+        seq.append(request.method)
+        if request.method == "GET":
+            return _present(["anthropic-primary"])
         return httpx.Response(status_code)
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
@@ -193,7 +259,21 @@ async def test_upsert_credential_non_404_patch_error_raises(status_code: int) ->
             "anthropic-primary", {"api_key": "anthropic-token"}
         )
 
-    assert requests == ["PATCH"]
+    assert seq == ["GET", "PATCH"]
+
+
+@pytest.mark.asyncio
+async def test_in_memory_credential_names_parses_the_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/credentials"
+        return _present(["anthropic-primary", "openai-primary"])
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    assert await client.in_memory_credential_names() == {
+        "anthropic-primary",
+        "openai-primary",
+    }
 
 
 def portal_key(

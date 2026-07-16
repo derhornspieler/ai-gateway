@@ -56,6 +56,18 @@ class BaseDriver:
     """Base class for all vendor rotation drivers."""
 
     name: str = "base"
+    # The LiteLLM credential this driver keeps current. The scheduler's
+    # credential-presence reconcile uses it to detect a credential that
+    # LiteLLM dropped from memory on a restart and re-mint it promptly.
+    # None means "declares no managed credential" and the reconcile skips it.
+    credential_name: Optional[str] = None
+    # True for a PRIMARY driver whose credential inference depends on and which
+    # therefore must be present whenever the driver is enabled. The presence
+    # reconcile proactively (re)mints such a credential within one cadence if it
+    # is missing from LiteLLM's memory — after a restart, or a first boot before
+    # the scheduled rotation — bounding the inference outage. False for one-shot
+    # static seed fallbacks, which the reconcile must never spuriously trigger.
+    ensure_credential_present: bool = False
 
     async def rotate(self, ctx: DriverContext) -> RotationResult:
         """Perform one rotation cycle. Must not raise for expected/handled

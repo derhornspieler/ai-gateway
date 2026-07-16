@@ -53,6 +53,7 @@ JOB_PREFIX = "rotate_"
 JWKS_WATCH_JOB_ID = "sys_jwks_watch"
 OPENAI_CLEANUP_JOB_ID = "sys_openai_orphan_cleanup"
 SETTINGS_RECOVERY_JOB_ID = "sys_settings_recovery"
+CREDENTIAL_PRESENCE_JOB_ID = "sys_litellm_credential_presence"
 PORTAL_KEY_RECONCILE_JOB_ID = "sys_portal_key_reconciliation"
 PORTAL_KEY_RECONCILE_LOCK = "portal-key-reconciliation"
 PORTAL_KEY_RECONCILE_HEALTH = "identity.portal_key_reconciliation"
@@ -244,9 +245,27 @@ class RotationScheduler:
             coalesce=True,
             misfire_grace_time=60,
         )
+        # Bound the inference outage after a LiteLLM restart. LiteLLM reloads
+        # runtime /credentials into its in-memory list only on create, not on
+        # restart, so a restarted proxy drops the credential from memory (the
+        # DB row survives) and every request fails "x-api-key required". Detect
+        # the drop within a cadence and re-mint, instead of waiting up to a full
+        # rotation interval.
+        self._scheduler.add_job(
+            self._reconcile_litellm_credentials,
+            trigger=IntervalTrigger(
+                seconds=self._settings.litellm_credential_reconcile_interval_seconds
+            ),
+            id=CREDENTIAL_PRESENCE_JOB_ID,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+            next_run_time=datetime.now(timezone.utc),
+        )
         logger.info(
-            "system jobs scheduled (settings recovery, jwks watch, openai orphan cleanup, "
-            "portal-key reconciliation)"
+            "system jobs scheduled (settings recovery, credential presence, jwks watch, "
+            "openai orphan cleanup, portal-key reconciliation)"
         )
 
     async def _recover_schedule(self) -> None:
@@ -261,6 +280,47 @@ class RotationScheduler:
         if any(job.id in managed_job_ids for job in self._scheduler.get_jobs()):
             return
         await self.reload()
+
+    async def _reconcile_litellm_credentials(self) -> None:
+        """(Re)mint any PRIMARY LiteLLM credential missing from LiteLLM's
+        in-memory list, bounding the inference outage to one cadence.
+
+        LiteLLM does not re-hydrate runtime credentials from Postgres into its
+        in-memory ``credential_list`` on startup, and the router reads only
+        memory — so after any restart (image upgrade, config converge, reboot,
+        OOM), and on a first boot before the scheduled rotation, the credential
+        is absent from memory and every request fails ``x-api-key required``.
+
+        For each enabled driver that declares ``ensure_credential_present``
+        (the real primary drivers, not the one-shot static seeds), if its
+        credential is missing, trigger a rotation now. This proactively covers
+        BOTH a still-running key-rotator whose LiteLLM restarted AND a fresh
+        key-rotator boot after a full converge. ``run_rotation`` is per-vendor
+        locked and a no-op once the credential is present, so a healthy steady
+        state does no work.
+        """
+        try:
+            present = await self._litellm.in_memory_credential_names()
+        except Exception:  # noqa: BLE001 — never let the reconcile crash the loop
+            logger.exception("litellm credential presence reconcile: probe failed")
+            return
+
+        for vendor, driver in self._drivers.items():
+            if not getattr(driver, "ensure_credential_present", False):
+                continue
+            cred = getattr(driver, "credential_name", None)
+            if not isinstance(cred, str) or not cred or cred in present:
+                continue
+            row = await self._db.get_settings(vendor) or {}
+            if not row.get("enabled"):
+                continue
+            logger.warning(
+                "litellm credential %s missing from memory (LiteLLM does not "
+                "reload DB credentials on restart); minting via vendor=%s",
+                cred,
+                vendor,
+            )
+            await self.run_rotation(vendor)
 
     async def _run_openai_orphan_cleanup(self) -> None:
         driver = self._drivers.get("openai")

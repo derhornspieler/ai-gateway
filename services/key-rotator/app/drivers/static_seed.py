@@ -35,6 +35,9 @@ class StaticSeedDriver(BaseDriver):
         # under (e.g. "static-anthropic").
         self.vendor = vendor
         self.name = f"static-{vendor}"
+        # Same LiteLLM credential the real vendor driver owns, so the
+        # presence reconcile treats both owners of {vendor}-primary alike.
+        self.credential_name = f"{vendor}-primary"
 
     async def _self_disable(self, ctx: DriverContext, config: dict | None = None) -> None:
         """Persist enabled=False for this static-{vendor} row so the seed is
