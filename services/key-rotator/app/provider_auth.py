@@ -308,8 +308,10 @@ class AnthropicWifAdapter:
                 not isinstance(raw.get(name), str) or not raw[name] for name in required
             ):
                 raise ProviderUnavailable("Keycloak returned an invalid WIF JWK")
-            if raw.get("use") not in {None, "sig"}:
-                raise ProviderUnavailable("Keycloak returned a non-signing WIF JWK")
+            # The realm legitimately publishes both an RS256 signing key and an
+            # RSA-OAEP encryption key. Both are public and must pass through:
+            # inline-JWKS verification selects the signing key, while hash
+            # consistency requires every published key.
             if "key_ops" in raw and (
                 not isinstance(raw["key_ops"], list)
                 or any(op != "verify" for op in raw["key_ops"])

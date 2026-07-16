@@ -21,6 +21,7 @@ from app.provider_auth import (
     ProviderNotFound,
     ProviderRegistry,
     ProviderUnavailable,
+    _jwks_sha256 as provider_auth_jwks_sha256,
 )
 from app.provider_state import (
     CREDENTIAL_ISSUED,
@@ -45,6 +46,31 @@ JWKS = {
     ]
 }
 JWKS_SHA256 = _jwks_sha256(JWKS["keys"])
+
+KEYCLOAK_DEFAULT_JWKS = {
+    "keys": [
+        {
+            "kid": "realm-signing-key",
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "x5c": ["MIIC-signing-certificate"],
+            "x5t": "signing-certificate-thumbprint",
+            "n": "signing-public-modulus",
+            "e": "AQAB",
+        },
+        {
+            "kid": "realm-encryption-key",
+            "kty": "RSA",
+            "alg": "RSA-OAEP",
+            "use": "enc",
+            "x5c": ["MIIC-encryption-certificate"],
+            "x5t": "encryption-certificate-thumbprint",
+            "n": "encryption-public-modulus",
+            "e": "AQAB",
+        },
+    ]
+}
 
 
 def settings() -> Settings:
@@ -443,6 +469,46 @@ async def test_status_reports_jwks_drift_against_approved_baseline():
     assert result["state"] == "jwks_drift"
     assert result["approved_jwks_sha256"] == _jwks_sha256(JWKS["keys"])
     assert result["current_jwks_sha256"] == _jwks_sha256(changed["keys"])
+
+
+def test_sanitize_jwks_preserves_keycloak_signing_and_encryption_keys():
+    sanitized = AnthropicWifAdapter._sanitize_jwks(
+        KEYCLOAK_DEFAULT_JWKS,
+        len(json.dumps(KEYCLOAK_DEFAULT_JWKS).encode()),
+    )
+
+    assert sanitized == KEYCLOAK_DEFAULT_JWKS["keys"]
+    assert len(sanitized) == 2
+    assert provider_auth_jwks_sha256(sanitized) == _jwks_sha256(sanitized)
+
+
+def test_sanitize_jwks_rejects_private_key_fields():
+    private_jwks = {
+        "keys": [
+            {
+                "kid": "bad",
+                "kty": "RSA",
+                "n": "public",
+                "e": "AQAB",
+                "d": "private-exponent",
+            }
+        ]
+    }
+
+    with pytest.raises(ProviderUnavailable, match="non-public WIF JWK"):
+        AnthropicWifAdapter._sanitize_jwks(private_jwks, 1)
+
+
+def test_sanitize_jwks_rejects_unsupported_key_type():
+    unsupported_jwks = {"keys": [{"kid": "bad", "kty": "DSA"}]}
+
+    with pytest.raises(ProviderUnavailable, match="unsupported WIF JWK"):
+        AnthropicWifAdapter._sanitize_jwks(unsupported_jwks, 1)
+
+
+def test_sanitize_jwks_rejects_oversized_jwks():
+    with pytest.raises(ProviderUnavailable, match="invalid WIF JWKS"):
+        AnthropicWifAdapter._sanitize_jwks(JWKS, 256 * 1024 + 1)
 
 
 @pytest.mark.asyncio
