@@ -385,6 +385,22 @@ def has_recent_admin_reauthentication(request: Request) -> bool:
     return -30 <= age <= settings.admin_step_up_seconds
 
 
+def admin_reauthentication_expires_at(request: Request) -> int | None:
+    """Absolute epoch (UTC seconds) at which the step-up window lapses, or None.
+
+    This is a FIXED, server-computed target the browser renders a countdown
+    against; the client only re-computes the remaining difference against this
+    unchanging value and never re-fetches or re-bases it, so the countdown
+    cannot jitter. Returns the marker time plus the configured admin step-up
+    window whenever a valid marker is present, else None. It carries no
+    credential — the same integrity guarantees as the marker itself apply.
+    """
+    timestamp = request.session.get("admin_reauth_at")
+    if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+        return None
+    return timestamp + settings.admin_step_up_seconds
+
+
 async def require_recent_admin(
     request: Request,
     user: dict[str, Any] = Depends(require_admin),

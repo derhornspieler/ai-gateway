@@ -401,7 +401,38 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button type="submit" class="ghost sm">Re-verify now</button>
     </form>
-    <p class="note" style="margin: 11px 0 0; padding-top: 11px; border-top: 1px solid var(--border);">Continuous monitoring of the live egress chain (periodic canary and staged CA-rotation review) is not yet wired — it is a planned follow-up. This action re-verifies, on demand, that the pinned bundle shipped in this control plane still matches the reviewed fingerprints above.</p>
+    {% if egress_trust_canary %}
+    <div style="margin: 11px 0 0; padding-top: 11px; border-top: 1px solid var(--border);">
+      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;">
+        <strong style="font-size: 12.5px;">Continuous canary</strong>
+        {% if egress_trust_canary.last_checked is none %}
+        <span class="pill"><span class="dot"></span>Awaiting first check</span>
+        {% elif not egress_trust_canary.verified %}
+        <span class="pill warn"><span class="dot"></span>Failing</span>
+        {% elif egress_trust_canary.stale %}
+        <span class="pill warn"><span class="dot"></span>Stale</span>
+        {% else %}
+        <span class="pill ok"><span class="dot"></span>Passing</span>
+        {% endif %}
+      </div>
+      {% if egress_trust_canary.last_checked is not none and not egress_trust_canary.verified %}
+      <div class="flash error" style="margin: 0 0 8px;">
+        Egress-trust canary FAILED{% if egress_trust_canary.last_error %} — {{ egress_trust_canary.last_error }}{% endif %}. Treat egress trust as unverified and check the portal logs.
+      </div>
+      {% elif egress_trust_canary.last_checked is not none and egress_trust_canary.stale %}
+      <div class="flash info" style="margin: 0 0 8px;">
+        The last automatic check is older than expected — the canary may be stalled. Check the portal logs and use "Re-verify now" above.
+      </div>
+      {% endif %}
+      <p class="note" style="margin: 0;">
+        {% if egress_trust_canary.last_checked is not none %}
+        Last automatic check: <span class="mono">{{ egress_trust_canary.last_checked }}</span>, re-running every {{ egress_trust_canary.interval_seconds }}s. This on-demand action re-verifies immediately.
+        {% else %}
+        The periodic canary starts shortly after this control plane boots and re-checks every {{ egress_trust_canary.interval_seconds }}s that the pinned bundle still matches the reviewed fingerprints above. This on-demand action re-verifies immediately.
+        {% endif %}
+      </p>
+    </div>
+    {% endif %}
   </div>
 </div>
 {% endif %}

@@ -8,6 +8,7 @@ Vault, and never disturbs unmanaged clients, secrets, mappers, or scopes.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import sys
 
@@ -209,16 +210,25 @@ async def test_missing_managed_client_fails_loudly_not_silently() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transient_5xx_token_failure_fails_loudly_not_rebootstrap() -> None:
+async def test_transient_5xx_token_failure_fails_loudly_not_rebootstrap(
+    monkeypatch,
+) -> None:
     """SSO-LOW: a Keycloak 5xx at the master-realm token endpoint is a TRANSIENT
     failure, NOT proof the temporary bootstrap client was consumed.
 
     Treating it as ``rebootstrap_required`` (rc 0) would let the converge go
     GREEN with stale SSO callbacks and misdirect the operator to re-run the
     identity bootstrap when the real cause was a blip. It must fail the converge
-    loudly. Driven through the real ``_request`` -> ``_bootstrap_token`` chain so
+    loudly -- after ``_bootstrap_token``'s own bounded retry is exhausted, since
+    a 5xx is exactly what a health-green-but-not-yet-ready admin API looks
+    like. Driven through the real ``_request`` -> ``_bootstrap_token`` chain so
     the classification the fix adds is exercised end to end.
     """
+
+    async def instant_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/protocol/openid-connect/token")

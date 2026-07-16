@@ -156,6 +156,15 @@ class Settings(BaseSettings):
     # or credential and is honored only for this short window.
     admin_step_up_seconds: int = Field(default=5 * 60, ge=60, le=15 * 60)
 
+    # How often the process-local egress-trust canary re-verifies the shipped
+    # Anthropic CA pin against the reviewed fingerprints. The check is local
+    # (no network) and cheap; the default is deliberately infrequent because
+    # the pinned bundle only changes on an Ansible re-converge. Bounded so a
+    # config typo can neither spin the loop nor disable it outright. 6h.
+    egress_trust_canary_interval_seconds: int = Field(
+        default=6 * 60 * 60, ge=60, le=7 * 24 * 60 * 60
+    )
+
     # --- Key-issuance guardrails (reviewed config, never runtime-editable) ---
     # Owner decision: the platform default is UNLIMITED — a new key carries no
     # budget, rate limit, or expiry unless the runtime per-project policy (or

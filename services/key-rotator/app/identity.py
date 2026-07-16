@@ -78,6 +78,14 @@ PAGE_SIZE = 100
 PRE_VAULT_IDENTITY_SCHEMA = 1
 MAX_PRE_VAULT_BASELINE_GROUPS = 32
 MAX_PRE_VAULT_BOOTSTRAP_IDENTITIES = 16
+# The pre-Vault reconcile fires the instant the Keycloak *container* reports
+# health-green, but the admin REST API can still lag a freshly-imported realm
+# by a few seconds. Bound the retry well under any caller's timeout: worst
+# case is 7 sleeps of 0.5, 1, 2, 4, 4, 4, 4 seconds (~19.5s) plus 8 bounded
+# HTTP attempts.
+BOOTSTRAP_TOKEN_MAX_ATTEMPTS = 8
+BOOTSTRAP_TOKEN_INITIAL_DELAY_SECONDS = 0.5
+BOOTSTRAP_TOKEN_MAX_DELAY_SECONDS = 4.0
 # A managed Keycloak group is the project security boundary.  Its direct-child
 # name is therefore the canonical project identifier copied into LiteLLM key
 # metadata and audit records.  Lowercase-only prevents case-fold collisions
@@ -330,21 +338,42 @@ class KeycloakAdmin:
             raise IdentityConflict(
                 "the one-time Keycloak bootstrap controller is unavailable or consumed"
             )
-        response = await self._request(
-            "POST",
-            "/realms/master/protocol/openid-connect/token",
-            form={
-                "grant_type": "client_credentials",
-                "client_id": self.settings.keycloak_bootstrap_admin_client_id,
-                "client_secret": self.settings.keycloak_bootstrap_admin_client_secret,
-            },
-            expected=(200,),
-        )
-        payload = self._json(response, "bootstrap token")
-        token = payload.get("access_token") if isinstance(payload, dict) else None
-        if not isinstance(token, str) or not token:
-            raise IdentityError("Keycloak did not issue a bootstrap access token")
-        return token
+        delay = BOOTSTRAP_TOKEN_INITIAL_DELAY_SECONDS
+        for attempt in range(1, BOOTSTRAP_TOKEN_MAX_ATTEMPTS + 1):
+            try:
+                response = await self._request(
+                    "POST",
+                    "/realms/master/protocol/openid-connect/token",
+                    form={
+                        "grant_type": "client_credentials",
+                        "client_id": self.settings.keycloak_bootstrap_admin_client_id,
+                        "client_secret": self.settings.keycloak_bootstrap_admin_client_secret,
+                    },
+                    expected=(200,),
+                )
+            except (TransientIdentityError, httpx.TransportError):
+                # Only a network-level failure to reach Keycloak or a 5xx
+                # (``_request`` already classifies those, never a semantic
+                # answer, as TransientIdentityError) is worth retrying: they
+                # are exactly what a container that is health-green but whose
+                # admin REST API has not finished coming up after a
+                # freshly-imported realm looks like. A 4xx (bad client_id /
+                # client_secret) is a definitive credential refusal and must
+                # propagate on the first attempt, not be retried into a
+                # slower, quieter failure.
+                if attempt == BOOTSTRAP_TOKEN_MAX_ATTEMPTS:
+                    raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, BOOTSTRAP_TOKEN_MAX_DELAY_SECONDS)
+                continue
+            payload = self._json(response, "bootstrap token")
+            token = payload.get("access_token") if isinstance(payload, dict) else None
+            if not isinstance(token, str) or not token:
+                raise IdentityError("Keycloak did not issue a bootstrap access token")
+            return token
+        # Unreachable: the loop above always returns or raises before falling
+        # off the end (the final attempt re-raises instead of continuing).
+        raise IdentityError("Keycloak did not issue a bootstrap access token")
 
     @staticmethod
     def _private_key_assertion(

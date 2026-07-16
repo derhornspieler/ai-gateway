@@ -174,6 +174,41 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             portal,
         )
 
+    def test_docstring_pins_the_sentinel_restricted_key_caveat(self) -> None:
+        hook = HOOK.read_text(encoding="utf-8")
+        self.assertIn(
+            "Caveat — the ``aigw-default`` sentinel is best-effort, not a "
+            "uniform\nguarantee: LiteLLM's own auth layer checks a "
+            "request's ``model`` against\nthe key's model allowlist "
+            "*before* this pre-call hook ever runs.",
+            hook,
+        )
+        self.assertIn(
+            "the\nsentinel string only ever resolves for keys with no "
+            "model restriction (no\n``models`` list, or the "
+            "``all-proxy-models`` wildcard). Callers that need\nthe "
+            "project default honored unconditionally should OMIT "
+            "``model`` from\nthe request rather than send the sentinel",
+            hook,
+        )
+
+    def test_config_comment_pins_the_sentinel_restricted_key_caveat(self) -> None:
+        config = LITELLM_CONFIG.read_text(encoding="utf-8")
+        self.assertIn(
+            "  # malformed default or one outside the key's model allowlist. "
+            "Caveat: the\n"
+            "  # `aigw-default` sentinel only reaches this hook for keys "
+            "with no model\n"
+            "  # allowlist (or the all-proxy-models wildcard) -- LiteLLM's "
+            "own auth\n"
+            "  # layer rejects an explicit \"aigw-default\" string on a "
+            "restricted key\n"
+            "  # before this hook runs. Callers should OMIT `model` to "
+            "get the project\n"
+            "  # default; that path is enforced here for every key.",
+            config,
+        )
+
     def test_hook_keeps_a_minimal_import_surface(self) -> None:
         hook = HOOK.read_text(encoding="utf-8")
         compile(hook, str(HOOK), "exec")

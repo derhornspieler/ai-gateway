@@ -165,7 +165,13 @@ async def lifespan(app: FastAPI):
         print(
             f"[dev-portal] warning: could not initialize OIDC client at startup: {exc}"
         )
-    yield
+    # Schedule the process-local egress-trust canary; the first check runs
+    # inside the task, never inline, so startup is not blocked on it.
+    _start_egress_trust_canary()
+    try:
+        yield
+    finally:
+        _stop_egress_trust_canary()
 
 
 app = FastAPI(
@@ -1800,6 +1806,125 @@ def _egress_trust_status() -> dict[str, Any]:
     }
 
 
+# --- egress-trust periodic canary -------------------------------------------
+#
+# A process-local background task re-runs the local egress-trust verification
+# on a fixed interval so the admin console can show that the shipped Anthropic
+# CA pin is *still* the reviewed one without an operator clicking "Re-verify".
+# dev-portal and admin-portal each run uvicorn with exactly --workers 1 (see
+# the Dockerfile CMD and the compose admin-portal command), so this module
+# state and its single asyncio task are confined to one event loop in one
+# process: there is no cross-worker/cross-process sharing to race, and no
+# server-side coordination to get wrong. The task performs no auth — it only
+# reads a file the image already ships — and never blocks startup: the first
+# check runs inside the loop body, not inline in the lifespan.
+_egress_trust_canary_state: dict[str, Any] = {
+    "last_checked": None,  # ISO-8601 UTC string of the last completed check
+    "last_checked_epoch": None,  # float epoch of the last check (for staleness)
+    "verified": None,  # True / False / None(=never run yet)
+    "detail": None,  # non-secret human explanation from the last check
+    "last_error": None,  # non-secret failure summary, or None on success
+}
+_egress_trust_canary_task: "asyncio.Task[None] | None" = None
+
+
+def _egress_trust_canary_snapshot() -> dict[str, Any]:
+    """Return a copy of the canary's non-secret state plus a staleness verdict.
+
+    ``stale`` is True before the first check completes, and thereafter once the
+    last result is older than twice the configured interval (one interval of
+    grace for a slow/blocked check). No secret ever enters this dict.
+    """
+    snapshot = dict(_egress_trust_canary_state)
+    interval = settings.egress_trust_canary_interval_seconds
+    epoch = snapshot.get("last_checked_epoch")
+    if not isinstance(epoch, (int, float)):
+        snapshot["age_seconds"] = None
+        snapshot["stale"] = True
+    else:
+        age = max(0, int(datetime.now(timezone.utc).timestamp() - epoch))
+        snapshot["age_seconds"] = age
+        snapshot["stale"] = age > interval * 2
+    snapshot["interval_seconds"] = interval
+    return snapshot
+
+
+def _run_egress_trust_canary_once() -> None:
+    """Run the local egress-trust verification once and record non-secret state.
+
+    Never raises: any fault is captured into ``last_error`` and logged so the
+    background loop survives and the admin panel can surface it loudly, rather
+    than the failure being silently swallowed.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        trust = _egress_trust_status()
+    except Exception as exc:  # noqa: BLE001 - the loop must never die on a fault
+        logger.error("egress-trust canary check raised: %s", exc)
+        _egress_trust_canary_state.update(
+            {
+                "last_checked": now.isoformat(),
+                "last_checked_epoch": now.timestamp(),
+                "verified": False,
+                "detail": None,
+                "last_error": str(exc)[:500],
+            }
+        )
+        return
+    verified = bool(trust.get("verified"))
+    detail = str(trust.get("detail") or "")
+    _egress_trust_canary_state.update(
+        {
+            "last_checked": now.isoformat(),
+            "last_checked_epoch": now.timestamp(),
+            "verified": verified,
+            "detail": detail,
+            "last_error": None if verified else (detail or "pin verification failed"),
+        }
+    )
+    if not verified:
+        logger.error("egress-trust canary: pin verification FAILED: %s", detail)
+
+
+async def _egress_trust_canary_loop() -> None:
+    """Re-run the egress-trust verification forever on the configured interval.
+
+    The very first check runs here (inside the task), not in the lifespan, so
+    startup is never blocked on it. Process-local by construction (see the
+    module note above); cancellation on shutdown propagates cleanly.
+    """
+    interval = settings.egress_trust_canary_interval_seconds
+    while True:
+        _run_egress_trust_canary_once()
+        await asyncio.sleep(interval)
+
+
+def _start_egress_trust_canary() -> None:
+    """Start the process-local canary task exactly once per process.
+
+    Idempotent: guards against a double-start (e.g. uvicorn ``--reload`` or the
+    shared lifespan being entered more than once) by refusing to launch a
+    second task while one is already live.
+    """
+    global _egress_trust_canary_task
+    if _egress_trust_canary_task is not None and not _egress_trust_canary_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _egress_trust_canary_task = loop.create_task(_egress_trust_canary_loop())
+
+
+def _stop_egress_trust_canary() -> None:
+    """Cancel the canary task on shutdown, if one is running."""
+    global _egress_trust_canary_task
+    task = _egress_trust_canary_task
+    _egress_trust_canary_task = None
+    if task is not None and not task.done():
+        task.cancel()
+
+
 @admin_app.post("/admin/egress-trust/verify")
 async def admin_egress_trust_verify(
     request: Request,
@@ -1991,6 +2116,10 @@ async def admin_page(
             "user_search": user_search,
             "identity_capabilities": sorted(IDENTITY_CAPABILITIES),
             "identity_step_up_recent": auth.has_recent_admin_reauthentication(request),
+            "identity_step_up_expires_at": auth.admin_reauthentication_expires_at(
+                request
+            ),
+            "egress_trust_canary": _egress_trust_canary_snapshot(),
             "policy_models": policy_models,
             "admin_surface": True,
             "flashes": auth.pop_flash(request),
@@ -2528,6 +2657,9 @@ async def admin_keys_page(
             "total_pages": listing["total_pages"] if listing else 0,
             "total_count": listing["total_count"] if listing else 0,
             "identity_step_up_recent": auth.has_recent_admin_reauthentication(request),
+            "identity_step_up_expires_at": auth.admin_reauthentication_expires_at(
+                request
+            ),
             "flashes": auth.pop_flash(request),
             "csrf_token": auth.get_csrf_token(request),
         },

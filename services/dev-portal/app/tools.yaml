@@ -75,6 +75,47 @@ tools:
       }
     note: "Paste into Kiro's settings.json under the OpenAI-compatible provider section."
 
+  - id: python-sdk
+    name: Python SDK
+    description: >-
+      Anthropic's official `anthropic` Python client, pointed at the gateway's
+      Anthropic-compatible endpoint instead of api.anthropic.com.
+    snippet: |
+      # pip install anthropic
+      from anthropic import Anthropic
+
+      client = Anthropic(
+          base_url="{api_base}",
+          api_key="{key}",
+      )
+
+      message = client.messages.create(
+          model="claude-sonnet-4-5",
+          max_tokens=256,
+          messages=[{"role": "user", "content": "hello"}],
+      )
+      print(message.content[0].text)
+    note: >-
+      The client appends /v1/messages to base_url, so set base_url to the
+      gateway root (not /v1). Model names are examples — use whatever your
+      gateway config exposes.
+
+  - id: cursor
+    name: Cursor
+    description: >-
+      Cursor's custom OpenAI-compatible endpoint, pointed at the gateway
+      instead of api.openai.com.
+    snippet: |
+      # Cursor → Settings → Models → OpenAI API Key
+      # 1. Enable "Override OpenAI Base URL" and set it to:
+      {api_base}/v1
+      # 2. Set the OpenAI API key to:
+      {key}
+    note: >-
+      Cursor validates the key against the base URL when you save. Some
+      features (e.g. Cursor Tab) still route through Cursor's own backend and
+      will not use the gateway.
+
   - id: curl
     name: curl (manual testing)
     description: >-

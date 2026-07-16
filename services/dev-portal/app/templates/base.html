@@ -57,6 +57,11 @@
     border: 1px solid rgba(240,180,41,.35); background: rgba(240,180,41,.08);
     padding: 4px 10px; border-radius: 20px;
   }
+  .stepup [data-stepup-remaining] { font-size: 11.5px; opacity: .85; }
+  .stepup.expired {
+    color: var(--error);
+    border-color: rgba(255,107,107,.4); background: rgba(255,107,107,.09);
+  }
   .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
   /* ---- tab rail ---- */
@@ -272,7 +277,12 @@
   {% endif %}
   <span class="spacer"></span>
   {% if admin_surface and user and identity_step_up_recent %}
-  <span class="stepup"><span class="dot"></span>Step-up active</span>
+  <span class="stepup"
+    {% if identity_step_up_expires_at %}data-stepup-expires="{{ identity_step_up_expires_at }}"{% endif %}>
+    <span class="dot"></span>
+    <span data-stepup-label>Step-up active</span>
+    {% if identity_step_up_expires_at %}<span class="tnum" data-stepup-remaining></span>{% endif %}
+  </span>
   {% endif %}
   {% if user or show_session_logout %}
   {% if user %}
@@ -376,6 +386,39 @@ document.addEventListener("submit", function (event) {
 
   var requested = (window.location.hash || "").replace("#tab-", "");
   if (requested) activateTab(requested, false);
+})();
+
+// Step-up countdown. The server passes an ABSOLUTE expiry epoch (the marker
+// time plus the configured admin step-up window). We only re-render the diff
+// against that FIXED target on an interval — never re-fetch or re-base it — so
+// the countdown cannot jitter. At zero we render the expired/reauthenticate
+// state in place.
+(function () {
+  var badge = document.querySelector(".stepup[data-stepup-expires]");
+  if (!badge) return;
+  var expires = parseInt(badge.getAttribute("data-stepup-expires"), 10);
+  if (!isFinite(expires)) return;
+  var remainingEl = badge.querySelector("[data-stepup-remaining]");
+  var labelEl = badge.querySelector("[data-stepup-label]");
+  var timer = null;
+  function render() {
+    var secondsLeft = Math.floor(expires - Date.now() / 1000);
+    if (secondsLeft <= 0) {
+      badge.classList.add("expired");
+      if (labelEl) labelEl.textContent = "Step-up expired — reauthenticate";
+      if (remainingEl) remainingEl.textContent = "";
+      if (timer) { window.clearInterval(timer); timer = null; }
+      return;
+    }
+    if (remainingEl) {
+      var mm = Math.floor(secondsLeft / 60);
+      var ss = secondsLeft % 60;
+      remainingEl.textContent =
+        (mm < 10 ? "0" : "") + mm + ":" + (ss < 10 ? "0" : "") + ss;
+    }
+  }
+  render();
+  timer = window.setInterval(render, 1000);
 })();
 
 function clearSensitiveValues() {

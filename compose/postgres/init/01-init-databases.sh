@@ -183,15 +183,41 @@ if [[ "$runtime_reconcile" == true ]]; then
     # Reporting grants exist only after LiteLLM's own migrations created the
     # reviewed tables; until then the desired state is "no grants" and the
     # section below correctly performs no writes. Owner decision: Grafana's
-    # read-only spend datasource reads exactly these four tables.
+    # read-only spend datasource reads exactly the reviewed dashboard columns
+    # of these four tables — column-level grants only, never table-wide, and
+    # never the prompt-bearing SpendLogs columns (messages, response,
+    # proxy_server_request). Drift is any missing allowed-column grant, any
+    # table-wide grant, or any readable prompt-bearing column.
     grafana_grants_ok="$(psql --username "$POSTGRES_USER" --dbname litellm \
         --tuples-only --no-align --command "
-          SELECT count(*) = 0 FROM unnest(ARRAY[
-                   'LiteLLM_SpendLogs','LiteLLM_VerificationToken',
-                   'LiteLLM_UserTable','LiteLLM_DailyUserSpend'
-                 ]) AS tab
-           WHERE to_regclass(format('public.%I', tab)) IS NOT NULL
-             AND NOT has_table_privilege('grafana_ro', format('public.%I', tab), 'SELECT');")" \
+          SELECT count(*) = 0 FROM (
+            SELECT reviewed.tab
+              FROM (VALUES
+                     ('LiteLLM_SpendLogs', ARRAY['api_key','completion_tokens','prompt_tokens','spend','startTime','total_tokens','user']),
+                     ('LiteLLM_VerificationToken', ARRAY['metadata','token']),
+                     ('LiteLLM_UserTable', ARRAY['user_alias','user_id']),
+                     ('LiteLLM_DailyUserSpend', ARRAY['cache_creation_input_tokens','cache_read_input_tokens','date','prompt_tokens'])
+                   ) AS reviewed(tab, cols)
+             CROSS JOIN LATERAL unnest(reviewed.cols) AS col
+             WHERE to_regclass(format('public.%I', reviewed.tab)) IS NOT NULL
+               AND NOT has_column_privilege('grafana_ro',
+                     to_regclass(format('public.%I', reviewed.tab)), col, 'SELECT')
+            UNION ALL
+            SELECT tab
+              FROM unnest(ARRAY[
+                     'LiteLLM_SpendLogs','LiteLLM_VerificationToken',
+                     'LiteLLM_UserTable','LiteLLM_DailyUserSpend'
+                   ]) AS tab
+             WHERE to_regclass(format('public.%I', tab)) IS NOT NULL
+               AND has_table_privilege('grafana_ro',
+                     to_regclass(format('public.%I', tab)), 'SELECT')
+            UNION ALL
+            SELECT col
+              FROM unnest(ARRAY['messages','proxy_server_request','response']) AS col
+             WHERE to_regclass(format('public.%I', 'LiteLLM_SpendLogs')) IS NOT NULL
+               AND has_column_privilege('grafana_ro',
+                     to_regclass(format('public.%I', 'LiteLLM_SpendLogs')), col, 'SELECT')
+          ) AS drift;")" \
         || grafana_grants_ok=f
     if [[ "$grafana_grants_ok" == t ]]; then
         fix_grafana_ro_grants=false
@@ -280,7 +306,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" \
 
     -- Read-only reporting identity for Grafana's provisioned LiteLLM spend
     -- datasource (owner-approved admin observability). It owns no database:
-    -- it may CONNECT only to litellm and SELECT only the reviewed tables
+    -- it may CONNECT only to litellm and SELECT only the reviewed columns
     -- granted below after LiteLLM's own migrations create them.
     SELECT 'CREATE USER grafana_ro'
         WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'grafana_ro') \gexec
@@ -318,24 +344,38 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" \
     GRANT CONNECT ON DATABASE postgres TO postgres;
     \endif
 
-    -- Least-privilege reporting grants: SELECT on exactly the reviewed spend,
-    -- token, user, and daily-aggregate tables — never a schema-wide or
-    -- default-privilege grant (the daily aggregate carries the prompt-cache
-    -- read/creation token split that the cache-utilization panels surface).
-    -- LiteLLM's migrations create these tables on its first start, so
-    -- a first converge legitimately grants nothing here and the second pass
-    -- (or any later converge) converges the grants. Prompt bodies are not
-    -- reachable: store_prompts_in_spend_logs is pinned false, so spend rows
-    -- are metadata-only.
+    -- Least-privilege reporting grants: column-level SELECT on exactly the
+    -- columns the eight provisioned dashboards query across the reviewed
+    -- spend, token, user, and daily-aggregate tables — never a whole-table,
+    -- schema-wide, or default-privilege grant (the daily aggregate carries
+    -- the prompt-cache read/creation token split that the cache-utilization
+    -- panels surface). The prompt-bearing SpendLogs columns (messages,
+    -- response, proxy_server_request) are deliberately excluded and actively
+    -- revoked, so grafana_ro can never read a prompt body even if a future
+    -- LiteLLM release sets store_prompts_in_spend_logs true. LiteLLM's
+    -- migrations create these tables on its first start, so a first converge
+    -- legitimately grants nothing here and the second pass (or any later
+    -- converge) converges the grants; the leading REVOKEs demote any
+    -- pre-existing whole-table grant from an already-initialized database.
     \if :fix_grafana_ro_grants
     \connect litellm
-    SELECT format('GRANT SELECT ON TABLE public.%I TO grafana_ro', tab)
+    SELECT format('REVOKE SELECT ON TABLE public.%I FROM grafana_ro', tab)
       FROM unnest(ARRAY[
              'LiteLLM_SpendLogs','LiteLLM_VerificationToken',
              'LiteLLM_UserTable','LiteLLM_DailyUserSpend'
            ]) AS tab
      WHERE to_regclass(format('public.%I', tab)) IS NOT NULL
      ORDER BY tab \gexec
+    SELECT 'REVOKE SELECT ("messages", "proxy_server_request", "response") ON TABLE public."LiteLLM_SpendLogs" FROM grafana_ro'
+     WHERE to_regclass('public."LiteLLM_SpendLogs"') IS NOT NULL \gexec
+    SELECT 'GRANT SELECT ("api_key", "completion_tokens", "prompt_tokens", "spend", "startTime", "total_tokens", "user") ON TABLE public."LiteLLM_SpendLogs" TO grafana_ro'
+     WHERE to_regclass('public."LiteLLM_SpendLogs"') IS NOT NULL \gexec
+    SELECT 'GRANT SELECT ("metadata", "token") ON TABLE public."LiteLLM_VerificationToken" TO grafana_ro'
+     WHERE to_regclass('public."LiteLLM_VerificationToken"') IS NOT NULL \gexec
+    SELECT 'GRANT SELECT ("user_alias", "user_id") ON TABLE public."LiteLLM_UserTable" TO grafana_ro'
+     WHERE to_regclass('public."LiteLLM_UserTable"') IS NOT NULL \gexec
+    SELECT 'GRANT SELECT ("cache_creation_input_tokens", "cache_read_input_tokens", "date", "prompt_tokens") ON TABLE public."LiteLLM_DailyUserSpend" TO grafana_ro'
+     WHERE to_regclass('public."LiteLLM_DailyUserSpend"') IS NOT NULL \gexec
     \connect postgres
     \endif
 EOSQL

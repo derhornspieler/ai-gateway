@@ -485,11 +485,59 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "SELECT 'CREATE USER grafana_ro'",
             "ALTER ROLE grafana_ro WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE",
             "GRANT CONNECT ON DATABASE litellm TO grafana_ro;",
-            "GRANT SELECT ON TABLE public.%I TO grafana_ro",
             "'LiteLLM_SpendLogs','LiteLLM_VerificationToken',",
             "'LiteLLM_UserTable','LiteLLM_DailyUserSpend'",
         ):
             self.assertIn(required, init)
+        # Column-level SELECT only: the exact per-table allowlists the eight
+        # provisioned dashboards query, pinned character-for-character. Each
+        # list is intentionally complete — a missing column breaks a panel,
+        # an extra column widens the reporting surface.
+        expected_grants = {
+            "LiteLLM_SpendLogs": (
+                'GRANT SELECT ("api_key", "completion_tokens", "prompt_tokens", '
+                '"spend", "startTime", "total_tokens", "user") '
+                'ON TABLE public."LiteLLM_SpendLogs" TO grafana_ro'
+            ),
+            "LiteLLM_VerificationToken": (
+                'GRANT SELECT ("metadata", "token") '
+                'ON TABLE public."LiteLLM_VerificationToken" TO grafana_ro'
+            ),
+            "LiteLLM_UserTable": (
+                'GRANT SELECT ("user_alias", "user_id") '
+                'ON TABLE public."LiteLLM_UserTable" TO grafana_ro'
+            ),
+            "LiteLLM_DailyUserSpend": (
+                'GRANT SELECT ("cache_creation_input_tokens", '
+                '"cache_read_input_tokens", "date", "prompt_tokens") '
+                'ON TABLE public."LiteLLM_DailyUserSpend" TO grafana_ro'
+            ),
+        }
+        for grant in expected_grants.values():
+            self.assertIn(grant, init)
+        # An already-initialized lab DB carrying the retired whole-table grant
+        # must be demoted, not left in place: the fixer actively revokes the
+        # table-wide SELECT and the three prompt-bearing columns before it
+        # re-grants at column level.
+        self.assertNotIn("GRANT SELECT ON TABLE public.%I TO grafana_ro", init)
+        self.assertIn(
+            "REVOKE SELECT ON TABLE public.%I FROM grafana_ro", init
+        )
+        self.assertIn(
+            'REVOKE SELECT ("messages", "proxy_server_request", "response") '
+            'ON TABLE public."LiteLLM_SpendLogs" FROM grafana_ro',
+            init,
+        )
+        # The three prompt-bearing columns must never appear inside any GRANT —
+        # not in a column list, not anywhere on a granting statement. Sweep
+        # every GRANT SELECT (...) column list and assert they are absent.
+        grant_column_lists = re.findall(r"GRANT SELECT \(([^)]*)\)", init)
+        self.assertEqual(len(grant_column_lists), len(expected_grants))
+        for column_list in grant_column_lists:
+            for forbidden_column in (
+                "messages", "response", "proxy_server_request",
+            ):
+                self.assertNotIn(forbidden_column, column_list)
         # Never a blanket or self-widening grant path for the reporting role.
         self.assertNotIn("GRANT ALL", init)
         self.assertNotIn("ALTER DEFAULT PRIVILEGES", init)

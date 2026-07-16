@@ -3238,8 +3238,12 @@ def test_admin_page_renders_the_verified_egress_pin(
     assert "Google Trust Services WE1" in response.text
     assert "GTS Root R4" in response.text
     assert 'action="/admin/egress-trust/verify"' in response.text
-    # The periodic canary is an explicit follow-up, never a faked live monitor.
-    assert "not yet wired" in response.text
+    # The periodic canary replaced the old "not yet wired" disclaimer. The
+    # TestClient fixture does not enter the lifespan, so the canary task never
+    # starts here and the panel shows the awaiting-first-check state.
+    assert "not yet wired" not in response.text
+    assert "Continuous canary" in response.text
+    assert "Awaiting first check" in response.text
 
 
 def test_egress_trust_verify_requires_live_admin_and_csrf(
@@ -3364,3 +3368,237 @@ def test_project_policy_widens_deconfigured_restriction_only_with_explicit_optou
         }
     ]
     assert "Project policy saved" in response.text
+
+
+# --- step-up countdown (Item A) ----------------------------------------------
+
+
+def test_admin_page_renders_a_fixed_step_up_countdown_target(
+    admin_client, set_admin_session, monkeypatch
+):
+    # The badge must carry a server-computed ABSOLUTE expiry the browser counts
+    # down against — marker time plus the configured window — never a value the
+    # client re-bases. admin_reauthentication_expires_at adds the window to the
+    # stored marker, so the target is deterministic regardless of render time.
+    _happy_admin_rotator(monkeypatch)
+    now = int(time.time())
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "admin_reauth_at": now,
+        }
+    )
+
+    response = admin_client.get("/admin")
+
+    assert response.status_code == 200
+    expected = now + settings.admin_step_up_seconds
+    assert f'data-stepup-expires="{expected}"' in response.text
+    assert "Step-up active" in response.text
+    assert "data-stepup-remaining" in response.text
+
+
+def test_admin_page_without_step_up_has_no_countdown_target(
+    admin_client, set_admin_session, monkeypatch
+):
+    _happy_admin_rotator(monkeypatch)
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    response = admin_client.get("/admin")
+
+    assert response.status_code == 200
+    # No recent step-up marker: the badge itself is not rendered (the countdown
+    # script is always present, so we check for the badge element, not the
+    # attribute string it references).
+    assert 'class="stepup"' not in response.text
+
+
+# --- connect-panel tool cards (Item B) ---------------------------------------
+
+
+def test_tools_yaml_includes_python_sdk_and_cursor_following_the_schema():
+    from app import tools
+
+    loaded = {tool["id"]: tool for tool in tools.load_tools()}
+    assert "python-sdk" in loaded
+    assert "cursor" in loaded
+
+    for tool_id in ("python-sdk", "cursor"):
+        tool = loaded[tool_id]
+        # Same schema every other entry uses: id/name/description/snippet, with
+        # an optional note. Missing keys would render blank cards.
+        assert set(("id", "name", "description", "snippet")) <= set(tool)
+        assert isinstance(tool["name"], str) and tool["name"]
+        assert isinstance(tool["snippet"], str) and tool["snippet"]
+
+    # Both must use the {api_base}/{key} placeholder convention so the generic
+    # renderer substitutes them; a hard-coded host would leak past the gateway.
+    rendered = {
+        tool["id"]: tool
+        for tool in tools.rendered_tools("https://gw.test", "sk-TESTKEY")
+    }
+    assert "{api_base}" not in rendered["python-sdk"]["snippet"]
+    assert "{key}" not in rendered["python-sdk"]["snippet"]
+    assert "https://gw.test" in rendered["python-sdk"]["snippet"]
+    assert "sk-TESTKEY" in rendered["python-sdk"]["snippet"]
+    # Cursor points its OpenAI-compatible override at the gateway's /v1 root.
+    assert "https://gw.test/v1" in rendered["cursor"]["snippet"]
+    assert "sk-TESTKEY" in rendered["cursor"]["snippet"]
+
+
+def test_python_sdk_snippet_targets_the_gateway_base_url_not_anthropic():
+    from app import tools
+
+    rendered = {
+        tool["id"]: tool
+        for tool in tools.rendered_tools("https://gw.test", "sk-TESTKEY")
+    }
+    snippet = rendered["python-sdk"]["snippet"]
+    assert "api.anthropic.com" not in snippet
+    assert 'base_url="https://gw.test"' in snippet
+
+
+# --- egress-trust periodic canary (Item C) -----------------------------------
+
+
+def _reset_canary_state(monkeypatch, **overrides):
+    """Install a fresh, isolated canary state dict for one test."""
+    state = {
+        "last_checked": None,
+        "last_checked_epoch": None,
+        "verified": None,
+        "detail": None,
+        "last_error": None,
+    }
+    state.update(overrides)
+    monkeypatch.setattr(main, "_egress_trust_canary_state", state)
+    return state
+
+
+def test_canary_snapshot_is_stale_before_the_first_check(monkeypatch):
+    _reset_canary_state(monkeypatch)
+    snap = main._egress_trust_canary_snapshot()
+    assert snap["last_checked"] is None
+    assert snap["stale"] is True
+    assert snap["age_seconds"] is None
+    assert snap["verified"] is None
+    # interval is always surfaced so the panel can explain the cadence.
+    assert snap["interval_seconds"] == settings.egress_trust_canary_interval_seconds
+
+
+def test_canary_snapshot_fresh_result_is_not_stale(monkeypatch):
+    now = datetime.now(timezone.utc)
+    _reset_canary_state(
+        monkeypatch,
+        last_checked=now.isoformat(),
+        last_checked_epoch=now.timestamp(),
+        verified=True,
+        detail="ok",
+    )
+    snap = main._egress_trust_canary_snapshot()
+    assert snap["stale"] is False
+    assert snap["verified"] is True
+
+
+def test_canary_snapshot_old_result_becomes_stale(monkeypatch):
+    interval = settings.egress_trust_canary_interval_seconds
+    old = datetime.now(timezone.utc).timestamp() - (interval * 2 + 10)
+    _reset_canary_state(
+        monkeypatch,
+        last_checked="2000-01-01T00:00:00+00:00",
+        last_checked_epoch=old,
+        verified=True,
+        detail="ok",
+    )
+    snap = main._egress_trust_canary_snapshot()
+    assert snap["stale"] is True
+    assert snap["age_seconds"] >= interval * 2
+
+
+def test_canary_run_records_pass(monkeypatch):
+    state = _reset_canary_state(monkeypatch)
+    monkeypatch.setattr(
+        main, "_egress_trust_status", lambda: {"verified": True, "detail": "matches"}
+    )
+    main._run_egress_trust_canary_once()
+    assert state["verified"] is True
+    assert state["last_error"] is None
+    assert state["last_checked"] is not None
+    assert isinstance(state["last_checked_epoch"], float)
+
+
+def test_canary_run_records_failure_loudly(monkeypatch, caplog):
+    state = _reset_canary_state(monkeypatch)
+    monkeypatch.setattr(
+        main,
+        "_egress_trust_status",
+        lambda: {"verified": False, "detail": "bundle mismatch"},
+    )
+    with caplog.at_level("ERROR"):
+        main._run_egress_trust_canary_once()
+    assert state["verified"] is False
+    # The failure is captured as a non-secret error and logged, never swallowed.
+    assert state["last_error"] == "bundle mismatch"
+    assert any("canary" in rec.message.lower() for rec in caplog.records)
+
+
+def test_canary_run_never_raises_when_the_check_throws(monkeypatch, caplog):
+    state = _reset_canary_state(monkeypatch)
+
+    def boom():
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(main, "_egress_trust_status", boom)
+    with caplog.at_level("ERROR"):
+        main._run_egress_trust_canary_once()  # must not raise
+    assert state["verified"] is False
+    assert "disk gone" in state["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_start_canary_is_idempotent_and_process_local(monkeypatch):
+    # dev-portal runs uvicorn --workers 1, so a single process-local task owns
+    # the canary. Starting twice must not spawn a second competing loop.
+    monkeypatch.setattr(main, "_egress_trust_canary_task", None)
+
+    async def _idle():
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(main, "_egress_trust_canary_loop", _idle)
+    try:
+        main._start_egress_trust_canary()
+        first = main._egress_trust_canary_task
+        assert first is not None
+        main._start_egress_trust_canary()
+        assert main._egress_trust_canary_task is first
+    finally:
+        main._stop_egress_trust_canary()
+        assert main._egress_trust_canary_task is None
+        # Give the event loop a tick to process the cancellation.
+        await asyncio.sleep(0)
+        assert first.cancelled() or first.done()
+
+
+def test_admin_page_surfaces_a_failing_canary_loudly(
+    admin_client, set_admin_session, monkeypatch
+):
+    _happy_admin_rotator(monkeypatch)
+    now = datetime.now(timezone.utc)
+    _reset_canary_state(
+        monkeypatch,
+        last_checked=now.isoformat(),
+        last_checked_epoch=now.timestamp(),
+        verified=False,
+        detail="bundle mismatch",
+        last_error="bundle mismatch",
+    )
+    set_admin_session({"user": portal_user(roles=[settings.admin_role])})
+
+    response = admin_client.get("/admin")
+
+    assert response.status_code == 200
+    assert "Continuous canary" in response.text
+    assert "Egress-trust canary FAILED" in response.text
+    # Rendered inside the existing loud alert styling.
+    assert 'class="flash error"' in response.text
+    assert "not yet wired" not in response.text

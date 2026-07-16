@@ -300,3 +300,35 @@ def test_recent_admin_marker_is_bounded_and_not_a_bearer_credential(monkeypatch)
         lambda: 10_001 + settings.admin_step_up_seconds,
     )
     assert auth.has_recent_admin_reauthentication(request) is False
+
+
+def test_step_up_expiry_is_a_fixed_absolute_target(monkeypatch):
+    # The countdown must render against a FIXED server-computed target, not a
+    # client clock: expiry is the marker time plus the configured window.
+    request = SimpleNamespace(session={})
+    monkeypatch.setattr(auth.time, "time", lambda: 10_000)
+    auth.mark_recent_admin_reauthentication(request)
+
+    expires = auth.admin_reauthentication_expires_at(request)
+    assert expires == 10_000 + settings.admin_step_up_seconds
+
+    # The value does not move as the clock advances — it is an absolute target.
+    monkeypatch.setattr(auth.time, "time", lambda: 10_123)
+    assert auth.admin_reauthentication_expires_at(request) == expires
+
+
+def test_step_up_expiry_is_none_without_a_valid_marker():
+    assert auth.admin_reauthentication_expires_at(SimpleNamespace(session={})) is None
+    # A forged/garbage marker (non-int, or a bool) yields no target.
+    assert (
+        auth.admin_reauthentication_expires_at(
+            SimpleNamespace(session={"admin_reauth_at": "soon"})
+        )
+        is None
+    )
+    assert (
+        auth.admin_reauthentication_expires_at(
+            SimpleNamespace(session={"admin_reauth_at": True})
+        )
+        is None
+    )

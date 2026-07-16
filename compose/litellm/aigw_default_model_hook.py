@@ -18,6 +18,19 @@ allowlist DENIES the request (HTTP 400) — it never falls through to a
 looser route. Keys without the metadata (operator keys, service keys) are
 treated exactly as LiteLLM would treat them natively.
 
+Caveat — the ``aigw-default`` sentinel is best-effort, not a uniform
+guarantee: LiteLLM's own auth layer checks a request's ``model`` against
+the key's model allowlist *before* this pre-call hook ever runs. For a
+model-restricted key, an explicit ``"aigw-default"`` string is simply not
+a member of that allowlist, so LiteLLM rejects it itself and this hook's
+sentinel branch never executes. Only a request with an omitted or empty
+``model`` reaches the hook regardless of a key's allowlist, so the
+sentinel string only ever resolves for keys with no model restriction (no
+``models`` list, or the ``all-proxy-models`` wildcard). Callers that need
+the project default honored unconditionally should OMIT ``model`` from
+the request rather than send the sentinel — that path is enforced here
+for every key, restricted or not, and fails closed the same way.
+
 This file is bind-mounted read-only next to ``/app/config.yaml`` and
 registered via ``litellm_settings.callbacks``; its content is covered by
 the litellm bind-source digest, so changing it requires an Ansible

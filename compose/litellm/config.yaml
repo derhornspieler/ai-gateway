@@ -42,8 +42,13 @@ litellm_settings:
   # enforcement. The pre-call hook resolves a request that omits `model`
   # (or sends the `aigw-default` sentinel) to the project's admin-set
   # default from the key's `aigw_default_model` metadata, and DENIES on a
-  # malformed default or one outside the key's model allowlist. The module
-  # is bind-mounted next to this file and resolved relative to it.
+  # malformed default or one outside the key's model allowlist. Caveat: the
+  # `aigw-default` sentinel only reaches this hook for keys with no model
+  # allowlist (or the all-proxy-models wildcard) -- LiteLLM's own auth
+  # layer rejects an explicit "aigw-default" string on a restricted key
+  # before this hook runs. Callers should OMIT `model` to get the project
+  # default; that path is enforced here for every key. The module is
+  # bind-mounted next to this file and resolved relative to it.
   callbacks: ["otel", "aigw_default_model_hook.aigw_default_model_enforcer"]
   drop_params: true
   num_retries: 2
