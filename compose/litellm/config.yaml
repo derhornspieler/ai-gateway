@@ -16,15 +16,49 @@ model_list:
   # growing chat history — deferred so the rollout is measured, not assumed.
   # Requires optional_pre_call_checks in router_settings.
   # Rationale + rollout plan: docs/research/openwebui-prompt-caching.md.
-  - model_name: claude-sonnet
+  # Model names are the current-generation Anthropic lineup, exposed to
+  # end users in Open WebUI and to API clients. Each entry is verified to
+  # actually serve on the customer's WIF-federated Anthropic workspace via
+  # scripts/test-wif-inference.py before it ships (the workspace's model
+  # entitlements — not this file — are the source of truth for what an org
+  # can reach; an unentitled model here would 404 at Anthropic).
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: anthropic/claude-opus-4-8
+      api_base: http://envoy-egress:8080/anthropic
+      litellm_credential_name: anthropic-primary
+      cache_control_injection_points: [{location: message, role: system}]
+  - model_name: claude-sonnet-4-5
     litellm_params:
       model: anthropic/claude-sonnet-4-5
       api_base: http://envoy-egress:8080/anthropic
       litellm_credential_name: anthropic-primary
       cache_control_injection_points: [{location: message, role: system}]
-  - model_name: claude-haiku
+  - model_name: claude-haiku-4-5
     litellm_params:
       model: anthropic/claude-haiku-4-5
+      api_base: http://envoy-egress:8080/anthropic
+      litellm_credential_name: anthropic-primary
+      cache_control_injection_points: [{location: message, role: system}]
+  # Verified live on the lab's WIF workspace 2026-07-16 (all six return real
+  # completions via scripts/test-wif-inference.py / probe). Access is NOT
+  # limited here — every key may reach every model; the admin portal's
+  # per-project runtime policy is the only model-access control.
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_base: http://envoy-egress:8080/anthropic
+      litellm_credential_name: anthropic-primary
+      cache_control_injection_points: [{location: message, role: system}]
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_base: http://envoy-egress:8080/anthropic
+      litellm_credential_name: anthropic-primary
+      cache_control_injection_points: [{location: message, role: system}]
+  - model_name: claude-fable-5
+    litellm_params:
+      model: anthropic/claude-fable-5
       api_base: http://envoy-egress:8080/anthropic
       litellm_credential_name: anthropic-primary
       cache_control_injection_points: [{location: message, role: system}]
