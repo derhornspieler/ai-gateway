@@ -66,8 +66,10 @@ hosts today: Postgres (Keycloak realm + LiteLLM), Vault (file backend,
 manual unseal), Open WebUI's app database, Grafana/Loki/Tempo/Prometheus
 local storage, and the key-rotator/portal process-local locks that already
 forbid replicas. A cutover therefore needs, at minimum: a per-service state
-map of what an image bump preserves versus destroys (the upgrade-durability
-audit); a decision per store between replicate-to-green, restore-into-green
+map of what an image bump preserves versus destroys (recorded in the
+[upgrade durability audit](research/upgrade-durability-audit-20260716.md),
+whose §3 derives the restore/freeze tiers and cutover ordering directly);
+a decision per store between replicate-to-green, restore-into-green
 during a write freeze, or accept-loss; a Vault unseal step inside the cutover
 window; and an identity plan for sessions (users re-authenticate after
 cutover — acceptable — versus session replication — not pursued). The

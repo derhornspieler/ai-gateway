@@ -119,10 +119,19 @@ The following are explicitly **not yet closed**:
   rollback-retention, Vault-readiness, and ACL changes in the current source are
   source-validated only and still require the final controlled converge and
   runtime proof.
-- **Real Anthropic inference — NOT EXECUTED.** Real Anthropic WIF exchange,
-  end-to-end LiteLLM inference, and its derived telemetry cannot run until the
-  customer supplies the external configuration; see
+- **Real Anthropic inference — PROVEN IN THE LAB (2026-07-16), production
+  enrollment still customer-owned.** The lab executed the real WIF exchange
+  and end-to-end LiteLLM inference against api.anthropic.com (both API
+  shapes, re-proven across a scheduled rotation and a token expiry;
+  `scripts/test-wif-inference.py`). A production deployment still requires
+  the customer's own Console enrollment; see
   [Anthropic WIF bootstrap](anthropic-wif-bootstrap.md).
+- **Upgrade durability — audited, rehearsals pending.** A per-service audit
+  of what an image bump preserves versus destroys (ranked risks, restore
+  ordering, Blue/Green tiering) is recorded in the
+  [upgrade durability audit](research/upgrade-durability-audit-20260716.md);
+  items it marks [REHEARSE] rest on upstream behavior and need live
+  rehearsal before being relied on.
 - **Key-rotator sealed-start retry — proof PENDING.** A reboot exposed a defect
   where zero-interval startup jobs were consumed while Vault was sealed. The
   scheduler fix (defer while sealed or unavailable, retry after unseal, leave
