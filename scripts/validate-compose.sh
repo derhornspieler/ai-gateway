@@ -2220,7 +2220,7 @@ compile(source, str(path), "exec")
 for required in (
     'ALIAS = "aigw-open-webui-service"',
     'USER_ID = "svc-open-webui"',
-    'MODELS = ["claude-sonnet", "claude-haiku", "gpt"]',
+    'MODELS = ["all-proxy-models"]',
     'ROUTES = ["/v1/models", "/v1/chat/completions"]',
     '"aigw_key_kind": "service"',
     '"aigw_service": "open-webui"',

@@ -572,6 +572,15 @@ services:
       resources:
         limits: { memory: 2G, cpus: "2.0", pids: 512 }
     environment:
+      # Config is DECLARATIVE: the reviewed env below is authoritative on every
+      # boot. Open WebUI otherwise persists most settings (PersistentConfig) in
+      # its DB and IGNORES the env after the first boot — so a hardening env
+      # like ENABLE_OLLAMA_API / ENABLE_EVALUATION_ARENA_MODELS would silently
+      # no-op on any instance whose DB was initialized earlier (a redeploy that
+      # keeps openwebui_data, or a lab). Pinning this false makes every env
+      # below enforce on each start and eliminates DB config drift; runtime
+      # admin-UI config changes are intentionally not persisted.
+      ENABLE_PERSISTENT_CONFIG: "false"
       WEBUI_URL: "https://chat.${DOMAIN:?DOMAIN must be set}"
       OPENAI_API_BASE_URL: http://litellm:4000/v1
       OPENAI_API_KEY: ${WEBUI_LITELLM_KEY:?WEBUI_LITELLM_KEY must be set}

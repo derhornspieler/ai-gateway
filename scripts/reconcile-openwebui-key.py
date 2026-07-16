@@ -15,7 +15,13 @@ import urllib.request
 BASE = "http://litellm:4000"
 ALIAS = "aigw-open-webui-service"
 USER_ID = "svc-open-webui"
-MODELS = ["claude-sonnet", "claude-haiku", "gpt"]
+# Unrestricted model scope (owner decision 2026-07-16): the shared chat key may
+# reach every model in the LiteLLM catalog — the admin portal governs access,
+# not a hardcoded per-key allowlist, and new models must appear in chat without
+# re-scoping. "all-proxy-models" is LiteLLM's all-models wildcard (see
+# compose/litellm/aigw_default_model_hook.py ALL_PROXY_MODELS). The ROUTES scope
+# below still restricts the key to listing models and chat only.
+MODELS = ["all-proxy-models"]
 ROUTES = ["/v1/models", "/v1/chat/completions"]
 METADATA = {
     "aigw_key_kind": "service",

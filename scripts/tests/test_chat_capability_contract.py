@@ -56,6 +56,11 @@ class ChatCapabilityContractTest(unittest.TestCase):
         self.assertIn('ENABLE_VERSION_UPDATE_CHECK: "false"', compose)
         self.assertIn('ANONYMIZED_TELEMETRY: "false"', compose)
         self.assertIn('ENABLE_EVALUATION_ARENA_MODELS: "false"', compose)
+        # Without this, every Open WebUI hardening env above silently no-ops on
+        # any instance whose DB was initialized before the env was set (a
+        # redeploy that keeps openwebui_data). It makes the reviewed env
+        # authoritative on every boot.
+        self.assertIn('ENABLE_PERSISTENT_CONFIG: "false"', compose)
 
     def test_openwebui_rp_logout_returns_to_the_chat_login(self) -> None:
         """Open WebUI's /signout only appends post_logout_redirect_uri when
