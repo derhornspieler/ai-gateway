@@ -287,7 +287,10 @@ services:
       # cookie and follows rd= only to hosts allow-listed here. Keycloak's
       # auth edge is the single cross-host hop the sign-out chain needs;
       # without this allow-list every rd= silently falls back to "/" and the
-      # Keycloak SSO session survives the sign-out.
+      # Keycloak SSO session survives the sign-out. Caveat (v7.15.3
+      # validator): the bare hostname admits http as well as https and
+      # rejects any explicit port — acceptable because rd= carries no code
+      # or token and the target is our own TLS-only auth edge.
       OAUTH2_PROXY_WHITELIST_DOMAINS: "auth.${DOMAIN:?DOMAIN must be set}"
       OAUTH2_PROXY_UPSTREAMS: http://litellm:4000
       OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"

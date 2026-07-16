@@ -863,7 +863,31 @@ button drives this chain (`GF_AUTH_SIGNOUT_REDIRECT_URL`); the LiteLLM Admin
 UI and Prometheus have no native sign-out control, so operators use the
 `/oauth2/sign_out` URL on those hosts directly. The Vault UI's inner sign-out
 ends only the Vault token session — full browser sign-out is the same outer
-chain on `vault.<domain>`.
+chain on `vault.<domain>`. Accepted residual: sign-out is a GET, so a
+cross-site navigation can clear the edge cookie (forced re-authentication,
+a nuisance only) — the Keycloak confirmation page gates actual SSO
+termination, and no code or token ever flows through `rd=`.
+
+**Migrating an existing realm to the admin logout allow-list.** Realm JSON
+imports only into an empty database and the durable identity controller
+deliberately cannot edit clients, so an already-bootstrapped realm (for
+example the lab) must have the `admin-ui` client's
+`post.logout.redirect.uris` attribute set once BEFORE the converge that
+ships `GF_AUTH_SIGNOUT_REDIRECT_URL` — otherwise Grafana's sign-out lands on
+Keycloak's "Invalid redirect uri" error page until the migration completes.
+Using the break-glass master administrator (retrieval ceremony above), set
+the attribute on the `admin-ui` client in realm `aigw` to the four admin
+host roots, `##`-joined and each with a trailing slash:
+
+```
+https://litellm-admin.<domain>/##https://grafana.<domain>/##https://prometheus.<domain>/##https://vault.<domain>/
+```
+
+(kcadm: `update clients/<uuid> -r aigw -s
+'attributes."post.logout.redirect.uris"=<value>'`), then read the attribute
+back and confirm the exact value before converging. A fresh bootstrap needs
+none of this — realm import and the pre-bootstrap reconciler both carry the
+allow-list.
 
 A logout initiated *elsewhere* (another app's sign-out, a Keycloak console
 session revocation) still does not erase an already-issued oauth2-proxy
