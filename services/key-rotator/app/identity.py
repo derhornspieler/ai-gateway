@@ -1380,6 +1380,12 @@ class KeycloakAdmin:
                 self.settings.webui_oidc_client_secret,
                 [f"https://chat.{domain}/oauth/oidc/callback"],
                 [f"https://chat.{domain}"],
+                # RP-initiated logout: Open WebUI's /signout sends the browser
+                # to Keycloak's end_session_endpoint with this exact
+                # post_logout_redirect_uri (WEBUI_AUTH_SIGNOUT_REDIRECT_URL in
+                # compose). Keycloak only honours it when it is on this
+                # allow-list; the trailing slash must match the compose value.
+                logout_redirects=[f"https://chat.{domain}/"],
             ),
             client(
                 "dev-portal",

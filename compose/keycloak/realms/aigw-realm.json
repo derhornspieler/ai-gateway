@@ -38,6 +38,9 @@
       "directAccessGrantsEnabled": false,
       "redirectUris": ["https://chat.aigw.example.internal/oauth/oidc/callback"],
       "webOrigins": ["https://chat.aigw.example.internal"],
+      "attributes": {
+        "post.logout.redirect.uris": "https://chat.aigw.example.internal/"
+      },
       "protocolMappers": [
         {
           "name": "realm-roles-to-roles-claim",

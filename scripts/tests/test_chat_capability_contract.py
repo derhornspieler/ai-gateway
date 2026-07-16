@@ -46,6 +46,50 @@ class ChatCapabilityContractTest(unittest.TestCase):
         self.assertIn('ENABLE_OLLAMA_API: "false"', compose)
         self.assertNotIn('ENABLE_OLLAMA_API: "true"', compose)
 
+    def test_compose_silences_openwebui_phone_home(self) -> None:
+        """Goal: Open WebUI reaches nothing on the Internet except models via
+        LiteLLM. The net-chat bridge enforces that at the firewall; these app
+        settings stop Open WebUI from even ATTEMPTING telemetry / version /
+        HuggingFace calls, so a future network misconfig cannot leak."""
+        compose = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn('OFFLINE_MODE: "true"', compose)
+        self.assertIn('ENABLE_VERSION_UPDATE_CHECK: "false"', compose)
+        self.assertIn('ANONYMIZED_TELEMETRY: "false"', compose)
+        self.assertIn('ENABLE_EVALUATION_ARENA_MODELS: "false"', compose)
+
+    def test_openwebui_rp_logout_returns_to_the_chat_login(self) -> None:
+        """Open WebUI's /signout only appends post_logout_redirect_uri when
+        WEBUI_AUTH_SIGNOUT_REDIRECT_URL is set, and Keycloak only honours it
+        when the open-webui client allow-lists it. Pin both halves (compose env
+        + the client's post.logout.redirect.uris in every realm source and the
+        reconciler) so logout round-trips to the chat login instead of landing
+        on Keycloak's logout page. The trailing slash must match end to end."""
+        compose = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            'WEBUI_AUTH_SIGNOUT_REDIRECT_URL: "https://chat.${DOMAIN'
+            ':?DOMAIN must be set}/"',
+            compose,
+        )
+        template = (
+            ROOT
+            / "ansible/roles/docker_stack/templates/keycloak-realms/aigw-realm.json.j2"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"post.logout.redirect.uris": "https://chat.{{ aigw_domain }}/"',
+            template,
+        )
+        realm = (ROOT / "compose/keycloak/realms/aigw-realm.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            '"post.logout.redirect.uris": "https://chat.aigw.example.internal/"',
+            realm,
+        )
+        identity = (ROOT / "services/key-rotator/app/identity.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('logout_redirects=[f"https://chat.{domain}/"]', identity)
+
     def test_realm_sources_define_and_scope_the_chat_role(self) -> None:
         for path in (
             ROOT

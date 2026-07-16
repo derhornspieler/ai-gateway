@@ -628,6 +628,26 @@ services:
       # user even with no Ollama backend present. Disable it so no user can
       # reach or configure an out-of-band model backend.
       ENABLE_OLLAMA_API: "false"
+      # Defense-in-depth egress: the net-chat bridge already default-drops all
+      # Internet egress (only Envoy egresses; verified the container cannot
+      # resolve public DNS or reach a public IP), but Open WebUI's defaults
+      # still ATTEMPT phone-home. Silence them at the app so a future network
+      # misconfig cannot leak and the logs stay clean. OFFLINE_MODE is the
+      # master switch (also forces ENABLE_VERSION_UPDATE_CHECK off and blocks
+      # HuggingFace/model downloads); the rest are explicit belt-and-suspenders.
+      OFFLINE_MODE: "true"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+      ANONYMIZED_TELEMETRY: "false"          # bundled Chroma vector-DB telemetry
+      # The evaluation "arena" feature adds a synthetic "arena-model" to the
+      # picker that is not a real gateway model; off so users see only the
+      # LiteLLM catalog.
+      ENABLE_EVALUATION_ARENA_MODELS: "false"
+      # RP-initiated logout: Open WebUI's /signout redirects to Keycloak's
+      # end_session_endpoint, but only appends post_logout_redirect_uri when
+      # this is set. Without it the user lands on Keycloak's logout page
+      # instead of the chat login. The value must byte-match the open-webui
+      # client's post.logout.redirect.uris (reconciled by key-rotator).
+      WEBUI_AUTH_SIGNOUT_REDIRECT_URL: "https://chat.${DOMAIN:?DOMAIN must be set}/"
       # Model authorization lives at the gateway: the scoped workload key and
       # the per-project runtime policy decide which models chat may reach.
       # Open WebUI's own model access control is redundant on this path, and
