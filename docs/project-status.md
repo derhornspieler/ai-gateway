@@ -145,7 +145,8 @@ The following are explicitly **not yet closed**:
   proved.
 - **High availability.** There is no HA today, and HA is not pursued on
   Docker Compose: the VM scales vertically, and horizontal scaling/HA would be
-  a separate Kubernetes design. See the
+  a separate Kubernetes design. A Blue/Green two-VM upgrade path behind an HA
+  proxy is recorded as a future planning exercise. See the
   [scaling and HA posture](high-availability.md).
 
 These residuals are not waived by any local or recovery test. Rehearse stateful

@@ -45,3 +45,36 @@ ownership are customer infrastructure decisions; they are inputs to the
 Kubernetes design, not choices this repository can make. A Kubernetes profile
 would be specified, reviewed, and accepted on its own evidence — distinct from
 the single-stack drills in [test-runbook.md](test-runbook.md).
+
+## Planning exercise (future): Blue/Green upgrades across two VMs
+
+**Status: planning exercise only.** Nothing below is implemented, scheduled,
+or supported today; it is recorded so the option surfaces when upgrade
+downtime becomes a real constraint (owner request, 2026-07-16).
+
+The idea: two identical single-stack VMs ("blue" and "green") behind a small
+third VM running a TLS-passthrough L4 proxy (HAProxy or similar) that owns the
+published edge IPs. Upgrades converge the idle color, prove it with the
+acceptance runbook, then cut traffic over; the previous color remains a warm
+rollback until the next cycle. This buys zero-interruption *planned* upgrades
+without re-platforming, and is not HA — the proxy VM and each stack VM remain
+single failure domains.
+
+What makes this a design exercise rather than a procedure is state. This
+stack is deliberately stateful in one place per concern, and none of it spans
+hosts today: Postgres (Keycloak realm + LiteLLM), Vault (file backend,
+manual unseal), Open WebUI's app database, Grafana/Loki/Tempo/Prometheus
+local storage, and the key-rotator/portal process-local locks that already
+forbid replicas. A cutover therefore needs, at minimum: a per-service state
+map of what an image bump preserves versus destroys (the upgrade-durability
+audit); a decision per store between replicate-to-green, restore-into-green
+during a write freeze, or accept-loss; a Vault unseal step inside the cutover
+window; and an identity plan for sessions (users re-authenticate after
+cutover — acceptable — versus session replication — not pursued). The
+three-NIC firewall ABI also multiplies: both stack VMs need the full
+egress/ADM/internal topology, and the proxy VM needs its own reviewed,
+minimal edge posture.
+
+If the state-map work concludes that most stores must be externalized to make
+cutover safe, that is the signal to spend the effort on the Kubernetes design
+above instead — externalized state is most of that migration's cost anyway.
