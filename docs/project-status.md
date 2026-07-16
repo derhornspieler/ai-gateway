@@ -132,11 +132,13 @@ The following are explicitly **not yet closed**:
   [upgrade durability audit](research/upgrade-durability-audit-20260716.md);
   items it marks [REHEARSE] rest on upstream behavior and need live
   rehearsal before being relied on.
-- **Key-rotator sealed-start retry — proof PENDING.** A reboot exposed a defect
-  where zero-interval startup jobs were consumed while Vault was sealed. The
-  scheduler fix (defer while sealed or unavailable, retry after unseal, leave
-  generic failures terminal) is source-tested and deployed, but its
-  sealed-start-to-unseal retry proof is still pending.
+- **Key-rotator sealed-start retry — PROVEN LIVE (2026-07-16).** A genuine VM
+  reboot produced a real sealed window: for its full duration the zero-interval
+  startup jobs deferred every 30 s ("Vault not ready; deferred without
+  driver/audit attempt") without being consumed, the 15 s presence-reconcile
+  failed non-terminally with operator ALERTs, the converge auto-unseal ended
+  the window, the vendor credential re-minted within one reconcile tick, and
+  end-to-end WIF inference passed in both API shapes immediately after.
 - **Alloy ACL and rollback-retention live gates — PENDING.** The parent/child
   ACL reconciliation and the content-addressed rollback-retention helper pass
   source tests but have not completed the controlled live deploy and the

@@ -236,12 +236,15 @@ text, and once the threshold is reached the `vault` healthcheck reports healthy
 
 After Vault is unsealed, wait for `key-rotator` and inspect status and recent
 errors. The patched scheduler must defer startup rotations while Vault is sealed
-without writing failed history, then retry after unseal. This sealed-start retry
-fix is in current source and passed its available-Vault path, but the live
-sealed-to-unsealed proof remains PENDING; because Docker `live-restore` means a
-daemon restart alone cannot seal Vault, only an explicit restart of the
-long-running service set demonstrates it. Do not use a manual container restart
-to make a sealed-start acceptance test pass; that masks the behavior under test.
+without writing failed history, then retry after unseal. This behavior was
+proven live on 2026-07-16 under a genuine VM reboot: the sealed window showed
+30 s one-shot deferrals (never consumed) and non-terminal reconcile failures
+with ALERTs, and after the converge auto-unseal the credential re-minted within
+one 15 s reconcile tick with end-to-end inference passing. For any future
+re-proof, note that Docker `live-restore` means a daemon restart alone cannot
+seal Vault — only a reboot or an explicit restart of the long-running service
+set demonstrates it. Do not use a manual container restart to make a
+sealed-start acceptance test pass; that masks the behavior under test.
 
 ```bash
 scripts/aigw-compose.sh ps
