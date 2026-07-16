@@ -622,6 +622,12 @@ services:
       # Per solution-map FAQ: Open WebUI's own API keys stay disabled —
       # gateway keys come from dev-portal only.
       ENABLE_API_KEYS: "false"
+      # The gateway's ONLY model backend is LiteLLM over the OpenAI-compatible
+      # API above. Open WebUI 0.10 defaults ENABLE_OLLAMA_API=true, which
+      # exposes the Ollama connection UI and /ollama/* API surface to every
+      # user even with no Ollama backend present. Disable it so no user can
+      # reach or configure an out-of-band model backend.
+      ENABLE_OLLAMA_API: "false"
       # Model authorization lives at the gateway: the scoped workload key and
       # the per-project runtime policy decide which models chat may reach.
       # Open WebUI's own model access control is redundant on this path, and

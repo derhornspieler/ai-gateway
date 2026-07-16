@@ -37,6 +37,15 @@ class ChatCapabilityContractTest(unittest.TestCase):
         compose = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn('BYPASS_MODEL_ACCESS_CONTROL: "true"', compose)
 
+    def test_compose_disables_the_ollama_backend_for_all_users(self) -> None:
+        """The gateway's only model backend is LiteLLM over the OpenAI-
+        compatible API. Open WebUI 0.10 defaults ENABLE_OLLAMA_API=true, which
+        exposes the Ollama connection UI and /ollama/* surface to every user.
+        Pin it off so no user can reach or configure an out-of-band backend."""
+        compose = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn('ENABLE_OLLAMA_API: "false"', compose)
+        self.assertNotIn('ENABLE_OLLAMA_API: "true"', compose)
+
     def test_realm_sources_define_and_scope_the_chat_role(self) -> None:
         for path in (
             ROOT
