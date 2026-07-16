@@ -151,6 +151,55 @@ class AdminSurfaceContractTests(unittest.TestCase):
                     self.assertNotIn(forbidden, rendered_format)
         self.assertEqual(len(cookie_vars), len(set(cookie_vars)))
 
+    def test_admin_rp_logout_chain_is_pinned_end_to_end(self) -> None:
+        """Sign-out at an admin host must end the Keycloak SSO session and
+        land back on a login page, not silently re-authenticate. Three pinned
+        halves: every oauth2-proxy allow-lists the auth edge so
+        /oauth2/sign_out?rd= may hop to Keycloak's end_session endpoint (an
+        unset whitelist makes rd= fall back to "/" and the SSO session
+        survives); Grafana's native sign-out chains through that hop; and the
+        admin-ui client allow-lists each host root as a post-logout target in
+        both realm sources and the identity reconciler. Trailing slashes must
+        match end to end."""
+        self.assertEqual(
+            self.compose.count(
+                'OAUTH2_PROXY_WHITELIST_DOMAINS: "auth.${DOMAIN'
+                ':?DOMAIN must be set}"'
+            ),
+            4,
+        )
+        self.assertIn(
+            'GF_AUTH_SIGNOUT_REDIRECT_URL: "https://grafana.${DOMAIN'
+            ":?DOMAIN must be set}/oauth2/sign_out?rd=https%3A%2F%2Fauth."
+            "${DOMAIN:?DOMAIN must be set}%2Frealms%2Faigw%2Fprotocol"
+            "%2Fopenid-connect%2Flogout%3Fclient_id%3Dadmin-ui"
+            "%26post_logout_redirect_uri%3Dhttps%253A%252F%252Fgrafana."
+            '${DOMAIN:?DOMAIN must be set}%252F"',
+            self.compose,
+        )
+        clients = {client["clientId"]: client for client in self.realm["clients"]}
+        self.assertEqual(
+            clients["admin-ui"]["attributes"]["post.logout.redirect.uris"],
+            "https://litellm-admin.aigw.example.internal/"
+            "##https://grafana.aigw.example.internal/"
+            "##https://prometheus.aigw.example.internal/"
+            "##https://vault.aigw.example.internal/",
+        )
+        template = (
+            ROOT
+            / "ansible/roles/docker_stack/templates/keycloak-realms/aigw-realm.json.j2"
+        ).read_text()
+        self.assertIn(
+            '"post.logout.redirect.uris": "https://litellm-admin.{{ aigw_domain }}/'
+            "##https://grafana.{{ aigw_domain }}/"
+            "##https://prometheus.{{ aigw_domain }}/"
+            '##https://vault.{{ aigw_domain }}/"',
+            template,
+        )
+        identity = (ROOT / "services/key-rotator/app/identity.py").read_text()
+        for host in ("litellm-admin", "grafana", "prometheus", "vault"):
+            self.assertIn(f'f"https://{host}.{{domain}}/",', identity)
+
     def test_keycloak_callbacks_follow_the_split_without_a_second_console_origin(self) -> None:
         clients = {client["clientId"]: client for client in self.realm["clients"]}
         self.assertEqual(

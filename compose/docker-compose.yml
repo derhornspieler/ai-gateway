@@ -283,6 +283,12 @@ services:
       # surface, which was reported as a broken authorization redirect.
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_REDIRECT_URL: "https://litellm-admin.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      # RP-initiated logout: GET /oauth2/sign_out?rd=<url> clears this proxy's
+      # cookie and follows rd= only to hosts allow-listed here. Keycloak's
+      # auth edge is the single cross-host hop the sign-out chain needs;
+      # without this allow-list every rd= silently falls back to "/" and the
+      # Keycloak SSO session survives the sign-out.
+      OAUTH2_PROXY_WHITELIST_DOMAINS: "auth.${DOMAIN:?DOMAIN must be set}"
       OAUTH2_PROXY_UPSTREAMS: http://litellm:4000
       OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
       OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
@@ -343,6 +349,7 @@ services:
       OAUTH2_PROXY_SCOPE: openid email profile
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_REDIRECT_URL: "https://grafana.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      OAUTH2_PROXY_WHITELIST_DOMAINS: "auth.${DOMAIN:?DOMAIN must be set}"
       OAUTH2_PROXY_UPSTREAMS: http://grafana:3000
       OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
       OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
@@ -399,6 +406,7 @@ services:
       OAUTH2_PROXY_SCOPE: openid email profile
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_REDIRECT_URL: "https://prometheus.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      OAUTH2_PROXY_WHITELIST_DOMAINS: "auth.${DOMAIN:?DOMAIN must be set}"
       OAUTH2_PROXY_UPSTREAMS: http://${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}:9090
       OAUTH2_PROXY_ALLOWED_GROUPS: "aigw-admins"
       OAUTH2_PROXY_OIDC_GROUPS_CLAIM: "roles"
@@ -454,6 +462,7 @@ services:
       OAUTH2_PROXY_SCOPE: openid email profile
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_REDIRECT_URL: "https://vault.${DOMAIN:?DOMAIN must be set}/oauth2/callback"
+      OAUTH2_PROXY_WHITELIST_DOMAINS: "auth.${DOMAIN:?DOMAIN must be set}"
       # The DHI Vault binary deliberately omits HashiCorp's embedded UI. Keep
       # OAuth in front of one same-origin, fixed-backend UI/API proxy: it serves
       # reviewed static assets under /ui and forwards only /v1 to DHI Vault.
@@ -1464,6 +1473,14 @@ services:
       GF_USERS_AUTO_ASSIGN_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_AUTH_BASIC_ENABLED: "false"
+      # Grafana's sign-out otherwise only clears its own session and the
+      # surviving oauth2-proxy cookie silently re-authenticates the browser.
+      # Chain instead through the proxy's /oauth2/sign_out (clears the edge
+      # cookie) into Keycloak's end_session endpoint, landing back on the
+      # Grafana host — which, cookie-less, immediately presents the Keycloak
+      # login. The rd= value is percent-encoded once for oauth2-proxy; the
+      # inner post_logout_redirect_uri is encoded twice.
+      GF_AUTH_SIGNOUT_REDIRECT_URL: "https://grafana.${DOMAIN:?DOMAIN must be set}/oauth2/sign_out?rd=https%3A%2F%2Fauth.${DOMAIN:?DOMAIN must be set}%2Frealms%2Faigw%2Fprotocol%2Fopenid-connect%2Flogout%3Fclient_id%3Dadmin-ui%26post_logout_redirect_uri%3Dhttps%253A%252F%252Fgrafana.${DOMAIN:?DOMAIN must be set}%252F"
       GF_SECURITY_COOKIE_SECURE: "true"
       GF_SECURITY_COOKIE_SAMESITE: strict
       # Land authenticated operators on the provisioned live overview instead

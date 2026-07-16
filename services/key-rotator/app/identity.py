@@ -811,7 +811,7 @@ class KeycloakAdmin:
                 if not isinstance(have, list) or sorted(have) != sorted(want):
                     current[field] = want
                     needs_update = True
-            # Only the two clients whose spec declares an RP-initiated logout
+            # Only clients whose spec declares an RP-initiated logout
             # allow-list have that attribute managed here.  Never invent one on
             # a client that does not use it, and never disturb any other
             # operator- or Keycloak-owned attribute on the representation.
@@ -1418,6 +1418,17 @@ class KeycloakAdmin:
                     f"https://grafana.{domain}",
                     f"https://prometheus.{domain}",
                     f"https://vault.{domain}",
+                ],
+                # Each admin host's oauth2-proxy chains /oauth2/sign_out into
+                # Keycloak's end_session endpoint with its own host root as
+                # post_logout_redirect_uri; landing there cookie-less brings
+                # the Keycloak login straight back. Trailing slashes must
+                # match the sign-out URLs end to end.
+                logout_redirects=[
+                    f"https://litellm-admin.{domain}/",
+                    f"https://grafana.{domain}/",
+                    f"https://prometheus.{domain}/",
+                    f"https://vault.{domain}/",
                 ],
             ),
             # Vault's inner OIDC login, behind the admin-ui oauth2-proxy gate.

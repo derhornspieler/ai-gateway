@@ -149,6 +149,7 @@ expected = {
     "open-webui": {
         "redirectUris": [f"https://chat.{domain}/oauth/oidc/callback"],
         "webOrigins": [f"https://chat.{domain}"],
+        "logout": f"https://chat.{domain}/",
     },
     "dev-portal": {
         "redirectUris": [f"https://portal.{domain}/auth/callback"],
@@ -173,6 +174,10 @@ expected = {
             f"https://prometheus.{domain}",
             f"https://vault.{domain}",
         ],
+        "logout": (
+            f"https://litellm-admin.{domain}/##https://grafana.{domain}/##"
+            f"https://prometheus.{domain}/##https://vault.{domain}/"
+        ),
     },
     # Vault's inner OIDC login behind the admin-ui oauth2-proxy gate. The
     # loopback callback serves the CLI's `vault login -method=oidc` through a

@@ -143,15 +143,21 @@ async def test_reconciliation_migrates_only_managed_callbacks_idempotently() -> 
         logout = desired[client_id]["attributes"].get("post.logout.redirect.uris")
         if logout is not None:
             assert client["attributes"]["post.logout.redirect.uris"] == logout
-    # open-webui, dev-portal, and admin-portal do RP-initiated logout, so they
-    # carry a managed post-logout allow-list (open-webui's is verified in the
-    # desired-driven loop above). The oauth2-proxy gate (admin-ui) and Vault do
-    # not RP-logout through Keycloak, so the controller never invents one.
+    # open-webui, dev-portal, admin-portal, and the oauth2-proxy gate
+    # (admin-ui, one host root per admin surface, ##-joined) do RP-initiated
+    # logout, so they carry a managed post-logout allow-list (verified in the
+    # desired-driven loop above). Vault's inner OIDC client does not RP-logout
+    # through Keycloak, so the controller never invents one for it.
     assert (
         admin.clients["open-webui"]["attributes"]["post.logout.redirect.uris"]
         == desired["open-webui"]["attributes"]["post.logout.redirect.uris"]
     )
-    assert "post.logout.redirect.uris" not in admin.clients["admin-ui"]["attributes"]
+    assert admin.clients["admin-ui"]["attributes"][
+        "post.logout.redirect.uris"
+    ] == "##".join(
+        f"https://{host}.{admin.settings.aigw_domain}/"
+        for host in ("litellm-admin", "grafana", "prometheus", "vault")
+    )
     assert "post.logout.redirect.uris" not in admin.clients["vault"]["attributes"]
     # The unmanaged built-in was never opened.
     assert "account" not in admin.puts

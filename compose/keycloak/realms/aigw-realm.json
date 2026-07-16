@@ -144,6 +144,9 @@
         "https://prometheus.aigw.example.internal",
         "https://vault.aigw.example.internal"
       ],
+      "attributes": {
+        "post.logout.redirect.uris": "https://litellm-admin.aigw.example.internal/##https://grafana.aigw.example.internal/##https://prometheus.aigw.example.internal/##https://vault.aigw.example.internal/"
+      },
       "protocolMappers": [
         {
           "name": "realm-roles-to-roles-claim",

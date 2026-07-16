@@ -414,7 +414,7 @@ temporary master-realm client `aigw-bootstrap-controller` still exists — a
 converge repairs this automatically. The `docker_stack` role runs
 `app.reconcile_oidc_redirect_uris` through the key-rotator service; it uses only
 that already-reviewed bootstrap credential to realign the five managed clients'
-`redirectUris`, `webOrigins`, and the two managed `post.logout.redirect.uris`
+`redirectUris`, `webOrigins`, and the managed `post.logout.redirect.uris`
 allow-lists to the configured `aigw_domain`. It touches nothing else — not
 client secrets, flows, protocol mappers, realm-role scopes, the durable
 controller, the WIF broker, or the `account`/`security-admin-console`/`broker`
@@ -852,9 +852,23 @@ administrator makes the next admin read or mutation fail its live composite-role
 check and clears the portal session; and the controller and broker fingerprints
 match the recorded deployment evidence.
 
-Keycloak logout does not erase an already-issued oauth2-proxy cookie
-immediately. Both ADM proxies refresh and revalidate cookies every five minutes
-and cap them at eight hours; the portal's live composite-role check closes the
+Each admin host supports RP-initiated sign-out through its oauth2-proxy:
+`GET /oauth2/sign_out?rd=<Keycloak end_session URL>` clears the edge cookie
+and hops to Keycloak (the auth edge is the one host every proxy allow-lists
+via `OAUTH2_PROXY_WHITELIST_DOMAINS`; without it `rd=` silently falls back to
+`/` and the SSO session survives). Keycloak asks for logout confirmation —
+no `id_token_hint` is presented — then returns to the host root, which,
+cookie-less, immediately shows the Keycloak login. Grafana's own sign-out
+button drives this chain (`GF_AUTH_SIGNOUT_REDIRECT_URL`); the LiteLLM Admin
+UI and Prometheus have no native sign-out control, so operators use the
+`/oauth2/sign_out` URL on those hosts directly. The Vault UI's inner sign-out
+ends only the Vault token session — full browser sign-out is the same outer
+chain on `vault.<domain>`.
+
+A logout initiated *elsewhere* (another app's sign-out, a Keycloak console
+session revocation) still does not erase an already-issued oauth2-proxy
+cookie. The proxies refresh and revalidate cookies every five minutes and cap
+them at eight hours; the portal's live composite-role check closes the
 stale-cookie path immediately for admin reads and mutations, while the LiteLLM
 Admin UI and Grafana can retain their edge session until the next proxy refresh.
 Acceptance must prove revocation is enforced within that five-minute bound after
