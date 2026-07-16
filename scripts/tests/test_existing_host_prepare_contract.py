@@ -115,6 +115,19 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
                 firewall_ownership_checker_start:firewall_ownership_checker_end
             ]
         )
+        artifact_gate_start = cls.host.index(
+            "        import json\n",
+            cls.host.index(
+                "Preflight — reject unsafe or unowned existing AIGW-managed host artifacts"
+            ),
+        )
+        artifact_gate_end = cls.host.index(
+            '      - "{{ aigw_managed_host_artifacts | to_json }}"',
+            artifact_gate_start,
+        )
+        cls.artifact_adoption_gate = textwrap.dedent(
+            cls.host[artifact_gate_start:artifact_gate_end]
+        )
         docker_zone_checker_start = cls.firewall_preflight.index(
             "        docker_firewalld_zone_path ="
         )
@@ -178,6 +191,47 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             exec(self.endpoint_validator, {"__name__": "__endpoint_validator__"})
         finally:
             sys.stdin = original_stdin
+
+    def run_artifact_adoption_gate(
+        self,
+        has_ownership: bool,
+        docker_adoption: bool = False,
+        firewall_adoption: bool = False,
+        ssh_adoption: bool = False,
+    ) -> None:
+        """Execute the embedded artifact-adoption gate against a root-owned artifact.
+
+        os.lstat is mocked to a root-owned 0600 regular file so the "unsafe"
+        branch never fires; the only remaining decision is whether proven
+        ownership (completed OR validated pending marker) or an explicit
+        adoption flag authorizes the retained managed artifact.
+        """
+        import json
+        import os
+        import stat
+        from unittest.mock import patch
+
+        artifacts = [
+            {"path": "/usr/local/sbin/aigw-policy-routing", "adoption": "docker"}
+        ]
+
+        def fake_lstat(_path: str) -> SimpleNamespace:
+            return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_gid=0)
+
+        original_argv = sys.argv
+        try:
+            sys.argv = [
+                "gate",
+                json.dumps(artifacts),
+                "true" if has_ownership else "false",
+                "true" if docker_adoption else "false",
+                "true" if firewall_adoption else "false",
+                "true" if ssh_adoption else "false",
+            ]
+            with patch.object(os, "lstat", side_effect=fake_lstat):
+                exec(self.artifact_adoption_gate, {"__name__": "__artifact_gate__"})
+        finally:
+            sys.argv = original_argv
 
     def mount_checker_namespace(self, checker: str) -> dict[str, object]:
         import os
@@ -802,9 +856,16 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         ownership = namespace["has_reviewed_aigw_firewall_ownership"]
 
         self.assertTrue(ownership(True, False, False))
-        self.assertFalse(ownership(False, False, True))
-        self.assertFalse(ownership(False, True, False))
+        # A byte-exact pending marker now resumes an interrupted converge on its
+        # own — the same trust deploy-stack-only.yml already grants — so no
+        # firewall adoption flag is required.
+        self.assertTrue(ownership(False, True, False))
         self.assertTrue(ownership(False, True, True))
+        # Fail-closed invariant: a genuinely foreign host has no valid marker,
+        # so a bare adoption flag never grants ownership, and neither does an
+        # entirely unmarked host.
+        self.assertFalse(ownership(False, False, True))
+        self.assertFalse(ownership(False, False, False))
 
         # The narrow recovery function must protect only the generated AIGW
         # objects; arbitrary direct/NM/firewalld state remains on `unowned`.
@@ -818,6 +879,136 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             "unexpected active AI Gateway firewalld zones",
         ):
             self.assertIn(required, self.firewall_preflight)
+
+    def test_site_preflight_resumes_from_validated_pending_marker_without_adoption_flags(self) -> None:
+        # host_preflight now proves ownership from a completed OR a byte-exact
+        # pending marker, and records that as aigw_host_ownership_proven.
+        self.assertIn("aigw_host_ownership_proven: >-", self.host)
+        self.assertIn(
+            "{{ (aigw_host_marker_stat.exists | default(false) | bool) or",
+            self.host,
+        )
+        self.assertIn(
+            "(aigw_host_pending_marker_stat.exists | default(false) | bool) }}",
+            self.host,
+        )
+        # The marker shape and content asserts are relocated to run BEFORE the
+        # artifact-adoption gate, so the proven fact is genuinely validated at
+        # every consumer (a foreign/malformed marker aborts first; host_preflight
+        # is the first, read-only role, so nothing has mutated).
+        gate = self.host.index(
+            "Preflight — reject unsafe or unowned existing AIGW-managed host artifacts"
+        )
+        for earlier in (
+            "Preflight — reject symlinked or non-root host-boundary objects",
+            "Preflight — require an existing marker to describe this exact host contract",
+            "Preflight — require an in-progress marker to describe this exact host contract",
+            "Preflight — record a validated dedicated-Docker-host ownership contract",
+        ):
+            self.assertLess(self.host.index(earlier), gate, earlier)
+        # The old unconditional "require adoption to resume" assert is gone; a
+        # validated pending marker now resumes with only an informational note,
+        # never a demand for aigw_adopt_dedicated_docker_host.
+        self.assertNotIn(
+            "Preflight — require explicit adoption to resume an incomplete host converge",
+            self.host,
+        )
+        self.assertIn(
+            "Preflight — note resuming an interrupted converge from a validated pending marker",
+            self.host,
+        )
+        self.assertIn(
+            "resuming an interrupted converge from a validated pending marker; no",
+            self.host,
+        )
+        resume = self.host.split(
+            "Preflight — note resuming an interrupted converge from a validated pending marker",
+            1,
+        )[1].split("\n- name:", 1)[0]
+        self.assertIn("ansible.builtin.debug:", resume)
+        self.assertIn(
+            "when: aigw_host_pending_marker_stat.exists | default(false)", resume
+        )
+        self.assertNotIn("ansible.builtin.assert:", resume)
+        self.assertNotIn("aigw_adopt_dedicated_docker_host | bool", resume)
+
+    def test_site_preflight_still_requires_adoption_for_unmarked_managed_artifacts(self) -> None:
+        # Foreign/unmarked host: ownership false, no adoption flag → the gate
+        # must still refuse a retained managed artifact.
+        with self.assertRaises(SystemExit) as unmarked:
+            self.run_artifact_adoption_gate(has_ownership=False)
+        self.assertIn(
+            "requires explicit docker adoption", str(unmarked.exception)
+        )
+        # A validated pending (or completed) marker proves ownership → the gate
+        # passes with no adoption flag, exactly as a completed marker would.
+        self.run_artifact_adoption_gate(has_ownership=True)
+        # The explicit adoption flag still works for a genuinely unmarked host.
+        self.run_artifact_adoption_gate(has_ownership=False, docker_adoption=True)
+        # The gate consumes the proven-ownership fact, not raw completed-marker
+        # existence, so a byte-exact pending marker is trusted here too.
+        self.assertIn(
+            "'true' if (aigw_host_ownership_proven | default(false) | bool) else 'false'",
+            self.host,
+        )
+
+    def test_completed_marker_gates_accept_a_validated_pending_marker(self) -> None:
+        # The three ownership gates that previously trusted only a completed
+        # marker now consume aigw_host_ownership_proven, so a validated pending
+        # marker (a resumed first converge) satisfies them without adoption.
+        for gate in (
+            "Preflight — reject an unmarked nonempty stack directory without explicit adoption",
+            "Preflight — require a non-running Docker root to be empty unless this is a marked AIGW host",
+            "Preflight — require explicit adoption for retained named volumes on an unmarked Docker host",
+        ):
+            block = self.host.split(gate, 1)[1].split("\n- name:", 1)[0]
+            self.assertIn(
+                "(aigw_host_ownership_proven | default(false) | bool) or", block
+            )
+            self.assertNotIn("aigw_host_marker_stat.exists", block)
+        # Exactly those three gates flipped to the proven-ownership fact.
+        self.assertEqual(
+            3,
+            self.host.count(
+                "(aigw_host_ownership_proven | default(false) | bool) or"
+            ),
+        )
+        # The daemon.json adoption gate is deliberately LEFT on the completed
+        # marker only: a resumed pending converge must not silently adopt a
+        # foreign /etc/docker/daemon.json.
+        daemon = self.host.split(
+            "Preflight — allow only a clean, marked, legacy-AIGW-only, or explicitly adopted daemon configuration",
+            1,
+        )[1]
+        self.assertIn("(aigw_host_marker_stat.exists | default(false)) or", daemon)
+        self.assertNotIn("aigw_host_ownership_proven", daemon)
+
+    def test_site_and_stack_only_agree_on_pending_marker_ownership(self) -> None:
+        # Both entrypoints accept the identical byte-exact pending-marker
+        # contract as an ownership signal with no adoption flag. site.yml runs
+        # host_preflight (ownership from completed OR pending); stack-only runs
+        # its own marker gate that trusts either marker's existence.
+        for source in (self.host, self.stack_only):
+            self.assertIn("format=aigw-dedicated-docker-host-v1", source)
+            self.assertIn("project={{ compose_project_name }}", source)
+            self.assertIn("docker_data_root={{ docker_data_root }}", source)
+        self.assertIn("aigw_host_ownership_proven: >-", self.host)
+        self.assertIn(
+            "(aigw_host_pending_marker_stat.exists | default(false) | bool) }}",
+            self.host,
+        )
+        self.assertIn(
+            "(stack_only_host_markers.results[0].stat.exists | default(false)) or\n"
+            "            (stack_only_host_markers.results[1].stat.exists | default(false))",
+            self.stack_only,
+        )
+        # Neither entrypoint demands an adoption flag to trust a byte-exact
+        # pending marker.
+        self.assertNotIn(
+            "Preflight — require explicit adoption to resume an incomplete host converge",
+            self.host,
+        )
+        self.assertNotIn("aigw_adopt_dedicated_docker_host", self.stack_only)
 
     def test_firewall_preflight_accepts_only_the_exact_docker_engine_29_zone(self) -> None:
         import os

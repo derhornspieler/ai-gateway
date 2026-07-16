@@ -96,18 +96,22 @@
         def has_reviewed_aigw_firewall_ownership(
             completed_marker, pending_marker, explicit_firewall_adoption,
         ):
-            """Return true only for a completed or explicitly resumed converge.
+            """Return true for a completed or validated-pending converge.
 
             The pending value is supplied by host_preflight only after it has
-            verified the exact root-owned pending ownership marker and required
-            the separate dedicated-Docker-host adoption acknowledgement. The
-            firewall acknowledgement remains separate: it authorizes only the
-            exact generated AIGW artifacts checked below, never arbitrary
-            firewalld, direct-rule, nftables, or NetworkManager policy.
+            verified the exact root-owned pending ownership marker (correct
+            shape and byte-exact format/project/data-root content). A validated
+            pending marker is our own host-prep-done ownership signal, so it
+            resumes an interrupted converge without an adoption flag — exactly
+            the trust deploy-stack-only.yml already grants. A genuinely foreign
+            host has no valid marker, so both marker values stay false and
+            ownership stays false regardless of any adoption flag. The firewall
+            acknowledgement (explicit_firewall_adoption) remains a separate
+            control below: it authorizes only the exact generated AIGW
+            artifacts, never arbitrary firewalld, direct-rule, nftables, or
+            NetworkManager policy.
             """
-            return completed_marker or (
-                pending_marker and explicit_firewall_adoption
-            )
+            return completed_marker or pending_marker
 
         reviewed_aigw_firewall_ownership = has_reviewed_aigw_firewall_ownership(
             has_marker, has_valid_pending_marker, firewall_adoption,

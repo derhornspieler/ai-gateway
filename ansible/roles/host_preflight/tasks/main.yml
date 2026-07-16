@@ -1170,112 +1170,6 @@
       - { path: /etc/systemd/system/aigw-vault-audit-rotate.service, adoption: docker }
       - { path: /etc/systemd/system/aigw-vault-audit-rotate.timer, adoption: docker }
 
-- name: Preflight — reject unsafe or unowned existing AIGW-managed host artifacts
-  ansible.builtin.command:
-    argv:
-      - python3
-      - -I
-      - -c
-      - |
-        import json
-        import os
-        import stat
-        import sys
-
-        artifacts = json.loads(sys.argv[1])
-        has_marker = sys.argv[2] == "true"
-        docker_adoption = sys.argv[3] == "true"
-        firewall_adoption = sys.argv[4] == "true"
-        ssh_adoption = sys.argv[5] == "true"
-        adoptions = {
-            "docker": docker_adoption,
-            "firewall": firewall_adoption,
-            "ssh": ssh_adoption,
-        }
-        errors = []
-        for artifact in artifacts:
-            path = artifact["path"]
-            try:
-                metadata = os.lstat(path)
-            except FileNotFoundError:
-                continue
-            if (
-                stat.S_ISLNK(metadata.st_mode) or
-                not stat.S_ISREG(metadata.st_mode) or
-                metadata.st_uid != 0 or metadata.st_gid != 0 or
-                metadata.st_mode & 0o022
-            ):
-                errors.append(f"unsafe existing managed artifact {path}")
-                continue
-            adoption_granted = adoptions[artifact["adoption"]]
-            if not has_marker and not adoption_granted:
-                errors.append(
-                    f"unmarked existing managed artifact {path} requires explicit {artifact['adoption']} adoption"
-                )
-        if errors:
-            raise SystemExit("; ".join(dict.fromkeys(errors)))
-      - "{{ aigw_managed_host_artifacts | to_json }}"
-      - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
-      - "{{ 'true' if (aigw_adopt_dedicated_docker_host | bool) else 'false' }}"
-      - "{{ 'true' if (aigw_adopt_firewalld_state | bool) else 'false' }}"
-      - "{{ 'true' if (aigw_adopt_ssh_state | bool) else 'false' }}"
-  changed_when: false
-
-- name: Preflight — reject unmanaged drop-ins for AI Gateway systemd units
-  ansible.builtin.command:
-    argv:
-      - python3
-      - -I
-      - -c
-      - |
-        import json
-        import os
-        import stat
-        import sys
-
-        errors = []
-        for unit in json.loads(sys.argv[1]):
-            unit_name = os.path.basename(unit)
-            for root in (
-                "/etc/systemd/system", "/run/systemd/system",
-                "/usr/local/lib/systemd/system", "/usr/lib/systemd/system",
-            ):
-                directory = os.path.join(root, unit_name + ".d")
-                try:
-                    metadata = os.lstat(directory)
-                except FileNotFoundError:
-                    continue
-                if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or
-                        metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022):
-                    errors.append(f"unsafe managed-unit drop-in directory {directory}")
-                    continue
-                with os.scandir(directory) as entries:
-                    for entry in entries:
-                        try:
-                            child = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            errors.append(f"uninspectable managed-unit drop-in {entry.path}")
-                            continue
-                        if (stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or
-                                child.st_uid != 0 or child.st_gid != 0 or child.st_mode & 0o022):
-                            errors.append(f"unsafe managed-unit drop-in {entry.path}")
-                        else:
-                            errors.append(f"unmanaged managed-unit drop-in {entry.path}")
-        if errors:
-            raise SystemExit("; ".join(dict.fromkeys(errors)))
-      - >-
-        {{ [
-             '/etc/systemd/system/aigw-policy-routing.service',
-             '/etc/systemd/system/aigw-host-input-rules.service',
-             '/etc/systemd/system/docker-user-rules.service',
-             '/etc/systemd/system/docker-user-rules-watch.service',
-             '/etc/systemd/system/aigw-docker-log-acl.service',
-             '/etc/systemd/system/aigw-docker-log-acl.timer',
-             '/etc/systemd/system/aigw-vault-audit-rotate.service',
-             '/etc/systemd/system/aigw-vault-audit-rotate.timer'
-           ] | to_json }}
-  changed_when: false
-
 - name: Preflight — reject symlinked or non-root host-boundary objects
   ansible.builtin.assert:
     that:
@@ -1356,32 +1250,146 @@
   when: aigw_host_pending_marker_stat.exists | default(false)
   no_log: true
 
-- name: Preflight — require explicit adoption to resume an incomplete host converge
-  ansible.builtin.assert:
-    that:
-      - aigw_adopt_dedicated_docker_host | bool
-    quiet: true
-    fail_msg: >-
-      A previous host converge stopped after Docker policy changed but before
-      verification promoted its pending marker. Inspect the VM and re-run with
-      aigw_adopt_dedicated_docker_host=true to resume deliberately after
-      removing/reviewing any retained packet-filter state. If the retained
-      state includes exact AI Gateway firewalld/nftables/DOCKER-USER artifacts,
-      also set aigw_adopt_firewalld_state=true; if the managed sshd fragment
-      is present, also set aigw_adopt_ssh_state=true. These acknowledgements
-      are intentionally separate because a partial run may have already
-      written Docker, firewall, and SSH host policy; arbitrary firewall policy
-      is never silently adopted.
-  when: aigw_host_pending_marker_stat.exists | default(false)
-
-# This fact is deliberately set only after the pending marker's ownership,
-# shape, and exact content have been checked and its Docker takeover has been
-# explicitly acknowledged above. Downstream read-only preflights may use it to
-# distinguish this interrupted converge from arbitrary unmarked host state.
-- name: Preflight — record a validated incomplete host ownership contract
+# This fact is deliberately set only after both markers' ownership, shape, and
+# exact content have been proven by the asserts immediately above — before the
+# artifact-adoption gate and every downstream ownership gate consume it. A
+# genuinely foreign host has no valid marker, so aigw_host_ownership_proven
+# stays false and each adoption gate still demands its explicit flag; a bare
+# adoption flag with no marker never grants ownership. A validated pending
+# marker is the sanctioned host-prep-done ownership signal, so a site.yml
+# resume of an interrupted first converge is trusted exactly as
+# deploy-stack-only.yml already trusts it. host_preflight is the first,
+# read-only role: a malformed or foreign marker aborts at the asserts above
+# before anything mutates.
+- name: Preflight — record a validated dedicated-Docker-host ownership contract
   ansible.builtin.set_fact:
     aigw_host_pending_marker_valid: >-
       {{ aigw_host_pending_marker_stat.exists | default(false) | bool }}
+    aigw_host_ownership_proven: >-
+      {{ (aigw_host_marker_stat.exists | default(false) | bool) or
+         (aigw_host_pending_marker_stat.exists | default(false) | bool) }}
+
+- name: Preflight — reject unsafe or unowned existing AIGW-managed host artifacts
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import stat
+        import sys
+
+        artifacts = json.loads(sys.argv[1])
+        has_marker = sys.argv[2] == "true"
+        docker_adoption = sys.argv[3] == "true"
+        firewall_adoption = sys.argv[4] == "true"
+        ssh_adoption = sys.argv[5] == "true"
+        adoptions = {
+            "docker": docker_adoption,
+            "firewall": firewall_adoption,
+            "ssh": ssh_adoption,
+        }
+        errors = []
+        for artifact in artifacts:
+            path = artifact["path"]
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISLNK(metadata.st_mode) or
+                not stat.S_ISREG(metadata.st_mode) or
+                metadata.st_uid != 0 or metadata.st_gid != 0 or
+                metadata.st_mode & 0o022
+            ):
+                errors.append(f"unsafe existing managed artifact {path}")
+                continue
+            adoption_granted = adoptions[artifact["adoption"]]
+            if not has_marker and not adoption_granted:
+                errors.append(
+                    f"unmarked existing managed artifact {path} requires explicit {artifact['adoption']} adoption"
+                )
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - "{{ aigw_managed_host_artifacts | to_json }}"
+      - "{{ 'true' if (aigw_host_ownership_proven | default(false) | bool) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_dedicated_docker_host | bool) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_firewalld_state | bool) else 'false' }}"
+      - "{{ 'true' if (aigw_adopt_ssh_state | bool) else 'false' }}"
+  changed_when: false
+
+- name: Preflight — reject unmanaged drop-ins for AI Gateway systemd units
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import os
+        import stat
+        import sys
+
+        errors = []
+        for unit in json.loads(sys.argv[1]):
+            unit_name = os.path.basename(unit)
+            for root in (
+                "/etc/systemd/system", "/run/systemd/system",
+                "/usr/local/lib/systemd/system", "/usr/lib/systemd/system",
+            ):
+                directory = os.path.join(root, unit_name + ".d")
+                try:
+                    metadata = os.lstat(directory)
+                except FileNotFoundError:
+                    continue
+                if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or
+                        metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022):
+                    errors.append(f"unsafe managed-unit drop-in directory {directory}")
+                    continue
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            child = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            errors.append(f"uninspectable managed-unit drop-in {entry.path}")
+                            continue
+                        if (stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or
+                                child.st_uid != 0 or child.st_gid != 0 or child.st_mode & 0o022):
+                            errors.append(f"unsafe managed-unit drop-in {entry.path}")
+                        else:
+                            errors.append(f"unmanaged managed-unit drop-in {entry.path}")
+        if errors:
+            raise SystemExit("; ".join(dict.fromkeys(errors)))
+      - >-
+        {{ [
+             '/etc/systemd/system/aigw-policy-routing.service',
+             '/etc/systemd/system/aigw-host-input-rules.service',
+             '/etc/systemd/system/docker-user-rules.service',
+             '/etc/systemd/system/docker-user-rules-watch.service',
+             '/etc/systemd/system/aigw-docker-log-acl.service',
+             '/etc/systemd/system/aigw-docker-log-acl.timer',
+             '/etc/systemd/system/aigw-vault-audit-rotate.service',
+             '/etc/systemd/system/aigw-vault-audit-rotate.timer'
+           ] | to_json }}
+  changed_when: false
+
+# The shape and content of the pending marker are proven by the relocated
+# asserts that now run *before* the artifact-adoption gate (a validated pending
+# marker is trusted there as full ownership, exactly as deploy-stack-only.yml
+# already trusts it). host_preflight is the first, read-only role, so a foreign
+# or malformed marker has already aborted before this point and nothing has
+# mutated. No adoption flag is required to resume our own interrupted converge.
+- name: Preflight — note resuming an interrupted converge from a validated pending marker
+  ansible.builtin.debug:
+    msg: >-
+      resuming an interrupted converge from a validated pending marker; no
+      adoption flag required. A previous host converge recorded this exact
+      root-owned dedicated-Docker-host pending marker before verification
+      promoted it, so host preparation is trusted as our own — the same trust
+      deploy-stack-only.yml already grants.
+  when: aigw_host_pending_marker_stat.exists | default(false)
 
 - name: Preflight — read an existing Docker daemon configuration without following links
   ansible.builtin.slurp:
@@ -1552,7 +1560,7 @@
   ansible.builtin.assert:
     that:
       - >-
-        (aigw_host_marker_stat.exists | default(false)) or
+        (aigw_host_ownership_proven | default(false) | bool) or
         ((aigw_stack_dir_inventory_raw.stdout | from_json) | length == 0) or
         (aigw_adopt_dedicated_docker_host | bool)
     quiet: true
@@ -1987,7 +1995,7 @@
   ansible.builtin.assert:
     that:
       - >-
-        (aigw_host_marker_stat.exists | default(false)) or
+        (aigw_host_ownership_proven | default(false) | bool) or
         (aigw_inactive_roots.stdout | trim | length == 0)
     quiet: true
     fail_msg: >-
@@ -2028,7 +2036,7 @@
   ansible.builtin.assert:
     that:
       - >-
-        (aigw_host_marker_stat.exists | default(false)) or
+        (aigw_host_ownership_proven | default(false) | bool) or
         (aigw_live_docker_boundary.retained_expected_volumes | length == 0) or
         (aigw_adopt_dedicated_docker_host | bool)
     quiet: true
