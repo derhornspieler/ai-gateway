@@ -312,6 +312,12 @@ The ordinary stack requires all of the following. The role validates lengths,
 rejects obvious placeholders, and generally permits only `[A-Za-z0-9_-]` so
 Compose interpolation and database URLs remain unambiguous.
 
+> For a plain-language, front-loaded summary of which of these are
+> **auto-generated** by the inventory bootstrap versus **operator-supplied**
+> (and, for each operator input, the helper and where it goes), see
+> [Secrets and vault prerequisites](deploy-runbook.md#secrets-and-vault-prerequisites-read-before-you-start)
+> in the runbook. The list below remains the full reference.
+
 #### Secret overlay variables
 
 | Variable | Purpose / constraint |
