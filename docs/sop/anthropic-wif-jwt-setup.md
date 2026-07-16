@@ -97,6 +97,16 @@ Do this on the target VM.
    64-hex-character `federation_jwks_sha256=` line. **If it prints no keys, STOP** —
    the broker is not ready; do not create a federation.
 
+   > **The array normally holds two keys, and that is correct.** The realm's
+   > default key providers publish an RS256 **signing** key (`use:"sig"`) and an
+   > RSA-OAEP **encryption** key (`use:"enc"`). Paste the **entire** array — both
+   > keys. Inline verification uses only the signing key; the encryption key is
+   > harmless and expected, and `federation_jwks_sha256` is computed over both, so
+   > the pasted set matches the recorded hash. (If the admin portal's *Broker
+   > private_key_jwt* readiness ever disagrees with this export — export prints
+   > keys but the panel says "not ready" — trust this §2 export; that is the
+   > authoritative readiness check.)
+
 3. Copy the whole `keys` array and record the `federation_jwks_sha256` value in
    your controlled deployment evidence.
 
