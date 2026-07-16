@@ -25,6 +25,22 @@ def settings(**overrides) -> Settings:
     return Settings(**values)
 
 
+# LiteLLM v1.91.3 exact response bodies. The PATCH endpoint `return`s (does
+# not raise) handle_exception_on_proxy(), so its failures — including "not
+# found" — arrive as HTTP 200 whose body is the serialized ProxyException.
+UPDATE_OK = {"success": True, "message": "Credential updated successfully"}
+CREATE_OK = {"success": True, "message": "Credential created successfully"}
+MASKED_NOT_FOUND = {
+    "message": "Credential not found in DB.",
+    "type": "internal_server_error",
+    "param": "None",
+    "openai_code": 404,
+    "code": "404",
+    "headers": {},
+    "provider_specific_fields": None,
+}
+
+
 @pytest.mark.asyncio
 async def test_upsert_credential_patch_uses_complete_litellm_credential_item(
     caplog,
@@ -40,7 +56,7 @@ async def test_upsert_credential_patch_uses_complete_litellm_credential_item(
         assert request.method == "PATCH"
         assert request.url.path == "/credentials/anthropic-primary"
         assert json.loads(request.content) == expected
-        return httpx.Response(200)
+        return httpx.Response(200, json=UPDATE_OK)
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
     with caplog.at_level("INFO", logger="key_rotator.litellm"):
@@ -65,7 +81,7 @@ async def test_upsert_credential_patch_404_falls_back_to_complete_post_create() 
         )
         if request.method == "PATCH":
             return httpx.Response(404)
-        return httpx.Response(201)
+        return httpx.Response(200, json=CREATE_OK)
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
     await client.upsert_credential(
@@ -76,6 +92,90 @@ async def test_upsert_credential_patch_404_falls_back_to_complete_post_create() 
         ("PATCH", "/credentials/anthropic-primary", expected),
         ("POST", "/credentials", expected),
     ]
+
+
+@pytest.mark.asyncio
+async def test_upsert_credential_masked_patch_404_falls_back_to_post_create() -> None:
+    """A missing credential arrives as HTTP 200 + serialized ProxyException
+    (code "404") on LiteLLM v1.91.3 — the create fallback must still fire.
+    This is the exact live body that left anthropic-primary permanently
+    absent while every rotation reported success."""
+    expected = {
+        "credential_name": "anthropic-primary",
+        "credential_values": {"api_key": "anthropic-token"},
+        "credential_info": {"managed_by": "key-rotator"},
+    }
+    requests: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            (request.method, request.url.path, json.loads(request.content))
+        )
+        if request.method == "PATCH":
+            return httpx.Response(200, json=MASKED_NOT_FOUND)
+        return httpx.Response(200, json=CREATE_OK)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    await client.upsert_credential(
+        "anthropic-primary", {"api_key": "anthropic-token"}
+    )
+
+    assert requests == [
+        ("PATCH", "/credentials/anthropic-primary", expected),
+        ("POST", "/credentials", expected),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upsert_credential_masked_non_404_patch_error_raises() -> None:
+    masked_error = dict(MASKED_NOT_FOUND, code="500", openai_code=500)
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        return httpx.Response(200, json=masked_error)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    with pytest.raises(LiteLLMError):
+        await client.upsert_credential(
+            "anthropic-primary", {"api_key": "anthropic-token"}
+        )
+
+    assert requests == ["PATCH"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"", b"null", b"[]", b"not-json"])
+async def test_upsert_credential_ambiguous_patch_2xx_raises(body: bytes) -> None:
+    """A 2xx without success=true proves nothing — fail closed rather than
+    report a rotation that may not have persisted."""
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        return httpx.Response(200, content=body)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    with pytest.raises(LiteLLMError):
+        await client.upsert_credential(
+            "anthropic-primary", {"api_key": "anthropic-token"}
+        )
+
+    assert requests == ["PATCH"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_credential_create_without_success_body_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            return httpx.Response(404)
+        return httpx.Response(200, json=MASKED_NOT_FOUND)
+
+    client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
+    with pytest.raises(LiteLLMError):
+        await client.upsert_credential(
+            "anthropic-primary", {"api_key": "anthropic-token"}
+        )
 
 
 @pytest.mark.asyncio

@@ -110,14 +110,36 @@ class LiteLLMClient:
             kwargs["transport"] = self._transport
         return kwargs
 
+    @staticmethod
+    def _json_object(resp: httpx.Response) -> dict[str, Any]:
+        """Decode a response body as a JSON object, or {} if it is not one."""
+
+        try:
+            data = resp.json()
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     async def upsert_credential(self, name: str, values: dict[str, Any]) -> None:
-        """Try PATCH /credentials/{name}; on 404, POST /credentials to
-        create it. `values` typically contains {"api_key": "..."} — never
-        logged in full, only a masked prefix.
+        """Try PATCH /credentials/{name}; if it does not exist, POST
+        /credentials to create it. `values` typically contains
+        {"api_key": "..."} — never logged in full, only a masked prefix.
+
+        LiteLLM v1.91.3's PATCH endpoint `return`s (instead of raising)
+        handle_exception_on_proxy(), so every PATCH failure — including
+        "Credential not found in DB." — arrives as HTTP 200 whose body is
+        the serialized ProxyException. A 2xx status therefore proves
+        nothing: only a body carrying success=true does. A masked 404 must
+        still fall back to create, and any other masked error must raise.
         """
         masked = {k: (mask_secret(v) if isinstance(v, str) else v) for k, v in values.items()}
         base = self._settings.litellm_url.rstrip("/")
         safe_name = path_segment(name, label="LiteLLM credential name")
+        credential_item = {
+            "credential_name": name,
+            "credential_values": values,
+            "credential_info": {"managed_by": "key-rotator"},
+        }
 
         # Do not inherit HTTP(S)_PROXY from the container environment. These
         # requests carry the LiteLLM master key and plaintext vendor keys;
@@ -126,31 +148,52 @@ class LiteLLMClient:
         async with httpx.AsyncClient(**self._client_kwargs()) as client:
             resp = await client.patch(
                 f"{base}/credentials/{safe_name}",
-                json={
-                    "credential_name": name,
-                    "credential_values": values,
-                    "credential_info": {"managed_by": "key-rotator"},
-                },
+                json=credential_item,
                 headers=self._headers(),
             )
 
-            if resp.status_code == 404:
-                logger.info("litellm credential name=%s not found, creating", name)
-                resp = await client.post(
-                    f"{base}/credentials",
-                    json={
-                        "credential_name": name,
-                        "credential_values": values,
-                        "credential_info": {"managed_by": "key-rotator"},
-                    },
-                    headers=self._headers(),
-                )
+            not_found = resp.status_code == 404
+            if not not_found:
                 resp.raise_for_status()
-                logger.info("created litellm credential name=%s values=%s", name, masked)
-                return
+                data = self._json_object(resp)
+                if data.get("success") is True:
+                    logger.info(
+                        "updated litellm credential name=%s values=%s", name, masked
+                    )
+                    return
+                not_found = str(data.get("code")) == "404"
+                if not not_found:
+                    raise LiteLLMError(
+                        "LiteLLM credential update failed for %s: "
+                        "type=%s code=%s message=%s"
+                        % (
+                            name,
+                            data.get("type"),
+                            data.get("code"),
+                            str(data.get("message"))[:200],
+                        )
+                    )
 
+            logger.info("litellm credential name=%s not found, creating", name)
+            resp = await client.post(
+                f"{base}/credentials",
+                json=credential_item,
+                headers=self._headers(),
+            )
             resp.raise_for_status()
-            logger.info("updated litellm credential name=%s values=%s", name, masked)
+            data = self._json_object(resp)
+            if data.get("success") is not True:
+                raise LiteLLMError(
+                    "LiteLLM credential create failed for %s: "
+                    "type=%s code=%s message=%s"
+                    % (
+                        name,
+                        data.get("type"),
+                        data.get("code"),
+                        str(data.get("message"))[:200],
+                    )
+                )
+            logger.info("created litellm credential name=%s values=%s", name, masked)
 
     @staticmethod
     def _key_metadata(entry: dict[str, Any]) -> dict[str, Any]:
