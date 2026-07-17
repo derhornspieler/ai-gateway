@@ -571,7 +571,13 @@ promotes only validated, server-authenticated LiteLLM metadata into canonical
 `aigw.project.id`, and `aigw.request.id` trace attributes. The spend index joins
 the hashed key to that metadata while prompt bodies stay disabled in spend logs.
 This gives direct API traffic the required timestamp, user, prompt, key
-identifier, and project correlation without storing bearer plaintext. Open WebUI
+identifier, and project correlation without storing bearer plaintext. A
+human-readable `aigw.user.name` (forwarded chat end user → portal-stamped
+username → key alias → the subject UUID) and `aigw.enduser.id` ride alongside
+for legibility, and `aigw.user.name`/`aigw.project.id` also become bounded Loki
+stream labels for dashboard filtering — but these are attribution only, never an
+authorization record: the enforced identity stays `aigw.user.id`/`aigw.api_key.id`,
+which a spoofed forwarded header cannot change. Open WebUI's *enforced* identity
 remains a documented service/project-only attribution exception. Operational and
 Vault audit logs go to Loki. See
 [observability-operations.md](observability-operations.md).

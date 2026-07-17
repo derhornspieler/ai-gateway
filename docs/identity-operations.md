@@ -844,6 +844,19 @@ exact state — three federated users, three groups, `configured=true`,
 
 ## Auditing and acceptance
 
+**How user identity reaches the request audit.** Two identity surfaces feed
+per-request telemetry so the audit reads in human terms rather than opaque
+UUIDs. At key-mint time dev-portal stamps the signed-in `preferred_username`
+into the LiteLLM key metadata (`aigw_username`); and on the chat path Open WebUI
+forwards each request's authenticated identity to LiteLLM, which records it as
+the request end user. Alloy resolves both into a readable `aigw.user.name` (and
+`aigw.enduser.id`) beside the opaque `aigw.user.id`. The forwarded chat header
+is **attribution only** — it grants no authorization, and any
+already-authenticated API caller can set it for its own traffic, so the enforced
+identity stays the key's `aigw.user.id` / `aigw.api_key.id`. See
+[observability-operations.md](observability-operations.md) for the full
+identity-priority chain and how to filter the audit by user or project.
+
 Identity bootstrap, group create/delete, and membership changes write bounded
 metadata to rotator history, portal actions emit structured subject-based audit
 logs, and Vault audit records cover key and state writes. None of these replaces

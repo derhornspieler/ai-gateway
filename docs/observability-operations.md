@@ -113,6 +113,37 @@ timestamps, trace and span IDs, and the captured prompt/completion content are
 not rewritten. These five fields stay trace attributes and are excluded from
 metric dimensions to prevent user-controlled cardinality growth.
 
+Alongside those five, Alloy also promotes a human-readable **`aigw.user.name`**
+so the audit is legible without cross-referencing opaque UUIDs. It is filled
+from the first source that matches, each strictly regex-bounded:
+
+1. the forwarded chat end user — Open WebUI runs with
+   `ENABLE_FORWARD_USER_INFO_HEADERS` and LiteLLM records its
+   `X-OpenWebUI-User-Email` header (which carries the OIDC `preferred_username`
+   in this deployment) as the request end user, also kept verbatim as
+   **`aigw.enduser.id`**;
+2. the portal-stamped `aigw_username` from the key's metadata — dev-portal
+   writes the signed-in `preferred_username` into key metadata at mint time;
+3. the key's human-chosen alias; then
+4. the stable `aigw.user.id` (the Keycloak subject UUID), so the field is never
+   empty.
+
+**This name is attribution only and grants no authorization.** LiteLLM accepts
+the forwarded header from any already-authenticated caller, so a client that
+spoofs it only mislabels its own traffic — the enforced key identity is still
+recorded in `aigw.user.id` and `aigw.api_key.id`, which no header can change.
+
+`aigw.user.name` and `aigw.project.id` are additionally promoted to two Loki
+**stream labels** — `aigw_user_name` and `aigw_project_id` (Prometheus-format
+names). A stream label is an indexed key you can pick from a dropdown or put in
+the `{...}` selector, versus a line field you must `grep`/`logfmt` for; that is
+what lets the request audit be filtered by person or project in one click
+(see [Filtering the request audit by user or project](#filtering-the-request-audit-by-user-or-project)).
+This is a deliberate, bounded-cardinality decision: the user and project
+populations are small, they share one dedicated stream, and the Loki writer's
+`max_streams` cap backstops it. The high-churn `aigw.request.id` and
+`aigw.api_key.id` stay line fields and must never become labels.
+
 LiteLLM spend rows are a separate cost and accounting index, not the prompt audit
 store. `general_settings.store_prompts_in_spend_logs` is pinned to `false`, so
 `messages`, `response`, and `proxy_server_request` remain empty objects while
@@ -126,12 +157,17 @@ prompt storage to make that join self-contained, since it creates a second
 sensitive-content store with a different retention and access boundary.
 
 Open WebUI is an explicit attribution exception. Its one shared scoped key is
-owned by `svc-open-webui`, so its spans prove the originating service and project
-but not the human browser user, and an upstream or client `llm.user` value is
-untrusted and not promoted to `aigw.user.id`. Do not present Open WebUI traces as
-per-person audit evidence until a server-side, identity-bound propagation design
-has been implemented and adversarially tested; portal-issued direct API keys
-continue to provide per-human owner attribution. See
+owned by `svc-open-webui`, so the *enforced* identity on its spans —
+`aigw.user.id` and `aigw.api_key.id` — proves the originating service and
+project, never the human browser user, and an upstream or client `llm.user`
+value is untrusted and not promoted to `aigw.user.id`. Chat traffic does now
+carry a readable `aigw.user.name` / `aigw.enduser.id`, because Open WebUI
+forwards each request's authenticated chat identity to LiteLLM (the identity
+chain above), which makes the per-request stream legible per person. Treat that
+name as attribution only, not authenticated audit evidence: it is a convenience
+label the chat frontend supplies, and any already-authenticated API caller can
+send the same header for its own traffic. Portal-issued direct API keys remain
+the source of *trusted* per-human owner attribution. See
 [operations.md](operations.md) for how that shared key is reconciled each
 converge.
 
@@ -139,6 +175,35 @@ The container-log pipeline heuristically redacts credential-shaped fields and
 `sk-*` values as defense in depth, not as a substitute for applications never
 logging secrets, and user-controlled key aliases are excluded from Prometheus
 labels to prevent cardinality exhaustion.
+
+## Filtering the request audit by user or project
+
+The **AI Gateway Request Audit** dashboard (Grafana, ADM edge only) has two
+dropdowns at the top — **User** and **Project** — backed by the
+`aigw_user_name` and `aigw_project_id` stream labels. Picking a value narrows
+the *Requests by User*, *Cost by Project*, and *Recent AI Requests* panels to
+that person or project in one click; leaving both on **All** shows everything.
+**All** also matches lines that never got the label (legacy lines, or a request
+whose name did not resolve), so nothing silently drops out of a panel. The
+*missing-correlation* panel is deliberately left unfiltered — its whole job is
+to surface requests that failed to correlate, so a user/project filter must not
+be able to hide them.
+
+To filter directly in Grafana Explore or Logs Drilldown instead, put the label
+inside the stream selector `{...}` rather than after `| logfmt` — a stream label
+is indexed, so this is the fast path (placeholders below are fake):
+
+```logql
+{service_name="aigw-requests", aigw_user_name="jdoe", aigw_project_id="team-blue"} | logfmt
+```
+
+Only `aigw_user_name` and `aigw_project_id` are stream labels. Everything else —
+`aigw_request_id`, `aigw_api_key_id`, and the model/token/cost fields — is a
+line field you match after `| logfmt`, for example:
+
+```logql
+{service_name="aigw-requests"} | logfmt | aigw_request_id="<litellm.call_id>"
+```
 
 ## Access-log path suppression
 
@@ -308,7 +373,8 @@ clear the development Cribl sink state, and recreate the edges before collecting
 fresh evidence, while production deletion must follow the customer evidence and
 incident process. In Grafana Explore (or Logs Drilldown), query
 `{service_name="aigw-requests"} | logfmt` to locate a test request and confirm
-the expected prompt attribute plus the canonical `aigw.*` fields, checking
+the expected prompt attribute plus the canonical `aigw.*` fields (including a
+resolved human-readable `aigw.user.name`), checking
 that the API-key ID equals the source lowercase hash, the request ID equals
 `litellm.call_id`, and the project matches the portal project; then send missing,
 malformed, uppercase-hash, overlength or injection-like project, and non-LiteLLM
@@ -318,9 +384,11 @@ for container and Vault audit logs and Prometheus for Envoy TLS, spanmetrics,
 node-exporter, and the `aigw-state-capacity` rule group.
 
 For an Open WebUI request, require service and project correlation to
-`svc-open-webui` and `open-webui`, record per-human attribution as not
-implemented, and prove that a supplied `llm.user` value cannot become a canonical
-trusted user attribute. Confirm that a user without `aigw-admins` is rejected
+`svc-open-webui` and `open-webui`, confirm the forwarded chat identity now
+surfaces as a readable `aigw.user.name` / `aigw.enduser.id` while the enforced
+`aigw.user.id` stays the shared key's subject, and prove that a supplied
+`llm.user` value cannot become a canonical trusted user attribute
+(`aigw.user.id`). Confirm that a user without `aigw-admins` is rejected
 before Grafana and that an admin still receives the Grafana local login. For a
 real Cribl cutover, send a non-sensitive canary through each signal, verify
 certificate and SNI validation and the narrow firewall counter, then test an
