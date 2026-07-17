@@ -93,19 +93,19 @@ retired. Because the loader clears its environment and runs on a fixed system
 
 ## Current lab rehearsal artifact
 
-The current lab seed was rebuilt on 2026-07-15 with
-`scripts/rebuild-offline-image-seed.py` running as root on the lab VM's own
-root Docker daemon (linux/arm64, containerd image store), matching the hashes
-committed in `inventory/host_vars/lab-aigw01.yml` and staged root-owned mode
-`0600` at the pinned `/var/tmp` paths:
+The current lab seed was rebuilt on 2026-07-16 (LiteLLM `v1.92.0` pin bump)
+with `scripts/rebuild-offline-image-seed.py` running as root on the lab VM's
+own root Docker daemon (linux/arm64, containerd image store), matching the
+hashes committed in `inventory/host_vars/lab-aigw01.yml` and staged
+root-owned mode `0600` at the pinned `/var/tmp` paths:
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `aigw-external-images-linux-arm64-20260715-vaultui.docker.tar.zst` | 3,347,684,377 bytes | `4cd1d451a4654d1f183127cafc8e9dbfe7a04ade891e2a42928401586e160470` |
-| `aigw-external-images-linux-arm64-20260715-vaultui.manifest.json` | 5,190 bytes | `3eeb68d8581e1cba995574a6a0a3e244947378b5a4a1efd4dfabdcf24233865d` |
+| `aigw-external-images-linux-arm64-20260716-vaultui.docker.tar.zst` | 3,350,475,655 bytes | `00b9e596cda233eb8660e6ae63850169441814b6c0a679cad56db8f059854869` |
+| `aigw-external-images-linux-arm64-20260716-vaultui.manifest.json` | 5,190 bytes | `6f4be25ea921f41f8f21040739ea19b13a9e183a9ef2dbf521a1a2a8205ab37f` |
 
 Both files are also retained mode `0600` beneath
-`/Users/jamesrudisill/.aigw-lab-dr/20260715-vaultui-seed`. The archive passed
+`/Users/jamesrudisill/.aigw-lab-dr/20260716-vaultui-seed`. The archive passed
 zstd integrity and OCI-metadata validation during export. Its manifest records
 25 exact Linux/ARM64 external `tag@sha256` references and immutable image IDs
 — the complete digest-pinned source set of the checkout it was built from,
@@ -116,13 +116,18 @@ the daemon before export, and the identical map is frozen in
 `ansible/reset-rocky9-lab.yml` (`aigw_lab_reset_legacy_seed_image_tags`),
 which the lab reset requires the staged manifest to equal exactly.
 
-The superseded 2026-07-13 seed
+The superseded 2026-07-15 seed
+(`aigw-external-images-linux-arm64-20260715-vaultui.docker.tar.zst`,
+`4cd1d451a4654d1f183127cafc8e9dbfe7a04ade891e2a42928401586e160470`, 25 images,
+LiteLLM `v1.91.3`) remains retained beneath
+`/Users/jamesrudisill/.aigw-lab-dr/20260715-vaultui-seed`, and the earlier
+2026-07-13 seed
 (`aigw-external-images-linux-arm64-20260713.docker.tar.zst`,
 `e418ac9299351254412028b3a1481eccaf8791a4847e931d724a4882de2defde`, 22 images,
-no `hashicorp/vault` UI source) remains retained beneath
+no `hashicorp/vault` UI source) beneath
 `/Users/jamesrudisill/.aigw-lab-dr/20260713-pre-rebuild` for the recorded G3
-rehearsal history, but no longer matches the inventory pins and must not be
-re-staged.
+rehearsal history; neither matches the inventory pins any longer and neither
+may be re-staged.
 
 To validate this feature locally without contacting a VM or loading images:
 
