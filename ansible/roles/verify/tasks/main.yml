@@ -532,7 +532,7 @@
             'litellm', 'open-webui', 'keycloak',
             'dev-portal', 'admin-portal',
             'envoy-egress', 'key-rotator', 'vault', 'postgres', 'redis',
-            'alloy', 'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana',
+            'alloy', 'prometheus', 'node-exporter', 'loki', 'grafana',
             'cribl-mock'
           ]
           + (['oauth2-proxy-vault', 'vault-ui-proxy']
@@ -1051,7 +1051,7 @@
             'oauth2-proxy', 'oauth2-proxy-grafana',
             'oauth2-proxy-prometheus', 'litellm', 'open-webui', 'keycloak',
             'dev-portal', 'admin-portal', 'key-rotator', 'vault', 'postgres',
-            'redis', 'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana'
+            'redis', 'prometheus', 'node-exporter', 'loki', 'grafana'
           ]
           + (['oauth2-proxy-vault', 'vault-ui-proxy']
              if (aigw_vault_ui_enabled | bool) else [])
@@ -1613,7 +1613,6 @@
         expected = {
             ("Prometheus", "prometheus", "prometheus", "http://prometheus:9090"),
             ("Loki", "loki", "loki", "http://loki:3100"),
-            ("Tempo", "tempo", "tempo", "http://tempo:3200"),
             # Owner-approved read-only LiteLLM spend path (grafana_ro role,
             # SELECT-only grants) over the dedicated net-db-grafana bridge.
             (
@@ -1746,7 +1745,6 @@
         for url in (
             "http://prometheus:9090/-/ready",
             "http://loki:3100/ready",
-            "http://tempo:3200/ready",
         ):
             with urllib.request.urlopen(url, timeout=10) as response:
                 if response.status != 200:
@@ -1789,7 +1787,6 @@
             ("keycloak", "keycloak:9000"),
             ("alloy", "alloy:12345"),
             ("grafana", "grafana:3000"),
-            ("tempo", "tempo:3200"),
             ("prometheus", "prometheus-observability:9090"),
             ("loki", "loki:3100"),
             ("node-exporter", "node-exporter:9100"),
@@ -1816,7 +1813,6 @@
             ("aigw-observability-pipeline", "AIGatewayAlloyExporterQueueSaturation"),
             ("aigw-observability-pipeline", "AIGatewayLokiWriteDrops"),
             ("aigw-observability-pipeline", "AIGatewayLokiWriteRetriesHigh"),
-            ("aigw-observability-pipeline", "AIGatewayTempoRefusedSpans"),
             ("aigw-observability-pipeline", "AIGatewayPrometheusRemoteWriteFailures"),
             ("aigw-observability-pipeline", "AIGatewayPrometheusRemoteWriteBacklog"),
             ("aigw-state-capacity", "AIGatewayFilesystemSpaceLow"),

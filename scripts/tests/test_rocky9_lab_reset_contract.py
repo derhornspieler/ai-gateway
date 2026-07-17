@@ -199,8 +199,13 @@ class Rocky9LabResetContractTests(unittest.TestCase):
         ]
         current_names = playbook_list(self.source, "aigw_lab_reset_expected_networks")
         self.assertIn("net-db-grafana", current_names)
+        # net-db-grafana postdates the frozen legacy snapshot, and net-traces
+        # was removed with Tempo while the legacy graph still carries it.
+        # Everything else must match order-for-order.
+        self.assertNotIn("net-traces", current_names)
         self.assertEqual(
-            [name for name in current_names if name not in {"net-db-grafana"}], legacy_names
+            [name for name in current_names if name not in {"net-db-grafana"}],
+            [name for name in legacy_names if name != "net-traces"],
         )
         # The live graph proof consumes only the frozen legacy set; the
         # current-topology assertion keeps pinning the evolving model.

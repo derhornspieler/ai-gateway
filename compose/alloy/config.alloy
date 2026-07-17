@@ -5,8 +5,9 @@
 //   to storage/export networks must never expose its unauthenticated receiver
 //   or HTTP UI on those networks.
 // - Full prompt/completion bodies are deliberate span attributes (§9.7). They
-//   go to local Tempo and the customer Cribl endpoint; they are not metric
-//   labels and are never written to stdout by this configuration.
+//   go to the customer Cribl endpoint and, for litellm_request spans only, to
+//   the local per-request Loki stream (service_name="aigw-requests"); they are
+//   not metric labels and are never written to stdout by this configuration.
 // - Docker logs are read from the host's json-file directory, read-only. The
 //   Docker API socket is intentionally not mounted.
 
@@ -61,7 +62,7 @@ otelcol.processor.transform "aigw_correlation" {
 // END AIGW MANAGED TRACE CORRELATION
 
 // Promote correlation first, then remove every raw identity/credential source
-// before any signal can reach Tempo, Prometheus, Loki, or customer Cribl.  The
+// before any signal can reach Prometheus, Loki, or customer Cribl.  The
 // application requirement to retain prompt/completion bodies is deliberate:
 // gen_ai.input.messages, gen_ai.output.messages, and their legacy prompt /
 // completion equivalents are not matched by these deletion rules.
@@ -213,8 +214,8 @@ otelcol.processor.batch "default" {
   output {
     traces = [
       otelcol.exporter.otlp.cribl.input,
-      otelcol.exporter.otlp.tempo.input,
       otelcol.connector.spanmetrics.default.input,
+      otelcol.processor.filter.aigw_request_spans.input,
     ]
     logs = [
       otelcol.exporter.otlp.cribl.input,
@@ -236,6 +237,86 @@ otelcol.connector.spanmetrics "default" {
   dimension { name = "gen_ai.request.model" }
   output {
     metrics = [otelcol.exporter.prometheus.local.input]
+  }
+}
+
+// Per-request audit stream (owner decision): one Loki log line per
+// litellm_request span so Grafana Logs Drilldown can filter AI requests by
+// user/key/project and show the approved prompt/completion content. The
+// sensitive-attribute sanitizer above has already removed every credential
+// and raw-identity source before this branch; prompt bodies are deliberately
+// retained here, in this stream only. Sibling spans (raw_gen_ai_request,
+// Received Proxy Server Request) never enter it — the filter drops everything
+// that is not the exact litellm_request span; they still reach Cribl through
+// the batch fan-out with everything else.
+otelcol.processor.filter "aigw_request_spans" {
+  error_mode = "ignore"
+  traces {
+    span = [
+      `name != "litellm_request"`,
+    ]
+  }
+  output {
+    traces = [otelcol.connector.spanlogs.aigw_requests.input]
+  }
+}
+
+// One log line per surviving span, carrying only the explicit allow-listed
+// span attributes. The body is logfmt-style key=value text, so LogQL's
+// `| logfmt` yields aigw_user_id / gen_ai_* fields for dashboards.
+otelcol.connector.spanlogs "aigw_requests" {
+  spans = true
+  span_attributes = [
+    "aigw.user.id",
+    "aigw.api_key.id",
+    "aigw.project.id",
+    "aigw.request.id",
+    "gen_ai.request.model",
+    "gen_ai.response.model",
+    "litellm.model_group",
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.total_tokens",
+    "gen_ai.cost.total_cost",
+    "gen_ai.response.finish_reasons",
+    "llm.is_streaming",
+    "http.route",
+    "litellm.call_id",
+    "gen_ai.input.messages",
+    "gen_ai.output.messages",
+  ]
+  output {
+    logs = [otelcol.processor.transform.aigw_request_stream.input]
+  }
+}
+
+// Stable stream identity: Grafana's Logs Drilldown keys its whole UI on the
+// OTel-semantic service_name label, so pin the resource service.name to the
+// dedicated stream value before label promotion.
+otelcol.processor.transform "aigw_request_stream" {
+  error_mode = "ignore"
+  log_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["service.name"], "aigw-requests")`,
+    ]
+  }
+  output {
+    logs = [otelcol.processor.attributes.aigw_request_stream_labels.input]
+  }
+}
+
+// otelcol.exporter.loki promotes OTLP attributes into Loki labels only via
+// the documented hint attributes; loki.resource.labels turns the resource
+// service.name into the service_name stream label.
+otelcol.processor.attributes "aigw_request_stream_labels" {
+  action {
+    key    = "loki.resource.labels"
+    action = "insert"
+    value  = "service.name"
+  }
+  output {
+    logs = [otelcol.exporter.loki.local.input]
   }
 }
 
@@ -262,24 +343,9 @@ loki.write "local" {
   }
 }
 
-// Persistent exporter queues survive Alloy restarts and endpoint outages.
-// queue_size remains byte-bounded at each exporter; fsync trades a small
+// Persistent exporter queue survives Alloy restarts and endpoint outages.
+// queue_size remains byte-bounded at the exporter; fsync trades a small
 // amount of throughput for a durable customer audit trail.
-otelcol.storage.file "tempo_queue" {
-  directory             = "/var/lib/alloy/queues/tempo"
-  directory_permissions = "0700"
-  fsync                  = true
-  timeout                = "5s"
-
-  compaction {
-    cleanup_on_start              = true
-    on_start                      = true
-    on_rebound                    = true
-    rebound_needed_threshold_mib  = 32
-    rebound_trigger_threshold_mib = 8
-  }
-}
-
 otelcol.storage.file "cribl_queue" {
   directory             = "/var/lib/alloy/queues/cribl"
   directory_permissions = "0700"
@@ -290,31 +356,8 @@ otelcol.storage.file "cribl_queue" {
     cleanup_on_start              = true
     on_start                      = true
     on_rebound                    = true
-    rebound_needed_threshold_mib  = 64
-    rebound_trigger_threshold_mib = 16
-  }
-}
-
-// Local trace store. Plaintext is acceptable only on isolated net-traces;
-// Tempo's OTLP receiver is bound to its fixed address on that bridge.
-otelcol.exporter.otlp "tempo" {
-  client {
-    endpoint = sys.env("TEMPO_INGEST_IP") + ":4317"
-    tls { insecure = true }
-  }
-  sending_queue {
-    enabled           = true
-    num_consumers     = 2
-    queue_size        = 33554432
-    sizer             = "bytes"
-    block_on_overflow = false
-    storage           = otelcol.storage.file.tempo_queue.handler
-  }
-  retry_on_failure {
-    enabled          = true
-    initial_interval = "1s"
-    max_interval     = "10s"
-    max_elapsed_time = "0s"
+    rebound_needed_threshold_mib  = 2048
+    rebound_trigger_threshold_mib = 512
   }
 }
 
@@ -337,7 +380,10 @@ otelcol.exporter.otlp "cribl" {
   sending_queue {
     enabled           = true
     num_consumers     = 2
-    queue_size        = 67108864
+    // Owner decision: the on-disk queue is the Cribl-outage buffer and must
+    // hold roughly 24 hours of this deployment's telemetry (prompt-bearing
+    // spans included). 2 GiB is deliberately generous for the lab volume.
+    queue_size        = 2147483648
     sizer             = "bytes"
     block_on_overflow = false
     storage           = otelcol.storage.file.cribl_queue.handler

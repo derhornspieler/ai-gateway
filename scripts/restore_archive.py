@@ -28,7 +28,6 @@ BASE_VOLUMES = frozenset(
         "alloy_data",
         "prom_data",
         "loki_data",
-        "tempo_data",
         "grafana_data",
     }
 )
@@ -57,15 +56,17 @@ STACK_REQUIRED_ROOTS = frozenset(
         "loki",
         "postgres",
         "prometheus",
-        "tempo",
         "traefik",
         "services",
         "scripts",
         "certs",
     }
 )
+# "tempo" is tolerated (never required) so a pre-Tempo-removal archive's
+# configuration tree still passes the top-level root scan; its volume
+# manifest (tempo_data) still fails the exact-volume contract by design.
 STACK_OPTIONAL_ROOTS = frozenset(
-    {"docker-compose.lab.yml", "bind-source-digest-inputs.json", "secrets"}
+    {"docker-compose.lab.yml", "bind-source-digest-inputs.json", "secrets", "tempo"}
 )
 SAFE_SERVICE_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
 SAFE_PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")

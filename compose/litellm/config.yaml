@@ -64,7 +64,8 @@ model_list:
       cache_control_injection_points: [{location: message, role: system}]
 
 litellm_settings:
-  # otel: prompt-bearing spans -> Alloy -> Tempo/Cribl (§9.7).
+  # otel: prompt-bearing spans -> Alloy -> Cribl, plus the derived per-request
+  # Loki stream (service_name="aigw-requests") for local audit (§9.7).
   # aigw_default_model_hook: server-side per-project default-model
   # enforcement. The pre-call hook resolves a request that omits `model`
   # (or sends the `aigw-default` sentinel) to the project's admin-set

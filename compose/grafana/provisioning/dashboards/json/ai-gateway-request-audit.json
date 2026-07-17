@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "ADM-only request audit. Select a trace to inspect its UTC timestamp, opaque user ID, project ID, nonreversible API-key fingerprint, request ID, and retained prompt/completion attributes together.",
+  "description": "ADM-only request audit over the dedicated Loki stream Alloy derives from litellm_request spans. Filter by opaque user ID, project ID, nonreversible API-key fingerprint, or request ID and inspect the retained prompt/completion content per request.",
   "editable": false,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -41,7 +41,7 @@
           "showLineNumbers": false,
           "showMiniMap": false
         },
-        "content": "### Request audit contract\nOpen a matching trace and select the `litellm_request` span. The same span contains its UTC start time, `aigw.user.id`, `aigw.project.id`, `aigw.api_key.id` (SHA-256 fingerprint only), `aigw.request.id`, and the approved `gen_ai.input.messages` / `gen_ai.output.messages` content. Raw authorization, API keys, request headers, email, IP, and unfiltered LiteLLM auth metadata are removed before Tempo or Cribl export. Prompt content is sensitive and this dashboard is intentionally ADM-only.",
+        "content": "### Request audit contract\nEvery `litellm_request` span becomes one log line in the Loki stream `{service_name=\"aigw-requests\"}`. Each line carries `aigw.user.id`, `aigw.project.id`, `aigw.api_key.id` (SHA-256 fingerprint only), `aigw.request.id`, the model/token/cost fields, and the approved `gen_ai.input.messages` / `gen_ai.output.messages` content; `| logfmt` exposes them as `aigw_user_id`-style fields (Logs Drilldown filters work the same way). Raw authorization, API keys, request headers, email, IP, and unfiltered LiteLLM auth metadata are removed before any export. Prompt content is sensitive and this dashboard is intentionally ADM-only.",
         "mode": "markdown"
       },
       "pluginVersion": "12.4.5",
@@ -50,54 +50,110 @@
     },
     {
       "datasource": {
-        "type": "tempo",
-        "uid": "tempo"
+        "type": "loki",
+        "uid": "loki"
       },
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
         "overrides": []
       },
       "gridPos": {
-        "h": 14,
-        "w": 24,
+        "h": 8,
+        "w": 12,
         "x": 0,
         "y": 4
       },
       "id": 2,
       "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
+        "legend": {
+          "calcs": [
             "sum"
           ],
-          "show": false
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
-        "showHeader": true
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "pluginVersion": "12.4.5",
       "targets": [
         {
           "datasource": {
-            "type": "tempo",
-            "uid": "tempo"
+            "type": "loki",
+            "uid": "loki"
           },
-          "limit": 100,
-          "query": "{ span:name = \"litellm_request\" && span.aigw.user.id != nil && span.aigw.project.id != nil && span.aigw.api_key.id != nil } | select(span.aigw.user.id, span.aigw.project.id, span.aigw.api_key.id, span.aigw.request.id, span.gen_ai.input.messages, span.gen_ai.output.messages) with (most_recent=true)",
-          "queryType": "traceql",
-          "refId": "A",
-          "spanLimit": 20,
-          "tableType": "spans"
+          "expr": "sum by (aigw_user_id) (count_over_time({service_name=\"aigw-requests\"} | logfmt [$__auto]))",
+          "queryType": "range",
+          "refId": "A"
         }
       ],
-      "title": "Fully Correlated AI Requests",
-      "type": "table"
+      "title": "Requests by User",
+      "type": "timeseries"
     },
     {
       "datasource": {
-        "type": "tempo",
-        "uid": "tempo"
+        "type": "loki",
+        "uid": "loki"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.5",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "sum by (aigw_project_id) (sum_over_time({service_name=\"aigw-requests\"} | logfmt | unwrap gen_ai_cost_total_cost [$__auto]))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Cost by Project",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
       },
       "fieldConfig": {
         "defaults": {},
@@ -107,84 +163,70 @@
         "h": 14,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 12
       },
-      "id": 3,
+      "id": 4,
       "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
-        "showHeader": true
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
       },
       "pluginVersion": "12.4.5",
       "targets": [
         {
           "datasource": {
-            "type": "tempo",
-            "uid": "tempo"
+            "type": "loki",
+            "uid": "loki"
           },
-          "limit": 100,
-          "query": "{ span:name = \"litellm_request\" && (span.aigw.user.id = nil || span.aigw.project.id = nil || span.aigw.api_key.id = nil) } with (most_recent=true)",
-          "queryType": "traceql",
-          "refId": "A",
-          "spanLimit": 20,
-          "tableType": "spans"
+          "expr": "{service_name=\"aigw-requests\"} | logfmt",
+          "queryType": "range",
+          "refId": "A"
         }
       ],
-      "title": "Requests Missing Required Correlation",
-      "type": "table"
+      "title": "Recent AI Requests (prompts included)",
+      "type": "logs"
     },
     {
       "datasource": {
-        "type": "tempo",
-        "uid": "tempo"
+        "type": "loki",
+        "uid": "loki"
       },
       "fieldConfig": {
         "defaults": {},
         "overrides": []
       },
       "gridPos": {
-        "h": 16,
+        "h": 10,
         "w": 24,
         "x": 0,
-        "y": 32
+        "y": 26
       },
-      "id": 4,
+      "id": 5,
       "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
-        "showHeader": true
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
       },
       "pluginVersion": "12.4.5",
       "targets": [
         {
           "datasource": {
-            "type": "tempo",
-            "uid": "tempo"
+            "type": "loki",
+            "uid": "loki"
           },
-          "limit": 100,
-          "query": "{ resource.service.name = \"litellm\" && span:name = \"litellm_request\" } with (most_recent=true)",
-          "queryType": "traceql",
-          "refId": "A",
-          "spanLimit": 20,
-          "tableType": "spans"
+          "expr": "{service_name=\"aigw-requests\"} | logfmt | aigw_user_id=\"\" or aigw_project_id=\"\" or aigw_api_key_id=\"\"",
+          "queryType": "range",
+          "refId": "A"
         }
       ],
-      "title": "All AI Request Traces",
-      "type": "table"
+      "title": "Requests Missing Required Correlation",
+      "type": "logs"
     }
   ],
   "refresh": "30s",
@@ -192,7 +234,7 @@
   "tags": [
     "ai-gateway",
     "audit",
-    "traces",
+    "requests",
     "provisioned"
   ],
   "templating": {

@@ -167,7 +167,7 @@ class OfflineImageSeedBuilderTests(unittest.TestCase):
         project_root = SCRIPT.parents[1]
         references = builder.collect_project_image_references(project_root)
 
-        self.assertEqual(len(references), 25)
+        self.assertEqual(len(references), 24)
         self.assertIn(PINNED_DEBIAN, references)
         self.assertIn(PINNED_FRONTEND, references)
         self.assertIn(

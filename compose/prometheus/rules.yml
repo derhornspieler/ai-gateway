@@ -87,14 +87,6 @@ groups:
           summary: "Alloy is repeatedly retrying Loki writes"
           description: "The Loki writer retried at least three batches in five minutes."
 
-      - alert: AIGatewayTempoRefusedSpans
-        expr: increase(tempo_receiver_refused_spans{job="tempo"}[5m]) > 0
-        for: 2m
-        labels: { severity: critical }
-        annotations:
-          summary: "Tempo refused incoming spans"
-          description: "Tempo receiver {{ $labels.receiver }} refused spans over {{ $labels.transport }}."
-
       - alert: AIGatewayPrometheusRemoteWriteFailures
         expr: >-
           increase(prometheus_remote_storage_samples_failed_total{job="alloy"}[5m]) > 0

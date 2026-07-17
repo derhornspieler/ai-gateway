@@ -194,7 +194,9 @@ docker_networks:
   - { name: net-telemetry,     bridge: br-otel,   subnet: 172.28.13.0/24, internal: true }
   - { name: net-metrics,       bridge: br-metrics, subnet: 172.28.14.0/24, internal: true }
   - { name: net-observability, bridge: br-obs,    subnet: 172.28.15.0/24, internal: true }
-  - { name: net-traces,        bridge: br-traces, subnet: 172.28.16.0/24, internal: true }
+  # 172.28.16.0/24 (net-traces/br-traces) is retired: it carried only the
+  # Alloy -> Tempo OTLP hop and was removed with the local trace store. The
+  # subnet stays reserved — never reassign it to a new bridge.
   - { name: net-identity,      bridge: br-ident,  subnet: 172.28.17.0/24, internal: true }
   # Published ports do not traverse a Docker `internal: true` bridge. This
   # dedicated ordinary bridge has no application peers; DOCKER-USER and the
@@ -274,7 +276,6 @@ oauth2_proxy_grafana_ip: 172.28.6.3
 alloy_telemetry_ip: 172.28.13.2
 alloy_observability_ip: 172.28.15.2
 prometheus_observability_ip: 172.28.15.3
-tempo_ingest_ip: 172.28.16.2
 lab_dns_ip: 172.28.18.2
 
 # ── firewalld ───────────────────────────────────────────────────────────

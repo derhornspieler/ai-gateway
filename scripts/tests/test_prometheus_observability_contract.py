@@ -52,7 +52,6 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             ("keycloak", "keycloak:9000"),
             ("alloy", "alloy:12345"),
             ("grafana", "grafana:3000"),
-            ("tempo", "tempo:3200"),
             ("prometheus", "prometheus-observability:9090"),
             ("loki", "loki:3100"),
             ("node-exporter", "node-exporter:9100"),
@@ -66,7 +65,6 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "keycloak": "net-metrics",
             "alloy": "net-observability",
             "grafana": "net-observability",
-            "tempo": "net-observability",
             "prometheus": "net-observability",
             "loki": "net-observability",
             "node-exporter": "net-metrics",
@@ -76,7 +74,7 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
         for service_name, network in shared_plane.items():
             self.assertIn(network, prometheus_service)
             self.assertIn(network, service_block(self.compose, service_name))
-        for forbidden in ("vault", "litellm", "postgres", "redis"):
+        for forbidden in ("vault", "litellm", "postgres", "redis", "tempo"):
             self.assertFalse(any(job == forbidden for job, _target in targets))
 
     def test_alerts_cover_reviewed_restart_safe_failure_signals(self) -> None:
@@ -88,7 +86,6 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "AIGatewayAlloyExporterQueueSaturation",
             "AIGatewayLokiWriteDrops",
             "AIGatewayLokiWriteRetriesHigh",
-            "AIGatewayTempoRefusedSpans",
             "AIGatewayPrometheusRemoteWriteFailures",
             "AIGatewayPrometheusRemoteWriteBacklog",
             "AIGatewayFilesystemSpaceLow",
@@ -131,10 +128,6 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "AIGatewayLokiWriteRetriesHigh": (
                 "increase(loki_write_batch_retries_total",
                 "[5m]) >= 3",
-            ),
-            "AIGatewayTempoRefusedSpans": (
-                "increase(tempo_receiver_refused_spans",
-                "[5m]) > 0",
             ),
             "AIGatewayPrometheusRemoteWriteFailures": (
                 "increase(prometheus_remote_storage_samples_failed_total",
@@ -187,11 +180,11 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "AIGatewayAlloyExporterEnqueueFailures",
             "AIGatewayAlloyExporterQueueSaturation",
             "AIGatewayLokiWriteDrops",
-            "AIGatewayTempoRefusedSpans",
             "AIGatewayPrometheusRemoteWriteFailures",
             "AIGatewayPrometheusRemoteWriteBacklog",
         ):
             self.assertIn(alert, self.verify)
+        self.assertNotIn("AIGatewayTempoRefusedSpans", self.verify)
         self.assertIn('rule.get("health") != "ok"', self.verify)
 
     def test_volume_initializer_logs_have_exact_compose_routing_labels(self) -> None:

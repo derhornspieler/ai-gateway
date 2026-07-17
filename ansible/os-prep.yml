@@ -291,7 +291,8 @@
                 "net-telemetry": ("br-otel", "172.28.13.0/24", True),
                 "net-metrics": ("br-metrics", "172.28.14.0/24", True),
                 "net-observability": ("br-obs", "172.28.15.0/24", True),
-                "net-traces": ("br-traces", "172.28.16.0/24", True),
+                # 172.28.16.0/24 (net-traces) is retired with Tempo; the
+                # subnet stays reserved and must never be reassigned.
                 "net-identity": ("br-ident", "172.28.17.0/24", True),
                 "net-lab-dns": ("br-lab-dns", "172.28.18.0/24", False),
                 "net-int-edge": ("br-int-edge", "172.28.19.0/24", False),

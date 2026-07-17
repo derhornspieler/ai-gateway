@@ -35,7 +35,6 @@
       - prometheus
       - node-exporter
       - loki
-      - tempo
       - grafana
       - cribl-mock
       - lab-dns
@@ -84,7 +83,6 @@
       - net-telemetry
       - net-metrics
       - net-observability
-      - net-traces
       - net-identity
       - net-lab-dns
       - net-int-edge
@@ -125,7 +123,6 @@
       - alloy_data
       - prom_data
       - loki_data
-      - tempo_data
       - grafana_data
       - samba_ad_config
       - samba_ad_state

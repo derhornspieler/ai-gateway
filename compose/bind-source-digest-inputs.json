@@ -10,7 +10,6 @@
     "postgres": ["postgres/init"],
     "prometheus": ["prometheus/prometheus.yml", "prometheus/rules.yml"],
     "redis": ["secrets/redis_users.acl", "secrets/redis_password"],
-    "tempo": ["tempo/config.yml"],
     "traefik-adm": ["traefik/traefik-adm.yml", "traefik/dynamic-adm.yml", "certs"],
     "traefik-int": ["traefik/traefik-int.yml", "traefik/dynamic-int.yml", "certs"],
     "vault": ["vault/config.hcl"]

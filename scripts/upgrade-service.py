@@ -80,7 +80,6 @@ FAMILIES: dict[str, Family] = {
                ("postgres",),
                "MINOR bumps only — a major is a migration project, and the "
                "restore version guard will refuse cross-major restores"),
-        Family("tempo", "dhi.io/tempo", "direct", (COMPOSE, RESET_MAP), ("tempo",)),
         Family("keycloak", "dhi.io/keycloak", "base", (COMPOSE, RESET_MAP),
                ("keycloak",),
                "one-way Liquibase migration on first start — take a backup first"),

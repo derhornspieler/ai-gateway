@@ -89,7 +89,6 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         allowed = {
             ("prometheus", "prometheus"),
             ("loki", "loki"),
-            ("tempo", "tempo"),
             # Owner-approved read-only LiteLLM spend datasource (grafana_ro).
             ("grafana-postgresql-datasource", "litellm-spend"),
         }
@@ -112,34 +111,39 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
                     observed.add(pair)
         self.assertIn(("prometheus", "prometheus"), observed)
         self.assertIn(("loki", "loki"), observed)
-        self.assertIn(("tempo", "tempo"), observed)
         self.assertIn(("grafana-postgresql-datasource", "litellm-spend"), observed)
 
-    def test_request_audit_keeps_required_fields_on_one_tempo_span(self) -> None:
+    def test_request_audit_reads_the_dedicated_loki_request_stream(self) -> None:
+        """The audit surface is the Loki stream Alloy derives from
+        litellm_request spans (service_name="aigw-requests"): every query
+        targets that exact stream through the Loki datasource with logfmt
+        field extraction, and cost/user panels aggregate its fields."""
         dashboard = next(
             item for item in self.dashboards if item["uid"] == "aigw-request-audit"
         )
-        tempo_targets = [
+        loki_targets = [
             target
             for panel in panels(dashboard)
             for target in panel.get("targets", [])
-            if target.get("datasource", {}).get("uid") == "tempo"
+            if target.get("datasource", {}).get("uid") == "loki"
         ]
-        self.assertEqual(len(tempo_targets), 3)
-        self.assertTrue(all(target["queryType"] == "traceql" for target in tempo_targets))
-        self.assertTrue(all(target["tableType"] == "spans" for target in tempo_targets))
-        rendered = "\n".join(target["query"] for target in tempo_targets)
+        self.assertEqual(len(loki_targets), 4)
+        rendered = "\n".join(target["expr"] for target in loki_targets)
+        for target in loki_targets:
+            self.assertIn('{service_name="aigw-requests"}', target["expr"])
+            self.assertIn("| logfmt", target["expr"])
         for field in (
-            "span:name = \"litellm_request\"",
-            "span.aigw.user.id",
-            "span.aigw.project.id",
-            "span.aigw.api_key.id",
-            "span.aigw.request.id",
-            "span.gen_ai.input.messages",
-            "span.gen_ai.output.messages",
+            "aigw_user_id",
+            "aigw_project_id",
+            "aigw_api_key_id",
+            "gen_ai_cost_total_cost",
+            "count_over_time",
+            "sum_over_time",
+            "unwrap gen_ai_cost_total_cost",
         ):
             self.assertIn(field, rendered)
-        self.assertNotIn("aigw.api_key.alias", rendered)
+        self.assertNotIn("aigw_api_key_alias", rendered)
+        self.assertNotIn("tempo", json.dumps(dashboard))
 
     def test_overview_queries_match_the_live_metric_schema(self) -> None:
         overview = next(item for item in self.dashboards if item["uid"] == "aigw-overview")
@@ -180,14 +184,13 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             ),
             "aigw-grafana-lgtm": (
                 "loki_distributor_lines_received_total",
-                "tempo_distributor_spans_received_total",
+                "traces_span_metrics_calls_total",
                 "otelcol_exporter_send_failed_log_records_total",
                 "otelcol_exporter_send_failed_spans_total",
                 "prometheus_tsdb_head_samples_appended_total",
                 "otelcol_exporter_queue_size",
                 "otelcol_exporter_queue_capacity",
                 "loki_request_duration_seconds_bucket",
-                "tempo_request_duration_seconds_bucket",
                 "grafana_datasource_request_duration_seconds_bucket",
                 "process_resident_memory_bytes",
             ),
@@ -224,7 +227,8 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             for panel in panels(lgtm)
             for target in panel.get("targets", [])
         )
-        self.assertIn('== bool 5', lgtm_queries)
+        self.assertIn('== bool 4', lgtm_queries)
+        self.assertNotIn('tempo', lgtm_queries)
         edge = next(item for item in self.dashboards if item["uid"] == "aigw-edge-identity")
         edge_queries = "\n".join(
             target["expr"]

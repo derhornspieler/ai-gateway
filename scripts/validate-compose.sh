@@ -474,8 +474,9 @@ for required in (
     assert required in rollback, required
 assert "shell=True" not in rollback
 stateful = gate.split("stateful=(", 1)[1].split(")", 1)[0].split()
-for required in ("open-webui", "vault", "alloy", "prometheus", "loki", "tempo", "grafana", "samba-ad"):
+for required in ("open-webui", "vault", "alloy", "prometheus", "loki", "grafana", "samba-ad"):
     assert required in stateful, required
+assert "tempo" not in stateful
 
 bind_digest_helper = Path(sys.argv[1]).parent / "compute-bind-source-digests.py"
 bind_digest_source = bind_digest_helper.read_text()
@@ -1043,7 +1044,6 @@ env \
   ALLOY_TELEMETRY_IP=172.28.13.2 \
   ALLOY_OBSERVABILITY_IP=172.28.15.2 \
   PROMETHEUS_OBSERVABILITY_IP=172.28.15.3 \
-  TEMPO_INGEST_IP=172.28.16.2 \
   LAB_DNS_IP=172.28.18.2 \
   LAB_DNS_ADM_CIDR=10.8.10.0/24 \
   AIGW_BIND_DIGEST_TRAEFIK_INT=0000000000000000000000000000000000000000000000000000000000000001 \
@@ -1057,7 +1057,6 @@ env \
   AIGW_BIND_DIGEST_ALLOY=0000000000000000000000000000000000000000000000000000000000000009 \
   AIGW_BIND_DIGEST_PROMETHEUS=000000000000000000000000000000000000000000000000000000000000000a \
   AIGW_BIND_DIGEST_LOKI=000000000000000000000000000000000000000000000000000000000000000b \
-  AIGW_BIND_DIGEST_TEMPO=000000000000000000000000000000000000000000000000000000000000000c \
   AIGW_BIND_DIGEST_GRAFANA=000000000000000000000000000000000000000000000000000000000000000d \
   AIGW_BIND_DIGEST_CRIBL_MOCK=000000000000000000000000000000000000000000000000000000000000000e \
   AIGW_BIND_DIGEST_LAB_DNS=000000000000000000000000000000000000000000000000000000000000000f \
@@ -1387,7 +1386,7 @@ assert services["loki"]["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
     "http://127.0.0.1:3100/ready",
 ]
-assert services["tempo"]["healthcheck"]["test"] == ["CMD", "/opt/tempo/tempo", "--health"]
+assert "tempo" not in services, "tempo was removed; traces flow to Cribl only"
 assert services["cribl-mock"]["healthcheck"]["test"] == [
     "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
     "http://127.0.0.1:13133/",
@@ -1408,7 +1407,7 @@ assert "com.aigw.contract.selinux-generation" not in services["volume-init"].get
 )
 bind_digest_services = {
     "traefik-int", "traefik-adm", "litellm", "open-webui", "keycloak",
-    "vault", "postgres", "redis", "alloy", "prometheus", "loki", "tempo",
+    "vault", "postgres", "redis", "alloy", "prometheus", "loki",
     "grafana", "cribl-mock",
 }
 assert bind_digest_services == set(manifest["base"])
@@ -1424,7 +1423,6 @@ bind_digest_environment = {
     "alloy": "AIGW_BIND_DIGEST_ALLOY",
     "prometheus": "AIGW_BIND_DIGEST_PROMETHEUS",
     "loki": "AIGW_BIND_DIGEST_LOKI",
-    "tempo": "AIGW_BIND_DIGEST_TEMPO",
     "grafana": "AIGW_BIND_DIGEST_GRAFANA",
     "cribl-mock": "AIGW_BIND_DIGEST_CRIBL_MOCK",
 }
@@ -1497,7 +1495,7 @@ expected_dhi = {
     "oauth2-proxy", "oauth2-proxy-grafana", "oauth2-proxy-prometheus",
     "oauth2-proxy-vault", "keycloak", "vault", "postgres",
     "vault-ui-proxy",
-    "redis", "alloy", "prometheus", "node-exporter", "loki", "tempo",
+    "redis", "alloy", "prometheus", "node-exporter", "loki",
     "grafana", "cribl-mock",
 }
 for name in expected_dhi:
@@ -1681,7 +1679,7 @@ assert rotator_bind["bind"]["selinux"] == "z"
 
 bind_digest_services = {
     "traefik-int", "traefik-adm", "litellm", "open-webui", "keycloak",
-    "vault", "postgres", "redis", "alloy", "prometheus", "loki", "tempo",
+    "vault", "postgres", "redis", "alloy", "prometheus", "loki",
     "grafana", "cribl-mock", "lab-dns", "samba-ad", "key-rotator",
 }
 expected_bind_sources = dict(manifest["base"])
@@ -1700,7 +1698,6 @@ bind_digest_environment = {
     "alloy": "AIGW_BIND_DIGEST_ALLOY",
     "prometheus": "AIGW_BIND_DIGEST_PROMETHEUS",
     "loki": "AIGW_BIND_DIGEST_LOKI",
-    "tempo": "AIGW_BIND_DIGEST_TEMPO",
     "grafana": "AIGW_BIND_DIGEST_GRAFANA",
     "cribl-mock": "AIGW_BIND_DIGEST_CRIBL_MOCK",
     "lab-dns": "AIGW_BIND_DIGEST_LAB_DNS",
@@ -1953,7 +1950,8 @@ assert "endpoint: 127.0.0.1:13133" in text
 assert "extensions: [health_check]" in text
 PY
 
-# Prompts are deliberately retained in Tempo/Cribl spans, not duplicated into
+# Prompts are deliberately retained in Cribl spans and the derived Loki
+# aigw-requests stream, not duplicated into
 # PostgreSQL spend rows.  Keep the DB-side opt-out explicit: relying on an
 # upstream default would make an otherwise routine LiteLLM upgrade a sensitive
 # data-expansion event.

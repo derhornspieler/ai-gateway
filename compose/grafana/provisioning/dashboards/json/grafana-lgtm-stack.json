@@ -1,6 +1,6 @@
 {
   "annotations": {"list": []},
-  "description": "Grafana, Loki, Tempo, Alloy, and Prometheus ingestion, query, queue, and process health.",
+  "description": "Grafana, Loki, Alloy, and Prometheus ingestion, query, queue, and process health.",
   "editable": false,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -17,7 +17,7 @@
       "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
       "id": 1,
       "options": {"colorMode": "background", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-      "targets": [{"editorMode": "code", "expr": "sum(up{job=~\"grafana|loki|tempo|alloy|prometheus\"} == 1) == bool 5", "instant": true, "legendFormat": "LGTM", "range": false, "refId": "A"}],
+      "targets": [{"editorMode": "code", "expr": "sum(up{job=~\"grafana|loki|alloy|prometheus\"} == 1) == bool 4", "instant": true, "legendFormat": "LGTM", "range": false, "refId": "A"}],
       "title": "Observability Targets",
       "type": "stat"
     },
@@ -37,8 +37,8 @@
       "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
       "id": 3,
       "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-      "targets": [{"editorMode": "code", "expr": "sum(rate(tempo_distributor_spans_received_total{job=\"tempo\"}[$__rate_interval])) or vector(0)", "instant": true, "legendFormat": "Spans", "range": false, "refId": "A"}],
-      "title": "Tempo Ingestion",
+      "targets": [{"editorMode": "code", "expr": "sum(rate(traces_span_metrics_calls_total[$__rate_interval])) or vector(0)", "instant": true, "legendFormat": "Spans", "range": false, "refId": "A"}],
+      "title": "AI Request Span Rate",
       "type": "stat"
     },
     {
@@ -59,7 +59,6 @@
       "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
         {"editorMode": "code", "expr": "sum(rate(loki_distributor_lines_received_total{job=\"loki\"}[$__rate_interval]))", "legendFormat": "Loki lines", "range": true, "refId": "A"},
-        {"editorMode": "code", "expr": "sum(rate(tempo_distributor_spans_received_total{job=\"tempo\"}[$__rate_interval]))", "legendFormat": "Tempo spans", "range": true, "refId": "B"},
         {"editorMode": "code", "expr": "sum(rate(prometheus_tsdb_head_samples_appended_total{job=\"prometheus\"}[$__rate_interval]))", "legendFormat": "Prometheus samples", "range": true, "refId": "C"}
       ],
       "title": "Ingestion Throughput",
@@ -83,7 +82,6 @@
       "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
         {"editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le) (rate(loki_request_duration_seconds_bucket{job=\"loki\"}[$__rate_interval])))", "legendFormat": "Loki p95", "range": true, "refId": "A"},
-        {"editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le) (rate(tempo_request_duration_seconds_bucket{job=\"tempo\"}[$__rate_interval])))", "legendFormat": "Tempo p95", "range": true, "refId": "B"},
         {"editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le) (rate(grafana_datasource_request_duration_seconds_bucket{job=\"grafana\"}[$__rate_interval])))", "legendFormat": "Grafana datasource p95", "range": true, "refId": "C"}
       ],
       "title": "Query and Datasource Latency",
@@ -95,14 +93,14 @@
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
       "id": 8,
       "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-      "targets": [{"editorMode": "code", "expr": "sum by (job) (process_resident_memory_bytes{job=~\"grafana|loki|tempo|alloy|prometheus\"})", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
+      "targets": [{"editorMode": "code", "expr": "sum by (job) (process_resident_memory_bytes{job=~\"grafana|loki|alloy|prometheus\"})", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
       "title": "Observability Process Memory",
       "type": "timeseries"
     }
   ],
   "refresh": "15s",
   "schemaVersion": 42,
-  "tags": ["ai-gateway", "grafana", "loki", "tempo", "alloy", "prometheus"],
+  "tags": ["ai-gateway", "grafana", "loki", "alloy", "prometheus"],
   "templating": {"list": []},
   "time": {"from": "now-6h", "to": "now"},
   "timepicker": {},

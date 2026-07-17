@@ -151,6 +151,9 @@ done
 # before containers were stopped. Remove only the fixed reviewed top-level
 # roots, so a pre-existing symlink cannot redirect a privileged copy outside
 # STACK_DIR, then install the root-owned staged tree without interpreting tar.
+# `tempo` stays in this removal list although new archives no longer carry it:
+# restoring onto a host that predates the Tempo removal must still clear the
+# stale tempo/ config root instead of leaving it beside the restored tree.
 config_roots=(
   docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml docker-compose.lab.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana
   keycloak litellm loki postgres prometheus tempo traefik services scripts

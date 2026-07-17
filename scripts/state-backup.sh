@@ -129,7 +129,7 @@ pg_version="$("${compose[@]}" exec -T postgres psql -U postgres -d postgres -Atq
 
 allowed_volumes=(
   pg_data openwebui_data vault_data vault_audit alloy_data prom_data
-  loki_data tempo_data grafana_data samba_ad_config samba_ad_state samba_ad_public
+  loki_data grafana_data samba_ad_config samba_ad_state samba_ad_public
 )
 archived_volumes=()
 for logical in "${allowed_volumes[@]}"; do
@@ -160,7 +160,7 @@ done
   echo "move/delete secrets/vault-init.json before backup; do not co-locate unseal material with Vault state" >&2
   exit 1
 }
-config_items=(docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana keycloak litellm loki postgres prometheus tempo traefik services scripts certs)
+config_items=(docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana keycloak litellm loki postgres prometheus traefik services scripts certs)
 [[ ! -f docker-compose.lab.yml ]] || config_items+=(docker-compose.lab.yml)
 [[ ! -d secrets ]] || config_items+=(secrets)
 tar --numeric-owner --exclude='.state' --exclude='.state-backup.*' \

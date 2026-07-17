@@ -36,7 +36,6 @@ networks:
   net-telemetry:    { external: true }
   net-metrics:      { external: true }
   net-observability: { external: true }
-  net-traces:       { external: true }
   # Ordinary bridge required for Docker 29's published-port DNAT. It has no
   # application peers and remains egress-denied by both host firewall layers.
   net-int-edge:     { external: true }
@@ -105,7 +104,6 @@ services:
         chown 473:473 /state/alloy && chmod 0700 /state/alloy
         chown 65532:65532 /state/prometheus && chmod 0700 /state/prometheus
         chown 65532:65532 /state/loki && chmod 0700 /state/loki
-        chown 65532:65532 /state/tempo && chmod 0700 /state/tempo
         chown 65532:65532 /state/grafana && chmod 0700 /state/grafana
     volumes:
       - pg_data:/state/postgres
@@ -115,7 +113,6 @@ services:
       - alloy_data:/state/alloy
       - prom_data:/state/prometheus
       - loki_data:/state/loki
-      - tempo_data:/state/tempo
       - grafana_data:/state/grafana
 
   # ── edge: internal users (eth2) ─────────────────────────────────────
@@ -1221,7 +1218,6 @@ services:
       - --server.http.listen-addr=${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}:12345
     environment:
       ALLOY_TELEMETRY_IP: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}
-      TEMPO_INGEST_IP: ${TEMPO_INGEST_IP:?TEMPO_INGEST_IP must be set}
       CRIBL_OTLP_ENDPOINT: ${CRIBL_OTLP_ENDPOINT:?CRIBL_OTLP_ENDPOINT must be set}
       CRIBL_OTLP_INSECURE: ${CRIBL_OTLP_INSECURE:-false}
       CRIBL_OTLP_CA_FILE: ${CRIBL_OTLP_CA_FILE:-/etc/ssl/certs/aigw-cribl-ca.pem}
@@ -1241,7 +1237,6 @@ services:
         ipv4_address: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}
       net-observability:
         ipv4_address: ${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}
-      net-traces: {}
       # Fixed source identity for an explicitly enabled external Cribl export.
       # The in-stack mock remains reachable without a physical-NIC exception.
       net-internal:
@@ -1289,7 +1284,9 @@ services:
       # inject remote-write series into its unauthenticated web API.
       - --web.listen-address=${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}:9090
       - --storage.tsdb.path=/var/prometheus
-      - --storage.tsdb.retention.time=15d
+      # 7d local metrics (owner decision, matched to Loki's 168h); long-term
+      # retention is the customer Cribl pipeline's job.
+      - --storage.tsdb.retention.time=7d
       - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-5GB}
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
@@ -1396,44 +1393,6 @@ services:
     depends_on:
       volume-init: { condition: service_completed_successfully }
 
-  tempo:
-    <<: *hardening
-    labels:
-      <<: *selinux-labels
-      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_TEMPO:?AIGW_BIND_DIGEST_TEMPO must be set}
-    # Immutable multi-arch v3.0.2 index. Full-prompt attributes require the
-    # explicit non-default size limits in tempo/config.yml.
-    image: dhi.io/tempo:3.0.2@sha256:bf79f4006e80cee3ef1b402fedf7899fb423b20173ff9d49337110df76d36203
-    read_only: true
-    tmpfs: [/tmp]
-    deploy:
-      resources:
-        limits: { memory: 1G, cpus: "1.0", pids: 512 }
-    command:
-      - -target=all
-      - -config.file=/etc/tempo/config.yml
-      - -config.expand-env=true
-    environment:
-      TEMPO_INGEST_IP: ${TEMPO_INGEST_IP:?TEMPO_INGEST_IP must be set}
-    volumes:
-      - ./tempo/config.yml:/etc/tempo/config.yml:ro,Z
-      - tempo_data:/var/tempo
-    networks:
-      net-traces:
-        ipv4_address: ${TEMPO_INGEST_IP:?TEMPO_INGEST_IP must be set}
-      net-observability: {}
-    healthcheck:
-      # Tempo provides this shell-free native /ready client specifically for
-      # its distroless image; no extra probe layer is required.
-      # DHI relocates the upstream binary from /tempo to /opt/tempo/tempo.
-      test: [CMD, /opt/tempo/tempo, --health]
-      interval: 10s
-      timeout: 5s
-      retries: 18
-      start_period: 30s
-    depends_on:
-      volume-init: { condition: service_completed_successfully }
-
   grafana:
     <<: *hardening
     labels:
@@ -1496,7 +1455,7 @@ services:
       # DHI stays deterministic/offline. Grafana 12's built-in app preinstall
       # list remains active even when the explicit list is empty, so disable
       # that mechanism and every online update/signature lookup. The built-in
-      # Prometheus, Loki, Tempo, and PostgreSQL datasources require no
+      # Prometheus, Loki, and PostgreSQL datasources require no
       # downloaded plugin; the sole app plugin (Loki drilldown) is baked into
       # the image below and served from an immutable read-only rootfs path.
       GF_PLUGINS_PREINSTALL: ""
@@ -1529,7 +1488,6 @@ services:
     depends_on:
       prometheus: { condition: service_healthy }
       loki: { condition: service_started }
-      tempo: { condition: service_started }
       volume-init: { condition: service_completed_successfully }
 
   cribl-mock:
@@ -1572,5 +1530,4 @@ volumes:
   alloy_data:
   prom_data:
   loki_data:
-  tempo_data:
   grafana_data:

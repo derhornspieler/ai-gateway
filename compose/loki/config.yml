@@ -1,6 +1,8 @@
 # Loki single-binary, filesystem storage (LUKS-encrypted volume at rest §1.6).
-# Full AI content belongs in Tempo spans, not logs. Loki still contains
-# sensitive operational/audit data and is queried only via the ADM Grafana path.
+# Full AI content lives in Cribl spans and, by explicit owner decision, in the
+# dedicated per-request stream (service_name="aigw-requests") Alloy derives
+# from litellm_request spans. Loki therefore contains sensitive prompt and
+# operational/audit data and is queried only via the ADM Grafana path.
 auth_enabled: false
 
 server:
@@ -51,4 +53,4 @@ schema_config:
         period: 24h
 
 limits_config:
-  retention_period: 720h   # 30d local; long-term retention is Cribl's job
+  retention_period: 168h   # 7d local; long-term retention is Cribl's job

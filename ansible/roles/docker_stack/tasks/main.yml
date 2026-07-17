@@ -37,7 +37,6 @@
       - alloy_telemetry_ip == '172.28.13.2'
       - alloy_observability_ip == '172.28.15.2'
       - prometheus_observability_ip == '172.28.15.3'
-      - tempo_ingest_ip == '172.28.16.2'
       - lab_dns_ip == '172.28.18.2'
       - keycloak_internal_ip == '172.28.2.3'
       - (docker_networks | selectattr('name', 'equalto', 'net-chat') | map(attribute='subnet') | first) == '172.28.3.0/24'
@@ -46,7 +45,6 @@
       - (docker_networks | selectattr('name', 'equalto', 'net-grafana') | map(attribute='subnet') | first) == '172.28.6.0/24'
       - (docker_networks | selectattr('name', 'equalto', 'net-telemetry') | map(attribute='subnet') | first) == '172.28.13.0/24'
       - (docker_networks | selectattr('name', 'equalto', 'net-observability') | map(attribute='subnet') | first) == '172.28.15.0/24'
-      - (docker_networks | selectattr('name', 'equalto', 'net-traces') | map(attribute='subnet') | first) == '172.28.16.0/24'
       - (docker_networks | selectattr('name', 'equalto', 'net-identity') | map(attribute='subnet') | first) == '172.28.17.0/24'
       - (docker_networks | selectattr('name', 'equalto', 'net-lab-dns') | map(attribute='subnet') | first) == '172.28.18.0/24'
     fail_msg: >-
@@ -286,7 +284,6 @@
     - postgres/init
     - prometheus
     - traefik
-    - tempo
     - vault
 
 - name: Find existing Grafana dashboard artifacts
@@ -359,7 +356,6 @@
     - traefik/traefik-adm.yml
     - traefik/dynamic-int.yml
     - traefik/dynamic-adm.yml
-    - tempo/config.yml
     - vault/config.hcl
 
 - name: Render plane-specific container resolver lists
@@ -2025,7 +2021,6 @@
           {'path': stack_dir ~ '/prometheus/rules.yml', 'recursive': false},
           {'path': stack_dir ~ '/secrets/redis_password', 'recursive': false},
           {'path': stack_dir ~ '/secrets/redis_users.acl', 'recursive': false},
-          {'path': stack_dir ~ '/tempo/config.yml', 'recursive': false},
           {'path': stack_dir ~ '/traefik/dynamic-adm.yml', 'recursive': false},
           {'path': stack_dir ~ '/traefik/dynamic-int.yml', 'recursive': false},
           {'path': stack_dir ~ '/traefik/traefik-adm.yml', 'recursive': false},
@@ -2381,7 +2376,6 @@
             "alloy_data": (473, 473, 0o700),
             "prom_data": (65532, 65532, 0o700),
             "loki_data": (65532, 65532, 0o700),
-            "tempo_data": (65532, 65532, 0o700),
             "grafana_data": (65532, 65532, 0o700),
         }
         drift = []
@@ -2476,7 +2470,6 @@
             "alloy_data": (473, 473, 0o700),
             "prom_data": (65532, 65532, 0o700),
             "loki_data": (65532, 65532, 0o700),
-            "tempo_data": (65532, 65532, 0o700),
             "grafana_data": (65532, 65532, 0o700),
         }
         drift = []
@@ -2771,7 +2764,7 @@
           'oauth2-proxy-prometheus', 'litellm',
           'open-webui', 'keycloak', 'dev-portal', 'admin-portal',
           'key-rotator', 'vault', 'postgres', 'redis',
-          'prometheus', 'node-exporter', 'loki', 'tempo', 'grafana'
+          'prometheus', 'node-exporter', 'loki', 'grafana'
         ] + (['oauth2-proxy-vault', 'vault-ui-proxy']
              if (aigw_vault_ui_enabled | bool) else [])) | to_json }}
     stdin: "{{ effective_compose_model.stdout }}"

@@ -166,29 +166,34 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         # dropping it silently empties that whole UI (observed live).
         self.assertIn('service_name = "service"', docker_logs)
 
-    def test_tempo_and_cribl_queues_are_durable_bounded_and_independent(self) -> None:
-        for label, directory, size in (
-            ("tempo", "/var/lib/alloy/queues/tempo", 33554432),
-            ("cribl", "/var/lib/alloy/queues/cribl", 67108864),
-        ):
-            storage = self.alloy.split(
-                f'otelcol.storage.file "{label}_queue"', 1
-            )[1].split("}\n\n", 1)[0]
-            self.assertIn(f'directory             = "{directory}"', storage)
-            self.assertIn("fsync                  = true", storage)
-            self.assertIn("on_start                      = true", storage)
-            self.assertIn("on_rebound                    = true", storage)
+    def test_cribl_queue_is_durable_bounded_and_sized_for_a_day_of_outage(self) -> None:
+        storage = self.alloy.split(
+            'otelcol.storage.file "cribl_queue"', 1
+        )[1].split("}\n\n", 1)[0]
+        self.assertIn('directory             = "/var/lib/alloy/queues/cribl"', storage)
+        self.assertIn("fsync                  = true", storage)
+        self.assertIn("on_start                      = true", storage)
+        self.assertIn("on_rebound                    = true", storage)
+        self.assertIn("rebound_needed_threshold_mib  = 2048", storage)
+        self.assertIn("rebound_trigger_threshold_mib = 512", storage)
 
-            exporter = self.alloy.split(
-                f'otelcol.exporter.otlp "{label}"', 1
-            )[1].split("\n}\n", 1)[0]
-            self.assertIn(f"queue_size        = {size}", exporter)
-            self.assertIn('sizer             = "bytes"', exporter)
-            self.assertIn(
-                f"storage           = otelcol.storage.file.{label}_queue.handler",
-                exporter,
-            )
-            self.assertIn('max_elapsed_time = "0s"', exporter)
+        exporter = self.alloy.split(
+            'otelcol.exporter.otlp "cribl"', 1
+        )[1].split("\n}\n", 1)[0]
+        # Owner decision: the persistent queue is the ~24h Cribl-outage
+        # buffer; 2 GiB byte-bounded, never an unbounded batch count.
+        self.assertIn("queue_size        = 2147483648", exporter)
+        self.assertIn('sizer             = "bytes"', exporter)
+        self.assertIn(
+            "storage           = otelcol.storage.file.cribl_queue.handler",
+            exporter,
+        )
+        self.assertIn('max_elapsed_time = "0s"', exporter)
+
+        # Tempo was removed: no second OTLP exporter, no tempo queue, and no
+        # TEMPO_INGEST_IP contract may survive anywhere in the pipeline.
+        self.assertNotIn("tempo", self.alloy.lower())
+        self.assertNotIn("TEMPO_INGEST_IP", self.compose)
 
         alloy_service = self.compose.split("  alloy:\n", 1)[1].split(
             "  loki:\n", 1
@@ -196,6 +201,79 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         self.assertIn("- alloy_data:/var/lib/alloy", alloy_service)
         self.assertIn("- --stability.level=public-preview", alloy_service)
         self.assertIn("- --disable-reporting", alloy_service)
+
+    def test_request_stream_is_filtered_allowlisted_and_labeled_for_drilldown(self) -> None:
+        # The Loki request stream must be fed from the SANITIZED trace path:
+        # batch fans out to Cribl, spanmetrics, and the request-span filter —
+        # nothing else, and no Tempo exporter.
+        batch = self.alloy.split('otelcol.processor.batch "default"', 1)[1].split(
+            "\n}\n", 1
+        )[0]
+        self.assertIn("otelcol.exporter.otlp.cribl.input", batch)
+        self.assertIn("otelcol.connector.spanmetrics.default.input", batch)
+        self.assertIn("otelcol.processor.filter.aigw_request_spans.input", batch)
+
+        # Only the exact litellm_request span may become a log line; sibling
+        # spans (raw vendor payload, proxy request) are dropped here while
+        # still reaching Cribl through the batch fan-out.
+        span_filter = self.alloy.split(
+            'otelcol.processor.filter "aigw_request_spans"', 1
+        )[1].split("\n}\n", 1)[0]
+        self.assertIn('`name != "litellm_request"`', span_filter)
+        self.assertIn(
+            "traces = [otelcol.connector.spanlogs.aigw_requests.input]", span_filter
+        )
+
+        spanlogs = self.alloy.split(
+            'otelcol.connector.spanlogs "aigw_requests"', 1
+        )[1].split("\n}\n", 1)[0]
+        self.assertIn("spans = true", spanlogs)
+        for attribute in (
+            "aigw.user.id",
+            "aigw.api_key.id",
+            "aigw.project.id",
+            "aigw.request.id",
+            "gen_ai.request.model",
+            "gen_ai.response.model",
+            "litellm.model_group",
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.total_tokens",
+            "gen_ai.cost.total_cost",
+            "gen_ai.response.finish_reasons",
+            "llm.is_streaming",
+            "http.route",
+            "litellm.call_id",
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+        ):
+            self.assertIn(f'"{attribute}",', spanlogs)
+        # Allow-list only: never a raw credential/identity source.
+        for forbidden in ("authorization", "metadata.user_api_key", "headers"):
+            self.assertNotIn(forbidden, spanlogs)
+        self.assertIn(
+            "logs = [otelcol.processor.transform.aigw_request_stream.input]",
+            spanlogs,
+        )
+
+        # Grafana Logs Drilldown keys on service_name; the stream identity is
+        # pinned on the resource and promoted via the documented Loki hint.
+        transform = self.alloy.split(
+            'otelcol.processor.transform "aigw_request_stream"', 1
+        )[1].split("\n}\n", 1)[0]
+        self.assertIn(
+            '`set(attributes["service.name"], "aigw-requests")`', transform
+        )
+        self.assertIn(
+            "logs = [otelcol.processor.attributes.aigw_request_stream_labels.input]",
+            transform,
+        )
+        labels = self.alloy.split(
+            'otelcol.processor.attributes "aigw_request_stream_labels"', 1
+        )[1].split("\n}\n", 1)[0]
+        self.assertIn('key    = "loki.resource.labels"', labels)
+        self.assertIn('value  = "service.name"', labels)
+        self.assertIn("logs = [otelcol.exporter.loki.local.input]", labels)
 
 
 if __name__ == "__main__":
