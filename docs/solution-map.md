@@ -607,7 +607,7 @@ Important residuals before production:
   which remain unsupported until a database-backed or distributed fenced lock
   exists;
 - the two ADM OAuth2 Proxy cookies revalidate every five minutes and expire
-  after eight hours, leaving a bounded post-revocation edge window that
+  after ten hours, leaving a bounded post-revocation edge window that
   acceptance must verify;
 - Vault bootstrap is 1-of-1, file-backed, internally plaintext, and uses a test
   root; customer-root PKI and production unseal custody are not automated, and

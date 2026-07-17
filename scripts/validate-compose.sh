@@ -1168,7 +1168,7 @@ for name in (
 ):
     env = services[name]["environment"]
     assert env["OAUTH2_PROXY_COOKIE_REFRESH"] == "5m", name
-    assert env["OAUTH2_PROXY_COOKIE_EXPIRE"] == "8h", name
+    assert env["OAUTH2_PROXY_COOKIE_EXPIRE"] == "10h", name
     assert env["OAUTH2_PROXY_SCOPE"] == "openid email profile", name
     assert env["OAUTH2_PROXY_OIDC_EMAIL_CLAIM"] == "preferred_username", name
     assert env["OAUTH2_PROXY_SKIP_PROVIDER_BUTTON"] == "true", name
@@ -1277,6 +1277,7 @@ assert services["open-webui"]["environment"]["WEBUI_SECRET_KEY"] == "ValidationS
 assert services["open-webui"]["environment"]["SSL_CERT_FILE"] == "/etc/ssl/certs/aigw-ca.pem"
 assert services["open-webui"]["environment"]["WEBUI_SESSION_COOKIE_SECURE"] == "true"
 assert services["open-webui"]["environment"]["WEBUI_AUTH_COOKIE_SECURE"] == "true"
+assert services["open-webui"]["environment"]["JWT_EXPIRES_IN"] == "10h"
 open_webui = services["open-webui"]
 assert open_webui["user"] == "65532:65532"
 assert open_webui["read_only"] is True

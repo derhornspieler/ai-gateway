@@ -618,9 +618,9 @@ authorization until its nominal session expiry.
 Test each admin UI separately after Keycloak logout. Four oauth2-proxy
 instances — for the LiteLLM Admin UI, Grafana, Prometheus, and Vault — sit on
 the ADM leg and share the single `admin-ui` Keycloak client; all four
-refresh/revalidate their cookies every five minutes and expire them after eight
+refresh/revalidate their cookies every five minutes and expire them after ten
 hours. Privileged access must be rejected no later than the first refresh after
-revocation; separately prove an inactive cookie cannot exceed the eight-hour
+revocation; separately prove an inactive cookie cannot exceed the ten-hour
 maximum. Every portal admin page read and mutation must deny the live-revoked
 administrator immediately.
 

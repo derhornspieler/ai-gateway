@@ -912,11 +912,11 @@ allow-list.
 A logout initiated *elsewhere* (another app's sign-out, a Keycloak console
 session revocation) still does not erase an already-issued oauth2-proxy
 cookie. The proxies refresh and revalidate cookies every five minutes and cap
-them at eight hours; the portal's live composite-role check closes the
+them at ten hours; the portal's live composite-role check closes the
 stale-cookie path immediately for admin reads and mutations, while the LiteLLM
 Admin UI and Grafana can retain their edge session until the next proxy refresh.
 Acceptance must prove revocation is enforced within that five-minute bound after
-Keycloak logout and that no cookie survives the eight-hour maximum. See
+Keycloak logout and that no cookie survives the ten-hour maximum. See
 [project-status.md](project-status.md) for the overall prototype posture: this is
 a customer prototype, not a turnkey, highly available appliance, and recovery
 acceptance does not confer HA.

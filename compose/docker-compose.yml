@@ -263,7 +263,7 @@ services:
       # Re-run the Keycloak refresh flow frequently enough that logout and AD
       # group/role revocation are not hidden behind a week-long signed cookie.
       OAUTH2_PROXY_COOKIE_REFRESH: 5m
-      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_COOKIE_EXPIRE: 10h
       # Deliberately omit request URI, upstream URL, and free-form messages:
       # OAuth callbacks carry one-time code/state values in the query string.
       OAUTH2_PROXY_REQUEST_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} host={{.Host}} method={{.RequestMethod}} protocol={{.Protocol}} status={{.StatusCode}} bytes={{.ResponseSize}} duration={{.RequestDuration}}'
@@ -342,7 +342,7 @@ services:
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       OAUTH2_PROXY_COOKIE_REFRESH: 5m
-      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_COOKIE_EXPIRE: 10h
       OAUTH2_PROXY_REQUEST_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} host={{.Host}} method={{.RequestMethod}} protocol={{.Protocol}} status={{.StatusCode}} bytes={{.ResponseSize}} duration={{.RequestDuration}}'
       OAUTH2_PROXY_AUTH_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} status={{.Status}}'
       OAUTH2_PROXY_REVERSE_PROXY: "true"
@@ -399,7 +399,7 @@ services:
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       OAUTH2_PROXY_COOKIE_REFRESH: 5m
-      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_COOKIE_EXPIRE: 10h
       OAUTH2_PROXY_REQUEST_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} host={{.Host}} method={{.RequestMethod}} protocol={{.Protocol}} status={{.StatusCode}} bytes={{.ResponseSize}} duration={{.RequestDuration}}'
       OAUTH2_PROXY_AUTH_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} status={{.Status}}'
       OAUTH2_PROXY_REVERSE_PROXY: "true"
@@ -455,7 +455,7 @@ services:
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       OAUTH2_PROXY_COOKIE_REFRESH: 5m
-      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_COOKIE_EXPIRE: 10h
       OAUTH2_PROXY_REQUEST_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} host={{.Host}} method={{.RequestMethod}} protocol={{.Protocol}} status={{.StatusCode}} bytes={{.ResponseSize}} duration={{.RequestDuration}}'
       OAUTH2_PROXY_AUTH_LOGGING_FORMAT: '[{{.Timestamp}}] request_id={{.RequestID}} client={{.Client}} user={{.Username}} status={{.Status}}'
       OAUTH2_PROXY_REVERSE_PROXY: "true"
@@ -617,6 +617,10 @@ services:
       ENABLE_LOGIN_FORM: "false"
       WEBUI_SESSION_COOKIE_SECURE: "true"
       WEBUI_AUTH_COOKIE_SECURE: "true"
+      # Session policy: every gateway session is capped at 10h absolute
+      # (Keycloak enforces the 8h idle timeout realm-side). Open WebUI's
+      # default token lifetime is unlimited, which would outlive SSO logout.
+      JWT_EXPIRES_IN: 10h
       OAUTH_CLIENT_ID: open-webui
       OAUTH_CLIENT_SECRET: ${WEBUI_OIDC_CLIENT_SECRET:?WEBUI_OIDC_CLIENT_SECRET must be set}
       OPENID_PROVIDER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/.well-known/openid-configuration"

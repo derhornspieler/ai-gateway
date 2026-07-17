@@ -16,6 +16,8 @@
   "maxDeltaTimeSeconds": 43200,
   "loginTheme": "keycloak",
   "accessTokenLifespan": 600,
+  "ssoSessionIdleTimeout": 28800,
+  "ssoSessionMaxLifespan": 36000,
   "roles": {
     "realm": [
       { "name": "aigw-admins", "description": "Admin portal + Grafana + rotation control" },

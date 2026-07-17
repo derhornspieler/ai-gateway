@@ -148,8 +148,9 @@ class Settings(BaseSettings):
 
     # How long a signed session cookie is honored. Kept deliberately short: the
     # cookie carries roles and is signed (not encrypted), so bounding its
-    # lifetime bounds the blast radius of any stale/forged cookie. 8h.
-    session_max_age_seconds: int = Field(default=8 * 60 * 60, ge=300, le=24 * 60 * 60)
+    # lifetime bounds the blast radius of any stale/forged cookie. 10h — the
+    # gateway-wide absolute session cap (Keycloak enforces the 8h idle limit).
+    session_max_age_seconds: int = Field(default=10 * 60 * 60, ge=300, le=24 * 60 * 60)
 
     # Destructive identity changes require a fresh OIDC prompt in addition to
     # the normal signed admin session. The resulting marker contains no token
