@@ -77,13 +77,13 @@ python3 "$STACK_DIR/scripts/restore_archive.py" \
   --volume-target "$docker_root"
 rm -f "$staging/outer.tar.gz"
 
-# PostgreSQL major-version guard. A logical dump taken on major N cannot be
-# loaded by a different major's server binaries, and this restore replaces the
-# data volume while the deployed Compose file pins the postgres image that will
-# start next. Compare the backup receipt's recorded server_version major
-# against the deployed pin and refuse a cross-major restore before any
-# destructive operation. (Audit 2026-07-16 risk 2: restore had no version
-# guard.) Same-major minor differences are allowed.
+# PostgreSQL major-version guard. This restore replaces the physical pg_data
+# volume, and a data directory written by major N will not start under a
+# different major's server binaries. The deployed Compose file pins the
+# postgres image that will mount the restored volume next, so compare the
+# backup receipt's recorded server_version major against that pin and refuse a
+# cross-major restore before any destructive operation. (Audit 2026-07-16 risk
+# 2: restore had no version guard.) Same-major minor differences are allowed.
 backup_pg_major="$(python3 - "$staging/extracted/manifest.json" <<'PY'
 import json, re, sys
 v = str(json.load(open(sys.argv[1])).get("postgres_version", ""))
@@ -94,7 +94,9 @@ PY
 target_pg_major="$(python3 - "$STACK_DIR/docker-compose.yml" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
-m = re.search(r"image:\s*\S*postgres:(\d+)", text)
+# Anchor to a real `image:` line (line-start after indentation) so a commented
+# or documentation reference to a postgres tag cannot be read as the pin.
+m = re.search(r"(?m)^\s*image:\s*\S*postgres:(\d+)", text)
 print(m.group(1) if m else "")
 PY
 )"
