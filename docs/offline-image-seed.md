@@ -15,7 +15,7 @@ see [solution-map.md](solution-map.md).
 The archive holds every literal digest-pinned external image in the reviewed
 Compose and Dockerfile sources — exactly the set
 `scripts/rebuild-offline-image-seed.py` collects: the directly run DHI pins
-(`busybox`, `postgres`, `tempo`), the DHI base images that each locally built
+(`busybox`, `postgres`), the DHI base images that each locally built
 `ai-gateway/dhi-*:<ver>-probe` derivative is built FROM (oauth2-proxy,
 keycloak, vault, redis, alloy, prometheus, node-exporter, loki, grafana, and
 the OpenTelemetry Collector, plus both the DHI Traefik runtime base and the
@@ -101,22 +101,29 @@ root-owned mode `0600` at the pinned `/var/tmp` paths:
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `aigw-external-images-linux-arm64-20260717-batch.docker.tar.zst` | 3,338,982,081 bytes | `e5f25660d8d766044492a5c562622f5a44e4339147a31b0fb287ce717122e483` |
-| `aigw-external-images-linux-arm64-20260717-batch.manifest.json` | 5,189 bytes | `571c5d0b25fb911b1be7251062a8d651bf6545c8131297d54c9284e2c704375e` |
+| `aigw-external-images-linux-arm64-20260717-notempo.docker.tar.zst` | 3,310,325,144 bytes | `1e485c3c8cb3eb0ecfb8d2358d71ef44d0919e490d204cf2d8d0f6aa4be73410` |
+| `aigw-external-images-linux-arm64-20260717-notempo.manifest.json` | 4,999 bytes | `ebafa86ae961a698620af77e126b6fd0a76e4f49889c9e156211186a1b2bf7cd` |
 
 Both files are also retained mode `0600` beneath
-`/Users/jamesrudisill/.aigw-lab-dr/20260717-batch-seed`. The archive passed
+`/Users/jamesrudisill/.aigw-lab-dr/20260717-notempo-seed`. The archive passed
 zstd integrity and OCI-metadata validation during export. Its manifest records
-25 exact Linux/ARM64 external `tag@sha256` references and immutable image IDs
-— the complete digest-pinned source set of the checkout it was built from,
-including the upstream `hashicorp/vault` Vault UI source added for the
+24 exact Linux/ARM64 external `tag@sha256` references and immutable image IDs
+— the complete digest-pinned source set of the checkout it was built from
+after the Tempo removal (traces now flow to Cribl only), including the
+upstream `hashicorp/vault` Vault UI source added for the
 optional Vault UI feature — and asserts that no locally built `ai-gateway/*`
 image is present. Every recorded RepoDigest and image ID was verified against
-the daemon before export, and the identical map is frozen in
-`ansible/reset-rocky9-lab.yml` (`aigw_lab_reset_legacy_seed_image_tags`),
-which the lab reset requires the staged manifest to equal exactly.
+the daemon before export. The frozen legacy map in
+`ansible/reset-rocky9-lab.yml` (`aigw_lab_reset_legacy_seed_image_tags`)
+still describes the 25-image 2026-07-17 "batch" seed (including
+`dhi.io/tempo`) because the legacy reset compares against the snapshot-era
+staging, not the current seed.
 
-The superseded 2026-07-16 seed
+The superseded 2026-07-17 "batch" seed
+(`aigw-external-images-linux-arm64-20260717-batch.docker.tar.zst`,
+`e5f25660d8d766044492a5c562622f5a44e4339147a31b0fb287ce717122e483`, 25 images,
+pre-Tempo-removal pins) remains retained beneath
+`/Users/jamesrudisill/.aigw-lab-dr/20260717-batch-seed`, the 2026-07-16 seed
 (`aigw-external-images-linux-arm64-20260716-vaultui.docker.tar.zst`,
 `00b9e596cda233eb8660e6ae63850169441814b6c0a679cad56db8f059854869`, 25 images,
 pre-batch pins) remains retained beneath
