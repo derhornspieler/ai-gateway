@@ -45,6 +45,8 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "aigw.api_key.id": "metadata.user_api_key_hash",
             "aigw.request.id": "litellm.call_id",
             "aigw.project.id": "metadata.user_api_key_project_id",
+            "aigw.enduser.id": "metadata.user_api_key_end_user_id",
+            "aigw.user.name": "metadata.user_api_key_alias",
         }
         for canonical, source in expected.items():
             self.assertIn(f'attributes["{canonical}"]', self.correlation)
@@ -59,6 +61,36 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         self.assertIn("^[0-9a-f]{64}$", self.correlation)
         self.assertNotIn("aigw.api_key.alias", self.correlation)
         self.assertNotIn("llm.user", self.correlation)
+
+    def test_readable_identity_is_prioritized_bounded_and_always_present(self) -> None:
+        """aigw.user.name resolution order (first match wins): the header-
+        forwarded chat end user, the portal-stamped aigw_username, the key
+        alias, then the opaque aigw.user.id so the field (and its Loki label)
+        never goes missing. Every source is regex-bounded because these become
+        log fields and a stream label."""
+        statements = self.correlation.split("statements = [", 1)[1]
+        order = [
+            'set(attributes["aigw.enduser.id"], attributes["metadata.user_api_key_end_user_id"])',
+            'set(attributes["aigw.user.name"], attributes["aigw.enduser.id"])',
+            "aigw_username",
+            'set(attributes["aigw.user.name"], attributes["metadata.user_api_key_alias"])',
+            'set(attributes["aigw.user.name"], attributes["aigw.user.id"])',
+        ]
+        positions = [statements.index(fragment) for fragment in order]
+        self.assertEqual(positions, sorted(positions))
+        # Every fallback except the seed rule is nil-guarded so a higher-
+        # priority identity is never overwritten.
+        self.assertEqual(
+            statements.count('attributes["aigw.user.name"] == nil'), 3
+        )
+        # Bounded charsets: the end-user/alias rule and the portal-username
+        # extraction (kept textually identical to the dev-portal stamper).
+        self.assertEqual(
+            statements.count("^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$"), 3
+        )
+        self.assertIn(
+            "(?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})", statements
+        )
 
     def test_every_otlp_signal_is_sanitized_before_batch_and_export(self) -> None:
         memory = self.alloy.split(
@@ -129,6 +161,8 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
 
         retained = (
             "aigw.user.id",
+            "aigw.user.name",
+            "aigw.enduser.id",
             "aigw.project.id",
             "aigw.api_key.id",
             "aigw.request.id",
@@ -227,9 +261,23 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         spanlogs = self.alloy.split(
             'otelcol.connector.spanlogs "aigw_requests"', 1
         )[1].split("\n}\n", 1)[0]
-        self.assertIn("spans = true", spanlogs)
+        self.assertIn("spans  = true", spanlogs)
+        # Bounded-cardinality attribution labels only: user/project populations
+        # are small and this is one dedicated stream. Request-id and key-id are
+        # unbounded/high-churn and must never become labels.
+        self.assertIn(
+            'labels = [\n    "aigw.user.name",\n    "aigw.project.id",\n  ]',
+            spanlogs,
+        )
+        for forbidden_label in ("aigw.request.id", "aigw.api_key.id"):
+            self.assertNotIn(
+                forbidden_label,
+                spanlogs.split("labels = [", 1)[1].split("]", 1)[0],
+            )
         for attribute in (
             "aigw.user.id",
+            "aigw.user.name",
+            "aigw.enduser.id",
             "aigw.api_key.id",
             "aigw.project.id",
             "aigw.request.id",
@@ -273,6 +321,10 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         )[1].split("\n}\n", 1)[0]
         self.assertIn('key    = "loki.resource.labels"', labels)
         self.assertIn('value  = "service.name"', labels)
+        # The documented hint promotes exactly the two bounded attribution
+        # attributes into aigw_user_name / aigw_project_id stream labels.
+        self.assertIn('key    = "loki.attribute.labels"', labels)
+        self.assertIn('value  = "aigw.user.name, aigw.project.id"', labels)
         self.assertIn("logs = [otelcol.exporter.loki.local.input]", labels)
 
 

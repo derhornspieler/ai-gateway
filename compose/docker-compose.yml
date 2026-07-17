@@ -670,6 +670,13 @@ services:
       # instead of the chat login. The value must byte-match the open-webui
       # client's post.logout.redirect.uris (reconciled by key-rotator).
       WEBUI_AUTH_SIGNOUT_REDIRECT_URL: "https://chat.${DOMAIN:?DOMAIN must be set}/"
+      # Forward the authenticated chat identity to LiteLLM as
+      # X-OpenWebUI-User-{Name,Id,Email,Role} headers so per-request telemetry
+      # attributes chat traffic to the person, not the shared workload key.
+      # LiteLLM reads the Email header (which carries preferred_username under
+      # OAUTH_EMAIL_CLAIM above) via general_settings.user_header_name; the
+      # header is attribution-only and grants no authorization there.
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
       # Model authorization lives at the gateway: the scoped workload key and
       # the per-project runtime policy decide which models chat may reach.
       # Open WebUI's own model access control is redundant on this path, and

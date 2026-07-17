@@ -1277,6 +1277,11 @@ assert services["open-webui"]["environment"]["SSL_CERT_FILE"] == "/etc/ssl/certs
 assert services["open-webui"]["environment"]["WEBUI_SESSION_COOKIE_SECURE"] == "true"
 assert services["open-webui"]["environment"]["WEBUI_AUTH_COOKIE_SECURE"] == "true"
 assert services["open-webui"]["environment"]["JWT_EXPIRES_IN"] == "10h"
+# Chat requests must attribute to the person, not the shared workload key:
+# the X-OpenWebUI-User-* forwarding pairs with the LiteLLM user_header_name
+# setting (attribution-only; grants no authorization at the gateway). NOTE:
+# this comment lives inside a single-quoted sh -c script — no apostrophes.
+assert services["open-webui"]["environment"]["ENABLE_FORWARD_USER_INFO_HEADERS"] == "true"
 open_webui = services["open-webui"]
 assert open_webui["user"] == "65532:65532"
 assert open_webui["read_only"] is True
@@ -1967,6 +1972,14 @@ general = text.split("general_settings:", 1)[1].split("router_settings:", 1)[0]
 assert len(re.findall(r"(?m)^  store_prompts_in_spend_logs: false$", general)) == 1
 assert "store_prompts_in_spend_logs: true" not in text
 
+# Chat end-user attribution: LiteLLM records the Open WebUI-forwarded
+# identity header as the request's end user (telemetry/spend attribution
+# only — it must never become an authorization input). The Email header is
+# the deliberate choice: OAUTH_EMAIL_CLAIM maps it to preferred_username.
+assert len(re.findall(
+    r"(?m)^  user_header_name: X-OpenWebUI-User-Email$", general
+)) == 1
+
 # Per-project default-model enforcement is a pre-call hook registered in
 # litellm_settings.callbacks. Dropping the registration (or the otel export
 # beside it) would silently disable a reviewed policy control, so pin the
@@ -2035,16 +2048,23 @@ for canonical, source in (
     ('aigw.api_key.id', 'metadata.user_api_key_hash'),
     ('aigw.request.id', 'litellm.call_id'),
     ('aigw.project.id', 'metadata.user_api_key_project_id'),
+    ('aigw.enduser.id', 'metadata.user_api_key_end_user_id'),
+    ('aigw.user.name', 'metadata.user_api_key_alias'),
 ):
     assert canonical in correlation
     assert source in correlation
-assert correlation.count('resource.attributes["service.name"] == "litellm"') == 5
-assert correlation.count('name == "litellm_request"') == 5
+assert correlation.count('resource.attributes["service.name"] == "litellm"') == 10
+assert correlation.count('name == "litellm_request"') == 10
 assert '^[0-9a-f]{64}$' in correlation
 assert 'aigw.api_key.alias' not in correlation
 assert 'metadata.user_api_key_auth_metadata' in correlation
 assert 'attributes["aigw.project.id"] == nil' in correlation
 assert '(?P<project>[a-z0-9][a-z0-9_.-]{0,63})' in correlation
+# Readable identity: nil-guarded priority chain (end user -> portal
+# aigw_username -> key alias -> opaque user id), every source bounded.
+assert correlation.count('attributes["aigw.user.name"] == nil') == 3
+assert correlation.count('^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$') == 3
+assert '(?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})' in correlation
 for forbidden in ('gen_ai.request.id', 'llm.user', 'authorization', 'access_token'):
     assert forbidden not in correlation
 
@@ -2070,6 +2090,28 @@ for sample in (
     "{'aigw_project_id': 'safe-project}",
 ):
     assert project_capture.search(sample) is None
+
+# Mirror the bounded aigw_username capture (portal-stamped readable identity)
+# the same way: malformed or oversized values must fail closed rather than
+# emit a misleading first-class user-name label.
+username_capture = re.compile(
+    r'''['"]aigw_username['"][ ]*:[ ]*['"]'''
+    r'''(?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})['"]'''
+)
+for sample in (
+    "{'aigw_username': 'lab-developer'}",
+    '{"aigw_username": "j.doe@example"}',
+):
+    match = username_capture.search(sample)
+    assert match and match.group('username') in {'lab-developer', 'j.doe@example'}
+for sample in (
+    "{}",
+    "{'aigw_username': ''}",
+    "{'aigw_username': ' lab-user'}",
+    "{'aigw_username': 'safe<script>'}",
+    "{'aigw_username': 'a" + "b" * 64 + "'}",
+):
+    assert username_capture.search(sample) is None
 PY
 
 # The volume initializer needs only ownership/mode capabilities. FSETID is

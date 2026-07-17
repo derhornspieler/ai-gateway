@@ -27,6 +27,20 @@ class ChatCapabilityContractTest(unittest.TestCase):
         # The pre-aigw-chat gate must not silently return.
         self.assertNotIn('OAUTH_ALLOWED_ROLES: "aigw-users', compose)
 
+    def test_chat_identity_forwarding_is_attribution_only(self) -> None:
+        """Open WebUI forwards the authenticated chat identity to LiteLLM
+        (X-OpenWebUI-User-* headers) and LiteLLM records the Email header —
+        which carries preferred_username under OAUTH_EMAIL_CLAIM — as the
+        request's end user, so per-request telemetry attributes chat traffic
+        to the person instead of the shared workload key. Both halves are
+        pinned together: dropping either silently reverts every chat request
+        to the anonymous service identity. The header is attribution-only
+        (spend/telemetry); it must never gate authorization."""
+        compose = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn('ENABLE_FORWARD_USER_INFO_HEADERS: "true"', compose)
+        litellm = (ROOT / "compose/litellm/config.yaml").read_text(encoding="utf-8")
+        self.assertIn("user_header_name: X-OpenWebUI-User-Email", litellm)
+
     def test_compose_bypasses_openwebui_internal_model_acl(self) -> None:
         """Model authorization is the gateway's job (scoped workload key +
         per-project runtime policy). Open WebUI 0.10's own model access

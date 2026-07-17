@@ -40,6 +40,23 @@ otelcol.processor.memory_limiter "default" {
 // are intentionally not authoritative inputs. Missing or malformed metadata
 // leaves the span untouched; error_mode=ignore prevents a bad optional field
 // from dropping prompt-bearing traces.
+//
+// aigw.user.name is the HUMAN-READABLE identity beside the stable opaque
+// aigw.user.id (Keycloak subject UUID). Source priority, first match wins:
+//   1. metadata.user_api_key_end_user_id — the end user LiteLLM records from
+//      general_settings.user_header_name (chat path: Open WebUI forwards the
+//      authenticated preferred_username) or a caller-supplied `user` field.
+//      ATTRIBUTION ONLY: it grants no authorization; an API caller spoofing
+//      it only mislabels its own already-authenticated traffic, whose key
+//      identity is still recorded in aigw.user.id / aigw.api_key.id. It is
+//      also kept as its own field, aigw.enduser.id.
+//   2. aigw_username from the key's portal-stamped metadata (dev-portal
+//      writes the OIDC preferred_username at mint time), extracted from the
+//      serialized server-side auth metadata like the project fallback below.
+//   3. metadata.user_api_key_alias — the key's human-chosen alias.
+//   4. aigw.user.id — so the field is always present for label filtering.
+// Every source is bounded and strictly validated: these become log fields
+// and (for aigw.user.name) a Loki stream label on the aigw-requests stream.
 // BEGIN AIGW MANAGED TRACE CORRELATION
 otelcol.processor.transform "aigw_correlation" {
   error_mode = "ignore"
@@ -52,6 +69,11 @@ otelcol.processor.transform "aigw_correlation" {
       `set(attributes["aigw.request.id"], attributes["litellm.call_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["litellm.call_id"]) and IsMatch(attributes["litellm.call_id"], "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")`,
       `set(attributes["aigw.project.id"], attributes["metadata.user_api_key_project_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_project_id"]) and IsMatch(attributes["metadata.user_api_key_project_id"], "^[a-z0-9][a-z0-9_.-]{0,63}$")`,
       `set(attributes["aigw.project.id"], ExtractPatterns(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")["project"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.project.id"] == nil and IsString(attributes["metadata.user_api_key_auth_metadata"]) and IsMatch(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")`,
+      `set(attributes["aigw.enduser.id"], attributes["metadata.user_api_key_end_user_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_end_user_id"]) and IsMatch(attributes["metadata.user_api_key_end_user_id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
+      `set(attributes["aigw.user.name"], attributes["aigw.enduser.id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["aigw.enduser.id"])`,
+      `set(attributes["aigw.user.name"], ExtractPatterns(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_username['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})['\\\"]")["username"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.user.name"] == nil and IsString(attributes["metadata.user_api_key_auth_metadata"]) and IsMatch(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_username['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})['\\\"]")`,
+      `set(attributes["aigw.user.name"], attributes["metadata.user_api_key_alias"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.user.name"] == nil and IsString(attributes["metadata.user_api_key_alias"]) and IsMatch(attributes["metadata.user_api_key_alias"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
+      `set(attributes["aigw.user.name"], attributes["aigw.user.id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.user.name"] == nil and IsString(attributes["aigw.user.id"])`,
     ]
   }
 
@@ -264,10 +286,25 @@ otelcol.processor.filter "aigw_request_spans" {
 // One log line per surviving span, carrying only the explicit allow-listed
 // span attributes. The body is logfmt-style key=value text, so LogQL's
 // `| logfmt` yields aigw_user_id / gen_ai_* fields for dashboards.
+//
+// `labels` re-emits the listed keys as log ATTRIBUTES so the downstream
+// loki.attribute.labels hint can promote them to Loki stream labels, giving
+// Logs Drilldown label tabs and dashboard dropdowns. Cardinality is a
+// deliberate, bounded decision: the user and project populations are small
+// (dozens) and this is a single dedicated stream; aigw.user.name is
+// regex-validated at promotion and the writer's max_streams=1000 is the
+// hard backstop. aigw.request.id and aigw.api_key.id are unbounded/high-
+// churn and MUST stay line fields, never labels.
 otelcol.connector.spanlogs "aigw_requests" {
-  spans = true
+  spans  = true
+  labels = [
+    "aigw.user.name",
+    "aigw.project.id",
+  ]
   span_attributes = [
     "aigw.user.id",
+    "aigw.user.name",
+    "aigw.enduser.id",
     "aigw.api_key.id",
     "aigw.project.id",
     "aigw.request.id",
@@ -308,12 +345,19 @@ otelcol.processor.transform "aigw_request_stream" {
 
 // otelcol.exporter.loki promotes OTLP attributes into Loki labels only via
 // the documented hint attributes; loki.resource.labels turns the resource
-// service.name into the service_name stream label.
+// service.name into the service_name stream label, and loki.attribute.labels
+// promotes the spanlogs-emitted attribution attributes into the bounded
+// aigw_user_name / aigw_project_id stream labels (Prometheus-format names).
 otelcol.processor.attributes "aigw_request_stream_labels" {
   action {
     key    = "loki.resource.labels"
     action = "insert"
     value  = "service.name"
+  }
+  action {
+    key    = "loki.attribute.labels"
+    action = "insert"
+    value  = "aigw.user.name, aigw.project.id"
   }
   output {
     logs = [otelcol.exporter.loki.local.input]
