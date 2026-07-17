@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "ADM-only request audit over the dedicated Loki stream Alloy derives from litellm_request spans. Filter by opaque user ID, project ID, nonreversible API-key fingerprint, or request ID and inspect the retained prompt/completion content per request.",
+  "description": "ADM-only request audit over the dedicated Loki stream Alloy derives from litellm_request spans. Filter by readable user name or project with the dropdowns (Loki labels), or by opaque user ID, nonreversible API-key fingerprint, or request ID, and inspect the retained prompt/completion content per request.",
   "editable": false,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -41,7 +41,7 @@
           "showLineNumbers": false,
           "showMiniMap": false
         },
-        "content": "### Request audit contract\nEvery `litellm_request` span becomes one log line in the Loki stream `{service_name=\"aigw-requests\"}`. Each line carries `aigw.user.id`, `aigw.project.id`, `aigw.api_key.id` (SHA-256 fingerprint only), `aigw.request.id`, the model/token/cost fields, and the approved `gen_ai.input.messages` / `gen_ai.output.messages` content; `| logfmt` exposes them as `aigw_user_id`-style fields (Logs Drilldown filters work the same way). Raw authorization, API keys, request headers, email, IP, and unfiltered LiteLLM auth metadata are removed before any export. Prompt content is sensitive and this dashboard is intentionally ADM-only.",
+        "content": "### Request audit contract\nEvery `litellm_request` span becomes one log line in the Loki stream `{service_name=\"aigw-requests\"}`. Each line carries `aigw.user.id` (stable subject UUID), `aigw.user.name` (readable identity: chat end user, portal username, or key alias — attribution only, never an authorization record), `aigw.enduser.id`, `aigw.project.id`, `aigw.api_key.id` (SHA-256 fingerprint only), `aigw.request.id`, the model/token/cost fields, and the approved `gen_ai.input.messages` / `gen_ai.output.messages` content; `| logfmt` exposes them as `aigw_user_id`-style fields (Logs Drilldown filters work the same way). `aigw_user_name` and `aigw_project_id` are also Loki stream labels — use the User/Project dropdowns above to filter every panel. Raw authorization, API keys, request headers, email, IP, and unfiltered LiteLLM auth metadata are removed before any export. Prompt content is sensitive and this dashboard is intentionally ADM-only.",
         "mode": "markdown"
       },
       "pluginVersion": "12.4.5",
@@ -91,7 +91,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "sum by (aigw_user_id) (count_over_time({service_name=\"aigw-requests\"} | logfmt [$__auto]))",
+          "expr": "sum by (aigw_user_name) (count_over_time({service_name=\"aigw-requests\", aigw_user_name=~\"$user\", aigw_project_id=~\"$project\"} | logfmt [$__auto]))",
           "queryType": "range",
           "refId": "A"
         }
@@ -142,7 +142,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "sum by (aigw_project_id) (sum_over_time({service_name=\"aigw-requests\"} | logfmt | unwrap gen_ai_cost_total_cost [$__auto]))",
+          "expr": "sum by (aigw_project_id) (sum_over_time({service_name=\"aigw-requests\", aigw_user_name=~\"$user\", aigw_project_id=~\"$project\"} | logfmt | unwrap gen_ai_cost_total_cost [$__auto]))",
           "queryType": "range",
           "refId": "A"
         }
@@ -181,7 +181,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{service_name=\"aigw-requests\"} | logfmt",
+          "expr": "{service_name=\"aigw-requests\", aigw_user_name=~\"$user\", aigw_project_id=~\"$project\"} | logfmt",
           "queryType": "range",
           "refId": "A"
         }
@@ -238,7 +238,62 @@
     "provisioned"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "loki"
+        },
+        "definition": "label_values({service_name=\"aigw-requests\"}, aigw_user_name)",
+        "includeAll": true,
+        "label": "User",
+        "multi": true,
+        "name": "user",
+        "options": [],
+        "query": "label_values({service_name=\"aigw-requests\"}, aigw_user_name)",
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "loki"
+        },
+        "definition": "label_values({service_name=\"aigw-requests\"}, aigw_project_id)",
+        "includeAll": true,
+        "label": "Project",
+        "multi": true,
+        "name": "project",
+        "options": [],
+        "query": "label_values({service_name=\"aigw-requests\"}, aigw_project_id)",
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
   "time": {
     "from": "now-6h",

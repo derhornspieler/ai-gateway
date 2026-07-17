@@ -130,10 +130,11 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertEqual(len(loki_targets), 4)
         rendered = "\n".join(target["expr"] for target in loki_targets)
         for target in loki_targets:
-            self.assertIn('{service_name="aigw-requests"}', target["expr"])
+            self.assertIn('{service_name="aigw-requests"', target["expr"])
             self.assertIn("| logfmt", target["expr"])
         for field in (
             "aigw_user_id",
+            "aigw_user_name",
             "aigw_project_id",
             "aigw_api_key_id",
             "gen_ai_cost_total_cost",
@@ -144,6 +145,36 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             self.assertIn(field, rendered)
         self.assertNotIn("aigw_api_key_alias", rendered)
         self.assertNotIn("tempo", json.dumps(dashboard))
+
+        # Label-backed filter controls: the User/Project dropdowns read the
+        # bounded aigw_user_name / aigw_project_id stream labels and must be
+        # wired into the requests-by-user, cost-by-project, and recent-request
+        # panels; All (allValue ".*") also matches lines missing the label so
+        # the panels keep working with no selection and with legacy lines.
+        variables = {
+            variable["name"]: variable
+            for variable in dashboard["templating"]["list"]
+        }
+        for name, label_name in (
+            ("user", "aigw_user_name"),
+            ("project", "aigw_project_id"),
+        ):
+            variable = variables[name]
+            self.assertEqual(variable["type"], "query")
+            self.assertEqual(
+                variable["query"],
+                'label_values({service_name="aigw-requests"}, %s)' % label_name,
+            )
+            self.assertTrue(variable["includeAll"])
+            self.assertEqual(variable["allValue"], ".*")
+        filtered = [
+            target["expr"]
+            for target in loki_targets
+            if 'aigw_user_name=~"$user"' in target["expr"]
+        ]
+        self.assertEqual(len(filtered), 3)
+        for expr in filtered:
+            self.assertIn('aigw_project_id=~"$project"', expr)
 
     def test_overview_queries_match_the_live_metric_schema(self) -> None:
         overview = next(item for item in self.dashboards if item["uid"] == "aigw-overview")
