@@ -329,6 +329,10 @@ def establish_session(
     request.session["user"] = {
         "email": claim_text("email", "preferred_username"),
         "name": claim_text("name", "preferred_username", "email") or subject,
+        # The stable human-readable login (never an email fallback): stamped
+        # into portal key metadata at mint time so gateway telemetry can show
+        # a recognizable identity beside the opaque subject UUID.
+        "username": claim_text("preferred_username"),
         "sub": subject,
         "roles": extract_roles(userinfo),
     }

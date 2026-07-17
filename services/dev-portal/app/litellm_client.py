@@ -28,6 +28,12 @@ ADMIN_KEY_LIST_MAX_PAGE = 10_000
 PORTAL_KEY_CREATOR_FIELD = "created_via"
 PORTAL_KEY_CREATOR_VALUE = "dev-portal"
 PORTAL_PROJECT_METADATA_KEY = "aigw_project_id"
+# Human-readable owner identity (OIDC preferred_username) stamped at mint
+# time. It reaches LiteLLM telemetry via the key's server-side auth metadata
+# and is promoted to aigw.user.name by the Alloy correlation transform, whose
+# extraction regex this charset mirrors (kept textually identical there).
+PORTAL_USERNAME_METADATA_KEY = "aigw_username"
+PORTAL_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$")
 # Carries the project's admin-set default model on every portal key; the
 # LiteLLM pre-call hook (compose/litellm/aigw_default_model_hook.py) reads it
 # to resolve requests that omit a model. Kept textually identical there.
@@ -304,6 +310,7 @@ async def key_generate(
     alias: str,
     project_id: str,
     project_policy: dict[str, Any] | None = None,
+    username: str | None = None,
 ) -> dict[str, Any]:
     """Mint a portal-owned virtual key for one immutable owner/project pair.
 
@@ -327,6 +334,12 @@ async def key_generate(
             PORTAL_PROJECT_METADATA_KEY: project_id,
         },
     }
+    # Telemetry attribution only, never an authorization input: stamp the
+    # authenticated login when it fits the reviewed bounded charset, and
+    # deliberately omit it otherwise — an exotic preferred_username must not
+    # block a mint, and the audit stream then falls back to alias/subject.
+    if isinstance(username, str) and PORTAL_USERNAME_RE.fullmatch(username):
+        payload["metadata"][PORTAL_USERNAME_METADATA_KEY] = username
     # Two reviewed guardrail layers, neither reachable from the browser:
     # 1. Static deployment config (group_vars → env). The platform default is
     #    now UNLIMITED — cost/budget is an admin-only concept, so no default

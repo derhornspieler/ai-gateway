@@ -115,7 +115,7 @@ def test_key_creation_uses_immutable_subject_and_rejects_bad_csrf(
         assert user_id == "stable-oidc-sub"
         return list(inventory)
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         calls.append((user_id, alias, project_id))
         listed = portal_key(
             owner=user_id,
@@ -205,7 +205,7 @@ def test_post_generation_membership_failure_revokes_without_disclosure(
         assert user_id == owner
         return [dict(entry) for entry in inventory]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         inventory.append(
             portal_key(
                 owner=user_id,
@@ -267,7 +267,7 @@ def test_post_generation_cleanup_failure_never_discloses_plaintext(
         assert user_id == owner
         return [dict(entry) for entry in inventory]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         inventory.append(
             portal_key(
                 owner=user_id,
@@ -403,7 +403,7 @@ def test_existing_active_key_blocks_generation(client, set_session, monkeypatch)
     async def key_list(user_id):
         return [portal_key(owner=user_id, token="already-active")]
 
-    async def key_generate(_user_id, _alias, _project_id, _project_policy=None):
+    async def key_generate(_user_id, _alias, _project_id, _project_policy=None, username=None):
         nonlocal generated
         generated = True
         return {"key": "must-not-exist"}
@@ -488,7 +488,7 @@ def test_deactivation_then_regeneration(client, set_session, monkeypatch):
                 entry["blocked"] = True
         return {"key": key, "blocked": True}
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         state.append(
             portal_key(
                 owner=user_id,
@@ -542,7 +542,7 @@ def test_two_concurrent_generations_create_only_one(monkeypatch):
         await asyncio.sleep(0)
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         nonlocal generate_calls
         generate_calls += 1
         await asyncio.sleep(0.01)
@@ -586,7 +586,7 @@ def test_malformed_generate_response_deactivates_unverified_candidate(monkeypatc
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         state.append(
             portal_key(
                 owner=user_id,
@@ -655,7 +655,7 @@ def test_committed_key_after_generate_disconnect_is_deactivated(monkeypatch, cap
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         # Model LiteLLM committing before the response connection is lost.
         state.append(
             portal_key(
@@ -721,7 +721,7 @@ def test_ambiguous_generate_cleanup_refuses_unbounded_candidate_set(
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         state.extend(
             portal_key(
                 owner=user_id,
@@ -762,7 +762,7 @@ def test_post_generate_duplicate_is_cleaned_up_without_disclosure(monkeypatch):
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         # Model a future unsupported second replica racing this worker after
         # both observed an empty inventory.
         state.extend(
@@ -2304,7 +2304,7 @@ def test_key_mint_carries_the_projects_runtime_policy(
     async def key_list(user_id):
         return [dict(entry) for entry in inventory]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         generated.append(project_policy)
         inventory.append(
             portal_key(
@@ -2342,7 +2342,7 @@ def test_unreadable_project_policy_fails_the_mint_closed(
             status_code=503, detail="Current project policy could not be verified."
         )
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         nonlocal called
         called = True
         return {"key": "sk-never"}
@@ -2765,7 +2765,7 @@ def test_key_mint_is_not_disclosed_when_the_default_model_stamp_is_missing(
     async def key_list(user_id):
         return [dict(entry) for entry in inventory]
 
-    async def key_generate(user_id, alias, project_id, project_policy=None):
+    async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         # Upstream drops the metadata stamp the pre-call hook enforces from.
         inventory.append(
             portal_key(owner=user_id, token="minted-hash", alias=alias)

@@ -674,6 +674,7 @@ async def _generate_project_key(
     project_id: str,
     allowed_projects: tuple[str, ...],
     project_policy: dict[str, Any] | None = None,
+    username: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Serialize and verify the one-active-key invariant before disclosure."""
     async with _project_lock(user_id, project_id):
@@ -685,7 +686,7 @@ async def _generate_project_key(
 
         try:
             result = await litellm_client.key_generate(
-                user_id, alias, project_id, project_policy
+                user_id, alias, project_id, project_policy, username=username
             )
         except litellm_client.LiteLLMError:
             # LiteLLM may commit before a timeout/disconnect loses the response.
@@ -952,6 +953,10 @@ async def create_key(
             clean_project,
             project_ids,
             policies[clean_project],
+            # Telemetry attribution: the authenticated preferred_username is
+            # stamped into key metadata (aigw_username) so the audit stream
+            # can render a readable identity beside the subject UUID.
+            username=user.get("username"),
         )
         # Close the normal group-removal race before the one-time plaintext is
         # rendered. The check is shielded so a browser disconnect cannot abort

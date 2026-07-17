@@ -188,6 +188,7 @@ def test_new_identity_clears_previous_accounts_secret_state():
         {
             "sub": "new-subject",
             "email": "new@example.test",
+            "preferred_username": "new-login",
             "realm_access": {"roles": [settings.developer_role]},
         },
     )
@@ -196,7 +197,10 @@ def test_new_identity_clears_previous_accounts_secret_state():
         "user": {
             "sub": "new-subject",
             "email": "new@example.test",
-            "name": "new@example.test",
+            "name": "new-login",
+            # The readable identity is exactly preferred_username — never an
+            # email fallback (emails are deliberately kept out of telemetry).
+            "username": "new-login",
             "roles": [settings.developer_role],
         }
     }

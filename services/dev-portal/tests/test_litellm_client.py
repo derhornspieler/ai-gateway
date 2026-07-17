@@ -181,6 +181,34 @@ async def test_key_generate_defaults_to_unlimited_with_project_metadata(
 
 
 @pytest.mark.asyncio
+async def test_key_generate_stamps_a_bounded_readable_username(monkeypatch):
+    """The OIDC preferred_username is telemetry attribution, never an
+    authorization input: a well-formed login is stamped as metadata
+    aigw_username (promoted to aigw.user.name by the Alloy correlation
+    transform), while a missing or out-of-charset value is silently omitted
+    so an exotic username can never block a mint."""
+    body = None
+
+    def handler(request: httpx.Request):
+        nonlocal body
+        body = json.loads(request.content)
+        return httpx.Response(200, json={"key": "sk-once"})
+
+    _mock_client(monkeypatch, handler)
+
+    await litellm_client.key_generate(
+        "owner-sub", "laptop", "ai-gateway", username="lab-developer"
+    )
+    assert body["metadata"]["aigw_username"] == "lab-developer"
+
+    for rejected in (None, "", " lab-user", "bad name", "<script>", "a" * 65, 7):
+        await litellm_client.key_generate(
+            "owner-sub", "laptop", "ai-gateway", username=rejected
+        )
+        assert "aigw_username" not in body["metadata"]
+
+
+@pytest.mark.asyncio
 async def test_key_generate_applies_the_runtime_project_policy(monkeypatch):
     body = None
 
