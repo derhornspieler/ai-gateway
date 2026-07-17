@@ -77,6 +77,41 @@ python3 "$STACK_DIR/scripts/restore_archive.py" \
   --volume-target "$docker_root"
 rm -f "$staging/outer.tar.gz"
 
+# PostgreSQL major-version guard. A logical dump taken on major N cannot be
+# loaded by a different major's server binaries, and this restore replaces the
+# data volume while the deployed Compose file pins the postgres image that will
+# start next. Compare the backup receipt's recorded server_version major
+# against the deployed pin and refuse a cross-major restore before any
+# destructive operation. (Audit 2026-07-16 risk 2: restore had no version
+# guard.) Same-major minor differences are allowed.
+backup_pg_major="$(python3 - "$staging/extracted/manifest.json" <<'PY'
+import json, re, sys
+v = str(json.load(open(sys.argv[1])).get("postgres_version", ""))
+m = re.match(r"\s*(\d+)", v)
+print(m.group(1) if m else "")
+PY
+)"
+target_pg_major="$(python3 - "$STACK_DIR/docker-compose.yml" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"image:\s*\S*postgres:(\d+)", text)
+print(m.group(1) if m else "")
+PY
+)"
+[[ "$backup_pg_major" =~ ^[0-9]+$ ]] || {
+  echo "restore refused: backup receipt has no usable postgres_version" >&2; exit 1;
+}
+[[ "$target_pg_major" =~ ^[0-9]+$ ]] || {
+  echo "restore refused: cannot read the deployed postgres image major" >&2; exit 1;
+}
+[[ "$backup_pg_major" == "$target_pg_major" ]] || {
+  echo "restore refused: backup PostgreSQL major $backup_pg_major != deployed" \
+       "major $target_pg_major — a cross-major logical restore is unsafe." \
+       "Deploy the matching postgres major first, or restore into a matching host." >&2
+  exit 1
+}
+echo "PostgreSQL major $backup_pg_major matches the deployed pin." >&2
+
 echo "Stopping the current stack for destructive restore..." >&2
 "${compose[@]}" stop -t 60 >/dev/null
 require_project_stopped

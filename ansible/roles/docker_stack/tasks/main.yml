@@ -446,7 +446,7 @@
     label: "{{ item.path }}"
   when:
     - item.state == 'directory'
-    - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.git|secrets)(/|$)')
+    - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.venv|venv|\.tox|node_modules|\.git|secrets)(/|$)')
 
 - name: Sync allow-listed custom-service source files
   ansible.builtin.copy:
@@ -470,7 +470,10 @@
     label: "{{ item.path }}"
   when:
     - item.state == 'file'
-    - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.git|secrets)(/|$)')
+    # A local dev virtualenv (services/*/.venv) otherwise matches the *.py
+    # allow-list below and syncs thousands of files into the deployed tree,
+    # adding minutes to every converge and shipping dev tooling to the host.
+    - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.venv|venv|\.tox|node_modules|\.git|secrets)(/|$)')
     - item.path is regex('(^|/)(Dockerfile(?:\.open-webui|\.grafana)?|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch)|upstream-provenance\.json|oauth-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
 
 # Ansible vars are the single source of truth for the runtime DNS views. The
