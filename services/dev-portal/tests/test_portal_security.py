@@ -2693,7 +2693,8 @@ def test_project_policy_deny_all_models_scopes_keys_to_the_sentinel(
             "page": 1, "total_pages": 1, "total_count": 1}
 
     async def key_update(key, updates):
-        key_updates.append((key, updates)); return {}
+        key_updates.append((key, updates))
+        return {}
 
     async def admin_key_lookup(token):
         return full_key_object(token=token, user_id="dev-a",
