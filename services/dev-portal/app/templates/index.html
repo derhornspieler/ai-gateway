@@ -89,7 +89,9 @@
     {% else %}Unlimited{% endif %}<br>
     <span class="muted">Models:</span>
     {% set project_models = policy.allowed_models if policy.allowed_models else available_models %}
-    {% if project_models %}
+    {% if project_models == [no_models_sentinel] %}
+    <span class="muted">No model access for API/tooling (chat, if enabled, is separate).</span>
+    {% elif project_models %}
     <div class="mtags">{% for model in project_models | sort %}<span class="mtag">{{ model }}</span>{% if policy.default_model == model %}<span class="badge">default</span> {% endif %}{% endfor %}</div>
     {% else %}all configured models{% endif %}
     {% if policy.default_model %}<span class="note">Requests that omit a model are served with the project default.</span>{% endif %}

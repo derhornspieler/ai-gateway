@@ -109,7 +109,7 @@
     <div class="card">
       <p class="muted" style="margin-top: 0;">Rate limit:
         {% if selected_group.policy.tpm_limit or selected_group.policy.rpm_limit %}{{ selected_group.policy.tpm_limit or "unlimited" }} TPM &middot; {{ selected_group.policy.rpm_limit or "unlimited" }} RPM{% else %}Unlimited (default){% endif %};
-        models: {% if selected_group.policy.allowed_models %}{% for m in selected_group.policy.allowed_models | sort %}<span class="mtag">{{ m }}</span>{% endfor %}{% else %}all configured{% endif %}{% if selected_group.policy.default_model %}; default: <span class="mtag">{{ selected_group.policy.default_model }}</span>{% endif %}
+        models: {% if selected_group.policy.allowed_models == [no_models_sentinel] %}<span class="mtag">no model access</span>{% elif selected_group.policy.allowed_models %}{% for m in selected_group.policy.allowed_models | sort %}<span class="mtag">{{ m }}</span>{% endfor %}{% else %}all configured{% endif %}{% if selected_group.policy.default_model %}; default: <span class="mtag">{{ selected_group.policy.default_model }}</span>{% endif %}
       </p>
       {% if identity_step_up_recent and policy_models %}
       <form method="post" action="/admin/identity/groups/{{ selected_group.id }}/policy" data-confirm="Save this policy and re-tune every existing key in {{ selected_group.name }}? Rate limits and model access change immediately.">
@@ -121,11 +121,13 @@
             <label class="fld" for="policy-rpm-{{ selected_group.id }}">RPM limit (blank = unlimited)</label>
             <input type="text" id="policy-rpm-{{ selected_group.id }}" name="rpm_limit" value="{{ selected_group.policy.rpm_limit or '' }}" maxlength="32" placeholder="unlimited" autocomplete="off" style="width: 140px;">
           </div>
+          {% set no_models = selected_group.policy.allowed_models == [no_models_sentinel] %}
           <div>
             <label class="fld" style="margin-top: 0;">Allowed models (none checked = all configured models, including future ones)</label>
             {% for model in policy_models %}
-            <label class="check"><input type="checkbox" name="allowed_models" value="{{ model }}"{% if selected_group.policy.allowed_models and model in selected_group.policy.allowed_models %} checked{% endif %}> {{ model }}</label>
+            <label class="check"><input type="checkbox" name="allowed_models" value="{{ model }}"{% if not no_models and selected_group.policy.allowed_models and model in selected_group.policy.allowed_models %} checked{% endif %}> {{ model }}</label>
             {% endfor %}
+            <label class="check" style="margin-top: 8px;"><input type="checkbox" name="deny_all_models" value="1"{% if no_models %} checked{% endif %}> <strong>No model access</strong> — deny all API/tooling models (chat is gated separately by the aigw-chat role)</label>
             <label class="fld" for="policy-default-{{ selected_group.id }}">Default model (enforced — requests that omit a model use it)</label>
             <select id="policy-default-{{ selected_group.id }}" name="default_model" style="max-width: 220px;">
               <option value="">(none)</option>
@@ -136,7 +138,7 @@
           </div>
         </div>
         {% set stored_models = (selected_group.policy.allowed_models or []) + ([selected_group.policy.default_model] if selected_group.policy.default_model else []) %}
-        {% set deconfigured = stored_models | reject('in', policy_models) | unique | list %}
+        {% set deconfigured = stored_models | reject('in', policy_models) | reject('equalto', no_models_sentinel) | unique | list %}
         {% if deconfigured %}
         <p class="flash error" style="margin-top: 12px;">This project is restricted to <strong>{{ deconfigured | join(', ') }}</strong>, no longer configured in LiteLLM. This form cannot preserve that restriction. Re-add the model(s) to LiteLLM, or check the box below to widen the project deliberately.</p>
         <label class="check"><input type="checkbox" name="remove_model_restrictions" value="1"> Remove all model restrictions (widen this project to every configured model)</label>

@@ -2660,6 +2660,96 @@ def test_project_policy_save_retunes_existing_project_keys(
     assert "1 existing keys re-tuned" in response.text
 
 
+def test_project_policy_deny_all_models_scopes_keys_to_the_sentinel(
+    admin_client, set_admin_session, monkeypatch
+):
+    """The 'No model access' option must scope the group to a reserved sentinel
+    that matches no real model, so API/tooling keys can call nothing. Chat is
+    gated separately by the aigw-chat role."""
+    puts = []
+    key_updates = []
+
+    async def rotator_get(path):
+        if path == "/identity/groups":
+            return [{
+                "id": "group-1", "name": "ai-gateway",
+                "capabilities": ["aigw-developers"], "member_count": 1,
+                "policy": {"tpm_limit": None, "rpm_limit": None,
+                           "allowed_models": None, "default_model": None},
+            }]
+        return {"admin": True}
+
+    async def rotator_put(path, payload):
+        puts.append((path, payload))
+        return {"id": "group-1", "name": "ai-gateway",
+                "policy": {"tpm_limit": None, "rpm_limit": None,
+                           "allowed_models": [litellm_client.NO_MODELS_SENTINEL],
+                           "default_model": None}}
+
+    async def admin_key_list_page(page):
+        return {"keys": [full_key_object(
+            token="portal-1", user_id="dev-a",
+            metadata={"created_via": "dev-portal", "aigw_project_id": "ai-gateway"})],
+            "page": 1, "total_pages": 1, "total_count": 1}
+
+    async def key_update(key, updates):
+        key_updates.append((key, updates)); return {}
+
+    async def admin_key_lookup(token):
+        return full_key_object(token=token, user_id="dev-a",
+            metadata={"created_via": "dev-portal", "aigw_project_id": "ai-gateway"})
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    csrf = "c" * 43
+    set_admin_session({"user": portal_user(roles=[settings.admin_role]),
+                       "csrf_token": csrf, "admin_reauth_at": int(time.time())})
+
+    admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={"tpm_limit": "", "rpm_limit": "", "deny_all_models": "1",
+              "default_model": "", "csrf_token": csrf},
+        follow_redirects=True)
+
+    assert puts == [("/identity/groups/group-1/policy", {
+        "tpm_limit": None, "rpm_limit": None,
+        "allowed_models": [litellm_client.NO_MODELS_SENTINEL],
+        "default_model": None})]
+    # The re-tuned key is scoped to the sentinel — no real model is callable.
+    assert key_updates and key_updates[0][1]["models"] == [
+        litellm_client.NO_MODELS_SENTINEL]
+
+
+def test_project_policy_all_and_none_are_mutually_exclusive(
+    admin_client, set_admin_session, monkeypatch
+):
+    async def rotator_get(path):
+        if path == "/identity/groups":
+            return [{"id": "group-1", "name": "ai-gateway",
+                     "capabilities": ["aigw-developers"], "member_count": 1,
+                     "policy": {"tpm_limit": None, "rpm_limit": None,
+                                "allowed_models": None, "default_model": None}}]
+        return {"admin": True}
+
+    async def rotator_put(path, payload):
+        raise AssertionError("must not persist an ambiguous all+none policy")
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    csrf = "c" * 43
+    set_admin_session({"user": portal_user(roles=[settings.admin_role]),
+                       "csrf_token": csrf, "admin_reauth_at": int(time.time())})
+    resp = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={"tpm_limit": "", "rpm_limit": "", "deny_all_models": "1",
+              "remove_model_restrictions": "1", "csrf_token": csrf},
+        follow_redirects=True)
+    assert "not both" in resp.text
+
+
 def test_key_mint_is_not_disclosed_when_the_default_model_stamp_is_missing(
     client, set_session, monkeypatch
 ):

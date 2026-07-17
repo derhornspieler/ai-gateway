@@ -27,7 +27,9 @@
   Your project <span class="mono">{{ project_id }}</span> can use:
   {% if policy %}
   {% set project_models = policy.allowed_models if policy.allowed_models else available_models %}
-  {% if project_models %}
+  {% if project_models == [no_models_sentinel] %}
+  no models — API/tooling access is disabled for this project.
+  {% elif project_models %}
   {% for model in project_models | sort %}<span class="mtag">{{ model }}</span>{% if policy.default_model == model %}<span class="badge">default</span> {% endif %}{% endfor %}
   {% else %}
   all configured models.

@@ -42,6 +42,12 @@ KEY_DURATION_RE = re.compile(r"^[1-9][0-9]{0,5}(s|m|h|d)$")
 # Kept textually identical to the identity controller's MODEL_NAME_RE: model
 # names travel from Keycloak group policy through this client into LiteLLM.
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")
+# Reserved model name for the explicit "no model access" group policy. It is a
+# valid model name (rides through every 1-element-list validator unchanged) but
+# is never a real served model, so a key scoped to it can call nothing — LiteLLM
+# denies every real model. This is the deny-all-tooling state, distinct from an
+# unset policy (all models). Chat access stays governed by the aigw-chat role.
+NO_MODELS_SENTINEL = "aigw-no-models"
 MAX_POLICY_MODELS = 32
 RATE_LIMIT_MAX = 1_000_000_000
 # The only /key/update fields this portal may ever send. Everything else on

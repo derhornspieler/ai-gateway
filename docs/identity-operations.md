@@ -125,6 +125,26 @@ capabilities the portals honor:
 | `aigw-developers` | dev-portal self-service LiteLLM keys and coding-tool snippets |
 | `aigw-admins` | developer functions plus rotation, identity administration, the LiteLLM Admin UI, and Grafana edge access. Note: Open WebUI maps `aigw-admins` to its local admin role, and Open WebUI has no admin-without-access concept, so administrators can still open chat through that mapping even without `aigw-chat`. |
 
+**Model access is two independent levers.** A group's project policy
+(admin console → Identity & Access → a group) controls **API/tooling** model
+access: unset = all configured models, a checked subset = those models, or
+**"No model access"** = the group's keys are scoped to a reserved sentinel
+(`aigw-no-models`) that matches no real model, so LiteLLM returns
+`403 key not allowed to access model` for every request. That policy does NOT
+govern **chat**: Open WebUI runs on a shared service key with model-access
+control bypassed, so chat is gated only by the `aigw-chat` role. To make a
+group "log in but no models anywhere," set its policy to No model access AND do
+not grant it `aigw-chat`. Only models with a configured backend appear as
+options (the selector reads the live LiteLLM `/v1/models`), so a provider that
+is not set up — e.g. OpenAI — cannot be offered.
+
+**Signing out to switch accounts.** Each app (dev-portal, admin-portal, Open
+WebUI) holds its own session cookie independent of the Keycloak SSO session.
+Ending the Keycloak session alone (its `/logout`) does not clear an app's
+cookie, so the next visit silently re-authenticates as the same user. To fully
+switch accounts, use the app's own "Log out" (which clears its cookie and
+RP-logs-out), then sign in as the other user.
+
 **Migrating an existing realm to `aigw-chat`.** Realm JSON imports only into
 an empty database, and the durable identity controller deliberately cannot
 create realm roles or edit client scope mappings, so an already-bootstrapped

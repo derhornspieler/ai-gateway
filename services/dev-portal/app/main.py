@@ -910,6 +910,7 @@ async def index(
             "project_ids": project_ids,
             "project_policies": project_policies,
             "available_models": available_models,
+            "no_models_sentinel": litellm_client.NO_MODELS_SENTINEL,
             "policy_error": policy_error,
             # The "Connect a tool" tab always renders placeholder snippets;
             # a generated key exists only in its one-time POST response.
@@ -1016,6 +1017,7 @@ async def create_key(
             "project_ids": project_ids,
             "project_policies": policies,
             "available_models": available_models,
+            "no_models_sentinel": litellm_client.NO_MODELS_SENTINEL,
             "policy_error": None,
             "tools": tools.rendered_tools(settings.public_api_base, "YOUR_KEY"),
             "api_base": settings.public_api_base,
@@ -1124,6 +1126,7 @@ async def snippets_page(
             "project_ids": project_ids,
             "project_policies": project_policies,
             "available_models": available_models,
+            "no_models_sentinel": litellm_client.NO_MODELS_SENTINEL,
             "flashes": auth.pop_flash(request),
         },
     )
@@ -2124,6 +2127,7 @@ async def admin_page(
             ),
             "egress_trust_canary": _egress_trust_canary_snapshot(),
             "policy_models": policy_models,
+            "no_models_sentinel": litellm_client.NO_MODELS_SENTINEL,
             "admin_surface": True,
             "flashes": auth.pop_flash(request),
             "csrf_token": auth.get_csrf_token(request),
@@ -3007,6 +3011,7 @@ async def admin_identity_set_group_policy(
     allowed_models: list[str] = Form(default=[]),
     default_model: str = Form("", max_length=128),
     remove_model_restrictions: str | None = Form(None),
+    deny_all_models: str | None = Form(None),
     csrf_token: str = Form(..., min_length=32, max_length=128),
 ):
     redirect = RedirectResponse(
@@ -3046,6 +3051,12 @@ async def admin_identity_set_group_policy(
         return redirect
 
     clear_restrictions = remove_model_restrictions is not None
+    deny_all = deny_all_models is not None
+    if clear_restrictions and deny_all:
+        auth.flash(
+            request, "Choose all models or no models, not both.", "error"
+        )
+        return redirect
     selected = sorted({model.strip() for model in allowed_models if model.strip()})
     if any(model not in available for model in selected):
         auth.flash(request, "Choose only configured models.", "error")
@@ -3078,8 +3089,11 @@ async def admin_identity_set_group_policy(
         set(stored_allowed or [])
         .union([stored_default] if stored_default else [])
         - set(available)
+        - {litellm_client.NO_MODELS_SENTINEL}
     )
-    if deconfigured and not clear_restrictions:
+    # Setting deny-all is a NARROWING (to nothing), never a silent widening, so
+    # the deconfigured-model guard does not apply.
+    if deconfigured and not clear_restrictions and not deny_all:
         auth.flash(
             request,
             "This project is restricted to model(s) "
@@ -3094,6 +3108,13 @@ async def admin_identity_set_group_policy(
     if clear_restrictions:
         # Explicit operator decision: drop every model restriction.
         selected = []
+        clean_default = None
+    elif deny_all:
+        # Explicit operator decision: no model access at all. Scope the group's
+        # keys to a reserved sentinel that matches no real model, so LiteLLM
+        # denies every model for API/tooling. Chat is gated by the aigw-chat
+        # role separately.
+        selected = [litellm_client.NO_MODELS_SENTINEL]
         clean_default = None
     else:
         clean_default = default_model.strip() or None
