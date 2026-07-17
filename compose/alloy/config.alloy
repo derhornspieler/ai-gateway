@@ -384,6 +384,9 @@ loki.process "docker" {
       project = "",
       service = "",
       stream  = "",
+      // Grafana's Logs Drilldown app keys its whole UI on the OTel-semantic
+      // service_name label; without it every stream is invisible there.
+      service_name = "service",
     }
   }
   stage.output { source = "message" }

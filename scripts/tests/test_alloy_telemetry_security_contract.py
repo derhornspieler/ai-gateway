@@ -162,6 +162,9 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         )[0]
         self.assertIn('(?:(?:bearer|basic)\\s+)?', docker_logs)
         self.assertIn('((?:bearer|basic)\\s+)', docker_logs)
+        # Grafana Logs Drilldown keys on the OTel-semantic service_name label;
+        # dropping it silently empties that whole UI (observed live).
+        self.assertIn('service_name = "service"', docker_logs)
 
     def test_tempo_and_cribl_queues_are_durable_bounded_and_independent(self) -> None:
         for label, directory, size in (
