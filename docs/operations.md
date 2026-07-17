@@ -1027,6 +1027,31 @@ has passed focused source tests but has not completed its live deployment gate.
 
 ## Upgrade procedure
 
+### Per-service operator cycle (`scripts/upgrade-service.py`)
+
+The controller-side operator tool wraps the reviewed cycle below into three
+commands without weakening any gate. `plan <family> <new-tag>` resolves the
+candidate's index digest through the target's registry credential and rewrites
+every declaration of that family's pin (Compose image/build args, Dockerfile
+`ARG`/`FROM`, the lab reset seed map — both on-disk formats), then shows the
+git diff; committing stays with the operator so every version change lands in
+review. Local build tags (`ai-gateway/dhi-*-probe`) are deliberately never
+renamed — the deployed version lives solely in the base/patch digest, which
+the content-addressed rollback preservation requires (a tag rename reads as
+drift and fails the converge, by design). `deploy` runs preflight (committed
+tree, backup-receipt freshness on the target), the stack converge, a
+health-watch until every container settles, and the end-to-end gate
+(`scripts/test-e2e-lab.py`). `rollback <family>` restores the previous
+git-committed pin (the image bits are still local: content-addressed
+`aigw-rollback-*` tags for built services, cached pulls for direct pins) and
+repeats the same deploy verification. On the offline-seed lab profile, `plan`
+prints the seed-refresh steps that must run between plan and deploy; a
+production inventory with direct registry access skips them.
+`scripts/tests/test_upgrade_service_map.py` pins the tool's family map to the
+real pin topology so the two cannot drift apart silently.
+
+### Reviewed upgrade contract (what the tool wraps)
+
 Images are tag-and-digest pinned, and an upgrade changes both deliberately. Do
 not use `latest` or a blind `docker compose pull`. Read upstream security and
 migration notes for every stateful component, then scan and record the exact
