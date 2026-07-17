@@ -77,11 +77,42 @@ attacks the custom Python surface we maintain, not just a feature checkbox.
   Vault (enterprise secret-manager integration) but does not rotate vendor
   keys; that half of key-rotator stays.
 
-**Net effect:** roughly 30–40% of the custom Python surface (dev-portal
-issuance flow, admin model-policy page, virtual-key rotation engine, one
-oauth2-proxy instance) retires, in exchange for accepting LiteLLM's UI and
-policy model where ours is more opinionated (identity-linked project groups,
-deny-all sentinel, curated developer experience).
+### 2a. Owner follow-up: can Enterprise actually REPLACE the portals?
+
+**No — and the tier split matters more than §2's first draft implied.** The
+enforcement primitives the owner asked about are mostly FREE-tier proxy
+features; Enterprise sells the self-serve *experience*, and neither tier can
+express our key-lifecycle invariant:
+
+| Capability | Free (OSS proxy + DB) | Enterprise | Ours only |
+|---|---|---|---|
+| Token throughput per group (`tpm_limit`/`rpm_limit` on teams, tighter per key/user) | ✅ | — | |
+| Cost budgets w/ reset windows (`max_budget` + `budget_duration` per team/user/key) | ✅ | — | |
+| Models per group (team `models` allow-list; empty = deny) | ✅ | — | |
+| Self-serve key page behind SSO (users mint their own keys under team limits) | limited (SSO ≤5 users) | ✅ | |
+| SCIM/user provisioning, audit logs, Prometheus `/metrics`, admin-UI SSO at scale | ❌ | ✅ | |
+| **One active key per user per project** (issuance dedupe, revoke-on-reissue, rotation semantics) | ❌ | ❌ | ✅ dev-portal + key-rotator |
+| Keycloak managed-group topology sync, last-admin protection, `aigw-chat` gating | ❌ | ❌ | ✅ identity controller |
+| Curated developer UX (config snippets, API reference, project-scoped view) | ❌ | ❌ | ✅ dev-portal |
+
+The one-key-per-user-per-project rule is the load-bearing difference:
+LiteLLM's model is "mint as many keys as you like under team constraints" —
+a key is *a* credential, not *the* per-user-per-project identity. Our whole
+attribution/rotation design assumes the latter.
+
+**JWT auth note (owner decision):** not relevant to this deployment. LiteLLM's
+JWT feature lets API callers present OIDC tokens to the proxy instead of `sk-`
+keys — it never exposes Anthropic directly — but the platform's design goal is
+precisely the controlled internal token per user per project, so this feature
+buys nothing here. Disregard it in tier comparisons.
+
+**Net effect (revised):** Enterprise does not retire the portals. The
+realistic purchase rationale is the narrow slice only Enterprise has —
+admin-UI SSO at scale, audit logs, native `/metrics`, SCIM — with the portals
+retained as the opinionated issuance/identity layer. The earlier "30–40% of
+custom Python retires" framing holds ONLY if the one-key-per-user-per-project
+invariant were abandoned in favor of LiteLLM's many-keys model, which the
+owner has ruled out.
 
 **Follow-on facts verified for the owner's side questions:**
 
@@ -227,9 +258,10 @@ figures are planning ballparks — get real quotes before budgeting.
   Un-gates SSO-on-admin-UI, `/metrics`, audit logs; retires the litellm
   oauth2-proxy and inner break-glass login. Portal-collapse features (SCIM
   depth, full RBAC) may require Premium — confirm tier split in the trial.
-- **Consolidation scenario** — LiteLLM Premium: **~$30k/yr.** The full §2
-  collapse (self-serve keys, teams/budgets, scheduled rotation, JWT auth),
-  retiring 30–40% of the custom Python surface.
+- **Consolidation scenario** — LiteLLM Premium: **~$30k/yr.** Only worth it
+  if the one-key-per-user-per-project invariant were abandoned for LiteLLM's
+  many-keys self-serve model (§2a) — the owner has ruled that out, so this
+  scenario is documented for completeness, not recommended.
 - **White-label chat add-on** — Open WebUI Enterprise: quote, seat-based;
   only if the customer requires de-branding above 50 users.
 - **Compliance-driven ceiling** — adding Vault Enterprise + RH Keycloak +
@@ -241,9 +273,12 @@ figures are planning ballparks — get real quotes before budgeting.
 
 ## 6. Bottom line
 
-1. **Highest-leverage purchase:** LiteLLM Enterprise — retires real custom
-   code (portal issuance, model policy, virtual-key rotation, one oauth2-proxy)
-   and un-gates `/metrics`, SSO, JWT auth, SCIM.
+1. **Highest-leverage purchase:** LiteLLM Enterprise **Basic** — un-gates
+   admin-UI SSO, audit logs, and Prometheus `/metrics` (~$3k/yr), retiring
+   the litellm oauth2-proxy + inner break-glass login. The portals stay:
+   per §2a, no LiteLLM tier can express the one-key-per-user-per-project
+   invariant or the Keycloak identity topology, and the enforcement limits
+   (team budgets, TPM/RPM, model allow-lists) are free-tier anyway.
 2. **Open WebUI:** free at any scale if its branding stays visible; the
    enterprise license is only needed for white-labeling above 50 users — a
    customer branding decision, not an engineering one.
