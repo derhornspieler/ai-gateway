@@ -499,7 +499,7 @@ services:
     # v1.74.0 is affected by critical auth bypasses (including
     # GHSA-4xpc-pv4p-pm3w). This signed stable release was independently
     # resolved to the immutable multi-arch index below.
-    image: ghcr.io/berriai/litellm:v1.91.3@sha256:b6e44a97d551dfaa37a13dd02c0d05b2e7e38f5e900aaaea6fd39431ff6207fa
+    image: ghcr.io/berriai/litellm:v1.92.0@sha256:9ef6f45bc0104940571765e610c52a1d761b5ec85efcd193795281086ee61277
     # read_only intentionally NOT set: the image runs prisma generate /
     # schema migrations and writes caches under /app and $HOME at startup;
     # the write set isn't stable across releases.

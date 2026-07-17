@@ -220,7 +220,7 @@ image upgrade:
 | Status | Workload/current pin | Rationale |
 |---|---|---|
 | DHI derivative | Traefik: `dhi.io/traefik:3.7.6` runtime plus upstream `v3.7.7` binary → `ai-gateway/dhi-traefik:3.7.7-patched` | the catalog DHI trails the fix for `GHSA-cxjq-mrr5-89rv`; the build keeps the non-root, shellless DHI runtime and replaces only `/usr/bin/traefik` from the immutable patched upstream image |
-| Non-DHI | LiteLLM upstream `v1.91.3` (`ghcr.io/berriai/litellm`) | the evaluated DHI artifact contained a fixable High CVE in `sigstore`; the signed upstream release passed the project scan and compatibility review |
+| Non-DHI | LiteLLM upstream `v1.92.0` (`ghcr.io/berriai/litellm`) | the evaluated DHI artifact contained a fixable High CVE in `sigstore`; the signed upstream release passed the project scan and compatibility review |
 | Non-DHI | Open WebUI upstream `0.10.2` (`ai-gateway/open-webui:0.10.2-probe`) | no application-specific DHI catalog image was available; the shared probe is still layered on |
 | Non-DHI | Samba AD lab: pinned Debian plus pinned Samba packages | no application-specific DHI image was available, and this directory exists only in the disposable lab profile |
 

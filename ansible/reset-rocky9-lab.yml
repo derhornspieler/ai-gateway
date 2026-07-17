@@ -160,7 +160,7 @@
     # image set requires updating this reviewed snapshot in the same change.
     aigw_lab_reset_legacy_seed_image_tags:
       dhi.io/grafana:12.4.5: sha256:bf28b93e5f122d0d93574f865df15ba01ca630e91e9af1138c4bfd3461e8619e
-      ghcr.io/berriai/litellm:v1.91.3: sha256:b6e44a97d551dfaa37a13dd02c0d05b2e7e38f5e900aaaea6fd39431ff6207fa
+      ghcr.io/berriai/litellm:v1.92.0: sha256:9ef6f45bc0104940571765e610c52a1d761b5ec85efcd193795281086ee61277
       dhi.io/vault:2.0.3: sha256:743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6
       dhi.io/prometheus:3.5.5: sha256:098f1065ce3fdb4c725962bda64ec67d2f6d4f573141d08f3270361ce632d9b0
       dhi.io/opentelemetry-collector:0.156.0-contrib: sha256:04dc55c259a159b8b6b833d1be3ede9f4b1a94d870c193fc40e61564950d6757

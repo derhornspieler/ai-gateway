@@ -49,7 +49,7 @@ with `--network=none`.
 
 **Documented exceptions.** Three upstream images remain, each pinned past a
 known-vulnerable release with the rationale recorded inline: LiteLLM
-v1.91.3, Open WebUI 0.10.2, and the lab-only Debian Samba build.
+v1.92.0, Open WebUI 0.10.2, and the lab-only Debian Samba build.
 
 **Extracted, never executed.** The optional Vault browser UI
 (`vault-ui-proxy`) is a stdlib-only Go proxy whose UI assets are extracted

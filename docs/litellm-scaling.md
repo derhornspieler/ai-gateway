@@ -17,7 +17,7 @@ pinned image changes.
 ## Current executable topology
 
 The implemented Compose service is a single LiteLLM container running the image
-`ghcr.io/berriai/litellm:v1.91.3`, pinned by digest. LiteLLM is one of the
+`ghcr.io/berriai/litellm:v1.92.0`, pinned by digest. LiteLLM is one of the
 stack's three reviewed non-DHI application exceptions rather than a
 locally-built DHI derivative. It uses the default single Uvicorn worker within
 reviewed limits of 2 CPUs, 4 GiB memory, and 1024 PIDs, with a 600-second
