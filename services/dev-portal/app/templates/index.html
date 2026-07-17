@@ -4,6 +4,7 @@
 <nav class="tabs" role="tablist" aria-label="Developer portal sections">
   <button type="button" role="tab" id="tabbtn-keys" data-tab="keys" aria-controls="tab-keys" aria-selected="true">My keys</button>
   <button type="button" role="tab" id="tabbtn-connect" data-tab="connect" aria-controls="tab-connect" aria-selected="false">Connect a tool</button>
+  <button type="button" role="tab" id="tabbtn-reference" data-tab="reference" aria-controls="tab-reference" aria-selected="false">API reference</button>
 </nav>
 {% endblock %}
 {% block content %}
@@ -79,7 +80,7 @@
 <div class="card">
   {% for project_id in project_ids %}
   {% set policy = project_policies.get(project_id) %}
-  <p{% if not loop.last %} style="margin-bottom: 14px;"{% endif %}>
+  <div class="proj"{% if not loop.last %} style="margin-bottom: 14px;"{% endif %}>
     <span class="mono">{{ project_id }}</span><br>
     {% if policy %}
     <span class="muted">Token rate limit:</span>
@@ -89,13 +90,13 @@
     <span class="muted">Models:</span>
     {% set project_models = policy.allowed_models if policy.allowed_models else available_models %}
     {% if project_models %}
-    {% for model in project_models %}<code>{{ model }}</code>{% if policy.default_model == model %} <span class="badge">default</span>{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+    <div class="mtags">{% for model in project_models | sort %}<span class="mtag">{{ model }}</span>{% if policy.default_model == model %}<span class="badge">default</span> {% endif %}{% endfor %}</div>
     {% else %}all configured models{% endif %}
-    {% if policy.default_model %}<br><span class="note">Requests that omit a model are served with the project default.</span>{% endif %}
+    {% if policy.default_model %}<span class="note">Requests that omit a model are served with the project default.</span>{% endif %}
     {% else %}
     <span class="muted">Policy unavailable right now.</span>
     {% endif %}
-  </p>
+  </div>
   {% endfor %}
 </div>
 {% endif %}
@@ -107,13 +108,13 @@
 {% if keys %}
 <div class="card" style="padding: 0; overflow: hidden;">
   <div class="tblwrap">
-    <table>
+    <table class="keys compact">
       <thead><tr><th>Alias</th><th>Project</th><th>Identifier</th><th>Rate limit</th><th>Expires</th><th>Status</th><th></th></tr></thead>
       <tbody>
         {% for k in keys %}
         <tr>
-          <td>{{ k.key_alias or k.alias or "(no alias)" }}</td>
-          <td class="mono muted">{{ k.portal_project_id }}</td>
+          <td><span class="trunc" title="{{ k.key_alias or k.alias or '(no alias)' }}">{{ k.key_alias or k.alias or "(no alias)" }}</span></td>
+          <td class="mono muted"><span class="trunc" title="{{ k.portal_project_id }}">{{ k.portal_project_id }}</span></td>
           <td class="mono muted">{{ (k.token or k.key_name or "")[:16] }}&hellip;</td>
           <td class="muted">{% if k.tpm_limit or k.rpm_limit %}{{ k.tpm_limit or "unlimited" }} TPM &middot; {{ k.rpm_limit or "unlimited" }} RPM{% else %}Unlimited{% endif %}</td>
           <td class="muted">{{ k.expires or "never" }}</td>
@@ -140,6 +141,10 @@
   <p class="muted" style="margin: 0;">No keys yet. Generate one above to get started.</p>
 </div>
 {% endif %}
+</section>
+
+<section class="panel" id="tab-reference" role="tabpanel" aria-labelledby="tabbtn-reference">
+{% include "_api_reference.html" %}
 </section>
 
 <section class="panel" id="tab-connect" role="tabpanel" aria-labelledby="tabbtn-connect">

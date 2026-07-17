@@ -126,7 +126,7 @@ tools:
         -H "Authorization: Bearer {key}" \
         -H "Content-Type: application/json" \
         -d '{
-          "model": "gpt-4o",
+          "model": "claude-haiku-4-5",
           "messages": [{"role": "user", "content": "hello"}]
         }'
 

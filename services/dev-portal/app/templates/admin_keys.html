@@ -28,7 +28,7 @@
 {% if keys %}
 <div class="card" style="padding: 0; overflow: hidden;">
   <div class="tblwrap">
-    <table>
+    <table class="keys">
       <thead>
         <tr>
           <th>Key</th><th>Provenance</th><th>Owner</th><th>Models</th>
@@ -40,7 +40,7 @@
       <tbody>
         {% for k in keys %}
         <tr>
-          <td>{{ k.alias or "(no alias)" }}<br><code class="muted">{{ k.token[:16] }}{% if k.token %}&hellip;{% endif %}</code></td>
+          <td><span class="trunc" title="{{ k.alias or '(no alias)' }}">{{ k.alias or "(no alias)" }}</span><br><code class="muted">{{ k.token[:16] }}{% if k.token %}&hellip;{% endif %}</code></td>
           <td>
             {% if k.provenance == "portal" %}
             <span class="chip cap">portal: {{ k.project }}</span>
@@ -51,8 +51,11 @@
             {% endif %}
             {% if k.created_via and k.provenance != "portal" %}<br><span class="muted">{{ k.created_via }}</span>{% endif %}
           </td>
-          <td class="muted">{{ k.owner or "—" }}</td>
-          <td class="muted">{{ k.models | join(", ") if k.models else "all" }}</td>
+          <td class="muted"><span class="trunc" title="{{ k.owner or '—' }}">{{ k.owner or "—" }}</span></td>
+          <td class="models">
+            {% if k.models %}{% for m in k.models | sort %}<span class="mtag">{{ m }}</span>{% endfor %}
+            {% else %}<span class="mtag all">all models</span>{% endif %}
+          </td>
           <td class="tnum">{{ "%.4f" | format(k.spend) if k.spend is not none else "—" }}</td>
           <td class="tnum">{{ k.max_budget if k.max_budget is not none else "none" }}</td>
           <td class="tnum">{{ k.tpm_limit if k.tpm_limit is not none else "none" }}</td>

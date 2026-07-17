@@ -109,7 +109,7 @@
     <div class="card">
       <p class="muted" style="margin-top: 0;">Rate limit:
         {% if selected_group.policy.tpm_limit or selected_group.policy.rpm_limit %}{{ selected_group.policy.tpm_limit or "unlimited" }} TPM &middot; {{ selected_group.policy.rpm_limit or "unlimited" }} RPM{% else %}Unlimited (default){% endif %};
-        models: {% if selected_group.policy.allowed_models %}{{ selected_group.policy.allowed_models | join(', ') }}{% else %}all configured{% endif %}{% if selected_group.policy.default_model %}; default: {{ selected_group.policy.default_model }}{% endif %}
+        models: {% if selected_group.policy.allowed_models %}{% for m in selected_group.policy.allowed_models | sort %}<span class="mtag">{{ m }}</span>{% endfor %}{% else %}all configured{% endif %}{% if selected_group.policy.default_model %}; default: <span class="mtag">{{ selected_group.policy.default_model }}</span>{% endif %}
       </p>
       {% if identity_step_up_recent and policy_models %}
       <form method="post" action="/admin/identity/groups/{{ selected_group.id }}/policy" data-confirm="Save this policy and re-tune every existing key in {{ selected_group.name }}? Rate limits and model access change immediately.">
@@ -180,13 +180,13 @@
     {% if identity_members %}
     <div class="card" style="padding: 0; overflow: hidden;">
       <div class="tblwrap">
-        <table>
+        <table class="keys narrow">
           <thead><tr><th>User</th><th>Email</th><th>Effective access</th><th>Action</th></tr></thead>
           <tbody>
             {% for member in identity_members %}
             <tr>
               <td>{{ member.username }}</td>
-              <td class="muted">{{ member.email }}</td>
+              <td class="muted"><span class="trunc wide" title="{{ member.email }}">{{ member.email }}</span></td>
               <td>{% for capability in selected_group.capabilities %}<span class="chip cap">{{ capability }}</span> {% endfor %}</td>
               <td style="text-align: right;">
                 {% if identity_step_up_recent %}
@@ -460,7 +460,7 @@
 
 <div class="card" style="padding: 0; overflow: hidden;">
   <div class="tblwrap">
-    <table>
+    <table class="keys compact">
       <thead><tr><th>Provider</th><th>Mode</th><th>Rotation</th><th class="tnum">Interval</th><th>Last run</th><th>Next run</th><th></th></tr></thead>
       <tbody>
         {% for vendor_id, v in primary_vendors %}
@@ -551,7 +551,7 @@
 {% if history %}
 <div class="card" style="padding: 0; overflow: hidden;">
   <div class="tblwrap">
-    <table>
+    <table class="keys compact">
       <thead><tr><th>Time</th><th>Source</th><th>Action</th><th>Status</th><th>Detail</th></tr></thead>
       <tbody>
         {% for h in history %}
@@ -560,7 +560,7 @@
           <td>{{ h.vendor or "" }}</td>
           <td>{{ h.action or h.event or "" }}</td>
           <td>{% set event_status = h.status or "" %}{% if event_status == 'success' %}<span class="pill ok">{{ event_status }}</span>{% elif event_status %}<span class="pill warn">{{ event_status }}</span>{% endif %}</td>
-          <td class="muted">{{ h.detail or h.message or "" }}</td>
+          <td class="muted detail">{{ h.detail or h.message or "" }}</td>
         </tr>
         {% endfor %}
       </tbody>

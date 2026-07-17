@@ -63,13 +63,6 @@ model_list:
       litellm_credential_name: anthropic-primary
       cache_control_injection_points: [{location: message, role: system}]
 
-  # ── OpenAI ───────────────────────────────────────────────────────────
-  - model_name: gpt
-    litellm_params:
-      model: openai/gpt-4o
-      api_base: http://envoy-egress:8080/openai/v1
-      litellm_credential_name: openai-primary
-
 litellm_settings:
   # otel: prompt-bearing spans -> Alloy -> Tempo/Cribl (§9.7).
   # aigw_default_model_hook: server-side per-project default-model

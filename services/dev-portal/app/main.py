@@ -147,13 +147,16 @@ FORBIDDEN_HTML = """<!DOCTYPE html>
 <style>
 body{background:#0f1420;color:#e6e9f0;font-family:-apple-system,sans-serif;
 display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{background:#161d2e;border:1px solid #263048;border-radius:10px;padding:32px 40px;text-align:center}
-a{color:#4f7cff}
+.box{background:#161d2e;border:1px solid #263048;border-radius:10px;padding:32px 40px;text-align:center;max-width:26rem}
+.box p{color:#aab3c5;line-height:1.5}
+a.btn{display:inline-block;margin-top:8px;background:#4f7cff;color:#fff;
+text-decoration:none;padding:9px 18px;border-radius:7px;font-weight:600}
 </style></head>
 <body><div class="box">
-<h1>403 — Forbidden</h1>
-<p>Your account does not have the role required for this page.</p>
-<p><a href="/">Back to your keys</a></p>
+<h1>403 — Access not available</h1>
+<p>You are signed in, but this account does not have the role this portal
+requires. If you need developer access, ask an administrator to grant it.</p>
+<p><a class="btn" href="/logout">Sign out</a></p>
 </div></body></html>"""
 
 

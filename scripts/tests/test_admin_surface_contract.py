@@ -346,13 +346,50 @@ class TabbedConsoleSurfaceContractTests(unittest.TestCase):
             'role="tablist"',
             'data-tab="keys"',
             'data-tab="connect"',
+            'data-tab="reference"',
             'id="tab-keys" role="tabpanel"',
             'id="tab-connect" role="tabpanel"',
+            'id="tab-reference" role="tabpanel"',
             "data-one-time-secret",
         ):
             self.assertIn(pinned, index)
-        for name in ("index.html", "snippets.html", "_connect_panel.html"):
+        for name in (
+            "index.html", "snippets.html", "_connect_panel.html",
+            "_api_reference.html",
+        ):
             self.assertNotIn("/admin", (PORTAL_TEMPLATES / name).read_text())
+
+    def test_api_reference_documents_only_edge_reachable_endpoints(self) -> None:
+        """The developer API reference must document exactly the inference
+        surface the internal edge allow-lists (dynamic-int.yml) and never a
+        schema or management path that edge denies — no upstream Swagger leak,
+        and no dead endpoints."""
+        ref = (PORTAL_TEMPLATES / "_api_reference.html").read_text()
+        for path in (
+            "/v1/chat/completions",
+            "/v1/models",
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+        ):
+            self.assertIn(path, ref)
+        for denied in (
+            "/openapi.json", "/docs", "/redoc",
+            "/v1/model/info", "/v1/memory", "/v1/workflows",
+            "/key/generate", "/user/new", "/config", "/ui",
+        ):
+            self.assertNotIn(denied, ref)
+        self.assertIn("Authorization: Bearer", ref)
+        self.assertIn("x-api-key", ref)
+        self.assertIn("anthropic-version", ref)
+        # The static fallback model list must not name a model the gateway
+        # does not serve.
+        cfg = (ROOT / "compose/litellm/config.yaml").read_text()
+        served = set(re.findall(r"model_name:\s*(\S+)", cfg))
+        documented = set(re.findall(r"claude-[a-z0-9-]+", ref))
+        self.assertTrue(
+            documented <= served,
+            f"reference names models not served: {documented - served}",
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,70 @@
+<p class="sub">The exact API surface this gateway exposes. Every example uses the
+<span class="mono">YOUR_KEY</span> placeholder — paste the key you copied when
+you created it. The gateway serves two request shapes over the same virtual key;
+only the endpoints below are reachable (management and schema paths are blocked
+at the edge).</p>
+
+<h3>Authentication</h3>
+<ul class="apiauth">
+  <li><strong>OpenAI shape</strong> — header <code>Authorization: Bearer YOUR_KEY</code></li>
+  <li><strong>Anthropic shape</strong> — headers <code>x-api-key: YOUR_KEY</code> and <code>anthropic-version: 2023-06-01</code></li>
+  <li><code>401</code> = missing/wrong header for the shape, or an inactive key · <code>403</code> = a path outside the list below · <code>429</code> = your project's TPM/RPM limit.</li>
+</ul>
+
+<h3>Models available now</h3>
+<div class="mtags">
+  {% if available_models %}{% for model in available_models | sort %}<span class="mtag">{{ model }}</span>{% endfor %}
+  {% else %}<span class="mtag">claude-opus-4-8</span><span class="mtag">claude-opus-4-7</span><span class="mtag">claude-sonnet-5</span><span class="mtag">claude-sonnet-4-5</span><span class="mtag">claude-haiku-4-5</span><span class="mtag">claude-fable-5</span>{% endif %}
+</div>
+<p class="note">These are the models the gateway serves today; which ones a given
+key may call is set by your project's admin policy. All are Anthropic Claude
+models — the OpenAI-compatible shape works, but every model behind it is a
+Claude model.</p>
+
+<div class="apiep">
+  <h4><span class="verb">POST</span> /v1/chat/completions <span class="muted">— OpenAI-compatible chat</span></h4>
+  <pre>curl "{{ api_base }}/v1/chat/completions" \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "hello"}],
+    "max_tokens": 256
+  }'</pre>
+  <p class="note">Omit <code>model</code> to use your project's default. Streaming: add <code>"stream": true</code> (server-sent events).</p>
+</div>
+
+<div class="apiep">
+  <h4><span class="verb">GET</span> /v1/models <span class="muted">— list available models</span></h4>
+  <pre>curl "{{ api_base }}/v1/models" -H "Authorization: Bearer YOUR_KEY"</pre>
+  <p class="note">Returns the same list shown above. <code>/v1/models/&lt;id&gt;</code> returns a single record.</p>
+</div>
+
+<div class="apiep">
+  <h4><span class="verb">POST</span> /v1/messages <span class="muted">— Anthropic-compatible messages</span></h4>
+  <pre>curl "{{ api_base }}/v1/messages" \
+  -H "x-api-key: YOUR_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "hello"}]
+  }'</pre>
+  <p class="note">This is the endpoint Claude Code and the <code>anthropic</code> SDK use. The gateway injects Anthropic prompt caching on the system message for you.</p>
+</div>
+
+<div class="apiep">
+  <h4><span class="verb">POST</span> /v1/messages/count_tokens <span class="muted">— Anthropic token counting</span></h4>
+  <pre>curl "{{ api_base }}/v1/messages/count_tokens" \
+  -H "x-api-key: YOUR_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "hello"}]}'</pre>
+  <p class="note">Returns <code>{"input_tokens": N}</code> without running the model.</p>
+</div>
+
+<p class="note"><code>GET /health/liveliness</code> and <code>GET /health/readiness</code>
+report gateway health (no auth). <code>/v1/completions</code> and
+<code>/v1/embeddings</code> are accepted by the edge but no model is configured
+to serve them, so they are not usable today.</p>

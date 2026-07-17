@@ -15,7 +15,7 @@
     --border-hi: #33405f;
     --text: #e6e9f0;
     --muted: #93a0b8;
-    --faint: #6b778f;
+    --faint: #76829c;
     --accent: #4f7cff;
     --accent-hover: #6a90ff;
     --success: #35c98f;
@@ -50,7 +50,13 @@
   header a { color: var(--text); text-decoration: none; }
   header .brand { font-weight: 700; color: var(--accent); letter-spacing: .2px; }
   header .brand span { color: var(--faint); font-weight: 500; }
-  header .who, header .user { color: var(--muted); font-size: 13px; }
+  header .who, header .user { color: var(--muted); font-size: 13px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  @media (max-width: 640px) {
+    header { padding: 0 14px; gap: 10px; }
+    header .brand span { display: none; }
+    header .who, header .user { display: none; }
+    .stepup [data-stepup-remaining] { display: none; }
+  }
   .stepup {
     display: inline-flex; align-items: center; gap: 7px;
     font-size: 12px; color: var(--warn);
@@ -120,11 +126,56 @@
   .pill.off { color: var(--faint); }
   .pill .dot { width: 6px; height: 6px; }
   .chip {
-    font-size: 10.5px; padding: 1px 7px; border-radius: 5px;
+    font-size: 11.5px; padding: 1px 7px; border-radius: 5px; white-space: nowrap;
     background: var(--panel-hi); border: 1px solid var(--border); color: var(--muted);
   }
+  /* Dense data tables (key inventory, rotation, audit, members): opaque
+     identifiers (token hashes, UUIDs, timestamps, hyphenated names) must never
+     stack into tall cells. A min-width floor makes the .tblwrap scroll
+     horizontally on a narrow viewport instead of word-wrapping every cell;
+     the floor is chosen per column count. */
+  table.keys { min-width: 940px; }
+  table.keys.compact { min-width: 720px; }
+  table.keys.narrow { min-width: 560px; }
+  table.keys td { white-space: nowrap; }
+  table.keys td.models, table.keys td.detail { white-space: normal; }
+  /* A free-prose column inside an otherwise-nowrap table must be bounded so
+     the table does not grow absurdly wide. */
+  td.detail { min-width: 240px; max-width: 460px; }
+  /* Edit-limits form controls live inside a nowrap actions cell; let their
+     labels wrap normally. */
+  table.keys .advbody { white-space: normal; }
+  /* Truncate a long opaque identifier to one line with the full value on
+     hover. Unscoped so every table and card can reuse it. */
+  .trunc {
+    display: inline-block; max-width: 168px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+  }
+  .trunc.wide { max-width: 220px; }
+  /* A whole, non-wrapping model-name tag: a narrow column/line wraps BETWEEN
+     models instead of breaking names on their hyphens. Unscoped for reuse in
+     tables, cards, and prose. */
+  .mtag {
+    display: inline-block; white-space: nowrap; font-size: 11.5px;
+    font-family: var(--mono); padding: 1px 6px; margin: 1px 3px 1px 0;
+    border-radius: 5px; background: var(--panel-hi);
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .mtag.all { font-family: inherit; font-style: italic; }
+  .mtags { display: flex; flex-wrap: wrap; align-items: center; gap: 0; margin: 4px 0; }
+  td.models { min-width: 160px; max-width: 320px; }
+  /* API reference */
+  .apiauth { margin: 6px 0 18px; padding-left: 18px; font-size: 13px; color: var(--muted); line-height: 1.7; }
+  .apiep { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin: 12px 0; background: var(--panel); }
+  .apiep h4 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+  .apiep pre { margin: 0; }
+  .verb {
+    display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 700;
+    letter-spacing: .04em; padding: 1px 6px; border-radius: 4px; margin-right: 4px;
+    background: var(--accent); color: #fff;
+  }
   .chip.cap { color: #b7c6ea; border-color: var(--border-hi); }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75em; background: var(--panel-border); color: var(--muted); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; background: var(--panel-border); color: var(--muted); }
 
   .grid2 { display: grid; grid-template-columns: 320px 1fr; gap: 16px; align-items: start; }
   @media (max-width: 780px) { .grid2 { grid-template-columns: 1fr; } }
@@ -139,7 +190,7 @@
   }
   .grow:hover { border-color: var(--border-hi); }
   .grow[aria-current="true"] { border-color: var(--accent); background: var(--panel-hi); }
-  .grow .gname { font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .grow .gname { font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
   .grow .gmeta { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 5px; }
   .memct { font-size: 12px; color: var(--muted); font-weight: 500; }
 
@@ -251,11 +302,11 @@
   .key-box { display: flex; align-items: center; gap: 10px; }
   .key-box code { flex: 1; word-break: break-all; }
   .baseurl {
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     background: var(--panel-hi); border: 1px solid var(--border-hi); border-radius: 8px;
     padding: 10px 14px; margin-bottom: 18px;
   }
-  .baseurl code { font-family: var(--mono); color: #b7c6ea; word-break: break-all; }
+  .baseurl code { font-family: var(--mono); color: #b7c6ea; overflow-wrap: anywhere; }
   .toolgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   @media (max-width: 720px) { .toolgrid { grid-template-columns: 1fr; } }
   .toolcard h4 { margin: 0 0 3px; font-size: 14px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }

@@ -98,6 +98,11 @@ def test_ordinary_authenticated_user_cannot_access_key_management(
 
     assert response.status_code == 403
     assert called is False
+    # A non-developer arrives here via shared SSO (already signed into chat).
+    # The 403 must offer a working escape, not a self-looping link back to the
+    # keys page they cannot see. Sign out clears the session and RP-logs-out.
+    assert 'href="/logout"' in response.text
+    assert 'href="/"' not in response.text
 
 
 def test_key_creation_uses_immutable_subject_and_rejects_bad_csrf(
