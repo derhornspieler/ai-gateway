@@ -93,7 +93,7 @@ retired. Because the loader clears its environment and runs on a fixed system
 
 ## Current lab rehearsal artifact
 
-The current lab seed was rebuilt on 2026-07-16 (LiteLLM `v1.92.0` pin bump)
+The current lab seed was rebuilt on 2026-07-17 (batched DHI bumps: Keycloak 26.7.0, Prometheus 3.13.1, node-exporter 1.12.1, CoreDNS 1.14.6, Traefik patch v3.7.8)
 with `scripts/rebuild-offline-image-seed.py` running as root on the lab VM's
 own root Docker daemon (linux/arm64, containerd image store), matching the
 hashes committed in `inventory/host_vars/lab-aigw01.yml` and staged
@@ -101,11 +101,11 @@ root-owned mode `0600` at the pinned `/var/tmp` paths:
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `aigw-external-images-linux-arm64-20260716-vaultui.docker.tar.zst` | 3,350,475,655 bytes | `00b9e596cda233eb8660e6ae63850169441814b6c0a679cad56db8f059854869` |
-| `aigw-external-images-linux-arm64-20260716-vaultui.manifest.json` | 5,190 bytes | `6f4be25ea921f41f8f21040739ea19b13a9e183a9ef2dbf521a1a2a8205ab37f` |
+| `aigw-external-images-linux-arm64-20260717-batch.docker.tar.zst` | 3,338,982,081 bytes | `e5f25660d8d766044492a5c562622f5a44e4339147a31b0fb287ce717122e483` |
+| `aigw-external-images-linux-arm64-20260717-batch.manifest.json` | 5,189 bytes | `571c5d0b25fb911b1be7251062a8d651bf6545c8131297d54c9284e2c704375e` |
 
 Both files are also retained mode `0600` beneath
-`/Users/jamesrudisill/.aigw-lab-dr/20260716-vaultui-seed`. The archive passed
+`/Users/jamesrudisill/.aigw-lab-dr/20260717-batch-seed`. The archive passed
 zstd integrity and OCI-metadata validation during export. Its manifest records
 25 exact Linux/ARM64 external `tag@sha256` references and immutable image IDs
 — the complete digest-pinned source set of the checkout it was built from,
@@ -116,10 +116,14 @@ the daemon before export, and the identical map is frozen in
 `ansible/reset-rocky9-lab.yml` (`aigw_lab_reset_legacy_seed_image_tags`),
 which the lab reset requires the staged manifest to equal exactly.
 
-The superseded 2026-07-15 seed
+The superseded 2026-07-16 seed
+(`aigw-external-images-linux-arm64-20260716-vaultui.docker.tar.zst`,
+`00b9e596cda233eb8660e6ae63850169441814b6c0a679cad56db8f059854869`, 25 images,
+pre-batch pins) remains retained beneath
+`/Users/jamesrudisill/.aigw-lab-dr/20260716-vaultui-seed`, the 2026-07-15 seed
 (`aigw-external-images-linux-arm64-20260715-vaultui.docker.tar.zst`,
 `4cd1d451a4654d1f183127cafc8e9dbfe7a04ade891e2a42928401586e160470`, 25 images,
-LiteLLM `v1.91.3`) remains retained beneath
+LiteLLM `v1.91.3`) beneath
 `/Users/jamesrudisill/.aigw-lab-dr/20260715-vaultui-seed`, and the earlier
 2026-07-13 seed
 (`aigw-external-images-linux-arm64-20260713.docker.tar.zst`,

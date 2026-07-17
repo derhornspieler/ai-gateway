@@ -9,6 +9,6 @@ COPY healthcheck.go .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/dns-healthcheck ./healthcheck.go
 
 # DHI CoreDNS is shellless and runs as uid/gid 65532 (nonroot).
-FROM dhi.io/coredns:1.14.4@sha256:d9983439aa6ff935a715f9f2cd11a043e42b40be4d526b187041acfb5c0a4e7c
+FROM dhi.io/coredns:1.14.6@sha256:2a3969483a757474e70ae7fc4f4a5d0af61e112a4e23e9c5ad3ddfad5979f716
 COPY --from=health-builder --chmod=0555 /out/dns-healthcheck /dns-healthcheck
 USER 65532:65532
