@@ -29,7 +29,7 @@ platform DNS record, and `keycloak.<domain>` is a stale historical name that
 was never implemented — use `auth.<domain>`.
 
 **Everything else has no external FQDN.** PostgreSQL, Redis, Vault's internal
-API, Envoy, key-rotator, the oauth2-proxy gates, Alloy, Loki, Tempo,
+API, Envoy, key-rotator, the oauth2-proxy gates, Alloy, Loki,
 node-exporter, cribl-mock, Samba AD, and the Traefik edges themselves are
 addressed only by private Docker DNS names on their isolated bridges and are
 unreachable from any physical network.

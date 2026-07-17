@@ -118,7 +118,6 @@ metadata contracts below and nothing else.
 | `alloy_data` | `473:473` | `0700` |
 | `prom_data` | `65532:65532` | `0700` |
 | `loki_data` | `65532:65532` | `0700` |
-| `tempo_data` | `65532:65532` | `0700` |
 | `grafana_data` | `65532:65532` | `0700` |
 
 Ansible hashes the initializer's effective Compose definition and reruns it only
@@ -299,7 +298,6 @@ probes with PID checks or shell assumptions.
 | `prometheus` | fixed observability-address `/-/ready` |
 | `node-exporter` | loopback `/metrics` scrape must contain `node_exporter_build_info` |
 | `loki` | loopback `/ready`, including service-manager and ingester readiness |
-| `tempo` | DHI's native `/opt/tempo/tempo --health` readiness client |
 | `grafana` | loopback `/api/health` |
 | `cribl-mock` | loopback OpenTelemetry Collector `health_check` extension on port 13133; signal delivery is tested separately |
 | `lab-dns` | loopback CoreDNS `/health` must return exactly `OK`; authoritative answers, NXDOMAIN behavior, and egress denial are separate probes |
@@ -326,7 +324,7 @@ therefore performs trusted TLS with exact SNI, requiring
 `portal.<domain>/healthz` = 200, internal `api.<domain>/ui` = 403, ADM
 `admin.<domain>/` = 303 (OIDC redirect), and
 `litellm-admin.<domain>/openapi.json` = 403, and it queries Grafana's authenticated API from an
-isolated `net-grafana` probe that must find the exact Prometheus, Loki, and Tempo
+isolated `net-grafana` probe that must find the exact Prometheus and Loki
 datasource graph with each datasource reporting `OK`. That probe retries at most
 12 times with a five-second delay; Ansible streams the password on exact stdin
 with `stdin_add_newline: false`, keeps the result under `no_log`, and disables
@@ -839,9 +837,8 @@ Never pass root tokens, unseal shares, provider keys, Samba passwords, or privat
 | Vault file backend | `vault_data` | critical encrypted secret state |
 | Vault audit | `vault_audit` | security evidence; separate retention policy |
 | Alloy positions/WAL | `alloy_data` | prevents log duplicates/gaps; telemetry only |
-| Prometheus | `prom_data` | local metrics history |
-| Loki | `loki_data` | local operational/audit history |
-| Tempo | `tempo_data` | sensitive full-prompt trace history |
+| Prometheus | `prom_data` | local metrics history (7 days) |
+| Loki | `loki_data` | local operational/audit history plus the sensitive full-prompt `aigw-requests` stream (7 days) |
 | Grafana | `grafana_data` | local users/preferences; data sources are provisioned |
 | Redis | none (in-memory) | disposable cache; no restore expected |
 | Samba lab | `samba_ad_config`, `samba_ad_state`, `samba_ad_public` | lab identity/password/LDAPS state; restore together |
@@ -1068,7 +1065,7 @@ build definition, a missing tag, or a differing local image ID for an existing
 stateful custom image, `scripts/pre-upgrade-check.sh` requires an available
 artifact whose receipt and hash still match and that is no more than 24 hours old.
 The gated stateful set is Postgres, Keycloak, LiteLLM, Open WebUI, Vault, Alloy,
-Prometheus, Loki, Tempo, Grafana, and lab Samba, so Alloy's durable positions and
+Prometheus, Loki, Grafana, and lab Samba, so Alloy's durable positions and
 the lab Samba state are covered as well as application data. The check also
 refuses to run while `.state/restore-required-unseal` exists. The disposable
 lab profile disables this gate only so candidate upgrades can be tested; do
@@ -1080,7 +1077,7 @@ retaining both the exact rollback tag and the backup receipt through acceptance.
 Do not treat image retention as database-schema rollback. Then validate without
 starting containers, rebuild and run the unit, config, and runtime tests,
 converge the lab, and test schema migrations and rollback for Postgres,
-Keycloak, LiteLLM, Open WebUI, Vault, Loki, and Tempo, because a binary rollback
+Keycloak, LiteLLM, Open WebUI, Vault, and Loki, because a binary rollback
 is insufficient once an on-disk schema has migrated.
 
 ```bash

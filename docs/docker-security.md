@@ -38,7 +38,7 @@ condition, not an auto-repair.
 converge can never rebuild or retag an image.
 
 **Docker Hardened Images (DHI) by default.** Catalog-supported components
-run directly on `dhi.io` images (Postgres 16.14, Tempo 3.0.2, BusyBox) or on
+run directly on `dhi.io` images (Postgres 16.14, BusyBox) or on
 reviewed single-layer derivatives that add only a static health-probe binary
 to an otherwise shellless DHI runtime (Keycloak 26.6.4, Vault 2.0.3, Redis
 7.4.9, the four OAuth2 Proxy 7.15.3 gates, Alloy, Prometheus, Loki, Grafana,

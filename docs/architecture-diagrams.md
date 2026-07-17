@@ -65,7 +65,7 @@ flowchart LR
     D3[net-vault — Vault + key-rotator + Vault gate]
   end
   subgraph obs [Telemetry planes]
-    O1[net-telemetry / net-traces / net-observability / net-metrics<br/>Alloy, Tempo, Loki, Prometheus, Grafana, node-exporter]
+    O1[net-telemetry / net-observability / net-metrics<br/>Alloy, Loki, Prometheus, Grafana, node-exporter]
   end
   E1 --- A1
   E2 --- A1
@@ -200,8 +200,9 @@ flowchart TB
 
 ## 8. Telemetry flow
 
-Prompts and completions are sensitive: they travel as Tempo trace attributes
-(and optionally to Cribl), never as ordinary Loki log records. Retention and
+Prompts and completions are sensitive: they travel as span attributes to
+Cribl and land locally only in the dedicated Loki `aigw-requests` per-request
+stream, never in ordinary service log records. Retention and
 redaction rules are in
 [observability operations](observability-operations.md).
 
@@ -213,9 +214,8 @@ flowchart LR
   DL[Docker JSON logs<br/>uid-473 ACL tail] --> AL
   VA[Vault audit device tail] --> AL
 
-  AL -->|traces| TP[(Tempo — 30 d<br/>prompt-bearing spans)]
-  AL -->|logs| LK[(Loki — 30 d)]
-  AL -->|remote write + spanmetrics| PR[(Prometheus — 15 d)]
+  AL -->|logs + per-request stream| LK[(Loki — 7 d<br/>incl. prompt-bearing aigw-requests)]
+  AL -->|remote write + spanmetrics| PR[(Prometheus — 7 d)]
   NE[node-exporter] --> PR
   AL -.optional OTLP over internal NIC.-> CR[Cribl export]
   GF[Grafana — ADM leg,<br/>behind oauth2-proxy] --> TP & LK & PR

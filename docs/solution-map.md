@@ -93,11 +93,10 @@ stage.
 | `postgres` | separate LiteLLM, Keycloak, and rotator databases | `pg_data`; three isolated database planes |
 | `redis` | LiteLLM cache/router state | ACL-authenticated from root-rendered files (no server argv/environment credential), tmpfs only, intentionally non-persistent |
 | `alloy` | OTLP receive/fan-out, Docker log tail, Vault audit tail, spanmetrics | `alloy_data`; fixed receiver/export identities |
-| `prometheus` | metrics and Alloy remote-write receiver | 15-day `prom_data`; ADM UI only through OAuth2 Proxy |
+| `prometheus` | metrics and Alloy remote-write receiver | 7-day `prom_data`; ADM UI only through OAuth2 Proxy |
 | `node-exporter` | host filesystem/capacity metrics for local alert rules | read-only host-root view; metrics-only network; no persistence |
-| `loki` | operational and Vault audit logs | 30-day `loki_data` |
-| `tempo` | prompt-bearing distributed traces | 30-day `tempo_data` |
-| `grafana` | query UI for Prometheus, Loki, and Tempo | `grafana_data`; ADM-only behind `oauth2-proxy-grafana`, auth-proxy header trust, org Admin auto-assign, own login form disabled |
+| `loki` | operational and Vault audit logs plus the prompt-bearing per-request stream (`service_name="aigw-requests"`) Alloy derives from `litellm_request` spans | 7-day `loki_data` |
+| `grafana` | query UI for Prometheus and Loki | `grafana_data`; ADM-only behind `oauth2-proxy-grafana`, auth-proxy header trust, org Admin auto-assign, own login form disabled |
 | `cribl-mock` | lab-only OTLP receipt proof | basic debug counts; no durable storage |
 | `lab-dns` (platform-DNS overlay only) | authoritative, non-recursive `aigw.aegisgroup.ch` DNS for host-side clients | exact ADM/internal host IPs:53 TCP+UDP; dedicated no-peer bridge; enabled by `platform_authoritative_dns_enabled` |
 | `samba-ad` (lab overlay only) | disposable AD-compatible directory and hostname-verified LDAPS | isolated `net-identity`; no published host port; three persistent lab volumes |
@@ -121,8 +120,8 @@ creates a customer LDAP provider. Samba is lab-only and must never be presented
 as a customer directory; see [identity-operations.md](identity-operations.md).
 
 Every long-running service has an explicit exec-form health contract. Shellless
-images use either an image-native client (Traefik's `traefik healthcheck`,
-Tempo's `/opt/tempo/tempo --health`) or the static `aigw-health-probe` binary
+images use either an image-native client (Traefik's `traefik healthcheck`)
+or the static `aigw-health-probe` binary
 built from `services/dhi-health-probe` and copied onto the pinned runtime.
 Samba's probe checks domain state, policy, and LDAPS; lab DNS carries a
 purpose-built `dns-healthcheck`. `volume-init` intentionally has no healthcheck
@@ -134,7 +133,7 @@ non-root process loaded its dynamic TLS/router files, and Grafana
 `/api/health` does not prove datasource provisioning loaded. The Ansible
 `verify` role therefore performs trusted TLS/SNI/status checks across both edge
 legs and queries Grafana's authenticated API from an isolated network probe for
-the exact healthy Prometheus/Loki/Tempo graph. Deterministic `0755`/`0644`
+the exact healthy Prometheus/Loki graph. Deterministic `0755`/`0644`
 non-secret configuration modes and narrower verified Keycloak/Traefik private
 bind ownership prevent controller checkout or restored root ownership from
 silently defeating those services. During recovery maintenance, host-origin
@@ -147,9 +146,9 @@ with CA and SNI validation.
 
 Ansible hashes the effective Compose definition for `volume-init`. Before
 starting the application graph it requires an existing successful one-shot
-container with that hash and compares the root owner/group/mode of all eight
+container with that hash and compares the root owner/group/mode of all seven
 managed state volumes (`pg_data`, `vault_data`, `vault_audit`, `alloy_data`,
-`prom_data`, `loki_data`, `tempo_data`, `grafana_data`). It reruns the
+`prom_data`, `loki_data`, `grafana_data`). It reruns the
 initializer only when the container is absent, its last exit was nonzero, its
 definition hash changed, or one of those metadata contracts drifted, then
 verifies the exact metadata again. `openwebui_data` is deliberately outside
@@ -204,10 +203,10 @@ fallback to the direct-only file.
 
 ### Hardened-image policy and reviewed exceptions
 
-DHI is the preferred runtime source, not an unconditional downgrade rule. Three
+DHI is the preferred runtime source, not an unconditional downgrade rule. Two
 bases are pinned directly from the DHI catalog and ship their own shell-free
-health path: BusyBox `1.38.0-alpine` (`volume-init`), Postgres `16.14`, and
-Tempo `3.0.2`. Ten more are locally built DHI derivatives that embed the static
+health path: BusyBox `1.38.0-alpine` (`volume-init`) and Postgres `16.14`.
+Ten more are locally built DHI derivatives that embed the static
 `aigw-health-probe` because DHI runtimes are shellless — OAuth2 Proxy `7.15.3`,
 Keycloak `26.6.4`, Vault `2.0.3`, Redis `7.4.9`, Alloy `1.17.1`, Prometheus
 `3.5.5`, node-exporter `1.11.1`, Loki `3.7.3`, Grafana `12.4.5`, and the
@@ -291,12 +290,11 @@ flowchart LR
   LL -->|OTLP, full AI spans| AL[Alloy]
   DP -->|OTLP/logs| AL
   KR -->|OTLP/logs| AL
-  AL --> TP[(Tempo)]
-  AL --> LK[(Loki)]
+  AL -->|logs + per-request stream| LK[(Loki)]
   AL --> PR
   NE[Node exporter] --> PR
   AL -->|optional OTLP over internal NIC| CR[Cribl]
-  GF --> TP & LK & PR
+  GF --> LK & PR
 ```
 
 ### User and administrator authorization
@@ -404,8 +402,8 @@ host firewall layers still deny their container-originated egress.
 | `net-cache` / `br-cache` | `172.28.12.0/24` | LiteLLM, Redis |
 | `net-telemetry` / `br-otel` | `172.28.13.0/24` | LiteLLM, dev/admin portals, key-rotator, Alloy (`.2`) |
 | `net-metrics` / `br-metrics` | `172.28.14.0/24` | both Traefik instances, Keycloak, Envoy, Prometheus, node-exporter |
-| `net-observability` / `br-obs` | `172.28.15.0/24` | Alloy (`.2`), Prometheus (`.3`), Prometheus OAuth2 proxy, Loki, Tempo, Grafana |
-| `net-traces` / `br-traces` | `172.28.16.0/24` | Alloy, Tempo (`.2`) |
+| `net-observability` / `br-obs` | `172.28.15.0/24` | Alloy (`.2`), Prometheus (`.3`), Prometheus OAuth2 proxy, Loki, Grafana |
+| _(retired)_ | `172.28.16.0/24` | formerly `net-traces`/`br-traces` (Alloy→Tempo); removed with the local trace store — subnet stays reserved |
 | `net-identity` / `br-ident` | `172.28.17.0/24` | lab overlay only: Keycloak and Samba AD |
 | `net-lab-dns` / `br-lab-dns` | `172.28.18.0/24` | lab overlay only: DNS (`172.28.18.2`); no application peers |
 | `net-int-edge` / `br-int-edge` | `172.28.19.0/24` | `traefik-int` only; no application peers |
@@ -564,8 +562,10 @@ The repository does not create or unlock LUKS. Generic/customer playbooks fail
 before mutation unless both the configured Docker data root and `/opt/ai-gateway`
 resolve through a block device with a `crypto_LUKS` ancestor; only the explicit
 disposable lab profile opts out. Prompt and completion content is
-explicitly captured as OpenTelemetry span attributes and retained in Tempo for
-30 days, and is also sent to Cribl when configured. Before export, Alloy
+explicitly captured as OpenTelemetry span attributes, exported to Cribl when
+configured, and retained locally for 7 days in the Loki per-request stream
+(`service_name="aigw-requests"`) Alloy derives from `litellm_request` spans.
+Before export, Alloy
 promotes only validated, server-authenticated LiteLLM metadata into canonical
 `aigw.user.id`, hashed `aigw.api_key.id`, bounded `aigw.api_key.alias`,
 `aigw.project.id`, and `aigw.request.id` trace attributes. The spend index joins
@@ -655,7 +655,7 @@ configuration — is recorded in [project-status.md](project-status.md) and
 | dev portal plus one bounded Open WebUI workload key | Human API keys stay portal-owned and one-time-visible. Open WebUI's own key issuance stays disabled; Ansible reconciles one shared LiteLLM workload key with inference-only routes and service/project attribution. |
 | Four OAuth2 Proxy gates rather than in-app admin SSO | LiteLLM Admin, Grafana, Prometheus, and Vault lack a common OIDC gate at their license tier; a dedicated DHI proxy per UI enforces the `aigw-admins` role with an isolated cookie namespace. |
 | Vault CE rather than OpenBao | Customer accepted Vault's license for internal use; the implementation uses KV v2, PKI, audit, and metrics-capable CE features only. |
-| Tempo for AI content, Loki for logs | Full prompts are trace attributes. Keeping them out of ordinary log streams avoids duplicate sensitive stores and unbounded log labels. |
+| Cribl for AI trace history, one dedicated Loki request stream locally | Full prompts are span attributes. The local Tempo store was retired (nobody used the waterfall); the derived `aigw-requests` Loki stream keeps a bounded 7-day local audit surface while ordinary service log streams stay prompt-free. |
 | Full prompt capture | Customer requirement; access control, encrypted storage, capacity planning, and retention are load-bearing controls. |
 
 Earlier Caddy, flat `net-backend`, CONNECT-proxy, native-OIDC-Grafana,

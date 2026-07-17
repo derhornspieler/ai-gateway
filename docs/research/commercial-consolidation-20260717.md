@@ -28,7 +28,7 @@ it plays and the commercial tier that exists for it.
 | oauth2-proxy ×4 | OIDC gate for admin UIs | MIT | none (would be *replaced*, not licensed) |
 | dev-portal / admin-portal | Self-service keys, group model policy, identity ops | ours | n/a (candidate for *collapse*) |
 | key-rotator | Provider+virtual key rotation, Keycloak identity controller | ours | n/a (candidate for *partial collapse*) |
-| Grafana/Prometheus/Loki/Tempo/Alloy | Dashboards, metrics, logs, traces | AGPL/Apache | Grafana Enterprise stack / Grafana Cloud |
+| Grafana/Prometheus/Loki/Alloy | Dashboards, metrics, logs, request stream | AGPL/Apache | Grafana Enterprise stack / Grafana Cloud |
 | PostgreSQL, Redis-less design | State | PostgreSQL license | n/a |
 
 ---
@@ -53,9 +53,12 @@ attacks the custom Python surface we maintain, not just a feature checkbox.
 - **Virtual-key rotation half of key-rotator** → scheduled key rotations
   (enterprise) + audit logs (enterprise).
 - **Prometheus `/metrics`** → enterprise-gated endpoint becomes available;
-  today's workaround (OTel callback → Alloy → Tempo spans; edge metrics from
+  today's workaround (OTel callback → Alloy → Cribl spans + the Loki
+  `aigw-requests` stream; edge metrics from
   Traefik/Envoy; no `litellm` scrape job in `compose/prometheus/prometheus.yml`)
-  stops being the only source of request metrics.
+  stops being the only source of request metrics. *(Implemented 2026-07-17:
+  Tempo has since been removed — traces go to Cribl only and the local
+  per-request audit lives in the Loki `aigw-requests` stream.)*
 - **JWT auth** (enterprise) → API callers could present Keycloak-issued JWTs
   instead of static `sk-` keys — a posture upgrade nothing in the current
   stack offers.
@@ -123,9 +126,10 @@ owner has ruled out.
   checkboxes and in developer tables with no portal change.
 - *"We pull logs via OTel because Prometheus export is enterprise, right?"* —
   Correct in substance: LiteLLM's `/metrics` is enterprise-gated, so the
-  free-tier design uses the OTel callback (spans → Alloy → Tempo, with
-  key/project attribution) and container logs → Loki. Request metrics today
-  come from the Traefik/Envoy edges, not from LiteLLM itself.
+  free-tier design uses the OTel callback (spans → Alloy → Cribl, with
+  key/project attribution and, since 2026-07-17, a derived per-request Loki
+  stream instead of local Tempo) and container logs → Loki. Request metrics
+  today come from the Traefik/Envoy edges, not from LiteLLM itself.
 
 ---
 

@@ -22,7 +22,7 @@ among them — are bounded in [litellm-scaling.md](litellm-scaling.md).
 Ad hoc Compose `--scale` is not supported. Several services carry
 single-replica invariants: key-rotator's managed-group topology lock and the
 portals' key-lifecycle serialization are process-local, LiteLLM's worker/pool
-accounting assumes the reviewed container count, and Grafana, Loki, Tempo,
+accounting assumes the reviewed container count, and Grafana, Loki,
 Prometheus, Vault, and Postgres all use local single-writer state. Keep one
 replica and one worker per service unless a change is explicitly reviewed.
 
@@ -32,7 +32,7 @@ True HA and horizontal scaling require re-platforming to Kubernetes — a
 separate architecture, not another Compose overlay on this VM. That design
 must supply, at minimum: multiple independent nodes across failure domains;
 external HA PostgreSQL and Redis; Vault on Integrated Storage with TLS and a
-production unseal ceremony; object storage for Loki/Tempo; the customer's own
+production unseal ceremony; object storage for Loki; the customer's own
 AD/LDAP and DNS; per-service readiness, drain, migration, and disruption
 policy; and preservation of this stack's isolation model (exact egress
 identity, no Docker-socket/broad discovery, per-plane network segmentation).
@@ -63,7 +63,7 @@ single failure domains.
 What makes this a design exercise rather than a procedure is state. This
 stack is deliberately stateful in one place per concern, and none of it spans
 hosts today: Postgres (Keycloak realm + LiteLLM), Vault (file backend,
-manual unseal), Open WebUI's app database, Grafana/Loki/Tempo/Prometheus
+manual unseal), Open WebUI's app database, Grafana/Loki/Prometheus
 local storage, and the key-rotator/portal process-local locks that already
 forbid replicas. A cutover therefore needs, at minimum: a per-service state
 map of what an image bump preserves versus destroys (recorded in the

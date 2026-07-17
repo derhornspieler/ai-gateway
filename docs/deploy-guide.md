@@ -247,7 +247,7 @@ select the platform-DNS overlay and the `vault-ui` Compose profile through
 A set of fixed workload IPs pin the few containers that other components
 address directly: `ENVOY_EGRESS_IP` (the sole external-DNS/TCP-443 workload at
 `172.28.0.2`), `ALLOY_INTERNAL_IP`, `ALLOY_TELEMETRY_IP`,
-`ALLOY_OBSERVABILITY_IP`, `PROMETHEUS_OBSERVABILITY_IP`, `TEMPO_INGEST_IP`,
+`ALLOY_OBSERVABILITY_IP`, `PROMETHEUS_OBSERVABILITY_IP`,
 `TRAEFIK_INT_CHAT_IP`, `TRAEFIK_INT_PORTAL_IP`, `TRAEFIK_ADM_ADMIN_IP`,
 `TRAEFIK_ADM_GRAFANA_IP`, `OAUTH2_PROXY_LITELLM_IP`, and the overlay-only `LAB_DNS_IP`. These must stay inside
 their bridge subnets and off the reserved gateway address; the preflight
@@ -257,7 +257,7 @@ Ansible also writes one keyed `AIGW_BIND_DIGEST_*` content marker per service
 whose read-only bind sources must be intact before it starts:
 `AIGW_BIND_DIGEST_TRAEFIK_INT`, `_TRAEFIK_ADM`, `_LITELLM`, `_OPEN_WEBUI`,
 `_KEYCLOAK`, `_VAULT`, `_POSTGRES`, `_REDIS`, `_ALLOY`, `_PROMETHEUS`, `_LOKI`,
-`_TEMPO`, `_GRAFANA`, `_CRIBL_MOCK`, and the lab-only `_LAB_DNS`, `_SAMBA_AD`,
+`_GRAFANA`, `_CRIBL_MOCK`, and the lab-only `_LAB_DNS`, `_SAMBA_AD`,
 `_KEY_ROTATOR_LAB`. They are blank in the example so a direct Compose start
 stays fail-closed until Ansible has computed the digests; a changed digest
 recreates only the affected consumer.

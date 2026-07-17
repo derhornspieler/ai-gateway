@@ -414,10 +414,9 @@ rather than the deliberately denied physical host addresses; verify physical
 listeners, DNAT, and firewall policy separately. These checks detect unreadable
 Traefik dynamic route/TLS files that native `/ping` misses. An isolated,
 network-scoped probe container reads Grafana's provisioned datasource table
-read-only from a `--volumes-from grafana:ro` mount — proving exactly Prometheus,
-Loki, and Tempo with the reviewed UIDs, types, and URLs — and confirms all three
-backends answer their native readiness endpoints (`/-/ready`, `/ready`,
-`/ready`). It runs inside the bounded 12 attempts with five-second delay, with
+read-only from a `--volumes-from grafana:ro` mount — proving exactly Prometheus
+and Loki with the reviewed UIDs, types, and URLs — and confirms both
+backends answer their native readiness endpoints (`/-/ready`, `/ready`). It runs inside the bounded 12 attempts with five-second delay, with
 the probe container's logging disabled and no secret in its arguments or output;
 Grafana's own login form and basic auth are disabled, so no admin password is
 presented. Reading `/api/health` alone does not prove the provisioning graph
@@ -447,7 +446,6 @@ and seal state.
 | `alloy_data` | `473:473` | `0700` |
 | `prom_data` | `65532:65532` | `0700` |
 | `loki_data` | `65532:65532` | `0700` |
-| `tempo_data` | `65532:65532` | `0700` |
 | `grafana_data` | `65532:65532` | `0700` |
 
 Compare those semantic leaves, not the total number of Ansible tasks reporting
@@ -773,10 +771,12 @@ a successful model test.
 
 Generate a uniquely tagged, synthetic prompt. In Grafana Explore, prove:
 
-- the trace appears in Tempo with the expected service/model and prompt-bearing
-  span attributes;
+- the request appears in the Loki `{service_name="aigw-requests"}` stream with
+  the expected service/model fields and prompt-bearing `gen_ai.*` content, and
+  the span reaches the Cribl mock/receiver;
 - operational service logs appear in Loki and do not duplicate the full
-  prompt or expose credentials;
+  prompt or expose credentials (prompts live only in the `aigw-requests`
+  stream);
 - both Traefik edges retain method/status/vhost/timing metadata but omit
   `RequestPath`, `RequestLine`, headers, and query parameters; after a complete
   login/logout flow, Docker, Loki, and Cribl contain zero OAuth `code`,
@@ -792,8 +792,8 @@ Generate a uniquely tagged, synthetic prompt. In Grafana Explore, prove:
   verification-token row that contains the authenticated owner and
   `metadata.aigw_project_id`; zero native LiteLLM project rows is expected.
   Require prompt/request/response objects in the spend row to remain empty and
-  use the timestamped Tempo span as the prompt audit record. Never print or
-  search for the plaintext bearer key as evidence;
+  use the timestamped `aigw-requests` log line as the prompt audit record.
+  Never print or search for the plaintext bearer key as evidence;
 - classify the shared Open WebUI key as service/project attribution only; do
   not claim its browser traffic is per-human until a trusted server-side
   identity propagation design has passed this matrix;
@@ -802,11 +802,11 @@ Generate a uniquely tagged, synthetic prompt. In Grafana Explore, prove:
   list — eight at the time of writing), and the three component dashboards
   (Rocky 9 Host, Grafana LGTM Stack, and Edge/Egress/Identity Services)
   populate from scraped native metrics — node-exporter
-  host series, LGTM self-observability (`loki_*`, `tempo_*`, `otelcol_*`,
-  `prometheus_*`), and Traefik/Keycloak/Envoy/JVM edge and identity series —
-  with their component-health panels counting exact scrape targets (`== bool 5`
-  for LGTM, `== bool 4` for edge/identity) rather than any cAdvisor or
-  `container_*` metric;
+  host series, LGTM self-observability (`loki_*`, `traces_span_metrics_*`,
+  `otelcol_*`, `prometheus_*`), and Traefik/Keycloak/Envoy/JVM edge and
+  identity series — with their component-health panels counting exact scrape
+  targets (`== bool 4` for both LGTM and edge/identity) rather than any
+  cAdvisor or `container_*` metric;
 - the Cribl mock or approved external receiver records delivery without a
   collector feedback loop;
 - a user without `aigw-admins` cannot cross the Grafana edge gate.
@@ -918,7 +918,7 @@ At minimum prove:
   explicit executables alone are executable, and the Keycloak and Traefik
   private bind trees retain their reviewed narrower ownership/modes;
 - lab Samba's three volumes restore as one consistent set;
-- Tempo/Loki/Prometheus retention state is either restored or explicitly
+- Loki/Prometheus retention state is either restored or explicitly
   accepted as disposable by policy;
 - any Keycloak session-table count difference is classified from authenticated
   rows and realm policy. In the 2026-07-13 evidence, the 9+9 rows all had

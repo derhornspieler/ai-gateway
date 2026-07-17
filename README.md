@@ -166,7 +166,7 @@ compose/
   .env.example             fail-closed variable contract templated by Ansible
   traefik/                 separate internal and ADM routing
   keycloak/ litellm/ postgres/ vault/
-  alloy/ prometheus/ loki/ tempo/ grafana/ cribl-mock/
+  alloy/ prometheus/ loki/ grafana/ cribl-mock/
 services/
   egress-proxy/            Envoy TLS-originating, pinned per-vendor CA egress
   key-rotator/             rotation engine and Keycloak identity controller
@@ -212,8 +212,9 @@ docs/                      current operator and architecture documentation
   `targeted` policy already enforcing, requires per-container MCS labels, and
   asserts zero AVCs in the converge window. It does not convert a permissive or
   disabled host.
-- Full prompts/completions are sensitive Tempo trace attributes and may also be
-  exported to Cribl; they are not ordinary Loki log records. Open WebUI uses one
+- Full prompts/completions are sensitive span attributes exported to Cribl and
+  retained locally only in the dedicated Loki `aigw-requests` per-request
+  stream; they never appear in ordinary service log records. Open WebUI uses one
   inference-only service key, so its audit attribution is `svc-open-webui`, not
   the individual browser user.
 - Authenticated restore exits with zero running project containers under an exact

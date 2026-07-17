@@ -25,7 +25,7 @@ telemetry pipeline. It complements the operator guide in
 - **What Prometheus scrapes — and deliberately does not.** Prometheus scrapes
   only reviewed metrics/observability-plane endpoints (the
   two Traefik edges, Envoy's read-only stats facade, Keycloak management,
-  Alloy, Grafana, Tempo, Loki, node-exporter, and itself); Vault, Postgres,
+  Alloy, Grafana, Loki, node-exporter, and itself); Vault, Postgres,
   Redis, and LiteLLM are deliberately not scraped because exposing their
   metrics would weaken an authentication boundary. Alert rules live in
   Prometheus (`compose/prometheus/rules.yml`), not Grafana.
@@ -49,8 +49,8 @@ telemetry pipeline. It complements the operator guide in
   immutable in the UI: eight reviewed
   dashboards (overview, live logs, request audit, top projects, top users,
   edge/identity, LGTM stack, Rocky 9 host) in the "AI Gateway" folder, exactly
-  four datasources (Prometheus, Loki, Tempo, and the read-only LiteLLM Spend
-  PostgreSQL datasource) with trace/log cross-linking, no runtime plugin
+  three datasources (Prometheus, Loki, and the read-only LiteLLM Spend
+  PostgreSQL datasource), no runtime plugin
   downloads (the sole app plugin — Grafana Loki drilldown
   `grafana-lokiexplore-app` 2.2.1 — is version- and sha256-pinned into the
   Grafana image at build and loaded from a read-only rootfs path), and no
@@ -63,34 +63,40 @@ telemetry pipeline. It complements the operator guide in
 ## Collection and routing
 
 Grafana Alloy is the single collector and router. It accepts OTLP only on its
-fixed `net-telemetry` address and fans each signal out to a local store and,
-optionally, to Cribl: traces go to Tempo over `net-traces`, logs go to Loki over
-`net-observability`, and metrics go to Prometheus over `net-observability`.
-Prometheus additionally scrapes isolated service endpoints and, on the separate
-`net-metrics` bridge, the node-exporter host metrics; Alloy also derives bounded
-`spanmetrics` from AI spans. Grafana reads the provisioned Prometheus, Loki, and
-Tempo datasources on `net-observability` and is reached only through
-`net-grafana`. Alloy's one `net-internal` leg is the fixed source identity for an
+fixed `net-telemetry` address and fans each signal out: traces go to Cribl
+(there is no local trace store), logs go to Loki over `net-observability`, and
+metrics go to Prometheus over `net-observability`. From `litellm_request`
+spans Alloy additionally derives one Loki log line per AI request (an explicit
+attribute allow-list, stream label `service_name="aigw-requests"`), which is
+the local per-request audit surface and the stream Grafana Logs Drilldown
+filters by user/key/project. Prometheus additionally scrapes isolated service
+endpoints and, on the separate `net-metrics` bridge, the node-exporter host
+metrics; Alloy also derives bounded `spanmetrics` from AI spans. Grafana reads
+the provisioned Prometheus and Loki datasources on `net-observability` and is
+reached only through `net-grafana`. Alloy's one `net-internal` leg is the fixed source identity for an
 explicitly enabled Cribl export, and the in-stack `cribl-mock` OpenTelemetry
 Collector lives on `net-internal` as the development export target.
 
 | Data | Source and path | Local destination | External copy |
 |---|---|---|---|
-| AI request/response content | LiteLLM emits OTLP spans with `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_ONLY`; Alloy accepts OTLP only on its fixed `net-telemetry` address | Tempo | Cribl OTLP |
-| Other application OTLP | LiteLLM and instrumented custom services to Alloy | traces: Tempo; logs: Loki; metrics: Prometheus | original OTLP signals to Cribl |
+| AI request/response content | LiteLLM emits OTLP spans with `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_ONLY`; Alloy accepts OTLP only on its fixed `net-telemetry` address | Loki per-request stream (`service_name="aigw-requests"`, derived from `litellm_request` spans only) | Cribl OTLP |
+| Other application OTLP | LiteLLM and instrumented custom services to Alloy | traces: none locally (spanmetrics only); logs: Loki; metrics: Prometheus | original OTLP signals to Cribl |
 | Container stdout/stderr | bounded Docker `json-file` files to a read-only Alloy file tail (no Docker socket) | Loki | Cribl OTLP logs, except Alloy and the mock sink to prevent feedback |
 | Vault audit | Vault HMAC-protected audit file to a dedicated read-only Alloy mount | Loki | Cribl OTLP logs |
 | Service/host metrics | Prometheus scrapes isolated service endpoints and node-exporter; Alloy derives bounded `spanmetrics` from AI spans | Prometheus | Cribl receives source OTLP, not node-exporter or locally derived spanmetrics series |
 
 ## Sensitive prompt content
 
-Full prompts and completions are deliberately retained as trace attributes in
-Tempo and, when enabled, in Cribl. They are never written as Loki log records and
-never become metric labels. Do not add a debug exporter or log span bodies to
-stdout: either would create an uncontrolled second prompt store. This is the core
-data-classification rule of the deployment, so the Grafana, Prometheus, Loki,
-Tempo, and Alloy APIs must not be published directly, and the ADM Grafana vhost is
-the only supported query path for prompt-bearing data.
+Full prompts and completions are deliberately retained as span attributes in
+Cribl (when enabled) and, locally, only in the dedicated Loki per-request
+stream `{service_name="aigw-requests"}` that Alloy derives from sanitized
+`litellm_request` spans (owner decision). They never appear in ordinary
+service log streams and never become metric labels. Do not add a debug
+exporter, log span bodies to stdout, or route additional span names into the
+request stream: any of those would create an uncontrolled second prompt store.
+This is the core data-classification rule of the deployment, so the Grafana,
+Prometheus, Loki, and Alloy APIs must not be published directly, and the ADM
+Grafana vhost is the only supported query path for prompt-bearing data.
 
 Before trace batching, Alloy promotes validated server-authenticated LiteLLM
 metadata on `litellm_request` spans into five canonical correlation attributes:
@@ -110,7 +116,7 @@ metric dimensions to prevent user-controlled cardinality growth.
 LiteLLM spend rows are a separate cost and accounting index, not the prompt audit
 store. `general_settings.store_prompts_in_spend_logs` is pinned to `false`, so
 `messages`, `response`, and `proxy_server_request` remain empty objects while
-prompt content stays in the controlled Tempo/Cribl trace path. Because the
+prompt content stays in the controlled Cribl/`aigw-requests` path. Because the
 portal's project is namespaced key metadata rather than a native LiteLLM project,
 a correct spend correlation joins `LiteLLM_SpendLogs.api_key` (the SHA-256 key
 identifier) to `LiteLLM_VerificationToken.token` and reads
@@ -196,22 +202,20 @@ deliberate defense in depth for prompt-bearing data.
 | Store/buffer | Enforced bound |
 |---|---|
 | Docker stdout/stderr | 5 files x 20 MiB per container (about 100 MiB per service instance) |
-| Loki | 30 days; compactor deletion enabled with a 2-hour delete delay |
-| Tempo | 30 days; 8 MiB maximum attribute, 16 MiB maximum trace, 10 MiB/s steady and 16 MiB burst ingestion |
-| Prometheus | 15 days and 5 GB by default; the first limit reached wins |
+| Loki (including the `aigw-requests` stream) | 7 days; compactor deletion enabled with a 2-hour delete delay |
+| Prometheus | 7 days and 5 GB by default; the first limit reached wins |
 | Alloy process | 384 MiB memory limiter plus 64 MiB spike allowance inside a 512 MiB container limit |
-| Alloy to Tempo | 32 MiB in-memory queue; retries for at most 1 minute |
-| Alloy to Cribl | 64 MiB in-memory queue; retries for at most 5 minutes |
+| Alloy to Cribl | 2 GiB persistent on-disk queue (fsync, byte-sized) — the owner-approved ~24 h Cribl-outage buffer; retries do not time out |
 
-Both OTLP exporter queues are byte-bounded with `block_on_overflow=false`, so
-after the retry window or once a queue fills, that destination loses new telemetry
-rather than exhausting the VM. The local and Cribl branches are separate, so a
-short Cribl outage does not directly stop a healthy local store; sustained
-collector pressure can still make the shared OTLP receiver reject work, and SDK
-retry behavior then determines upstream loss. Alloy file positions and the
-Prometheus remote-write WAL persist in `alloy_data`, but the OTLP exporter queues
-do not survive an Alloy restart. Alert on exporter send failures, queue capacity,
-receiver refusals, and host disk usage.
+The Cribl OTLP exporter queue is byte-bounded with `block_on_overflow=false`,
+so once it fills, that destination loses new telemetry rather than exhausting
+the VM. The local and Cribl branches are separate, so a Cribl outage of up to
+roughly a day buffers durably on disk without stopping the healthy local
+stores; sustained collector pressure can still make the shared OTLP receiver
+reject work, and SDK retry behavior then determines upstream loss. Alloy file
+positions, the Prometheus remote-write WAL, and the persistent Cribl exporter
+queue all live in `alloy_data` and survive an Alloy restart. Alert on exporter
+send failures, queue capacity, receiver refusals, and host disk usage.
 
 Cribl retention is a customer-side policy and is not controlled here. A real Cribl
 target must use `host:port` with no URL scheme, `cribl_otlp_insecure: false`, the
@@ -236,15 +240,17 @@ delivery as an incomplete paging control.
 ## Capacity planning
 
 The 40 GB lab disk is suitable only for low-volume testing and is not a production
-sizing recommendation when full prompts are retained for 30 days. Measure
+sizing recommendation when full prompts are retained for 7 days. Measure
 representative traffic, then size the encrypted Docker data volume as roughly:
 
 ```text
-(daily Tempo bytes + daily Loki bytes) × 30 days × 2 headroom
+daily Loki bytes (service logs + aigw-requests stream) × 7 days × 2 headroom
++ the 2 GiB Alloy→Cribl outage buffer in alloy_data
 + Prometheus, Postgres, Vault, images, and up to ~100 MiB × container instances
 ```
 
-Prompt and tool payload size dominates Tempo growth. Record daily growth with
+Prompt and tool payload size dominates the `aigw-requests` share of Loki
+growth. Record daily growth with
 `docker system df -v` and `du` against Docker's volume root for at least a week,
 then tune the warning and critical thresholds to the measured recovery time; the
 committed rules alert at 85% and 95% used plus predicted exhaustion within 24
@@ -255,7 +261,7 @@ observability failure.
 
 ## Backup and recovery of telemetry volumes
 
-Telemetry state lives in the named volumes `tempo_data`, `loki_data`,
+Telemetry state lives in the named volumes `loki_data`,
 `prom_data`, `grafana_data`, `alloy_data`, and `vault_audit`. They are single-node
 local stores with no replication. `scripts/state-backup.sh` quiesces the complete
 writer set and includes these volumes in one age-encrypted artifact alongside
@@ -275,8 +281,9 @@ captured configuration and repair bind ownership while restored Vault stays
 sealed, then unseal with the separately held old share, run the complete runtime
 wait, and verify that new logs, traces, and metrics arrive before reopening
 access. `vault-bootstrap.sh` is forbidden while the marker exists. Losing
-`alloy_data` can cause file-tail duplicates or gaps around rotated Docker logs;
-losing the Tempo, Loki, or Prometheus volumes loses local history but should not
+`alloy_data` can cause file-tail duplicates or gaps around rotated Docker logs
+and discards any buffered Cribl backlog;
+losing the Loki or Prometheus volumes loses local history but should not
 block inference. `docker compose down` preserves named volumes, while
 `docker compose down -v` irreversibly deletes the local telemetry stores, Vault
 data and audit records, and application databases, so use it only for an
@@ -287,7 +294,7 @@ explicitly disposable lab.
 Run `scripts/validate-compose.sh` after every Compose or environment change. Do
 not accept Grafana's native `/api/health` alone: the verify role queries the
 authenticated API from an isolated `net-grafana` probe, requires exactly the
-provisioned Prometheus, Loki, and Tempo datasource graph, and requires `OK` from
+provisioned Prometheus and Loki datasource graph, and requires `OK` from
 every datasource health endpoint, which detects an unreadable provisioning bind
 tree that container health cannot see. That probe is bounded to 12 attempts with a
 five-second delay, the password is exact stdin with no Ansible-added newline, all
@@ -299,8 +306,9 @@ match is a release blocker. On a disposable lab that previously logged those
 values, stop Alloy and Loki, remove and recreate `loki_data` and `alloy_data`,
 clear the development Cribl sink state, and recreate the edges before collecting
 fresh evidence, while production deletion must follow the customer evidence and
-incident process. In Grafana Explore, use Tempo to locate a test trace and confirm
-the expected prompt attribute plus the five canonical `aigw.*` fields, checking
+incident process. In Grafana Explore (or Logs Drilldown), query
+`{service_name="aigw-requests"} | logfmt` to locate a test request and confirm
+the expected prompt attribute plus the canonical `aigw.*` fields, checking
 that the API-key ID equals the source lowercase hash, the request ID equals
 `litellm.call_id`, and the project matches the portal project; then send missing,
 malformed, uppercase-hash, overlength or injection-like project, and non-LiteLLM
