@@ -46,7 +46,6 @@ each bound to one NIC IP, publishing only `:443`. All names use the same wildcar
 |---|---|---|---|
 | `chat.` | **both** (ADM + internal) | open-webui | dual-homed (owner decision): VPN admins via ADM, LAN users via internal; one OIDC client, gated by `aigw-chat` |
 | `admin.` | ADM | admin-portal | |
-| `admin-portal.` | ADM | admin-portal | 301 → `admin.` |
 | `litellm-admin.` | ADM | oauth2-proxy → litellm | native LiteLLM admin UI |
 | `grafana.` | ADM | oauth2-proxy-grafana | |
 | `prometheus.` | ADM | oauth2-proxy-prometheus | |

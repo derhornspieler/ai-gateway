@@ -1152,7 +1152,6 @@
       - "{{ item.transport }}"
   loop:
     - { name: "admin.{{ aigw_domain }}", transport: +notcp }
-    - { name: "admin-portal.{{ aigw_domain }}", transport: +tcp }
     - { name: "litellm-admin.{{ aigw_domain }}", transport: +notcp }
     - { name: "grafana.{{ aigw_domain }}", transport: +notcp }
     - { name: "prometheus.{{ aigw_domain }}", transport: +tcp }
@@ -1202,7 +1201,6 @@
   loop:
     - { name: "auth.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
     - { name: "admin.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
-    - { name: "admin-portal.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
     - { name: "litellm-admin.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
     - { name: "grafana.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +notcp }
     - { name: "prometheus.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
@@ -1557,7 +1555,6 @@
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin.{{ aigw_domain }}", path: /, status: "303" }
     # Traefik v3 RedirectRegex emits 301 for permanent redirects and 302 for
     # temporary redirects. Verify the implementation's actual contract.
-    - { address: "{{ traefik_adm_admin_ip }}", hostname: "admin-portal.{{ aigw_domain }}", path: /healthz, status: "301" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /, status: "302" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /ui, status: "302" }
     - { address: "{{ traefik_adm_admin_ip }}", hostname: "litellm-admin.{{ aigw_domain }}", path: /openapi.json, status: "403" }

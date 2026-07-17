@@ -37,19 +37,17 @@ class AdminSurfaceContractTests(unittest.TestCase):
             f"    {following}:\n", 1
         )[0]
 
-    def test_custom_console_owns_admin_and_alias_is_redirect_only(self) -> None:
-        admin = self._router("admin", "admin-portal")
+    def test_custom_console_owns_admin_on_the_canonical_host_only(self) -> None:
+        # The console is published ONLY at admin.<domain>; the legacy
+        # admin-portal.<domain> alias host (router + redirect middleware) was
+        # removed. The service named admin-portal still backs the admin router.
+        admin = self._router("admin", "litellm-admin-docs-deny")
         self.assertIn("service: admin-portal", admin)
         self.assertNotIn("service: oauth2-proxy", admin)
-
-        alias = self._router("admin-portal", "litellm-admin-root")
-        self.assertIn("middlewares: [admin-portal-canonical]", alias)
-        self.assertIn("https://admin.", self.traefik)
-        self.assertIn("permanent: true", self.traefik)
-        self.assertIn(
-            'hostname: "admin-portal.{{ aigw_domain }}", path: /healthz, status: "301"',
-            self.verify,
-        )
+        # No alias host, redirect middleware, or health probe for it survives.
+        self.assertNotIn("admin-portal.", self.traefik)
+        self.assertNotIn("admin-portal-canonical", self.traefik)
+        self.assertNotIn("admin-portal.", self.verify)
 
     def test_native_litellm_ui_has_distinct_oidc_host_and_safe_root(self) -> None:
         root = self._router("litellm-admin-root", "litellm-admin")
@@ -235,7 +233,6 @@ class AdminSurfaceContractTests(unittest.TestCase):
         # must stay off the internal edge.
         for admin_host in (
             "admin.",
-            "admin-portal.",
             "litellm-admin.",
             "grafana.",
             "prometheus.",

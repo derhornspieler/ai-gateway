@@ -337,7 +337,7 @@ them are hostnames under your base domain:
 | Hostname | Points to | Who uses it |
 |---|---|---|
 | `portal.<domain>`, `api.<domain>`, `auth.<domain>` | the **internal** interface IP | users and developers |
-| `chat.<domain>`, `admin.<domain>`, `admin-portal.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, `vault.<domain>` | the **ADM** interface IP | chat and administration (ADM leg) |
+| `chat.<domain>`, `admin.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, `vault.<domain>` | the **ADM** interface IP | chat and administration (ADM leg) |
 
 The complete name inventory, per-audience resolution expectations, and the
 internal-vs-internet DNS design are in the

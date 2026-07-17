@@ -214,7 +214,7 @@ needs the controls in [deploy-guide.md](deploy-guide.md) and
 [operations.md](operations.md).
 
 Finally, an existing `aigw` realm user whose token already carries `aigw-admins`
-must be able to sign in to `admin-portal.<domain>`. The portal cannot create or
+must be able to sign in to `admin.<domain>`. The portal cannot create or
 authorize its own first administrator. A generic deployment must establish this
 user through a controlled Keycloak or customer-IdP process. Only the lab inventory seeds disposable Keycloak-local users for this first entry — and only
 when `aigw_seed_test_users` is explicitly enabled — because lab LDAP is not
@@ -226,7 +226,7 @@ removed after the Samba `lab-admin` handoff.
 
 > **What you do** — four actions:
 >
-> 1. Open `https://admin-portal.<domain>` as the initial administrator.
+> 1. Open `https://admin.<domain>` as the initial administrator.
 > 2. Choose **Reauthenticate with Keycloak** and complete the fresh login.
 > 3. In **Initialize identity control**, type `INITIALIZE` exactly.
 > 4. Submit.
@@ -234,7 +234,7 @@ removed after the Samba `lab-admin` handoff.
 > **Expected result:** the portal displays readiness booleans and two SHA-256
 > certificate fingerprints.
 
-Open `https://admin-portal.<domain>` as the initial administrator and choose
+Open `https://admin.<domain>` as the initial administrator and choose
 **Reauthenticate with Keycloak**. The portal sends `prompt=login` and
 `max_age=0`, requires the same immutable subject and a current admin role, and
 grants a five-minute mutation window; ordinary page access is not sufficient for

@@ -19,7 +19,6 @@ configuration and verified by the `verify` role on every converge.
 | `auth.<domain>` | Keycloak | Internal + ADM | Internal edge serves only the scoped `aigw`-realm login paths; the full console and master realm are reachable only through the ADM edge |
 | `chat.<domain>` | Open WebUI browser chat | **ADM** | Routed on the ADM edge in the current implementation; the internal DNS view carries no `chat` record |
 | `admin.<domain>` | Platform administration portal | ADM | |
-| `admin-portal.<domain>` | Legacy alias | ADM | Permanent redirect to `admin.<domain>` |
 | `litellm-admin.<domain>` | Native LiteLLM administration UI | ADM | Behind its oauth2-proxy gate; `/openapi.json`, `/docs`, `/redoc` are denied |
 | `grafana.<domain>` | Grafana dashboards | ADM | Behind its oauth2-proxy gate |
 | `prometheus.<domain>` | Prometheus UI | ADM | Behind its oauth2-proxy gate |

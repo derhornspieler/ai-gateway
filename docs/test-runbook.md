@@ -405,7 +405,7 @@ Require the full Ansible functional probes as well. Connecting to the exact
 Traefik service-plane addresses with trusted TLS and exact SNI, the reviewed
 edge contract is: 200 for internal `portal.<domain>/healthz` and
 `auth.<domain>/realms/aigw/.well-known/openid-configuration`; 403 for internal
-`api.<domain>/ui`; 200 for ADM `admin-portal.<domain>/healthz`; and a 302 OIDC
+`api.<domain>/ui`; 200 for ADM `admin.<domain>/healthz`; and a 302 OIDC
 redirect for ADM `admin.<domain>/`, `grafana.<domain>/`, `prometheus.<domain>/`,
 `vault.<domain>/`, and `auth.<domain>/admin/`, as each oauth2-proxy or the
 Keycloak admin route bounces an unauthenticated request to Keycloak. During
@@ -628,7 +628,7 @@ Each admin UI must first pass its own oauth2-proxy `aigw-admins` gate. Grafana
 then consumes the proxied identity through its auth-proxy allow-list — its login
 form and basic auth are disabled — so it presents no second login. The portal
 admin surface is the dedicated `admin-portal` ASGI application on the ADM leg
-(`admin-portal.<domain>` via traefik-adm on `net-admin-app`); the internal
+(`admin.<domain>` via traefik-adm on `net-admin-app`); the internal
 user/developer portal never registers an admin surface. The `/admin` read
 revalidates live admin authority on every request, and mutations add CSRF plus a
 fresh step-up reauthentication bounded to roughly five minutes.
@@ -639,7 +639,7 @@ This section applies only to the lab overlay.
 
 1. Confirm `samba-ad` is healthy, read-only, non-privileged, has only the
    reviewed capabilities, publishes no port, and joins only `net-identity`.
-2. Sign into `admin-portal.<domain>/admin` as disposable `testadmin`, select
+2. Sign into `admin.<domain>/admin` as disposable `testadmin`, select
    **Reauthenticate with Keycloak**, then submit `INITIALIZE`.
 3. Confirm status shows the durable controller and WIF broker ready, the lab
    LDAP provider ready, certificate fingerprints, `break_glass_escrowed` true,

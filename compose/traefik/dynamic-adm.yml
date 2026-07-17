@@ -16,14 +16,6 @@ http:
       # aigw-admins decision, and requires step-up authentication for writes.
       service: admin-portal
       tls: {}
-    admin-portal:
-      rule: 'Host(`admin-portal.{{ env "DOMAIN" }}`)'
-      entryPoints: [websecure]
-      # Compatibility only. Never establish a second cookie/OIDC origin for
-      # the same console; preserve the path while moving to the canonical host.
-      middlewares: [admin-portal-canonical]
-      service: admin-portal
-      tls: {}
     litellm-admin-docs-deny:
       rule: 'Host(`litellm-admin.{{ env "DOMAIN" }}`) && (Path(`/openapi.json`) || Path(`/openapi.json/`) || Path(`/docs`) || Path(`/docs/`) || Path(`/redoc`) || Path(`/redoc/`))'
       priority: 120
@@ -78,11 +70,6 @@ http:
     deny-all:
       ipAllowList:
         sourceRange: ["0.0.0.0/32"]
-    admin-portal-canonical:
-      redirectRegex:
-        regex: '^https://admin-portal\.[^/]+/(.*)$'
-        replacement: 'https://admin.{{ env "DOMAIN" }}/${1}'
-        permanent: true
     litellm-admin-root:
       redirectRegex:
         regex: '^https://litellm-admin\.[^/]+/$'

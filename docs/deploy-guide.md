@@ -419,7 +419,7 @@ valid only for a fresh uninitialized deployment with no restore marker.
 
 Use split DNS where necessary. The internal leg publishes `auth`, `chat`, `api`,
 and `portal`, which resolve to the internal host address. The ADM leg publishes
-`admin`, `admin-portal`, `grafana`, `prometheus`, `vault`, and `auth`, which
+`admin`, `grafana`, `prometheus`, `vault`, and `auth`, which
 resolve to the ADM host address. There is no separate `keycloak` hostname:
 `auth.DOMAIN` is dual-homed. Resolved to the internal address it serves the
 `aigw` realm, and the internal router scopes it to `/realms/aigw` and

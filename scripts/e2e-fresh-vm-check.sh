@@ -89,7 +89,7 @@ command -v openssl >/dev/null || fatal "openssl is required"
 # (owner decision): the source-restricted ADM/VPN listener stays, and LAN
 # users reach the same Open WebUI — same OIDC client, same aigw-chat gate —
 # on the internal edge.
-ADMIN_LABELS=(admin admin-portal litellm-admin grafana prometheus)
+ADMIN_LABELS=(admin litellm-admin grafana prometheus)
 if [[ "$VAULT_UI" == "true" ]]; then
   ADMIN_LABELS+=(vault)
 fi

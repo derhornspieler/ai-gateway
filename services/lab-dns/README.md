@@ -14,7 +14,6 @@ Records intentionally split the two Traefik edges:
 | Name | Lab address | Plane |
 | --- | --- | --- |
 | `admin.aigw.aegisgroup.ch` | `10.8.10.10` | ADM |
-| `admin-portal.aigw.aegisgroup.ch` | `10.8.10.10` | ADM |
 | `grafana.aigw.aegisgroup.ch` | `10.8.10.10` | ADM |
 | `keycloak.aigw.aegisgroup.ch` | `10.8.10.10` | ADM |
 | `prometheus.aigw.aegisgroup.ch` | `10.8.10.10` | ADM |
@@ -51,7 +50,6 @@ Verify the scoped resolver and both address planes:
 ```sh
 scutil --dns | grep -A5 'aigw.aegisgroup.ch'
 dig +short admin.aigw.aegisgroup.ch
-dig +short admin-portal.aigw.aegisgroup.ch
 dig +short auth.aigw.aegisgroup.ch
 dig +short keycloak.aigw.aegisgroup.ch
 dig +short portal.aigw.aegisgroup.ch

@@ -815,7 +815,6 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         )[1].split(
             "Query the published ADM platform DNS view over UDP and TCP from the controller", 1
         )[0]
-        self.assertIn('"admin-portal.{{ aigw_domain }}"', negative)
         self.assertIn('"litellm-admin.{{ aigw_domain }}"', negative)
         self.assertIn(
             '{ name: "vault.{{ aigw_domain }}", transport: +notcp }',

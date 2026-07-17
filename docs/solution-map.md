@@ -244,11 +244,10 @@ and routes `chat.<domain>` to Open WebUI, `litellm-admin.<domain>` through
 `oauth2-proxy-grafana`, `prometheus.<domain>` through `oauth2-proxy-prometheus`,
 `vault.<domain>` through `oauth2-proxy-vault` to `vault-ui-proxy` (this
 router and backend are rendered only when the optional Vault UI profile is
-enabled), the legacy `admin-portal.<domain>` host as a redirect to
-`admin.<domain>`, and the full-console `auth.<domain>` to Keycloak. Only
+enabled), `admin.<domain>`, and the full-console `auth.<domain>` to Keycloak. Only
 Traefik publishes container ports in the base stack, bound to the exact
 ADM/internal host IPs; nothing binds the egress IP or `0.0.0.0`. The `verify`
-role DNS-checks `portal`, `auth`, `admin`, `admin-portal`, `litellm-admin`,
+role DNS-checks `portal`, `auth`, `admin`, `litellm-admin`,
 `grafana`, `prometheus`, and `vault`.
 
 ```mermaid

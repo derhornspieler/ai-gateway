@@ -258,7 +258,6 @@ class DnsPlaneContractTests(unittest.TestCase):
             self.assertRegex(internal, rf"(?m)^{name}\s+IN A\s+{{{{ eth2_ip }}}}$")
         for admin_only in (
             "admin",
-            "admin-portal",
             "litellm-admin",
             "grafana",
             "prometheus",

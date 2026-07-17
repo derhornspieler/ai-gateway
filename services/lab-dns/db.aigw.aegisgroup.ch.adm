@@ -14,7 +14,6 @@ $TTL 60
 ; ADM-view administration surfaces terminate only on the ADM host-only NIC.
 dns          IN A 10.8.10.10
 admin        IN A 10.8.10.10
-admin-portal IN A 10.8.10.10
 litellm-admin IN A 10.8.10.10
 grafana      IN A 10.8.10.10
 prometheus   IN A 10.8.10.10
