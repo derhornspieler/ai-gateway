@@ -1348,8 +1348,11 @@ services:
     command:
       - --path.rootfs=/host
       # Keep the Docker-root mount itself visible while excluding its many
-      # per-container overlay mounts from metric cardinality.
-      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/(containers|overlay2)/.+)($|/)
+      # per-container overlay mounts from metric cardinality. /run is excluded
+      # because the docker.sock-masking tmpfs above and the host's own /run
+      # both resolve to the same stripped mountpoint, which makes the
+      # filesystem collector emit duplicate series and fail every scrape.
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/(containers|overlay2)/.+)($|/)
     volumes:
       - /:/host:ro,rslave
     networks: [net-metrics]

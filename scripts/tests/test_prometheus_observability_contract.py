@@ -198,6 +198,20 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
         ):
             self.assertIn(required, initializer)
 
+    def test_node_exporter_filesystem_exclude_covers_the_masked_run_mount(
+        self,
+    ) -> None:
+        """The docker.sock-masking tmpfs and the host's own /run collapse to
+        one stripped mountpoint; without /run in the exclude the filesystem
+        collector emits duplicate series and errors on EVERY scrape
+        (observed live: 8 duplicate node_filesystem_* errors per gather)."""
+        exporter = service_block(self.compose, "node-exporter")
+        self.assertIn(
+            "--collector.filesystem.mount-points-exclude="
+            "^/(dev|proc|sys|run|var/lib/docker/(containers|overlay2)/.+)($|/)",
+            exporter,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
