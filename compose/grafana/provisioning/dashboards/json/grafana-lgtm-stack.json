@@ -37,6 +37,7 @@
       "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
       "id": 3,
       "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "interval": "2m",
       "targets": [{"editorMode": "code", "expr": "sum(rate(traces_span_metrics_calls_total[$__rate_interval])) or vector(0)", "instant": true, "legendFormat": "Spans", "range": false, "refId": "A"}],
       "title": "AI Request Span Rate",
       "type": "stat"

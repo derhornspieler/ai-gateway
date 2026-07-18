@@ -277,7 +277,8 @@
         }
       ],
       "title": "Trace Error Rate",
-      "type": "stat"
+      "type": "stat",
+      "interval": "2m"
     },
     {
       "datasource": {
@@ -366,7 +367,8 @@
         }
       ],
       "title": "Span Calls by Service, Operation and Status",
-      "type": "timeseries"
+      "type": "timeseries",
+      "interval": "2m"
     },
     {
       "datasource": {
@@ -455,7 +457,8 @@
         }
       ],
       "title": "Span Duration p95 by Operation",
-      "type": "timeseries"
+      "type": "timeseries",
+      "interval": "2m"
     },
     {
       "datasource": {
