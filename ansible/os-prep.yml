@@ -784,6 +784,26 @@
                     raise RuntimeError("ip " + " ".join(args) + ": " + result.stderr.strip())
                 return json.loads(result.stdout)
 
+            def existing_table_routes(table_id):
+                # A custom routing table with zero routes has never been
+                # created in the kernel's FIB — the normal, expected state on
+                # a first-ever converge, before this role has added anything
+                # to it. `ip route show table <id>` reports that case as a
+                # non-zero-exit error ("FIB table does not exist") rather
+                # than an empty list; treat it as no existing routes, since a
+                # table that does not exist cannot collide with anything.
+                # Any other error still fails closed.
+                args = ("-j", "-4", "route", "show", "table", str(table_id))
+                result = subprocess.run(
+                    ["ip", *args], text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=False,
+                )
+                if result.returncode:
+                    if "FIB table does not exist" in result.stderr:
+                        return []
+                    raise RuntimeError("ip " + " ".join(args) + ": " + result.stderr.strip())
+                return json.loads(result.stdout)
+
             errors = []
             rules = invoke("-j", "-4", "rule", "show")
             for table in tables:
@@ -792,7 +812,7 @@
                 device = table["dev"]
                 source = table["src"]
                 gateway = table["gw"]
-                existing = invoke("-j", "-4", "route", "show", "table", str(table_id))
+                existing = existing_table_routes(table_id)
                 def canonical_link_signature(route):
                     # Do not let an arbitrary route sharing only a destination
                     # and device pass as the kernel-connected route that the

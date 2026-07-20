@@ -254,7 +254,11 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         namespace = self.mount_checker_namespace(self.socket_mount_checker)
         return namespace["has_approved_node_exporter_rootfs"](container, mounts)
 
-    def run_policy_table_validator(self, routes_by_command: dict[tuple[str, ...], list[dict[str, object]]]) -> None:
+    def run_policy_table_validator(
+        self,
+        routes_by_command: dict[tuple[str, ...], list[dict[str, object]]],
+        errors_by_command: dict[tuple[str, ...], str] | None = None,
+    ) -> None:
         """Run the embedded collision guard against a deterministic `ip -j` view."""
         validator_start = self.os_prep.index(
             "            import ipaddress\n",
@@ -268,9 +272,13 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         import json
         import subprocess
 
+        errors_by_command = errors_by_command or {}
+
         def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
             self.assertEqual(command[0], "ip")
             key = tuple(command[1:])
+            if key in errors_by_command:
+                return SimpleNamespace(returncode=1, stdout="", stderr=errors_by_command[key])
             self.assertIn(key, routes_by_command, f"unexpected ip invocation: {key!r}")
             return SimpleNamespace(returncode=0, stdout=json.dumps(routes_by_command[key]), stderr="")
 
@@ -1409,6 +1417,42 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as foreign_error:
             self.run_policy_table_validator(foreign_routes)
         self.assertIn("table 101 has a non-AIGW route", str(foreign_error.exception))
+
+    def test_policy_table_guard_treats_a_not_yet_created_table_as_no_collision(self) -> None:
+        # A custom routing table with zero routes has never been created in
+        # the kernel's FIB — the normal state on a first-ever converge,
+        # before this role has added anything to it. `ip route show table
+        # <id>` reports that as a non-zero-exit "FIB table does not exist"
+        # error rather than an empty list. Reproduces a real failure seen on
+        # a pristine host: every first-time deployment hit this before the
+        # fix, since tables 101/102 are never pre-populated.
+        self.assertIn("FIB table does not exist", self.os_prep)
+
+        routes = {
+            ("-j", "-4", "rule", "show"): [
+                {"priority": 0, "src": "all", "table": "local"},
+                {"priority": 32766, "src": "all", "table": "main"},
+            ],
+            ("-j", "-4", "route", "show", "table", "main"): [
+                {"dst": "10.8.10.0/24", "dev": "enp0s7", "scope": "link"},
+                {"dst": "10.20.0.0/24", "dev": "enp0s8", "scope": "link"},
+            ],
+        }
+        errors = {
+            ("-j", "-4", "route", "show", "table", "101"): "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+            ("-j", "-4", "route", "show", "table", "102"): "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+        }
+        # Must not raise: a nonexistent table cannot collide with anything.
+        self.run_policy_table_validator(routes, errors_by_command=errors)
+
+        # A genuinely different error on the same call must still fail
+        # closed rather than being silently swallowed alongside the
+        # benign not-yet-created case.
+        other_error = dict(errors)
+        other_error[("-j", "-4", "route", "show", "table", "101")] = "Error: Operation not permitted\n"
+        with self.assertRaises(RuntimeError) as permission_error:
+            self.run_policy_table_validator(routes, errors_by_command=other_error)
+        self.assertIn("Operation not permitted", str(permission_error.exception))
 
 
 if __name__ == "__main__":
