@@ -218,6 +218,26 @@ you do not need to stay logged into the VM) and compare.
 | 6 | Clock synchronized | `ssh <user>@<vm> "chronyc tracking \| head -2"` | A reference server and a small offset (under 5 seconds) |
 | 7 | A login account with sudo that accepts your SSH key | `ssh <user>@<vm> sudo -n true` | No password prompt, no error |
 | 8 | Enough resources | — | At least 4 vCPU / 24 GiB RAM / 100 GB disk for a pilot; the services alone reserve ~20 GiB of memory |
+| 9 | A way to obtain the container images — **either** registry credentials **or** a pre-staged offline seed (see note below) | `ssh <user>@<vm> 'sudo docker pull dhi.io/vault:2.0.3'` *(only meaningful after Docker is installed; on a fresh VM confirm the credential plan instead)* | The pull succeeds, **or** you have deliberately chosen the offline-seed route |
+
+**About row 9 — this one bites late if you skip it.** Most of the stack is
+built from **Docker Hardened Images** under the private `dhi.io` registry, which
+requires an entitled Docker subscription. A VM with no `dhi.io` credential does
+not fail at the start of the converge — it fails part-way through the stack
+phase, when a task first needs one of those images, with a registry
+`401 Unauthorized`. Choose one of these **before** Part 6:
+
+- **Registry credentials (normal path).** Log the target VM's *root* Docker
+  daemon in to `dhi.io` (the converge runs Docker as root, so a login under
+  your own user is not enough).
+- **Pre-staged offline seed (air-gapped / no-credential path).** Export the
+  digest-pinned external images elsewhere and stage the archive on the target,
+  then set the five `offline_image_seed_*` values in `host_vars`. This is a
+  fully supported production feature — the complete procedure, including the
+  fail-closed hash/ownership contract, is in
+  [offline-image-seed.md](offline-image-seed.md). Verify the seed's image set
+  still matches the checkout you are deploying; a stale seed is refused rather
+  than silently mixed with newer pins.
 
 If any row fails, stop and fix it first — the automation checks all of these
 and will refuse to proceed, **except the encrypted-disk check (row 5)**. LUKS
@@ -550,6 +570,7 @@ printing it) and
 | `ping` fails in Part 4 | SSH target/user/key wrong | Verify `ssh <user>@<vm>` works by hand first |
 | Converge stops at a topology assertion | The values you entered disagree with the VM's live interfaces/routes | Re-run the Part 1 checks; correct `host_vars` |
 | Converge stops at SELinux / clock / encryption | VM doesn't meet Part 1 rows 4–6 | Fix the VM (this may need the VM team), rerun |
+| Converge stops part-way through the stack phase with a registry `401 Unauthorized`, an "failed to resolve reference" error, or a Vault-config validation that reports no output | The VM cannot pull the `dhi.io` Docker Hardened Images — Part 1 row 9 was not satisfied | Either log the VM's **root** Docker daemon in to `dhi.io`, or pre-stage the images and set the `offline_image_seed_*` values ([offline-image-seed.md](offline-image-seed.md)), then rerun |
 | First converge "waits only for core services" and mentions Vault | Not an error | Expected — do Part 7 |
 | A service is unhealthy after Part 7 | Vault sealed (e.g. after a reboot) | Re-run the Part 6 converge — it auto-unlocks Vault from the controller's stored key. For an immediate fix on the VM, pipe the stored unseal key into `sudo scripts/vault-unseal.sh` (see [operations](operations.md)) |
 | Step 7c stops: "initialized Vault requires vault_unseal_key" | You skipped Step 7b, so the controller has no stored unlock key | Do Step 7b (store the key), then rerun Step 7c |

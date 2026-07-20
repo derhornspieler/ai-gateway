@@ -1,6 +1,9 @@
 """Static regressions for the host/container SELinux hand-off."""
 
+import os
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 
@@ -13,6 +16,80 @@ FULL_SITE = ROOT / "ansible/site.yml"
 OS_PREP = ROOT / "ansible/os-prep.yml"
 STACK_ONLY_PLAYBOOK = ROOT / "ansible/deploy-stack-only.yml"
 SELINUX_BASELINE = ROOT / "ansible/roles/selinux_baseline/tasks/main.yml"
+VAULT_VALIDATOR = ROOT / "scripts/validate-vault-config.sh"
+
+
+class VaultConfigValidationTests(unittest.TestCase):
+    def run_validator(self, docker_script: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            stack_dir = temp_path / "stack"
+            config_dir = stack_dir / "vault"
+            fake_bin = temp_path / "bin"
+            config_dir.mkdir(parents=True)
+            fake_bin.mkdir()
+            (config_dir / "config.hcl").write_text("storage \"file\" {}\n", encoding="utf-8")
+
+            fake_stat = fake_bin / "stat"
+            fake_stat.write_text("#!/bin/sh\nprintf '%s\\n' '0:0:644:1'\n", encoding="utf-8")
+            fake_stat.chmod(0o755)
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(docker_script, encoding="utf-8")
+            fake_docker.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            env["STACK_DIR"] = str(stack_dir)
+            return subprocess.run(
+                ["bash", str(VAULT_VALIDATOR)],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_docker_failure_reports_stderr_and_pinned_image(self) -> None:
+        result = self.run_validator(
+            "#!/bin/sh\n"
+            "echo 'failed to fetch anonymous token: 401 Unauthorized' >&2\n"
+            "exit 1\n"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to fetch anonymous token: 401 Unauthorized", result.stderr)
+        self.assertIn(
+            "dhi.io/vault:2.0.3@sha256:743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6",
+            result.stderr,
+        )
+        self.assertIn("image, registry, or Docker daemon problem", result.stderr)
+        self.assertIn("docs/offline-image-seed.md", result.stderr)
+        self.assertNotIn("JSONDecodeError", result.stderr)
+
+    def test_valid_report_succeeds_despite_nonzero_docker_exit(self) -> None:
+        result = self.run_validator(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"children\":[{\"name\":\"Parse Configuration\",\"status\":\"ok\"}]}'\n"
+            "echo 'unrelated telemetry diagnostic failed' >&2\n"
+            "exit 2\n"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Static Vault configuration parses successfully", result.stdout)
+        self.assertNotIn("unrelated telemetry diagnostic failed", result.stderr)
+
+    def test_missing_successful_parse_configuration_fails(self) -> None:
+        result = self.run_validator(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"children\":[{\"name\":\"Parse Configuration\",\"status\":\"error\"}]}'\n"
+            "exit 0\n"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Vault configuration parse did not report status=ok", result.stderr
+        )
+        self.assertNotIn("image, registry, or Docker daemon problem", result.stderr)
 
 
 class SelinuxContractTests(unittest.TestCase):

@@ -26,6 +26,9 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 install -m 0444 -- "$source_config" "$validation_dir/config.hcl"
 
+diagnose_report="$validation_dir/diagnose.json"
+docker_stderr="$validation_dir/docker.stderr"
+docker_status=0
 "${docker_cmd[@]}" run --rm \
   --network none \
   --cap-drop ALL \
@@ -36,7 +39,22 @@ install -m 0444 -- "$source_config" "$validation_dir/config.hcl"
   --tmpfs /vault/logs:uid=1000,gid=1000,mode=0700 \
   --entrypoint vault \
   --volume "$validation_dir/config.hcl:/vault/config/aigw.hcl:ro,Z" \
-  "$IMAGE" operator diagnose -config=/vault/config/aigw.hcl -format=json 2>/dev/null |
+  "$IMAGE" operator diagnose -config=/vault/config/aigw.hcl -format=json \
+  >"$diagnose_report" 2>"$docker_stderr" || docker_status=$?
+
+if ! python3 -c 'import json, sys; json.load(sys.stdin)' <"$diagnose_report" 2>/dev/null; then
+  echo "Docker did not produce a parseable Vault diagnose report using image $IMAGE (exit status $docker_status)." >&2
+  echo "This indicates an image, registry, or Docker daemon problem, not a Vault configuration result." >&2
+  echo "A host without registry credentials can pre-stage images; see docs/offline-image-seed.md." >&2
+  if [ -s "$docker_stderr" ]; then
+    echo "Docker stderr follows:" >&2
+    cat "$docker_stderr" >&2
+  else
+    echo "Docker produced no stderr." >&2
+  fi
+  exit 1
+fi
+
 python3 -c '
 import json, sys
 
@@ -47,6 +65,6 @@ parse = next(
 )
 if not parse or parse.get("status") != "ok":
     raise SystemExit("Vault configuration parse did not report status=ok")
-'
+' <"$diagnose_report"
 
 echo "Static Vault configuration parses successfully in the pinned image."
