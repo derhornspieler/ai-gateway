@@ -428,7 +428,7 @@ arguments shown above:
 
 | Playbook | What it does | When you run it |
 |---|---|---|
-| `ansible/site.yml` | Everything: prepares the host, then deploys and verifies the stack | **First deploy** (this Part and Step 7c), and any time you are unsure — it is always safe |
+| `ansible/site.yml` | Everything: prepares the host, then deploys and verifies the stack | **First deploy** (this Part and Step 7d), and any time you are unsure — it is always safe |
 | `ansible/os-prep.yml` | Host preparation only: all safety checks, clock, SELinux, routing, firewall, OS packages, Docker, and the 20 container networks. **Starts no containers.** | When the host/OS team prepares the VM ahead of time, or after changing host-level inventory (NICs, firewall, DNS resolvers) without wanting to touch the running stack yet |
 | `ansible/deploy-stack-only.yml` | Stack only: deploys the containers, verifies everything, and records the host as a completed dedicated gateway host | App/config updates on a host that already converged, or the stack half of a first deploy after `os-prep.yml` ran |
 
@@ -468,7 +468,8 @@ Two rules keep this safe, and the playbooks enforce both for you:
 
 Vault (the built-in secrets safe) starts empty and sealed. You now do three
 things in order: (7a) initialize Vault once on the VM, (7b) give the
-controller an encrypted copy of Vault's unlock key, and (7c) run the converge
+controller an encrypted copy of Vault's unlock key, (7c) hand Vault your
+intermediate CA if your edge TLS mode needs it, and (7d) run the converge
 again so the automation can unlock Vault and finish.
 
 **Step 7a — Initialize Vault on the VM.** Log in to the VM (first time you
@@ -515,7 +516,62 @@ unset AIGW_UNSEAL_SHARE
 The helper accepts exactly one valid share, never prints it, and refuses to
 overwrite an existing one.
 
-**Step 7c — Run the converge one more time.** Back on the controller, run the
+**Step 7c — Give Vault your intermediate CA.** *(Only for
+`aigw_edge_tls_mode: customer-intermediate` or `vault-intermediate`. Skip
+this step entirely for `customer-supplied`, and go straight to Step 7d.)*
+
+Until you do this, Vault cannot issue edge certificates from your CA, so the
+two Traefik edges keep serving the short-lived **self-signed placeholder**
+they came up with. Nothing in the converge performs this ceremony for you —
+it is a deliberate on-host step, because it is the moment your CA material
+enters Vault.
+
+The converge has already staged your three files on the VM as root-owned
+`0600` copies under `/opt/ai-gateway/secrets/`. Log in to the VM and run the
+import with the Vault **root token from Step 7a on stdin** — never as an
+argument, and never echoed:
+
+```bash
+ssh <ansible_user>@<vm>
+sudo -i
+cd /opt/ai-gateway
+read -rsp 'Vault root token: ' TOK; printf '\n'
+printf '%s\n' "$TOK" | ./scripts/vault-pki-intermediate.sh import-intermediate \
+    --intermediate secrets/aigw-intermediate-import.pem \
+    --intermediate-key secrets/aigw-intermediate-import.key \
+    --chain secrets/aigw-intermediate-import-chain.pem
+unset TOK
+```
+
+**You should see** the script wait for the full service graph to report
+healthy and then finish with two lines:
+
+```
+>> edge now serves a certificate chaining to the customer root CA (customer-intermediate).
+>> the staged intermediate private key has been shredded; it now lives only inside Vault.
+```
+
+Confirm it from your own workstation before moving on — this must verify
+against your real root CA, not merely connect:
+
+```bash
+echo | openssl s_client -connect <ADM_IP>:443 \
+  -servername admin.<domain> -CAfile /path/to/your-root-ca.pem 2>&1 \
+  | grep 'Verify return code'
+```
+
+**You should see** `Verify return code: 0 (ok)`, and the certificate's issuer
+should now be your intermediate CA rather than the placeholder's own name.
+For `vault-intermediate` mode the same step is a three-part CSR ceremony
+(`csr` → sign on your CA host → `install-signed`) documented in
+[operations — production edge TLS](operations.md#production-edge-tls).
+
+> **Do this before Step 7d.** The final converge verifies the edge
+> certificate, and on a real-CA profile it rejects a placeholder once Vault
+> is initialized — so skipping this step makes Step 7d fail rather than
+> silently leaving a self-signed edge in place.
+
+**Step 7d — Run the converge one more time.** Back on the controller, run the
 exact command from Part 6 again. Because Vault is now initialized, the
 automation **automatically unlocks it** using the encrypted key you just
 stored, then waits for and verifies the complete system.
@@ -530,7 +586,7 @@ ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
 > initialized Vault needs `vault_unseal_key` from the controller — it refuses
 > to finish a half-unlocked system. Do Step 7b, then rerun.
 
-The whole 7a → 7b → 7c sequence is also captured, ready to copy, in
+The whole 7a → 7b → 7c → 7d sequence is also captured, ready to copy, in
 [`rocky9-lab.first-init.sh.example`](../ansible/inventory/examples/rocky9-lab.first-init.sh.example)
 (disposable lab, which pipes the share straight from the bootstrap without
 printing it) and
@@ -573,7 +629,8 @@ printing it) and
 | Converge stops part-way through the stack phase with a registry `401 Unauthorized`, an "failed to resolve reference" error, or a Vault-config validation that reports no output | The VM cannot pull the `dhi.io` Docker Hardened Images — Part 1 row 9 was not satisfied | Either log the VM's **root** Docker daemon in to `dhi.io`, or pre-stage the images and set the `offline_image_seed_*` values ([offline-image-seed.md](offline-image-seed.md)), then rerun |
 | First converge "waits only for core services" and mentions Vault | Not an error | Expected — do Part 7 |
 | A service is unhealthy after Part 7 | Vault sealed (e.g. after a reboot) | Re-run the Part 6 converge — it auto-unlocks Vault from the controller's stored key. For an immediate fix on the VM, pipe the stored unseal key into `sudo scripts/vault-unseal.sh` (see [operations](operations.md)) |
-| Step 7c stops: "initialized Vault requires vault_unseal_key" | You skipped Step 7b, so the controller has no stored unlock key | Do Step 7b (store the key), then rerun Step 7c |
+| Step 7d stops: "initialized Vault requires vault_unseal_key" | You skipped Step 7b, so the controller has no stored unlock key | Do Step 7b (store the key), then rerun Step 7d |
+| Step 7d stops rejecting a placeholder / self-signed edge certificate | You are on a real-CA edge TLS mode and skipped Step 7c, so Vault never received your intermediate and the edges still serve the bootstrap placeholder | Do Step 7c (import the intermediate), confirm `Verify return code: 0 (ok)` against your root CA, then rerun Step 7d |
 | You need to change a secret later | — | `ansible-vault edit ansible/inventory/generated/<alias>/group_vars/production_rocky9/vault.yml --vault-id <alias>@<password-file>`, then rerun the converge |
 
 ## Glossary
