@@ -51,7 +51,7 @@
         import subprocess
         import sys
 
-        project, data_root, stack_dir, expected_text, expected_volumes_text, has_marker, explicit_adoption = sys.argv[1:]
+        project, data_root, stack_dir, expected_text, expected_volumes_text, has_marker, has_valid_pending_marker, explicit_adoption = sys.argv[1:]
         expected_entries = json.loads(expected_text)
         expected_volumes = set(json.loads(expected_volumes_text))
         expected = {
@@ -317,7 +317,10 @@
                 ):
                     errors.append(f"Compose volume {volume_name} lacks the reviewed ownership labels")
                 retained_expected_volumes.append(volume_name)
-            if retained_expected_volumes and has_marker != "true" and explicit_adoption != "true":
+            has_reviewed_aigw_ownership = (
+                has_marker == "true" or has_valid_pending_marker == "true"
+            )
+            if retained_expected_volumes and not has_reviewed_aigw_ownership and explicit_adoption != "true":
                 errors.append("unmarked host retains Compose-named Docker volumes")
 
             for name, wanted in expected.items():
@@ -367,6 +370,7 @@
       - "{{ docker_networks | to_json }}"
       - "{{ aigw_expected_docker_volumes | to_json }}"
       - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
+      - "{{ 'true' if (aigw_host_pending_marker_valid | default(false) | bool) else 'false' }}"
       - "{{ 'true' if (aigw_adopt_dedicated_docker_host | bool) else 'false' }}"
   changed_when: false
 

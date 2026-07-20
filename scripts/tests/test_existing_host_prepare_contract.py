@@ -308,6 +308,84 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             subprocess.run = original_run  # type: ignore[assignment]
             sys.argv = original_argv
 
+    def run_docker_network_validator(
+        self,
+        *,
+        completed_marker: bool = False,
+        pending_marker: bool = False,
+        explicit_adoption: bool = False,
+    ) -> None:
+        """Run the embedded Docker boundary validator with one retained volume."""
+        validator_start = self.docker_networks.index(
+            "        import json\n",
+            self.docker_networks.index(
+                "Preflight — reject live Docker network drift before reconciliation"
+            ),
+        )
+        validator_end = self.docker_networks.index(
+            '      - "{{ compose_project_name }}"', validator_start
+        )
+        validator = textwrap.dedent(
+            self.docker_networks[validator_start:validator_end]
+        )
+
+        import json
+        import subprocess
+
+        volume_name = "ai-gateway_litellm-data"
+        docker_outputs: dict[tuple[str, ...], str] = {
+            ("info", "--format=json"): json.dumps(
+                {"DockerRootDir": "/var/lib/docker"}
+            ),
+            ("ps", "-aq", "--no-trunc"): "",
+            ("network", "ls", "-q"): "",
+            ("volume", "ls", "-q"): volume_name + "\n",
+            ("volume", "inspect", volume_name): json.dumps(
+                [
+                    {
+                        "Name": volume_name,
+                        "Labels": {
+                            "com.docker.compose.project": "ai-gateway",
+                            "com.docker.compose.volume": "litellm-data",
+                        },
+                    }
+                ]
+            ),
+        }
+
+        def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+            if command == ["ip", "-j", "link", "show"]:
+                return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+            self.assertEqual(
+                command[:3],
+                ["docker", "--host", "unix:///run/docker.sock"],
+            )
+            key = tuple(command[3:])
+            self.assertIn(key, docker_outputs, f"unexpected Docker invocation: {key!r}")
+            return SimpleNamespace(
+                returncode=0, stdout=docker_outputs[key], stderr=""
+            )
+
+        original_argv = sys.argv
+        original_run = subprocess.run
+        try:
+            subprocess.run = fake_run  # type: ignore[assignment]
+            sys.argv = [
+                "validator",
+                "ai-gateway",
+                "/var/lib/docker",
+                "/opt/ai-gateway",
+                "[]",
+                '["litellm-data"]',
+                "true" if completed_marker else "false",
+                "true" if pending_marker else "false",
+                "true" if explicit_adoption else "false",
+            ]
+            exec(validator, {"__name__": "__docker_network_validator__"})
+        finally:
+            subprocess.run = original_run  # type: ignore[assignment]
+            sys.argv = original_argv
+
     def test_generic_ssh_and_socks_defaults_are_secure_while_lab_is_explicit(self) -> None:
         for required in (
             "aigw_ssh_password_authentication: false",
@@ -969,6 +1047,30 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         self.assertIn(
             "'true' if (aigw_host_ownership_proven | default(false) | bool) else 'false'",
             self.host,
+        )
+
+    def test_docker_network_validator_accepts_retained_volume_with_pending_marker(self) -> None:
+        self.run_docker_network_validator(pending_marker=True)
+
+    def test_docker_network_validator_rejects_retained_volume_without_marker(self) -> None:
+        with self.assertRaises(SystemExit) as unmarked:
+            self.run_docker_network_validator()
+        self.assertIn(
+            "unmarked host retains Compose-named Docker volumes",
+            str(unmarked.exception),
+        )
+
+    def test_docker_network_validator_accepts_retained_volume_with_completed_marker(self) -> None:
+        self.run_docker_network_validator(completed_marker=True)
+
+    def test_docker_network_validator_receives_validated_pending_marker(self) -> None:
+        validator = self.docker_networks.split(
+            "Preflight — reject live Docker network drift before reconciliation",
+            1,
+        )[1].split("\n- name:", 1)[0]
+        self.assertIn(
+            "'true' if (aigw_host_pending_marker_valid | default(false) | bool) else 'false'",
+            validator,
         )
 
     def test_completed_marker_gates_accept_a_validated_pending_marker(self) -> None:
