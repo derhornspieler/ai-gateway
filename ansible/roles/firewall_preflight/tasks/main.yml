@@ -191,6 +191,90 @@
             actual = hashlib.sha256(content).hexdigest()
             return actual == digest
 
+        # firewalld copies each of its nine standard vendor zone templates
+        # from /usr/lib into /etc the first time that zone is touched by ANY
+        # tool -- including Anaconda's own `firewall --service=...` kickstart
+        # directive, even when the requested service was already present in
+        # the template. This materialized copy (and the "<name>.xml.old"
+        # backup a later rewrite can leave beside it) is neither
+        # administrator policy nor an AIGW artifact, but accepting it by
+        # filename alone would create a bypass for an altered zone. Accept
+        # it only when its content is byte-identical to the RPM-verified
+        # /usr/lib template firewalld copied it from -- proving no
+        # customization happened beyond what the package itself ships. A
+        # missing/broken RPM query, or any content difference, fails closed
+        # as unreviewed.
+        vendor_zone_names = {
+            "public", "trusted", "home", "internal",
+            "external", "dmz", "work", "drop", "block",
+        }
+
+        def rpm_verified_template_digest(rpm, template_path):
+            owner = subprocess.run(
+                [rpm, "-qf", "--qf", "%{NAME}\\n", "--", template_path],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if owner.returncode != 0 or owner.stdout.strip() != "firewalld":
+                return None
+            query = subprocess.run(
+                [rpm, "-q", "--qf", "[%{FILENAMES}\\t%{FILEDIGESTS}\\n]", "firewalld"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if query.returncode != 0:
+                return None
+            records = [line.split("\t") for line in query.stdout.splitlines()]
+            matches = [record for record in records if record and record[0] == template_path]
+            if len(matches) != 1 or len(matches[0]) != 2:
+                return None
+            digest = matches[0][1]
+            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                return None
+            return digest
+
+        def is_pristine_vendor_zone_copy(
+            path, metadata, zone_directory="/etc/firewalld/zones",
+        ):
+            directory, filename = os.path.split(path)
+            if directory != zone_directory:
+                return False
+            if filename.endswith(".xml.old"):
+                name = filename[: -len(".xml.old")]
+            elif filename.endswith(".xml"):
+                name = filename[: -len(".xml")]
+            else:
+                return False
+            if name not in vendor_zone_names:
+                return False
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o644
+                or metadata.st_size > 65536
+            ):
+                return False
+            rpm = shutil.which("rpm", path="/usr/sbin:/usr/bin:/sbin:/bin")
+            if not rpm:
+                return False
+            digest = rpm_verified_template_digest(rpm, f"/usr/lib/firewalld/zones/{name}.xml")
+            if digest is None:
+                return False
+            try:
+                with open(path, "rb") as source:
+                    content = source.read(65537)
+            except OSError:
+                return False
+            if len(content) > 65536:
+                return False
+            return hashlib.sha256(content).hexdigest() == digest
+
         # Docker Engine 29 creates this administrator-directory zone while
         # managing its bridge firewall integration. It is not an AIGW policy,
         # but accepting it by filename or target alone would turn the exception
@@ -438,6 +522,8 @@
                         custom_firewalld_paths.append(entry.path)
                 elif is_generated_aigw_zone_backup(entry.path, metadata):
                     managed_zone_backup_files.append(entry.path)
+                elif is_pristine_vendor_zone_copy(entry.path, metadata):
+                    pass
                 elif metadata.st_size:
                     custom_firewalld_paths.append(entry.path)
         for path in (

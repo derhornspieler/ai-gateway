@@ -140,6 +140,18 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
                 docker_zone_checker_start:docker_zone_checker_end
             ]
         )
+        vendor_zone_checker_start = cls.firewall_preflight.index(
+            "        vendor_zone_names ="
+        )
+        vendor_zone_checker_end = cls.firewall_preflight.index(
+            "\n        # Docker Engine 29 creates this administrator-directory zone",
+            vendor_zone_checker_start,
+        )
+        cls.vendor_zone_checker = textwrap.dedent(
+            cls.firewall_preflight[
+                vendor_zone_checker_start:vendor_zone_checker_end
+            ]
+        )
         validator_start = cls.os_prep.index("            import ipaddress\n")
         validator_end = cls.os_prep.index(
             "          - \"{{ deployment_profile | default('') }}\"",
@@ -1205,6 +1217,109 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
                         backup_path,
                         root_owned_lstat(backup_path),
                         zone_directory=directory,
+                    )
+                )
+
+    def test_firewall_preflight_accepts_only_a_byte_identical_vendor_zone_copy(self) -> None:
+        # firewalld materializes a standard vendor zone template (e.g.
+        # "public") into /etc the first time ANY tool touches it -- including
+        # Anaconda's kickstart `firewall --service=...` directive, even when
+        # the requested service was already in the template. Reproduces a
+        # real failure seen on a pristine kickstart-installed host: the
+        # unpatched preflight refused to converge over this file, requiring
+        # a manual "rm" the operator should never have needed to run.
+        import hashlib
+        import os
+        import re
+        import shutil
+        import stat
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+
+        namespace: dict[str, object] = {
+            "__name__": "__vendor_zone_checker__",
+            "os": os,
+            "re": re,
+            "stat": stat,
+            "shutil": shutil,
+            "subprocess": subprocess,
+            "hashlib": hashlib,
+        }
+        exec(self.vendor_zone_checker, namespace)
+        is_pristine_vendor_zone_copy = namespace["is_pristine_vendor_zone_copy"]
+
+        template_content = (
+            b'<?xml version="1.0" encoding="utf-8"?>\n'
+            b"<zone>\n"
+            b"  <short>Public</short>\n"
+            b'  <service name="ssh"/>\n'
+            b'  <service name="dhcpv6-client"/>\n'
+            b'  <service name="cockpit"/>\n'
+            b"  <forward/>\n"
+            b"</zone>\n"
+        )
+        template_digest = hashlib.sha256(template_content).hexdigest()
+
+        def fake_run(command, **_kwargs):
+            if command[:2] == ["rpm", "-qf"]:
+                path = command[-1]
+                stdout = "firewalld\n" if path.endswith("/zones/public.xml") else ""
+                return SimpleNamespace(returncode=0 if stdout else 1, stdout=stdout, stderr="")
+            if command[:2] == ["rpm", "-q"]:
+                stdout = f"/usr/lib/firewalld/zones/public.xml\t{template_digest}\n"
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+            raise AssertionError(f"unexpected command: {command!r}")
+
+        with tempfile.TemporaryDirectory() as zones_dir:
+            live_path = os.path.join(zones_dir, "public.xml")
+            backup_path = live_path + ".old"
+            with open(live_path, "wb") as source:
+                source.write(template_content)
+            with open(backup_path, "wb") as source:
+                source.write(template_content)
+
+            def root_owned_metadata(path: str):
+                real = os.stat(path)
+                return SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o644,
+                    st_uid=0,
+                    st_gid=0,
+                    st_size=real.st_size,
+                )
+
+            with patch.object(subprocess, "run", side_effect=fake_run), patch.object(
+                shutil, "which", return_value="rpm"
+            ):
+                self.assertTrue(
+                    is_pristine_vendor_zone_copy(
+                        live_path, root_owned_metadata(live_path), zone_directory=zones_dir
+                    )
+                )
+                self.assertTrue(
+                    is_pristine_vendor_zone_copy(
+                        backup_path, root_owned_metadata(backup_path), zone_directory=zones_dir
+                    )
+                )
+
+                # A single byte of administrator customization must be
+                # refused, not silently accepted as "close enough."
+                with open(live_path, "wb") as source:
+                    source.write(template_content.replace(b'name="cockpit"', b'name="http"'))
+                self.assertFalse(
+                    is_pristine_vendor_zone_copy(
+                        live_path, root_owned_metadata(live_path), zone_directory=zones_dir
+                    )
+                )
+
+                # A name outside the nine standard vendor zones is never
+                # recognized, regardless of content.
+                foreign_path = os.path.join(zones_dir, "aigw-adm.xml")
+                with open(foreign_path, "wb") as source:
+                    source.write(template_content)
+                self.assertFalse(
+                    is_pristine_vendor_zone_copy(
+                        foreign_path, root_owned_metadata(foreign_path), zone_directory=zones_dir
                     )
                 )
 
