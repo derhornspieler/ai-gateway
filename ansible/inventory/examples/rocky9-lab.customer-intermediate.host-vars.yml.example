@@ -55,7 +55,15 @@ retain_bootstrap_admin_user: true
 # a regular non-symlink single-link file (the preflight and the on-host ceremony
 # both enforce this). The chain file is the COMPLETE intermediate + root chain.
 # ansible/inventory/local-pki/ is gitignored so this material never lands in git.
+#
+# These MUST be absolute paths. Ansible resolves a relative stat/copy path
+# against the invoking playbook's own directory (ansible/), never the
+# repository root — so a relative value here silently mis-resolves (e.g.
+# "ansible/inventory/local-pki/x.pem" becomes
+# "ansible/ansible/inventory/local-pki/x.pem") and the preflight fails closed
+# with a clear "must be an absolute path" error. Substitute your own absolute
+# repository path below.
 aigw_edge_tls_mode: customer-intermediate
-aigw_edge_tls_intermediate_cert_file: "ansible/inventory/local-pki/intermediate.pem"
-aigw_edge_tls_intermediate_key_file: "ansible/inventory/local-pki/intermediate.key"
-aigw_edge_tls_intermediate_chain_file: "ansible/inventory/local-pki/ca-chain.pem"
+aigw_edge_tls_intermediate_cert_file: "<ABSOLUTE_PATH_TO_REPO>/ansible/inventory/local-pki/intermediate.pem"
+aigw_edge_tls_intermediate_key_file: "<ABSOLUTE_PATH_TO_REPO>/ansible/inventory/local-pki/intermediate.key"
+aigw_edge_tls_intermediate_chain_file: "<ABSOLUTE_PATH_TO_REPO>/ansible/inventory/local-pki/ca-chain.pem"

@@ -166,6 +166,14 @@ file paths at a protected location outside the repository; the preflight fails
 closed if the set is incomplete or the private-key file is group-readable or a
 symlink.
 
+> **These must be absolute paths (starting with `/`), not relative ones.**
+> Ansible resolves a relative path against the invoking playbook's own
+> directory (`ansible/`), never the repository root or your shell's working
+> directory — so a relative value silently mis-resolves to a nonexistent
+> location. The preflight now fails closed with a clear "must be an absolute
+> path" error if you give it one, rather than a confusing "not found." This
+> applies to `identity_ldap_ca_bundle_src` too (§2b).
+
 #### 2d. Anthropic WIF record — operator-completed at go-live (Part 8)
 
 This one is easy to miss because these values are **identifiers, not
@@ -196,18 +204,19 @@ deployment** — the customer profile has no Samba directory.
 ## Part 1 — Check the target VM (10 minutes)
 
 Someone (you, or your virtualization/cloud team) must provide a VM that meets
-this checklist **before** you start. For each row, run the check command on
-the VM and compare.
+this checklist **before** you start. For each row, run the exact command shown
+**from the controller** (it opens its own one-off SSH connection per command —
+you do not need to stay logged into the VM) and compare.
 
-| # | Requirement | How to check (run on the VM) | You should see |
+| # | Requirement | How to check (run from the controller) | You should see |
 |---|---|---|---|
-| 1 | Rocky Linux 9 | `cat /etc/rocky-release` | `Rocky Linux release 9.x` |
-| 2 | Three network interfaces, each already configured with its own IP address: one for internet egress, one for administrators (ADM), one for internal users | `ip -br -4 address` | Three interfaces, each with an IPv4 address |
-| 3 | Exactly one default route, on the egress interface | `ip -4 route show table main` | One line starting `default via …` naming the egress interface |
-| 4 | SELinux enforcing | `getenforce` | `Enforcing` |
-| 5 | Encrypted disk under Docker and the install directory (**strongly recommended**, see note) | `lsblk -o NAME,FSTYPE \| grep crypto_LUKS` | At least one `crypto_LUKS` entry backing the root/data volume |
-| 6 | Clock synchronized | `chronyc tracking \| head -2` | A reference server and a small offset (under 5 seconds) |
-| 7 | A login account with sudo that accepts your SSH key | `ssh <user>@<vm> sudo -n true` from the controller | No password prompt, no error |
+| 1 | Rocky Linux 9 | `ssh <user>@<vm> 'cat /etc/rocky-release'` | `Rocky Linux release 9.x` |
+| 2 | Three network interfaces, each already configured with its own IP address: one for internet egress, one for administrators (ADM), one for internal users | `ssh <user>@<vm> 'ip -br -4 address'` | Three interfaces, each with an IPv4 address |
+| 3 | Exactly one default route, on the egress interface | `ssh <user>@<vm> 'ip -4 route show table main'` | One line starting `default via …` naming the egress interface |
+| 4 | SELinux enforcing | `ssh <user>@<vm> getenforce` | `Enforcing` |
+| 5 | Encrypted disk under Docker and the install directory (**strongly recommended**, see note) | `ssh <user>@<vm> "lsblk -o NAME,FSTYPE \| grep crypto_LUKS"` | At least one `crypto_LUKS` entry backing the root/data volume |
+| 6 | Clock synchronized | `ssh <user>@<vm> "chronyc tracking \| head -2"` | A reference server and a small offset (under 5 seconds) |
+| 7 | A login account with sudo that accepts your SSH key | `ssh <user>@<vm> sudo -n true` | No password prompt, no error |
 | 8 | Enough resources | — | At least 4 vCPU / 24 GiB RAM / 100 GB disk for a pilot; the services alone reserve ~20 GiB of memory |
 
 If any row fails, stop and fix it first — the automation checks all of these
@@ -298,8 +307,38 @@ Every blank value maps to something you wrote down in Part 1. The essentials:
 | `eth2_ip` / `eth2_gateway` | Internal interface IP and gateway |
 | `vpn_client_cidr` | The administrators' network range |
 | `internal_cidr` | The internal users' network range |
-| `internal_dns_servers` | Your corporate resolver list (1–3 addresses) |
-| `egress_dns_servers` | The internet resolver list (1–3 addresses, no overlap with the line above) |
+| `internal_dns_servers` / `egress_dns_servers` / `platform_authoritative_dns_enabled` | Three fields, one DNS mode — see below |
+
+**DNS: pick exactly one mode.** `internal_dns_servers`, `egress_dns_servers`, and
+`platform_authoritative_dns_enabled` are three separate YAML fields that work
+together as a single choice; the value of one determines what the others
+should hold.
+
+**Mode A — use your existing corporate DNS** (the usual choice for a real
+deployment):
+
+```yaml
+internal_dns_servers: ["<resolver reachable through ADM/internal>", "<optional second>"]
+egress_dns_servers: ["<a distinct Internet resolver reachable only through egress>"]
+platform_authoritative_dns_enabled: false
+```
+
+**Mode B — let the gateway answer only for its own `aigw_domain`** (no
+recursion, no corporate resolver needed — useful for a pilot or test where
+you don't have one):
+
+```yaml
+internal_dns_servers: ["{{ eth1_ip }}", "{{ eth2_ip }}"]
+egress_dns_servers: ["<a distinct Internet resolver reachable only through egress>"]
+platform_authoritative_dns_enabled: true
+```
+
+In Mode B, ADM clients use `eth1_ip` and internal clients use `eth2_ip` as
+their resolver; this authoritative service returns `NXDOMAIN` for every other
+zone, so it must not replace a client's general recursive resolver. In
+**both** modes, `egress_dns_servers` must be a distinct resolver from
+`internal_dns_servers` — it is reachable only through the egress interface
+and is the sole DNS that Envoy (and only Envoy) uses to reach AI vendor APIs.
 
 Leave everything you don't understand at its default — the defaults are the
 safe, fail-closed choices. (The `eth0/1/2` names are just labels; your real

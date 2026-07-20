@@ -137,6 +137,20 @@
       ignore_errors: true
       no_log: true
 
+    # Same relative-path trap as the edge TLS paths above: a relative
+    # identity_ldap_ca_bundle_src silently mis-resolves against the playbook's
+    # own directory instead of the repository root, then fails the stat check
+    # below with a generic "not found" that hides the real cause.
+    - name: Preflight — require external directory CA bundle path to be absolute
+      ansible.builtin.set_fact:
+        aigw_generic_relative_identity_ldap_paths: >-
+          {{
+            ([] if ((identity_ldap_ca_bundle_src | default('') | length == 0) or
+                    (identity_ldap_ca_bundle_src is match('^/')))
+             else ['identity_ldap_ca_bundle_src'])
+          }}
+      changed_when: false
+
     # The bundle is public reviewed content, but it is about to become the sole
     # LDAPS trust anchor. Refuse anything that is not a bounded certificates-only
     # PEM before the converge can mount it into Keycloak.
@@ -183,6 +197,10 @@
             combine(
               {} if not (aigw_generic_identity_ldap_ca_validation.failed | default(false))
               else {'identity_ldap_ca_bundle_src': 'certificates_only_pem'}
+            ) |
+            combine(
+              {} if (aigw_generic_relative_identity_ldap_paths | default([]) | length == 0)
+              else {'identity_ldap_ca_bundle_src': 'must_be_absolute_path'}
             )
           }}
       changed_when: false
@@ -324,6 +342,40 @@
           }}
       changed_when: false
 
+    # Ansible resolves a relative stat/copy path against the invoking
+    # playbook's own directory (ansible/), never the repository root or the
+    # operator's shell working directory — an easy-to-miss behavior. A
+    # relative value here silently mis-resolves to a nonexistent path (e.g.
+    # "ansible/inventory/local-pki/x.pem" becomes
+    # "ansible/ansible/inventory/local-pki/x.pem") and then fails downstream
+    # with a confusing bare-filename "not found" instead of naming the real
+    # problem. Require every operator-supplied controller-local file path to
+    # be absolute so it always resolves to exactly what the operator wrote.
+    - name: Preflight — require edge TLS file paths to be absolute
+      ansible.builtin.set_fact:
+        aigw_generic_relative_edge_tls_paths: >-
+          {{
+            ([] if ((aigw_edge_tls_leaf_cert_file | default('') | length == 0) or
+                    (aigw_edge_tls_leaf_cert_file is match('^/')))
+             else ['aigw_edge_tls_leaf_cert_file']) +
+            ([] if ((aigw_edge_tls_private_key_file | default('') | length == 0) or
+                    (aigw_edge_tls_private_key_file is match('^/')))
+             else ['aigw_edge_tls_private_key_file']) +
+            ([] if ((aigw_edge_tls_chain_file | default('') | length == 0) or
+                    (aigw_edge_tls_chain_file is match('^/')))
+             else ['aigw_edge_tls_chain_file']) +
+            ([] if ((aigw_edge_tls_intermediate_cert_file | default('') | length == 0) or
+                    (aigw_edge_tls_intermediate_cert_file is match('^/')))
+             else ['aigw_edge_tls_intermediate_cert_file']) +
+            ([] if ((aigw_edge_tls_intermediate_key_file | default('') | length == 0) or
+                    (aigw_edge_tls_intermediate_key_file is match('^/')))
+             else ['aigw_edge_tls_intermediate_key_file']) +
+            ([] if ((aigw_edge_tls_intermediate_chain_file | default('') | length == 0) or
+                    (aigw_edge_tls_intermediate_chain_file is match('^/')))
+             else ['aigw_edge_tls_intermediate_chain_file'])
+          }}
+      changed_when: false
+
     # Edge TLS mode is fail-closed on the controller too, so an operator learns
     # the inventory is unusable before the first mutating converge. The three
     # customer-supplied file paths are lstat'ed here, on the machine that holds
@@ -445,7 +497,8 @@
              else ['customer_intermediate_files_set_for_other_mode']) +
             ([] if ((aigw_edge_tls_min_days_remaining | default(30) | int) >= 7)
              else ['aigw_edge_tls_min_days_remaining']) +
-            aigw_generic_unsafe_edge_tls_inputs
+            aigw_generic_unsafe_edge_tls_inputs +
+            aigw_generic_relative_edge_tls_paths
           }}
       changed_when: false
 
