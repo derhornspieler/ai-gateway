@@ -47,6 +47,22 @@ class GenericRocky9ContractTests(unittest.TestCase):
         names = [entry["name"] for entry in self.contract["required_secret_keys"]]
         self.assertEqual(len(names), len(set(names)))
         self.assertNotIn("rotator_vault_token", names)
+        for entry in self.contract["required_secret_keys"]:
+            self.assertLessEqual(
+                set(entry), {"name", "alphabet", "min_length", "exact_length", "prefix"}
+            )
+        webui_key = next(
+            entry
+            for entry in self.contract["required_secret_keys"]
+            if entry["name"] == "webui_litellm_key"
+        )
+        self.assertEqual(webui_key["prefix"], "sk-")
+        self.assertFalse(
+            any(
+                "prefix" in entry and entry["name"] != "webui_litellm_key"
+                for entry in self.contract["required_secret_keys"]
+            )
+        )
         self.assertEqual(
             names,
             [

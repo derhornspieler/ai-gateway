@@ -633,8 +633,13 @@ def random_secret(entry: dict[str, Any], seen: set[str]) -> str:
     else:
         fail(f"invalid alphabet for {entry.get('name')!r}")
 
+    prefix = entry.get("prefix", "")
+    if not isinstance(prefix, str):
+        fail(f"invalid prefix for {entry.get('name')!r}")
+
     while True:
-        value = "".join(secrets.choice(alphabet) for _ in range(length))
+        random_part = "".join(secrets.choice(alphabet) for _ in range(length))
+        value = prefix + random_part
         if value not in seen:
             seen.add(value)
             return value

@@ -958,14 +958,22 @@
 - name: Fail closed on missing, placeholder, or unsafe stack secrets
   ansible.builtin.assert:
     that:
-      - lookup('vars', item.name, default='') | length >= item.min_length
+      - >-
+        lookup('vars', item.name, default='') | length >=
+        item.min_length + (item.prefix | default('') | length)
+      - >-
+        item.prefix is not defined or
+        lookup('vars', item.name, default='') is string and
+        lookup('vars', item.name, default='').startswith(item.prefix)
       - lookup('vars', item.name, default='') is regex('^[A-Za-z0-9_-]+$')
       - lookup('vars', item.name, default='') | lower not in ['change_me', 'changeme', 'replace_me', 'password', 'secret']
     quiet: true
     fail_msg: >-
-      {{ item.name }} must be at least {{ item.min_length }} characters, must
-      not be a placeholder, and may contain only A-Z/a-z/0-9/_/-. This keeps
-      Compose interpolation and PostgreSQL URI embedding unambiguous.
+      {{ item.name }} must begin with its required prefix
+      {{ item.prefix | default('(none)') }} plus at least {{ item.min_length }}
+      secret characters, must not be a placeholder, and may contain only
+      A-Z/a-z/0-9/_/-. This keeps Compose interpolation and PostgreSQL URI
+      embedding unambiguous.
   loop:
     - { name: pg_super_password, min_length: 24 }
     - { name: pg_litellm_password, min_length: 24 }
@@ -977,7 +985,7 @@
     - { name: litellm_salt_key, min_length: 32 }
     - { name: litellm_ui_breakglass_password, min_length: 32 }
     - { name: redis_password, min_length: 32 }
-    - { name: webui_litellm_key, min_length: 24 }
+    - { name: webui_litellm_key, min_length: 24, prefix: "sk-" }
     - { name: webui_secret_key, min_length: 32 }
     - { name: webui_oidc_client_secret, min_length: 32 }
     - { name: portal_oidc_client_secret, min_length: 32 }

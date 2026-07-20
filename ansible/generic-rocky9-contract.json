@@ -45,7 +45,7 @@
     {"name": "litellm_salt_key", "min_length": 32, "alphabet": "safe"},
     {"name": "litellm_ui_breakglass_password", "min_length": 32, "alphabet": "safe"},
     {"name": "redis_password", "min_length": 32, "alphabet": "safe"},
-    {"name": "webui_litellm_key", "min_length": 24, "alphabet": "safe"},
+    {"name": "webui_litellm_key", "min_length": 24, "alphabet": "safe", "prefix": "sk-"},
     {"name": "webui_secret_key", "min_length": 32, "alphabet": "safe"},
     {"name": "webui_oidc_client_secret", "min_length": 32, "alphabet": "safe"},
     {"name": "portal_oidc_client_secret", "min_length": 32, "alphabet": "safe"},

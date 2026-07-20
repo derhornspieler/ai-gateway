@@ -25,6 +25,7 @@ COMMITTED_INVENTORY = ROOT / "ansible" / "inventory" / "hosts.yml"
 PROD_GROUP_VARS = ROOT / "ansible" / "inventory" / "group_vars" / "production_rocky9.yml"
 GENERIC_GROUP_VARS = ROOT / "ansible" / "inventory" / "group_vars" / "generic_rocky9.yml"
 HOSTS_EXAMPLE = ROOT / "ansible" / "inventory" / "examples" / "production-rocky9.hosts.yml.example"
+RECONCILE_OPENWEBUI_KEY = ROOT / "scripts" / "reconcile-openwebui-key.py"
 
 FAKE_VAULT = """#!/usr/bin/env python3
 import sys
@@ -57,6 +58,15 @@ def _write_password_file(root: Path) -> Path:
 
 def _load_bootstrap_module():
     spec = importlib.util.spec_from_file_location("_aigw_bootstrap_under_test", LEGACY_BOOTSTRAP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_reconcile_openwebui_key_module():
+    spec = importlib.util.spec_from_file_location(
+        "_aigw_reconcile_openwebui_key_under_test", RECONCILE_OPENWEBUI_KEY
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -102,6 +112,23 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
         self.assertIn("deliberately unrenamed", legacy_pf)
 
     # ── generator output ────────────────────────────────────────────────
+    def test_generated_webui_litellm_key_matches_its_real_consumer_contract(self) -> None:
+        bootstrap = _load_bootstrap_module()
+        reconcile = _load_reconcile_openwebui_key_module()
+        entry = next(
+            entry
+            for entry in self.contract["required_secret_keys"]
+            if entry["name"] == "webui_litellm_key"
+        )
+
+        generated = bootstrap.random_secret(entry, set())
+
+        self.assertIsNotNone(reconcile.KEY_RE.fullmatch(generated))
+        self.assertTrue(generated.startswith(entry["prefix"]))
+        self.assertGreaterEqual(
+            len(generated.removeprefix(entry["prefix"])), entry["min_length"]
+        )
+
     def test_production_bootstrap_emits_canonical_layout_and_five_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -452,6 +479,43 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
             rejected = run("not-a-real-profile")
             self.assertNotEqual(rejected.returncode, 0)
 
+    def test_production_preflight_reports_wrong_webui_key_prefix(self) -> None:
+        ansible_playbook = shutil.which("ansible-playbook")
+        self.assertIsNotNone(ansible_playbook, "ansible-playbook is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "host_vars").mkdir()
+            (root / "hosts.yml").write_text(_production_hosts_yaml(), encoding="utf-8")
+            host_vars = root / "host_vars" / "prod-aigw01.yml"
+            valid = _full_valid_host_vars(self.contract, "rocky9-production")
+
+            host_vars.write_text(valid, encoding="utf-8")
+            accepted = subprocess.run(
+                [str(ansible_playbook), "-i", str(root / "hosts.yml"), str(PROD_PREFLIGHT)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
+            host_vars.write_text(
+                valid.replace("webui_litellm_key: sk-", "webui_litellm_key: bad-", 1),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [str(ansible_playbook), "-i", str(root / "hosts.yml"), str(PROD_PREFLIGHT)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            combined = (rejected.stdout + rejected.stderr).replace("\\", "")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('"invalid_secret": ["webui_litellm_key"]', combined)
+
     def test_production_preflight_fails_before_mutation_on_missing_values(self) -> None:
         ansible_playbook = shutil.which("ansible-playbook")
         self.assertIsNotNone(ansible_playbook, "ansible-playbook is required")
@@ -584,7 +648,12 @@ def _full_valid_host_vars(contract: dict, profile: str) -> str:
     ]
     for index, entry in enumerate(contract["required_secret_keys"]):
         length = entry.get("exact_length") or entry["min_length"]
-        value = (f"K{index:03d}" + filler)[:length]
+        if entry.get("prefix"):
+            # Match the committed lab token's shape: sk- plus 64 safe random
+            # characters. The fixture contains no real secret.
+            value = entry["prefix"] + (f"K{index:03d}" + filler)[: max(length, 64)]
+        else:
+            value = (f"K{index:03d}" + filler)[:length]
         lines.append(f"{entry['name']}: {value}")
     return "\n".join(lines) + "\n"
 
