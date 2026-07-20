@@ -45,9 +45,7 @@ class OidcRedirectUriReconciliationContractTests(unittest.TestCase):
             "- --confirm",
             "- RECONCILE_PREBOOTSTRAP_OIDC_REDIRECT_URIS",
             "- key-rotator",
-            "- run",
-            "- --rm",
-            "- --no-deps",
+            "- exec",
             "- -T",
             "services: [keycloak]",
         ):

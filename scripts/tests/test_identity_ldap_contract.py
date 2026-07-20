@@ -248,6 +248,41 @@ class IdentityLdapSecretBoundaryTests(unittest.TestCase):
         keycloak_block = overlay.split("  keycloak:", 1)[1].split("  key-rotator:", 1)[0]
         self.assertNotIn("identity_ldap_bind_password", keycloak_block)
 
+    def test_transient_reconciliation_cannot_relabel_the_canonical_credential(
+        self,
+    ) -> None:
+        source = STACK_TASKS.read_text(encoding="utf-8")
+        task_blocks = source.split("\n- name:")
+        key_rotator_tasks = [
+            block for block in task_blocks if "      - key-rotator\n" in block
+        ]
+        self.assertTrue(key_rotator_tasks)
+        for block in key_rotator_tasks:
+            with self.subTest(task=block.splitlines()[0]):
+                self.assertFalse(
+                    "      - run\n" in block and "      - --rm\n" in block,
+                    "a transient key-rotator would steal the private LDAP "
+                    "credential's MCS category",
+                )
+
+        for task_name in (
+            "Apply the first pre-Vault managed-identity recovery baseline",
+            "Prove the pre-Vault managed-identity recovery is idempotent",
+            "Reconcile only applicable pre-bootstrap Keycloak OIDC role scopes",
+            "Reconcile managed OIDC client redirect URIs to the configured domain",
+        ):
+            block = source.split(f"- name: {task_name}", 1)[1].split("\n- name:", 1)[0]
+            self.assertIn("      - exec\n", block)
+            self.assertIn("      - -T\n      - key-rotator\n", block)
+            self.assertNotIn("      - run\n", block)
+
+        self.assertLess(
+            source.index("- name: Deploy stack without implicitly rebuilding custom images"),
+            source.index(
+                "- name: Apply the first pre-Vault managed-identity recovery baseline"
+            ),
+        )
+
     def test_the_credential_is_never_rendered_into_env(self) -> None:
         env_source = ENV_TEMPLATE.read_text(encoding="utf-8")
         self.assertNotIn("{{ identity_ldap_bind_password", env_source)

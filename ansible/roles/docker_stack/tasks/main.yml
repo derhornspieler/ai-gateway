@@ -3566,9 +3566,10 @@
   ansible.builtin.command:
     argv:
       - "{{ stack_dir }}/scripts/aigw-compose.sh"
-      - run
-      - --rm
-      - --no-deps
+      # The long-running service already exists from "Deploy stack" above.
+      # Execute inside it so a transient container cannot privately relabel
+      # and steal the canonical LDAP bind credential's MCS category.
+      - exec
       - -T
       - key-rotator
       - /opt/venv/bin/python
@@ -3604,9 +3605,7 @@
   ansible.builtin.command:
     argv:
       - "{{ stack_dir }}/scripts/aigw-compose.sh"
-      - run
-      - --rm
-      - --no-deps
+      - exec
       - -T
       - key-rotator
       - /opt/venv/bin/python
@@ -3690,9 +3689,7 @@
   ansible.builtin.command:
     argv:
       - "{{ stack_dir }}/scripts/aigw-compose.sh"
-      - run
-      - --rm
-      - --no-deps
+      - exec
       - -T
       - key-rotator
       - /opt/venv/bin/python
@@ -3762,9 +3759,7 @@
   ansible.builtin.command:
     argv:
       - "{{ stack_dir }}/scripts/aigw-compose.sh"
-      - run
-      - --rm
-      - --no-deps
+      - exec
       - -T
       - key-rotator
       - /opt/venv/bin/python
