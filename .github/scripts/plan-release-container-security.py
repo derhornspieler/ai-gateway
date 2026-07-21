@@ -8,6 +8,7 @@ from collections import defaultdict
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 
@@ -22,6 +23,105 @@ from release_security_common import (
 )
 
 
+DHI_IMAGE_RE = re.compile(
+    r"^dhi\.io/[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"@sha256:[0-9a-f]{64}$"
+)
+DOCKERFILE_VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _build_definition(service_name: str, service: dict[str, object]) -> dict[str, object]:
+    build = service.get("build")
+    if isinstance(build, str):
+        return {"context": build}
+    if not isinstance(build, dict):
+        raise ReleaseSecurityError(f"service has no safe build definition: {service_name}")
+    return build
+
+
+def dockerfile_dhi_bases(
+    root: Path, service_name: str, service: dict[str, object]
+) -> list[str]:
+    """Return the exact DHI stages used by one reviewed Dockerfile.
+
+    This intentionally supports only the simple ARG and FROM forms used in
+    this repository. A new Dockerfile form fails closed until it is reviewed.
+    """
+
+    build = _build_definition(service_name, service)
+    raw_context = build.get("context", ".")
+    raw_dockerfile = build.get("dockerfile", "Dockerfile")
+    raw_args = build.get("args", {})
+    if (
+        not isinstance(raw_context, str)
+        or not raw_context
+        or not isinstance(raw_dockerfile, str)
+        or not raw_dockerfile
+        or not isinstance(raw_args, dict)
+        or any(not isinstance(k, str) or not isinstance(v, str) for k, v in raw_args.items())
+    ):
+        raise ReleaseSecurityError(f"service has invalid build inputs: {service_name}")
+    context = Path(raw_context)
+    if not context.is_absolute():
+        context = root / context
+    context = context.resolve()
+    dockerfile = (context / raw_dockerfile).resolve()
+    try:
+        context.relative_to((root / "services").resolve())
+        dockerfile.relative_to(context)
+    except ValueError as exc:
+        raise ReleaseSecurityError(
+            f"service build leaves the reviewed services tree: {service_name}"
+        ) from exc
+    try:
+        lines = dockerfile.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ReleaseSecurityError(f"cannot read Dockerfile for {service_name}") from exc
+
+    values = dict(raw_args)
+    final_base = ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        instruction, separator, remainder = stripped.partition(" ")
+        if not separator:
+            continue
+        if instruction.upper() == "ARG":
+            name, has_default, default = remainder.strip().partition("=")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ReleaseSecurityError(
+                    f"Dockerfile has an unsafe ARG for {service_name}: {name}"
+                )
+            if name not in values and has_default:
+                values[name] = default
+            continue
+        if instruction.upper() != "FROM":
+            continue
+        token = remainder.split()[0]
+
+        def replace(match: re.Match[str]) -> str:
+            name = match.group(1) or match.group(2)
+            if name not in values:
+                raise ReleaseSecurityError(
+                    f"Dockerfile FROM uses an unresolved ARG for {service_name}: {name}"
+                )
+            return values[name]
+
+        reference = DOCKERFILE_VAR_RE.sub(replace, token)
+        if "$" in reference:
+            raise ReleaseSecurityError(
+                f"Dockerfile FROM uses an unsupported expansion for {service_name}"
+            )
+        final_base = reference
+        if final_base.startswith("dhi.io/"):
+            if DHI_IMAGE_RE.fullmatch(final_base) is None:
+                raise ReleaseSecurityError(
+                    f"DHI build stage is not tag-and-digest pinned: {service_name}"
+                )
+    return [final_base] if DHI_IMAGE_RE.fullmatch(final_base) else []
+
+
 def artifact_slug(kind: str, value: str) -> str:
     """Return a short artifact-safe name without trusting an image reference."""
 
@@ -30,7 +130,10 @@ def artifact_slug(kind: str, value: str) -> str:
 
 
 def custom_matrix(
-    manifest: dict[str, object], preprod_only: set[str], platform: str
+    manifest: dict[str, object],
+    preprod_only: set[str],
+    platform: str,
+    dhi_bases_by_service: dict[str, list[str]] | None = None,
 ) -> list[dict[str, object]]:
     """Collapse shared service builds into one scan for each final image."""
 
@@ -60,6 +163,14 @@ def custom_matrix(
                 f"shared custom image has different build inputs: {image}"
             )
         service_names = sorted(service for service, _ in records)
+        bases_by_service = dhi_bases_by_service or {}
+        dhi_bases = sorted(
+            {
+                base
+                for service_name in service_names
+                for base in bases_by_service.get(service_name, [])
+            }
+        )
         is_preprod_only = any(name in preprod_only for name in service_names)
         if is_preprod_only and not all(name in preprod_only for name in service_names):
             raise ReleaseSecurityError(
@@ -72,6 +183,7 @@ def custom_matrix(
                 "services": service_names,
                 "input_digest": next(iter(digests)),
                 "platform": platform,
+                "dhi_bases": dhi_bases,
                 "scope": "preprod-only" if is_preprod_only else "production",
                 "slug": artifact_slug("custom", image),
             }
@@ -124,6 +236,7 @@ def build_inventory(
         {
             "reference": reference,
             "platform": requested_platform,
+            "dhi_bases": [reference] if DHI_IMAGE_RE.fullmatch(reference) else [],
             "scope": (
                 "production"
                 if reference in scopes[builder.RELEASE_SCOPE_PRODUCTION]
@@ -133,8 +246,28 @@ def build_inventory(
         }
         for reference in references
     ]
+    model_services = model.get("services")
+    if not isinstance(model_services, dict):
+        raise ReleaseSecurityError("rendered release model has no services")
+    dhi_bases_by_service = {
+        name: dockerfile_dhi_bases(root, name, service)
+        for name, service in sorted(model_services.items())
+        if isinstance(name, str)
+        and isinstance(service, dict)
+        and service.get("build")
+    }
     custom = custom_matrix(
-        manifest, set(builder.PREPROD_ONLY_SERVICES), requested_platform
+        manifest,
+        set(builder.PREPROD_ONLY_SERVICES),
+        requested_platform,
+        dhi_bases_by_service,
+    )
+    dhi_images = sorted(
+        {
+            base
+            for item in [*external, *custom]
+            for base in item["dhi_bases"]
+        }
     )
     inventory = {
         "schema": 1,
@@ -145,10 +278,12 @@ def build_inventory(
         "egress_policy": egress_plan.receipt,
         "external_images": external,
         "custom_images": custom,
+        "dhi_images": dhi_images,
         "limitations": [
             "This hosted scan rebuilds candidates from the commit; it does not receive an operator's local offline archive.",
             "The evidence is GitHub Actions metadata, not signed SLSA provenance.",
             "Vulnerability results use the Trivy database available when the workflow runs.",
+            "DHI findings are filtered only by signed VEX for the exact reviewed base image.",
         ],
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -53,6 +53,10 @@ EVIDENCE = load(
     ".github/scripts/validate-image-security-evidence.py",
     "_test_image_security_evidence",
 )
+VEX = load(
+    ".github/scripts/manage-dhi-vex.py",
+    "_test_manage_dhi_vex",
+)
 SEED = load(
     "scripts/rebuild-offline-image-seed.py",
     "_test_release_container_seed_builder",
@@ -163,36 +167,57 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
         self.assertEqual(shared["services"], ["one", "two"])
         self.assertEqual(shared["scope"], "production")
         self.assertEqual(shared["platform"], "linux/amd64")
+        self.assertEqual(shared["dhi_bases"], [])
 
         manifest["services"]["two"]["digest"] = "c" * 64
         with self.assertRaises(PLAN.ReleaseSecurityError):
             PLAN.custom_matrix(manifest, {"mock"}, "linux/amd64")
 
     def test_every_image_gets_a_blocking_high_critical_scan_and_evidence(self) -> None:
-        self.assertEqual(WORKFLOW.count("Scan high and critical vulnerabilities"), 2)
+        self.assertEqual(WORKFLOW.count("Record raw Trivy high and critical findings"), 2)
+        self.assertEqual(WORKFLOW.count("Enforce VEX-aware high and critical gate"), 2)
         self.assertEqual(WORKFLOW.count("severity: HIGH,CRITICAL"), 3)
         self.assertEqual(WORKFLOW.count('ignore-unfixed: "false"'), 3)
-        self.assertEqual(WORKFLOW.count('exit-code: "1"'), 3)
+        self.assertEqual(WORKFLOW.count('exit-code: "1"'), 1)
+        self.assertEqual(WORKFLOW.count('exit-code: "0"'), 2)
+        self.assertEqual(WORKFLOW.count("exit-code: true"), 2)
         self.assertEqual(WORKFLOW.count("format: cyclonedx"), 2)
         self.assertEqual(WORKFLOW.count("trivy-vulnerabilities.json"), 2)
+        self.assertEqual(WORKFLOW.count("scout-vulnerabilities.sarif"), 2)
         self.assertEqual(WORKFLOW.count("provenance.json"), 2)
-        self.assertEqual(WORKFLOW.count("if-no-files-found: error"), 3)
+        self.assertEqual(WORKFLOW.count("if-no-files-found: error"), 4)
         self.assertIn("Enforce exact pull and vulnerability gate", WORKFLOW)
         self.assertIn("Enforce exact build and vulnerability gate", WORKFLOW)
         self.assertIn('[[ "$SCAN_OUTCOME" != "success" ]]', WORKFLOW)
         self.assertEqual(WORKFLOW.count("validate-image-security-evidence.py"), 2)
         self.assertEqual(WORKFLOW.count('[[ "$EVIDENCE_OUTCOME" != "success" ]]'), 2)
+        self.assertNotIn("trivy-config:", WORKFLOW)
+        self.assertEqual(WORKFLOW.count("--vex-receipt"), 2)
+        self.assertEqual(WORKFLOW.count("manage-dhi-vex.py select"), 2)
         self.assertIn("build_input_sha256", PROVENANCE_SOURCE)
         self.assertIn("runtime_and_database_metadata", PROVENANCE_SOURCE)
         self.assertIn("not signed SLSA provenance", PROVENANCE_SOURCE)
         self.assertIn("did not receive or inspect the operator's local offline archive", PROVENANCE_SOURCE)
 
     def test_evidence_validator_rejects_findings_missing_files_and_id_drift(self) -> None:
+        # Raw Trivy results stay in the evidence even when DHI VEX later proves
+        # a finding is not exploitable. Docker Scout is the VEX-aware gate.
+        EVIDENCE.validate_vulnerability_report(
+            {
+                "SchemaVersion": 2,
+                "Results": [{"Vulnerabilities": [{"Severity": "HIGH"}]}],
+            }
+        )
         with self.assertRaises(EVIDENCE.EvidenceError):
-            EVIDENCE.validate_vulnerability_report(
+            EVIDENCE.validate_scout_sarif(
                 {
-                    "SchemaVersion": 2,
-                    "Results": [{"Vulnerabilities": [{"Severity": "HIGH"}]}],
+                    "version": "2.1.0",
+                    "runs": [
+                        {
+                            "tool": {"driver": {"name": "docker scout"}},
+                            "results": [{"ruleId": "CVE-2099-0001"}],
+                        }
+                    ],
                 }
             )
         with self.assertRaises(EVIDENCE.EvidenceError):
@@ -201,10 +226,22 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
             "schema": 1,
             "outcomes": {
                 "pull_or_build": "success",
+                "raw_trivy_scan": "success",
                 "high_critical_scan": "success",
                 "sbom": "success",
             },
-            "scanner": {"waiver_file_sha256": "a" * 64},
+            "scanner": {
+                "waiver_file_sha256": "a" * 64,
+                "vex": {
+                    "receipt_file": "selected-dhi-vex.json",
+                    "receipt_sha256": "c" * 64,
+                    "signature_verified": True,
+                    "transparency_log_verified": False,
+                    "references": [],
+                    "document_sha256s": [],
+                    "statuses": [],
+                },
+            },
             "image": {
                 "available": True,
                 "id": "sha256:" + "a" * 64,
@@ -216,7 +253,10 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
         }
         with self.assertRaises(EVIDENCE.EvidenceError):
             EVIDENCE.validate_provenance(
-                provenance, "linux/amd64", "sha256:" + "b" * 64
+                provenance,
+                "linux/amd64",
+                "sha256:" + "b" * 64,
+                ("c" * 64, [], [], []),
             )
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(EVIDENCE.EvidenceError):
@@ -256,6 +296,186 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
                     job.index("docker logout dhi.io"),
                     min(action_offsets),
                 )
+
+    def test_dhi_vex_is_exact_signed_and_bound_to_each_build(self) -> None:
+        policy_path = ROOT / ".github/dhi-vex-policy.json"
+        policy = VEX.load_policy(policy_path)
+        self.assertEqual(policy["docker_scout"]["version"], "1.23.1")
+        self.assertTrue(policy["verification"]["skip_transparency_log"])
+        self.assertGreater(
+            len(policy["verification"]["skip_transparency_log_reason"]), 40
+        )
+        manager = (ROOT / ".github/scripts/manage-dhi-vex.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"--verify"', manager)
+        self.assertIn('"--skip-tlog"', manager)
+        self.assertIn('"--key"', manager)
+        self.assertEqual(WORKFLOW.count("actions/download-artifact@"), 2)
+        self.assertEqual(WORKFLOW.count("Download signature-verified DHI VEX evidence"), 2)
+
+    def test_dockerfile_dhi_base_discovery_is_exact_and_reviewed(self) -> None:
+        open_webui = {
+            "build": {
+                "context": "services/dhi-health-probe",
+                "dockerfile": "Dockerfile.open-webui",
+                "args": {
+                    "BASE_IMAGE": (
+                        "ghcr.io/open-webui/open-webui:v0.10.2@sha256:"
+                        "9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4"
+                    )
+                },
+            }
+        }
+        self.assertEqual(
+            PLAN.dockerfile_dhi_bases(ROOT, "open-webui", open_webui),
+            [],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            context = root / "services/example"
+            context.mkdir(parents=True)
+            (context / "Dockerfile").write_text(
+                "FROM dhi.io/python:3.14.6\n", encoding="utf-8"
+            )
+            with self.assertRaises(PLAN.ReleaseSecurityError):
+                PLAN.dockerfile_dhi_bases(
+                    root,
+                    "example",
+                    {"build": {"context": "services/example"}},
+                )
+
+    def test_vex_selector_rejects_unknown_and_copies_only_requested_base(self) -> None:
+        reference = (
+            "dhi.io/python:3.14.6@sha256:"
+            "c82da5a1a30a6214f45c42def5b6f5b85981c7dc7a1802015a6ebf264675436d"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            vex_directory = source / "vex"
+            vex_directory.mkdir(parents=True)
+            filename = "0" * 24 + ".openvex.json"
+            vex_path = vex_directory / filename
+            vex_payload = {
+                "@context": "https://openvex.dev/ns/v0.2.0",
+                "@id": "https://scout.docker.com/public/vex-test",
+                "author": "Docker Hardened Images <dhi@docker.com>",
+                "role": "Document Creator",
+                "tooling": "Docker Scout",
+                "statements": [
+                    {
+                        "products": [{"@id": reference.split("@", 1)[0]}],
+                        "status": "not_affected",
+                    }
+                ],
+            }
+            vex_path.write_text(json.dumps(vex_payload), encoding="utf-8")
+            policy_path = ROOT / ".github/dhi-vex-policy.json"
+            policy = VEX.load_policy(policy_path)
+            receipt = {
+                "schema": 1,
+                "platform": "linux/amd64",
+                "policy_sha256": VEX.sha256_file(policy_path),
+                "public_key_sha256": policy["verification"]["public_key_sha256"],
+                "docker_scout_version": "v1.23.1",
+                "signature_verified": True,
+                "transparency_log_verified": False,
+                "transparency_log_note": policy["verification"][
+                    "skip_transparency_log_reason"
+                ],
+                "records": [
+                    {
+                        "document_id": vex_payload["@id"],
+                        "file": f"vex/{filename}",
+                        "reason": None,
+                        "reference": reference,
+                        "sha256": VEX.sha256_file(vex_path),
+                        "statements": 1,
+                        "status": "verified",
+                    }
+                ],
+            }
+            VEX.write_json(source / "receipt.json", receipt)
+            output = root / "selected"
+            VEX.select_vex(
+                policy_path,
+                source,
+                json.dumps([reference]),
+                "linux/amd64",
+                output,
+            )
+            selected = json.loads(
+                (output / "selected-dhi-vex.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual([record["reference"] for record in selected["records"]], [reference])
+            self.assertTrue((output / "vex" / filename).is_file())
+            _, references, document_sha256s, statuses = EVIDENCE.validate_vex_receipt(
+                selected, output, "linux/amd64"
+            )
+            self.assertEqual(references, [reference])
+            self.assertEqual(document_sha256s, [VEX.sha256_file(vex_path)])
+            self.assertEqual(statuses, ["verified"])
+            with self.assertRaises(VEX.VexError):
+                VEX.select_vex(
+                    policy_path,
+                    source,
+                    json.dumps([reference.replace("python", "unknown")]),
+                    "linux/amd64",
+                    root / "rejected",
+                )
+
+    def test_missing_dhi_vex_stays_recorded_and_unsuppressed(self) -> None:
+        reference = (
+            "dhi.io/busybox:1.38.0-alpine@sha256:"
+            "69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            policy_path = ROOT / ".github/dhi-vex-policy.json"
+            policy = VEX.load_policy(policy_path)
+            receipt = {
+                "schema": 1,
+                "platform": "linux/amd64",
+                "policy_sha256": VEX.sha256_file(policy_path),
+                "public_key_sha256": policy["verification"]["public_key_sha256"],
+                "docker_scout_version": "v1.23.1",
+                "signature_verified": True,
+                "transparency_log_verified": False,
+                "transparency_log_note": policy["verification"][
+                    "skip_transparency_log_reason"
+                ],
+                "records": [
+                    {
+                        "document_id": None,
+                        "file": None,
+                        "reason": VEX.NO_VEX_REASON,
+                        "reference": reference,
+                        "sha256": None,
+                        "statements": 0,
+                        "status": "unavailable",
+                    }
+                ],
+            }
+            VEX.write_json(source / "receipt.json", receipt)
+            output = root / "selected"
+            VEX.select_vex(
+                policy_path,
+                source,
+                json.dumps([reference]),
+                "linux/amd64",
+                output,
+            )
+            selected = EVIDENCE.read_json(output / "selected-dhi-vex.json")
+            _, references, document_sha256s, statuses = EVIDENCE.validate_vex_receipt(
+                selected, output, "linux/amd64"
+            )
+            self.assertEqual(references, [reference])
+            self.assertEqual(document_sha256s, [])
+            self.assertEqual(statuses, ["unavailable"])
+            self.assertEqual(list((output / "vex").iterdir()), [])
 
 
 class TrivyWaiverContractTests(unittest.TestCase):

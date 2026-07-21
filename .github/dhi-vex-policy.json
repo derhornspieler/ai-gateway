@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "docker_scout": {
+    "version": "1.23.1",
+    "linux_amd64_url": "https://github.com/docker/scout-cli/releases/download/v1.23.1/docker-scout_1.23.1_linux_amd64.tar.gz",
+    "linux_amd64_sha256": "0f778f9d833f28bc6cccff95e33039849c0afcecafa38d9f46fe74bfd0915714"
+  },
+  "verification": {
+    "public_key": ".github/docker-dhi-vex.pub",
+    "public_key_source": "https://registry.scout.docker.com/keyring/dhi/latest.pub",
+    "public_key_sha256": "1d02bbccf149283ae6288d96264dcad3fb23ee1911d90324a48eab28e4cb8a5f",
+    "skip_transparency_log": true,
+    "skip_transparency_log_reason": "Docker's current DHI VEX signature is not recorded in the public log. The pinned Docker public key must still verify the signature."
+  }
+}

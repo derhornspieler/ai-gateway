@@ -88,6 +88,20 @@ jobs:
             --output release-container-inventory.json \
             --github-output "$GITHUB_OUTPUT"
 
+      - name: Install the pinned Docker Scout verifier
+        run: |
+          python3 -I .github/scripts/manage-dhi-vex.py install \
+            --policy .github/dhi-vex-policy.json \
+            --directory "$RUNNER_TEMP/docker-scout"
+
+      - name: Fetch and verify exact DHI VEX statements
+        run: |
+          python3 -I .github/scripts/manage-dhi-vex.py fetch \
+            --policy .github/dhi-vex-policy.json \
+            --inventory release-container-inventory.json \
+            --scout "$RUNNER_TEMP/docker-scout/docker-scout" \
+            --output-directory release-dhi-vex
+
       - name: Remove DHI registry credentials
         if: ${{ always() }}
         run: docker logout dhi.io
@@ -97,6 +111,14 @@ jobs:
         with:
           name: release-container-security-inventory
           path: release-container-inventory.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload signature-verified DHI VEX evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dhi-vex
+          path: release-dhi-vex
           if-no-files-found: error
           retention-days: 30
 
@@ -115,6 +137,25 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Download signature-verified DHI VEX evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dhi-vex
+          path: .release-dhi-vex
+
+      - name: Select VEX for this exact image
+        env:
+          DHI_BASES_JSON: ${{ toJSON(matrix.dhi_bases) }}
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
+        run: |
+          python3 -I .github/scripts/manage-dhi-vex.py select \
+            --policy .github/dhi-vex-policy.json \
+            --source-directory .release-dhi-vex \
+            --references-json "$DHI_BASES_JSON" \
+            --platform "$IMAGE_PLATFORM" \
+            --output-directory "$ARTIFACT_DIR"
 
       - name: Authenticate to DHI
         env:
@@ -144,8 +185,8 @@ jobs:
         if: ${{ always() }}
         run: docker logout dhi.io
 
-      - name: Scan high and critical vulnerabilities
-        id: vulnerability
+      - name: Record raw Trivy high and critical findings
+        id: trivy
         if: ${{ steps.acquire.outcome == 'success' }}
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -157,11 +198,28 @@ jobs:
           trivyignores: .github/trivyignore-images.yaml
           severity: HIGH,CRITICAL
           ignore-unfixed: "false"
-          exit-code: "1"
+          exit-code: "0"
           format: json
           output: security-artifacts/${{ matrix.slug }}/trivy-vulnerabilities.json
           hide-progress: "true"
           timeout: 20m0s
+
+      - name: Enforce VEX-aware high and critical gate
+        id: vulnerability
+        if: ${{ steps.acquire.outcome == 'success' }}
+        continue-on-error: true
+        uses: docker/scout-action@2688993af7bafd6ba8c6a74ec652442be91dd82b # v1.23.1
+        with:
+          command: cves
+          image: ${{ matrix.reference }}
+          platform: ${{ matrix.platform }}
+          only-severities: critical,high
+          only-vex-affected: true
+          vex-location: security-artifacts/${{ matrix.slug }}/vex
+          exit-code: true
+          sarif-file: security-artifacts/${{ matrix.slug }}/scout-vulnerabilities.sarif
+          summary: false
+          write-comment: false
 
       - name: Generate CycloneDX SBOM
         id: sbom
@@ -182,8 +240,10 @@ jobs:
           IMAGE_REFERENCE: ${{ matrix.reference }}
           IMAGE_SCOPE: ${{ matrix.scope }}
           ACQUIRE_OUTCOME: ${{ steps.acquire.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
           SCAN_OUTCOME: ${{ steps.vulnerability.outcome }}
           SBOM_OUTCOME: ${{ steps.sbom.outcome }}
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
           PROVENANCE: security-artifacts/${{ matrix.slug }}/provenance.json
         run: |
           python3 -I .github/scripts/write-image-provenance.py \
@@ -192,9 +252,11 @@ jobs:
             --source-reference "$IMAGE_REFERENCE" \
             --scope "$IMAGE_SCOPE" \
             --acquisition-outcome "$ACQUIRE_OUTCOME" \
+            --trivy-outcome "$TRIVY_OUTCOME" \
             --scan-outcome "$SCAN_OUTCOME" \
             --sbom-outcome "$SBOM_OUTCOME" \
             --waiver-file .github/trivyignore-images.yaml \
+            --vex-receipt "$ARTIFACT_DIR/selected-dhi-vex.json" \
             --output "$PROVENANCE"
 
       - name: Validate complete external image evidence
@@ -254,6 +316,25 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Download signature-verified DHI VEX evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dhi-vex
+          path: .release-dhi-vex
+
+      - name: Select VEX for this exact build
+        env:
+          DHI_BASES_JSON: ${{ toJSON(matrix.dhi_bases) }}
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
+        run: |
+          python3 -I .github/scripts/manage-dhi-vex.py select \
+            --policy .github/dhi-vex-policy.json \
+            --source-directory .release-dhi-vex \
+            --references-json "$DHI_BASES_JSON" \
+            --platform "$IMAGE_PLATFORM" \
+            --output-directory "$ARTIFACT_DIR"
+
       - name: Authenticate to DHI
         env:
           DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
@@ -290,8 +371,8 @@ jobs:
         if: ${{ always() }}
         run: docker logout dhi.io
 
-      - name: Scan high and critical vulnerabilities
-        id: vulnerability
+      - name: Record raw Trivy high and critical findings
+        id: trivy
         if: ${{ steps.acquire.outcome == 'success' }}
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -303,11 +384,28 @@ jobs:
           trivyignores: .github/trivyignore-images.yaml
           severity: HIGH,CRITICAL
           ignore-unfixed: "false"
-          exit-code: "1"
+          exit-code: "0"
           format: json
           output: security-artifacts/${{ matrix.slug }}/trivy-vulnerabilities.json
           hide-progress: "true"
           timeout: 20m0s
+
+      - name: Enforce VEX-aware high and critical gate
+        id: vulnerability
+        if: ${{ steps.acquire.outcome == 'success' }}
+        continue-on-error: true
+        uses: docker/scout-action@2688993af7bafd6ba8c6a74ec652442be91dd82b # v1.23.1
+        with:
+          command: cves
+          image: ${{ matrix.image }}
+          platform: ${{ matrix.platform }}
+          only-severities: critical,high
+          only-vex-affected: true
+          vex-location: security-artifacts/${{ matrix.slug }}/vex
+          exit-code: true
+          sarif-file: security-artifacts/${{ matrix.slug }}/scout-vulnerabilities.sarif
+          summary: false
+          write-comment: false
 
       - name: Generate CycloneDX SBOM
         id: sbom
@@ -330,9 +428,11 @@ jobs:
           SERVICE_NAME: ${{ matrix.service }}
           INPUT_DIGEST: ${{ matrix.input_digest }}
           ACQUIRE_OUTCOME: ${{ steps.acquire.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
           SCAN_OUTCOME: ${{ steps.vulnerability.outcome }}
           SBOM_OUTCOME: ${{ steps.sbom.outcome }}
           EXPECTED_IMAGE_ID: ${{ steps.acquire.outputs.image_id }}
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
           PROVENANCE: security-artifacts/${{ matrix.slug }}/provenance.json
         run: |
           python3 -I .github/scripts/write-image-provenance.py \
@@ -344,9 +444,11 @@ jobs:
             --input-digest "$INPUT_DIGEST" \
             --expected-image-id "$EXPECTED_IMAGE_ID" \
             --acquisition-outcome "$ACQUIRE_OUTCOME" \
+            --trivy-outcome "$TRIVY_OUTCOME" \
             --scan-outcome "$SCAN_OUTCOME" \
             --sbom-outcome "$SBOM_OUTCOME" \
             --waiver-file .github/trivyignore-images.yaml \
+            --vex-receipt "$ARTIFACT_DIR/selected-dhi-vex.json" \
             --output "$PROVENANCE"
 
       - name: Validate complete custom image evidence

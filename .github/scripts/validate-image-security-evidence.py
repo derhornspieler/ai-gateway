@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the three required image-security artifacts before upload."""
+"""Validate every required image-security artifact before upload."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -12,6 +13,7 @@ import stat
 
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_JSON_BYTES = 256 * 1024 * 1024
+NO_VEX_REASON = "Docker Scout reported no VEX attestation for this exact DHI image."
 
 
 class EvidenceError(RuntimeError):
@@ -59,11 +61,37 @@ def validate_vulnerability_report(payload: object) -> None:
         if not isinstance(vulnerabilities, list):
             raise EvidenceError("Trivy vulnerability list is invalid")
         for vulnerability in vulnerabilities:
-            severity = vulnerability.get("Severity") if isinstance(vulnerability, dict) else None
-            if severity in {"HIGH", "CRITICAL"}:
-                raise EvidenceError(
-                    "Trivy report contains a HIGH or CRITICAL vulnerability"
-                )
+            if not isinstance(vulnerability, dict):
+                raise EvidenceError("Trivy report has a malformed vulnerability")
+
+
+def validate_scout_sarif(payload: object) -> None:
+    """Require Docker Scout's VEX-aware blocking report to be empty."""
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != "2.1.0"
+        or not isinstance(payload.get("runs"), list)
+        or not payload["runs"]
+    ):
+        raise EvidenceError("Docker Scout SARIF report has an invalid schema")
+    for run in payload["runs"]:
+        driver = (
+            run.get("tool", {}).get("driver", {})
+            if isinstance(run, dict)
+            else {}
+        )
+        results = run.get("results") if isinstance(run, dict) else None
+        if (
+            not isinstance(driver, dict)
+            or str(driver.get("name", "")).lower() != "docker scout"
+            or not isinstance(results, list)
+        ):
+            raise EvidenceError("Docker Scout SARIF run is malformed")
+        if results:
+            raise EvidenceError(
+                "Docker Scout report contains a VEX-aware HIGH or CRITICAL finding"
+            )
 
 
 def validate_sbom(payload: object) -> None:
@@ -77,8 +105,95 @@ def validate_sbom(payload: object) -> None:
         raise EvidenceError("CycloneDX SBOM has an invalid schema")
 
 
+def validate_vex_receipt(
+    payload: object, directory: Path, expected_platform: str
+) -> tuple[str, list[str], list[str], list[str]]:
+    """Prove every selected DHI VEX file is signed-policy evidence."""
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != 1
+        or payload.get("platform") != expected_platform
+        or payload.get("signature_verified") is not True
+        or payload.get("transparency_log_verified") is not False
+        or not isinstance(payload.get("transparency_log_note"), str)
+        or len(str(payload.get("transparency_log_note"))) < 40
+        or payload.get("docker_scout_version") != "v1.23.1"
+        or IMAGE_ID_RE.fullmatch(
+            "sha256:" + str(payload.get("public_key_sha256"))
+        )
+        is None
+        or not isinstance(payload.get("records"), list)
+    ):
+        raise EvidenceError("selected DHI VEX receipt has an invalid schema")
+    references: list[str] = []
+    document_sha256s: list[str] = []
+    statuses: list[str] = []
+    for record in payload["records"]:
+        if not isinstance(record, dict):
+            raise EvidenceError("selected DHI VEX receipt has an invalid record")
+        reference = record.get("reference")
+        relative = record.get("file")
+        digest = record.get("sha256")
+        status_value = record.get("status")
+        if (
+            not isinstance(reference, str)
+            or not reference.startswith("dhi.io/")
+            or "@sha256:" not in reference
+            or status_value not in {"verified", "unavailable"}
+        ):
+            raise EvidenceError("selected DHI VEX receipt record is malformed")
+        if status_value == "verified":
+            if (
+                not isinstance(relative, str)
+                or re.fullmatch(r"vex/[0-9a-f]{24}\.openvex\.json", relative) is None
+                or IMAGE_ID_RE.fullmatch("sha256:" + str(digest)) is None
+                or record.get("reason") is not None
+            ):
+                raise EvidenceError("verified DHI VEX receipt record is malformed")
+            path = directory / relative
+            try:
+                metadata = path.lstat()
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise EvidenceError("selected DHI VEX document is missing") from exc
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_size < 2
+                or metadata.st_size > MAX_JSON_BYTES
+                or actual != digest
+            ):
+                raise EvidenceError(
+                    "selected DHI VEX document changed after verification"
+                )
+            document_sha256s.append(str(digest))
+        elif (
+            relative is not None
+            or digest is not None
+            or record.get("document_id") is not None
+            or record.get("statements") != 0
+            or record.get("reason") != NO_VEX_REASON
+        ):
+            raise EvidenceError("unavailable DHI VEX receipt record is malformed")
+        references.append(reference)
+        statuses.append(str(status_value))
+    if references != sorted(set(references)):
+        raise EvidenceError("selected DHI VEX references are not canonical")
+    receipt_path = directory / "selected-dhi-vex.json"
+    return (
+        hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        references,
+        document_sha256s,
+        statuses,
+    )
+
+
 def validate_provenance(
-    payload: object, expected_platform: str, expected_image_id: str
+    payload: object,
+    expected_platform: str,
+    expected_image_id: str,
+    vex_evidence: tuple[str, list[str], list[str], list[str]],
 ) -> None:
     operating_system, separator, architecture = expected_platform.partition("/")
     if separator != "/" or operating_system != "linux" or not architecture:
@@ -88,13 +203,24 @@ def validate_provenance(
     outcomes = payload.get("outcomes")
     image = payload.get("image")
     scanner = payload.get("scanner")
+    vex = scanner.get("vex") if isinstance(scanner, dict) else None
+    vex_sha256, vex_references, vex_document_sha256s, vex_statuses = vex_evidence
     if (
         not isinstance(outcomes, dict)
         or outcomes.get("pull_or_build") != "success"
+        or outcomes.get("raw_trivy_scan") != "success"
         or outcomes.get("high_critical_scan") != "success"
         or outcomes.get("sbom") != "success"
         or not isinstance(scanner, dict)
         or scanner.get("waiver_file_sha256") is None
+        or not isinstance(vex, dict)
+        or vex.get("receipt_file") != "selected-dhi-vex.json"
+        or vex.get("receipt_sha256") != vex_sha256
+        or vex.get("signature_verified") is not True
+        or vex.get("transparency_log_verified") is not False
+        or vex.get("references") != vex_references
+        or vex.get("document_sha256s") != vex_document_sha256s
+        or vex.get("statuses") != vex_statuses
         or not isinstance(image, dict)
         or image.get("available") is not True
         or IMAGE_ID_RE.fullmatch(str(image.get("id"))) is None
@@ -137,11 +263,20 @@ def main() -> None:
         validate_vulnerability_report(
             read_json(args.directory / "trivy-vulnerabilities.json")
         )
+        validate_scout_sarif(
+            read_json(args.directory / "scout-vulnerabilities.sarif")
+        )
         validate_sbom(read_json(args.directory / "sbom.cdx.json"))
+        vex_evidence = validate_vex_receipt(
+            read_json(args.directory / "selected-dhi-vex.json"),
+            args.directory,
+            args.platform,
+        )
         validate_provenance(
             read_json(args.directory / "provenance.json"),
             args.platform,
             args.expected_image_id,
+            vex_evidence,
         )
     except EvidenceError as exc:
         raise SystemExit(str(exc)) from None
