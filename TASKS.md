@@ -48,23 +48,6 @@
     operator runbook, diagrams, links, anchors, and navigation. State clearly
     what stays local, what leaves the host, and why. Create any missing document
     or diagram and write it at about an eighth-grade reading level.
-- [ ] **Run the credential-gated release rehearsal** - Build and load a real
-  schema-v2 preprod offline seed containing every production image plus the
-  preprod-only Samba AD and WIF mock images. Load that exact archive, deploy
-  those exact IDs to local preprod, and run the full LDAP/OIDC/WIF/Envoy
-  application checks. This local Docker deployment through Ansible is the
-  required release rehearsal; do not create a separate Rocky Linux or
-  Parallels test VM.
-- [ ] **Finish the production-safe image release and upgrade workflow** - Build
-  every production and preprod image once, then publish an explicit full
-  preprod release and a production-only release projection. Local preprod must
-  load the full release. Remote staging, upgrade, and rollback must accept and
-  transfer only the production release and must reject any manifest or archive
-  containing a `preprod-only`/`archive-only` image. Merely leaving Samba AD or
-  the WIF mock stopped on the remote Docker host is not sufficient: their image
-  bytes must never be copied there. Keep the Docker source-tag materialization
-  workaround, exact image-ID checks, checksums, schema-v2 receipts, and
-  state-plus-image rollback behavior fail-closed and covered by tests.
 ## Waiting On
 
 - [ ] **GitHub history and owner cleanup decision** - Forward-tree cleanup is in scope now. Removing personal author metadata from old commits or changing the repository owner requires an explicit repository transfer/history-rewrite decision.
@@ -276,6 +259,31 @@
     Trivy scans, and the full seeded preprod suite before promotion.
 
 ## Done
+
+- [x] ~~Run the credential-gated release rehearsal~~ (2026-07-21)
+  - Release r7 built a schema-v2 ARM64 production archive with 40 images and a
+    preprod archive with 43 images. The clean-room play removed only the owned
+    project and all 43 old release image IDs while preserving 55 unrelated
+    image IDs. It then freshly loaded the preprod archive and deployed it with
+    Ansible in seed mode. The run ended with `PREPROD_E2E_PASSED` and
+    `SEEDED_PREPROD_E2E_PASSED` after Vault, LDAPS, automatic Keycloak setup,
+    static users, OIDC roles, WIF, the immutable production Envoy startup gate,
+    and local mock inference passed.
+  - Production archive SHA-256:
+    `74b6d1df3325863c3bc7dc218edd97faa231dbac7bd2ea83553b6d48ea625c66`.
+    Production manifest SHA-256:
+    `6d8003c40053ef7bd0788309f40d2f3d60999b31da63d1421d735b3d05328e0c`.
+    Preprod archive SHA-256:
+    `cd19310e9e3a496871a706bdc0d97b0fb4a59744bb8ce9d12979c3935f154a0c`.
+    Preprod manifest SHA-256:
+    `0012ec5faa4febcc59b29704a81d3a657a15f7e20c27b0427dee4635dd74511b`.
+- [x] ~~Finish the production-safe image release and upgrade workflow~~
+  (2026-07-21)
+  - One build now emits a full preprod release and a production-only
+    projection. The loader and remote staging path reject a preprod-scoped
+    release, verify every checksum and image ID, and keep image plus state
+    rollback fail closed. Contract tests cover source-tag materialization,
+    exact transfer IDs, preprod-byte rejection, validation, and rollback.
 
 - [x] ~~Authenticate to DHI and build the exact schema-v2 release seed~~
   (2026-07-21)
