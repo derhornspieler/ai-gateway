@@ -77,8 +77,9 @@ Prompt and completion content is high-sensitivity data. It is allowed only in
 this dataset. It must not appear in runtime logs, metrics, or another SOC event
 class. For the four reviewed string prompt and completion attributes, Alloy
 applies three tested patterns: a named credential assignment, a Bearer or Basic
-token, and an `sk-` or `sk-ant-` key. Non-string or nested prompt values and
-broader secret formats are not covered yet. That gap remains open in
+token, and an `sk-` or `sk-ant-` key. A non-string or nested value is removed
+before spanlogs can copy it into Loki or Cribl. It is not recursively redacted.
+Broader string-secret formats are not covered yet. That gap remains open in
 [TASKS.md](../TASKS.md).
 
 The stable user, key, and project values come from the authenticated gateway
@@ -233,7 +234,7 @@ Every record must contain:
 | `outcome` | Exact reviewed value when the class has an outcome |
 | `service.name` | Reviewed producer name |
 | event time | UTC source timestamp |
-| `deployment.environment` | `preprod` or the production inventory name |
+| `deployment.environment` | Exact `preprod` or `production` value |
 
 Add only the fields needed for that event class. Missing required fields must
 drop the outbound copy and raise a local counter. Do not forward an unparsed
@@ -242,6 +243,11 @@ line as a fallback.
 One fail-closed Alloy transform adds the common schema attribute immediately
 before the only Cribl batch. A producer may also carry `schema_version=1` in
 its JSON body, but the OTLP attribute above is the machine contract.
+
+This table is the required target contract. In `r13`, the schema field is
+enforced, but every event class does not yet enforce the environment, producer,
+and recent UTC time. Keep the common-record backlog item open until live tests
+prove all four common fields for every event class.
 
 Alloy must remove these values before the allow-list check:
 
@@ -259,30 +265,38 @@ live-inspection evidence; it is not added to the startup event.
 
 The AI request dataset is the one exception for approved prompt and completion
 content. The current redactor covers three obvious credential forms in the
-four reviewed string attributes. It does not cover a non-string or nested
-prompt representation or every possible secret format. Treat the remaining
-content as sensitive.
+four reviewed string attributes. It removes non-string or nested prompt values
+because it cannot prove them safe. It does not cover every possible secret
+format inside a string. Treat the remaining content as sensitive.
 
 ## Remaining event and data gaps
 
 Keep the Cribl backlog item open until these gaps are closed:
 
 1. Extend prompt and completion redaction beyond the three current string
-   patterns. Handle non-string and nested representations and broader secret
-   formats without hiding the approved audit content.
-2. Prove attribution authenticity and readable-name quality for chat, direct
+   patterns. Add only narrow, reviewed patterns for supported secret formats.
+   Keep removing non-string and nested values before export.
+2. Add a source-authenticated LiteLLM ingest path. The shared OTLP receiver now
+   trusts a caller-owned `service.name` field, so another telemetry peer can
+   spoof an AI record. Stamp and require a server-owned source marker, and test
+   that another container cannot forge it.
+3. Enforce the common record contract. Every event class needs a recent UTC
+   time, fixed `preprod` or `production` environment, reviewed producer name,
+   and schema version. Reject a missing, zero, stale, or caller-controlled
+   value.
+4. Prove attribution authenticity and readable-name quality for chat, direct
    API, and every other supported client path. Keep readable names separate
    from authorization evidence.
-3. Add a reviewed path for controller-only events. Alloy cannot read Ansible
+5. Add a reviewed path for controller-only events. Alloy cannot read Ansible
    output today.
-4. Add the provider-rotation start, attempt, rollback, and recovery lifecycle.
+6. Add the provider-rotation start, attempt, rollback, and recovery lifecycle.
    Only the terminal result is exported now.
-5. Add application authorization-denial and privileged-change events that are
+7. Add application authorization-denial and privileged-change events that are
    not already covered by the exact Keycloak event list.
-6. Add LDAP and managed-identity drift detection, reconcile failure, and
+8. Add LDAP and managed-identity drift detection, reconcile failure, and
    recovery events.
-7. Add the remaining break-glass activation, disable, and cleanup events.
-8. Add natural producer receipt tests for each new event before calling it
+9. Add the remaining break-glass activation, disable, and cleanup events.
+10. Add natural producer receipt tests for each new event before calling it
    implemented.
 
 The separate customer endpoint, 24-hour retention, and hard queue-age choices

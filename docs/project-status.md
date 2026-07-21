@@ -49,10 +49,10 @@ before it changes anything.
 - Production keeps its firewall, routing, SELinux, encrypted-state, backup,
   Vault, and network checks. Preprod does not weaken those production rules.
 
-## Current release candidate: r12
+## Current release candidate: r13
 
-Release candidate `r12` was built from pushed commit
-`d63b70f7c9e7cac3762de4594264b41267f3912d`. Its production scope has 23
+Release candidate `r13` was built from pushed commit
+`15e47d6d48a82a05281b386f3446bbbd1760d455`. Its production scope has 23
 external and 17 custom image references, for 40 total. Its preprod scope has 24
 external and 19 custom image references, for 43 total.
 
@@ -61,9 +61,9 @@ There are two preprod-only custom services: `samba-ad:preprod` and
 the third extra preprod image reference. None of these three references is in
 the production seed. Anthropic is the only selected provider.
 
-The exact `r12` preprod archive passed the clean-room Ansible test. The receipt
+The exact `r13` preprod archive passed the clean-room Ansible test. The receipt
 removed 26 containers, 19 networks, 11 volumes, 62 image aliases, and all 43
-target image IDs. It preserved 167 unrelated image IDs. The archive then
+target image IDs. It preserved 185 unrelated image IDs. The archive then
 loaded fresh. Seed mode skipped pulls and source builds.
 
 The seeded test passed Redis first start, Vault, automatic Keycloak and LDAPS
@@ -78,36 +78,35 @@ SEEDED_PREPROD_E2E_PASSED
 
 After a Vault restart, Vault returned initialized and sealed. A second
 identical seed-mode Ansible converge auto-unsealed it and passed the full
-end-to-end and Cribl gates again. Before the second converge, the checks showed
-`initialized=true`, `sealed=true`, and HTTP 503. After it, they showed
-`sealed=false` and HTTP 200. This also proves the documented post-reboot unseal
-path in local preprod.
+end-to-end and Cribl gates again. Before the second converge, `vault status`
+showed `initialized=true` and `sealed=true`. The second converge restored full
+readiness. This proves the documented post-reboot unseal path in local preprod.
 
 All 25 long-running containers were healthy on the exact manifest image IDs.
 The exact Open WebUI runtime image is
-`sha256:92fe8394bb59b912f05ca0987e89b119d02b8fbebdc097898488a045b66d20cc`.
+`sha256:83cf446e3f3fffb5c99c2f8d8a09e59e1c3b9c5c5c65d4836692caf28c294792`.
 It was healthy, and its hardened-path gate passed.
 
-| `r12` artifact | SHA-256 |
+| `r13` artifact | SHA-256 |
 | --- | --- |
-| Production archive | `89b77840300ebd555dc73bb1ec8a2cae4a23422031b0df05af7a4e0d9ca15f63` |
-| Production manifest | `b09ef4b194e1c7c1a090119b5f95ca6ec1543a24acaeeb8736f6e5fc566d0d66` |
-| Preprod archive | `b5f4ae324cf6801b8102ae7f4418d532a16f4f5309bf3e88278472a0e3a29e5c` |
-| Preprod manifest | `b81df70057f1b0c8f8c00950cd201038555efa892ff389adb94a4d2ee8ba535d` |
+| Production archive | `8825cd55ba8e1b5998621b6823efcebd8caafd260d203e0aea124940af00e68a` |
+| Production manifest | `57852a98089709f05873c56bd315563060c4cbb2714639842ddd58e281dff03e` |
+| Preprod archive | `1280df053dfd18fe3891e3a07d4375ccbe12714a11e512d909156e5861c8a59a` |
+| Preprod manifest | `1653b490b0ca2ab62c84d576d9b7c770217736b7ec07cc578894b8172c10ee9f` |
 
-The `r12` Envoy policy digest is
+The `r13` Envoy policy digest is
 `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
 Its Envoy image ID is
 `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
 
-The visual browser replay has not run for `r12` because the current test
+The visual browser replay has not run for `r13` because the current test
 runtime exposed no browser. Do not use the accepted `r10` browser result as
-proof for `r12`.
+proof for `r13`.
 
-The Open WebUI derivative in `r12` is `0.10.2-aigw2`. Its committed local
+The Open WebUI derivative in `r13` is `0.10.2-aigw2`. Its committed local
 OpenVEX review covers the one raw Scout finding, `CVE-2026-45829`, and expires
 on 2026-10-19. That review is unsigned and Git-reviewed; it is separate from
-Docker-signed DHI VEX. The protected GitHub release scan for the exact `r12`
+Docker-signed DHI VEX. The protected GitHub release scan for the exact `r13`
 images is still blocked on its required DHI credentials, so this candidate is
 not release-approved.
 
@@ -174,27 +173,31 @@ certificate tests proved the Root CA chain and names.
 
 ## Gates that remain open
 
-- **r12 browser acceptance:** the exact `r12` seed passed clean-room loading,
+- **r13 browser acceptance:** the exact `r13` seed passed clean-room loading,
   Ansible deployment, integration, end-to-end, restart, and auto-unseal checks.
-  Repeat the real-browser test for `r12` when a browser runtime is available.
+  Repeat the real-browser test for `r13` when a browser runtime is available.
   Until then, `r10` remains the last release with full local and visual browser
   acceptance.
-- **GitHub container scans:** ordinary GitHub checks are green. The DHI image
-  release jobs stop at their required credential gate because the
+- **GitHub container scans:** credential-independent GitHub jobs are green.
+  The DHI image release jobs stop at their required credential gate because the
   `release-container-security` GitHub environment has no DHI secrets. The job
   keeps raw Trivy JSON and uses Docker Scout as its blocking VEX-aware gate.
   Do not weaken the credential gate. Add approved credentials, rerun it, and
   review every result before release.
-- **Production upgrade:** no approved remote VM or maintenance window was in
-  scope. Do not create a Rocky or Parallels test VM. Run the guarded remote
-  upgrade only on the approved target after the local and CI gates pass.
+- **Rocky Linux deployment:** the operator requested a Rocky Linux 9 test, but
+  no reachable Rocky VM exists. The old `10.8.10.10` target and its dedicated
+  networks were removed. Supply an existing three-NIC target or approve a new
+  VM and network build before this test can run. Do not treat a container as
+  proof of the Rocky host-hardening path.
 - **Production ceremonies:** customer TLS, external LDAPS, Vault key custody,
   Anthropic enrollment, production backups, the real Cribl endpoint, and final
   access approval need customer operators. This is operator-owned work.
 - **Cribl retention:** the seeded receipt and outage recovery passed. The Cribl
   team must still apply and prove its 24-hour destination retention. If a hard
   24-hour age limit is required on the local queue, that control is still a
-  release gate. See the [Cribl handoff](cribl-soc-handoff.md).
+  release gate. LiteLLM source authentication, trusted readable attribution,
+  and broader reviewed string-secret patterns also remain open. See the
+  [Cribl handoff](cribl-soc-handoff.md).
 - **PostgreSQL migration size:** PostgreSQL 18.4 is stable and passed the full
   seeded preprod stack. The production-sized PostgreSQL 16-to-18 rehearsal and
   forced rollback cases remain in [TASKS.md](../TASKS.md).

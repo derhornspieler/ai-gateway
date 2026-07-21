@@ -11,7 +11,7 @@ One build makes two file pairs:
 
 Never send the preprod pair to production.
 
-For the current `r12` candidate, production has 23 external and 17 custom
+For the current `r13` candidate, production has 23 external and 17 custom
 image references, for 40 total. Preprod has 24 external and 19 custom
 references, for 43 total. Only two custom services are preprod-only: Samba AD
 and the WIF provider mock. Their Debian 13.6-slim build base is the third extra

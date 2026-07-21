@@ -2,26 +2,26 @@
 
 ## Active
 
-- [ ] **Finish `r12` visual browser acceptance** - Candidate `r12` was built
-  from pushed commit `d63b70f7c9e7cac3762de4594264b41267f3912d`. Its exact
+- [ ] **Finish `r13` visual browser acceptance** - Candidate `r13` was built
+  from pushed commit `15e47d6d48a82a05281b386f3446bbbd1760d455`. Its exact
   preprod pair passed clean-room purge, fresh archive loading, one Ansible
   seed-mode deploy, and the full integration and end-to-end gate. The receipt
   removed 26 containers, 19 networks, 11 volumes, 62 aliases, and all 43 target
-  image IDs while preserving 167 unrelated IDs. Pulls and source builds stayed
+  image IDs while preserving 185 unrelated IDs. Pulls and source builds stayed
   off. All 25 long-running containers were healthy on the exact manifest image
   IDs. The run ended with `PREPROD_CLEAN_ROOM_OK`, `PREPROD_E2E_PASSED`, and
   `SEEDED_PREPROD_E2E_PASSED`.
 
   The exact Open WebUI runtime image is
-  `sha256:92fe8394bb59b912f05ca0987e89b119d02b8fbebdc097898488a045b66d20cc`.
+  `sha256:83cf446e3f3fffb5c99c2f8d8a09e59e1c3b9c5c5c65d4836692caf28c294792`.
   It was healthy, and its hardened-path gate passed.
 
-  After a Vault restart, the test proved `initialized=true`, `sealed=true`, and
-  HTTP 503. A second identical seed-mode converge auto-unsealed Vault, proved
-  `sealed=false` and HTTP 200, and passed the full end-to-end and Cribl tests
-  again. The visual browser replay could not run because the current test
-  runtime exposed no browser. Run that replay when a browser is available.
-  Keep the `r10` Chrome result as historical evidence; do not use it as `r12`
+  After a Vault restart, the test proved `initialized=true` and `sealed=true`.
+  A second identical seed-mode converge auto-unsealed Vault and passed the full
+  end-to-end and Cribl tests again. The visual browser replay could not run
+  because the current test runtime exposed no browser. Run that replay when a
+  browser is available.
+  Keep the `r10` Chrome result as historical evidence; do not use it as `r13`
   proof.
 - [ ] **Finish the approved Cribl security-event feed** - Alloy now sends a
   small, versioned security feed over verified OTLP/gRPC TLS. Raw metrics, raw
@@ -47,17 +47,29 @@
     wrong-server-name rejection, queue outage/recovery, and Alloy restart also
     pass. Do not use a synthetic fixture as proof that a live producer emitted
     an event.
-  - **Prompt-value redaction gap:** Alloy now redacts three tested credential
-    forms from the four reviewed string fields: named credential assignments,
-    Bearer or Basic tokens, and `sk-` or `sk-ant-` keys. Still handle non-string
-    and nested prompt values and broader secret formats without hiding the
-    approved audit content.
+  - **Prompt-value redaction gap:** Alloy redacts three tested credential forms
+    from the four reviewed string fields: named credential assignments, Bearer
+    or Basic tokens, and `sk-` or `sk-ant-` keys. It now removes a non-string or
+    nested value before spanlogs can copy it to Loki or Cribl. Still add narrow,
+    reviewed string patterns for other supported secret formats. Do not use a
+    generic high-entropy rule that would destroy useful prompt records.
   - **Attribution gap:** AI request export now requires bounded user ID, user
     name, key hash, project ID, and request ID fields. Still prove source
     authenticity and readable-name quality for chat, direct API, and every
     supported client path. `aigw.user.name` is readable attribution, not an
     authorization fact. Keep stable subject, key, and project evidence
     separate.
+  - **Source-authentication gap:** the shared OTLP listener trusts a caller's
+    `service.name=litellm` attribute. A peer on the telemetry network can spoof
+    an AI request record. Add a dedicated authenticated LiteLLM ingest path,
+    stamp a server-owned source marker, require that marker in the AI filter,
+    and prove another container cannot forge it. Do not accept a caller-owned
+    attribute as proof of source.
+  - **Common-record gap:** the handoff expects a recent UTC time, fixed
+    environment, producer, and schema on every record. The current projection
+    does not enforce all four fields for every event class. Add fixed
+    `preprod`/`production` values, a reviewed producer name, and recent-time
+    checks. Test every record class and reject a zero or stale timestamp.
   - **Event gaps:** add a reviewed sender for controller-only events; provider
     rotation start, attempt, rollback, and recovery; application authorization
     denials and uncovered privileged changes; LDAP and managed-identity drift,
@@ -71,18 +83,23 @@
 
 ## Waiting On
 
-- [ ] **Add approved DHI credentials to GitHub release scans** - The ordinary
-  `main` checks are green. The release image jobs stop at the required
-  credential gate before their raw Trivy records and blocking VEX-aware Scout
-  checks can finish because the protected
+- [ ] **Add approved DHI credentials to GitHub release scans** - The
+  credential-independent `main` jobs are green. The release image jobs stop at
+  the required credential gate before their raw Trivy records and blocking
+  VEX-aware Scout checks can finish because the protected
   `release-container-security` environment has no `DHI_USERNAME` or
   `DHI_PASSWORD` secret. A repository administrator must add approved
   credentials and rerun the failed jobs. Do not copy a developer's local login
   into GitHub or weaken the gate without explicit approval.
-- [ ] **Run the guarded production upgrade and rollback** - No approved remote
-  target or maintenance window was provided. Use the exact production-scoped
-  `r10` release only on an approved Docker host. Do not create a Rocky Linux or
-  Parallels rehearsal VM and do not send the preprod-only images to production.
+- [ ] **Run the Rocky Linux 9 deployment, upgrade, and rollback test** - The
+  operator requested this test, but no reachable Rocky VM exists. The old
+  `10.8.10.10` VM and its dedicated networks were removed. Get an existing
+  three-NIC Rocky Linux 9 target or approval to create a new VM and networks.
+  Then use the newest production-scoped release that passes every local and CI
+  gate. Run bootstrap, preflight, the two-pass Ansible converge, validation,
+  guarded upgrade, forced validation failure, and rollback. Keep Anthropic
+  enrollment as a separate operator step after the platform and identity proof.
+  Never send the preprod-only image pair to production.
 - [ ] **Complete the customer Cribl acceptance ceremony** - The local TLS mock,
   allow-list, redaction, queue outage, and recovery tests pass. The Cribl/SOC
   team must supply its approved endpoint and CA, enforce and prove 24-hour
@@ -97,7 +114,7 @@
   network-disabled image build, baked CA bundles, startup gate, schema-v2
   release record, loader contracts, documentation, diagrams, and exact seeded
   local preprod proof are complete. Release `r10` selected only `anthropic` and
-  reproduced the same Envoy image ID twice. Candidate `r12` also selects only
+  reproduced the same Envoy image ID twice. Candidate `r13` also selects only
   `anthropic` and passed the exact seeded local preprod gate. Its policy digest
   is `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`,
   and its Envoy image ID is
@@ -250,8 +267,8 @@
   beyond that as an inference.
 - [ ] **Finish protected scans for the newest supported image release** - The
   authoritative upstream and DHI catalog review, exact version-and-digest pins,
-  compatibility fixes, software/toolchain review, network-disabled `r12`
-  builds, and exact seeded local preprod checks are complete. The visual `r12`
+  compatibility fixes, software/toolchain review, network-disabled `r13`
+  builds, and exact seeded local preprod checks are complete. The visual `r13`
   browser replay is still active above. The release cannot pass until that
   replay is complete and GitHub builds and scans every final image with
   protected credentials. Save raw Trivy JSON, VEX-aware Scout results,
@@ -349,6 +366,30 @@
     release, verify every checksum and image ID, and keep image plus state
     rollback fail closed. Contract tests cover source-tag materialization,
     exact transfer IDs, preprod-byte rejection, validation, and rollback.
+
+- [x] ~~Build, hash-check, seed-test, and restart-test the `r13` schema-v2
+  candidate~~ (2026-07-21)
+  - The candidate was built from pushed commit
+    `15e47d6d48a82a05281b386f3446bbbd1760d455`. Production contains 23 exact
+    external and 17 repository-built references, for 40 total. Preprod contains
+    24 exact external and 19 repository-built references, for 43 total.
+    Anthropic is the only selected provider.
+  - Production archive SHA-256:
+    `8825cd55ba8e1b5998621b6823efcebd8caafd260d203e0aea124940af00e68a`.
+    Production manifest SHA-256:
+    `57852a98089709f05873c56bd315563060c4cbb2714639842ddd58e281dff03e`.
+    Preprod archive SHA-256:
+    `1280df053dfd18fe3891e3a07d4375ccbe12714a11e512d909156e5861c8a59a`.
+    Preprod manifest SHA-256:
+    `1653b490b0ca2ab62c84d576d9b7c770217736b7ec07cc578894b8172c10ee9f`.
+  - The clean-room run removed 26 containers, 19 networks, 11 volumes, 62
+    aliases, and all 43 target image IDs. It preserved 185 unrelated IDs. Fresh
+    seed loading and Ansible ended with `PREPROD_CLEAN_ROOM_OK`,
+    `PREPROD_E2E_PASSED`, and `SEEDED_PREPROD_E2E_PASSED`.
+  - After a Vault restart, the test proved `initialized=true` and `sealed=true`.
+    The same seed-mode converge auto-unsealed Vault and passed the full edge,
+    identity, and Cribl tests again. Visual browser acceptance remains active
+    above because the current runtime exposes no browser.
 
 - [x] ~~Build, hash-check, and seed-test the `r12` schema-v2 candidate~~
   (2026-07-21)
