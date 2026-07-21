@@ -216,7 +216,7 @@
     {% if identity_status.configured %}
     <span class="pill ok"><span class="dot"></span>ready</span>
     {% else %}
-    <span class="pill warn"><span class="dot"></span>setup required</span>
+    <span class="pill warn"><span class="dot"></span>deployment incomplete</span>
     {% endif %}
   </div>
   <p>Controller credential: {{ 'usable' if identity_status.controller_usable else 'unavailable' }}<br>
@@ -270,7 +270,7 @@
       <div class="rail"><div class="node">{{ '✓' if jwt_ready else '2' }}</div><div class="line"></div></div>
       <div class="body">
         <h4>Broker JWT signing key ready</h4>
-        <p class="note">Server-generated <span class="mono">private_key_jwt</span>: {{ 'ready — held in Vault' if jwt_ready else 'identity bootstrap required' }}.</p>
+        <p class="note">Server-generated <span class="mono">private_key_jwt</span>: {{ 'ready — held in Vault' if jwt_ready else 'automatic deployment incomplete' }}.</p>
         {% if provider.client_certificate_sha256 %}
         <p class="note" style="margin: 6px 0 0;">Client certificate SHA-256<br><code class="hash" id="anthropic-client-cert-sha">{{ provider.client_certificate_sha256 }}</code> <button type="button" class="copy" data-copy-target="anthropic-client-cert-sha">copy</button></p>
         {% endif %}

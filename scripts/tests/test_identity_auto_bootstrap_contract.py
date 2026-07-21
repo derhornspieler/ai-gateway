@@ -108,7 +108,10 @@ class IdentityAutoBootstrapContractTests(unittest.TestCase):
     def test_admin_portal_has_no_manual_initialization_action(self) -> None:
         self.assertNotIn('@admin_app.post("/admin/identity/bootstrap")', self.portal)
         self.assertNotIn('action="/admin/identity/bootstrap"', self.admin_template)
+        self.assertNotIn(">setup required<", self.admin_template)
         self.assertIn("there is no browser initialization step", self.admin_template)
+        self.assertIn("deployment incomplete", self.admin_template)
+        self.assertIn("automatic deployment incomplete", self.admin_template)
 
     def test_realm_callbacks_are_rendered_from_the_ansible_domain(self) -> None:
         for callback in (
