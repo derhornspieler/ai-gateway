@@ -147,8 +147,8 @@ COMPOSE_FILES = (
 # identity controller writes it only after Keycloak starts, so it is tracked
 # here but deliberately excluded from the immutable configuration digest.
 PREPROD_BIND_SOURCES = (
-    "alloy/config.alloy",
     "cribl-mock/config.yaml",
+    "cribl-mock/config.preprod-tls.yaml",
     "grafana/provisioning",
     "litellm/aigw_default_model_hook.py",
     "loki/config.yml",
@@ -157,6 +157,9 @@ PREPROD_BIND_SOURCES = (
     "prometheus/rules.yml",
     "secrets/preprod-edge-certs",
     "secrets/preprod-edge-forwarder.yaml",
+    "secrets/preprod-alloy-config.alloy",
+    "secrets/preprod-cribl.crt",
+    "secrets/preprod-cribl.key",
     "secrets/preprod-litellm-config.yaml",
     "secrets/preprod-wif-envoy.yaml",
     "secrets/preprod-realms",
@@ -1313,6 +1316,8 @@ def certificate_paths() -> dict[str, Path]:
         "edge_ca": EDGE_CERTS_DIR / "ca.pem",
         "samba_key": SECRETS_DIR / "preprod-samba.key",
         "samba_cert": SECRETS_DIR / "preprod-samba.crt",
+        "cribl_key": SECRETS_DIR / "preprod-cribl.key",
+        "cribl_cert": SECRETS_DIR / "preprod-cribl.crt",
         "wif_key": SECRETS_DIR / "preprod-wif.key",
         "wif_cert": SECRETS_DIR / "preprod-wif.crt",
     }
@@ -1388,6 +1393,7 @@ def prepare_certificates(domain: str) -> None:
     generate_leaf(
         paths, "samba_key", "samba_cert", f"samba-ad.{domain}", [f"samba-ad.{domain}"]
     )
+    generate_leaf(paths, "cribl_key", "cribl_cert", "cribl-mock", ["cribl-mock"])
     generate_leaf(
         paths,
         "wif_key",
@@ -1395,7 +1401,7 @@ def prepare_certificates(domain: str) -> None:
         f"wif-provider-mock.{domain}",
         [f"wif-provider-mock.{domain}"],
     )
-    for certificate_name in ("edge_cert", "samba_cert", "wif_cert"):
+    for certificate_name in ("edge_cert", "samba_cert", "cribl_cert", "wif_cert"):
         leaf = run(
             ["openssl", "x509", "-in", str(paths[certificate_name]), "-outform", "PEM"],
             capture=True,
@@ -1606,6 +1612,32 @@ def render_preprod_litellm_config() -> None:
     write_file(SECRETS_DIR / "preprod-litellm-config.yaml", rendered, 0o644)
 
 
+def render_preprod_alloy_config() -> None:
+    """Render the normal Alloy policy with verified TLS for the local mock."""
+
+    source = (COMPOSE_DIR / "alloy/config.alloy").read_text(encoding="utf-8")
+    begin = "    // BEGIN AIGW MANAGED CRIBL TLS"
+    end = "    // END AIGW MANAGED CRIBL TLS"
+    if source.count(begin) != 1 or source.count(end) != 1:
+        fail("the Alloy Cribl TLS markers changed")
+    before, remainder = source.split(begin, 1)
+    _old_block, after = remainder.split(end, 1)
+    secure_block = """
+    // BEGIN AIGW MANAGED CRIBL TLS
+    tls {
+      insecure             = false
+      ca_file              = "/etc/ssl/certs/aigw-cribl-ca.pem"
+      server_name          = "cribl-mock"
+      insecure_skip_verify = false
+      min_version          = "1.2"
+    }
+    // END AIGW MANAGED CRIBL TLS"""
+    rendered = before + secure_block + after
+    if "insecure = true" in rendered.split(begin, 1)[1].split(end, 1)[0]:
+        fail("the preprod Alloy configuration retained plaintext Cribl export")
+    write_file(SECRETS_DIR / "preprod-alloy-config.alloy", rendered, 0o644)
+
+
 def render_edge_forwarder() -> None:
     """Write the preprod-only TLS passthrough for Docker Desktop.
 
@@ -1771,7 +1803,7 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "VAULT_OIDC_RP_VAULT_PATH": "ai-gateway/keycloak/vault-oidc-rp",
         "GRAFANA_ADMIN_PASSWORD": "OnlyForTesting1!Grafana",
         "CRIBL_OTLP_ENDPOINT": "cribl-mock:4317",
-        "CRIBL_OTLP_INSECURE": "true",
+        "CRIBL_OTLP_INSECURE": "false",
         "CRIBL_OTLP_CA_FILE": "/etc/ssl/certs/aigw-cribl-ca.pem",
         "CRIBL_OTLP_SERVER_NAME": "cribl-mock",
         "PREPROD_PROJECT": args.project,
@@ -1811,6 +1843,7 @@ def prepare(args: argparse.Namespace) -> None:
     vendor_subnet = desired_networks(args)[f"{args.prefix}-net-vendor"][0]
     render_wif_mock_envoy(args.domain, vendor_subnet)
     render_preprod_litellm_config()
+    render_preprod_alloy_config()
     render_edge_forwarder()
     write_file(SECRETS_DIR / "preprod-samba-admin-password", "OnlyForTesting1!DomainAdmin\n", 0o600, replace=False)
     write_file(SECRETS_DIR / "preprod-samba-bind-password", "OnlyForTesting1!LdapBind\n", 0o600, replace=False)

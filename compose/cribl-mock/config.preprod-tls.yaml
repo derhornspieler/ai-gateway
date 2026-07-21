@@ -1,0 +1,10 @@
+# Local preprod adds TLS to the disposable Cribl OTLP receiver. The base file
+# owns the pipelines and health endpoint. Docker Compose passes both files to
+# the collector, which merges this small receiver override into the base model.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        tls:
+          cert_file: /run/preprod/cribl.crt
+          key_file: /run/preprod/cribl.key

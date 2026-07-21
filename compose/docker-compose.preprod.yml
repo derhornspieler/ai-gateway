@@ -275,7 +275,7 @@ services:
     # This owned volume starts empty. The acceptance test writes only reviewed
     # Docker-log fixtures into it so the production filters are exercised.
     volumes: !override
-      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro,Z
+      - ./secrets/preprod-alloy-config.alloy:/etc/alloy/config.alloy:ro,Z
       - ./secrets/preprod-root-ca.pem:/etc/ssl/certs/aigw-cribl-ca.pem:ro,z
       - alloy_data:/var/lib/alloy
       - preprod_empty_docker_logs:/var/lib/docker/containers:ro
@@ -312,6 +312,16 @@ services:
     labels: *preprod-labels
     build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
     image: "${PREPROD_PROJECT}/cribl-mock:local"
+    # The generated key stays mode 0600. Running as the checkout owner lets
+    # Docker Desktop and rootless Linux read it without making it public.
+    user: "${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set}:${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set}"
+    command: !override
+      - --config=/etc/otelcol/config.yaml
+      - --config=/etc/otelcol/config.preprod-tls.yaml
+    volumes:
+      - ./cribl-mock/config.preprod-tls.yaml:/etc/otelcol/config.preprod-tls.yaml:ro,Z
+      - ./secrets/preprod-cribl.crt:/run/preprod/cribl.crt:ro,Z
+      - ./secrets/preprod-cribl.key:/run/preprod/cribl.key:ro,Z
 
   samba-ad:
     labels: *preprod-labels

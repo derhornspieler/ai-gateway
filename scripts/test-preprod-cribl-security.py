@@ -28,6 +28,11 @@ OWNER_LABEL = "com.aigw.preprod.project"
 CONFIG_LABEL = "com.aigw.preprod.config-digest"
 FIXTURE_VOLUME = "preprod_empty_docker_logs"
 MAX_COMMAND_OUTPUT = 16 * 1024 * 1024
+MAX_TEST_CERT_BYTES = 64 * 1024
+CRIBL_CERT = COMPOSE_DIR / "secrets/preprod-cribl.crt"
+CRIBL_KEY = COMPOSE_DIR / "secrets/preprod-cribl.key"
+WRONG_SAN_CERT = COMPOSE_DIR / "secrets/preprod-wif.crt"
+WRONG_SAN_KEY = COMPOSE_DIR / "secrets/preprod-wif.key"
 
 
 OTLP_FIXTURE_HELPER = r"""
@@ -684,6 +689,96 @@ def wait_for_queue(preprod: Preprod, model: dict[str, Any], *, populated: bool) 
     fail(f"the persistent Cribl queue did not {state}")
 
 
+def replace_test_certificate(path: Path, content: bytes) -> None:
+    """Replace one generated preprod certificate file without changing its inode."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        fail("a generated preprod Cribl certificate file is missing")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or not content
+        or len(content) > MAX_TEST_CERT_BYTES
+    ):
+        fail("a generated preprod Cribl certificate file is unsafe")
+    flags = os.O_WRONLY | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+
+
+def recreate_cribl(preprod: Preprod) -> None:
+    preprod.compose(
+        "up",
+        "-d",
+        "--no-deps",
+        "--force-recreate",
+        "--no-build",
+        "--pull",
+        "never",
+        "cribl-mock",
+    )
+    preprod.wait_healthy("cribl-mock")
+
+
+def exercise_tls_server_name_failure(
+    preprod: Preprod, model: dict[str, Any], token: str
+) -> None:
+    """Prove Alloy queues records when the trusted server has the wrong SAN."""
+
+    paths = (CRIBL_CERT, CRIBL_KEY, WRONG_SAN_CERT, WRONG_SAN_KEY)
+    try:
+        original_cert, original_key, wrong_cert, wrong_key = (
+            path.read_bytes() for path in paths
+        )
+    except OSError:
+        fail("the generated preprod TLS test material is unreadable")
+    wait_for_queue(preprod, model, populated=False)
+    cribl = preprod.container_id("cribl-mock")
+    replaced = False
+    restored = False
+    try:
+        preprod.docker("stop", "--time", "10", cribl)
+        replace_test_certificate(CRIBL_CERT, wrong_cert)
+        replace_test_certificate(CRIBL_KEY, wrong_key)
+        replaced = True
+        recreate_cribl(preprod)
+        send_otlp_fixtures(
+            preprod,
+            OTLP_OUTAGE_HELPER,
+            token,
+            "OTLP_OUTAGE_FIXTURES_ACCEPTED",
+        )
+        wait_for_queue(preprod, model, populated=True)
+        marker = f"queued-ai-input-{token}-0"
+        time.sleep(3)
+        if marker in cribl_logs(preprod):
+            fail("Alloy accepted a Cribl certificate with the wrong server name")
+
+        replace_test_certificate(CRIBL_CERT, original_cert)
+        replace_test_certificate(CRIBL_KEY, original_key)
+        restored = True
+        recreate_cribl(preprod)
+        wait_for_receipts(preprod, (marker,))
+        wait_for_queue(preprod, model, populated=False)
+    finally:
+        if replaced and not restored:
+            replace_test_certificate(CRIBL_CERT, original_cert)
+            replace_test_certificate(CRIBL_KEY, original_key)
+            recreate_cribl(preprod)
+
+
 def exercise_outage_recovery(preprod: Preprod, model: dict[str, Any], token: str) -> None:
     cribl = preprod.container_id("cribl-mock")
     alloy = preprod.container_id("alloy")
@@ -727,6 +822,7 @@ def main() -> int:
     parser.add_argument("--image-mode", choices=("source", "seed"), default="source")
     args = parser.parse_args()
     token = secrets.token_hex(8)
+    tls_token = secrets.token_hex(8)
     outage_token = secrets.token_hex(8)
 
     preprod = Preprod(args.image_mode)
@@ -764,6 +860,7 @@ def main() -> int:
     # One extra file-source interval proves denied records did not merely lag.
     time.sleep(12)
     assert_initial_receipts(cribl_logs(preprod), token)
+    exercise_tls_server_name_failure(preprod, model, tls_token)
     exercise_outage_recovery(preprod, model, outage_token)
 
     print("PREPROD_CRIBL_SECURITY_FEED_PASSED")

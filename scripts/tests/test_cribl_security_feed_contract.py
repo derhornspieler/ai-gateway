@@ -20,6 +20,10 @@ PREPROD_TASKS = (
     ROOT / "ansible/roles/preprod_stack/tasks/present.yml"
 ).read_text(encoding="utf-8")
 CRIBL_MOCK = (ROOT / "compose/cribl-mock/config.yaml").read_text(encoding="utf-8")
+CRIBL_PREPROD_TLS = (
+    ROOT / "compose/cribl-mock/config.preprod-tls.yaml"
+).read_text(encoding="utf-8")
+PREPROD_SCRIPT = (ROOT / "scripts/preprod.py").read_text(encoding="utf-8")
 
 EVENTS = (
     "CLIENT_LOGIN",
@@ -148,6 +152,8 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             '"action":"break_glass_use"',
             "<redacted-authorization>",
             "wait_for_queue(preprod, model, populated=True)",
+            "exercise_tls_server_name_failure(preprod, model, tls_token)",
+            "Alloy accepted a Cribl certificate with the wrong server name",
             'preprod.docker("restart", "--time", "10", alloy)',
             "PREPROD_CRIBL_SECURITY_FEED_PASSED",
         ):
@@ -157,6 +163,29 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             PREPROD_TASKS,
         )
         self.assertIn("scripts/test-preprod-cribl-security.py", PREPROD_TASKS)
+
+    def test_preprod_uses_verified_tls_for_the_cribl_mock(self) -> None:
+        for fragment in (
+            "cert_file: /run/preprod/cribl.crt",
+            "key_file: /run/preprod/cribl.key",
+        ):
+            self.assertIn(fragment, CRIBL_PREPROD_TLS)
+        for fragment in (
+            '"cribl_key": SECRETS_DIR / "preprod-cribl.key"',
+            '"cribl_cert": SECRETS_DIR / "preprod-cribl.crt"',
+            'generate_leaf(paths, "cribl_key", "cribl_cert", "cribl-mock", ["cribl-mock"])',
+            '"CRIBL_OTLP_INSECURE": "false"',
+            'server_name          = "cribl-mock"',
+            "insecure_skip_verify = false",
+            'render_preprod_alloy_config()',
+        ):
+            self.assertIn(fragment, PREPROD_SCRIPT)
+        cribl = PREPROD_OVERLAY.split("  cribl-mock:\n", 1)[1].split(
+            "\n  samba-ad:", 1
+        )[0]
+        self.assertIn("config.preprod-tls.yaml", cribl)
+        self.assertIn("./secrets/preprod-cribl.crt:/run/preprod/cribl.crt:ro,Z", cribl)
+        self.assertIn("./secrets/preprod-cribl.key:/run/preprod/cribl.key:ro,Z", cribl)
 
 
 if __name__ == "__main__":
