@@ -1,230 +1,233 @@
-# LiteLLM Capacity and Scaling Design
+# LiteLLM capacity and scaling
 
-This document separates the tuning that is possible in the current single-VM
-deployment from a future multi-replica design. It is not a high-availability
-claim; that boundary is drawn in [high-availability.md](high-availability.md),
-and the surrounding trust model lives in [solution-map.md](solution-map.md).
-One Rocky Linux host, one Docker daemon, one edge pair, one database server,
-one cache, and one physical network path remain shared failure domains no
-matter how many LiteLLM processes are started.
+This page explains what can scale today and what needs a new design. The
+current deployment is one VM. More LiteLLM processes on that VM would not make
+the system highly available. See [availability limits](high-availability.md).
 
-The upstream production guidance referenced here is version-sensitive. It was
-reviewed on 2026-07-12; recheck the
-[LiteLLM production guide](https://docs.litellm.ai/docs/proxy/prod) and the
-[health-check contract](https://docs.litellm.ai/docs/proxy/health) whenever the
-pinned image changes.
+The upstream guidance was last reviewed on 2026-07-12. Recheck the
+[LiteLLM production guide](https://docs.litellm.ai/docs/proxy/prod),
+[health checks](https://docs.litellm.ai/docs/proxy/health), and pinned image
+before changing this design.
 
-## Current executable topology
+## Current design
 
-The implemented Compose service is a single LiteLLM container running the image
-`ghcr.io/berriai/litellm:v1.93.0`, pinned by digest. LiteLLM is one of the
-stack's three reviewed non-DHI application exceptions rather than a
-locally-built DHI derivative. It uses the default single Uvicorn worker within
-reviewed limits of 2 CPUs, 4 GiB memory, and 1024 PIDs, with a 600-second
-provider request timeout and two retries.
+The stack runs one LiteLLM container with one Uvicorn worker. The image is
+`ghcr.io/berriai/litellm:v1.93.0`, pinned by digest.
 
-Its state lives in two services that are already part of the stack. A dedicated
-`litellm` logical database on the shared PostgreSQL server, reached over
-`net-db-litellm`, is the durable virtual-key, credential, budget, and spend
-store. A single password-protected, non-persistent Redis instance on
-`net-cache` is the bounded cache and router-coordination store. LiteLLM reaches
-vendors only through `envoy-egress` on `net-vendor`, and emits prompt-bearing
-OTel spans to Alloy on `net-telemetry`.
+Current limits are:
 
-Traffic reaches LiteLLM on two separate edges. On the internal leg
-`traefik-int` publishes the `api.$DOMAIN` host but routes only an explicit
-allow-list of the inference surface — `/v1` and `/v1/…`, `/chat/completions`,
-`/completions`, `/embeddings`, `/models`, `/health/liveliness`, and
-`/health/readiness` — to `litellm:4000`. Every other path on that host falls
-through to a catch-all `api-deny` router whose `deny-all` middleware returns 403
-before it can reach the proxy, so the management API and Admin UI are never
-exposed there. The LiteLLM Admin UI is reached only on the ADM leg:
-`admin.$DOMAIN` on `traefik-adm` passes through `oauth2-proxy` (Keycloak OIDC,
-`aigw-admins` role) to `litellm:4000` over `net-admin-app`.
+| Setting | Value |
+| --- | --- |
+| CPU | 2 CPUs |
+| Memory | 4 GiB |
+| PIDs | 1024 |
+| Provider timeout | 600 seconds |
+| Provider retries | 2 |
 
-Six consumers target the single `litellm:4000` service name: the `traefik-int`
-api router, the `oauth2-proxy` Admin-UI gate, Open WebUI, the dev-portal, the
-admin-portal, and key-rotator. To serve them LiteLLM joins `net-chat`,
-`net-portal`, `net-admin-app`, `net-vendor`, `net-db-litellm`, `net-cache`, and
-`net-telemetry`.
+LiteLLM uses:
 
-The container healthcheck probes `/health/liveliness`. The api-host allow-list
-additionally exposes `/health/readiness`, but no implemented load balancer uses
-readiness to remove an instance from rotation. Compose's default termination
-grace is also shorter than the longest permitted 600-second inference request,
-so planned container replacement is not proven hitless for long or streaming
-requests.
+- PostgreSQL for keys, credentials, budgets, and spend data;
+- Redis for private cache and router state;
+- Envoy as its only provider path; and
+- Alloy for prompt-bearing telemetry.
 
-Do not use `docker compose up --scale litellm=N` as an operational shortcut.
-Docker DNS answers, client DNS caching, concurrent schema migration, database
-connection multiplication, background work, readiness, and connection drain
-have not been made deterministic in that topology. The portals' separate
-single-worker restriction is unrelated and remains mandatory: scaling LiteLLM
-does not authorize scaling `dev-portal`/`admin-portal` or their process-local
-API-key creation lock.
+The public API is `api.<domain>` on the internal edge. Traefik allows only the
+approved inference, model, liveness, and readiness paths. Other paths return
+HTTP 403 before they reach LiteLLM.
 
-## Safe vertical tuning
+The Admin UI is `litellm-admin.<domain>` on the ADM edge. OAuth2 Proxy checks
+the Keycloak `aigw-admins` role before it sends traffic to LiteLLM.
 
-Treat every change as a measured capacity experiment, not a generic CPU
-formula.
+Six consumers use the one `litellm:4000` service:
 
-1. Establish a repeatable baseline with one worker and the pinned image.
-   Measure CPU throttling, RSS, PIDs, file descriptors, event-loop latency,
-   PostgreSQL connections and query latency, Redis latency, Envoy latency, and
-   Alloy drops alongside request latency and throughput.
-2. Increase CPU, memory, and PID limits together in small reviewed increments.
-   Preserve host headroom for PostgreSQL, Redis, Envoy, Vault, and the
-   prompt-bearing telemetry pipeline. A larger LiteLLM limit that induces host
-   reclaim or OOM pressure is a regression.
-3. Keep one worker until evidence shows process saturation rather than provider
-   latency, database contention, telemetry cost, or egress limits. LiteLLM's
-   documented default is one Uvicorn worker, and the command in Compose sets no
-   `--num_workers`.
-4. If multiple workers in one container are tested, set `--num_workers`
-   explicitly and review whether Gunicorn supervision and bounded, jittered
-   worker recycling are needed; never add those flags without testing them
-   against the exact pinned image. Database capacity must account for every
-   worker:
+- the internal API edge;
+- the LiteLLM Admin gate;
+- Open WebUI;
+- the developer portal;
+- the admin portal; and
+- key-rotator.
 
-   ```text
-   total LiteLLM DB connections =
-     per-worker pool limit × workers per container × containers
-   ```
+The container health check calls `/health/liveliness`. The edge also exposes
+`/health/readiness`, but there is no replica load balancer that removes an
+unready instance. The normal Compose stop window is also shorter than the
+longest 600-second request. A restart is not proven to be hitless for long or
+streaming calls.
 
-   Reserve separate PostgreSQL capacity for Keycloak, key-rotator, backup,
-   migrations, and operator recovery. A pooler is a separate reviewed service,
-   not a substitute for connection accounting.
-5. Keep debug logging disabled and use bounded structured telemetry. Benchmark
-   with the required prompt capture enabled; a result obtained by disabling
-   mandatory audit/trace work is not representative.
-6. Do not shorten the 600-second request timeout merely to make restart tests
-   pass. If the workload permits a lower bound, change the API contract first,
-   then align client, load-balancer, proxy, and termination timeouts.
+## Do not use Compose scaling
 
-## Required multi-replica architecture (design, not implemented)
+Do not run this shortcut:
 
-Nothing in this section exists today. It is a bounded design for a future
-high-throughput profile. The current stack already has one PostgreSQL server
-with the `litellm` database and one Redis instance. Future work would add
-stable replica identities, a load balancer that does not use the Docker
-socket, a controlled migration step, and safe connection draining. No proxy
-may access `/var/run/docker.sock` or depend on Docker-label discovery.
+```bash
+docker compose up --scale litellm=2
+```
 
-1. Ansible renders named replica services, or an orchestrator renders stable
-   replica endpoints. Every replica receives the same reviewed image, model
-   config, master and salt keys, security settings, and resource limits.
-2. Replicas share the one reviewed PostgreSQL service and the one reviewed
-   Redis service. They attach to a dedicated LiteLLM backend bridge plus the
-   existing vendor, database, cache, and telemetry planes; they do not join the
-   user or admin frontend planes directly.
-3. A dedicated internal `litellm-lb` joins the backend bridge and only the
-   specific frontend planes needed by the six consumers — the `traefik-int` api
-   router, `oauth2-proxy`, Open WebUI, dev-portal, admin-portal, and
-   key-rotator. All six target that stable load-balancer name instead of an
-   individual replica. Because per-request authorization, budget, and spend
-   state live in PostgreSQL and router/cache coordination lives in Redis, the
-   replicas are stateless at the HTTP layer: the load balancer needs
-   readiness-aware round-robin across ready replicas, not sticky sessions.
-4. The load balancer uses a reviewed static file containing the exact replica
-   URLs, active `/health/readiness` checks, bounded passive-failure handling,
-   and explicit timeouts. The intended primitives are documented by
-   [Traefik's file-configured HTTP load balancer](https://doc.traefik.io/traefik/reference/routing-configuration/http/load-balancing/service/).
-   Configuration comes from Ansible and inventory, not the Docker API. External
-   inference paths stay restricted by the existing `traefik-int` allow-list, and
-   the Admin UI stays behind `oauth2-proxy` on the ADM leg.
-5. A deployment first runs the exact schema migration once as a separate
-   controlled job. Only after it succeeds do application replicas start or roll
-   with automatic schema updates disabled. Multiple replicas must never race
-   migrations.
-6. A rolling update adds and proves a ready replacement before draining an old
-   replica. Draining removes the old replica from new selection, waits longer
-   than the maximum approved in-flight request or stream duration, and only then
-   sends the final stop signal. At least two ready replicas are required
-   throughout that sequence.
+The current design does not control:
 
-This design improves LiteLLM process capacity but does not make the single-VM
-stack highly available. Host, Docker, load-balancer, PostgreSQL, Redis, Envoy,
-and physical-network failure remain shared. Real HA requires separate failure
-domains plus replicated or managed state and an external load-balancing control
-plane; see [high-availability.md](high-availability.md).
+- Docker DNS and client caching;
+- database migration races;
+- database connections per worker;
+- background jobs;
+- readiness-based traffic removal; or
+- connection drain during a restart.
 
-### Shared-state requirements
+The developer and admin portal single-worker rule is separate. Scaling
+LiteLLM does not allow more portal workers. Their key-creation locks are local
+to one process.
 
-All replicas must use the same stable `LITELLM_SALT_KEY`, because changing it
-can make stored credentials unreadable, and the same `LITELLM_MASTER_KEY`.
-PostgreSQL sizing must cover all worker pools and migrations. Backup, restore,
-ACL repair, and the upgrade gates in [operations.md](operations.md) remain one
-coordinated operation. Every replica must share Redis for router and cache
-state. Before Redis owns global rate limits or other required controls, define
-its persistence, replication, outage behavior, and fail-open or fail-closed
-rules. The current single tmpfs instance is not enough for that role.
+## Safe changes today
 
-Credential creation and rotation must become visible on every replica within a
-measured bound — test cache invalidation rather than assuming that a successful
-write through one instance proves immediate use by all others. Do not enable
-`allow_requests_on_db_unavailable` by default: upstream notes that it changes
-readiness and authorization behavior, and this deployment must first define
-which key, budget, and audit guarantees may fail before accepting that
-availability tradeoff.
+The supported path is measured vertical tuning on the same VM.
 
-## Benchmark and failure acceptance
+1. Record a one-worker baseline.
+2. Raise CPU, memory, and PID limits in small steps.
+3. Keep enough host room for PostgreSQL, Redis, Envoy, Vault, and telemetry.
+4. Keep one worker unless tests show that the Python process is the real limit.
+5. Run the full security and telemetry workload during every benchmark.
+6. Keep the 600-second timeout unless the API contract changes first.
 
-Record the exact image digest, host size, worker/replica count, pool settings,
-model and provider, payload distribution, prompt-capture setting, concurrency,
-duration, and client location. Use synthetic prompts unless production data is
-explicitly approved. Include both streaming and non-streaming requests and
-enough duration to expose memory growth and connection exhaustion. The full
-acceptance runbook lives in [test-runbook.md](test-runbook.md).
+Measure at least:
 
-Use the version-reviewed
-[official LiteLLM benchmark method](https://docs.litellm.ai/docs/benchmarks) as
-one reproducible input, not as a promised result. Run two distinct phases. A
-`network_mock: true` microbenchmark with retries and callbacks disabled,
-following the upstream configuration, measures LiteLLM's hot-path proxy
-overhead without provider or network variance; because it bypasses Envoy and
-the required prompt telemetry it cannot by itself approve this gateway. A
-representative end-to-end run then restores the reviewed retries, Envoy path,
-PostgreSQL and Redis behavior, virtual-key enforcement, OTel callback, and full
-prompt capture — this is the release-capacity measurement.
+- CPU use and throttling;
+- memory, PIDs, and file descriptors;
+- request count, errors, and latency;
+- PostgreSQL connections and query time;
+- Redis delay and evictions;
+- Envoy provider delay and errors; and
+- Alloy queue, refusal, and drop counters.
 
-In both phases capture the `x-litellm-overhead-duration-ms` response header and
-report its p50/p95/p99 distribution beside total request latency. Reject a
-harness that silently omits the header or mixes proxy-overhead samples with
-provider latency. Do not copy upstream RPS or latency results into this
-project's capacity claim; hardware, image, callbacks, database, and traffic all
-differ. At minimum collect:
+A larger LiteLLM limit is a failure if it causes host memory pressure, slow
+databases, lost telemetry, or container restarts.
 
-- successful requests per second, error and timeout rate, time to first token,
-  and end-to-end p50/p95/p99 latency;
-- per-replica CPU, throttling, RSS, PIDs, restarts, open connections, and
-  request distribution;
-- PostgreSQL active and queued connections, lock and query latency, transaction
-  errors, and storage/WAL growth;
-- Redis latency, memory, evictions, connection count, and restart impact;
-- Envoy upstream latency and errors, and Alloy queue, refusal, and drop
-  counters; and
-- provider rate-limit responses, kept separate from gateway-generated failures.
+If you test more workers in one container, set the worker count on purpose.
+Do not rely on an image default. Count database connections with this formula:
 
-The candidate passes only when it also proves these security and failure
-properties:
+```text
+total LiteLLM database connections =
+  pool limit per worker x workers per container x containers
+```
 
-1. virtual-key ownership, project limits, budgets, and management-path denial
-   remain correct under concurrency;
-2. every replica can reach vendors only through Envoy and cannot reach the host
-   or external network directly;
-3. traffic is sent only to ready replicas, and a killed or unready replica is
-   removed within the declared bound with no authentication bypass;
-4. a planned drain completes in-flight ordinary and streaming requests while new
-   requests move to healthy replicas;
-5. one controlled schema migration succeeds with application replicas barred
-   from racing it;
-6. provider credential rotation and virtual-key deactivation take effect on
-   every replica within the accepted bound;
-7. PostgreSQL and Redis outage behavior matches the documented security policy;
-   and
-8. an unchanged full converge preserves the intended replica set and does not
-   recreate healthy stateful services.
+Leave separate PostgreSQL room for Keycloak, key-rotator, Grafana reads,
+backup, migration, and recovery. A connection pooler would be a new reviewed
+service. It is not a way to skip connection planning.
 
-Set workload-specific service-level thresholds before running the test. "More
-RPS" alone is not acceptance if tail latency, dropped streams, database
-headroom, authorization consistency, or observability deteriorate.
+## Future multi-replica design
+
+This section is a design only. It is not implemented.
+
+A safe multi-replica profile needs:
+
+1. Named replicas with stable addresses.
+2. The same image, model config, keys, limits, and security rules on every
+   replica.
+3. One static, socket-free load balancer in front of the replicas.
+4. Active `/health/readiness` checks.
+5. One controlled database migration job.
+6. A drain step before an old replica stops.
+
+The load balancer must use an Ansible-made static file. It must not read the
+Docker socket or discover containers from labels.
+
+The six current consumers would call the stable load balancer name. The load
+balancer would send requests only to ready replicas. Sticky sessions should
+not be needed because authorization, budgets, and spend live in PostgreSQL and
+cache coordination lives in Redis.
+
+Replicas would share only the networks they need:
+
+- one new private LiteLLM backend network;
+- the provider network to Envoy;
+- the LiteLLM database network;
+- the cache network; and
+- the telemetry network.
+
+Replicas would not join user or admin edge networks. The load balancer would
+join the exact edge networks needed by the six consumers.
+
+### Database migration and drain
+
+Run the schema migration once, before application replicas start. Disable
+automatic migration in the replicas. Two replicas must never race a schema
+change.
+
+A rolling update must follow this order:
+
+```text
+start replacement
+  -> wait for readiness
+  -> add it to traffic
+  -> remove old replica from new traffic
+  -> wait for in-flight calls and streams
+  -> stop old replica
+```
+
+At least two ready replicas must stay available during the roll. The drain
+window must be longer than the approved longest request or stream.
+
+### Shared state
+
+All replicas must use the same `LITELLM_SALT_KEY` and `LITELLM_MASTER_KEY`.
+Changing the salt can make saved credentials unreadable.
+
+All replicas must share PostgreSQL and Redis. Test how fast a new credential,
+key deactivation, budget change, or rotation reaches every replica. Do not
+assume one successful write updates all caches at once.
+
+The current Redis service is one non-persistent instance. Before it becomes a
+required global rate-limit control, define persistence, replication, outage
+behavior, and fail-open or fail-closed rules.
+
+Do not enable `allow_requests_on_db_unavailable` without a separate security
+decision. It changes readiness and authorization behavior.
+
+## Benchmark plan
+
+Record the exact test inputs:
+
+- image digest and host size;
+- worker and replica count;
+- database pool settings;
+- model and provider;
+- request sizes and concurrency;
+- prompt-capture setting;
+- streaming and non-streaming mix;
+- test length; and
+- client location.
+
+Use synthetic prompts unless production data is approved.
+
+Run two phases:
+
+1. A `network_mock: true` test measures LiteLLM code overhead. It does not
+   prove Envoy, provider, database, key, or telemetry behavior.
+2. A full gateway test restores retries, Envoy, PostgreSQL, Redis, virtual
+   keys, Alloy, and prompt capture. This is the release-capacity test.
+
+Use the version-matched
+[official benchmark method](https://docs.litellm.ai/docs/benchmarks) as an
+input, not as a promised result.
+
+Record the `x-litellm-overhead-duration-ms` header. Report its p50, p95, and
+p99 values apart from total provider latency. Also report throughput, errors,
+timeouts, time to first token, resource use, database delay, Redis delay,
+Envoy errors, Alloy loss, and provider rate limits.
+
+## Acceptance rules
+
+A candidate passes only when all of these remain true:
+
+1. Key ownership, project limits, budgets, and admin-path denial work under
+   load.
+2. Every replica reaches providers only through Envoy.
+3. An unready or dead replica leaves traffic within the stated time.
+4. A planned drain finishes in-flight normal and streaming requests.
+5. Only one schema migration runs.
+6. Credential rotation and key deactivation reach every replica in time.
+7. PostgreSQL and Redis failures match the written security policy.
+8. A second unchanged Ansible converge keeps healthy services in place.
+
+Set pass and fail limits before the test. More requests per second is not a
+pass if tail latency, database room, authorization, or telemetry gets worse.
+
+Even this future design would still share one VM, Docker daemon, load balancer,
+PostgreSQL, Redis, Envoy, and network path. Real high availability needs more
+than one failure domain.
