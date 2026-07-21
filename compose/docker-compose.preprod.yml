@@ -272,8 +272,8 @@ services:
     image: "${PREPROD_PROJECT}/alloy:local"
     security_opt: !override [no-new-privileges:true]
     # Local preprod must never read another local project's Docker logs.
-    # Keep Alloy's production pipeline intact, but give its file source an
-    # empty preprod-owned volume instead of the Docker data root.
+    # This owned volume starts empty. The acceptance test writes only reviewed
+    # Docker-log fixtures into it so the production filters are exercised.
     volumes: !override
       - ./alloy/config.alloy:/etc/alloy/config.alloy:ro,Z
       - ./secrets/preprod-root-ca.pem:/etc/ssl/certs/aigw-cribl-ca.pem:ro,z

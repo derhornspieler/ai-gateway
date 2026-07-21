@@ -1869,6 +1869,7 @@ text = Path(sys.argv[1]).read_text()
 assert "health_check:" in text
 assert "endpoint: 127.0.0.1:13133" in text
 assert "extensions: [health_check]" in text
+assert "verbosity: detailed" in text
 PY
 
 # Prompts are deliberately retained in Cribl spans and the derived Loki

@@ -194,8 +194,9 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         docker_logs = self.alloy.split('loki.process "docker"', 1)[1].split(
             'loki.process "external_file_logs"', 1
         )[0]
-        self.assertIn('(?:(?:bearer|basic)\\s+)?', docker_logs)
-        self.assertIn('((?:bearer|basic)\\s+)', docker_logs)
+        self.assertIn('(?:(?:bearer|basic)\\s+)?([^"\'\\s,}]{8,})', docker_logs)
+        self.assertIn('(?:bearer|basic)\\s+([A-Za-z0-9._~+/-]{8,})', docker_logs)
+        self.assertNotIn('${1}<redacted>', docker_logs)
         # Grafana Logs Drilldown keys on the OTel-semantic service_name label;
         # dropping it silently empties that whole UI (observed live).
         self.assertIn('service_name = "service"', docker_logs)
@@ -399,6 +400,9 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "aigw.egress.trust",
         ):
             self.assertIn(event, structured)
+        self.assertIn('source   = "security_schema"', structured)
+        self.assertIn('template = "{{ .Value }}"', structured)
+        self.assertIn('aigw_security_schema      = "security_schema"', structured)
         self.assertIn("AIGW_SECURITY_EVENT", structured)
         self.assertNotIn('service=~\\"alloy|cribl-mock\\"', structured)
         # Use RE2 character classes for literal dots. A backslash here must

@@ -16,7 +16,10 @@ extensions:
 
 exporters:
   debug:
-    verbosity: basic
+    # Preprod acceptance reads the exact record body and attributes from this
+    # disposable sink. Detailed output is required to prove both the allow-list
+    # and redaction rules; a healthy listener or aggregate count is not enough.
+    verbosity: detailed
 
 service:
   extensions: [health_check]

@@ -402,6 +402,21 @@
     preprod_end_to_end_acceptance.rc != 0 or
     'PREPROD_E2E_PASSED' not in preprod_end_to_end_acceptance.stdout
 
+- name: Prove the curated Cribl security feed and persistent recovery queue
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ preprod_repo_root }}/scripts/test-preprod-cribl-security.py"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+  register: preprod_cribl_security_acceptance
+  changed_when: false
+  failed_when: >-
+    preprod_cribl_security_acceptance.rc != 0 or
+    'PREPROD_CRIBL_SECURITY_FEED_PASSED' not in
+    preprod_cribl_security_acceptance.stdout
+
 - name: Report the full local preprod acceptance result
   ansible.builtin.debug:
     msg: PREPROD_E2E_PASSED

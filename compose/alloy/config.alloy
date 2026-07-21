@@ -524,15 +524,17 @@ loki.process "docker" {
   // a different data class: redact credential-shaped fields and vendor keys if
   // a dependency ever prints them during an error path.
   stage.replace {
-    expression = `(?i)("?(?:api[_-]?key|client[_-]?secret|password|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*["']?(?:(?:bearer|basic)\s+)?)[^"'\s,}]{8,}`
-    replace    = `${1}<redacted>`
+    // Alloy replaces the CAPTURED text, not the full regular-expression
+    // match. Capture only the credential so the field name remains useful.
+    expression = `(?i)"?(?:api[_-]?key|client[_-]?secret|password|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*["']?(?:(?:bearer|basic)\s+)?([^"'\s,}]{8,})`
+    replace    = `<redacted>`
   }
   stage.replace {
-    expression = `(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/-]{8,}`
-    replace    = `${1}<redacted>`
+    expression = `(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/-]{8,})`
+    replace    = `<redacted-authorization>`
   }
   stage.replace {
-    expression = `\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b`
+    expression = `(\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b)`
     replace    = `<redacted-vendor-key>`
   }
   stage.label_drop { values = ["filename"] }
@@ -643,10 +645,17 @@ loki.process "cribl_structured_security" {
       security_schema  = "schema_version",
     }
   }
+  // JSON numbers enter the extracted map as numeric values. Loki labels accept
+  // strings only, so normalize the schema value before the exact-match gate.
+  // Without this stage every valid structured record is silently dropped.
+  stage.template {
+    source   = "security_schema"
+    template = "{{ .Value }}"
+  }
   stage.labels {
     values = {
       aigw_security_event_class = "security_event",
-      aigw_security_schema      = "",
+      aigw_security_schema      = "security_schema",
       security_action           = "",
       security_event            = "",
       security_outcome          = "",

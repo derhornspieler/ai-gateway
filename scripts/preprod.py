@@ -2041,7 +2041,7 @@ def verify_rendered_resource_ownership(
         or alloy_log_mounts[0].get("source") != "preprod_empty_docker_logs"
         or alloy_log_mounts[0].get("read_only") is not True
     ):
-        fail("preprod Alloy must use only its empty owned Docker-log volume")
+        fail("preprod Alloy must use only its owned security-fixture log volume")
     node_mounts = services.get("node-exporter", {}).get("volumes") or []
     if any(
         isinstance(mount, dict) and mount.get("target") == "/host"

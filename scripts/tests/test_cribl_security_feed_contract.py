@@ -10,6 +10,16 @@ ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
 ALLOY = (ROOT / "compose/alloy/config.alloy").read_text(encoding="utf-8")
 IDENTITY = (ROOT / "services/key-rotator/app/identity.py").read_text(encoding="utf-8")
+PREPROD_OVERLAY = (ROOT / "compose/docker-compose.preprod.yml").read_text(
+    encoding="utf-8"
+)
+PREPROD_RECEIPT = (
+    ROOT / "scripts/test-preprod-cribl-security.py"
+).read_text(encoding="utf-8")
+PREPROD_TASKS = (
+    ROOT / "ansible/roles/preprod_stack/tasks/present.yml"
+).read_text(encoding="utf-8")
+CRIBL_MOCK = (ROOT / "compose/cribl-mock/config.yaml").read_text(encoding="utf-8")
 
 EVENTS = (
     "CLIENT_LOGIN",
@@ -111,6 +121,35 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             prometheus,
         )
         self.assertNotIn("--storage.tsdb.retention.time=7d", prometheus)
+
+    def test_seeded_preprod_has_record_level_allow_deny_and_recovery_proof(self) -> None:
+        self.assertIn("preprod_empty_docker_logs:", PREPROD_OVERLAY)
+        self.assertIn(
+            "preprod_empty_docker_logs:/var/lib/docker/containers:ro",
+            PREPROD_OVERLAY,
+        )
+        self.assertNotIn("${DOCKER_DATA_ROOT}", PREPROD_OVERLAY)
+        self.assertIn("verbosity: detailed", CRIBL_MOCK)
+        for marker in (
+            "OTLP_FIXTURES_ACCEPTED",
+            "DENIED_RAW_TRACE_",
+            "denied_raw_metric_",
+            "DENIED_RAW_LOG_",
+            "DENIED_ORDINARY_LOG_",
+            "DENIED_SCHEMA_",
+            "DENIED_ACTION_",
+            "DENIED_MALFORMED_",
+            "<redacted-authorization>",
+            "wait_for_queue(preprod, model, populated=True)",
+            'preprod.docker("restart", "--time", "10", alloy)',
+            "PREPROD_CRIBL_SECURITY_FEED_PASSED",
+        ):
+            self.assertIn(marker, PREPROD_RECEIPT)
+        self.assertIn(
+            "Prove the curated Cribl security feed and persistent recovery queue",
+            PREPROD_TASKS,
+        )
+        self.assertIn("scripts/test-preprod-cribl-security.py", PREPROD_TASKS)
 
 
 if __name__ == "__main__":

@@ -1719,6 +1719,7 @@ class PreprodContractTests(unittest.TestCase):
             "preprod_empty_docker_logs:/var/lib/docker/containers:ro",
             self.compose,
         )
+        self.assertIn("Local preprod must never read another local project's Docker logs", self.compose)
         self.assertIn("security_opt: !override [no-new-privileges:true]", self.compose)
         self.assertIn("SELinux process isolation enabled", self.script)
         self.assertIn("volumes: !override []", self.compose)
@@ -2229,14 +2230,20 @@ class PreprodContractTests(unittest.TestCase):
         acceptance = self.tasks.index(
             "Run the full local preprod edge and identity acceptance gate"
         )
+        cribl_acceptance = self.tasks.index(
+            "Prove the curated Cribl security feed and persistent recovery queue"
+        )
         report = self.tasks.index("Report the full local preprod acceptance result")
         self.assertLess(internal_verify, acceptance)
-        self.assertLess(acceptance, report)
+        self.assertLess(acceptance, cribl_acceptance)
+        self.assertLess(cribl_acceptance, report)
         acceptance_block = self.tasks[acceptance:report]
         self.assertIn("scripts/test-e2e-preprod.py", acceptance_block)
+        self.assertIn("scripts/test-preprod-cribl-security.py", acceptance_block)
         self.assertIn("--image-mode", acceptance_block)
         self.assertIn('"{{ preprod_image_mode }}"', acceptance_block)
         self.assertIn("PREPROD_E2E_PASSED", acceptance_block)
+        self.assertIn("PREPROD_CRIBL_SECURITY_FEED_PASSED", acceptance_block)
 
     def test_seed_mode_uses_exact_transfer_ids_and_cannot_build_or_pull(self) -> None:
         self.assertIn('"ai-gateway/samba-ad:preprod"', self.script)
