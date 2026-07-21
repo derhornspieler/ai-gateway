@@ -29,6 +29,7 @@ EDGE_CERTS_DIR = SECRETS_DIR / "preprod-edge-certs"
 VAULT_INIT_FILE = SECRETS_DIR / "preprod-vault-init.json"
 SEED_RECEIPT = SECRETS_DIR / "preprod-seed-receipt.json"
 SEED_OVERLAY = SECRETS_DIR / "preprod-seed-images.yml"
+PREPROD_ROOT_CA_FILE = SECRETS_DIR / "preprod-root-ca.pem"
 
 ROOT_UID = 0
 ROOT_GID = 0
@@ -71,6 +72,7 @@ POSTGRES_DIRECT_CONSUMERS = ("litellm", "keycloak", "key-rotator", "grafana")
 POSTGRES_RECONCILE_RESULTS = frozenset(
     {"AIGW_POSTGRES_CHANGED", "AIGW_POSTGRES_OK"}
 )
+EDGE_RESPONSE_MAX_BYTES = 64 * 1024
 PREPROD_USERNAMES = frozenset(
     {"preprod-admin", "preprod-developer", "preprod-user"}
 )
@@ -2605,9 +2607,24 @@ def start(args: argparse.Namespace) -> None:
     stage_postgres_before_consumers(args)
     compose(args, "up", "-d", "--remove-orphans")
     verify_existing_project_boundary(args, expected_volume_names)
+    wait_for_container(args, "traefik-int", "healthy", 300)
+    wait_for_container(args, "traefik-adm", "healthy", 300)
+    # Docker Desktop can leave the passthrough proxy with unusable upstream
+    # sockets even though its configuration-only healthcheck is green. Restart
+    # it after both Traefik edges are ready, then prove both real TLS routes.
+    compose(
+        args,
+        "restart",
+        "--no-deps",
+        "--timeout",
+        "30",
+        "preprod-edge-forwarder",
+    )
+    wait_for_container(args, "preprod-edge-forwarder", "healthy", 120)
     wait_for_container(args, "samba-ad", "healthy", 300)
     wait_for_container(args, "litellm", "healthy", 600)
     wait_for_container(args, "keycloak", "healthy", 600)
+    verify_edge_routes(args)
     wait_for_container(args, "key-rotator", "running", 300)
     # LiteLLM creates its reporting tables during startup. A second idempotent
     # pass installs the reviewed column-only Grafana grants on a clean stack.
@@ -2653,6 +2670,74 @@ def wait_for_container(args: argparse.Namespace, service: str, wanted: str, time
             fail(f"preprod service {service} entered state status={status} health={health}")
         time.sleep(3)
     fail(f"timed out waiting for preprod service {service} to become {wanted}")
+
+
+def edge_json(hostname: str, address: str, path: str) -> object:
+    """Read one fixed preprod TLS route without using local curl settings."""
+
+    approved = {
+        ("api.aigw.internal", "127.0.2.1", "/health/liveliness"),
+        (
+            "auth.aigw.internal",
+            "127.0.3.1",
+            "/realms/aigw/.well-known/openid-configuration",
+        ),
+    }
+    if (hostname, address, path) not in approved:
+        fail("the preprod edge verifier received an unapproved route")
+    result = run(
+        [
+            "curl",
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--http1.1",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            str(EDGE_RESPONSE_MAX_BYTES),
+            "--noproxy",
+            "*",
+            "--proto",
+            "=https",
+            "--cacert",
+            str(PREPROD_ROOT_CA_FILE),
+            "--resolve",
+            f"{hostname}:443:{address}",
+            f"https://{hostname}{path}",
+        ],
+        capture=True,
+    )
+    response_size = len(result.stdout.encode("utf-8"))
+    if not result.stdout or response_size > EDGE_RESPONSE_MAX_BYTES:
+        fail(f"{hostname}{path} returned an invalid response size")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        fail(f"{hostname}{path} returned invalid JSON")
+
+
+def verify_edge_routes(_: argparse.Namespace) -> None:
+    """Prove that both loopback planes reach the intended TLS services."""
+
+    api_health = edge_json(
+        "api.aigw.internal", "127.0.2.1", "/health/liveliness"
+    )
+    if api_health != "I'm alive!":
+        fail("the preprod API edge returned the wrong health response")
+    discovery = edge_json(
+        "auth.aigw.internal",
+        "127.0.3.1",
+        "/realms/aigw/.well-known/openid-configuration",
+    )
+    if not isinstance(discovery, dict) or discovery.get("issuer") != (
+        "https://auth.aigw.internal/realms/aigw"
+    ):
+        fail("the preprod identity edge returned the wrong issuer")
+    print("PREPROD_EDGE_ROUTES_VERIFIED")
 
 
 def vault_call(
@@ -3081,6 +3166,7 @@ def verify(args: argparse.Namespace) -> None:
                 f"preprod service {service} is not running and healthy: "
                 f"status={status} health={health}"
             )
+    verify_edge_routes(args)
     status_code, identity = internal_call(args, "GET", "/identity/status")
     identity_fields = {
         "configured": True,

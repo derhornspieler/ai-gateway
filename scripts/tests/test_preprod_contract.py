@@ -2071,6 +2071,9 @@ class PreprodContractTests(unittest.TestCase):
         def wait(_args, service, wanted, timeout):
             events.append(("wait", (service, wanted, timeout)))
 
+        def verify_edge(_args):
+            events.append(("edge", ()))
+
         with (
             mock.patch.object(module, "check_context"),
             mock.patch.object(module, "rendered_compose_model", return_value={}),
@@ -2083,6 +2086,7 @@ class PreprodContractTests(unittest.TestCase):
             mock.patch.object(module, "verify_existing_project_boundary"),
             mock.patch.object(module, "compose", side_effect=compose),
             mock.patch.object(module, "wait_for_container", side_effect=wait),
+            mock.patch.object(module, "verify_edge_routes", side_effect=verify_edge),
             mock.patch("sys.stdout", new_callable=io.StringIO),
         ):
             module.start(args)
@@ -2113,13 +2117,43 @@ class PreprodContractTests(unittest.TestCase):
         full_up = events.index(
             ("compose", ("up", "-d", "--remove-orphans"))
         )
+        traefik_int_ready = events.index(
+            ("wait", ("traefik-int", "healthy", 300))
+        )
+        traefik_adm_ready = events.index(
+            ("wait", ("traefik-adm", "healthy", 300))
+        )
+        forwarder_restart = events.index(
+            (
+                "compose",
+                (
+                    "restart",
+                    "--no-deps",
+                    "--timeout",
+                    "30",
+                    "preprod-edge-forwarder",
+                ),
+            )
+        )
+        forwarder_ready = events.index(
+            ("wait", ("preprod-edge-forwarder", "healthy", 120))
+        )
         litellm_ready = events.index(("wait", ("litellm", "healthy", 600)))
+        keycloak_ready = events.index(("wait", ("keycloak", "healthy", 600)))
+        edge_verified = events.index(("edge", ()))
         self.assertEqual(len(reconciles), 2)
         self.assertLess(stop, postgres_up)
         self.assertLess(postgres_up, postgres_ready)
         self.assertLess(postgres_ready, reconciles[0])
         self.assertLess(reconciles[0], full_up)
+        self.assertLess(full_up, traefik_int_ready)
+        self.assertLess(full_up, traefik_adm_ready)
+        self.assertLess(traefik_int_ready, forwarder_restart)
+        self.assertLess(traefik_adm_ready, forwarder_restart)
+        self.assertLess(forwarder_restart, forwarder_ready)
         self.assertLess(full_up, litellm_ready)
+        self.assertLess(litellm_ready, edge_verified)
+        self.assertLess(keycloak_ready, edge_verified)
         self.assertLess(litellm_ready, reconciles[1])
 
     def test_postgres_reconcile_receipt_is_fail_closed(self) -> None:
@@ -2214,14 +2248,67 @@ class PreprodContractTests(unittest.TestCase):
                 "internal_call",
                 side_effect=[(200, identity), (200, provider)],
             ),
+            mock.patch.object(module, "verify_edge_routes") as edge_routes,
             mock.patch("sys.stdout", new_callable=io.StringIO),
         ):
             module.verify(mock.Mock())
         volume_init.assert_called_once()
+        edge_routes.assert_called_once()
         self.assertEqual(
             [call.args[1:] for call in wait.call_args_list],
             [("alpha", "healthy", 120), ("beta", "healthy", 120)],
         )
+
+    def test_edge_route_verifier_is_tls_pinned_bounded_and_fail_closed(self) -> None:
+        module = load_preprod_module()
+        healthy = subprocess.CompletedProcess([], 0, '"I\'m alive!"', "")
+        discovery = subprocess.CompletedProcess(
+            [],
+            0,
+            json.dumps(
+                {"issuer": "https://auth.aigw.internal/realms/aigw"},
+                separators=(",", ":"),
+            ),
+            "",
+        )
+        with (
+            mock.patch.object(module, "run", side_effect=[healthy, discovery]) as run,
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            module.verify_edge_routes(mock.Mock())
+        self.assertEqual(run.call_count, 2)
+        commands = [call.args[0] for call in run.call_args_list]
+        for command in commands:
+            for required in (
+                "--disable",
+                "--fail-with-body",
+                "--http1.1",
+                "--max-filesize",
+                "--noproxy",
+                "--proto",
+                "--cacert",
+                "--resolve",
+            ):
+                self.assertIn(required, command)
+            self.assertIn(str(module.PREPROD_ROOT_CA_FILE), command)
+            self.assertTrue(command[-1].startswith("https://"))
+        self.assertIn(
+            "api.aigw.internal:443:127.0.2.1",
+            commands[0],
+        )
+        self.assertIn(
+            "auth.aigw.internal:443:127.0.3.1",
+            commands[1],
+        )
+
+        malformed = subprocess.CompletedProcess([], 0, "not-json", "")
+        with mock.patch.object(module, "run", return_value=malformed):
+            with self.assertRaisesRegex(SystemExit, "returned invalid JSON"):
+                module.edge_json(
+                    "api.aigw.internal", "127.0.2.1", "/health/liveliness"
+                )
+        with self.assertRaisesRegex(SystemExit, "unapproved route"):
+            module.edge_json("example.invalid", "127.0.2.1", "/health/liveliness")
 
     def test_ansible_runs_full_acceptance_after_internal_verification(self) -> None:
         internal_verify = self.tasks.index(
