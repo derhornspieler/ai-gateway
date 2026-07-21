@@ -392,7 +392,7 @@ otelcol.processor.transform "cribl_security_contract" {
 
 // This is the only queue ingress for the customer security feed. Every input
 // is already reduced to a reviewed log schema. Do not connect a raw receiver,
-// trace, metric, ordinary service log, Vault audit file, or Alloy's own logs.
+// trace, metric, ordinary service log, raw Vault audit file, or Alloy's own logs.
 otelcol.processor.batch "cribl_security" {
   timeout             = "1s"
   send_batch_size     = 512
@@ -642,7 +642,10 @@ loki.process "cribl_structured_security" {
       security_action  = "action",
       security_event   = "event",
       security_outcome = "outcome",
+      security_rotation_status = "rotation_status",
       security_schema  = "schema_version",
+      security_state   = "state",
+      security_vendor  = "vendor",
     }
   }
   // JSON numbers enter the extracted map as numeric values. Loki labels accept
@@ -659,6 +662,9 @@ loki.process "cribl_structured_security" {
       security_action           = "",
       security_event            = "",
       security_outcome          = "",
+      security_rotation_status  = "",
+      security_state            = "",
+      security_vendor           = "",
     }
   }
   stage.match {
@@ -672,7 +678,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "mismatched_security_emitter"
   }
   stage.match {
-    selector            = "{service=\"key-rotator\",security_event!=\"aigw.identity.audit\"}"
+    selector            = "{service=\"key-rotator\",security_event!~\"aigw[.]identity[.]audit|aigw[.]provider[.]rotation|aigw[.]vault[.]state\"}"
     action              = "drop"
     drop_counter_reason = "mismatched_security_emitter"
   }
@@ -687,9 +693,34 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "unapproved_portal_action"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.identity.audit\",security_action!~\"bootstrap|deployment_converge|group_policy_update|group_create|group_delete|group_member_add|group_member_remove\"}"
+    selector            = "{security_event=\"aigw.identity.audit\",security_action!~\"bootstrap|break_glass_use|deployment_converge|group_policy_update|group_create|group_delete|group_member_add|group_member_remove\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_identity_action"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action!=\"rotate\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_rotation_action"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_vendor!~\"anthropic|static-anthropic\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_rotation_vendor"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_rotation_status!~\"success|failed|skipped|disabled\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_rotation_status"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.vault.state\",security_action!=\"state_observed\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_vault_action"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.vault.state\",security_state!~\"sealed|unsealed|uninitialized|unavailable\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_vault_state"
   }
   stage.match {
     selector            = "{security_event=\"aigw.egress.trust\",security_action!=\"startup_gate\"}"
@@ -705,24 +736,83 @@ loki.process "cribl_structured_security" {
   forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
 }
 
-// Vault audit records are HMAC-redacted by Vault and live on a dedicated
-// read-only mount in Alloy. They are retained locally only. Unsealing happens
-// while the audit device is unavailable, so these records are not a reliable
-// structured seal/unseal feed and must not be guessed into the SOC stream.
+// Vault writes its HMAC-protected JSON audit records to a dedicated read-only
+// mount. The raw records remain local. A second fail-closed processor emits
+// only bounded metadata; the key-rotator watcher emits seal-state changes.
 loki.source.file "vault_audit" {
   targets = [{
     __path__ = "/var/log/aigw/vault/audit.log",
     job      = "vault-audit",
     service  = "vault-audit",
   }]
-  forward_to = [loki.write.local.receiver]
+  forward_to = [
+    loki.write.local.receiver,
+    loki.process.cribl_vault_audit.receiver,
+  ]
   file_match {
     enabled     = true
     sync_period = "10s"
   }
 }
 
-// Bridge only the two fail-closed security classifiers above into OTLP logs.
+// Never forward a raw Vault audit record. Keep only its record type, operation,
+// a small path category, success/failure, and the fact that Vault HMAC-protected
+// the source. Unknown JSON, paths, operations, and record types fail closed.
+loki.process "cribl_vault_audit" {
+  stage.json {
+    expressions = {
+      vault_error     = "error",
+      vault_operation = "request.operation",
+      vault_path      = "request.path",
+      vault_type      = "type",
+    }
+  }
+  stage.regex {
+    source     = "vault_path"
+    expression = `^(?P<vault_path_class>kv/(?:data|metadata)/ai-gateway|auth/token|sys/(?:audit|mounts|policies))(?:/.*)?$`
+  }
+  stage.template {
+    source   = "vault_outcome"
+    template = `{{ if .vault_error }}failure{{ else }}success{{ end }}`
+  }
+  stage.labels {
+    values = {
+      vault_operation  = "",
+      vault_outcome    = "",
+      vault_path_class = "",
+      vault_type       = "",
+    }
+  }
+  stage.match {
+    selector            = "{vault_type!~\"request|response\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_vault_record_type"
+  }
+  stage.match {
+    selector            = "{vault_operation!~\"create|delete|list|patch|read|update\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_vault_operation"
+  }
+  stage.match {
+    selector            = "{vault_path_class!~\"kv/(data|metadata)/ai-gateway|auth/token|sys/(audit|mounts|policies)\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_vault_path"
+  }
+  stage.template {
+    source = "vault_security_line"
+    template = `schema_version=1 event=aigw.vault.audit record_type={{ .vault_type }} operation={{ .vault_operation }} path_class={{ .vault_path_class }} outcome={{ .vault_outcome }} hmac_protected=true`
+  }
+  stage.output { source = "vault_security_line" }
+  stage.static_labels {
+    values = {
+      aigw_security_event_class = "vault_audit",
+      aigw_security_schema      = "1",
+    }
+  }
+  forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
+}
+
+// Bridge only the three fail-closed security classifiers above into OTLP logs.
 // The request-audit spanlog joins the same queue directly after its exact
 // trace filter. No trace or metric output exists on this receiver or batch.
 otelcol.receiver.loki "cribl_security_logs" {

@@ -404,6 +404,26 @@ def fixture_lines(token: str) -> str:
         '"action":"deployment_converge","outcome":"success","changed":true,'
         f'"project":"receipt-{token}"}}'
     )
+    identity_failure = (
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
+        '"action":"deployment_converge","outcome":"failed",'
+        f'"error_type":"ReceiptFailure","project":"failed-{token}"}}'
+    )
+    break_glass = (
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
+        '"action":"break_glass_use","outcome":"success",'
+        f'"purpose":"deployment_converge","receipt":"break-glass-{token}"}}'
+    )
+    rotation = (
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.provider.rotation",'
+        '"action":"rotate","outcome":"success","vendor":"anthropic",'
+        f'"rotation_status":"success","receipt":"rotation-{token}"}}'
+    )
+    vault_state = (
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.vault.state",'
+        '"action":"state_observed","outcome":"success","state":"unsealed",'
+        f'"receipt":"vault-state-{token}"}}'
+    )
     egress = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.egress.trust",'
         '"action":"startup_gate","outcome":"success",'
@@ -421,12 +441,28 @@ def fixture_lines(token: str) -> str:
             'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
             f'"action":"not.approved","outcome":"success","marker":"DENIED_ACTION_{token}"}}',
         ),
+        (
+            "key-rotator",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.provider.rotation",'
+            '"action":"rotate","outcome":"success","vendor":"openai",'
+            f'"rotation_status":"success","marker":"DENIED_VENDOR_{token}"}}',
+        ),
+        (
+            "key-rotator",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.vault.state",'
+            '"action":"state_observed","outcome":"failure","state":"tampered",'
+            f'"marker":"DENIED_VAULT_STATE_{token}"}}',
+        ),
         ("dev-portal", f"AIGW_SECURITY_EVENT not-json DENIED_MALFORMED_{token}"),
     )
     records = [
         docker_log_line("keycloak", keycloak, timestamp),
         docker_log_line("dev-portal", portal, timestamp),
         docker_log_line("key-rotator", identity, timestamp),
+        docker_log_line("key-rotator", identity_failure, timestamp),
+        docker_log_line("key-rotator", break_glass, timestamp),
+        docker_log_line("key-rotator", rotation, timestamp),
+        docker_log_line("key-rotator", vault_state, timestamp),
         docker_log_line("envoy-egress", egress, timestamp),
     ]
     records.extend(docker_log_line(service, message, timestamp) for service, message in denied)
@@ -544,6 +580,14 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         '"note":"Bearer <redacted-authorization>"',
         '"event":"aigw.identity.audit"',
         f'"project":"receipt-{token}"',
+        f'"project":"failed-{token}"',
+        f'"receipt":"break-glass-{token}"',
+        '"event":"aigw.provider.rotation"',
+        f'"receipt":"rotation-{token}"',
+        '"event":"aigw.vault.state"',
+        f'"receipt":"vault-state-{token}"',
+        "event=aigw.vault.audit",
+        "hmac_protected=true",
         '"event":"aigw.egress.trust"',
         f'"policy_sha256":"{token * 4}"',
     )
@@ -557,6 +601,8 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"DENIED_ORDINARY_LOG_{token}",
         f"DENIED_SCHEMA_{token}",
         f"DENIED_ACTION_{token}",
+        f"DENIED_VENDOR_{token}",
+        f"DENIED_VAULT_STATE_{token}",
         f"DENIED_MALFORMED_{token}",
         f"DENIED_RAW_TRACE_{token}",
         f"denied_raw_metric_{token}",
@@ -709,6 +755,9 @@ def main() -> int:
             f"event_type=LOGIN realm_id=aigw client_id=portal user_id=receipt-{token}",
             f'"subject":"receipt-{token}"',
             f'"project":"receipt-{token}"',
+            f'"receipt":"rotation-{token}"',
+            f'"receipt":"vault-state-{token}"',
+            "event=aigw.vault.audit",
             f'"policy_sha256":"{token * 4}"',
         ),
     )

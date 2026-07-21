@@ -198,6 +198,35 @@ for required in (
 assert "operator unseal" not in text
 assert "VAULT_UNSEAL_KEY" not in text
 PY
+
+# The one-time production audit-device helper follows the same stdin-only
+# boundary as unseal and must never place the root token in Docker metadata.
+bash -n "$ROOT/scripts/vault-enable-audit.sh"
+python3 -I - "$ROOT/scripts/vault-enable-audit.sh" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+for required in (
+    'docker_cmd=(docker --host unix:///run/docker.sock)',
+    'exec "${docker_cmd[@]}" run --rm -i',
+    "--network net-vault",
+    "--user 65532:65532",
+    "--read-only",
+    "--cap-drop ALL",
+    "--security-opt no-new-privileges:true",
+    "--log-driver none",
+    "sys.stdin.buffer.read(8193)",
+    "urllib.request.ProxyHandler({})",
+    "RejectRedirects()",
+    '"file_path": "/vault/logs/audit.log"',
+    '"hmac_accessor": "true"',
+    '"log_raw": "false"',
+    '"mode": "0640"',
+):
+    assert required in text, required
+assert "VAULT_ROOT_TOKEN" not in text
+PY
 grep -Fq 'common_name="*.$DOMAIN" alt_names="$DOMAIN"' "$ROOT/scripts/vault-pki-intermediate.sh"
 
 # ── Edge TLS / PKI contract ─────────────────────────────────────────────────
@@ -541,6 +570,7 @@ if ansible.is_file():
         "validate-compose.sh",
         "validate-identity-policy.py",
         "validate-vault-config.sh",
+        "vault-enable-audit.sh",
         "vault-oidc-setup.sh",
         "vault-pki-intermediate.sh",
         "vault-unseal.sh",

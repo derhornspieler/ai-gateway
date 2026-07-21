@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import uuid
@@ -53,6 +54,7 @@ JOB_PREFIX = "rotate_"
 JWKS_WATCH_JOB_ID = "sys_jwks_watch"
 SETTINGS_RECOVERY_JOB_ID = "sys_settings_recovery"
 CREDENTIAL_PRESENCE_JOB_ID = "sys_litellm_credential_presence"
+VAULT_STATE_JOB_ID = "sys_vault_state"
 PORTAL_KEY_RECONCILE_JOB_ID = "sys_portal_key_reconciliation"
 PORTAL_KEY_RECONCILE_LOCK = "portal-key-reconciliation"
 PORTAL_KEY_RECONCILE_HEALTH = "identity.portal_key_reconciliation"
@@ -128,6 +130,7 @@ class RotationScheduler:
         self._drivers = drivers
         self._identity = identity
         self._scheduler = AsyncIOScheduler()
+        self._last_vault_state: str | None = None
         # Per-vendor mutual exclusion: manual (POST /rotate/{vendor}) and
         # scheduled runs both execute run_rotation in this one process, so
         # an asyncio.Lock per vendor is sufficient. A second concurrent
@@ -228,6 +231,19 @@ class RotationScheduler:
             coalesce=True,
             misfire_grace_time=60,
         )
+        # Report only the first observed state and later transitions. This
+        # gives the SOC a bounded seal/unseal trail without polling noise or
+        # exposing Vault response details.
+        self._scheduler.add_job(
+            self._observe_vault_state,
+            trigger=IntervalTrigger(seconds=15),
+            id=VAULT_STATE_JOB_ID,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+            next_run_time=datetime.now(timezone.utc),
+        )
         # Bound the inference outage after a LiteLLM restart. LiteLLM reloads
         # runtime /credentials into its in-memory list only on create, not on
         # restart, so a restarted proxy drops the credential from memory (the
@@ -247,8 +263,61 @@ class RotationScheduler:
             next_run_time=datetime.now(timezone.utc),
         )
         logger.info(
-            "system jobs scheduled (settings recovery, credential presence, jwks watch, "
-            "portal-key reconciliation)"
+            "system jobs scheduled (settings recovery, credential presence, vault state, "
+            "jwks watch, portal-key reconciliation)"
+        )
+
+    @staticmethod
+    def _security_event(event: str, action: str, outcome: str, **fields: str) -> None:
+        document = {
+            "schema_version": 1,
+            "event": event,
+            "action": action,
+            "outcome": outcome,
+            **fields,
+        }
+        logger.info(
+            "AIGW_SECURITY_EVENT %s",
+            json.dumps(document, separators=(",", ":"), sort_keys=True),
+        )
+
+    async def _observe_vault_state(self) -> None:
+        try:
+            status = self._vault.public_status()
+        except Exception:  # noqa: BLE001 - emit only a fixed unavailable state
+            state = "unavailable"
+        else:
+            if status == {"initialized": True, "sealed": False}:
+                state = "unsealed"
+            elif status == {"initialized": True, "sealed": True}:
+                state = "sealed"
+            elif status == {"initialized": False, "sealed": True}:
+                state = "uninitialized"
+            else:
+                state = "unavailable"
+        if state == self._last_vault_state:
+            return
+        self._last_vault_state = state
+        self._security_event(
+            "aigw.vault.state",
+            "state_observed",
+            "success" if state == "unsealed" else "failure",
+            state=state,
+        )
+
+    def _audit_rotation_result(self, vendor: str, result: RotationResult) -> None:
+        safe_vendor = vendor if vendor in self._drivers else "unknown"
+        safe_status = (
+            result.status
+            if result.status in {"success", "failed", "skipped", "disabled"}
+            else "failed"
+        )
+        self._security_event(
+            "aigw.provider.rotation",
+            "rotate",
+            "success" if safe_status == "success" else "failure",
+            vendor=safe_vendor,
+            rotation_status=safe_status,
         )
 
     async def _recover_schedule(self) -> None:
@@ -869,7 +938,9 @@ class RotationScheduler:
         driver = self._drivers.get(vendor)
         if driver is None:
             logger.warning("run_rotation: no driver registered for vendor=%s", vendor)
-            return RotationResult(status="failed", detail="no driver registered")
+            result = RotationResult(status="failed", detail="no driver registered")
+            self._audit_rotation_result(vendor, result)
+            return result
 
         # Per-vendor mutual exclusion (manual vs scheduled): a second
         # attempt is skipped fast and audited — never queued behind the
@@ -882,7 +953,9 @@ class RotationScheduler:
             )
             logger.warning("run_rotation: vendor=%s %s", vendor, detail)
             await self._db.record_history(vendor, "rotate", "skipped", detail)
-            return RotationResult(status="skipped", detail=detail)
+            result = RotationResult(status="skipped", detail=detail)
+            self._audit_rotation_result(vendor, result)
+            return result
 
         async with lock:
             async with self._db.rotation_lock(self._lock_domain(vendor)) as acquired:
@@ -892,9 +965,12 @@ class RotationScheduler:
                     )
                     logger.warning("run_rotation: vendor=%s %s", vendor, detail)
                     await self._db.record_history(vendor, "rotate", "skipped", detail)
-                    return RotationResult(status="skipped", detail=detail)
+                    result = RotationResult(status="skipped", detail=detail)
+                    self._audit_rotation_result(vendor, result)
+                    return result
                 result = await self._run_rotation_locked(vendor, driver)
         await self._reconcile_oneshot_lifecycle(vendor, result)
+        self._audit_rotation_result(vendor, result)
         return result
 
     async def _reconcile_oneshot_lifecycle(

@@ -298,6 +298,22 @@ bootstrap script on production. The controller handoff example is
 Protect all recovery shares and the first root token. Do not place them in Git,
 logs, tickets, or chat.
 
+Before you store or revoke the first root token, enable the reviewed file audit
+device on the target VM. Run this from `/opt/ai-gateway`:
+
+```bash
+sudo -v
+read -rsp 'First Vault root token: ' AIGW_FIRST_ROOT_TOKEN; printf '\n'
+printf '%s\n' "$AIGW_FIRST_ROOT_TOKEN" | sudo scripts/vault-enable-audit.sh
+unset AIGW_FIRST_ROOT_TOKEN
+```
+
+The helper accepts the token only on stdin. It enables JSON audit records at
+`/vault/logs/audit.log`, keeps raw values HMAC-protected, sets mode `0640`, and
+reads the live Vault configuration back. The second Ansible converge refuses
+an initialized Vault when this file is missing, empty, unreadable by Alloy, or
+not JSON-shaped.
+
 ### Step 7b — Store one encrypted unseal key on the controller
 
 Use the stdin-only helper:

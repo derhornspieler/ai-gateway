@@ -2710,6 +2710,45 @@ def bootstrap_vault(args: argparse.Namespace) -> None:
             fail("Vault did not accept the local preprod unseal share")
 
     root_token = document["root_token"]
+    desired_audit = {
+        "file_path": "/vault/logs/audit.log",
+        "format": "json",
+        "hmac_accessor": "true",
+        "log_raw": "false",
+        "mode": "0640",
+    }
+    status, audit_devices = vault_call(
+        args, "GET", "/v1/sys/audit", token=root_token
+    )
+    if status != 200 or not isinstance(audit_devices, dict):
+        fail("Vault audit-device inspection failed")
+    file_audit = audit_devices.get("file/")
+    if file_audit is None:
+        status, _ = vault_call(
+            args,
+            "PUT",
+            "/v1/sys/audit/file",
+            body={"type": "file", "options": desired_audit},
+            token=root_token,
+        )
+        if status not in {200, 204}:
+            fail("Vault file audit-device setup failed")
+    status, audit_devices = vault_call(
+        args, "GET", "/v1/sys/audit", token=root_token
+    )
+    file_audit = audit_devices.get("file/") if isinstance(audit_devices, dict) else None
+    options = file_audit.get("options") if isinstance(file_audit, dict) else None
+    if (
+        status != 200
+        or not isinstance(file_audit, dict)
+        or file_audit.get("type") != "file"
+        or not isinstance(options, dict)
+        or any(
+            str(options.get(key, "")).lower() != value
+            for key, value in desired_audit.items()
+        )
+    ):
+        fail("Vault file audit-device configuration did not verify")
     status, mounts = vault_call(args, "GET", "/v1/sys/mounts", token=root_token)
     if status != 200:
         fail("Vault mount inspection failed")

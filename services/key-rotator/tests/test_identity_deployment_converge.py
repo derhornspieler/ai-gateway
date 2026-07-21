@@ -262,6 +262,11 @@ async def test_complete_deployment_is_live_proved_and_idempotent() -> None:
         "success",
         {"changed": False, "ldap_provider": "corp-ad"},
     )
+    assert (
+        "break_glass_use",
+        "success",
+        {"purpose": "deployment_converge"},
+    ) in admin.audit_calls
 
 
 @pytest.mark.asyncio
@@ -395,7 +400,30 @@ async def test_bad_bind_stops_before_callbacks_cleanup_or_success_audit() -> Non
 
     assert admin.callback_calls == 0
     assert admin.cleanup_calls == 0
-    assert admin.audit_calls == []
+    assert admin.audit_calls == [
+        (
+            "break_glass_use",
+            "success",
+            {"purpose": "deployment_converge"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deployment_failure_audit_contains_only_the_error_type() -> None:
+    admin = DeploymentHarness()
+
+    await admin.audit_deployment_failure(
+        IdentityConflict("secret LDAP bind password from upstream")
+    )
+
+    assert admin.audit_calls == [
+        (
+            "deployment_converge",
+            "failed",
+            {"error_type": "IdentityConflict"},
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -432,7 +460,13 @@ async def test_final_status_must_still_be_strictly_complete(monkeypatch) -> None
 
     with pytest.raises(IdentityError, match="did not verify"):
         await admin.converge_deployment_identity()
-    assert admin.audit_calls == []
+    assert admin.audit_calls == [
+        (
+            "break_glass_use",
+            "success",
+            {"purpose": "deployment_converge"},
+        )
+    ]
 
 
 class CleanupHarness(KeycloakAdmin):

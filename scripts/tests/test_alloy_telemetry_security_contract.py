@@ -371,8 +371,22 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "\n}\n", 1
         )[0]
         self.assertIn("loki.write.local.receiver", vault)
-        self.assertNotIn("cribl", vault.lower())
+        self.assertIn("loki.process.cribl_vault_audit.receiver", vault)
         self.assertNotIn("otelcol.receiver", vault)
+        vault_security = self.alloy.split(
+            'loki.process "cribl_vault_audit"', 1
+        )[1].split('otelcol.receiver.loki "cribl_security_logs"', 1)[0]
+        for required in (
+            "event=aigw.vault.audit",
+            "hmac_protected=true",
+            'aigw_security_event_class = "vault_audit"',
+            'vault_type!~\\"request|response\\"',
+            'vault_operation!~\\"create|delete|list|patch|read|update\\"',
+            "otelcol.receiver.loki.cribl_security_logs.receiver",
+        ):
+            self.assertIn(required, vault_security)
+        self.assertNotIn('{{ .vault_error }}', vault_security)
+        self.assertNotIn('{{ .vault_path }}', vault_security)
 
     def test_security_classifiers_are_exact_and_non_recursive(self) -> None:
         keycloak = self.alloy.split(
@@ -397,6 +411,8 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         for event in (
             "aigw.portal.audit",
             "aigw.identity.audit",
+            "aigw.provider.rotation",
+            "aigw.vault.state",
             "aigw.egress.trust",
         ):
             self.assertIn(event, structured)
@@ -409,6 +425,11 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         # survive both Alloy and LogQL string parsing, and a single escaped
         # dot makes Alloy fail at startup.
         self.assertIn('security_action!~\\"key[.]generate|key[.]deactivate|', structured)
+        self.assertIn('security_vendor!~\\"anthropic|static-anthropic\\"', structured)
+        self.assertIn(
+            'security_state!~\\"sealed|unsealed|uninitialized|unavailable\\"',
+            structured,
+        )
         self.assertNotIn('security_action!~\\"key\\\\.generate', structured)
 
         # Alloy and the mock sink never enter either positive classifier, so

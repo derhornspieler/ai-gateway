@@ -444,12 +444,16 @@ async def test_identity_deployment_route_is_admin_only_confirmed_and_redacted() 
         def __init__(self) -> None:
             self.calls = 0
             self.fail = False
+            self.failure_types = []
 
         async def converge_deployment_identity(self):
             self.calls += 1
             if self.fail:
                 raise IdentityError("secret LDAP bind password from upstream")
             return "verified"
+
+        async def audit_deployment_failure(self, error):
+            self.failure_types.append(type(error).__name__)
 
     identity = Identity()
     try:
@@ -494,6 +498,7 @@ async def test_identity_deployment_route_is_admin_only_confirmed_and_redacted() 
             assert failed.status_code == 502
             assert failed.json() == {"detail": "identity deployment failed"}
             assert "password" not in failed.text
+            assert identity.failure_types == ["IdentityError"]
     finally:
         state.clear()
         state.update(old_state)
@@ -675,6 +680,77 @@ class SchedulerVault:
     def ready(self) -> bool:
         self.ready_calls += 1
         return self.is_ready
+
+
+def test_provider_rotation_security_event_is_bounded(caplog) -> None:
+    scheduler = RotationScheduler(
+        settings(), object(), object(), object(), {"anthropic": object()}
+    )
+
+    with caplog.at_level("INFO", logger="key_rotator.scheduler"):
+        scheduler._audit_rotation_result(
+            "anthropic",
+            RotationResult(status="success", detail="secret provider response"),
+        )
+        scheduler._audit_rotation_result(
+            "unreviewed-vendor",
+            RotationResult(status="unexpected", detail="another secret"),
+        )
+
+    security_lines = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("AIGW_SECURITY_EVENT ")
+    ]
+    assert security_lines == [
+        'AIGW_SECURITY_EVENT {"action":"rotate","event":"aigw.provider.rotation",'
+        '"outcome":"success","rotation_status":"success","schema_version":1,'
+        '"vendor":"anthropic"}',
+        'AIGW_SECURITY_EVENT {"action":"rotate","event":"aigw.provider.rotation",'
+        '"outcome":"failure","rotation_status":"failed","schema_version":1,'
+        '"vendor":"unknown"}',
+    ]
+    assert "provider response" not in caplog.text
+    assert "another secret" not in caplog.text
+    assert "unreviewed-vendor" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_vault_state_security_event_emits_only_transitions(caplog) -> None:
+    class VaultStates:
+        def __init__(self) -> None:
+            self.states = [
+                {"initialized": False, "sealed": True},
+                {"initialized": False, "sealed": True},
+                {"initialized": True, "sealed": True},
+                {"initialized": True, "sealed": False},
+                VaultError("secret transport detail"),
+            ]
+
+        def public_status(self):
+            state = self.states.pop(0)
+            if isinstance(state, Exception):
+                raise state
+            return state
+
+    scheduler = RotationScheduler(
+        settings(), object(), VaultStates(), object(), {}
+    )
+    with caplog.at_level("INFO", logger="key_rotator.scheduler"):
+        for _ in range(5):
+            await scheduler._observe_vault_state()
+
+    security_lines = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("AIGW_SECURITY_EVENT ")
+    ]
+    assert len(security_lines) == 4
+    assert '"state":"uninitialized"' in security_lines[0]
+    assert '"state":"sealed"' in security_lines[1]
+    assert '"state":"unsealed"' in security_lines[2]
+    assert '"state":"unavailable"' in security_lines[3]
+    assert "secret transport detail" not in caplog.text
 
 
 class SchedulerDB:

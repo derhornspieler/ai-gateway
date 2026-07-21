@@ -615,6 +615,7 @@ async def identity_deployment(body: IdentityDeploymentRequest) -> dict[str, str]
     try:
         return {"result": await identity.converge_deployment_identity()}
     except IdentityError as exc:
+        await identity.audit_deployment_failure(exc)
         # This endpoint exists only for unattended deployment. Keep its
         # response fixed so a wrapped directory or Vault diagnostic can never
         # become Ansible output, even if a future IdentityError is less careful.

@@ -675,6 +675,7 @@
       - validate-compose.sh
       - validate-identity-policy.py
       - validate-vault-config.sh
+      - vault-enable-audit.sh
       - vault-oidc-setup.sh
       - vault-pki-intermediate.sh
       - vault-unseal.sh
@@ -3332,6 +3333,54 @@
       Initialization is a separate explicit ceremony and must never be
       inferred or made destructive by a normal converge.
   when: not ((vault_status_before_unseal.stdout | from_json).initialized | bool)
+
+- name: Require the reviewed Vault file audit device after initialization
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - run
+      - --rm
+      - --pull
+      - never
+      - --network
+      - none
+      - --user
+      - 473:473
+      - --read-only
+      - --cap-drop
+      - ALL
+      - --security-opt
+      - no-new-privileges:true
+      - --volume
+      - "{{ compose_project_name }}_vault_audit:/audit:ro"
+      - dhi.io/busybox:1.38.0-alpine@sha256:69a25015bda2c7dfac5d3a88990b56bc0f38539b313c448b171edef1497193ad
+      - /bin/sh
+      - -ec
+      - >-
+        test -f /audit/audit.log;
+        test ! -L /audit/audit.log;
+        test -r /audit/audit.log;
+        test -s /audit/audit.log;
+        test "$(head -c 1 /audit/audit.log)" = '{'
+  register: vault_audit_file_contract
+  changed_when: false
+  failed_when: false
+  when: (vault_status_before_unseal.stdout | from_json).initialized | bool
+
+- name: Explain how to repair a missing Vault audit device
+  ansible.builtin.assert:
+    that:
+      - vault_audit_file_contract.rc == 0
+    quiet: true
+    fail_msg: >-
+      Vault is initialized, but /vault/logs/audit.log is missing, empty,
+      unsafe, or unreadable by Alloy. Use a reviewed temporary Vault root
+      token on the target: pipe it on stdin to
+      scripts/vault-enable-audit.sh, then run this converge again. Never put
+      that token in inventory, argv, an environment variable, or a log.
+  when: (vault_status_before_unseal.stdout | from_json).initialized | bool
 
 # A genuinely fresh Vault remains uninitialized/sealed on first converge so
 # the operator can execute the reviewed bootstrap ceremony. Every initialized

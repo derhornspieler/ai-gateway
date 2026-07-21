@@ -3551,6 +3551,7 @@ class KeycloakAdmin:
                 "error_type",
                 "federation_configured",
                 "ldap_provider",
+                "purpose",
                 "project",
                 "temporary_bootstrap_service_deleted",
                 "break_glass_admin_ensured",
@@ -3567,6 +3568,15 @@ class KeycloakAdmin:
         logger.info(
             "AIGW_SECURITY_EVENT %s",
             json.dumps(event, separators=(",", ":"), sort_keys=True),
+        )
+
+    async def audit_deployment_failure(self, error: Exception) -> None:
+        """Emit a fixed failure summary without leaking LDAP or Vault detail."""
+
+        await self._audit(
+            "deployment_converge",
+            "failed",
+            {"error_type": type(error).__name__},
         )
 
     async def _bootstrap_locked(self) -> dict[str, Any]:
@@ -3816,6 +3826,11 @@ class KeycloakAdmin:
                 changed = True
 
             admin_token = await self._break_glass_admin_token()
+            await self._audit(
+                "break_glass_use",
+                "success",
+                {"purpose": "deployment_converge"},
+            )
             changed = (
                 await self._reconcile_security_event_logging(admin_token) or changed
             )
