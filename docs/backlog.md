@@ -16,10 +16,10 @@ documentation gate checks:
 - navigation between related pages.
 
 The diagrams and main design guides were checked against the deployed code.
-The release test uses the offline seed in local Docker. It does not use a Rocky
-or Parallels test VM.
+The release test uses the offline seed in local Docker preprod. It does not use
+a Rocky or Parallels test VM.
 
-One human review remains:
+One human plain language review remains:
 
 1. Ask a new operator to follow local preprod with no verbal help.
 2. Ask a production operator to review the production commands.
@@ -65,7 +65,7 @@ The remaining job needs production-sized test data:
 1. Create a large, realistic PostgreSQL 16 test backup.
 2. Run the full encrypted backup and logical 16-to-18 migration.
 3. Test every database client after cutover.
-4. Force a pre-cutover failure and prove the PostgreSQL 16 rollback.
+4. Force a failure before cutover and prove the pre-cutover PostgreSQL 16 rollback.
 5. Force a post-cutover failure and prove downgrade is refused.
 6. Restore a PostgreSQL 18 physical backup on a clean approved host.
 
@@ -74,7 +74,7 @@ may have been a careful first choice, but that is only an inference.
 
 ## Review every container image version
 
-For each runtime and build image, record:
+For each DHI and non-DHI image, including build images, record:
 
 - current pin and digest;
 - newest supported stable release;
