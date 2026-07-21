@@ -46,7 +46,7 @@ Toolchain is pinned in each service's `requirements-dev.txt` (ruff 0.15.21, pyte
 ### Go modules (services/{dhi-health-probe,egress-proxy,vault-ui-proxy} — stdlib-only, no go.sum)
 
 ```bash
-cd services/<module> && go test -race ./... && go vet ./...   # Go 1.25.x; three independent modules
+cd services/<module> && go test -race ./... && go vet ./...   # Go 1.26.x; four independent modules
 ```
 
 Dockerfiles also run tests during `docker build` with `RUN --network=none`, so Go tests must never need network.
