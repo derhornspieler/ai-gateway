@@ -55,6 +55,12 @@ new preprod archive, and deployed once with Ansible in seed mode.
 The clean-room receipt removed 26 containers, 19 networks, 11 volumes, and 43
 release image IDs. It preserved 129 unrelated image IDs.
 
+After the documentation overhaul, the same `r10` preprod seed was tested again
+from a full clean room. The repeat removed the same owned resources and release
+images, preserved the same 129 unrelated image IDs, loaded the archive again,
+and performed one Ansible seed-mode deploy with pulls and source builds
+disabled. All 25 long-running containers were healthy at the end.
+
 The final markers were:
 
 ```text

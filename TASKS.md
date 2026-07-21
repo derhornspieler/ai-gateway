@@ -280,6 +280,10 @@
   - The exact seeded portal image contains the automatic-setup wording. A
     later comment-only provider wording change was reconverged against the
     same seed and passed the full acceptance and Cribl recovery gates again.
+  - After the documentation overhaul, the same `r10` preprod archive passed a
+    second full clean-room load and one Ansible seed-mode deploy. Pulls and
+    source builds stayed disabled, all three success markers returned, and all
+    25 long-running containers were healthy.
 - [x] ~~Run the credential-gated release rehearsal~~ (2026-07-21)
   - Release r7 built a schema-v2 ARM64 production archive with 40 images and a
     preprod archive with 43 images. The clean-room play removed only the owned
