@@ -1,15 +1,12 @@
-# AI Gateway — Technical Diagrams
+# AI Gateway technical diagrams
 
-This document is the visual companion to the
-[solution map](solution-map.md). Each diagram reflects the implemented
-configuration in `compose/`, `ansible/`, and `services/`; where a diagram
-simplifies, the solution map's tables remain authoritative. Diagrams render
-natively on GitHub/GitLab (Mermaid). Provider catalog and CA review details
-are in [Provider onboarding](provider-onboarding.md) and the
-[Provider CA maintenance SOP](sop/provider-ca-maintenance.md).
+These pictures match the current code in `compose/`, `ansible/`, and
+`services/`. The [solution map](solution-map.md) has the exact service tables.
+The [security model](security-model.md) explains the controls in plain words.
 
-For a short explanation of the controls behind these pictures, read the
-[security model](security-model.md).
+GitHub renders these Mermaid diagrams. Provider details are in
+[provider onboarding](provider-onboarding.md) and the
+[CA maintenance SOP](sop/provider-ca-maintenance.md).
 
 ## Diagram index
 
@@ -30,9 +27,9 @@ For a short explanation of the controls behind these pictures, read the
 
 ## 1. Network topology and trust zones
 
-Three customer-owned interfaces map to three firewalld zones with distinct
-inbound policy. Nothing publishes a listener on the egress leg; only the two
-Traefik edges publish container ports, each bound to its exact host address.
+Production has three customer-owned connections. Each has its own firewalld
+zone. Egress has no listener. The two Traefik edges bind only to the exact ADM
+and internal addresses.
 
 ```mermaid
 flowchart TB
@@ -60,21 +57,20 @@ flowchart TB
   USERS -->|user HTTPS| NIC2 --> TI
 ```
 
-Reply traffic for the ADM and internal legs uses source-policy routing
-(tables 101/102) so responses leave through the interface they arrived on.
+Route tables 101 and 102 send ADM and internal replies back through the same
+connection.
 
 ## 2. Local preprod topology
 
-Local preprod runs on one local Docker engine. It keeps the production service
-networks but replaces physical host interfaces with three labeled Docker
-planes. Only the two loopback HTTPS addresses are published. The exact
-production Envoy image starts from the offline seed and its policy is checked.
-The mock WIF request path stays separate, so test trust can never enter that
-production Envoy image.
+Local preprod runs on one Docker engine. Three Docker planes stand in for the
+host connections. Only `127.0.2.1:443` and `127.0.3.1:443` are published.
 
-Docker Desktop requires one preprod-only Envoy TCP forwarder to own both IPv4
-port 443 publications. It passes TLS through unchanged to the separate
-Internal and ADM Traefik containers. This workaround is not in production.
+The exact production Envoy image comes from the seed and must pass its policy
+gate. A separate test Envoy handles mock WIF. Test CA trust never enters the
+production image.
+
+Docker Desktop needs one test-only TCP forwarder to own both port 443 binds.
+It passes TLS to the two Traefik edges. Production does not use this helper.
 
 ```mermaid
 flowchart LR
@@ -101,7 +97,8 @@ flowchart LR
   SEED --> ANS --> APPS
   CLIENT -->|user names| PNI --> TI --> APPS
   CLIENT -->|admin names| PNA --> TA --> APPS
-  AD -->|LDAPS| KC --> APPS
+  KC -->|LDAPS| AD
+  KC --> APPS
   KR --> WEV --> WIF
   EV --- PNE
   CA -.signs edge, LDAPS,<br/>and mock certificates.-> TI
@@ -110,22 +107,19 @@ flowchart LR
   CA -.-> WIF
 ```
 
-See [Local preprod](preprod.md) for the exact names, addresses, static users,
-and bounded destroy command.
+See [local preprod](preprod.md) for names, addresses, users, and destroy steps.
 
 ## 3. Segmented container planes
 
-The stack pre-creates 20 Docker bridges and uses 18 in the base profile;
-services join only the planes they need, and both an atomic `DOCKER-USER`
-chain and an independent native nftables guard (`aigw_guard`) deny
-cross-plane, container-to-host, and unapproved egress traffic. The full
-per-bridge membership table is in the solution map.
+Ansible creates 20 Docker bridges. The base stack uses 18. Services join only
+the planes they need. `DOCKER-USER` and `aigw_guard` deny cross-plane,
+container-to-host, and unsafe outbound traffic.
 
 ```mermaid
 flowchart LR
   subgraph edge [Edge planes]
-    E1[net-internal / net-int-edge<br/>traefik-int + user apps]
-    E2[net-adm / net-admin-app / net-grafana<br/>traefik-adm + admin gates]
+    E1[net-int-edge: traefik-int<br/>net-internal: exact external paths]
+    E2[net-adm: traefik-adm<br/>net-admin-app / net-grafana: admin apps]
   end
   subgraph app [Application planes]
     A1[net-chat / net-portal<br/>Open WebUI, portals, LiteLLM, Keycloak]
@@ -168,8 +162,10 @@ flowchart LR
   TA --> O2[up to 4 oauth2-proxy gates] -->|aigw-admins| ADM_UIS[LiteLLM Admin / Grafana / Prometheus / optional Vault UIs]
   TA -->|auth.DOMAIN full console| KC
 
-  DP -->|key lifecycle| KR[key-rotator]
+  DP -->|live project checks| KR[key-rotator]
+  DP -->|create and manage own keys| LL
   AP -->|identity + rotation control| KR
+  AP -->|admin key controls| LL
   LL -->|selected provider path| EV[Envoy egress] --> V[Selected provider APIs]
   KR --> EV
   LL & KC & KR --> PG[(Postgres)]
@@ -179,10 +175,10 @@ flowchart LR
 
 ## 5. Authentication flow — browser OIDC and admin gates
 
-All human access authenticates against Keycloak realm `aigw`, which emits
-the four realm roles (`aigw-chat`, `aigw-users` (deprecated for chat),
-`aigw-developers`, `aigw-admins`) in a
-`roles` claim. Admin UIs sit behind dedicated oauth2-proxy instances.
+All people sign in through Keycloak realm `aigw`. It sends four roles in the
+`roles` claim: `aigw-chat`, old `aigw-users`, `aigw-developers`, and
+`aigw-admins`. Each proxied admin UI has its own OAuth2 Proxy. Chat and both
+portals use OIDC in the app.
 
 ```mermaid
 sequenceDiagram
@@ -191,32 +187,41 @@ sequenceDiagram
   participant T as Traefik edge
   participant P as oauth2-proxy (admin UIs only)
   participant K as Keycloak (realm aigw)
-  participant S as Upstream service
+  participant S as App or admin UI
 
   B->>T: HTTPS request
-  T->>P: route (ADM admin UIs) / direct OIDC app (chat, portals)
-  P->>B: redirect to Keycloak authorization endpoint
-  B->>K: authenticate (directory-federated user)
-  K-->>B: authorization code
-  B->>P: callback with code
-  P->>K: exchange code, validate roles claim
-  alt roles include required role
-    P->>S: proxy request (encrypted session cookie)
-    S-->>B: application response
-  else missing role
-    P-->>B: access denied
+  alt Proxied admin UI
+    T->>P: route to its dedicated gate
+    P-->>B: redirect to Keycloak
+    B->>K: authenticate
+    K-->>B: authorization code
+    B->>P: callback with code
+    P->>K: exchange code and check admin role
+    alt admin role present
+      P->>S: send approved request
+      S-->>B: response
+    else admin role missing
+      P-->>B: access denied
+    end
+  else Chat or portal app
+    T->>S: route to app
+    S-->>B: redirect to Keycloak
+    B->>K: authenticate
+    K-->>B: authorization code
+    B->>S: callback with code
+    S->>K: exchange code and check required role
+    S-->>B: app response or access denied
   end
 ```
 
-Admin-portal mutations additionally require a CSRF token and a fresh
-Keycloak step-up (`prompt=login`, `max_age=0`) within a five-minute window,
-and every page read re-checks the caller's live composite roles — a revoked
-administrator fails closed even with a valid session cookie.
+Admin portal writes also need a CSRF token and a fresh Keycloak login. The
+step-up uses `prompt=login` and `max_age=0` and lasts five minutes. Each page
+checks the live admin role again.
 
 ## 6. Logic flow — developer key lifecycle
 
-Group membership in Keycloak is the authorization source; LiteLLM virtual
-keys are always derived from it and revoked with it.
+Keycloak group membership grants project access. Portal keys follow that live
+membership.
 
 ```mermaid
 flowchart TD
@@ -224,7 +229,7 @@ flowchart TD
   AUTHZ -- no --> DENY([Denied])
   AUTHZ -- yes --> PROJ{Live member of a managed<br/>project group? — verified via key-rotator}
   PROJ -- no --> DENY
-  PROJ -- yes --> MINT[key-rotator mints scoped LiteLLM virtual key<br/>project ID = group name in key metadata]
+  PROJ -- yes --> MINT[dev-portal calls LiteLLM to mint a scoped key<br/>project ID = group name in key metadata]
   MINT --> SHOW[One-time plaintext key shown once<br/>never stored or logged]
   SHOW --> USE[AI tool calls api.DOMAIN /v1 with key]
   REM([Admin removes member from group]) --> KILL[key-rotator logs user out of Keycloak<br/>and deactivates that subject's project keys<br/>before and after the membership change]
@@ -232,13 +237,12 @@ flowchart TD
 
 ## 7. Security flow — provider credential rotation (Anthropic WIF)
 
-No long-lived vendor API key sits in application configuration. key-rotator
-brokers a short-lived Anthropic token through Keycloak's isolated
-`anthropic-wif` realm using `private_key_jwt`; the private key exists only
-in Vault in the production path. The component also supports a separately
-configured mounted PEM for bounded test or integration use. That signing key
-is a credential, not a provider CA bundle. Provider CA bundles are baked into
-the immutable Envoy image. Every vendor call leaves through Envoy.
+No long-lived Anthropic key sits in app config. key-rotator gets a short-lived
+token through the separate `anthropic-wif` realm. Production keeps the
+`private_key_jwt` key in Vault. A reviewed test can use a mounted PEM instead.
+
+The signing key is not a provider CA. Provider CA files are built into the
+immutable Envoy image. Every provider call goes through Envoy.
 
 ```mermaid
 sequenceDiagram
@@ -251,24 +255,25 @@ sequenceDiagram
 
   KR->>VT: read client private key<br/>(ai-gateway/anthropic-wif-client-key)
   KR->>KC: token request as anthropic-token-broker<br/>client assertion: private_key_jwt (RS256, 3072-bit)
-  KC-->>KR: workload identity JWT<br/>sub=service-account-anthropic-token-broker<br/>aud contains https://api.anthropic.com (600 s lifespan)
+  KC-->>KR: workload identity JWT<br/>sub=service-account-anthropic-token-broker<br/>aud=https://api.anthropic.com (600 s lifespan)
   KR->>EV: POST /v1/oauth/token (WIF exchange)
   EV->>AN: pinned TLS, exact SAN, narrowed CA
-  AN-->>KR: short-lived sk-ant-oat01 access token
+  AN-->>EV: short-lived sk-ant-oat01 access token
+  EV-->>KR: return token
   KR->>KR: install token as LiteLLM provider credential<br/>(anthropic-primary), schedule refresh
 ```
 
 ## 8. Security design — layered enforcement
 
-Each layer fails closed independently; compromising one does not disable the
-others.
+Each layer fails closed on its own. One failed layer does not switch off the
+rest.
 
 ```mermaid
 flowchart TB
   L1[Host ingress — firewalld zones:<br/>exact source CIDRs, SSH key-only on ADM,<br/>no egress-leg listener]
   L2[Packet policy — atomic DOCKER-USER +<br/>independent nftables aigw_guard:<br/>deny cross-plane, container-to-host,<br/>unapproved bridge egress]
   L3[Network segmentation — 20 isolated bridges;<br/>the base stack joins 18 as needed;<br/>fixed IPs for firewall-addressed workloads]
-  L4[Identity — Keycloak OIDC everywhere;<br/>role-based access; per-UI oauth2-proxy gates;<br/>step-up + live-role re-checks for admin mutations]
+  L4[Identity — Keycloak OIDC for people;<br/>gateway keys for API tools; per-UI oauth2-proxy gates;<br/>step-up + live-role re-checks for admin mutations]
   L5["Secrets — Vault-backed provider credentials;<br/>file-backed where the service supports it;<br/>no secret in command arguments;<br/>fail-closed required-variable contract"]
   L6[Runtime — SELinux enforcing with per-container MCS;<br/>non-root DHI images, digest-pinned;<br/>read-only binds with keyed HMAC digests;<br/>no Docker socket exposure]
   L7[Egress — Envoy as the only external identity:<br/>selected routes, exact SANs, reviewed CA bundles]
@@ -277,14 +282,13 @@ flowchart TB
 
 ## 9. Telemetry and SOC log flow
 
-Prompts and completions are sensitive. Alloy converts the reviewed
-`litellm_request` span into a log record. The raw span never leaves the gateway.
-The log stays locally in Loki and may enter the narrow Cribl SOC feed.
+Prompts and replies are sensitive. Alloy turns the reviewed `litellm_request`
+span into a log. The raw span never leaves the gateway. The log stays in Loki
+and may enter the narrow Cribl SOC feed.
 
-Metrics, raw traces, ordinary service logs, and alert payloads never enter
-Cribl. Detailed routes and redaction rules are in
-[observability operations](observability-operations.md). The logging-team
-contract is in [Cribl SOC logging handoff](cribl-soc-handoff.md).
+Metrics, raw traces, normal service logs, and alert data never enter Cribl.
+See [observability operations](observability-operations.md) and the
+[Cribl SOC handoff](cribl-soc-handoff.md).
 
 ```mermaid
 flowchart LR
@@ -304,15 +308,13 @@ flowchart LR
 
 ## 10. Deployment logic — Ansible converge order
 
-The converge is a gated pipeline: each stage validates its contract and the
-run stops at the first failure, before later stages can mutate the host.
-Stages R1–R6 are `ansible/os-prep.yml` (host preparation, runs standalone and
-starts no containers); R7–R9 are `ansible/deploy-stack-only.yml` (stack
-phase); `ansible/site.yml` composes the two in this exact order.
+The run stops at the first failed gate. `ansible/os-prep.yml` runs R1 through
+R6 and starts no containers. `ansible/deploy-stack-only.yml` runs R7 through
+R9. `ansible/site.yml` runs both files in that order.
 
 ```mermaid
 flowchart TD
-  R1[host_preflight<br/>topology, dedicated-host adoption,<br/>encrypted-state backing] --> R1b[firewall_preflight<br/>existing firewall-state audit]
+  R1[host_preflight<br/>topology, dedicated-host adoption,<br/>encrypted-state warning] --> R1b[firewall_preflight<br/>existing firewall-state audit]
   R1b --> R1c[time_sync<br/>proven synchronized clock<br/>before signed installs]
   R1c --> R2[selinux_baseline<br/>container-selinux, MCS contract,<br/>enforcing required]
   R2 --> R3[network_routing<br/>additive tables 101/102]
@@ -329,9 +331,8 @@ flowchart TD
 
 ## 11. Provider selection and immutable Envoy build
 
-Operators select reviewed names. They cannot pass a hostname or CA path. The
-same canonical policy is used to build the image and write both release
-projections.
+Operators select reviewed names. They cannot pass a hostname or CA path. One
+sorted policy drives the image and both seed files.
 
 ```mermaid
 flowchart LR
@@ -354,14 +355,13 @@ flowchart LR
   MAN --> PRE[Preprod offline seed<br/>production plus Samba AD and WIF mock]
 ```
 
-The catalog itself is not copied into the final image. The generated policy
-contains only the selected records. Changing the selection changes the policy
-and image identity.
+The catalog is not copied into the image. Only selected records enter the
+policy. A different selection creates a different policy and image ID.
 
 ## 12. Runtime request path for selected providers
 
-The host firewall leaves Envoy as the only external workload identity. Envoy
-has no catch-all provider route and no system-trust fallback.
+The host firewall lets only Envoy reach a provider. Envoy has no catch-all
+provider route and no system trust fallback.
 
 ```mermaid
 flowchart LR
@@ -380,8 +380,8 @@ flowchart LR
 
 ## 13. CA capture, review, rotation, and approval
 
-Live capture is evidence, not approval. The reviewed source and a new release
-must cross the release approval boundary before any CA reaches runtime.
+A live capture is only evidence. A separate review and release approval must
+pass before the CA can reach runtime.
 
 ```mermaid
 flowchart LR
@@ -405,19 +405,17 @@ flowchart LR
   CUTOVER --> FINAL[New reviewed release<br/>removes retired CA]
 ```
 
-Ansible does not enter this flow. It receives the already-built release and
-never downloads trust material.
+Ansible does not enter this flow. It receives the built release and never
+downloads trust files.
 
-The fingerprint in this flow proves certificate-byte integrity. The
-provenance record explains the capture and independent review. Neither one
-proves the CA organization's country, the endpoint's current geography, or
-provider data residency. Those are separate facts and need separate evidence.
+The fingerprint proves the certificate bytes. The provenance record explains
+the capture and review. Neither proves CA country, endpoint location, or data
+residency. Those need separate proof.
 
 ## 14. Offline-seed validation, deployment, and rollback
 
-The production and preprod files are separate projections from one build.
-Local preprod must pass using its exact seed before the production pair is
-transferred.
+One build makes separate production and preprod files. Local preprod must pass
+with its exact seed before anyone transfers the production pair.
 
 ```mermaid
 flowchart TD
