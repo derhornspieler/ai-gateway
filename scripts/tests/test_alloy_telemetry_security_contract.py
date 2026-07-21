@@ -166,10 +166,6 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "aigw.project.id",
             "aigw.api_key.id",
             "aigw.request.id",
-            "gen_ai.input.messages",
-            "gen_ai.output.messages",
-            "gen_ai.prompt.0.content",
-            "gen_ai.completion.0.content",
             "gen_ai.request.model",
             "gen_ai.usage.input_tokens",
             "http.response.status_code",
@@ -211,6 +207,18 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
                     f'where IsString(attributes["{prompt_attribute}"])'
                 ),
                 3,
+            )
+            escaped_attribute = prompt_attribute.replace(".", "\\\\.")
+            self.assertEqual(
+                span_sanitizer.count(
+                    f'delete_matching_keys(attributes, "^{escaped_attribute}$")'
+                ),
+                1,
+            )
+            self.assertIn(
+                f'where attributes["{prompt_attribute}"] != nil and not '
+                f'IsString(attributes["{prompt_attribute}"])',
+                span_sanitizer,
             )
 
         docker_logs = self.alloy.split('loki.process "docker"', 1)[1].split(

@@ -134,6 +134,13 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
       `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.completion.0.content"])`,
       `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.completion.0.content"])`,
       `replace_pattern(attributes["gen_ai.completion.0.content"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      // OTTL cannot recursively prove an array or map safe. Keep the reviewed
+      // string form after the replacements above, and remove every other
+      // representation before spanlogs can copy it into Loki or Cribl.
+      `delete_matching_keys(attributes, "^gen_ai\\.input\\.messages$") where attributes["gen_ai.input.messages"] != nil and not IsString(attributes["gen_ai.input.messages"])`,
+      `delete_matching_keys(attributes, "^gen_ai\\.output\\.messages$") where attributes["gen_ai.output.messages"] != nil and not IsString(attributes["gen_ai.output.messages"])`,
+      `delete_matching_keys(attributes, "^gen_ai\\.prompt\\.0\\.content$") where attributes["gen_ai.prompt.0.content"] != nil and not IsString(attributes["gen_ai.prompt.0.content"])`,
+      `delete_matching_keys(attributes, "^gen_ai\\.completion\\.0\\.content$") where attributes["gen_ai.completion.0.content"] != nil and not IsString(attributes["gen_ai.completion.0.content"])`,
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
       `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,

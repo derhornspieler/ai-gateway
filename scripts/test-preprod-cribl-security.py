@@ -55,6 +55,22 @@ def text(key, value):
 def integer(key, value):
     return {"key": key, "value": {"intValue": str(value)}}
 
+def string_array(key, value):
+    return {
+        "key": key,
+        "value": {"arrayValue": {"values": [{"stringValue": value}]}},
+    }
+
+def nested_string(key, value):
+    return {
+        "key": key,
+        "value": {
+            "kvlistValue": {
+                "values": [{"key": "content", "value": {"stringValue": value}}]
+            }
+        },
+    }
+
 def post(path, document):
     body = json.dumps(document, separators=(",", ":"))
     connection = http.client.HTTPConnection("alloy", 4318, timeout=10)
@@ -124,6 +140,28 @@ unattributed_span = {
         text("gen_ai.input.messages", "DENIED_UNATTRIBUTED_TRACE_" + token)
     ],
 }
+nested_prompt_span = {
+    "traceId": trace_id,
+    "spanId": token[3:] + token[:3],
+    "name": "litellm_request",
+    "kind": 2,
+    "startTimeUnixNano": now,
+    "endTimeUnixNano": str(int(now) + 1000),
+    "attributes": [
+        text("metadata.user_api_key_user_id", "nested-user-" + token),
+        text("metadata.user_api_key_hash", "c" * 64),
+        text("metadata.user_api_key_project_id", "receipt-project"),
+        text("metadata.user_api_key_end_user_id", "nested-user-" + token),
+        text("litellm.call_id", "nested-call-" + token),
+        text("gen_ai.request.model", "receipt-model"),
+        string_array(
+            "gen_ai.input.messages", "NESTED_PROMPT_ARRAY_SECRET_" + token
+        ),
+        nested_string(
+            "gen_ai.output.messages", "NESTED_PROMPT_MAP_SECRET_" + token
+        ),
+    ],
+}
 post(
     "/v1/traces",
     {
@@ -131,7 +169,12 @@ post(
             "resource": {"attributes": [text("service.name", "litellm")]},
             "scopeSpans": [{
                 "scope": {"name": "aigw.preprod.receipt"},
-                "spans": [allowed_span, denied_span, unattributed_span],
+                "spans": [
+                    allowed_span,
+                    denied_span,
+                    unattributed_span,
+                    nested_prompt_span,
+                ],
             }],
         }]
     },
@@ -652,6 +695,7 @@ def assert_initial_receipts(logs: str, token: str) -> None:
     allowed = (
         f"allowed-ai-input-{token}",
         f"allowed-ai-output-{token}",
+        f"nested-call-{token}",
         "<redacted-credential>",
         "<redacted-authorization>",
         "<redacted-vendor-key>",
@@ -679,6 +723,8 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"PROMPT_PASSWORD_{token}",
         f"PROMPT_BEARER_{token}",
         f"sk-ant-{token}{token}",
+        f"NESTED_PROMPT_ARRAY_SECRET_{token}",
+        f"NESTED_PROMPT_MAP_SECRET_{token}",
         f"KEYCLOAK_SECRET_{token}",
         f"PORTAL_SECRET_{token}",
         f"UNAPPROVED_FIELD_{token}",
@@ -948,6 +994,7 @@ def main() -> int:
         preprod,
         (
             f"allowed-ai-input-{token}",
+            f"nested-call-{token}",
             f"event_type=LOGIN realm_id=aigw client_id=portal user_id=receipt-{token}",
             f"event=aigw.portal.audit action=rotation.trigger outcome=success subject=receipt-{token}",
             f"event=aigw.identity.audit action=deployment_converge outcome=success project=receipt-{token}",
