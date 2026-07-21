@@ -114,6 +114,7 @@ CLEAN_ROOM_ALIAS_KINDS = frozenset(
 )
 _LOCAL_DOCKER_CONTEXT = ""
 _LOCAL_DOCKER_ENDPOINT = ""
+_LOCAL_CURL = ""
 
 NETWORKS = {
     "plane-egress": (0, False),
@@ -279,6 +280,24 @@ def clean_environment() -> dict[str, str]:
         "XDG_CONFIG_HOME",
     )
     return {name: os.environ[name] for name in allowed if name in os.environ}
+
+
+def local_curl() -> str:
+    """Return one curl binary that supports the edge-check options we use."""
+
+    global _LOCAL_CURL
+    if _LOCAL_CURL:
+        return _LOCAL_CURL
+    executable = shutil.which("curl")
+    if executable is None:
+        fail("local preprod requires curl 7.76 or newer")
+    result = run([executable, "--version"], capture=True)
+    first_line = result.stdout.splitlines()[0] if result.stdout else ""
+    match = re.fullmatch(r"curl ([0-9]+)[.]([0-9]+)[.]([0-9]+)(?: .*)?", first_line)
+    if match is None or tuple(int(part) for part in match.groups()) < (7, 76, 0):
+        fail("local preprod requires curl 7.76 or newer")
+    _LOCAL_CURL = executable
+    return executable
 
 
 def preprod_env_value(name: str) -> str:
@@ -2687,7 +2706,7 @@ def edge_json(hostname: str, address: str, path: str) -> object:
         fail("the preprod edge verifier received an unapproved route")
     result = run(
         [
-            "curl",
+            local_curl(),
             "--disable",
             "--silent",
             "--show-error",
@@ -2699,6 +2718,8 @@ def edge_json(hostname: str, address: str, path: str) -> object:
             "15",
             "--max-filesize",
             str(EDGE_RESPONSE_MAX_BYTES),
+            "--limit-rate",
+            "64K",
             "--noproxy",
             "*",
             "--proto",

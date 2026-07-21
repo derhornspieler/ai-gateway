@@ -73,6 +73,7 @@ does not prove production firewall rules, customer PKI, or Cribl retention.
 - Docker Compose 5.3.1, the version used by the current release checks
 - Ansible Core
 - OpenSSL
+- curl 7.76 or newer
 - enough memory and disk for the full stack
 - access to the pinned DHI images, or a checked offline seed
 

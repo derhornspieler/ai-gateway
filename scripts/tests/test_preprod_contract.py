@@ -2154,6 +2154,7 @@ class PreprodContractTests(unittest.TestCase):
         self.assertLess(full_up, litellm_ready)
         self.assertLess(litellm_ready, edge_verified)
         self.assertLess(keycloak_ready, edge_verified)
+        self.assertLess(forwarder_ready, edge_verified)
         self.assertLess(litellm_ready, reconciles[1])
 
     def test_postgres_reconcile_receipt_is_fail_closed(self) -> None:
@@ -2272,6 +2273,7 @@ class PreprodContractTests(unittest.TestCase):
             "",
         )
         with (
+            mock.patch.object(module, "local_curl", return_value="/usr/bin/curl"),
             mock.patch.object(module, "run", side_effect=[healthy, discovery]) as run,
             mock.patch("sys.stdout", new_callable=io.StringIO),
         ):
@@ -2283,6 +2285,7 @@ class PreprodContractTests(unittest.TestCase):
                 "--disable",
                 "--fail-with-body",
                 "--http1.1",
+                "--limit-rate",
                 "--max-filesize",
                 "--noproxy",
                 "--proto",
@@ -2302,13 +2305,43 @@ class PreprodContractTests(unittest.TestCase):
         )
 
         malformed = subprocess.CompletedProcess([], 0, "not-json", "")
-        with mock.patch.object(module, "run", return_value=malformed):
+        with (
+            mock.patch.object(module, "local_curl", return_value="/usr/bin/curl"),
+            mock.patch.object(module, "run", return_value=malformed),
+        ):
             with self.assertRaisesRegex(SystemExit, "returned invalid JSON"):
                 module.edge_json(
                     "api.aigw.internal", "127.0.2.1", "/health/liveliness"
                 )
         with self.assertRaisesRegex(SystemExit, "unapproved route"):
             module.edge_json("example.invalid", "127.0.2.1", "/health/liveliness")
+
+        reset = subprocess.CompletedProcess(
+            ["/usr/bin/curl"], 35, "", "curl: (35) connection reset\n"
+        )
+        with (
+            mock.patch.object(module, "local_curl", return_value="/usr/bin/curl"),
+            mock.patch.object(module.subprocess, "run", return_value=reset),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            mock.patch("sys.stderr", new_callable=io.StringIO),
+        ):
+            with self.assertRaisesRegex(SystemExit, "exit code 35"):
+                module.verify_edge_routes(mock.Mock())
+        self.assertNotIn("PREPROD_EDGE_ROUTES_VERIFIED", output.getvalue())
+
+    def test_edge_route_verifier_requires_a_supported_curl(self) -> None:
+        module = load_preprod_module()
+        with mock.patch.object(module.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(SystemExit, "curl 7.76 or newer"):
+                module.local_curl()
+
+        old = subprocess.CompletedProcess([], 0, "curl 7.75.0 test\n", "")
+        with (
+            mock.patch.object(module.shutil, "which", return_value="/usr/bin/curl"),
+            mock.patch.object(module, "run", return_value=old),
+        ):
+            with self.assertRaisesRegex(SystemExit, "curl 7.76 or newer"):
+                module.local_curl()
 
     def test_ansible_runs_full_acceptance_after_internal_verification(self) -> None:
         internal_verify = self.tasks.index(
