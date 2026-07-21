@@ -650,6 +650,24 @@ services:
       # user even with no Ollama backend present. Disable it so no user can
       # reach or configure an out-of-band model backend.
       ENABLE_OLLAMA_API: "false"
+      # Keep every user-controlled execution and alternate-connection path
+      # closed. Open WebUI 0.10 enables both code features by default. Direct
+      # connections would also let a browser bypass LiteLLM and its policy.
+      ENABLE_CODE_EXECUTION: "false"
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_DIRECT_CONNECTIONS: "false"
+      # Retrieval stays local. Never let a user make the server fetch a URL,
+      # load code from a model repository, or call a web-search provider.
+      ENABLE_WEB_SEARCH: "false"
+      ENABLE_RAG_LOCAL_WEB_FETCH: "false"
+      RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE: "false"
+      RAG_RERANKING_MODEL_TRUST_REMOTE_CODE: "false"
+      # These optional surfaces are outside this gateway's chat-only scope.
+      ENABLE_IMAGE_GENERATION: "false"
+      ENABLE_IMAGE_PROMPT_GENERATION: "false"
+      ENABLE_IMAGE_EDIT: "false"
+      ENABLE_COMMUNITY_SHARING: "false"
+      ENABLE_USER_WEBHOOKS: "false"
       # Defense-in-depth egress: the net-chat bridge already default-drops all
       # Internet egress (only Envoy egresses; verified the container cannot
       # resolve public DNS or reach a public IP), but Open WebUI's defaults

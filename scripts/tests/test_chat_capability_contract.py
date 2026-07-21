@@ -76,6 +76,31 @@ class ChatCapabilityContractTest(unittest.TestCase):
         # authoritative on every boot.
         self.assertIn('ENABLE_PERSISTENT_CONFIG: "false"', compose)
 
+    def test_compose_disables_openwebui_execution_and_bypass_paths(self) -> None:
+        """Open WebUI is a chat client for this gateway, not a code runner,
+        web fetcher, image service, webhook relay, or direct model client.
+        Pin every dangerous optional surface off because several upstream
+        defaults are enabled and can change again during an image update."""
+        compose = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
+        disabled = (
+            "ENABLE_CODE_EXECUTION",
+            "ENABLE_CODE_INTERPRETER",
+            "ENABLE_DIRECT_CONNECTIONS",
+            "ENABLE_WEB_SEARCH",
+            "ENABLE_RAG_LOCAL_WEB_FETCH",
+            "RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE",
+            "RAG_RERANKING_MODEL_TRUST_REMOTE_CODE",
+            "ENABLE_IMAGE_GENERATION",
+            "ENABLE_IMAGE_PROMPT_GENERATION",
+            "ENABLE_IMAGE_EDIT",
+            "ENABLE_COMMUNITY_SHARING",
+            "ENABLE_USER_WEBHOOKS",
+        )
+        for name in disabled:
+            with self.subTest(name=name):
+                self.assertIn(f'{name}: "false"', compose)
+                self.assertNotIn(f'{name}: "true"', compose)
+
     def test_openwebui_rp_logout_returns_to_the_chat_login(self) -> None:
         """Open WebUI's /signout only appends post_logout_redirect_uri when
         WEBUI_AUTH_SIGNOUT_REDIRECT_URL is set, and Keycloak only honours it

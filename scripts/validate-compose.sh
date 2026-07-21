@@ -1301,6 +1301,21 @@ assert open_webui["environment"]["HOME"] == "/app/backend/data"
 assert open_webui["environment"]["PYTHONNOUSERSITE"] == "1"
 assert open_webui["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
 assert open_webui["environment"]["STATIC_DIR"] == "/tmp/static"
+for disabled_openwebui_feature in (
+    "ENABLE_CODE_EXECUTION",
+    "ENABLE_CODE_INTERPRETER",
+    "ENABLE_DIRECT_CONNECTIONS",
+    "ENABLE_WEB_SEARCH",
+    "ENABLE_RAG_LOCAL_WEB_FETCH",
+    "RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE",
+    "RAG_RERANKING_MODEL_TRUST_REMOTE_CODE",
+    "ENABLE_IMAGE_GENERATION",
+    "ENABLE_IMAGE_PROMPT_GENERATION",
+    "ENABLE_IMAGE_EDIT",
+    "ENABLE_COMMUNITY_SHARING",
+    "ENABLE_USER_WEBHOOKS",
+):
+    assert open_webui["environment"][disabled_openwebui_feature] == "false"
 assert open_webui["depends_on"]["volume-init"]["condition"] == "service_completed_successfully"
 openwebui_mounts = {mount["target"]: mount for mount in open_webui["volumes"]}
 assert openwebui_mounts["/app/backend/data"] == {
