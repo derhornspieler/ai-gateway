@@ -2,113 +2,121 @@
 
 _Updated 2026-07-21._
 
-AI Gateway is a customer prototype under active hardening. It runs on one
-Docker host and is not highly available. A passing local test does not approve
-a production release.
+AI Gateway is a customer prototype. It runs on one Docker host and is not
+highly available. Local tests reduce release risk, but they do not approve a
+production change.
 
-For design details, read the [solution map](solution-map.md). For release
-steps, use the [acceptance runbook](test-runbook.md). Old Rocky lab and recovery
-records are kept only as historical evidence in
-[docs/archive](archive/lab-dr-rehearsal.md). They are not deployment
+Start with the [solution map](solution-map.md) for design details. Use the
+[test runbook](test-runbook.md) for release checks. Old Rocky lab records are
+in [the archive](archive/lab-dr-rehearsal.md). They are not current deploy
 instructions.
 
-## Supported deployment paths
+## Supported paths
 
-There are two separate paths:
-
-| Environment | Purpose | Entry point |
+| Environment | Purpose | Guide |
 | --- | --- | --- |
-| Local preprod | Test the full stack on one local Docker engine | [Local preprod](preprod.md) |
-| Production | Deploy to an existing three-NIC Rocky Linux 9 VM | [Production runbook](deploy-runbook.md) |
+| Local preprod | Test the whole stack on local Docker | [Local preprod](preprod.md) |
+| Production | Deploy to an existing three-NIC Rocky Linux 9 VM | [Production deploy](deploy-runbook.md) |
 
-Local preprod uses the fixed domain `aigw.internal`. It creates its own test
-root CA, Samba AD over LDAPS, WIF provider mock, static users, and labeled
-Docker networks and volumes. It is localhost-only and does not run the Rocky
-host-hardening roles.
+Local preprod always uses `aigw.internal`. It creates a test Root CA, Samba AD
+over LDAPS, WIF and provider mocks, and fixed test users. It models the three
+host-facing network planes and keeps service networks separate. It does not
+run production host-hardening roles.
 
-Production uses the domain, IP addresses, directory, certificates, and secret
-custody values from a generated inventory. Ansible validates the live host
+Production gets its domain, addresses, directory settings, certificates, and
+secret values from a generated Ansible inventory. Ansible checks the live host
 before it changes anything.
 
-## Implemented in the current source
+## What is implemented
 
-- `scripts/bootstrap-rocky9-production.py` has a guided terminal setup and a
-  complete non-interactive example. Its older `generic-rocky9` names remain
-  compatibility aliases.
-- `ansible/preprod.yml` creates and verifies local preprod. The matching
-  destroy playbook removes only resources with the exact `aigw-preprod`
-  namespace and ownership labels.
-- Preprod models egress, ADM, and internal planes with separate Docker
-  networks. Public test traffic binds only to `127.0.2.1` and `127.0.3.1`.
-- Keycloak URLs, redirect URIs, web origins, logout URLs, and WIF issuer URLs
-  come from the selected deployment domain. Existing realms are reconciled;
-  changing a realm JSON file alone is not treated as an update.
-- When LDAPS is enabled, Ansible mounts the bind password from its protected
-  file and automatically configures and verifies federation, durable identity
-  control, OIDC clients, the break-glass account, and temporary-admin cleanup.
+- `scripts/bootstrap-rocky9-production.py` supports guided setup. Its
+  non-interactive mode documents all required options.
+- `ansible/preprod.yml` creates and checks local preprod. The destroy and
+  clean-room playbooks remove only resources owned by `aigw-preprod`.
+- Keycloak URLs and callbacks come from the Ansible domain. Ansible sets up
+  LDAPS, OIDC clients, lasting identity control, and temporary-admin cleanup.
   The admin portal has no user-run initialization step.
-- `scripts/update-images.py` joins the image release steps: fetch exact pins,
-  build custom images, create an offline seed, test that seed in local
-  preprod, stage it for a remote host, deploy with Ansible, validate, and roll
-  back on failure.
-- Offline seed mode verifies image IDs, removes Compose build sections, and
-  sets `pull_policy: never` before startup. The source-tag materialization
-  workaround is still available as
-  `--materialize-missing-source-tags`.
-- Production keeps its host firewall, routing, SELinux, encrypted-state,
-  backup, Vault, and segmented-network checks. Local preprod does not weaken
-  those production checks.
+- `scripts/update-images.py` pulls exact pins, builds custom images, creates
+  schema-v2 offline seeds, tests the preprod seed, and provides the guarded
+  remote upgrade and rollback flow.
+- Operators select Envoy providers from a reviewed catalog. The image contains
+  only the chosen routes and CA files. Anthropic is the only approved provider
+  in this release.
+- Seed mode uses exact image IDs. It disables pulls and source builds.
+- Production keeps its firewall, routing, SELinux, encrypted-state, backup,
+  Vault, and network checks. Preprod does not weaken those production rules.
 
-## Verified so far
+## Final local release evidence
 
-The current workspace has source and contract coverage for Compose rendering,
-production and preprod Ansible syntax, identity policy, portal and key-rotator
-behavior, offline seed planning and loading, update rollback rules, the Go
-services, and shell scripts.
+The ARM64 `r10` release test ran on 2026-07-21. It built both schema-v2 seeds,
+destroyed the old owned test stack, removed all old release images, loaded the
+new preprod archive, and deployed once with Ansible in seed mode.
 
-Local safety checks have also proved that preprod network creation and removal
-leave unrelated Docker projects alone. The Samba image tests prove that its
-test passwords do not appear in process arguments and that the lockout policy
-survives a restart.
+The clean-room receipt removed 26 containers, 19 networks, 11 volumes, and 43
+release image IDs. It preserved 129 unrelated image IDs.
 
-These checks are useful, but they are not the final release proof described in
-the [acceptance runbook](test-runbook.md).
+The final markers were:
 
-## Open release gates
+```text
+PREPROD_CLEAN_ROOM_OK
+PREPROD_E2E_PASSED
+SEEDED_PREPROD_E2E_PASSED
+```
 
-- **Seeded preprod:** the exact ARM64 schema-v2 release seed has been built.
-  Load its preprod archive into a clean local Docker engine and start preprod
-  from those exact image IDs. Run the full browser/OIDC, LDAPS, WIF, portal,
-  chat, admin-gate, validation, and local rollback checks. Do not create a
-  Rocky or Parallels test VM for this gate.
-- **Production upgrade:** promote only the production-scoped release after the
-  seeded local test passes. During the approved production maintenance window,
-  make a fresh backup, deploy through Ansible, validate the real host, and keep
-  the previous source, images, and state ready for rollback. Do not force a
-  failure on the production host merely to create test evidence.
-- **Production ceremonies:** customer TLS, external LDAPS, Vault
-  initialization and custody, Anthropic enrollment, backups, and final access
-  approval remain operator-owned work.
-- **Cribl SOC feed:** the source now has a log-only Alloy queue, a reviewed
-  Keycloak event list, request-audit conversion, and bounded structured-event
-  classifiers. The release still needs a seeded-preprod receipt test for every
-  approved class and proof that denied metrics, traces, alerts, malformed
-  records, and ordinary logs do not arrive. Any required event without a
-  structured producer remains open. See the
-  [logging-team handoff](cribl-soc-handoff.md).
-- **Security and version review:** the full source/container Trivy audit,
-  production-sized PostgreSQL 18 migration rehearsal, and complete
-  DHI/upstream version review are tracked in the
-  [repository task list](../TASKS.md).
-  PostgreSQL 18.4 is stable and operator-selected. Exact DHI 17.10 and 18.4
-  both passed the bounded application and restore comparison; seeded preprod
-  and production-sized evidence are still required.
-- **High availability:** there is no HA in the Docker Compose design. See the
-  [HA posture](high-availability.md).
-- **Repository history:** the active tree blocks prohibited customer and
-  personal identifiers. Removing old commit metadata or changing repository
-  ownership needs a separate owner-approved history plan.
+All 25 long-running containers were healthy. The checks covered the Root CA,
+Samba AD and LDAPS, all three test users, automatic Keycloak setup, OIDC roles
+and callbacks, Vault init and unseal, WIF, mock inference, the immutable
+production Envoy startup gate, and the curated Cribl TLS queue and recovery
+path.
 
-Do not reopen production access until every required section in the
-[acceptance runbook](test-runbook.md) has dated evidence and an owner has
-accepted every remaining risk.
+The production seed has 40 images. The preprod seed has 43 images. Production
+does not contain the preprod-only Samba AD or WIF mock images.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Production archive | `958ee15a3609a9bdee13d7144b941cbb4379136b1d674103f5ae887bf04cd453` |
+| Production manifest | `0960fab4f0133cf4be610c8e552a554eb3d795d5114bb108201243deb90c3da7` |
+| Preprod archive | `73e244dc6fc6fd347f7b8711a8710b586f554c603bcb1c4e0a3ca5938f0ad7e8` |
+| Preprod manifest | `80173e1a67fcb0997fd90572a1f1e8087d22ecd9a2438038f33f1191d93d7d02` |
+
+The selected provider is `anthropic`. The Envoy policy digest is
+`8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
+The Envoy image ID is
+`sha256:4fc925d12af6f8a693c363a5249ff7b71851c2276a3fcab7b3f6379fc2f66b35`.
+Two clean builds produced that same Envoy image ID.
+
+Local code checks also passed: 762 infrastructure contracts, 147 portal tests,
+323 key-rotator tests, all four Go race and vet suites, Compose rendering,
+identity policy, documentation links, YAML lint, ShellCheck, Ruff, and Bandit.
+
+## Gates that remain open
+
+- **Real browser:** no in-app browser backend was attached. The HTTP and OIDC
+  acceptance checks passed, but a person still must test login, callbacks,
+  cookies, roles, and logout in a real browser.
+- **GitHub container scans:** ordinary GitHub checks are green. The DHI image
+  build and Trivy jobs stop at their required credential gate because the
+  `release-container-security` GitHub environment has no DHI secrets. Do not
+  weaken that gate. Add approved credentials, rerun it, and review every
+  result before release.
+- **Production upgrade:** no approved remote VM or maintenance window was in
+  scope. Do not create a Rocky or Parallels test VM. Run the guarded remote
+  upgrade only on the approved target after the local and CI gates pass.
+- **Customer ceremonies:** customer TLS, external LDAPS, Vault key custody,
+  Anthropic enrollment, production backups, the real Cribl endpoint, and final
+  access approval need customer operators.
+- **Cribl retention:** the seeded receipt and outage recovery passed. The Cribl
+  team must still apply and prove its 24-hour destination retention. If a hard
+  24-hour age limit is required on the local queue, that control is still a
+  release gate. See the [Cribl handoff](cribl-soc-handoff.md).
+- **PostgreSQL migration size:** PostgreSQL 18.4 is stable and passed the full
+  seeded preprod stack. The production-sized PostgreSQL 16-to-18 rehearsal and
+  forced rollback cases remain in [TASKS.md](../TASKS.md).
+- **High availability:** the Compose design has no HA. See
+  [scaling and availability](high-availability.md).
+- **Repository history:** the active tree has no prohibited customer or
+  personal identifiers. A history rewrite or repository-owner change needs a
+  separate owner-approved plan.
+
+Do not call this production-approved until the open release gates have dated
+evidence and the release owner accepts every remaining risk.
