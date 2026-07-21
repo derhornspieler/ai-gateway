@@ -110,6 +110,6 @@ router_settings:
   redis_password: os.environ/REDIS_PASSWORD
   # Activates the PromptCachingDeploymentCheck that makes the per-model
   # cache_control_injection_points above take effect (auto-injection is a no-op
-  # without it).  Only the Anthropic models declare injection points; the
-  # openai model is untouched, so this check is inert for it.
+  # without it). Only the registered Anthropic models declare injection
+  # points. No other provider model is configured.
   optional_pre_call_checks: ["prompt_caching"]
