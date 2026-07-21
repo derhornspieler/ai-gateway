@@ -277,9 +277,17 @@ Pass only if:
 - the admin reaches admin and chat pages;
 - the developer reaches the developer portal and chat, but not admin pages;
 - the user reaches chat, but not portal or admin pages;
-- cookies are `Secure`, `HttpOnly`, and limited to the right host and path;
+- every cookie is `Secure` and limited to the right host and path;
+- application session and Keycloak identity cookies are `HttpOnly`;
 - logout clears the app and Keycloak sessions; and
 - Back, then Refresh, does not reopen a protected page.
+
+Keycloak's `KEYCLOAK_SESSION` and `KC_AUTH_SESSION_HASH` status cookies are
+intentionally readable by its session-check JavaScript. They do not carry a
+plain user ID or token. Do not force `HttpOnly` onto those two cookies; doing
+so breaks the supported login flow. Keycloak documents the hashed session
+format in its
+[26.1 release note](https://www.keycloak.org/2025/01/keycloak-2610-released).
 
 Remove the Root CA from the browser profile. The bounded destroy command in
 the next section removes the preprod hosts block. Do not save cookie values in

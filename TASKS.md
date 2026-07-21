@@ -58,11 +58,6 @@
   `DHI_PASSWORD` secret. A repository administrator must add approved
   credentials and rerun the failed jobs. Do not copy a developer's local login
   into GitHub or weaken the gate without explicit approval.
-- [ ] **Run real-browser release acceptance** - The seeded HTTP, OIDC, role,
-  callback, and logout contracts pass, but no in-app browser backend is
-  attached. A person or approved browser runner must test login, redirects,
-  cookies, logout, allowed roles, and denied roles against the live preprod
-  deployment and save the receipt.
 - [ ] **Run the guarded production upgrade and rollback** - No approved remote
   target or maintenance window was provided. Use the exact production-scoped
   `r10` release only on an approved Docker host. Do not create a Rocky Linux or
@@ -267,8 +262,16 @@
     deployed design. The automated link, anchor/bookmark, navigation, and
     Mermaid-reference validator is green.
   - The test runbook explains unit, contract, integration, end-to-end, browser,
-    and final release gates. The real-browser execution remains an explicit
-    external acceptance item above; it is not misreported as complete.
+    and final release gates.
+- [x] ~~Run real-browser release acceptance~~ (2026-07-21)
+  - System Chrome followed the domain-derived redirects between the developer
+    portal, admin portal, Open WebUI, Grafana, and Keycloak.
+  - The developer and administrator reached their allowed pages. The normal
+    user and developer received the expected denied-role pages. Chat SSO worked
+    for the normal user, and Grafana SSO worked for the administrator.
+  - Application and Keycloak identity cookies were secure and host-bounded.
+    Logout cleared both application and Keycloak sessions, and Back plus
+    Refresh did not reopen the protected developer page.
 - [x] ~~Run the final current-source schema-v2 seed rehearsal~~ (2026-07-21)
   - Release r10 built a 40-image ARM64 production archive and a 43-image
     preprod archive with Anthropic as the only selected provider. The

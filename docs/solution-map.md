@@ -327,15 +327,15 @@ Envoy image and provider policy as one release unit.
 
 - This is one VM, not a highly available system.
 - LiteLLM and both portal apps use reviewed single-worker limits.
-- A real browser login and logout test still needs a browser backend or a
-  person.
+- The dated system-Chrome login, role, redirect, cookie, and logout check is in
+  [project status](project-status.md#final-local-release-evidence).
 - Production LDAPS, TLS, Vault custody, Anthropic enrollment, Cribl, backup,
   and change-window steps need customer operators.
 - A full production-sized PostgreSQL 16-to-18 rehearsal is still open.
 - GitHub DHI image builds and Trivy scans need approved DHI credentials in the
   protected GitHub environment.
-- The full security audit, capacity alert expansion, and remaining plain-text
-  documentation review are tracked in [TASKS.md](../TASKS.md).
+- The protected container scan and capacity alert expansion are tracked in
+  [TASKS.md](../TASKS.md).
 
 Do not call the release production-approved until the dated gates in
 [project status](project-status.md) pass and the release owner accepts the

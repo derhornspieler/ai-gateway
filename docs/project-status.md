@@ -95,11 +95,16 @@ Local code checks also passed: 762 infrastructure contracts, 147 portal tests,
 323 key-rotator tests, all four Go race and vet suites, Compose rendering,
 identity policy, documentation links, YAML lint, ShellCheck, Ruff, and Bandit.
 
+System Chrome also passed the real-browser acceptance check. It followed the
+domain-derived redirects for the developer portal, admin portal, Open WebUI,
+Grafana, and Keycloak. Allowed roles reached their pages, denied roles saw a
+403 page, logout cleared the application and Keycloak sessions, and Back plus
+Refresh did not reopen the protected developer page. The browser reported TLS
+1.3, `*.aigw.internal`, and the AI Gateway preprod test Root CA. The separate
+certificate tests proved the Root CA chain and names.
+
 ## Gates that remain open
 
-- **Real browser:** no in-app browser backend was attached. The HTTP and OIDC
-  acceptance checks passed, but a person still must test login, callbacks,
-  cookies, roles, and logout in a real browser.
 - **GitHub container scans:** ordinary GitHub checks are green. The DHI image
   build and Trivy jobs stop at their required credential gate because the
   `release-container-security` GitHub environment has no DHI secrets. Do not
