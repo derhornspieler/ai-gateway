@@ -267,7 +267,7 @@ others.
 flowchart TB
   L1[Host ingress — firewalld zones:<br/>exact source CIDRs, SSH key-only on ADM,<br/>no egress-leg listener]
   L2[Packet policy — atomic DOCKER-USER +<br/>independent nftables aigw_guard:<br/>deny cross-plane, container-to-host,<br/>unapproved bridge egress]
-  L3[Network segmentation — 18 per-function bridges;<br/>services join only required planes;<br/>fixed IPs for firewall-addressed workloads]
+  L3[Network segmentation — 20 isolated bridges;<br/>the base stack joins 18 as needed;<br/>fixed IPs for firewall-addressed workloads]
   L4[Identity — Keycloak OIDC everywhere;<br/>role-based access; per-UI oauth2-proxy gates;<br/>step-up + live-role re-checks for admin mutations]
   L5["Secrets — Vault-backed provider credentials;<br/>file-backed where the service supports it;<br/>no secret in command arguments;<br/>fail-closed required-variable contract"]
   L6[Runtime — SELinux enforcing with per-container MCS;<br/>non-root DHI images, digest-pinned;<br/>read-only binds with keyed HMAC digests;<br/>no Docker socket exposure]

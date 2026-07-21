@@ -259,8 +259,9 @@ The Cribl team owns these steps. Cribl's current source page calls this an
 11. Give the gateway team the worker IP, port, server name, CA fingerprint,
     route name, destination name, and retention proof.
 
-Do not use the in-stack `cribl-mock` settings for production. The mock is
-plaintext and disposable.
+Do not use the in-stack `cribl-mock` settings for production. The mock uses a
+generated local TLS certificate and is disposable. Do not reuse its test CA,
+certificate, key, or endpoint in production.
 
 ## Gateway inventory
 

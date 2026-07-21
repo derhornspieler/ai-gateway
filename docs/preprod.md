@@ -7,7 +7,7 @@ Preprod is for release tests. It is not production. It uses:
 
 - the fixed domain `aigw.internal`;
 - the fixed Compose project `aigw-preprod`;
-- three fixed Docker networks;
+- three host-facing planes plus separate service networks;
 - a local test Root CA;
 - Samba AD over LDAPS;
 - static test users; and
