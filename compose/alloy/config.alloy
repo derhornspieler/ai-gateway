@@ -678,6 +678,8 @@ loki.process "cribl_envoy_tls" {
 // Gateway-owned components prefix reviewed, bounded JSON records with one
 // marker. Exact service/event/action/outcome allow-lists prevent ordinary
 // stdout, stack traces, or a look-alike container from entering the SOC feed.
+// The accepted body is rebuilt from approved scalar fields below. The source
+// JSON is never forwarded, so an unknown or nested field cannot leave the host.
 loki.process "cribl_structured_security" {
   stage.match {
     selector            = "{project!~\"ai-gateway|aigw-preprod\"}"
@@ -695,13 +697,25 @@ loki.process "cribl_structured_security" {
   stage.json {
     source = "aigw_security_json"
     expressions = {
-      security_action  = "action",
-      security_event   = "event",
-      security_outcome = "outcome",
-      security_rotation_status = "rotation_status",
-      security_schema  = "schema_version",
-      security_state   = "state",
-      security_vendor  = "vendor",
+      security_action                  = "action",
+      security_ca_fingerprints         = "ca_sha256_fingerprints",
+      security_changed                 = "changed",
+      security_error_type              = "error_type",
+      security_event                   = "event",
+      security_exact_sans              = "exact_sans",
+      security_ldap_provider           = "ldap_provider",
+      security_outcome                 = "outcome",
+      security_policy_sha256            = "policy_sha256",
+      security_project                 = "project",
+      security_providers               = "providers",
+      security_purpose                 = "purpose",
+      security_reason                  = "reason",
+      security_rotation_status         = "rotation_status",
+      security_schema                  = "schema_version",
+      security_sni                     = "sni",
+      security_state                   = "state",
+      security_subject                 = "subject",
+      security_vendor                  = "vendor",
     }
   }
   // JSON numbers enter the extracted map as numeric values. Loki labels accept
@@ -711,15 +725,31 @@ loki.process "cribl_structured_security" {
     source   = "security_schema"
     template = "{{ .Value }}"
   }
+  stage.template {
+    source   = "security_changed"
+    template = `{{ if eq .Value true }}true{{ else if eq .Value false }}false{{ end }}`
+  }
   stage.labels {
     values = {
       aigw_security_event_class = "security_event",
       aigw_security_schema      = "security_schema",
       security_action           = "",
+      security_ca_fingerprints  = "",
+      security_changed          = "",
+      security_error_type       = "",
       security_event            = "",
+      security_exact_sans       = "",
+      security_ldap_provider    = "",
       security_outcome          = "",
+      security_policy_sha256    = "",
+      security_project          = "",
+      security_providers        = "",
+      security_purpose          = "",
+      security_reason           = "",
       security_rotation_status  = "",
+      security_sni              = "",
       security_state            = "",
+      security_subject          = "",
       security_vendor           = "",
     }
   }
@@ -788,7 +818,163 @@ loki.process "cribl_structured_security" {
     action              = "drop"
     drop_counter_reason = "unapproved_security_outcome"
   }
-  stage.output { source = "aigw_security_json" }
+  // Optional scalar fields are either empty or match a short reviewed form.
+  // A malformed value drops the whole outbound copy. The original local log
+  // remains in Loki for the operator.
+  stage.match {
+    selector            = "{security_subject!~\"|[A-Za-z0-9][A-Za-z0-9_.:@-]{0,254}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_subject"
+  }
+  stage.match {
+    selector            = "{security_project!~\"|[a-z0-9][a-z0-9_.-]{0,63}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_project"
+  }
+  stage.match {
+    selector            = "{security_changed!~\"|true|false\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_changed"
+  }
+  stage.match {
+    selector            = "{security_error_type!~\"|[A-Za-z][A-Za-z0-9_]{0,127}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_error_type"
+  }
+  stage.match {
+    selector            = "{security_ldap_provider!~\"|[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_ldap_provider"
+  }
+  stage.match {
+    selector            = "{security_purpose!~\"|deployment_converge\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_purpose"
+  }
+  stage.match {
+    selector            = "{security_vendor!~\"|anthropic|static-anthropic\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_vendor"
+  }
+  stage.match {
+    selector            = "{security_state!~\"|sealed|unsealed|uninitialized|unavailable|identity_bootstrap_required|awaiting_enrollment|configured|jwks_drift|revocation_pending\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_state"
+  }
+  stage.match {
+    selector            = "{security_policy_sha256!~\"|[0-9a-f]{64}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_egress_policy_digest"
+  }
+  stage.match {
+    selector            = "{security_providers!~\"|anthropic\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_egress_provider_set"
+  }
+  stage.match {
+    selector            = "{security_sni!~\"|api[.]anthropic[.]com\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_egress_sni"
+  }
+  stage.match {
+    selector            = "{security_exact_sans!~\"|api[.]anthropic[.]com\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_egress_san"
+  }
+  stage.match {
+    selector            = "{security_ca_fingerprints!~\"|1dfc1605fbad358d8bc844f76d15203fac9ca5c1a79fd4857ffaf2864fbebf96,349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_egress_ca_fingerprints"
+  }
+  stage.match {
+    selector            = "{security_reason!~\"|config_override_rejected|ca_not_yet_valid|ca_expired|ca_fingerprint_mismatch|sni_policy_invalid|san_policy_invalid|ca_material_invalid|policy_digest_mismatch|immutable_policy_validation_failed\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_reason"
+  }
+  // Required fields vary by event. These checks make missing evidence fail
+  // closed instead of exporting an ambiguous record.
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_subject=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_subject"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"break_glass_use\",security_purpose!=\"deployment_converge\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_break_glass_purpose"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_vendor=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_rotation_vendor"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_rotation_status=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_rotation_status"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.vault.state\",security_state=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_vault_state"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.egress.trust\",security_outcome=\"success\",security_policy_sha256=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_egress_policy_digest"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.egress.trust\",security_outcome=\"success\",security_providers=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_egress_provider_set"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.egress.trust\",security_outcome=\"success\",security_sni=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_egress_sni"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.egress.trust\",security_outcome=\"success\",security_exact_sans=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_egress_sans"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.egress.trust\",security_outcome=\"success\",security_ca_fingerprints=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_egress_ca_fingerprints"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.egress.trust\",security_outcome=~\"failure|failed\",security_reason=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_egress_failure_reason"
+  }
+  stage.template {
+    source = "aigw_security_line"
+    template = `schema_version=1 event={{ .security_event }} action={{ .security_action }} outcome={{ .security_outcome }}{{ if .security_subject }} subject={{ .security_subject }}{{ end }}{{ if .security_project }} project={{ .security_project }}{{ end }}{{ if .security_changed }} changed={{ .security_changed }}{{ end }}{{ if .security_error_type }} error_type={{ .security_error_type }}{{ end }}{{ if .security_ldap_provider }} ldap_provider={{ .security_ldap_provider }}{{ end }}{{ if .security_purpose }} purpose={{ .security_purpose }}{{ end }}{{ if .security_vendor }} vendor={{ .security_vendor }}{{ end }}{{ if .security_rotation_status }} rotation_status={{ .security_rotation_status }}{{ end }}{{ if .security_state }} state={{ .security_state }}{{ end }}{{ if .security_policy_sha256 }} policy_sha256={{ .security_policy_sha256 }}{{ end }}{{ if .security_providers }} providers={{ .security_providers }}{{ end }}{{ if .security_sni }} sni={{ .security_sni }}{{ end }}{{ if .security_exact_sans }} exact_sans={{ .security_exact_sans }}{{ end }}{{ if .security_ca_fingerprints }} ca_sha256_fingerprints={{ .security_ca_fingerprints }}{{ end }}{{ if .security_reason }} reason={{ .security_reason }}{{ end }}`
+  }
+  stage.output { source = "aigw_security_line" }
+  stage.label_drop {
+    values = [
+      "security_action",
+      "security_ca_fingerprints",
+      "security_changed",
+      "security_error_type",
+      "security_event",
+      "security_exact_sans",
+      "security_ldap_provider",
+      "security_outcome",
+      "security_policy_sha256",
+      "security_project",
+      "security_providers",
+      "security_purpose",
+      "security_reason",
+      "security_rotation_status",
+      "security_sni",
+      "security_state",
+      "security_subject",
+      "security_vendor",
+    ]
+  }
   forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
 }
 

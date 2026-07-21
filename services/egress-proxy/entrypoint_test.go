@@ -116,6 +116,46 @@ func TestStartupFailuresUseOnlyStableSOCCategories(t *testing.T) {
 	}
 }
 
+func TestStartupSecurityEventUsesOnlyBoundedScalarFields(t *testing.T) {
+	receipt := egresspolicy.Receipt{
+		EgressPolicySHA256: "policy-digest",
+		Providers: []egresspolicy.RuntimeProvider{
+			{
+				Name:                 "anthropic",
+				SNI:                  "api.anthropic.com",
+				ExactSANs:            []string{"api.anthropic.com"},
+				CASHA256Fingerprints: []string{"first", "second"},
+			},
+			{
+				Name:                 "future-reviewed-provider",
+				SNI:                  "api.example.invalid",
+				ExactSANs:            []string{"api.example.invalid", "alt.example.invalid"},
+				CASHA256Fingerprints: []string{"third"},
+			},
+		},
+	}
+	event := startupSecurityEvent(receipt)
+	expected := map[string]any{
+		"schema_version":         1,
+		"event":                  "aigw.egress.trust",
+		"action":                 "startup_gate",
+		"outcome":                "success",
+		"policy_sha256":          "policy-digest",
+		"providers":              "anthropic,future-reviewed-provider",
+		"sni":                    "api.anthropic.com,api.example.invalid",
+		"exact_sans":             "api.anthropic.com,api.example.invalid,alt.example.invalid",
+		"ca_sha256_fingerprints": "first,second,third",
+	}
+	if len(event) != len(expected) {
+		t.Fatalf("expected %d fields, got %d", len(expected), len(event))
+	}
+	for name, value := range expected {
+		if event[name] != value {
+			t.Fatalf("%s: expected %v, got %v", name, value, event[name])
+		}
+	}
+}
+
 func TestHealthRequiresLoopbackLiveResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.WriteHeader(http.StatusOK)

@@ -27,6 +27,12 @@ service:
   # metrics. Disabling them removes the default localhost:8888 listener and
   # its unnecessary DNS/address-family dependency.
   telemetry:
+    # The debug exporter writes received records through the collector's own
+    # logger. Disable logger sampling so preprod can prove every record, not a
+    # statistical subset of otherwise identical debug messages.
+    logs:
+      sampling:
+        enabled: false
     metrics:
       level: none
   pipelines:

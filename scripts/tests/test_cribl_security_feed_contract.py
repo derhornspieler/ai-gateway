@@ -134,6 +134,10 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         )
         self.assertNotIn("${DOCKER_DATA_ROOT}", PREPROD_OVERLAY)
         self.assertIn("verbosity: detailed", CRIBL_MOCK)
+        self.assertIn(
+            "logs:\n      sampling:\n        enabled: false",
+            CRIBL_MOCK,
+        )
         for marker in (
             "OTLP_FIXTURES_ACCEPTED",
             "DENIED_RAW_TRACE_",
@@ -145,14 +149,15 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             "DENIED_VENDOR_",
             "DENIED_VAULT_STATE_",
             "DENIED_MALFORMED_",
-            '"event":"aigw.provider.rotation"',
-            '"event":"aigw.vault.state"',
+            "event=aigw.provider.rotation action=rotate outcome=success",
+            "event=aigw.vault.state action=state_observed outcome=success",
             "event=aigw.vault.audit",
             "action=upstream_tls_failure",
             "provider=anthropic reason=tls_transport_failure",
             "hmac_protected=true",
             '"action":"break_glass_use"',
-            "<redacted-authorization>",
+            "UNAPPROVED_FIELD_",
+            "NESTED_SECRET_",
             "wait_for_queue(preprod, model, populated=True)",
             "exercise_tls_server_name_failure(preprod, model, tls_token)",
             "Alloy accepted a Cribl certificate with the wrong server name",
@@ -165,6 +170,41 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             PREPROD_TASKS,
         )
         self.assertIn("scripts/test-preprod-cribl-security.py", PREPROD_TASKS)
+
+    def test_structured_security_events_use_a_fixed_field_projection(self) -> None:
+        structured = ALLOY.split(
+            'loki.process "cribl_structured_security"', 1
+        )[1].split('loki.source.file "vault_audit"', 1)[0]
+        self.assertIn('source = "aigw_security_line"', structured)
+        self.assertIn(
+            'stage.output { source = "aigw_security_line" }', structured
+        )
+        self.assertNotIn('stage.output { source = "aigw_security_json" }', structured)
+        self.assertIn(
+            'template = `{{ if eq .Value true }}true{{ else if eq .Value false }}false{{ end }}`',
+            structured,
+        )
+        for field in (
+            "security_subject",
+            "security_project",
+            "security_rotation_status",
+            "security_policy_sha256",
+            "security_providers",
+            "security_sni",
+            "security_exact_sans",
+            "security_ca_fingerprints",
+            "security_reason",
+        ):
+            self.assertIn(field, structured)
+        for reason in (
+            "missing_portal_subject",
+            "missing_rotation_vendor",
+            "missing_vault_state",
+            "missing_egress_policy_digest",
+            "missing_egress_ca_fingerprints",
+            "missing_egress_failure_reason",
+        ):
+            self.assertIn(reason, structured)
 
     def test_preprod_uses_verified_tls_for_the_cribl_mock(self) -> None:
         for fragment in (

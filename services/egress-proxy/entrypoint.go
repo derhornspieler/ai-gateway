@@ -126,26 +126,37 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	providers := make([]map[string]any, 0, len(receipt.Providers))
-	for _, provider := range receipt.Providers {
-		providers = append(providers, map[string]any{
-			"name":                   provider.Name,
-			"sni":                    provider.SNI,
-			"exact_sans":             provider.ExactSANs,
-			"ca_sha256_fingerprints": provider.CASHA256Fingerprints,
-		})
-	}
-	emitSecurityEvent(map[string]any{
-		"schema_version": 1,
-		"event":          "aigw.egress.trust",
-		"action":         "startup_gate",
-		"outcome":        "success",
-		"policy_sha256":  receipt.EgressPolicySHA256,
-		"providers":      providers,
-	})
+	emitSecurityEvent(startupSecurityEvent(receipt))
 	fmt.Fprintln(os.Stderr, "gate: immutable provider policy validated; starting envoy")
 	envoyArgs := append([]string{"envoy", "-c", defaultConfig}, args...)
 	return syscall.Exec(defaultEnvoyBin, envoyArgs, os.Environ())
+}
+
+// startupSecurityEvent flattens the reviewed receipt into bounded scalar
+// fields. Alloy can then rebuild a fixed SOC record without forwarding a
+// nested or unreviewed JSON value.
+func startupSecurityEvent(receipt egresspolicy.Receipt) map[string]any {
+	providerNames := make([]string, 0, len(receipt.Providers))
+	sniNames := make([]string, 0, len(receipt.Providers))
+	exactSANs := make([]string, 0)
+	caFingerprints := make([]string, 0)
+	for _, provider := range receipt.Providers {
+		providerNames = append(providerNames, provider.Name)
+		sniNames = append(sniNames, provider.SNI)
+		exactSANs = append(exactSANs, provider.ExactSANs...)
+		caFingerprints = append(caFingerprints, provider.CASHA256Fingerprints...)
+	}
+	return map[string]any{
+		"schema_version":         1,
+		"event":                  "aigw.egress.trust",
+		"action":                 "startup_gate",
+		"outcome":                "success",
+		"policy_sha256":          receipt.EgressPolicySHA256,
+		"providers":              strings.Join(providerNames, ","),
+		"sni":                    strings.Join(sniNames, ","),
+		"exact_sans":             strings.Join(exactSANs, ","),
+		"ca_sha256_fingerprints": strings.Join(caFingerprints, ","),
+	}
 }
 
 func isStartup(args []string) bool {

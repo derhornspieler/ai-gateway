@@ -33,6 +33,10 @@ CRIBL_CERT = COMPOSE_DIR / "secrets/preprod-cribl.crt"
 CRIBL_KEY = COMPOSE_DIR / "secrets/preprod-cribl.key"
 WRONG_SAN_CERT = COMPOSE_DIR / "secrets/preprod-wif.crt"
 WRONG_SAN_KEY = COMPOSE_DIR / "secrets/preprod-wif.key"
+ANTHROPIC_CA_FINGERPRINTS = (
+    "1dfc1605fbad358d8bc844f76d15203fac9ca5c1a79fd4857ffaf2864fbebf96,"
+    "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d"
+)
 
 
 OTLP_FIXTURE_HELPER = r"""
@@ -402,7 +406,10 @@ def fixture_lines(token: str) -> str:
     portal = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
         '"action":"rotation.trigger","outcome":"success",'
-        f'"subject":"receipt-{token}","note":"Bearer PORTAL_SECRET_{token}"}}'
+        f'"subject":"receipt-{token}","vendor":"anthropic",'
+        f'"unreviewed":"UNAPPROVED_FIELD_{token}",'
+        f'"nested":{{"private_key":"NESTED_SECRET_{token}"}},'
+        f'"note":"Bearer PORTAL_SECRET_{token}"}}'
     )
     identity = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
@@ -417,22 +424,23 @@ def fixture_lines(token: str) -> str:
     break_glass = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
         '"action":"break_glass_use","outcome":"success",'
-        f'"purpose":"deployment_converge","receipt":"break-glass-{token}"}}'
+        '"purpose":"deployment_converge"}'
     )
     rotation = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.provider.rotation",'
         '"action":"rotate","outcome":"success","vendor":"anthropic",'
-        f'"rotation_status":"success","receipt":"rotation-{token}"}}'
+        '"rotation_status":"success"}'
     )
     vault_state = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.vault.state",'
-        '"action":"state_observed","outcome":"success","state":"unsealed",'
-        f'"receipt":"vault-state-{token}"}}'
+        '"action":"state_observed","outcome":"success","state":"unsealed"}'
     )
     egress = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.egress.trust",'
         '"action":"startup_gate","outcome":"success",'
-        f'"policy_sha256":"{token * 4}"}}'
+        f'"policy_sha256":"{token * 4}","providers":"anthropic",'
+        '"sni":"api.anthropic.com","exact_sans":"api.anthropic.com",'
+        f'"ca_sha256_fingerprints":"{ANTHROPIC_CA_FINGERPRINTS}"}}'
     )
     egress_tls = json.dumps(
         {
@@ -577,18 +585,29 @@ def send_otlp_fixtures(preprod: Preprod, helper: str, token: str, marker: str) -
         fail("the OTLP fixture helper returned an invalid receipt")
 
 
-def cribl_logs(preprod: Preprod) -> str:
+def log_cursor() -> str:
+    """Return a Docker --since cursor for one bounded receipt phase."""
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def cribl_logs(preprod: Preprod, since: str) -> str:
     identifier = preprod.container_id("cribl-mock")
     return preprod.docker(
-        "logs", "--tail", "8000", identifier, include_stderr=True
+        "logs", "--since", since, identifier, include_stderr=True
     )
 
 
-def wait_for_receipts(preprod: Preprod, markers: tuple[str, ...], timeout: int = 45) -> str:
+def wait_for_receipts(
+    preprod: Preprod,
+    markers: tuple[str, ...],
+    since: str,
+    timeout: int = 90,
+) -> str:
     deadline = time.monotonic() + timeout
     latest = ""
     while time.monotonic() < deadline:
-        latest = cribl_logs(preprod)
+        latest = cribl_logs(preprod, since)
         if all(marker in latest for marker in markers):
             return latest
         time.sleep(1)
@@ -602,21 +621,17 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"receipt-call-{token}",
         "aigw.security.event_class: Str(ai_request_audit)",
         f"event_type=LOGIN realm_id=aigw client_id=portal user_id=receipt-{token}",
-        '"event":"aigw.portal.audit"',
-        '"action":"rotation.trigger"',
-        '"note":"Bearer <redacted-authorization>"',
-        '"event":"aigw.identity.audit"',
-        f'"project":"receipt-{token}"',
-        f'"project":"failed-{token}"',
-        f'"receipt":"break-glass-{token}"',
-        '"event":"aigw.provider.rotation"',
-        f'"receipt":"rotation-{token}"',
-        '"event":"aigw.vault.state"',
-        f'"receipt":"vault-state-{token}"',
+        f"event=aigw.portal.audit action=rotation.trigger outcome=success subject=receipt-{token} vendor=anthropic",
+        f"event=aigw.identity.audit action=deployment_converge outcome=success project=receipt-{token} changed=true",
+        f"event=aigw.identity.audit action=deployment_converge outcome=failed project=failed-{token} error_type=ReceiptFailure",
+        "event=aigw.identity.audit action=break_glass_use outcome=success purpose=deployment_converge",
+        "event=aigw.provider.rotation action=rotate outcome=success vendor=anthropic rotation_status=success",
+        "event=aigw.vault.state action=state_observed outcome=success state=unsealed",
         "event=aigw.vault.audit",
         "hmac_protected=true",
-        '"event":"aigw.egress.trust"',
-        f'"policy_sha256":"{token * 4}"',
+        f"event=aigw.egress.trust action=startup_gate outcome=success policy_sha256={token * 4}",
+        "providers=anthropic sni=api.anthropic.com exact_sans=api.anthropic.com",
+        f"ca_sha256_fingerprints={ANTHROPIC_CA_FINGERPRINTS}",
         "event=aigw.egress.trust action=upstream_tls_failure outcome=failed provider=anthropic reason=tls_transport_failure",
     )
     missing = [marker for marker in allowed if marker not in logs]
@@ -626,6 +641,8 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"TRACE_SECRET_{token}",
         f"KEYCLOAK_SECRET_{token}",
         f"PORTAL_SECRET_{token}",
+        f"UNAPPROVED_FIELD_{token}",
+        f"NESTED_SECRET_{token}",
         f"DENIED_ORDINARY_LOG_{token}",
         f"DENIED_SCHEMA_{token}",
         f"DENIED_ACTION_{token}",
@@ -761,6 +778,7 @@ def exercise_tls_server_name_failure(
 ) -> None:
     """Prove Alloy queues records when the trusted server has the wrong SAN."""
 
+    since = log_cursor()
     paths = (CRIBL_CERT, CRIBL_KEY, WRONG_SAN_CERT, WRONG_SAN_KEY)
     try:
         original_cert, original_key, wrong_cert, wrong_key = (
@@ -787,14 +805,14 @@ def exercise_tls_server_name_failure(
         wait_for_queue(preprod, model, populated=True)
         marker = f"queued-ai-input-{token}-0"
         time.sleep(3)
-        if marker in cribl_logs(preprod):
+        if marker in cribl_logs(preprod, since):
             fail("Alloy accepted a Cribl certificate with the wrong server name")
 
         replace_test_certificate(CRIBL_CERT, original_cert)
         replace_test_certificate(CRIBL_KEY, original_key)
         restored = True
         recreate_cribl(preprod)
-        wait_for_receipts(preprod, (marker,))
+        wait_for_receipts(preprod, (marker,), since)
         wait_for_queue(preprod, model, populated=False)
     finally:
         if replaced and not restored:
@@ -804,6 +822,7 @@ def exercise_tls_server_name_failure(
 
 
 def exercise_outage_recovery(preprod: Preprod, model: dict[str, Any], token: str) -> None:
+    since = log_cursor()
     cribl = preprod.container_id("cribl-mock")
     alloy = preprod.container_id("alloy")
     cribl_stopped = False
@@ -827,7 +846,7 @@ def exercise_outage_recovery(preprod: Preprod, model: dict[str, Any], token: str
         preprod.docker("start", cribl)
         cribl_stopped = False
         preprod.wait_healthy("cribl-mock")
-        wait_for_receipts(preprod, (f"queued-ai-input-{token}-0",))
+        wait_for_receipts(preprod, (f"queued-ai-input-{token}-0",), since)
         wait_for_queue(preprod, model, populated=False)
     finally:
         if cribl_stopped:
@@ -866,6 +885,7 @@ def main() -> int:
     preprod.wait_healthy("alloy")
     preprod.wait_healthy("cribl-mock")
 
+    receipt_since = log_cursor()
     write_log_fixtures(preprod, model, token)
     send_otlp_fixtures(preprod, OTLP_FIXTURE_HELPER, token, "OTLP_FIXTURES_ACCEPTED")
     logs = wait_for_receipts(
@@ -873,18 +893,19 @@ def main() -> int:
         (
             f"allowed-ai-input-{token}",
             f"event_type=LOGIN realm_id=aigw client_id=portal user_id=receipt-{token}",
-            f'"subject":"receipt-{token}"',
-            f'"project":"receipt-{token}"',
-            f'"receipt":"rotation-{token}"',
-            f'"receipt":"vault-state-{token}"',
+            f"event=aigw.portal.audit action=rotation.trigger outcome=success subject=receipt-{token}",
+            f"event=aigw.identity.audit action=deployment_converge outcome=success project=receipt-{token}",
+            "event=aigw.provider.rotation action=rotate outcome=success vendor=anthropic",
+            "event=aigw.vault.state action=state_observed outcome=success state=unsealed",
             "event=aigw.vault.audit",
-            f'"policy_sha256":"{token * 4}"',
+            f"event=aigw.egress.trust action=startup_gate outcome=success policy_sha256={token * 4}",
             "event=aigw.egress.trust action=upstream_tls_failure",
         ),
+        receipt_since,
     )
     # One extra file-source interval proves denied records did not merely lag.
     time.sleep(12)
-    assert_initial_receipts(cribl_logs(preprod), token)
+    assert_initial_receipts(cribl_logs(preprod, receipt_since), token)
     exercise_tls_server_name_failure(preprod, model, tls_token)
     exercise_outage_recovery(preprod, model, outage_token)
 
