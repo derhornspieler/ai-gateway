@@ -4,7 +4,7 @@
     that:
       - inventory_hostname == 'localhost'
       - (ansible_connection | default('')) == 'local'
-      - preprod_state in ['present', 'absent']
+      - preprod_state in ['present', 'absent', 'clean-room']
       - aigw_domain == 'aigw.internal'
       - preprod_project_name == 'aigw-preprod'
       - preprod_resource_prefix == 'aigw-preprod'
@@ -31,3 +31,7 @@
 - name: Run the bounded local preprod removal
   ansible.builtin.include_tasks: absent.yml
   when: preprod_state == 'absent'
+
+- name: Run the release-image clean-room removal
+  ansible.builtin.include_tasks: clean_room.yml
+  when: preprod_state == 'clean-room'

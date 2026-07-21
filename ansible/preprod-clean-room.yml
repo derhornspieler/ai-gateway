@@ -1,0 +1,27 @@
+---
+- name: Remove one exact local AI Gateway preprod release before a fresh load
+  hosts: preprod
+  gather_facts: false
+  become: false
+  pre_tasks:
+    - name: Require the exact release-image clean-room confirmation
+      ansible.builtin.assert:
+        that:
+          - preprod_state == 'clean-room'
+          - >-
+            preprod_clean_room_confirmation | default('') ==
+            'DESTROY_AIGW_PREPROD_RELEASE_IMAGES'
+        quiet: true
+        fail_msg: >-
+          Pass
+          -e preprod_clean_room_confirmation=DESTROY_AIGW_PREPROD_RELEASE_IMAGES.
+          The command removes only the validated preprod release boundary.
+  vars:
+    preprod_state: clean-room
+    preprod_image_mode: seed
+    aigw_domain: aigw.internal
+    preprod_project_name: aigw-preprod
+    preprod_resource_prefix: aigw-preprod
+    preprod_subnet_octet: 29
+  roles:
+    - preprod_stack

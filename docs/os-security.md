@@ -5,15 +5,29 @@ playbooks require and apply on the target Rocky Linux 9 VM: SELinux policy
 and verification, SSH hardening, encrypted state storage, package hygiene,
 auditing, and filesystem permission contracts. Network enforcement is covered
 separately in [network security](network-security.md); the container platform
-in [Docker security](docker-security.md).
+in [Docker security](docker-security.md). The shorter
+[security model](security-model.md) connects these host controls to identity,
+provider trust, and telemetry.
+
+In plain language, the production host must:
+
+- run Rocky Linux 9 with SELinux enforcing;
+- accept key-only SSH on the ADM interface from the approved VPN range;
+- use the exact reviewed Docker, Compose, containerd, `age`, and Python SDK
+  versions;
+- keep project files, secrets, and state at their required owners and modes;
+- report any new SELinux denial as a deployment failure; and
+- warn when sensitive state is not backed by customer-supplied LUKS storage.
+
+Local preprod does not change or prove these production host controls.
 
 ## Posture summary
 
-The playbook validates before it mutates, and it fails closed: every contract
-below is asserted by a read-only preflight or the post-converge `verify`
-role, and a violated contract stops the run rather than being silently
-repaired. Only Rocky Linux 9 is supported; any other distribution or major
-version is refused.
+The playbook validates before it mutates. Most violated contracts stop the run
+instead of being silently repaired. The stated exception is LUKS backing:
+Ansible reports a clear warning because disk provisioning belongs to the
+customer, then continues. Only Rocky Linux 9 is supported; any other
+distribution or major version is refused.
 
 ## 1. SELinux
 

@@ -59,6 +59,74 @@ class UpdateImagesContractTest(unittest.TestCase):
         self.assertIn("--provider NAME", result.stdout)
         self.assertIn("--test-preprod", result.stdout)
         self.assertIn("--ask-become-pass", result.stdout)
+        self.assertIn("--become-password-file PATH", result.stdout)
+
+    def test_preprod_become_options_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            TOOL.parser().parse_args(
+                [
+                    "test-preprod",
+                    "--archive",
+                    "/private/release.docker.tar.zst",
+                    "--manifest",
+                    "/private/release.manifest.json",
+                    "--ask-become-pass",
+                    "--become-password-file",
+                    "/private/become",
+                ]
+            )
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_become_password_file_is_private_single_link_and_never_opened(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            password = root / "become"
+            password.write_text("not-a-real-password\n")
+            password.chmod(0o600)
+
+            with mock.patch.object(Path, "open", side_effect=AssertionError("opened")):
+                normalized = TOOL.normalize_become_password_file(password)
+            self.assertEqual(normalized, password)
+
+            password.chmod(0o640)
+            with self.assertRaisesRegex(TOOL.WorkflowError, "mode 0600"):
+                TOOL.normalize_become_password_file(password)
+            password.chmod(0o600)
+
+            second_link = root / "second-link"
+            os.link(password, second_link)
+            with self.assertRaisesRegex(TOOL.WorkflowError, "one hard link"):
+                TOOL.normalize_become_password_file(password)
+
+    def test_become_password_file_rejects_relative_path_and_symlink(self) -> None:
+        with self.assertRaisesRegex(TOOL.WorkflowError, "absolute controller path"):
+            TOOL.normalize_become_password_file(Path("become"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            password = root / "become"
+            password.write_text("not-a-real-password\n")
+            password.chmod(0o600)
+            link = root / "become-link"
+            link.symlink_to(password)
+            with self.assertRaisesRegex(TOOL.WorkflowError, "not a symlink"):
+                TOOL.normalize_become_password_file(link)
+
+    def test_ansible_receives_only_the_validated_become_password_path(self) -> None:
+        password = Path("/private/operator/become")
+        with mock.patch.object(TOOL, "run_checked") as runner:
+            TOOL.ansible_command(
+                root=ROOT,
+                inventory=Path("/inventory.yml"),
+                playbook=Path("/playbook.yml"),
+                limit=None,
+                vault_id=None,
+                extra_vars={"safe": True},
+                become_password_file=password,
+            )
+        command = runner.call_args.args[0]
+        index = command.index("--become-password-file")
+        self.assertEqual(command[index + 1], str(password))
+        self.assertNotIn("not-a-real-password", " ".join(command))
 
     def test_prepare_requires_at_least_one_provider(self) -> None:
         with self.assertRaises(SystemExit) as raised:
@@ -74,6 +142,25 @@ class UpdateImagesContractTest(unittest.TestCase):
                 ]
             )
         self.assertEqual(raised.exception.code, 2)
+
+    def test_prepare_rejects_become_password_file_without_preprod_test(self) -> None:
+        args = TOOL.parser().parse_args(
+            [
+                "prepare",
+                "--archive",
+                "/private/release.docker.tar.zst",
+                "--manifest",
+                "/private/release.manifest.json",
+                "--platform",
+                "linux/amd64",
+                "--provider",
+                "anthropic",
+                "--become-password-file",
+                "/private/become",
+            ]
+        )
+        with self.assertRaisesRegex(TOOL.WorkflowError, "require --test-preprod"):
+            TOOL.cmd_prepare(args)
 
     def test_preprod_sudo_prompt_is_not_limited_to_archive_loading(self) -> None:
         args = TOOL.parser().parse_args(
@@ -96,6 +183,7 @@ class UpdateImagesContractTest(unittest.TestCase):
             release,
             load_archive=False,
             ask_become_pass=True,
+            become_password_file=None,
         )
 
     def test_prepare_passes_sudo_prompt_to_immediate_preprod_test(self) -> None:
@@ -142,6 +230,40 @@ class UpdateImagesContractTest(unittest.TestCase):
             preprod_release,
             load_archive=True,
             ask_become_pass=True,
+            become_password_file=None,
+        )
+
+    def test_test_preprod_validates_and_passes_become_password_file(self) -> None:
+        args = TOOL.parser().parse_args(
+            [
+                "test-preprod",
+                "--archive",
+                "/private/release.preprod.docker.tar.zst",
+                "--manifest",
+                "/private/release.preprod.manifest.json",
+                "--load-archive",
+                "--become-password-file",
+                "/private/become",
+            ]
+        )
+        release = mock.Mock()
+        normalized = Path("/private/checked-become")
+        with (
+            mock.patch.object(TOOL, "read_release", return_value=release),
+            mock.patch.object(
+                TOOL,
+                "normalize_become_password_file",
+                return_value=normalized,
+            ) as normalize,
+            mock.patch.object(TOOL, "test_preprod") as test_preprod,
+        ):
+            self.assertEqual(TOOL.cmd_test_preprod(args), 0)
+        normalize.assert_called_once_with(Path("/private/become"))
+        test_preprod.assert_called_once_with(
+            release,
+            load_archive=True,
+            ask_become_pass=False,
+            become_password_file=normalized,
         )
 
     def test_upgrade_help_has_no_target_or_inventory_defaults(self) -> None:
@@ -729,8 +851,15 @@ class UpdateImagesContractTest(unittest.TestCase):
         )
         stage_calls: list[str] = []
 
-        def stage(_release, *, state: str, ask_become_pass: bool):
+        def stage(
+            _release,
+            *,
+            state: str,
+            ask_become_pass: bool,
+            become_password_file: Path | None,
+        ):
             self.assertTrue(ask_become_pass)
+            self.assertIsNone(become_password_file)
             stage_calls.append(state)
             return staged_archive, staged_manifest
 
@@ -738,6 +867,7 @@ class UpdateImagesContractTest(unittest.TestCase):
             mock.patch.object(TOOL.sys, "platform", "linux"),
             mock.patch.object(TOOL, "require_release_scope"),
             mock.patch.object(TOOL, "validate_release_source_pins"),
+            mock.patch.object(TOOL, "clean_room_preprod_release"),
             mock.patch.object(TOOL, "stage_preprod_release", side_effect=stage),
             mock.patch.object(TOOL, "ansible_command") as ansible,
             mock.patch.object(TOOL, "run_checked"),
@@ -747,6 +877,7 @@ class UpdateImagesContractTest(unittest.TestCase):
                 release,
                 load_archive=True,
                 ask_become_pass=True,
+                become_password_file=None,
             )
 
         self.assertEqual(stage_calls, ["present", "absent"])
@@ -767,6 +898,7 @@ class UpdateImagesContractTest(unittest.TestCase):
             mock.patch.object(TOOL.sys, "platform", "darwin"),
             mock.patch.object(TOOL, "require_release_scope"),
             mock.patch.object(TOOL, "validate_release_source_pins"),
+            mock.patch.object(TOOL, "clean_room_preprod_release"),
             mock.patch.object(TOOL, "stage_preprod_release") as stage,
             mock.patch.object(TOOL, "ansible_command") as ansible,
             mock.patch.object(TOOL, "run_checked"),
@@ -776,12 +908,145 @@ class UpdateImagesContractTest(unittest.TestCase):
                 release,
                 load_archive=True,
                 ask_become_pass=True,
+                become_password_file=None,
             )
 
         stage.assert_not_called()
         values = ansible.call_args.kwargs["extra_vars"]
         self.assertEqual(values["preprod_seed_loader_archive"], str(release.archive))
         self.assertEqual(values["preprod_seed_loader_manifest"], str(release.manifest))
+
+    def test_release_grade_preprod_cleans_before_staging_then_deploys_once(self) -> None:
+        release = mock.Mock(
+            archive=Path("/private/release.preprod.docker.tar.zst"),
+            manifest=Path("/private/release.preprod.manifest.json"),
+            archive_sha256="a" * 64,
+            manifest_sha256="b" * 64,
+        )
+        staged_archive = Path("/var/tmp/staged/release.docker.tar.zst")
+        staged_manifest = Path("/var/tmp/staged/release.manifest.json")
+        order: list[str] = []
+
+        def stage(_release, *, state: str, **_kwargs):
+            order.append(f"stage:{state}")
+            return staged_archive, staged_manifest
+
+        def deploy(**kwargs):
+            order.append("deploy")
+            self.assertEqual(kwargs["playbook"], TOOL.PREPROD_PLAYBOOK)
+            self.assertIs(kwargs["extra_vars"]["preprod_seed_require_fresh_load"], True)
+
+        with (
+            mock.patch.object(TOOL.sys, "platform", "linux"),
+            mock.patch.object(TOOL, "require_release_scope"),
+            mock.patch.object(TOOL, "validate_release_source_pins"),
+            mock.patch.object(
+                TOOL,
+                "clean_room_preprod_release",
+                side_effect=lambda *_args, **_kwargs: order.append("clean-room"),
+            ),
+            mock.patch.object(TOOL, "stage_preprod_release", side_effect=stage),
+            mock.patch.object(TOOL, "ansible_command", side_effect=deploy),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            TOOL.test_preprod(
+                release,
+                load_archive=True,
+                ask_become_pass=False,
+                become_password_file=Path("/private/become"),
+            )
+
+        self.assertEqual(
+            order,
+            ["clean-room", "stage:present", "deploy", "stage:absent"],
+        )
+
+    def test_clean_room_failure_prevents_staging_and_deploy(self) -> None:
+        release = mock.Mock()
+        with (
+            mock.patch.object(TOOL, "require_release_scope"),
+            mock.patch.object(TOOL, "validate_release_source_pins"),
+            mock.patch.object(
+                TOOL,
+                "clean_room_preprod_release",
+                side_effect=TOOL.WorkflowError("clean-room failed"),
+            ),
+            mock.patch.object(TOOL, "stage_preprod_release") as stage,
+            mock.patch.object(TOOL, "ansible_command") as deploy,
+        ):
+            with self.assertRaisesRegex(TOOL.WorkflowError, "clean-room failed"):
+                TOOL.test_preprod(
+                    release,
+                    load_archive=True,
+                    ask_become_pass=False,
+                    become_password_file=None,
+                )
+        stage.assert_not_called()
+        deploy.assert_not_called()
+
+    def test_quick_no_load_preprod_skips_clean_room_and_is_not_release_grade(self) -> None:
+        release = mock.Mock(
+            archive=Path("/private/release.preprod.docker.tar.zst"),
+            manifest=Path("/private/release.preprod.manifest.json"),
+            archive_sha256="a" * 64,
+            manifest_sha256="b" * 64,
+        )
+        with (
+            mock.patch.object(TOOL, "require_release_scope"),
+            mock.patch.object(TOOL, "validate_release_source_pins"),
+            mock.patch.object(TOOL, "clean_room_preprod_release") as clean_room,
+            mock.patch.object(TOOL, "stage_preprod_release") as stage,
+            mock.patch.object(TOOL, "ansible_command") as deploy,
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            TOOL.test_preprod(
+                release,
+                load_archive=False,
+                ask_become_pass=False,
+                become_password_file=None,
+            )
+        clean_room.assert_not_called()
+        stage.assert_not_called()
+        deploy.assert_called_once()
+        self.assertIs(
+            deploy.call_args.kwargs["extra_vars"]["preprod_seed_require_fresh_load"],
+            False,
+        )
+
+    def test_clean_room_playbook_receives_exact_release_and_confirmation(self) -> None:
+        release = mock.Mock(
+            archive=Path("/private/release.preprod.docker.tar.zst"),
+            manifest=Path("/private/release.preprod.manifest.json"),
+            archive_sha256="a" * 64,
+            manifest_sha256="b" * 64,
+        )
+        with (
+            mock.patch.object(TOOL, "require_release_scope"),
+            mock.patch.object(TOOL, "validate_release_archive_allowlist"),
+            mock.patch.object(TOOL, "ansible_command") as ansible,
+        ):
+            TOOL.clean_room_preprod_release(
+                release,
+                ask_become_pass=False,
+                become_password_file=Path("/private/become"),
+            )
+        values = ansible.call_args.kwargs["extra_vars"]
+        self.assertEqual(
+            ansible.call_args.kwargs["playbook"],
+            TOOL.PREPROD_CLEAN_ROOM_PLAYBOOK,
+        )
+        self.assertEqual(
+            ansible.call_args.kwargs["become_password_file"],
+            Path("/private/become"),
+        )
+        self.assertEqual(values["preprod_seed_archive"], str(release.archive))
+        self.assertEqual(values["preprod_seed_archive_sha256"], release.archive_sha256)
+        self.assertEqual(values["preprod_seed_manifest"], str(release.manifest))
+        self.assertEqual(values["preprod_seed_manifest_sha256"], release.manifest_sha256)
+        self.assertEqual(
+            values["preprod_clean_room_confirmation"],
+            "DESTROY_AIGW_PREPROD_RELEASE_IMAGES",
+        )
 
     def test_preprod_wrapper_uses_the_playbooks_single_acceptance_gate(self) -> None:
         source = (ROOT / "scripts/update-images.py").read_text()

@@ -1,48 +1,73 @@
-# Operations
+# Production operations
 
-Production operations use the deployed `scripts/aigw-compose.sh` wrapper and
-Ansible entry points; do not assemble Compose files or profiles by hand.
+Use Ansible for production changes. Use the deployed
+`scripts/aigw-compose.sh` wrapper for read-only checks and logs. Do not build a
+Compose command by hand.
+
+| Need | Use |
+| --- | --- |
+| Full host and stack check | `ansible/site.yml` |
+| App-only deploy on a prepared host | `ansible/deploy-stack-only.yml` |
+| Vault unlock after reboot | [Vault unseal SOP](sop/vault-unseal-after-reboot.md) |
+| Image update | [Image update workflow](image-update-workflow.md) |
+| New production install | [Deployment runbook](deploy-runbook.md) |
+| Local release test | [Local preprod](preprod.md) |
 
 ## Routine checks
 
-- Run `ansible/site.yml` for a full converge whenever host/firewall state is in
-  doubt. Use `deploy-stack-only.yml` only on a host carrying the exact pending
-  or completed dedicated-host marker.
-- Verify Ansible pipelining before a converge with
-  `ansible-config dump | grep PIPELINING`; it must report `True`.
-- Use `scripts/aigw-compose.sh ps` for container state. Every expected
-  long-running service must be running and healthy; the `volume-init` one-shot
-  must remain successfully exited.
-- Vault seals after restart. A normal converge submits the encrypted
-  controller-held share through stdin and then proves strict dependency
-  readiness. Follow [sop/vault-unseal-after-reboot.md](sop/vault-unseal-after-reboot.md).
+Before any Ansible run, start at the repository root and check pipelining:
+
+```bash
+ansible-config dump | grep PIPELINING
+```
+
+It must show `True`. Pipelining keeps decrypted standard input out of remote
+Ansible temp files.
+
+Use a full `site.yml` run when host, firewall, route, or Docker network state
+may have changed. Use `deploy-stack-only.yml` only when the host has the exact
+pending or completed gateway marker. The stack-only play stops if the host is
+not ready.
+
+On the production VM, check container state with:
+
+```bash
+cd /opt/ai-gateway
+sudo scripts/aigw-compose.sh ps
+```
+
+Each required long-running service must be running and healthy. The
+`volume-init` one-shot must show a successful exit.
+
+Vault seals after a VM restart. Follow the
+[Vault unseal SOP](sop/vault-unseal-after-reboot.md). A normal Ansible run
+uses the encrypted controller copy of the share and then checks the stack.
 
 ## Production edge TLS
 
-HTTPS ends at the two Traefik edges. Most container-to-container traffic is
-plain HTTP on segmented Docker networks; the platform does not claim internal
-mTLS. Envoy starts separate verified TLS connections to AI vendors. Alloy uses
-a separate CA bundle for the optional Cribl SOC log endpoint. Follow the
-[Cribl logging-team handoff](cribl-soc-handoff.md) before enabling it.
+TLS ends at the internal and ADM Traefik edges. Envoy opens a separate checked
+TLS link to the selected AI provider. Alloy uses its own CA bundle when the
+optional Cribl feed is on.
 
-One certificate covers `*.<domain>` and `<domain>`. The validator requires both
-names. Choose one production mode in the generated host variables:
+The edge certificate must cover both `*.<domain>` and `<domain>`. Pick one mode
+in the generated host variables:
 
-| Mode | What the operator supplies |
+| Mode | What you provide |
 | --- | --- |
-| `customer-supplied` | A ready leaf certificate, its private key, and full chain |
-| `customer-intermediate` | An intermediate certificate, its private key, and full chain; Vault imports it and issues the leaf |
-| `vault-intermediate` | No private key file; Vault creates the intermediate key and emits a CSR for the customer CA to sign |
+| `customer-supplied` | A leaf certificate, private key, and full chain |
+| `customer-intermediate` | An intermediate certificate, private key, and full chain |
+| `vault-intermediate` | Vault makes the intermediate key and a CSR; your CA signs the CSR |
 
-The customer root private key must never enter the repository or gateway VM.
-Keep all controller-side private-key files outside the repository with mode
-`0600`. Ansible validates the certificate, key, chain, SANs, dates, usages,
-links, and file permissions before promotion.
+Keep the customer root private key off the gateway and out of this repository.
+Keep controller-side private keys outside the repository with mode `0600`.
+Ansible checks paths, ownership, certificates, keys, chains, names, dates, and
+key use before install.
 
-For `customer-intermediate`, run this after Vault initialization from
-`/opt/ai-gateway` on the target:
+For `customer-intermediate`, run this once after Vault initialization on the
+production VM:
 
 ```bash
+cd /opt/ai-gateway
 read -rsp 'Vault root token: ' AIGW_VAULT_TOKEN; printf '\n'
 printf '%s\n' "$AIGW_VAULT_TOKEN" | sudo scripts/vault-pki-intermediate.sh \
   import-intermediate \
@@ -52,14 +77,15 @@ printf '%s\n' "$AIGW_VAULT_TOKEN" | sudo scripts/vault-pki-intermediate.sh \
 unset AIGW_VAULT_TOKEN
 ```
 
-For `vault-intermediate`:
+For `vault-intermediate`, use this three-step flow:
 
-1. On the target, ask Vault to create its internal intermediate key and CSR:
+1. Ask Vault to make its key and CSR on the production VM:
 
    ```bash
    cd /opt/ai-gateway
    read -rsp 'Vault root token: ' AIGW_VAULT_TOKEN; printf '\n'
-   printf '%s\n' "$AIGW_VAULT_TOKEN" | sudo scripts/vault-pki-intermediate.sh csr
+   printf '%s\n' "$AIGW_VAULT_TOKEN" | \
+     sudo scripts/vault-pki-intermediate.sh csr
    unset AIGW_VAULT_TOKEN
    ```
 
@@ -73,42 +99,46 @@ For `vault-intermediate`:
      --out-dir /private/output/directory
    ```
 
-3. Copy `intermediate.pem` and `chain.pem` to protected temporary paths on the
-   target. Import them with the token on stdin:
+3. Copy `intermediate.pem` and `chain.pem` to protected temp paths on the VM.
+   Install them:
 
    ```bash
    cd /opt/ai-gateway
    read -rsp 'Vault root token: ' AIGW_VAULT_TOKEN; printf '\n'
-   printf '%s\n' "$AIGW_VAULT_TOKEN" | sudo scripts/vault-pki-intermediate.sh \
-     install-signed \
-     --signed-intermediate /protected/path/intermediate.pem \
-     --chain /protected/path/chain.pem
+   printf '%s\n' "$AIGW_VAULT_TOKEN" | \
+     sudo scripts/vault-pki-intermediate.sh install-signed \
+       --signed-intermediate /protected/path/intermediate.pem \
+       --chain /protected/path/chain.pem
    unset AIGW_VAULT_TOKEN
    ```
 
-After either intermediate ceremony, run the normal full production converge
-again. Verify both published edges with the customer root and the real
-hostname. A connection that succeeds only with certificate checking disabled
-does not pass.
+Run the full production converge after either ceremony. Test both edge IPs
+with the real hostname and customer Root CA. A test that works only when
+certificate checks are off does not pass.
+
+For the optional Cribl TLS setup, follow the
+[Cribl logging-team handoff](cribl-soc-handoff.md).
 
 ## Backup and restore
 
-`scripts/state-backup.sh` creates a quiesced age-encrypted backup on an
-independent filesystem. `scripts/state-restore.sh` authenticates and stages the
-archive, restores the exact approved volume/configuration inventory, and leaves
-the project stopped beneath a root-only recovery marker. Run a full
-current-source converge before unsealing and reopening ingress. Never perform a
-replacement Vault initialization on restored state.
+`scripts/state-backup.sh` stops writers and makes an age-encrypted backup on a
+separate file system. `scripts/state-restore.sh` checks and restores an approved
+backup. Restore leaves the project stopped under a root-only marker.
+
+After restore, run a full current-source converge. Then unlock Vault and check
+all services before you open ingress. Never initialize a new Vault over
+restored state.
 
 ## Updates
 
-Use `scripts/update-images.py` and
-[image-update-workflow.md](image-update-workflow.md). The workflow requires a
-fresh backup for stateful changes, deploys through Ansible, validates the full
-service graph, and restores both state and source during rollback.
+Use `scripts/update-images.py` and the
+[image update workflow](image-update-workflow.md). The workflow requires a new
+backup for stateful changes. It deploys through Ansible. It checks the result
+and restores the old state, source, images, and Envoy policy if validation
+fails.
 
 ## Local preprod
 
-Local preprod is operated only through `scripts/preprod.py` or the unified
-updater. It uses a distinct Compose project and loopback bindings. Destroying it
-must not target unrelated Docker projects; see [preprod.md](preprod.md).
+Local preprod is not a production host. It uses the fixed `aigw-preprod`
+project, `aigw.internal`, and loopback listeners. Operate it through Ansible or
+the image updater. See [Local preprod](preprod.md).

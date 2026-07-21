@@ -1,188 +1,212 @@
 # Image update workflow
 
-Use `scripts/update-images.py` to build, test, deploy, validate, and roll back
-image releases. The tool has no saved host, inventory, password, domain, or
-provider defaults.
+Use `scripts/update-images.py` for image releases. It can build, test, deploy,
+check, and roll back a release. It has no saved host, password, domain,
+inventory, or provider default.
 
-Each release build creates two file pairs:
+One build makes two file pairs:
 
-- a **production** archive and manifest with production images only; and
-- a **preprod** archive and manifest with the same production images plus the
-  Samba AD and WIF mock images.
+- **production:** production images only; and
+- **preprod:** the same images plus Samba AD and WIF test images.
 
-The two projections come from one build. Production files never contain the
-preprod-only image bytes.
+Never send the preprod pair to production.
 
-Provider design and CA review are covered in [Provider onboarding](provider-onboarding.md)
-and the [Provider CA maintenance SOP](sop/provider-ca-maintenance.md).
+## The normal engineer flow
+
+Use this order for each image change:
+
+1. Read the upstream release and upgrade notes.
+2. Pick the newest stable version that all linked services support.
+3. Change the reviewed tag and digest in the Dockerfile, Compose file, or
+   other pinned source file.
+4. Update app settings or libraries if the new image needs them.
+5. Run static checks and commit the source change.
+6. Run `prepare` to build both release pairs.
+7. Run the clean-room seeded preprod test. The updater destroys only owned
+   preprod state, purges the manifest image set, loads the archive, and runs
+   Ansible acceptance.
+8. Push the commit to `main`. Wait for the GitHub image scan.
+9. Transfer only the production pair for an approved upgrade.
+
+Do not edit a generated manifest. Git holds the reviewed source pins. The
+builder makes the manifest as release proof. Keep the archive, manifest,
+hashes, source commit, and test record together in private release storage.
+
+Provider review is covered in [Provider onboarding](provider-onboarding.md).
+CA work is covered in the
+[Provider CA SOP](sop/provider-ca-maintenance.md).
 
 ## 1. Build the offline release
 
-Create a private directory. Select at least one reviewed provider and build for
-the target Docker architecture:
+Make a new private directory. Put the date and platform in its name:
 
 ```bash
-install -d -m 0700 /srv/ai-gateway-releases/candidate
+install -d -m 0700 /srv/ai-gateway-releases/2026-07-21-linux-amd64
 python3 -I scripts/update-images.py prepare \
   --provider anthropic \
   --platform linux/amd64 \
-  --archive /srv/ai-gateway-releases/candidate/aigw-candidate.docker.tar.zst \
-  --manifest /srv/ai-gateway-releases/candidate/aigw-candidate.manifest.json
+  --archive /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst \
+  --manifest /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json
 ```
 
-Use `linux/arm64` for an ARM64 target. Anthropic is the only approved provider
-today. Repeat `--provider` only when a future reviewed catalog contains more
-than one needed provider. Names must exist in the committed catalog. The
-command has no hostname or CA-file option.
+Use `linux/arm64` for an ARM64 host. Anthropic is the only approved provider
+today. The provider name must exist in the committed catalog. The CLI does not
+accept a custom provider host or CA file.
 
-With the names above, the default outputs are:
+The command writes:
 
 ```text
-aigw-candidate.docker.tar.zst
-aigw-candidate.manifest.json
-aigw-candidate.preprod.docker.tar.zst
-aigw-candidate.preprod.manifest.json
+aigw-2026-07-21-linux-amd64.docker.tar.zst
+aigw-2026-07-21-linux-amd64.manifest.json
+aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
+aigw-2026-07-21-linux-amd64.preprod.manifest.json
 ```
 
-Use `--preprod-archive` and `--preprod-manifest` together if those sibling
-names do not fit your release layout.
+Use `--preprod-archive` and `--preprod-manifest` together when you need other
+preprod paths.
 
-The command does all of this:
+`prepare` does this work:
 
-1. Pulls every exact reviewed tag-and-digest pin.
-2. Restores a missing ordinary Docker tag only after checking its digest. The
-   update tool automatically enables the narrow
-   `--materialize-missing-source-tags` behavior needed by some Docker engines.
-3. Validates provider names through the network-disabled catalog planner.
-4. Builds a reproducible Envoy image with networking disabled and only the
-   selected routes and CA bundles.
-5. Builds all other production custom images and the two preprod-only images.
-6. Writes separate production and preprod schema-v2 releases with mode `0600`.
-7. Checks manifest pins, custom build-input hashes, provider evidence, policy
-   digest, image labels, and immutable image IDs against this source.
+1. Pulls each reviewed tag and digest pin.
+2. Checks the digest before it restores a missing normal tag.
+3. Checks the provider through the committed catalog.
+4. Builds Envoy with no build network.
+5. Adds only the selected provider route and CA data to Envoy.
+6. Builds the other production custom images.
+7. Builds the two preprod-only images.
+8. Writes both schema-v2 pairs with mode `0600`.
+9. Checks image IDs, source hashes, labels, provider data, and policy hashes.
 
-The manifest's `egress_policy` object records the canonical selected provider
-list, provider hostnames and TLS rules, CA fingerprints, provenance hashes,
-generated config digest, policy digest, and final Envoy image ID. A different
-provider selection changes the policy and image identity.
+The manifest records the provider list, hostnames, TLS rules, CA fingerprints,
+policy hash, and final Envoy image ID. A different provider choice makes a
+different policy and image.
 
-### Wait for the GitHub container-security gate
+### CI gate after local acceptance
 
-Push the reviewed commit to `main`. The **Repository and release container
-security** workflow does not allow manual dispatch, so branch-selected workflow
-code cannot request DHI release secrets. The workflow reads the committed
-`.github/release-container-security.json` selection. It scans every exact
-external image and every unique custom image in the full production plus
-preprod release set.
+Do not push yet. First pass the clean-room preprod test in Section 2. After
+that pass, push the reviewed commit to `main`. The **Repository and release
+container security** job scans the full production and preprod image union.
 
-The gate requires both DHI secrets. Missing credentials are a failure, not a
-skip. Every image must produce a `HIGH`/`CRITICAL` Trivy report, CycloneDX SBOM,
-and provenance record. Repository waivers belong in `.trivyignore.yaml`.
-Image vulnerability waivers belong in `.github/trivyignore-images.yaml` and
-must name an exact versioned package PURL. Every waiver must name an owner,
-explain the reason, and expire within one year. Save the workflow URL and the
-resolved inventory artifact with the release evidence.
+The GitHub Environment `release-container-security` must hold:
 
-Put the DHI secrets only in a GitHub Environment named
-`release-container-security`. Restrict that environment to the protected
-`main` branch. Remove repository-level and organization-level copies available
-to this repository. A workflow condition is not a secret boundary because
-branch code can change the condition. An environment branch rule is the
-enforcement point.
+```text
+DHI_USERNAME
+DHI_PASSWORD
+```
 
-This hosted gate rebuilds from the commit. It does not have the offline archive
-made on the operator workstation, and its provenance record is not a signed
-SLSA statement. Trivy also uses the vulnerability database available when the
-job runs. For those reasons, the gate does not replace the exact seeded
-preprod test in the next section. Do not run a separate local Trivy scan and
-call it the final release result.
+Limit that environment to protected `main`. Missing secrets fail the job. The
+job also fails for a pull, build, scan, SBOM, provenance, or upload error.
+
+The job blocks `HIGH` and `CRITICAL` findings unless an exact reviewed waiver
+applies. Keep waivers owned, dated, and tied to an exact package version.
+
+Hosted CI rebuilds from the commit. It does not receive the local archive.
+For that reason, CI does not replace the seeded preprod test.
 
 ## 2. Test the exact preprod seed
 
-When local Docker has the same architecture, add `--test-preprod` to the
-`prepare` command:
+To build both pairs and run the release-grade preprod test in one command, add
+`--test-preprod` to `prepare`:
 
 ```bash
 python3 -I scripts/update-images.py prepare \
   --provider anthropic \
   --platform linux/amd64 \
-  --archive /srv/ai-gateway-releases/candidate/aigw-candidate.docker.tar.zst \
-  --manifest /srv/ai-gateway-releases/candidate/aigw-candidate.manifest.json \
-  --test-preprod
+  --archive /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst \
+  --manifest /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json \
+  --test-preprod \
+  --become-password-file "$HOME/.ssh/become"
 ```
 
-On macOS, also add `--ask-become-pass`. Ansible needs permission to add the
-owned `127.0.2.1` and `127.0.3.1` loopback aliases that Docker Desktop lacks.
-Linux does not run that privileged alias task.
+This path uses the generated `.preprod` pair. It runs clean-room cleanup, then
+loads the archive bytes and runs Ansible acceptance. Use
+`--ask-become-pass` instead of `--become-password-file` for an interactive
+sudo prompt. Do not use both.
 
-This fast path activates the generated `.preprod` release from the exact images
-that `prepare` just built. It verifies the release receipt but does not unpack
-the archive a second time. It does not test the smaller production archive.
-Ansible starts the seed image IDs with `pull_policy: never` and no build
-sections. The end-to-end test checks Samba LDAPS, automatic Keycloak setup,
-static users and roles, WIF token exchange, LiteLLM, Envoy, and the mocked
-provider response.
-
-To load and test a copied preprod pair on macOS or Linux, use the preprod
-filenames:
+You can run the same release-grade test later from a copied preprod pair:
 
 ```bash
 python3 -I scripts/update-images.py test-preprod \
-  --archive /srv/ai-gateway-releases/candidate/aigw-candidate.preprod.docker.tar.zst \
-  --manifest /srv/ai-gateway-releases/candidate/aigw-candidate.preprod.manifest.json \
-  --load-archive
+  --archive /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
+  --manifest /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  --load-archive \
+  --become-password-file "$HOME/.ssh/become"
 ```
 
-On macOS, append `--ask-become-pass`. If the exact images are already loaded
-and you need only a development check, omit `--load-archive`.
+The password file must be an absolute, caller-owned, mode-`0600` regular file
+with one hard link. It cannot be a symbolic link. The updater never reads or
+copies it. It passes only the checked path to Ansible.
 
-On Linux, the tool copies caller-owned `0600` files into a digest-scoped,
-root-owned staging directory. The root-only loader checks and loads those
-copies. An Ansible `always` cleanup proves the staging directory was removed
-even when a test fails. On macOS, the Docker Desktop user verifies and loads
-the caller-owned private files directly.
+Both commands use this exact order:
 
-Keep the release only if local preprod passes. The detailed checks are in the
-[test runbook](test-runbook.md#2-build-and-test-the-offline-release).
+1. Check the preprod manifest and archive allow-list.
+2. Run `ansible/preprod-clean-room.yml` with the exact release paths and
+   hashes.
+3. Prove Docker is local. On Linux, prove the root loader and operator use the
+   same Docker socket.
+4. Destroy only owned preprod resources and generated seed state. Prove those
+   resources are gone.
+5. Purge only the manifest-listed image aliases and IDs after checking that no
+   foreign container uses them.
+6. Prove those images are absent and unrelated images were preserved.
+7. Remove the bounded preprod hosts block and only owned loopback aliases.
+8. Stage a private root copy on rootful Linux. Docker Desktop uses the
+   caller-owned files.
+9. Load the archive. Require exactly `LOADED`; reject `SKIPPED` and `RELOADED`.
+10. Run `ansible/preprod.yml` once for deploy and acceptance. Seed mode has no
+   pull or build sections. The play installs the bounded preprod hosts block.
+11. Remove any private root staging copy.
 
-`--test-preprod` is the fast development path. Final release evidence must use
-the test runbook's clean sequence: build the seed, destroy only namespaced
-preprod, load the `.preprod` archive, and let Ansible start with no pull or
-build. A green hosted-CI job does not replace that test. A registry-dependent
-job that did not complete is not a pass.
+A clean-room failure stops before staging and deploy. A load, deploy,
+acceptance, or staging-cleanup failure fails the test.
+
+The test covers Samba LDAPS, the local Root CA, Vault, automatic Keycloak
+setup, domain-based redirects, static users, roles, WIF, LiteLLM, the exact
+production Envoy startup gate, and inference through the preprod-only TLS
+Envoy and provider mock.
+
+Keep the release only when the clean test passes. Follow the exact order in
+the [acceptance test runbook](test-runbook.md#2-build-and-test-the-offline-release).
+
+For a quick local check of images that are already loaded, run `test-preprod`
+without `--load-archive`. That skips clean-room cleanup and archive loading.
+It is **not** release evidence.
 
 ## 3. Keep the previous release ready
 
-Automatic rollback needs the actual previous state, source, images, and Envoy
-provider policy. Keep:
+Rollback needs more than an old image tag. Keep:
 
-- the previous production schema-v2 archive and manifest;
-- a clean checkout or Git worktree at the previous reviewed commit;
-- a new backup path on an independent mounted filesystem; and
+- the previous production archive and manifest;
+- a clean checkout at the previous reviewed commit;
+- a new backup path on a separate file system; and
 - the matching age identity on the controller with mode `0600`.
 
-Example worktree:
+Example:
 
 ```bash
 git worktree add /srv/ai-gateway-releases/previous-source release-2026-07-01
 ```
 
-The candidate and previous checkouts must have no tracked edits. The tool
-recalculates external pins and all custom build-input hashes against each
-checkout. It also proves that the previous production seed matches the running
-images before it takes a backup.
+The current and previous checkouts must have no tracked edits. The updater
+checks both source trees. It also proves the previous seed matches the running
+release before it takes a backup.
 
 ## 4. Upgrade the remote host
 
-Transfer the production pair and independently recorded hashes to the
-controller. Do not pass the `.preprod` pair to `upgrade`.
+Copy the production pair and its hashes to the controller. Do not use the
+`.preprod` pair.
 
-This example is complete. Replace every example value:
+The local clean-room command is never used on production. Production upgrade
+uses the separate backup, staged production seed, validation, and automatic
+rollback flow below. It does not purge the running host's image set before the
+backup and rollback gates are ready.
+
+Replace every sample value below:
 
 ```bash
 python3 -I scripts/update-images.py upgrade \
-  --archive /srv/ai-gateway-releases/candidate/aigw-candidate.docker.tar.zst \
-  --manifest /srv/ai-gateway-releases/candidate/aigw-candidate.manifest.json \
+  --archive /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst \
+  --manifest /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json \
   --previous-archive /srv/ai-gateway-releases/previous/aigw-previous.docker.tar.zst \
   --previous-manifest /srv/ai-gateway-releases/previous/aigw-previous.manifest.json \
   --previous-release-dir /srv/ai-gateway-releases/previous-source \
@@ -201,64 +225,57 @@ python3 -I scripts/update-images.py upgrade \
   --remote-backup-path /mnt/ai-gateway-backups/gateway01-before-image-update.tar.gz.age
 ```
 
-The provider list is already sealed into the candidate manifest and Envoy
-image. `upgrade` does not accept a new provider selection.
+The provider choice is already sealed in the manifest and Envoy image. The
+upgrade command cannot change it.
 
-The `--ssh-target` and `--ssh-port` values must exactly match `ansible_user`,
-`ansible_host`, and `ansible_port` for `--limit`. Direct SSH uses batch mode,
-disables forwarding, uses the explicit port, and runs `sudo -n`. Configure a
-reviewed noninteractive sudo rule before maintenance.
+The SSH target and port must match the limited Ansible host. Direct SSH uses
+batch mode and `sudo -n`. Set up approved non-interactive sudo before the
+maintenance window.
 
-The backup root must be a dedicated directory. Do not use `/`, `/var`, `/tmp`,
-or another broad system root. `state-backup.sh` refuses a destination on the
-same block filesystem as the stack. The backup path must be new.
+The backup root must be a dedicated directory on a separate file system. Do
+not use `/`, `/var`, or `/tmp`. The backup output path must be new.
 
 ## What happens on the host
 
-1. Ansible stages the previous and candidate production seeds below the
-   private `/var/lib/ai-gateway/image-seeds` directory.
-2. The loader proves each archive allow-list, release scope, source contract,
-   image ID, and Envoy image-policy label binding.
-3. The tool proves the previous seed matches the running release.
-4. Ansible copies the controller-held age identity to fixed root-only storage
-   under `/run` for this workflow only.
-5. `state-backup.sh` stops writers, creates an authenticated encrypted backup,
-   restarts the original containers, and writes a fresh receipt.
-6. `ansible/deploy-stack-only.yml` activates the tested candidate images and
-   runs the verify role. The Envoy image and selected-provider policy move as
-   one release unit.
-7. `scripts/e2e-fresh-vm-check.sh` checks TLS, network planes, Keycloak redirect
-   URLs, and the live egress firewall on the actual production host. Its legacy
-   filename is kept for compatibility; it does not create or require a test VM.
-   Use `--validation-program` to add a reviewed site-specific executable gate.
-8. A Python `finally` path invokes the cleanup play and proves the temporary
-   age identity is gone.
+The updater:
+
+1. Stages the old and new production seeds in a private root path.
+2. Checks both seeds and their Envoy policy links.
+3. Proves the old seed matches the running release.
+4. Copies the age identity to a fixed private path under `/run`.
+5. Stops writers and makes a checked encrypted backup.
+6. Runs `ansible/deploy-stack-only.yml` with the new seed.
+7. Runs the normal verify role and the outside acceptance check.
+8. Runs an optional site test set by `--validation-program`.
+9. Removes the temp age identity in a final cleanup step.
+
+Envoy and its provider policy always move as one release unit.
 
 ## Automatic rollback
 
-Any deployment or validation failure starts rollback. The tool:
+A deploy or validation failure starts rollback. The updater:
 
-1. authenticates and restores the encrypted pre-upgrade state archive;
-2. runs the full `ansible/site.yml` from the previous clean source checkout;
-3. loads the previous production seed instead of rebuilding or pulling;
-4. restores the previous Envoy image and its matching provider policy;
-5. reruns the same external acceptance gate; and
-6. removes the exact restore marker only after validation passes.
+1. Checks and restores the encrypted backup.
+2. Runs the full `ansible/site.yml` from the old clean checkout.
+3. Loads the old production seed.
+4. Restores the old Envoy image and provider policy.
+5. Runs the same acceptance check.
+6. Removes the restore marker only after a pass.
 
-If restore, previous-source converge, validation, or temporary-key cleanup
-fails, the command exits with `AUTOMATIC ROLLBACK FAILED`. Keep ingress closed
-and keep the backup. The workflow never falls back to changing image tags
-alone.
+If restore, old-source deploy, validation, or cleanup fails, the command ends
+with `AUTOMATIC ROLLBACK FAILED`. Keep ingress closed. Keep the backup. Do not
+fall back to changing tags by hand.
 
-An external CA cutover can make an old release unable to reach a provider.
-Plan CA rotations with an overlap window by following the
-[CA maintenance SOP](sop/provider-ca-maintenance.md#rotation-with-an-overlap-window).
+An old release may stop working after a provider CA cutover. Plan CA rotation
+with an overlap window. See the
+[Provider CA SOP](sop/provider-ca-maintenance.md#rotation-with-an-overlap-window).
 
-PostgreSQL major changes are refused before staging. Use the separate
-[PostgreSQL 18 logical migration SOP](sop/postgresql-18-migration.md). It keeps
-the PostgreSQL 16 volume unchanged and closes rollback before PostgreSQL 18
-accepts normal application writes.
+The normal image workflow refuses a PostgreSQL major change. Use the
+[PostgreSQL 18 migration SOP](sop/postgresql-18-migration.md).
 
-The workflow does not rewrite source image pins. Change tag-and-digest pins
-through normal code review first. `prepare` fetches exactly those reviewed
-pins.
+## Related pages
+
+- [Local preprod](preprod.md)
+- [Acceptance test runbook](test-runbook.md)
+- [Offline seed details](offline-image-seed.md)
+- [Production operations](operations.md)

@@ -6,11 +6,19 @@ CA nears expiration, or a new provider is added.
 This is a trusted release-maintenance task. It is separate from deployment.
 Ansible never discovers or downloads CA files.
 
+See the [CA review and rotation diagram](../architecture-diagrams.md#13-ca-capture-review-rotation-and-approval)
+and the [provider trust section of the security model](../security-model.md#the-ca-stores-are-not-interchangeable)
+before changing trust material.
+
 ## Goal
 
 Produce reviewed CA bytes and provenance records, then bake them into a new
 immutable Envoy image. The live container must never receive an unreviewed CA
 mount or a downloaded CA file.
+
+This procedure is only for AI provider TLS. The Cribl, external-directory,
+edge, and local-preprod CAs have different owners and update paths. Never copy
+one of those bundles into the provider catalog.
 
 ## Before you start
 

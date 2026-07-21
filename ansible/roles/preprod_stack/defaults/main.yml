@@ -7,7 +7,8 @@ preprod_subnet_octet: 29
 preprod_image_mode: source
 preprod_pull_images: false
 preprod_build_images: true
-preprod_manage_hosts: false
+preprod_manage_hosts: true
+preprod_clean_room_confirmation: ""
 
 # Seed mode uses an archive and manifest already copied to the local controller.
 # All four values are required in that mode.
@@ -16,6 +17,7 @@ preprod_seed_archive_sha256: ""
 preprod_seed_manifest: ""
 preprod_seed_manifest_sha256: ""
 preprod_seed_load_archive: false
+preprod_seed_require_fresh_load: false
 # Linux root loads private staged copies. Docker Desktop loads the caller-owned
 # originals as the recorded non-root operator. Seed activation always uses the
 # caller-owned archive and manifest above.

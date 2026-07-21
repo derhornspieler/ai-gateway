@@ -27,11 +27,61 @@ def load_preprod_module():
     return module
 
 
+def load_seed_loader_module():
+    path = ROOT / "scripts/load-offline-image-seed.py"
+    spec = importlib.util.spec_from_file_location("aigw_seed_loader_for_preprod", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def clean_room_plan(module):
+    image_id = "sha256:" + "a" * 64
+    repository = "ai-gateway/clean-room-test"
+    aliases = [
+        {
+            "kind": "custom-archive-reference",
+            "value": f"{repository}:aigw-seed-{'a' * 64}",
+        },
+        {"kind": "custom-image", "value": f"{repository}:1"},
+    ]
+    return {
+        "groups": [{"aliases": aliases, "image_id": image_id}],
+        "manifest_sha256": "b" * 64,
+        "record_count": 1,
+        "schema_version": module.CLEAN_ROOM_PLAN_SCHEMA,
+        "unique_image_id_count": 1,
+    }
+
+
 class PreprodContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.script = (ROOT / "scripts/preprod.py").read_text()
         self.compose = (ROOT / "compose/docker-compose.preprod.yml").read_text()
         self.tasks = (ROOT / "ansible/roles/preprod_stack/tasks/present.yml").read_text()
+
+    def test_command_parser_registers_each_subcommand_once(self) -> None:
+        module = load_preprod_module()
+        parser = module.parser()
+        parsed = parser.parse_args(
+            [
+                "--image-mode",
+                "seed",
+                "clean-room-seed",
+                "--archive",
+                "/tmp/release.tar",
+                "--archive-sha256",
+                "a" * 64,
+                "--manifest",
+                "/tmp/release.json",
+                "--manifest-sha256",
+                "b" * 64,
+                "--confirm",
+                module.CLEAN_ROOM_CONFIRMATION,
+            ]
+        )
+        self.assertEqual(parsed.command, "clean-room-seed")
 
     def test_operator_entry_point_is_local_and_does_not_call_host_roles(self) -> None:
         inventory = (ROOT / "ansible/inventory/preprod.yml").read_text()
@@ -63,6 +113,88 @@ class PreprodContractTests(unittest.TestCase):
             "docker_stack",
         ):
             self.assertNotIn(f"- {role}", playbook)
+
+    def test_clean_room_playbook_is_confirmed_bounded_and_nonroot(self) -> None:
+        playbook = (ROOT / "ansible/preprod-clean-room.yml").read_text()
+        tasks = (
+            ROOT / "ansible/roles/preprod_stack/tasks/clean_room.yml"
+        ).read_text()
+        role = (ROOT / "ansible/roles/preprod_stack/tasks/main.yml").read_text()
+        defaults = (ROOT / "ansible/roles/preprod_stack/defaults/main.yml").read_text()
+
+        confirmation = "DESTROY_AIGW_PREPROD_RELEASE_IMAGES"
+        self.assertIn(confirmation, playbook)
+        self.assertIn(confirmation, tasks)
+        self.assertIn("preprod_state: clean-room", playbook)
+        self.assertIn("preprod_state in ['present', 'absent', 'clean-room']", role)
+        self.assertIn("include_tasks: clean_room.yml", role)
+        self.assertIn("preprod_manage_hosts: true", defaults)
+        self.assertIn("preprod_seed_require_fresh_load: false", defaults)
+
+        purge = tasks.index(
+            "- name: Validate, destroy, purge, and prove the exact preprod release boundary"
+        )
+        engine = tasks.index(
+            "- name: Prove clean-room and the Linux root loader use the same Docker engine"
+        )
+        loopback = tasks.index(
+            "- name: Remove only macOS loopback aliases owned by this preprod after clean-room purge"
+        )
+        hosts = tasks.index(
+            "- name: Remove only the exact marker-bounded preprod hosts fragment after clean-room purge"
+        )
+        report = tasks.index(
+            "- name: Report the completed release-image clean-room receipt"
+        )
+        self.assertLess(engine, purge)
+        self.assertLess(purge, loopback)
+        self.assertLess(loopback, hosts)
+        self.assertLess(hosts, report)
+        self.assertIn("become: false", tasks[purge:loopback])
+        self.assertIn("become: true", tasks[loopback:hosts])
+        self.assertIn("become: true", tasks[hosts:])
+        self.assertIn("preprod_clean_room.stdout | trim", tasks[report:])
+        self.assertNotIn("compose --rmi", tasks)
+
+        clean_argv = tasks[purge:loopback]
+        for option in (
+            "clean-room-seed",
+            "--archive",
+            "--archive-sha256",
+            "--manifest",
+            "--manifest-sha256",
+            "--confirm",
+        ):
+            self.assertIn(option, clean_argv)
+        self.assertIn("PREPROD_CLEAN_ROOM_OK", clean_argv)
+        self.assertIn("preprod_clean_room.stdout_lines | length != 1", clean_argv)
+        engine_block = tasks[engine:purge]
+        self.assertIn("check-root-seed-engine", engine_block)
+        self.assertIn("become: false", engine_block)
+        self.assertIn("== 'Linux'", engine_block)
+
+    def test_release_grade_seed_load_requires_one_fresh_archive_load(self) -> None:
+        defaults = (ROOT / "ansible/roles/preprod_stack/defaults/main.yml").read_text()
+        self.assertIn("preprod_seed_require_fresh_load: false", defaults)
+        linux_loader = self.tasks.split(
+            "- name: Load the exact offline image seed", 1
+        )[1].split(
+            "- name: Load the exact offline image seed through the Docker Desktop operator",
+            1,
+        )[0]
+        desktop_loader = self.tasks.split(
+            "- name: Load the exact offline image seed through the Docker Desktop operator",
+            1,
+        )[1].split("- name: Bind preprod", 1)[0]
+        self.assertIn("preprod_seed_require_fresh_load | bool", linux_loader)
+        self.assertIn("'LOADED ' ~ preprod_seed_archive_sha256", linux_loader)
+        self.assertIn("preprod_seed_require_fresh_load | bool", desktop_loader)
+        self.assertIn(
+            "'PREPROD_LOCAL_SEED_LOADED ' ~ preprod_seed_archive_sha256",
+            desktop_loader,
+        )
+        self.assertNotIn("SKIPPED", linux_loader)
+        self.assertNotIn("RELOADED ' ~", linux_loader)
 
     def test_preprod_has_no_retired_runtime_dependency(self) -> None:
         public_runtime = "\n".join(
@@ -99,6 +231,19 @@ class PreprodContractTests(unittest.TestCase):
         self.assertIn('"PG_DATA_VOLUME_NAME": f"{args.project}_pg18_data"', self.script)
         self.assertIn("com.aigw.preprod.project", self.script)
         self.assertIn("local Unix-socket Docker context", self.script)
+
+        module = load_preprod_module()
+        networks = module.desired_networks(
+            types.SimpleNamespace(prefix="aigw-preprod", subnet_octet=29)
+        )
+        self.assertEqual(
+            networks["aigw-preprod-net-vendor"],
+            ("172.28.7.0/24", True),
+        )
+        self.assertEqual(
+            networks["aigw-preprod-plane-egress"],
+            ("172.29.0.0/24", False),
+        )
 
     def test_dynamic_ipam_cannot_steal_reviewed_fixed_addresses(self) -> None:
         module = load_preprod_module()
@@ -223,6 +368,778 @@ class PreprodContractTests(unittest.TestCase):
             )
             self.assertFalse(Path(command[-2]).exists())
             self.assertIn("PREPROD_LOCAL_SEED_LOADED", stdout.getvalue())
+
+    def test_clean_room_plan_is_canonical_bounded_and_exactly_derived(self) -> None:
+        module = load_preprod_module()
+        self.assertEqual(
+            module._canonical_docker_alias("debian:13-slim"),
+            module._canonical_docker_alias("docker.io/library/debian:13-slim"),
+        )
+        self.assertEqual(
+            module._canonical_docker_alias("clean-room-test"),
+            "docker.io/library/clean-room-test:latest",
+        )
+        self.assertEqual(
+            module._canonical_docker_alias("docker.io/clean-room-test"),
+            "docker.io/library/clean-room-test:latest",
+        )
+        plan = clean_room_plan(module)
+        self.assertEqual(
+            module._validate_clean_room_plan(plan, "b" * 64), plan
+        )
+
+        malformed_cases = []
+        wrong_manifest = json.loads(json.dumps(plan))
+        wrong_manifest["manifest_sha256"] = "c" * 64
+        malformed_cases.append((wrong_manifest, "different manifest"))
+        unsorted = json.loads(json.dumps(plan))
+        unsorted["groups"][0]["aliases"].reverse()
+        malformed_cases.append((unsorted, "not canonical"))
+        wrong_archive_id = json.loads(json.dumps(plan))
+        wrong_archive_id["groups"][0]["aliases"][0]["value"] = (
+            "ai-gateway/clean-room-test:aigw-seed-" + "c" * 64
+        )
+        malformed_cases.append((wrong_archive_id, "not exact derivations"))
+        missing_archive = json.loads(json.dumps(plan))
+        missing_archive["groups"][0]["aliases"].pop(0)
+        malformed_cases.append((missing_archive, "not exact derivations"))
+        option_alias = json.loads(json.dumps(plan))
+        option_alias["groups"][0]["aliases"][1]["value"] = "--force"
+        malformed_cases.append((option_alias, "unsafe"))
+
+        for malformed, message in malformed_cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(SystemExit, message):
+                    module._validate_clean_room_plan(malformed, "b" * 64)
+
+    def test_clean_room_consumer_accepts_the_loaders_exact_plan_schema(self) -> None:
+        module = load_preprod_module()
+        loader = load_seed_loader_module()
+        custom_id = "sha256:" + "a" * 64
+        external_id = "sha256:" + "c" * 64
+        document = {
+            "external_images": [
+                {
+                    "image_id": external_id,
+                    "reference": "debian:13-slim@sha256:" + "d" * 64,
+                }
+            ],
+            "custom_images": [
+                {
+                    "archive_reference": (
+                        "ai-gateway/clean-room-test:aigw-seed-" + "a" * 64
+                    ),
+                    "image": "ai-gateway/clean-room-test:1",
+                    "image_id": custom_id,
+                }
+            ],
+        }
+        plan = loader._purge_plan_aliases(document)
+        plan["manifest_sha256"] = "b" * 64
+        self.assertEqual(
+            module._validate_clean_room_plan(plan, "b" * 64), plan
+        )
+        custom_group = next(
+            group for group in plan["groups"] if group["image_id"] == custom_id
+        )
+        self.assertEqual(
+            [alias["kind"] for alias in custom_group["aliases"]],
+            ["custom-archive-reference", "custom-image"],
+        )
+
+    def test_clean_room_planner_cli_is_read_only_exact_and_canonical(self) -> None:
+        module = load_preprod_module()
+        plan = clean_room_plan(module)
+        canonical = json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n"
+        args = types.SimpleNamespace(
+            archive="/private/release.preprod.docker.tar.zst",
+            archive_sha256="c" * 64,
+            manifest="/private/release.preprod.manifest.json",
+            manifest_sha256="b" * 64,
+        )
+        completed = subprocess.CompletedProcess([], 0, canonical, "")
+        with (
+            mock.patch.object(module.os, "geteuid", return_value=501),
+            mock.patch.object(
+                module,
+                "validate_local_docker_context",
+                return_value="unix:///private/tmp/docker.sock",
+            ),
+            mock.patch.object(module, "run", return_value=completed) as runner,
+        ):
+            self.assertEqual(module.clean_room_purge_plan(args), plan)
+        command = runner.call_args.args[0]
+        self.assertEqual(command[3], "local-preprod-purge-plan")
+        self.assertEqual(command[-1], "unix:///private/tmp/docker.sock")
+        self.assertEqual(command[-2], str(ROOT.resolve()))
+        for forbidden in ("load", "rm", "rmi", "--force"):
+            self.assertNotIn(forbidden, command)
+
+        noncanonical = subprocess.CompletedProcess(
+            [], 0, json.dumps(plan, indent=2) + "\n", ""
+        )
+        with (
+            mock.patch.object(module.os, "geteuid", return_value=501),
+            mock.patch.object(
+                module,
+                "validate_local_docker_context",
+                return_value="unix:///private/tmp/docker.sock",
+            ),
+            mock.patch.object(module, "run", return_value=noncanonical),
+        ):
+            with self.assertRaisesRegex(SystemExit, "unbounded response"):
+                module.clean_room_purge_plan(args)
+
+    def test_clean_room_inventory_inspects_all_objects_and_snapshots_non_targets(self) -> None:
+        module = load_preprod_module()
+        plan = clean_room_plan(module)
+        target_id = plan["groups"][0]["image_id"]
+        other_id = "sha256:" + "d" * 64
+        container_id = "e" * 64
+        aliases = {
+            alias["value"] for alias in plan["groups"][0]["aliases"]
+        }
+        target_document = {
+            "Id": target_id,
+            "RepoTags": sorted(
+                "docker.io/" + value
+                for value in aliases
+                if "@sha256:" not in value
+            ),
+            "RepoDigests": [
+                "docker.io/ai-gateway/clean-room-test@" + target_id
+            ],
+            "Descriptor": {"digest": target_id},
+        }
+        other_document = {
+            "Id": other_id,
+            "RepoTags": ["unrelated/image:1"],
+            "RepoDigests": [],
+            "Descriptor": {"digest": other_id},
+        }
+        container_document = {
+            "Id": container_id,
+            "Name": "/aigw-preprod-test-1",
+            "Image": target_id,
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "aigw-preprod",
+                    "com.aigw.preprod.project": "aigw-preprod",
+                }
+            },
+        }
+
+        def listed(kind, *_arguments, **_kwargs):
+            return [container_id] if kind == "container" else [target_id, other_id]
+
+        def inspected(kind, value):
+            if kind == "container":
+                return container_document
+            return target_document if value == target_id else other_document
+
+        def optional(value, _kind=None):
+            if value == other_id:
+                return other_document
+            return target_document
+
+        with (
+            mock.patch.object(module, "_clean_room_list", side_effect=listed),
+            mock.patch.object(
+                module, "_clean_room_inspect_required", side_effect=inspected
+            ) as inspect,
+            mock.patch.object(
+                module, "_clean_room_inspect_image_optional", side_effect=optional
+            ),
+        ):
+            inventory = module.collect_clean_room_inventory(plan)
+        self.assertEqual(inventory["non_target_ids"], {other_id})
+        self.assertEqual(inventory["present_target_ids"], {target_id})
+        self.assertEqual(len(inventory["present_aliases"]), 2)
+        self.assertEqual(len(inventory["generated_aliases"]), 1)
+        self.assertEqual(inspect.call_count, 3)
+
+    def test_clean_room_inventory_rejects_foreign_use_alias_and_id_only_trust(self) -> None:
+        module = load_preprod_module()
+        plan = clean_room_plan(module)
+        target_id = plan["groups"][0]["image_id"]
+        container_id = "e" * 64
+        target_document = {
+            "Id": target_id,
+            "RepoTags": ["foreign/alias:1"],
+            "RepoDigests": [],
+            "Descriptor": {"digest": target_id},
+        }
+        unrelated_container = {
+            "Id": container_id,
+            "Name": "/unrelated",
+            "Image": target_id,
+            "Config": {"Labels": {}},
+        }
+
+        def listed(kind, *_arguments, **_kwargs):
+            return [container_id] if kind == "container" else [target_id]
+
+        def inspected(kind, _value):
+            return unrelated_container if kind == "container" else target_document
+
+        with (
+            mock.patch.object(module, "_clean_room_list", side_effect=listed),
+            mock.patch.object(
+                module, "_clean_room_inspect_required", side_effect=inspected
+            ),
+            mock.patch.object(
+                module,
+                "_clean_room_inspect_image_optional",
+                return_value=target_document,
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "unreviewed Docker alias"):
+                module.collect_clean_room_inventory(plan)
+
+        target_document["RepoTags"] = []
+        with (
+            mock.patch.object(module, "_clean_room_list", side_effect=listed),
+            mock.patch.object(
+                module, "_clean_room_inspect_required", side_effect=inspected
+            ),
+            mock.patch.object(
+                module, "_clean_room_inspect_image_optional", return_value=None
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "without a reviewed alias binding"):
+                module.collect_clean_room_inventory(plan)
+
+        with (
+            mock.patch.object(module, "_clean_room_list", side_effect=listed),
+            mock.patch.object(
+                module, "_clean_room_inspect_required", side_effect=inspected
+            ),
+            mock.patch.object(
+                module,
+                "_clean_room_inspect_image_optional",
+                return_value=target_document,
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "unrelated running or stopped"):
+                module.collect_clean_room_inventory(plan)
+
+    def test_clean_room_image_removal_is_alias_first_no_prune_and_fail_closed(self) -> None:
+        module = load_preprod_module()
+        plan = clean_room_plan(module)
+        target_id = plan["groups"][0]["image_id"]
+        document = {"Id": target_id}
+        inventory = {
+            "present_aliases": [
+                (target_id, alias["kind"], alias["value"])
+                for alias in plan["groups"][0]["aliases"]
+            ],
+            "generated_aliases": [
+                (
+                    target_id,
+                    "custom-generated-repository-digest",
+                    "ai-gateway/clean-room-test@" + target_id,
+                )
+            ],
+            "present_target_ids": {target_id},
+        }
+        removals = []
+        with (
+            mock.patch.object(
+                module,
+                "_clean_room_inspect_image_optional",
+                return_value=document,
+            ),
+            mock.patch.object(
+                module,
+                "_remove_clean_room_image_reference",
+                side_effect=lambda value, kind: removals.append((value, kind)) or True,
+            ),
+        ):
+            module.remove_clean_room_images(plan, inventory)
+        self.assertEqual(
+            [value for value, _ in removals[:-1]],
+            [alias["value"] for alias in plan["groups"][0]["aliases"]]
+            + ["ai-gateway/clean-room-test@" + target_id],
+        )
+        self.assertEqual(removals[-1], (target_id, None))
+
+        late_foreign_alias = {"Id": target_id, "RepoTags": ["foreign:latest"]}
+        with (
+            mock.patch.object(
+                module,
+                "_clean_room_inspect_image_optional",
+                side_effect=[document, document, document, late_foreign_alias],
+            ),
+            mock.patch.object(module, "_remove_clean_room_image_reference") as remove,
+        ):
+            with self.assertRaisesRegex(SystemExit, "gained an unreviewed alias"):
+                module.remove_clean_room_images(plan, inventory)
+        self.assertEqual(remove.call_count, 3)
+
+        success = subprocess.CompletedProcess([], 0, "Deleted: " + target_id + "\n", "")
+        with mock.patch.object(module, "clean_room_docker", return_value=success) as docker:
+            self.assertTrue(
+                module._remove_clean_room_image_reference(target_id, None)
+            )
+        self.assertEqual(
+            docker.call_args.args,
+            ("image", "rm", "--no-prune", target_id),
+        )
+        for forbidden in ("--force", "--all", "--prune", "--rmi"):
+            self.assertNotIn(forbidden, docker.call_args.args)
+
+        generic = subprocess.CompletedProcess([], 1, "", "daemon unavailable\n")
+        with mock.patch.object(module, "clean_room_docker", return_value=generic):
+            with self.assertRaisesRegex(SystemExit, "failed while removing"):
+                module._remove_clean_room_image_reference(target_id, None)
+
+        exact_missing = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            "Error response from daemon: No such image: "
+            "ai-gateway/missing:latest\n",
+        )
+        with mock.patch.object(
+            module, "clean_room_docker", return_value=exact_missing
+        ):
+            self.assertFalse(
+                module._remove_clean_room_image_reference(
+                    "ai-gateway/missing", "custom-image"
+                )
+            )
+        format_newline_missing = subprocess.CompletedProcess(
+            [],
+            1,
+            "\n",
+            "Error response from daemon: No such image: "
+            "ai-gateway/missing:latest\n",
+        )
+        with mock.patch.object(
+            module, "clean_room_docker", return_value=format_newline_missing
+        ):
+            self.assertFalse(
+                module._remove_clean_room_image_reference(
+                    "ai-gateway/missing", "custom-image"
+                )
+            )
+        wrong_missing = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            "Error response from daemon: No such image: other:latest\n",
+        )
+        with mock.patch.object(
+            module, "clean_room_docker", return_value=wrong_missing
+        ):
+            with self.assertRaisesRegex(SystemExit, "failed while removing"):
+                module._remove_clean_room_image_reference(
+                    "ai-gateway/missing", "custom-image"
+                )
+
+    def test_clean_room_resource_preflight_refuses_unreconstructable_ownership(self) -> None:
+        module = load_preprod_module()
+        container_id = "e" * 64
+        inventory = {
+            "containers": {
+                container_id: {
+                    "Id": container_id,
+                    "Name": "/aigw-preprod-test-1",
+                    "Image": "sha256:" + "a" * 64,
+                    "Config": {
+                        "Labels": {
+                            "com.docker.compose.project": "aigw-preprod",
+                            "com.aigw.preprod.project": "aigw-preprod",
+                        }
+                    },
+                }
+            }
+        }
+        args = types.SimpleNamespace(
+            project="aigw-preprod",
+            prefix="aigw-preprod",
+            subnet_octet=29,
+            image_mode="seed",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            missing_env = Path(directory) / "preprod.env"
+            with mock.patch.object(module, "ENV_FILE", missing_env):
+                with self.assertRaisesRegex(SystemExit, "exact clean-room project"):
+                    module.preflight_clean_room_resources(args, inventory)
+
+            unsafe_receipt = Path(directory) / "receipt.json"
+            target = Path(directory) / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            unsafe_receipt.symlink_to(target)
+            with (
+                mock.patch.object(module, "SEED_RECEIPT", unsafe_receipt),
+                mock.patch.object(module, "SEED_OVERLAY", Path(directory) / "none"),
+                mock.patch.object(module, "VAULT_INIT_FILE", Path(directory) / "vault"),
+            ):
+                with self.assertRaisesRegex(SystemExit, "unsafe generated"):
+                    module._validate_clean_room_generated_state()
+
+    def test_clean_room_network_inventory_binds_full_ids_to_names(self) -> None:
+        module = load_preprod_module()
+        network_id = "a" * 64
+        document = {"Id": network_id, "Name": "aigw-preprod-net-test"}
+        with (
+            mock.patch.object(module, "_clean_room_list", return_value=[network_id]) as listed,
+            mock.patch.object(
+                module, "_clean_room_inspect_required", return_value=document
+            ) as inspected,
+        ):
+            self.assertEqual(
+                module._clean_room_network_inventory(),
+                [(network_id, "aigw-preprod-net-test", document)],
+            )
+        listed.assert_called_once_with("network", "--no-trunc", "--quiet")
+        inspected.assert_called_once_with("network", network_id)
+
+        changed = {"Id": "b" * 64, "Name": "aigw-preprod-net-test"}
+        with (
+            mock.patch.object(module, "_clean_room_list", return_value=[network_id]),
+            mock.patch.object(
+                module, "_clean_room_inspect_required", return_value=changed
+            ),
+            self.assertRaisesRegex(SystemExit, "network inspection changed identity"),
+        ):
+            module._clean_room_network_inventory()
+
+    def test_clean_room_resource_inventory_uses_bound_network_names(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(
+            project="aigw-preprod",
+            prefix="aigw-preprod",
+            subnet_octet=29,
+            image_mode="seed",
+        )
+        inventory = {"containers": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            with (
+                mock.patch.object(module, "ENV_FILE", missing),
+                mock.patch.object(module, "desired_networks", return_value={}),
+                mock.patch.object(
+                    module, "_validate_clean_room_generated_state", return_value=0
+                ),
+                mock.patch.object(
+                    module, "_clean_room_network_inventory", return_value=[]
+                ) as networks,
+                mock.patch.object(module, "_clean_room_list", return_value=[]) as listed,
+            ):
+                module.preflight_clean_room_resources(args, inventory)
+            self.assertEqual(
+                listed.call_args_list,
+                [
+                    mock.call("volume", "--format", "{{.Name}}"),
+                ],
+            )
+            networks.assert_called_once_with()
+
+            with (
+                mock.patch.object(module, "SEED_RECEIPT", missing),
+                mock.patch.object(module, "SEED_OVERLAY", missing),
+                mock.patch.object(module, "VAULT_INIT_FILE", missing),
+                mock.patch.object(module, "_clean_room_list", return_value=[]) as listed,
+                mock.patch.object(
+                    module,
+                    "_clean_room_network_inventory",
+                    return_value=[
+                        (
+                            "c" * 64,
+                            "aigw-preprod-stale",
+                            {"Id": "c" * 64, "Name": "aigw-preprod-stale", "Labels": {}},
+                        )
+                    ],
+                ),
+                self.assertRaisesRegex(SystemExit, "preprod network remains"),
+            ):
+                module.prove_clean_room_resource_absence(args)
+            self.assertEqual(
+                listed.call_args_list,
+                [
+                    mock.call("container", "--all", "--no-trunc", "--quiet"),
+                    mock.call("volume", "--format", "{{.Name}}"),
+                ],
+            )
+
+    def test_clean_room_removes_only_the_exact_legacy_vendor_subnet(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(
+            project="aigw-preprod",
+            prefix="aigw-preprod",
+            subnet_octet=29,
+            image_mode="seed",
+        )
+        container_id = "a" * 64
+        inventory = {
+            "containers": {
+                container_id: {
+                    "Name": "/aigw-preprod-litellm-1",
+                    "Config": {
+                        "Labels": {
+                            "com.docker.compose.project": "aigw-preprod",
+                            "com.aigw.preprod.project": "aigw-preprod",
+                        }
+                    },
+                }
+            }
+        }
+        network_name = "aigw-preprod-net-vendor"
+
+        def network(subnet: str) -> dict:
+            return {
+                "Id": "b" * 64,
+                "Name": network_name,
+                "Labels": {"com.aigw.preprod.project": "aigw-preprod"},
+                "Containers": {container_id: {}},
+                "Driver": "bridge",
+                "Scope": "local",
+                "Internal": True,
+                "IPAM": {
+                    "Config": [
+                        {
+                            "Subnet": subnet,
+                            "IPRange": module.dynamic_ip_range(subnet),
+                        }
+                    ]
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "preprod.env"
+            env_file.write_text("test\n", encoding="utf-8")
+            with (
+                mock.patch.object(module, "ENV_FILE", env_file),
+                mock.patch.object(module, "rendered_compose_model", return_value={}),
+                mock.patch.object(
+                    module, "verify_rendered_resource_ownership", return_value=set()
+                ),
+                mock.patch.object(module, "verify_existing_project_boundary"),
+                mock.patch.object(
+                    module, "_validate_clean_room_generated_state", return_value=0
+                ),
+                mock.patch.object(module, "_clean_room_list", return_value=[]),
+                mock.patch.object(
+                    module,
+                    "_clean_room_network_inventory",
+                    return_value=[
+                        ("b" * 64, network_name, network("172.29.7.0/24"))
+                    ],
+                ),
+            ):
+                result = module.preflight_clean_room_resources(args, inventory)
+            self.assertEqual(result["networks"], {network_name})
+
+            with (
+                mock.patch.object(module, "ENV_FILE", env_file),
+                mock.patch.object(module, "rendered_compose_model", return_value={}),
+                mock.patch.object(
+                    module, "verify_rendered_resource_ownership", return_value=set()
+                ),
+                mock.patch.object(module, "verify_existing_project_boundary"),
+                mock.patch.object(
+                    module, "_validate_clean_room_generated_state", return_value=0
+                ),
+                mock.patch.object(module, "_clean_room_list", return_value=[]),
+                mock.patch.object(
+                    module,
+                    "_clean_room_network_inventory",
+                    return_value=[
+                        ("b" * 64, network_name, network("172.29.8.0/24"))
+                    ],
+                ),
+                self.assertRaisesRegex(SystemExit, "unexpected settings"),
+            ):
+                module.preflight_clean_room_resources(args, inventory)
+
+    def test_clean_room_orders_all_validation_before_resources_then_images(self) -> None:
+        module = load_preprod_module()
+        plan = clean_room_plan(module)
+        events = []
+        inventory = {
+            "containers": {},
+            "images": {},
+            "non_target_ids": {"sha256:" + "d" * 64},
+            "generated_aliases": [],
+            "present_aliases": [],
+            "present_target_ids": set(),
+            "target_ids": {plan["groups"][0]["image_id"]},
+        }
+        resources = {
+            "containers": set(),
+            "volumes": set(),
+            "networks": set(),
+            "generated_state_files": 2,
+            "source_args": types.SimpleNamespace(image_mode="source"),
+        }
+        args = types.SimpleNamespace(
+            confirm=module.CLEAN_ROOM_CONFIRMATION,
+            manifest_sha256="b" * 64,
+            project="aigw-preprod",
+        )
+        with (
+            mock.patch.object(
+                module, "clean_room_purge_plan", side_effect=lambda _a: events.append("plan") or plan
+            ),
+            mock.patch.object(
+                module, "collect_clean_room_inventory", side_effect=lambda _p: events.append("inventory") or inventory
+            ),
+            mock.patch.object(
+                module, "preflight_clean_room_resources", side_effect=lambda _a, _i: events.append("resource-preflight") or resources
+            ),
+            mock.patch.object(
+                module, "_destroy_project_resources", side_effect=lambda *_a, **_k: events.append("destroy-resources")
+            ),
+            mock.patch.object(
+                module, "prove_clean_room_resource_absence", side_effect=lambda _a: events.append("prove-resources")
+            ),
+            mock.patch.object(
+                module, "prove_clean_room_target_images_unused", side_effect=lambda _ids: events.append("prove-unused")
+            ),
+            mock.patch.object(
+                module, "remove_clean_room_images", side_effect=lambda _p, _i: events.append("remove-images") or {"aliases": 0, "image_ids": 0}
+            ),
+            mock.patch.object(
+                module, "prove_clean_room_image_absence", side_effect=lambda _p, _i: events.append("prove-images")
+            ),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            module.clean_room_seed(args)
+        self.assertEqual(
+            events,
+            [
+                "plan",
+                "inventory",
+                "resource-preflight",
+                "destroy-resources",
+                "prove-resources",
+                "prove-unused",
+                "remove-images",
+                "prove-images",
+            ],
+        )
+        receipt = stdout.getvalue().strip()
+        self.assertTrue(receipt.startswith("PREPROD_CLEAN_ROOM_OK {"))
+        self.assertLess(len(receipt.encode()), 1100)
+
+        with mock.patch.object(module, "clean_room_purge_plan") as planner:
+            args.confirm = "yes"
+            with self.assertRaisesRegex(SystemExit, "requires DESTROY"):
+                module.clean_room_seed(args)
+        planner.assert_not_called()
+
+    def test_clean_room_resource_destroy_suppresses_nonreceipt_output_only(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(project="aigw-preprod")
+        network = "aigw-preprod-edge"
+
+        def docker_result(*arguments, **_kwargs):
+            if arguments[:2] == ("network", "ls"):
+                return subprocess.CompletedProcess([], 0, network + "\n", "")
+            if arguments[:2] == ("network", "inspect"):
+                return subprocess.CompletedProcess(
+                    [],
+                    0,
+                    json.dumps(
+                        [{"Labels": {"com.aigw.preprod.project": args.project}}]
+                    ),
+                    "",
+                )
+            return subprocess.CompletedProcess([], 0, network + "\n", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing_env = Path(directory) / "missing.env"
+            missing_vault = Path(directory) / "missing-vault.json"
+            with (
+                mock.patch.object(module, "ENV_FILE", missing_env),
+                mock.patch.object(module, "VAULT_INIT_FILE", missing_vault),
+                mock.patch.object(module, "desired_networks", return_value={network: None}),
+                mock.patch.object(module, "validate_local_docker_context"),
+                mock.patch.object(module, "check_context"),
+                mock.patch.object(module, "remove_seed_output_files"),
+                mock.patch.object(module, "docker", side_effect=docker_result) as docker,
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                module._destroy_project_resources(
+                    args, emit_context=False, emit_receipt=False
+                )
+                self.assertIn(
+                    mock.call("network", "rm", network, capture=True),
+                    docker.call_args_list,
+                )
+
+                docker.reset_mock()
+                module._destroy_project_resources(
+                    args, emit_context=True, emit_receipt=True
+                )
+                self.assertIn(
+                    mock.call("network", "rm", network, capture=False),
+                    docker.call_args_list,
+                )
+
+    def test_post_destroy_foreign_container_stops_before_any_image_removal(self) -> None:
+        module = load_preprod_module()
+        plan = clean_room_plan(module)
+        target_id = plan["groups"][0]["image_id"]
+        appeared_id = "f" * 64
+        with (
+            mock.patch.object(module, "_clean_room_list", return_value=[appeared_id]),
+            mock.patch.object(
+                module,
+                "_clean_room_inspect_required",
+                return_value={"Id": appeared_id, "Image": target_id},
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "appeared using"):
+                module.prove_clean_room_target_images_unused({target_id})
+
+        inventory = {
+            "containers": {},
+            "images": {},
+            "non_target_ids": set(),
+            "generated_aliases": [],
+            "present_aliases": [],
+            "present_target_ids": set(),
+            "target_ids": {target_id},
+        }
+        resources = {
+            "containers": set(),
+            "volumes": set(),
+            "networks": set(),
+            "generated_state_files": 0,
+            "source_args": types.SimpleNamespace(image_mode="source"),
+        }
+        args = types.SimpleNamespace(
+            confirm=module.CLEAN_ROOM_CONFIRMATION,
+            manifest_sha256="b" * 64,
+            project="aigw-preprod",
+        )
+        with (
+            mock.patch.object(module, "clean_room_purge_plan", return_value=plan),
+            mock.patch.object(
+                module, "collect_clean_room_inventory", return_value=inventory
+            ),
+            mock.patch.object(
+                module, "preflight_clean_room_resources", return_value=resources
+            ),
+            mock.patch.object(module, "_destroy_project_resources"),
+            mock.patch.object(module, "prove_clean_room_resource_absence"),
+            mock.patch.object(
+                module,
+                "prove_clean_room_target_images_unused",
+                side_effect=SystemExit(
+                    "ERROR: a container appeared using a clean-room target image after destroy"
+                ),
+            ),
+            mock.patch.object(module, "remove_clean_room_images") as remove,
+            mock.patch.object(module, "clean_room_docker") as docker,
+        ):
+            with self.assertRaisesRegex(SystemExit, "container appeared"):
+                module.clean_room_seed(args)
+        remove.assert_not_called()
+        docker.assert_not_called()
 
     def test_macos_loopback_alias_tasks_are_bounded_and_ordered(self) -> None:
         present = self.tasks
@@ -587,6 +1504,7 @@ class PreprodContractTests(unittest.TestCase):
 
     def test_exact_envoy_image_is_separate_from_the_preprod_wif_proxy(self) -> None:
         module = load_preprod_module()
+        self.assertEqual(module.PRODUCTION_VENDOR_SUBNET, "172.28.7.0/24")
         runtime_reference = module.envoy_base_image_reference()
         self.assertRegex(
             runtime_reference,
@@ -595,7 +1513,7 @@ class PreprodContractTests(unittest.TestCase):
         self.assertIn(runtime_reference, (ROOT / "services/egress-proxy/Dockerfile").read_text())
 
         production_block = self.compose.split("  envoy-egress:\n", 1)[1].split(
-            "\n  # The WIF exchange", 1
+            "\n  wif-egress-mock:\n", 1
         )[0]
         self.assertIn("volumes: !override []", production_block)
         self.assertNotIn("entrypoint:", production_block)
@@ -609,6 +1527,61 @@ class PreprodContractTests(unittest.TestCase):
         self.assertIn("entrypoint: [/usr/local/bin/envoy]", mock_block)
         self.assertIn("preprod-wif-envoy.yaml", mock_block)
         self.assertIn("EGRESS_BASE: http://wif-egress-mock:8080", self.compose)
+
+        litellm_block = self.compose.split("  litellm:\n", 1)[1].split(
+            "\n  # Build paths", 1
+        )[0]
+        self.assertIn("preprod-litellm-config.yaml:/app/config.yaml:ro,Z", litellm_block)
+        self.assertIn("wif-egress-mock: { condition: service_healthy", litellm_block)
+        self.assertNotIn("./litellm/config.yaml:/app/config.yaml", litellm_block)
+
+    def test_preprod_litellm_config_changes_only_reviewed_provider_routes(self) -> None:
+        module = load_preprod_module()
+        production = (
+            "model_list:\n"
+            "  - model_name: first\n"
+            "    litellm_params:\n"
+            "      api_base: http://envoy-egress:8080/anthropic\n"
+            "  - model_name: second\n"
+            "    litellm_params:\n"
+            "      api_base: http://envoy-egress:8080/anthropic\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "litellm").mkdir()
+            (root / "litellm/config.yaml").write_text(production, encoding="utf-8")
+            secrets = root / "secrets"
+            secrets.mkdir()
+            with (
+                mock.patch.object(module, "COMPOSE_DIR", root),
+                mock.patch.object(module, "SECRETS_DIR", secrets),
+            ):
+                module.render_preprod_litellm_config()
+            rendered = (secrets / "preprod-litellm-config.yaml").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(
+            rendered,
+            production.replace(
+                "http://envoy-egress:8080/anthropic",
+                "http://wif-egress-mock:8080/anthropic",
+            ),
+        )
+
+        unexpected = production + "      api_base: https://unreviewed.invalid\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "litellm").mkdir()
+            (root / "litellm/config.yaml").write_text(unexpected, encoding="utf-8")
+            secrets = root / "secrets"
+            secrets.mkdir()
+            with (
+                mock.patch.object(module, "COMPOSE_DIR", root),
+                mock.patch.object(module, "SECRETS_DIR", secrets),
+                self.assertRaisesRegex(SystemExit, "provider routes changed"),
+            ):
+                module.render_preprod_litellm_config()
 
     def test_seed_activation_disables_pull_for_every_runtime_image(self) -> None:
         module = load_preprod_module()
@@ -764,6 +1737,7 @@ class PreprodContractTests(unittest.TestCase):
         ):
             self.assertIn(shared_source, self.compose)
         for private_source in (
+            "./secrets/preprod-litellm-config.yaml:/app/config.yaml:ro,Z",
             "./secrets/preprod-wif-envoy.yaml:/etc/envoy/preprod-wif.yaml:ro,Z",
             "./secrets/preprod-samba.key:/run/secrets/samba_ad_tls_key:ro,Z",
             "./secrets/preprod-wif.key:/run/preprod/wif.key:ro,Z",
@@ -894,7 +1868,57 @@ class PreprodContractTests(unittest.TestCase):
     def test_prepare_creates_the_redis_bind_files_needed_on_a_clean_checkout(self) -> None:
         self.assertIn('SECRETS_DIR / "redis_password"', self.script)
         self.assertIn('SECRETS_DIR / "redis_users.acl"', self.script)
+
+    def test_preprod_redis_keeps_its_password_private_on_docker_desktop(self) -> None:
+        redis = self.compose.split("  redis:\n", 1)[1].split(
+            "\n  alloy:\n", 1
+        )[0]
+        self.assertIn(
+            'user: "${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set}:'
+            '${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set}"',
+            redis,
+        )
+        self.assertIn("tmpfs: !override", redis)
+        self.assertIn("- /tmp:mode=1777", redis)
+        self.assertIn(
+            "- /data:uid=${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set},"
+            "gid=${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set},mode=0700",
+            redis,
+        )
+        self.assertIn(
+            'write_file(SECRETS_DIR / "redis_password", redis_password + "\\n", 0o600)',
+            self.script,
+        )
+        self.assertIn(
+            'SECRETS_DIR / "redis_users.acl",\n'
+            '        f"user default reset on #{redis_password_hash} ~* &* +@all\\n",\n'
+            "        0o600,",
+            self.script,
+        )
         self.assertIn("user default reset on #", self.script)
+
+    def test_vault_helper_uses_running_container_stdin(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(project="aigw-preprod")
+        response = subprocess.CompletedProcess(
+            [], 0, '{"status":501,"body":{"initialized":false}}\n', ""
+        )
+        with mock.patch.object(module, "compose", return_value=response) as compose:
+            status, body = module.vault_call(args, "GET", "/v1/sys/health")
+
+        self.assertEqual(status, 501)
+        self.assertEqual(body, {"initialized": False})
+        positional = compose.call_args.args
+        self.assertEqual(
+            positional[:6],
+            (args, "exec", "-T", "key-rotator", "/opt/venv/bin/python", "-c"),
+        )
+        self.assertNotIn("run", positional)
+        self.assertEqual(
+            json.loads(compose.call_args.kwargs["input_text"]),
+            {"method": "GET", "path": "/v1/sys/health"},
+        )
+        self.assertTrue(compose.call_args.kwargs["sensitive"])
 
     def test_compose_render_scrubs_hostile_shell_interpolation(self) -> None:
         module = load_preprod_module()
@@ -1321,6 +2345,12 @@ class PreprodContractTests(unittest.TestCase):
         self.assertRegex(dockerfile.splitlines()[0], r"^# syntax=.*@sha256:[0-9a-f]{64}$")
         self.assertIn("RUN --network=none go test ./...", dockerfile)
         self.assertIn("USER 65532:65532", dockerfile)
+        self.assertIn(
+            "tls_minimum_protocol_version: TLSv1_3", self.script
+        )
+        self.assertIn(
+            "tls_maximum_protocol_version: TLSv1_3", self.script
+        )
 
     def test_wif_rotation_requires_success_after_the_pre_call_history_boundary(self) -> None:
         module = load_preprod_module()

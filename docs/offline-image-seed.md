@@ -1,148 +1,140 @@
 # Offline image releases
 
-An offline image release is a private pair of files:
+An offline release has two private files:
 
-- a compressed Docker archive ending in `.docker.tar.zst`; and
-- a JSON manifest ending in `.manifest.json`.
+- a Docker archive named `*.docker.tar.zst`; and
+- a JSON manifest named `*.manifest.json`.
 
-A schema-v2 build publishes two release pairs:
+Schema v2 makes two file pairs from one build:
 
-- `release_scope: production` contains external and custom production images;
-- `release_scope: preprod` contains the same production images plus the Samba
-  AD and WIF mock images.
+| Scope | Contents | Use |
+| --- | --- | --- |
+| `production` | All production images | A production VM |
+| `preprod` | All production images, Samba AD, and the WIF mock | Local preprod |
 
-Production archives do not contain preprod-only image bytes. Local preprod
-uses the preprod pair. A remote production deployment uses the production
-pair. Both projections come from the same reviewed build.
+The production archive has no preprod-only image bytes. Do not send the
+preprod pair to a production host.
 
-The older schema-v1 format is still accepted for external images only. A v1
-target builds custom images locally with `--pull=false`. Use schema v2 for new
-releases.
+Schema v1 is still accepted for old external-only seeds. Use schema v2 for all
+new releases.
 
-For the normal prepare, local test, remote upgrade, validation, and rollback
-cycle, follow the [image update workflow](image-update-workflow.md). This page
-documents the lower-level seed and manifest contract.
+## Build both release pairs
 
-## Prepare both release pairs
-
-Run from the repository root. Use the architecture of the remote Docker host:
+Most operators should use the image updater. Run it from the repository root:
 
 ```bash
-install -d -m 0700 "$PWD/private/offline-images"
+python3 -I scripts/update-images.py prepare \
+  --provider anthropic \
+  --platform linux/amd64 \
+  --archive /absolute/private/path/aigw-2026-07-21-linux-amd64.docker.tar.zst \
+  --manifest /absolute/private/path/aigw-2026-07-21-linux-amd64.manifest.json
+```
+
+Use `linux/arm64` for an ARM64 target. Anthropic is the only approved provider
+today. A provider name must exist in the reviewed catalog. The tool has no
+option for a custom hostname or CA path.
+
+The command creates these four files:
+
+```text
+aigw-2026-07-21-linux-amd64.docker.tar.zst
+aigw-2026-07-21-linux-amd64.manifest.json
+aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
+aigw-2026-07-21-linux-amd64.preprod.manifest.json
+```
+
+All paths must be absolute and different. The tool writes each file with mode
+`0600`. Use a new dated name for each release.
+
+The manifest is generated proof. Do not edit it. Keep it with the archive,
+hashes, source commit, and test record.
+
+Follow the [image update workflow](image-update-workflow.md) for the full
+build, test, upgrade, and rollback process.
+
+## Lower-level builder
+
+This command is for release-tool maintenance. Normal operators should use
+`update-images.py`.
+
+```bash
+install -d -m 0700 "$PWD/private/offline-images/2026-07-21-linux-amd64"
 python3 -I scripts/rebuild-offline-image-seed.py \
   --prepare-release \
   --provider anthropic \
   --platform linux/amd64 \
   --materialize-missing-source-tags \
   --allow-unprivileged-controller \
-  "$PWD/private/offline-images/aigw-release-linux-amd64.docker.tar.zst" \
-  "$PWD/private/offline-images/aigw-release-linux-amd64.manifest.json"
+  "$PWD/private/offline-images/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst" \
+  "$PWD/private/offline-images/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json"
 ```
 
-Use `linux/arm64` for an ARM64 target. Anthropic is the only approved provider
-today. At least one provider is required. Names must exist in the
-[reviewed provider catalog](provider-onboarding.md#catalog-files). The command
-does not accept arbitrary provider hostnames or CA paths.
+`update-images.py prepare` adds
+`--materialize-missing-source-tags` for you. Some Docker engines pull a digest
+but do not restore its normal tag. This flag adds the tag only after the tool
+checks the digest.
 
-The production output names above also create these default preprod siblings:
+The Docker engine must be local. Unix sockets are allowed. TCP and SSH Docker
+endpoints are refused.
 
-```text
-aigw-release-linux-amd64.preprod.docker.tar.zst
-aigw-release-linux-amd64.preprod.manifest.json
-```
-
-Use `--preprod-archive` and `--preprod-manifest` together to set different
-absolute paths.
-
-All four output paths must be distinct and absolute. Each file is published
-atomically with mode `0600`. Use a new name or directory for each release. If
-a stopped build leaves files from two releases, their hashes and bundle names
-will not match, so validation fails before Docker loads an image.
-
-The higher-level `update-images.py prepare` command is preferred. It enables
-the same `--materialize-missing-source-tags` flag automatically. This narrow
-flag handles Docker engines that pull a digest without restoring its ordinary
-tag. The builder creates the tag only after it checks the immutable digest.
-
-## What the builder does
-
-`--prepare-release` performs these steps:
-
-1. Collect every literal external `tag@sha256` pin from reviewed Compose and
-   Dockerfile source.
-2. Pull each exact pin for the requested platform.
-3. Verify each digest before restoring any missing ordinary source tag.
-4. Render the production and preprod Compose models.
-5. Run the reviewed Envoy provider planner with networking disabled.
-6. Build the Envoy image with networking disabled, reproducible timestamps,
-   and only the selected provider policy and CA files.
-7. Build the other custom images with `--pull=false`.
-8. Calculate the source and build-definition digest for every custom service.
-9. Give each custom image a transfer tag derived from its immutable image ID.
-10. Export the production and preprod image sets separately.
-11. Verify each archive allow-list before publishing any output.
-
-The Docker daemon must be local. UNIX sockets are accepted. TCP and SSH Docker
-endpoints are refused. If a private registry rejects a pull, authenticate the
-same local Docker client and retry:
+If `dhi.io` refuses a pull, log in with the same local Docker client:
 
 ```bash
 docker login dhi.io
 ```
 
-Registry credentials stay with the local Docker client. They are not written
-to an archive or manifest.
+Registry credentials do not enter the archive or manifest.
 
-## Release scopes
+## What the builder does
 
-The two schema-v2 projections have different custom-image sets:
+The builder:
 
-| Scope | Contents | Allowed use |
-|---|---|---|
-| `production` | Reviewed external images and production custom images only | Transfer to and activate on the Rocky Linux production host |
-| `preprod` | All production images plus `ai-gateway/samba-ad:preprod` and `ai-gateway/wif-provider-mock:preprod` | Load into local Ansible preprod and run end-to-end tests |
+1. Finds each exact tag and digest pin in reviewed source.
+2. Pulls each pin for the target platform.
+3. Checks each digest.
+4. Restores a missing source tag when needed.
+5. Renders the production and preprod Compose models.
+6. Checks the selected provider through the catalog.
+7. Builds Envoy with no build network.
+8. Adds only the selected routes and CA files to Envoy.
+9. Builds the other custom images without pulling new base tags.
+10. Records each custom build-input hash and image ID.
+11. Exports the production and preprod image sets on their own.
+12. Checks each archive list before it publishes files.
 
-The loader rejects preprod-only images in a production manifest. It also
-rejects a preprod manifest that lacks either preprod-only image.
+If any step fails, no release is accepted.
 
-## Schema-v2 manifest guarantees
+## What schema v2 records
 
-Every schema-v2 manifest records:
+The manifest records:
 
-- exact `release_scope` and target platform;
-- archive bundle name and image counts;
-- every external `tag@sha256` reference and immutable image ID;
-- every custom image, transfer tag, immutable image ID, deployment scope, and
-  activation rule;
-- exact build-input digest for every included custom service; and
-- one immutable `egress_policy` receipt.
+- the release scope and target platform;
+- the archive name and image counts;
+- each external tag, digest, and image ID;
+- each custom transfer tag and image ID;
+- each custom image's production or preprod scope;
+- each custom build-input hash; and
+- one Envoy egress-policy receipt.
 
-The `egress_policy` object records:
+The egress receipt records:
 
-- schema version;
-- generated egress-policy SHA-256;
-- generated Envoy config SHA-256;
-- selected provider names in sorted, unique order;
-- provider hostnames, route prefixes, SNI, and exact SAN requirements;
-- selected CA filenames, complete bundle hashes, ordered certificate
-  fingerprints, and provenance hashes; and
-- final Envoy image ID.
+- selected providers in sorted order;
+- provider hostnames, route prefixes, SNI, and exact SAN rules;
+- CA filenames, bundle hashes, certificate fingerprints, and source hashes;
+- generated config and policy hashes; and
+- the final Envoy image ID.
 
-The archive allow-list must exactly match the manifest. Extra tags, missing
-tags, duplicate tags, unapproved OCI descriptors, and custom tags whose image
-config does not match the recorded image ID are rejected before Docker loads
-the archive.
+The archive list must match the manifest. Extra, missing, or duplicate image
+entries fail before Docker loads the archive.
 
-Do not put passwords, registry tokens, private keys, or customer data in an
-archive or manifest.
+Never put passwords, tokens, private keys, or customer data in either file.
 
 ## Envoy image and policy binding
 
-The loader recalculates the canonical policy digest from the manifest. It then
-finds the one production Envoy custom image and requires its ID to equal
-`egress_policy.envoy_image_id`.
+The loader rebuilds the policy hash from the manifest. It finds the production
+Envoy image. That image ID must match `egress_policy.envoy_image_id`.
 
-After loading, it inspects these image labels:
+It also checks these image labels:
 
 ```text
 com.aigw.egress-policy.schema
@@ -150,103 +142,123 @@ com.aigw.egress-policy.providers
 com.aigw.egress-policy.sha256
 ```
 
-The labels must match the manifest's schema, canonical provider list, and
-policy digest. A manifest cannot pair one provider policy with another Envoy
-image. Deployment and rollback therefore treat the image and policy as one
-release unit.
+The labels must match the manifest. This stops one provider policy from being
+paired with a different Envoy image. Upgrade and rollback move the image and
+policy as one release unit.
 
-The final image contains only selected provider routes and CA files. At
-startup, its compiled gate checks policy and config digests, certificate
-fingerprints and dates, exact SAN and SNI rules, and missing or unexpected CA
-files. It does not download trust material or use the system CA store as a
-fallback.
+At startup, the Envoy gate checks the policy, config, CA file list,
+fingerprints, dates, SNI, and SAN rules. It fails closed for missing, extra,
+bad, or expired CA data. It does not download trust data during deployment.
 
-## Stage the production pair on a remote host
+## Stage a production pair
 
-Set these five inventory values. Paths are on the remote Docker host:
+Set these five inventory values. Each path is on the production VM:
 
 ```yaml
 offline_image_seed_enabled: true
-offline_image_seed_remote_path: /var/tmp/aigw-release-linux-amd64.docker.tar.zst
+offline_image_seed_remote_path: /var/tmp/aigw-2026-07-21-linux-amd64.docker.tar.zst
 offline_image_seed_sha256: <archive-sha256>
-offline_image_seed_manifest_remote_path: /var/tmp/aigw-release-linux-amd64.manifest.json
+offline_image_seed_manifest_remote_path: /var/tmp/aigw-2026-07-21-linux-amd64.manifest.json
 offline_image_seed_manifest_sha256: <manifest-sha256>
 ```
 
-Use the production pair, not the `.preprod` pair. Transfer both files to
-temporary names. Independently verify their SHA-256 values, then install them
-at the inventory paths as regular, non-symlink files owned by `root:root` with
-mode `0600`.
-
-Example controller hash command:
+Use the production pair. Copy both files to temp names first. Check their
+SHA-256 values on the controller:
 
 ```bash
 shasum -a 256 \
-  "$PWD/private/offline-images/aigw-release-linux-amd64.docker.tar.zst" \
-  "$PWD/private/offline-images/aigw-release-linux-amd64.manifest.json"
+  /absolute/private/path/aigw-2026-07-21-linux-amd64.docker.tar.zst \
+  /absolute/private/path/aigw-2026-07-21-linux-amd64.manifest.json
 ```
 
-## What Ansible and the loader do
+On the VM, install each file as a regular, non-symlink file. Use owner
+`root:root` and mode `0600`.
 
-The `docker_stack` role installs and runs
-`scripts/load-offline-image-seed.py`. The loader:
+## What Ansible checks
 
-1. validates the complete opt-in contract;
-2. checks trusted path ancestry, root ownership, mode `0600`, size limits,
-   hashes, platform, release scope, and manifest schema;
-3. validates custom build inputs and the complete Envoy policy receipt;
-4. reads bounded OCI metadata and proves the archive allow-list before load;
-5. streams the archive through `zstd` to the local Docker daemon;
-6. checks every external RepoDigest and image ID;
-7. checks every custom transfer-tag image ID and Envoy policy label; and
-8. writes a root-owned release receipt only after all checks pass.
+Ansible runs `scripts/load-offline-image-seed.py`. The loader checks:
 
-Before a custom Compose tag changes, Ansible compares active source and
-build-input digests with the manifest. A mismatch stops deployment. It saves
-the exact running image IDs under rollback tags before it activates the tested
-custom image IDs. Schema-v2 images are never rebuilt on the target.
+1. all five inventory values;
+2. safe paths, owner, mode, file size, and hashes;
+3. platform, scope, and schema;
+4. source pins and custom build-input hashes;
+5. the Envoy policy receipt;
+6. the archive image list;
+7. external image digests and IDs; and
+8. custom image IDs and Envoy labels.
 
-The normal Compose deployment and verify role run after activation. A failed
-load, parity check, preservation, activation, readiness check, or external
-validation stops the converge.
+The loader writes a root-owned receipt only after every check passes. Schema-v2
+custom images are not rebuilt on the production host.
 
-## Validate a loaded preprod release
+Before activation, Ansible saves the exact running custom image IDs under
+rollback tags. It then starts the normal stack and runs the verify role. A bad
+load, check, activation, health test, or outside validation stops the run.
 
-Local preprod can request a machine-readable receipt after loading the preprod
-pair:
+## Check a loaded preprod release
+
+The normal path is:
+
+```bash
+python3 -I scripts/update-images.py test-preprod \
+  --archive /absolute/private/path/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
+  --manifest /absolute/private/path/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  --load-archive \
+  --become-password-file "$HOME/.ssh/become"
+```
+
+Use `--ask-become-pass` instead when you want an interactive sudo prompt.
+
+This is a clean-room load. The updater first runs
+`ansible/preprod-clean-room.yml`. That play checks the preprod manifest,
+proves Docker is local, and checks the Linux root loader socket before any
+change. It then destroys and proves removal of only owned preprod resources,
+removes only the image aliases and IDs listed in the manifest, proves those
+images are absent, then removes the bounded hosts block and owned loopback
+aliases. If cleanup fails, staging and deploy do not start.
+
+After the absence proof, rootful Linux gets a private staging copy. Docker
+Desktop uses the caller-owned files. The loader must return exactly
+`LOADED <archive-sha256>`. `SKIPPED` or `RELOADED` fails this release path.
+The updater then runs `ansible/preprod.yml` once for seed activation, deploy,
+and acceptance. Seed mode has no pull or build sections. The play installs the
+bounded preprod hosts block for browser tests.
+
+The become password file, when used, must be an absolute, caller-owned,
+mode-`0600` regular file with one hard link and no symbolic link. The updater
+does not read or copy it. It passes only its path to Ansible.
+
+Running `test-preprod` without `--load-archive` is a quick check of images that
+are already present. It skips the clean-room and load steps. Do not use it as
+release evidence.
+
+The lower-level receipt command is for troubleshooting:
 
 ```bash
 python3 -I scripts/load-offline-image-seed.py local-release-receipt \
-  "$PWD/private/offline-images/aigw-release-linux-amd64.preprod.docker.tar.zst" \
-  "$PWD/private/offline-images/aigw-release-linux-amd64.preprod.manifest.json" \
+  /absolute/private/path/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
+  /absolute/private/path/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
   <preprod-manifest-sha256> \
   "$PWD"
 ```
 
-Run this as the desktop Docker user, not root. It accepts only a local
-`unix://` Docker endpoint and caller-owned mode-`0600` files. It recalculates
-source pins and build-input digests before issuing the receipt.
-
-Each key under `custom_images` is a canonical image name. Its
-`archive_reference` is the content-addressed tag used with `pull_policy:
-never`. Its `image_id` is the exact ID checked immediately before startup. The
-receipt also includes the validated egress policy.
-
-The root-only `release-receipt` command is used on deployed Linux hosts.
+Run that command as the local Docker user, not root. It accepts only a local
+Unix Docker socket and caller-owned mode-`0600` files.
 
 ## Recovery and retention
 
-The checksum marker lives in `offline_image_seed_marker_dir`, which defaults to
-`<docker_data_root>/.aigw-image-seeds`. If a seeded image is pruned, the next
-converge detects it, removes the stale marker, and reloads the still-staged
-archive.
+Keep both release pairs and the last known-good production release. Keep their
+hashes, source commits, provider choices, and CA evidence.
 
-Keep both release pairs, their independent hashes, and the previous known-good
-production release until the candidate is accepted or retired. Do not reuse a
-release after source pins, custom build inputs, provider selection, or CA
-evidence change. Build and test a new release.
+If a seeded image is pruned, the next converge sees the missing image and
+reloads the staged archive. Do not reuse a release after a source pin, build
+input, provider choice, or CA record changes. Build a new release.
 
-Run the focused contract tests from the repository root:
+Clean-room preprod is local-only. Never run its purge flow on a production
+host. Production uses the staged production pair, an encrypted backup,
+validation, and automatic rollback from the
+[image update workflow](image-update-workflow.md#4-upgrade-the-remote-host).
+
+Run the seed contract tests from the repository root:
 
 ```bash
 python3 -I -m unittest discover -v -s scripts/tests \
@@ -254,3 +266,9 @@ python3 -I -m unittest discover -v -s scripts/tests \
 python3 -I -m unittest discover -v -s scripts/tests \
   -p 'test_load_offline_image_seed.py'
 ```
+
+## Related pages
+
+- [Image update workflow](image-update-workflow.md)
+- [Local preprod](preprod.md)
+- [Acceptance test runbook](test-runbook.md)

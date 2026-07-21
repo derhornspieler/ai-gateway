@@ -8,6 +8,26 @@ natively on GitHub/GitLab (Mermaid). Provider catalog and CA review details
 are in [Provider onboarding](provider-onboarding.md) and the
 [Provider CA maintenance SOP](sop/provider-ca-maintenance.md).
 
+For a short explanation of the controls behind these pictures, read the
+[security model](security-model.md).
+
+## Diagram index
+
+- Foundations: [production network](#1-network-topology-and-trust-zones),
+  [local preprod](#2-local-preprod-topology), and
+  [container planes](#3-segmented-container-planes).
+- Application flows: [user and admin paths](#4-software-flow--user-developer-and-administrator-paths),
+  [browser OIDC](#5-authentication-flow--browser-oidc-and-admin-gates),
+  [developer keys](#6-logic-flow--developer-key-lifecycle), and
+  [Anthropic WIF](#7-security-flow--provider-credential-rotation-anthropic-wif).
+- Security and telemetry: [layered enforcement](#8-security-design--layered-enforcement)
+  and [local versus SOC telemetry](#9-telemetry-and-soc-log-flow).
+- Release path: [Ansible order](#10-deployment-logic--ansible-converge-order),
+  [provider selection](#11-provider-selection-and-immutable-envoy-build),
+  [provider runtime](#12-runtime-request-path-for-selected-providers),
+  [CA review and rotation](#13-ca-capture-review-rotation-and-approval), and
+  [seed validation and rollback](#14-offline-seed-validation-deployment-and-rollback).
+
 ## 1. Network topology and trust zones
 
 Three customer-owned interfaces map to three firewalld zones with distinct
@@ -16,7 +36,7 @@ Traefik edges publish container ports, each bound to its exact host address.
 
 ```mermaid
 flowchart TB
-  INET[Internet — AI vendor APIs]
+  INET[Internet — selected AI provider APIs]
   VPN[Administrators via VPN<br/>vpn_client_cidr]
   USERS[Internal users and AI tools<br/>internal_cidr]
 
@@ -25,7 +45,7 @@ flowchart TB
       NIC0[egress NIC<br/>target DROP, no listener<br/>only default route]
     end
     subgraph zadm [zone aigw-adm]
-      NIC1[ADM NIC — ETH1_IP<br/>TCP/22 + TCP/443<br/>from VPN CIDR only]
+      NIC1[ADM NIC — ETH1_IP<br/>management SSH + TCP/443<br/>from VPN CIDR only]
     end
     subgraph zint [zone aigw-internal]
       NIC2[internal NIC — ETH2_IP<br/>TCP/443<br/>from internal CIDR only]
@@ -75,7 +95,7 @@ flowchart LR
     WEV[Separate test Envoy<br/>trusts preprod Root CA]
     WIF[WIF provider mock<br/>TLS + JWT checks]
     EV[Exact production Envoy image<br/>selected policy checked]
-    CA[Test Root CA<br/>generated locally]
+    CA[Preprod Root CA<br/>generated locally]
   end
 
   SEED --> ANS --> APPS
@@ -133,11 +153,13 @@ flowchart LR
 ```mermaid
 flowchart LR
   U[User browser] -->|chat.DOMAIN, ADM leg| TA
+  U -->|chat.DOMAIN, internal leg| TI
   T[AI tool with gateway key] -->|api.DOMAIN /v1| TI[traefik-int]
   D[Developer browser] -->|portal.DOMAIN| TI
   A[Administrator browser] -->|admin hosts on ADM leg| TA[traefik-adm]
 
   TA --> OW[Open WebUI] --> LL[LiteLLM]
+  TI --> OW
   TI -->|inference allow-list| LL
   TI --> DP[dev-portal]
   TI -->|aigw realm only| KC[Keycloak]
@@ -213,7 +235,10 @@ flowchart TD
 No long-lived vendor API key sits in application configuration. key-rotator
 brokers a short-lived Anthropic token through Keycloak's isolated
 `anthropic-wif` realm using `private_key_jwt`; the private key exists only
-in Vault (or a mounted PEM) and every vendor call leaves through Envoy.
+in Vault in the production path. The component also supports a separately
+configured mounted PEM for bounded test or integration use. That signing key
+is a credential, not a provider CA bundle. Provider CA bundles are baked into
+the immutable Envoy image. Every vendor call leaves through Envoy.
 
 ```mermaid
 sequenceDiagram
@@ -244,7 +269,7 @@ flowchart TB
   L2[Packet policy — atomic DOCKER-USER +<br/>independent nftables aigw_guard:<br/>deny cross-plane, container-to-host,<br/>unapproved bridge egress]
   L3[Network segmentation — 18 per-function bridges;<br/>services join only required planes;<br/>fixed IPs for firewall-addressed workloads]
   L4[Identity — Keycloak OIDC everywhere;<br/>role-based access; per-UI oauth2-proxy gates;<br/>step-up + live-role re-checks for admin mutations]
-  L5["Secrets — Vault-backed provider credentials;<br/>file-backed Docker secrets; no secret in argv/env;<br/>fail-closed blank-variable Compose contract"]
+  L5["Secrets — Vault-backed provider credentials;<br/>file-backed where the service supports it;<br/>no secret in command arguments;<br/>fail-closed required-variable contract"]
   L6[Runtime — SELinux enforcing with per-container MCS;<br/>non-root DHI images, digest-pinned;<br/>read-only binds with keyed HMAC digests;<br/>no Docker socket exposure]
   L7[Egress — Envoy as the only external identity:<br/>selected routes, exact SANs, reviewed CA bundles]
   L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
@@ -270,10 +295,10 @@ flowchart LR
   VA[Vault raw audit tail] --> AL
 
   AL -->|local logs + request audit| LK[(Loki — 7 days)]
-  AL -->|local metrics + spanmetrics| PR[(Prometheus — 30 days)]
+  AL -->|local metrics + spanmetrics| PR[(Prometheus<br/>30 days or 5 GB, first limit wins)]
   NE[node-exporter] --> PR
   PR -.approved backlog.-> AM[Future Alertmanager<br/>local only]
-  AL -.curated OTLP logs over TLS only.-> CR[Cribl SOC — 24 hours]
+  AL -.curated OTLP logs over TLS only.-> CR[Cribl SOC destination<br/>24-hour retention]
   GF[Grafana — ADM leg,<br/>behind oauth2-proxy] --> LK & PR
 ```
 
@@ -323,7 +348,7 @@ flowchart LR
   PROV --> BUILD
   BUILD --> ONLY[Final image contains only selected<br/>routes, policy, and CA bundles]
   ONLY --> ID[Immutable Envoy image ID]
-  CANON --> MAN[Schema-v2 manifest egress policy]
+  CANON --> MAN[Matching schema-v2 manifest<br/>egress-policy receipts]
   ID --> MAN
   MAN --> PROD[Production offline seed<br/>no preprod-only images]
   MAN --> PRE[Preprod offline seed<br/>production plus Samba AD and WIF mock]
@@ -382,6 +407,11 @@ flowchart LR
 
 Ansible does not enter this flow. It receives the already-built release and
 never downloads trust material.
+
+The fingerprint in this flow proves certificate-byte integrity. The
+provenance record explains the capture and independent review. Neither one
+proves the CA organization's country, the endpoint's current geography, or
+provider data residency. Those are separate facts and need separate evidence.
 
 ## 14. Offline-seed validation, deployment, and rollback
 

@@ -1,647 +1,400 @@
-# AI Gateway — Deployment Runbook
+# Production deployment runbook
 
-This runbook walks you through deploying AI Gateway from nothing to a working
-system, step by step. It is written so that an engineer with basic IT
-experience — comfortable with a terminal, SSH, and editing a text file — can
-complete the deployment without prior knowledge of this project. Every step
-tells you what to type, what you should see, and what to do if you don't see
-it. Deeper explanations live in the [deployment guide](deploy-guide.md); you
-do not need them to finish this runbook.
+Use this runbook to install AI Gateway on an existing Rocky Linux 9 VM.
 
-**Time required:** roughly 2–4 hours, most of it waiting for the automated
-converge.
+This is the production path. Local release tests use Docker preprod instead.
+See [Local preprod](preprod.md).
 
-**The two computers involved:**
+Two systems take part:
 
-| Name | What it is | What you do on it |
-|---|---|---|
-| **Controller** | Your workstation or a jump host (Linux or macOS) | Run the setup scripts and Ansible commands |
-| **Target VM** | The Rocky Linux 9 virtual machine that will run AI Gateway | Mostly nothing — Ansible configures it for you. You log in once, near the end |
+| System | Purpose |
+| --- | --- |
+| Controller | A Linux or macOS system that runs Ansible |
+| Target VM | The Rocky Linux 9 VM that runs AI Gateway |
 
-> **What is Ansible?** An automation tool that connects to the target VM over
-> SSH and configures it exactly as this repository specifies. You run it from
-> the controller; it does the work on the VM. If any safety check fails, it
-> stops *before* changing anything — a failed run early on is normal and safe.
+Ansible configures the target VM. It does not create the VM, NICs, IPs, routes,
+or customer DNS records.
 
----
+## Secrets and Vault prerequisites
 
-## Secrets and vault prerequisites (read before you start)
+The inventory bootstrap makes the stack secrets. This includes database,
+Keycloak, OIDC, session, Redis, LiteLLM, and Grafana values. Do not make these
+values by hand.
 
-**Time to read:** about 5 minutes. Nothing here to run yet — this is the
-complete, up-front list of every secret this deployment needs, so nothing
-surprises you halfway through.
+You provide only the items that belong to your site:
 
-The important message first: **almost every secret is generated for you.** The
-command in [Part 3](#part-3--generate-your-deployment-folder-5-minutes) creates
-all 27 stack secrets. This includes database passwords, signing keys, and OIDC
-client secrets. It writes them to your inventory in encrypted form. You never
-invent, type, or paste them. The short list you must supply appears below.
+| Item | When it is needed |
+| --- | --- |
+| Ansible Vault password file | Always; it protects the generated inventory secrets |
+| Vault unseal key | After the one-time Vault initialization |
+| LDAPS bind password | When `identity_ldap_enabled: true` |
+| Edge certificate or intermediate CA files | Based on the selected TLS mode |
+| Anthropic WIF identifiers | At go-live, after the provider setup ceremony |
+| Cribl worker details and CA | Only when the optional SOC log feed is on |
 
-> **A "secret" here means a value stored inside the encrypted inventory (the
-> vault overlay).** An *inline-encrypted overlay* is a small file where each
-> secret is individually encrypted with your vault passphrase, so it is safe to
-> keep in the inventory. See the [Glossary](#glossary).
+Rules for every secret:
 
-### At a glance
+- Keep it out of Git.
+- Keep it out of command options and logs.
+- Use an absolute private file path when a command asks for a password file.
+- Use the stdin-only helper when this runbook says to pipe a value.
+- Never initialize Vault a second time.
 
-| Secret | What it is | How it is provided | When |
-|---|---|---|---|
-| **27 stack secrets** (databases, LiteLLM, Redis, Keycloak, OIDC, sessions, tokens, Grafana) | The credentials the running services use to talk to each other | **Auto-generated** and inline-encrypted by `scripts/bootstrap-rocky9-production.py` | Part 3 — automatic, no operator input |
-| `vault_unseal_key` | The key that unlocks the secrets safe (Vault) after every restart | **You supply it** from the Vault init ceremony, stored with `scripts/store-vault-unseal-key.py` | Part 7 — *after* the first converge (it cannot exist earlier) |
-| `identity_ldap_bind_password` *(only if you connect a customer directory)* | The read-only bind-account password for your AD/LDAPS server | **You supply it**, stored with `scripts/store-identity-ldap-bind-password.py` | Before the converge, only when `identity_ldap_enabled: true` |
-| **Edge TLS material** *(depends on `aigw_edge_tls_mode`)* | Your real certificate / intermediate CA, its private key, and chain | **You supply it as controller-local file *paths*** — never inventory secrets | Before the converge |
-| **Anthropic WIF record** *(at go-live)* | Non-secret Anthropic identifiers written into Vault | **You supply it** into Vault after the human Anthropic Console ceremony | Part 8 — after the stack is up |
+The bootstrap writes generated stack secrets to an encrypted inventory file.
+The Vault unseal key and LDAPS bind password use their own encrypted files.
 
-### 1. Auto-generated — you supply none of these (Part 3)
+## Part 1 — Check the target VM
 
-`scripts/bootstrap-rocky9-production.py` generates **27** random secrets and
-writes them, already encrypted, into
-`group_vars/production_rocky9/vault.yml` inside your generated inventory. You
-never see them, type them, or store them in plain text. Grouped by purpose:
+The VM team must provide this host before Ansible runs:
 
-| Purpose | Keys | Count |
-|---|---|---|
-| PostgreSQL role passwords | `pg_super_password`, `pg_litellm_password`, `pg_keycloak_password`, `pg_rotator_password`, `pg_grafana_ro_password` | 5 |
-| LiteLLM keys | `litellm_master_key`, `litellm_salt_key`, `litellm_ui_breakglass_password`, `webui_litellm_key` | 4 |
-| Redis | `redis_password` | 1 |
-| Keycloak admin/bootstrap | `kc_admin_password`, `kc_bootstrap_admin_client_secret` | 2 |
-| OIDC client secrets | `webui_oidc_client_secret`, `portal_oidc_client_secret`, `admin_portal_oidc_client_secret`, `oauth2_proxy_client_secret`, `vault_oidc_client_secret` | 5 |
-| oauth2-proxy cookie secrets | `oauth2_proxy_litellm_cookie_secret`, `oauth2_proxy_grafana_cookie_secret`, `oauth2_proxy_prometheus_cookie_secret`, `oauth2_proxy_vault_cookie_secret` | 4 |
-| Session / app-signing secrets | `webui_secret_key`, `portal_session_secret`, `admin_portal_session_secret` | 3 |
-| Internal service tokens | `rotator_internal_token`, `portal_identity_token` | 2 |
-| Grafana break-glass password | `grafana_admin_password` | 1 |
+| Need | Check from the controller |
+| --- | --- |
+| Rocky Linux 9 | `ssh <user>@<vm> 'cat /etc/rocky-release'` |
+| Three active IPv4 NICs | `ssh <user>@<vm> 'ip -br -4 address'` |
+| One default route on egress | `ssh <user>@<vm> 'ip -4 route show table main'` |
+| SELinux enforcing | `ssh <user>@<vm> getenforce` |
+| Clock in sync | `ssh <user>@<vm> 'chronyc tracking'` |
+| SSH key login and non-interactive sudo | `ssh <user>@<vm> sudo -n true` |
+| Enough pilot capacity | At least 4 vCPU, 24 GiB RAM, and 100 GB disk |
+| LUKS-backed state disk | `ssh <user>@<vm> 'lsblk -o NAME,FSTYPE'` |
 
-The complete list is `required_secret_keys` in
-`ansible/generic-rocky9-contract.json`. **Nothing in this table is an operator
-input.** To change a value later, edit the overlay in place. See the "You need
-to change a secret later" row under
-[Troubleshooting](#troubleshooting-quick-reference). Do not generate these
-values by hand on the first deploy.
+The host needs three separate network roles:
 
-> **Not a stack secret, but yours to keep:** the master **vault password** you
-> create in [Part 2](#part-2--prepare-the-controller-10-minutes)
-> (`~/.aigw-vault-pass`) is the passphrase that encrypts all 27 of the above. It
-> is never written into the inventory — you custody it yourself, in a password
-> manager. Lose it and the encrypted secrets cannot be read or changed.
+- **egress** has the only default route;
+- **ADM** serves SSH and admin HTTPS; and
+- **internal** serves the API and user portal.
 
-### 2. Operator-supplied — the short list you must provide
+Write down:
 
-Everything below is something the bootstrap does **not** generate.
+- each NIC name, IP, and gateway;
+- the ADM VPN source CIDR;
+- the internal user source CIDR;
+- internal DNS servers;
+- separate egress DNS servers; and
+- the base domain for the gateway.
 
-#### 2a. `vault_unseal_key` — always required (done in Part 7)
+The converge warns if the state paths are not on LUKS storage. It cannot add
+disk encryption. Fix the disk before real customer data is stored.
 
-This is the **only unconditional operator secret**. It comes from the one-time
-`vault operator init` ceremony, so it cannot exist before the first converge.
-The first `site.yml` run leaves Vault uninitialized on purpose. The "waits only
-for core services" notice at the end of
-[Part 6](#part-6--run-the-converge-3090-minutes) is expected. After you
-initialize Vault, use the stdin-only helper to store its unseal key in a
-**dedicated sibling overlay**. Never put it in `group_vars/all.yml`; a contract
-test forbids that location.
+### Choose how the VM gets images
 
-- **Helper:** `scripts/store-vault-unseal-key.py` — reads the key from stdin
-  only, refuses a terminal, and will not overwrite an existing key.
-- **Where it goes:** `group_vars/production_rocky9/vault-unseal.yml` in your
-  generated inventory.
-- **Exact commands:** [Part 7, Step 7b](#part-7--initialize-the-secrets-vault-and-hand-its-key-to-the-controller-15-minutes)
-  — do not run them now; you reach them after Part 6.
+Pick one path before the converge:
 
-#### 2b. `identity_ldap_bind_password` — only when you connect a customer directory
+1. Log the target VM's root Docker daemon in to `dhi.io`; or
+2. Stage a production offline seed and set the five
+   `offline_image_seed_*` inventory values.
 
-Skip this entirely unless you set `identity_ldap_enabled: true` to federate an
-**external customer Active Directory over LDAPS** (encrypted LDAP — see the
-[Glossary](#glossary)). It is the password for the read-only directory **bind
-account** — the service account Keycloak uses to look users up. It is never
-generated, and never placed in `.env`, on a command line, or in logs; it reaches
-the stack only as a root-owned file bind-mounted into the key-rotator service.
+A Docker login for the normal SSH user does not log in the root daemon. For
+the offline path, follow [Offline image releases](offline-image-seed.md).
 
-Store it with the stdin-only helper **before** the converge:
+## Part 2 — Prepare the controller
+
+Install Ansible Core 2.16 or newer. Then get this repository and its required
+Ansible collections:
 
 ```bash
-read -rsp 'Directory bind-account password: ' AIGW_LDAP_BIND; printf '\n'
-printf '%s\n' "$AIGW_LDAP_BIND" | python3 scripts/store-identity-ldap-bind-password.py \
-  --vault-file ansible/inventory/generated/mygateway/group_vars/production_rocky9/identity-ldap.yml \
-  --vault-id mygateway \
-  --vault-password-file ~/.aigw-vault-pass
-unset AIGW_LDAP_BIND
-```
-
-**You should see** `Stored and verified inline-encrypted identity_ldap_bind_password`.
-
-Enabling LDAP also means filling in these **non-secret** keys in your
-`host_vars` file (plain topology/identity settings, not encrypted secrets):
-
-| Key | What to put there |
-|---|---|
-| `identity_ldap_enabled` | `true` to turn the feature on — this changes the firewall ABI, so it requires a full `site.yml` run |
-| `identity_ldap_url` | Your directory endpoint — **must** begin `ldaps://` (plain `ldap://` is rejected) |
-| `identity_ldap_provider_name` | A display name for the directory |
-| `identity_ldap_vendor` | The directory vendor (e.g. Active Directory) |
-| `identity_ldap_directory_ip` | The directory server's IP (reached over the internal leg) |
-| `identity_ldap_bind_dn` | The bind account's distinguished name |
-| `identity_ldap_users_dn` | The base DN under which user accounts live |
-| `identity_ldap_ca_bundle_src` | Controller-local path to the CA bundle that signs the LDAPS certificate |
-| `identity_ldap_username_attribute`, `identity_ldap_rdn_attribute`, `identity_ldap_uuid_attribute`, `identity_ldap_user_object_classes`, `identity_ldap_user_filter` | The directory's user-schema mapping |
-
-Keep `identity_ldap_enabled: false` until every one of these is filled in.
-
-#### 2c. Edge TLS material — file paths, not inventory secrets
-
-Your gateway needs a real TLS certificate for its web addresses. Which files you
-supply depends on `aigw_edge_tls_mode`, which you set in `host_vars`. **In every
-mode the certificate and private key are given as controller-local *file
-paths* — they are never inventory secrets and never go into an inline-encrypted
-overlay** (a private key least of all):
-
-| `aigw_edge_tls_mode` | What you supply | Keys (file paths in `host_vars`) |
-|---|---|---|
-| `customer-supplied` | Your ready `*.<domain>` leaf certificate, its private key, and the full chain | `aigw_edge_tls_leaf_cert_file`, `aigw_edge_tls_private_key_file`, `aigw_edge_tls_chain_file` |
-| `customer-intermediate` | An intermediate CA certificate, its private key, and the full chain (Vault then issues every leaf) | `aigw_edge_tls_intermediate_cert_file`, `aigw_edge_tls_intermediate_key_file`, `aigw_edge_tls_intermediate_chain_file` |
-| `vault-intermediate` | *No files up front* — Vault emits a CSR that your CA signs offline | (none in the inventory; an on-host ceremony) |
-
-The full mode table, when to use each, and the exact on-host ceremonies are in
-[operations — production edge TLS](operations.md#production-edge-tls). Point the
-file paths at a protected location outside the repository; the preflight fails
-closed if the set is incomplete or the private-key file is group-readable or a
-symlink.
-
-> **These must be absolute paths (starting with `/`), not relative ones.**
-> Ansible resolves a relative path against the invoking playbook's own
-> directory (`ansible/`), never the repository root or your shell's working
-> directory — so a relative value silently mis-resolves to a nonexistent
-> location. The preflight now fails closed with a clear "must be an absolute
-> path" error if you give it one, rather than a confusing "not found." This
-> applies to `identity_ldap_ca_bundle_src` too (§2b).
-
-#### 2d. Anthropic WIF record — operator-completed at go-live (Part 8)
-
-This one is easy to miss because these values are **identifiers, not
-passwords** — but you still write them by hand, after the stack is up.
-Following the human Anthropic organization-admin Console (or Admin API)
-ceremony, you write one record directly into Vault at
-`kv/ai-gateway/anthropic-wif` holding the returned **non-secret** identifiers:
-`federation_issuer_id` (`fdis_…`), `federation_rule_id` (`fdrl_…`),
-`service_account_id` (`svac_…`), `organization_id`, `workspace_id`
-(`wrkspc_…`), and the approved `federation_jwks_sha256`. No bearer token is
-stored.
-
-- **Do it in:** [Part 8, step 4](#part-8--first-administrator-and-sign-off-15-minutes),
-  following the [Anthropic WIF setup SOP](sop/anthropic-wif-jwt-setup.md) and its
-  reference [anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md).
-- **Helper:** the Anthropic Console side can now be driven from the controller
-  with `scripts/anthropic-wif-enroll.py`. It needs a short-lived `org:admin`
-  OAuth bearer piped on stdin, which it holds only in memory and never stores.
-
-#### 2e. Cribl SOC connection — optional
-
-Do not point Alloy at a real Cribl worker until the logging and gateway teams
-complete the [Cribl SOC logging handoff](cribl-soc-handoff.md). You need the
-worker IP, TCP `4317`, TLS server name, dedicated CA bundle, exact destination
-`/32`, 24-hour Cribl retention proof, and receipt-test evidence. The feed is
-logs only. Raw traces, metrics, alerts, and ordinary service logs stay local.
-
-## Part 1 — Check the target VM (10 minutes)
-
-Someone (you, or your virtualization/cloud team) must provide a VM that meets
-this checklist **before** you start. For each row, run the exact command shown
-**from the controller** (it opens its own one-off SSH connection per command —
-you do not need to stay logged into the VM) and compare.
-
-| # | Requirement | How to check (run from the controller) | You should see |
-|---|---|---|---|
-| 1 | Rocky Linux 9 | `ssh <user>@<vm> 'cat /etc/rocky-release'` | `Rocky Linux release 9.x` |
-| 2 | Three network interfaces, each already configured with its own IP address: one for internet egress, one for administrators (ADM), one for internal users | `ssh <user>@<vm> 'ip -br -4 address'` | Three interfaces, each with an IPv4 address |
-| 3 | Exactly one default route, on the egress interface | `ssh <user>@<vm> 'ip -4 route show table main'` | One line starting `default via …` naming the egress interface |
-| 4 | SELinux enforcing | `ssh <user>@<vm> getenforce` | `Enforcing` |
-| 5 | Encrypted disk under Docker and the install directory (**strongly recommended**, see note) | `ssh <user>@<vm> "lsblk -o NAME,FSTYPE \| grep crypto_LUKS"` | At least one `crypto_LUKS` entry backing the root/data volume |
-| 6 | Clock synchronized | `ssh <user>@<vm> "chronyc tracking \| head -2"` | A reference server and a small offset (under 5 seconds) |
-| 7 | A login account with sudo that accepts your SSH key | `ssh <user>@<vm> sudo -n true` | No password prompt, no error |
-| 8 | Enough resources | — | At least 4 vCPU / 24 GiB RAM / 100 GB disk for a pilot; the services alone reserve ~20 GiB of memory |
-| 9 | A way to obtain the container images — **either** registry credentials **or** a pre-staged offline seed (see note below) | `ssh <user>@<vm> 'sudo docker pull dhi.io/vault:2.0.3'` *(only meaningful after Docker is installed; on a fresh VM confirm the credential plan instead)* | The pull succeeds, **or** you have deliberately chosen the offline-seed route |
-
-**About row 9 — this one bites late if you skip it.** Most of the stack is
-built from **Docker Hardened Images** under the private `dhi.io` registry, which
-requires an entitled Docker subscription. A VM with no `dhi.io` credential does
-not fail at the start of the converge — it fails part-way through the stack
-phase, when a task first needs one of those images, with a registry
-`401 Unauthorized`. Choose one of these **before** Part 6:
-
-- **Registry credentials (normal path).** Log the target VM's *root* Docker
-  daemon in to `dhi.io` (the converge runs Docker as root, so a login under
-  your own user is not enough).
-- **Pre-staged offline seed (air-gapped / no-credential path).** Export the
-  digest-pinned external images elsewhere and stage the archive on the target,
-  then set the five `offline_image_seed_*` values in `host_vars`. This is a
-  fully supported production feature — the complete procedure, including the
-  fail-closed hash/ownership contract, is in
-  [offline-image-seed.md](offline-image-seed.md). Verify the seed's image set
-  still matches the checkout you are deploying; a stale seed is refused rather
-  than silently mixed with newer pins.
-
-If any row fails, stop and fix it first — the automation checks all of these
-and will refuse to proceed, **except the encrypted-disk check (row 5)**. LUKS
-(full-disk encryption) is a build-time disk task the converge does not manage:
-if the disk is not encrypted the converge prints a loud
-`AIGW_ENCRYPTED_STATE_WARNING` and a `WARNING: … NOT on LUKS-encrypted storage`
-line and then continues. Provision the encrypted disk when the VM is built and
-keep the passphrase yourself; do not treat the warning as permission to skip
-encryption for real customer data.
-
-Write down these values now; you will need them in Part 3:
-
-- The **names** of the three interfaces (e.g. `ens160`, `ens192`, `ens224`)
-  and which role each plays (egress / ADM / internal)
-- Each interface's **IP address** and **gateway**
-- The **network range (CIDR)** administrators connect from (e.g. `10.8.10.0/24`)
-- The **network range (CIDR)** internal users connect from
-- One to three **internal DNS server** addresses (your corporate resolvers)
-- One to three **internet DNS server** addresses (what the gateway may use to
-  look up AI vendor APIs — must be different servers from the internal list)
-- The **base domain** the services will live under (e.g. `aigw.example.com` —
-  the system creates hostnames like `chat.aigw.example.com` under it)
-
-## Part 2 — Prepare the controller (10 minutes)
-
-On your workstation:
-
-```bash
-# 1. Confirm Ansible 2.16 or newer is installed
-ansible --version | head -1
-
-# 2. Get the repository and its pinned dependencies
 git clone <repository-url> ai-gateway
 cd ai-gateway
 ansible-galaxy collection install -r ansible/requirements.yml
 ```
 
-Create a **vault password file** — a single strong passphrase that encrypts
-all the secrets this deployment will generate. Do not reuse an existing
-password:
+Create one private password file for this inventory:
 
 ```bash
 umask 077
-openssl rand -base64 30 > ~/.aigw-vault-pass
+install -d -m 0700 "$HOME/.config/ai-gateway"
+openssl rand -base64 30 > "$HOME/.config/ai-gateway/mygateway.vault-password"
+chmod 600 "$HOME/.config/ai-gateway/mygateway.vault-password"
 ```
 
-Keep this file safe (and back the passphrase up in your password manager):
-without it, the deployment's secrets cannot be read or changed later.
+Back up the password in the approved password manager. Do not put the file in
+this repository.
 
-## Part 3 — Generate your deployment folder (5 minutes)
+## Part 3 — Generate your deployment folder
 
-One command creates a dedicated inventory for this customer/host, with every
-secret generated randomly and stored only in encrypted form:
+For a non-interactive run, all three options below are required:
 
 ```bash
-scripts/bootstrap-rocky9-production.py \
+python3 -I scripts/bootstrap-rocky9-production.py \
   --inventory-alias mygateway \
   --vault-id mygateway \
-  --vault-password-file ~/.aigw-vault-pass
+  --vault-password-file "$HOME/.config/ai-gateway/mygateway.vault-password"
 ```
 
-(The older `scripts/bootstrap-generic-rocky9.py` still works as a DEPRECATED
-compatibility alias and prints a one-line notice pointing at this canonical
-command.)
+Replace `mygateway` with a short name for this install. The script makes:
 
-Pick your own short name instead of `mygateway` (letters, digits, dots,
-dashes). **You should see** it create three files under
-`ansible/inventory/generated/mygateway/` and print the exact next command to
-run. It never prints or stores a secret in plain text.
+```text
+ansible/inventory/generated/mygateway/hosts.yml
+ansible/inventory/generated/mygateway/host_vars/mygateway.yml
+ansible/inventory/generated/mygateway/group_vars/production_rocky9/vault.yml
+```
 
-Now open the one file you must fill in:
+Run the script with no options in a terminal if you want guided prompts.
+
+Open the host variables:
 
 ```bash
 nano ansible/inventory/generated/mygateway/host_vars/mygateway.yml
 ```
 
-Every blank value maps to something you wrote down in Part 1. The essentials:
+Fill in the values from Part 1:
 
-| Field | What to put there |
-|---|---|
-| `ansible_host` | The VM's management IP (usually the ADM address) |
-| `ansible_user` | The sudo account from Part 1, row 7 |
-| `aigw_domain` | Your base domain, lowercase (e.g. `aigw.example.com`) |
-| `nic_egress` / `nic_adm` / `nic_internal` | The three interface **names** |
-| `eth0_ip` / `eth0_gateway` | Egress interface IP and gateway |
-| `eth1_ip` / `eth1_gateway` | ADM interface IP and gateway |
-| `eth2_ip` / `eth2_gateway` | Internal interface IP and gateway |
-| `vpn_client_cidr` | The administrators' network range |
-| `internal_cidr` | The internal users' network range |
-| `internal_dns_servers` / `egress_dns_servers` / `platform_authoritative_dns_enabled` | Three fields, one DNS mode — see below |
+| Field | Value |
+| --- | --- |
+| `ansible_host` | Target VM SSH address |
+| `ansible_user` | SSH user with `sudo -n` access |
+| `aigw_domain` | Lowercase base domain, such as `aigw.example.internal` |
+| `nic_egress`, `nic_adm`, `nic_internal` | Live NIC names |
+| `eth0_ip`, `eth0_gateway` | Egress values |
+| `eth1_ip`, `eth1_gateway` | ADM values |
+| `eth2_ip`, `eth2_gateway` | Internal values |
+| `vpn_client_cidr` | Allowed ADM client range |
+| `internal_cidr` | Allowed internal client range |
+| `internal_dns_servers` | Customer internal resolvers |
+| `egress_dns_servers` | Separate resolvers reached through egress |
 
-**DNS: pick exactly one mode.** `internal_dns_servers`, `egress_dns_servers`, and
-`platform_authoritative_dns_enabled` are three separate YAML fields that work
-together as a single choice; the value of one determines what the others
-should hold.
+The `eth0`, `eth1`, and `eth2` labels show roles. Your live NIC names may be
+different.
 
-**Mode A — use your existing corporate DNS** (the usual choice for a real
-deployment):
+### Pick a DNS mode
+
+Most sites use customer DNS:
 
 ```yaml
-internal_dns_servers: ["<resolver reachable through ADM/internal>", "<optional second>"]
-egress_dns_servers: ["<a distinct Internet resolver reachable only through egress>"]
+internal_dns_servers: ["<internal-resolver>"]
+egress_dns_servers: ["<separate-egress-resolver>"]
 platform_authoritative_dns_enabled: false
 ```
 
-**Mode B — let the gateway answer only for its own `aigw_domain`** (no
-recursion, no corporate resolver needed — useful for a pilot or test where
-you don't have one):
+A pilot may let the gateway answer only for `aigw_domain`:
 
 ```yaml
 internal_dns_servers: ["{{ eth1_ip }}", "{{ eth2_ip }}"]
-egress_dns_servers: ["<a distinct Internet resolver reachable only through egress>"]
+egress_dns_servers: ["<separate-egress-resolver>"]
 platform_authoritative_dns_enabled: true
 ```
 
-In Mode B, ADM clients use `eth1_ip` and internal clients use `eth2_ip` as
-their resolver; this authoritative service returns `NXDOMAIN` for every other
-zone, so it must not replace a client's general recursive resolver. In
-**both** modes, `egress_dns_servers` must be a distinct resolver from
-`internal_dns_servers` — it is reachable only through the egress interface
-and is the sole DNS that Envoy (and only Envoy) uses to reach AI vendor APIs.
+The built-in DNS service is not a general resolver. It returns `NXDOMAIN` for
+other zones.
 
-Leave everything you don't understand at its default — the defaults are the
-safe, fail-closed choices. (The `eth0/1/2` names are just labels; your real
-interfaces can be called anything.)
+### Pick an edge TLS mode
 
-## Part 4 — Pass the preflight gate (2 minutes)
+Set one `aigw_edge_tls_mode`:
 
-This checks your folder for mistakes **without touching the VM at all**:
+| Mode | Input |
+| --- | --- |
+| `customer-supplied` | Absolute paths to the leaf certificate, key, and chain |
+| `customer-intermediate` | Absolute paths to the intermediate certificate, key, and chain |
+| `vault-intermediate` | No key file at this step; Vault makes a key and CSR later |
 
-```bash
-ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
-  ansible/preflight-rocky9-production.yml --limit mygateway \
-  --vault-id mygateway@~/.aigw-vault-pass
-```
+Private key files must be regular single-link files with mode `0600`. See
+[Production edge TLS](operations.md#production-edge-tls).
 
-**You should see** a line containing `AIGW_GENERIC_PREFLIGHT=` with
-`"status": "ok"`. If the status is `invalid`, the same line lists exactly
-which fields are missing or malformed — fix them in the `host_vars` file and
-run it again. Repeat until it says `ok`.
+### Add production LDAPS
 
-Then confirm the controller can actually reach the VM:
+To connect a customer directory, set `identity_ldap_enabled: true`. Fill in all
+`identity_ldap_*` fields. The URL must use `ldaps://`. The CA bundle path must
+be absolute.
+
+Store the bind password in its own encrypted file:
 
 ```bash
-ansible -i ansible/inventory/generated/mygateway/hosts.yml mygateway -m ping
+read -rsp 'Directory bind password: ' AIGW_LDAP_BIND; printf '\n'
+printf '%s\n' "$AIGW_LDAP_BIND" | \
+  python3 -I scripts/store-identity-ldap-bind-password.py \
+    --vault-file ansible/inventory/generated/mygateway/group_vars/production_rocky9/identity-ldap.yml \
+    --vault-id mygateway \
+    --vault-password-file "$HOME/.config/ai-gateway/mygateway.vault-password"
+unset AIGW_LDAP_BIND
 ```
 
-**You should see** `"ping": "pong"`. If not, check `ansible_host`,
-`ansible_user`, and your SSH key.
+Ansible later uses this password to configure Keycloak. There is no user-run
+identity initialization page.
 
-## Part 5 — Register the DNS names (coordinate with your DNS admin)
+## Part 4 — Pass the preflight gate
 
-Before the converge, your DNS must point these names at the gateway. All of
-them are hostnames under your base domain:
-
-| Hostname | Points to | Who uses it |
-|---|---|---|
-| `portal.<domain>`, `api.<domain>`, `auth.<domain>` | the **internal** interface IP | users and developers |
-| `chat.<domain>`, `admin.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, `vault.<domain>` | the **ADM** interface IP | chat and administration (ADM leg) |
-
-The complete name inventory, per-audience resolution expectations, and the
-internal-vs-internet DNS design are in the
-[FQDN inventory](fqdn-inventory.md).
-
-## Part 6 — Run the converge (30–90 minutes)
-
-This is the main event. Keep your current terminal open until it finishes —
-the automation hardens SSH partway through and proves it can still log in
-before continuing, but don't close your safety line early.
+First check Ansible pipelining from the repository root:
 
 ```bash
-ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
-  ansible/site.yml --limit mygateway \
-  --vault-id mygateway@~/.aigw-vault-pass
+ansible-config dump | grep PIPELINING
 ```
 
-The converge runs these stages in order:
+It must show `True`.
 
-1. host safety, clock, and SELinux checks;
-2. network routes, firewall zones, and packet rules;
-3. OS packages, Docker, and SSH hardening;
-4. the 20 isolated container networks;
-5. configuration, image builds, and container startup; and
-6. final verification.
-
-### The three playbooks — which one do I run?
-
-`site.yml` is actually two playbooks run back-to-back, and you can run each
-half on its own. All three take the same `-i`, `--limit`, and `--vault-id`
-arguments shown above:
-
-| Playbook | What it does | When you run it |
-|---|---|---|
-| `ansible/site.yml` | Everything: prepares the host, then deploys and verifies the stack | **First deploy** (this Part and Step 7d), and any time you are unsure — it is always safe |
-| `ansible/os-prep.yml` | Host preparation only: all safety checks, clock, SELinux, routing, firewall, OS packages, Docker, and the 20 container networks. **Starts no containers.** | When the host/OS team prepares the VM ahead of time, or after changing host-level inventory (NICs, firewall, DNS resolvers) without wanting to touch the running stack yet |
-| `ansible/deploy-stack-only.yml` | Stack only: deploys the containers, verifies everything, and records the host as a completed dedicated gateway host | App/config updates on a host that already converged, or the stack half of a first deploy after `os-prep.yml` ran |
+Run the controller-only preflight. Use an absolute password-file path after
+the `@` sign:
 
 ```bash
-# Host preparation only (no containers started):
-ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
-  ansible/os-prep.yml --limit mygateway \
-  --vault-id mygateway@~/.aigw-vault-pass
-
-# Stack deploy/redeploy on a prepared host:
-ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
-  ansible/deploy-stack-only.yml --limit mygateway \
-  --vault-id mygateway@~/.aigw-vault-pass
+ansible-playbook \
+  -i ansible/inventory/generated/mygateway/hosts.yml \
+  ansible/preflight-rocky9-production.yml \
+  --limit mygateway \
+  --vault-id mygateway@/absolute/private/mygateway.vault-password
 ```
 
-Two rules keep this safe, and the playbooks enforce both for you:
+A pass prints an `AIGW_GENERIC_PREFLIGHT` receipt with status `ok`. If it says
+`invalid`, fix the listed field and run it again.
 
-- `deploy-stack-only.yml` **refuses to run on a host that was never
-  prepared** — it requires the ownership marker that only `os-prep.yml` (or
-  `site.yml`) writes, and it re-checks the live firewall and container
-  networks before touching anything. If it refuses, run `site.yml`; never
-  work around its assertions.
-- Running `os-prep.yml` then `deploy-stack-only.yml` ends in exactly the
-  same state as one `site.yml` run, so you can hand the two halves to two
-  different people (host team, then app team) without losing anything.
+Check SSH:
 
-**Two outcomes are normal:**
+```bash
+ansible -i ansible/inventory/generated/mygateway/hosts.yml \
+  mygateway -m ping
+```
 
-- It stops early with a clear assertion message. Nothing was changed; read
-  the message, fix the input, and run it again.
-- It completes but prints an explicit notice that **Vault is not initialized
-  yet** and that it only waited for the core services. **This is expected on
-  the first run** — Vault (the secrets safe) starts empty and sealed on
-  purpose. Continue to Part 7.
+The result must include `"ping": "pong"`.
 
-## Part 7 — Initialize the secrets vault and hand its key to the controller (15 minutes)
+## Part 5 — Register the DNS names
 
-Vault (the built-in secrets safe) starts empty and sealed. Do these four steps
-in order:
+Create these records before the full converge:
 
-1. initialize Vault once on the VM;
-2. give the controller an encrypted copy of Vault's unlock key;
-3. give Vault the intermediate CA when your edge TLS mode needs it; and
-4. run the converge again so the automation can unlock Vault and finish.
+| Names | Target |
+| --- | --- |
+| `portal.<domain>`, `api.<domain>`, `auth.<domain>` | Internal IP |
+| `chat.<domain>`, `admin.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, `vault.<domain>` | ADM IP |
 
-**Step 7a — Initialize Vault through the reviewed operator ceremony.** Follow
-the organization-approved production ceremony to initialize and unseal Vault,
-distribute recovery material to its custodians, and retain the unseal share that
-the controller will encrypt in Step 7b. Do not use an automated test initializer
-on a production target. The executable controller-side handoff is
+See the [FQDN inventory](fqdn-inventory.md) for the full split-DNS rules.
+
+## Part 6 — Run the first converge
+
+Run the full play from the repository root:
+
+```bash
+ansible-playbook \
+  -i ansible/inventory/generated/mygateway/hosts.yml \
+  ansible/site.yml \
+  --limit mygateway \
+  --vault-id mygateway@/absolute/private/mygateway.vault-password
+```
+
+The play checks the host, sets network and firewall rules, installs Docker,
+creates the container networks, deploys the core stack, and runs checks.
+
+On a new install, Vault is still empty. A first-run notice that only core
+services are ready is expected. Continue to Part 7.
+
+### Which production playbook should I use?
+
+| Playbook | Use |
+| --- | --- |
+| `ansible/site.yml` | First install, host changes, or any time you are unsure |
+| `ansible/os-prep.yml` | Host setup only; it starts no containers |
+| `ansible/deploy-stack-only.yml` | App deploy on a host that already passed host setup |
+
+The stack-only play checks the host marker, firewall, and networks. If it
+refuses, run `site.yml`. Do not bypass the check.
+
+## Part 7 — Initialize Vault and finish the install
+
+Vault initialization happens once. A reboot needs only an unseal, not a new
+initialization.
+
+### Step 7a — Initialize Vault once
+
+Follow the approved production Vault ceremony. Do not run the local test
+bootstrap script on production. The controller handoff example is
 [`production-rocky9.first-init.sh.example`](../ansible/inventory/examples/production-rocky9.first-init.sh.example).
-Securely custody every recovery share and the initial root token according to
-that ceremony; anyone with them controls the gateway's secrets.
 
-**Step 7b — Give the controller an encrypted copy of the unseal key.** Back on
-the controller, store the unseal key in a dedicated encrypted file so the
-automation can unlock Vault on every later run. The command reads the key from
-your keyboard (it is never typed on the command line or saved in plain text)
-and writes only its encrypted form:
+Protect all recovery shares and the first root token. Do not place them in Git,
+logs, tickets, or chat.
+
+### Step 7b — Store one encrypted unseal key on the controller
+
+Use the stdin-only helper:
 
 ```bash
-read -rsp 'Vault unseal key from Step 7a: ' AIGW_UNSEAL_SHARE; printf '\n'
-printf '%s\n' "$AIGW_UNSEAL_SHARE" | python3 scripts/store-vault-unseal-key.py \
-  --vault-file ansible/inventory/generated/mygateway/group_vars/production_rocky9/vault-unseal.yml \
-  --vault-id mygateway \
-  --vault-password-file ~/.aigw-vault-pass
+read -rsp 'Vault unseal key: ' AIGW_UNSEAL_SHARE; printf '\n'
+printf '%s\n' "$AIGW_UNSEAL_SHARE" | \
+  python3 -I scripts/store-vault-unseal-key.py \
+    --vault-file ansible/inventory/generated/mygateway/group_vars/production_rocky9/vault-unseal.yml \
+    --vault-id mygateway \
+    --vault-password-file "$HOME/.config/ai-gateway/mygateway.vault-password"
 unset AIGW_UNSEAL_SHARE
 ```
 
-**You should see** `Stored and verified inline-encrypted vault_unseal_key`.
-The helper accepts exactly one valid share, never prints it, and refuses to
-overwrite an existing one.
+The helper writes only an encrypted value. It does not replace an existing
+one.
 
-**Step 7c — Give Vault your intermediate CA.** *(Only for
-`aigw_edge_tls_mode: customer-intermediate` or `vault-intermediate`. Skip
-this step entirely for `customer-supplied`, and go straight to Step 7d.)*
+### Step 7c — Finish the edge CA ceremony when needed
 
-Until you do this, Vault cannot issue edge certificates from your CA, so the
-two Traefik edges keep serving the short-lived **self-signed placeholder**
-they came up with. Nothing in the converge performs this ceremony for you —
-it is a deliberate on-host step, because it is the moment your CA material
-enters Vault.
+Skip this step for `customer-supplied` TLS.
 
-The converge has already staged your three files on the VM as root-owned
-`0600` copies under `/opt/ai-gateway/secrets/`. Log in to the VM and run the
-import with the Vault **root token from Step 7a on stdin** — never as an
-argument, and never echoed:
+For `customer-intermediate`, import the staged intermediate into Vault. For
+`vault-intermediate`, ask Vault for a CSR, sign it on the approved CA system,
+then install the signed result. Follow
+[Production edge TLS](operations.md#production-edge-tls).
 
-```bash
-ssh <ansible_user>@<vm>
-sudo -i
-cd /opt/ai-gateway
-read -rsp 'Vault root token: ' TOK; printf '\n'
-printf '%s\n' "$TOK" | ./scripts/vault-pki-intermediate.sh import-intermediate \
-    --intermediate secrets/aigw-intermediate-import.pem \
-    --intermediate-key secrets/aigw-intermediate-import.key \
-    --chain secrets/aigw-intermediate-import-chain.pem
-unset TOK
-```
+Test the live edge with the customer Root CA. A connection that works only
+with certificate checks off does not pass.
 
-**You should see** the script wait for the full service graph to report
-healthy and then finish with two lines:
+### Step 7d — Run the full converge again
 
-```
->> edge now serves a certificate chaining to the customer root CA (customer-intermediate).
->> the staged intermediate private key has been shredded; it now lives only inside Vault.
-```
-
-Confirm it from your own workstation before moving on — this must verify
-against your real root CA, not merely connect:
+Run the same command from Part 6:
 
 ```bash
-echo | openssl s_client -connect <ADM_IP>:443 \
-  -servername admin.<domain> -CAfile /path/to/your-root-ca.pem 2>&1 \
-  | grep 'Verify return code'
+ansible-playbook \
+  -i ansible/inventory/generated/mygateway/hosts.yml \
+  ansible/site.yml \
+  --limit mygateway \
+  --vault-id mygateway@/absolute/private/mygateway.vault-password
 ```
 
-**You should see** `Verify return code: 0 (ok)`, and the certificate's issuer
-should now be your intermediate CA rather than the placeholder's own name.
-For `vault-intermediate` mode the same step is a three-part CSR ceremony
-(`csr` → sign on your CA host → `install-signed`) documented in
-[operations — production edge TLS](operations.md#production-edge-tls).
+Ansible now unlocks Vault with the encrypted controller copy. When LDAPS is
+enabled, Ansible also:
 
-> **Do this before Step 7d.** The final converge verifies the edge
-> certificate, and on a real-CA profile it rejects a placeholder once Vault
-> is initialized — so skipping this step makes Step 7d fail rather than
-> silently leaving a self-signed edge in place.
+1. proves the directory TLS chain, hostname, and bind;
+2. configures Keycloak federation;
+3. builds all managed redirect, origin, and logout URLs from `aigw_domain`;
+4. removes short-term bootstrap access; and
+5. verifies the final identity state.
 
-**Step 7d — Run the converge one more time.** Back on the controller, run the
-exact command from Part 6 again. Because Vault is now initialized, the
-automation **automatically unlocks it** using the encrypted key you just
-stored, then waits for and verifies the complete system.
+The admin portal does not ask the user to initialize identity.
 
-```bash
-ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
-  ansible/site.yml --limit mygateway \
-  --vault-id mygateway@~/.aigw-vault-pass
-```
+## Part 8 — First administrator and sign-off
 
-> If you skip Step 7b, this run **stops on purpose** with a message that an
-> initialized Vault needs `vault_unseal_key` from the controller — it refuses
-> to finish a half-unlocked system. Do Step 7b, then rerun.
+1. Assign one approved directory user to the `aigw-admins` group. This grants
+   access; it does not initialize the platform.
+2. On the ADM network, open `https://admin.<domain>` and
+   `https://grafana.<domain>`. Both must redirect to Keycloak and return after
+   login.
+3. Open `https://chat.<domain>` on ADM and `https://portal.<domain>` on the
+   internal network.
+4. Test logout from each app. It must end the Keycloak session and return to
+   the same deployed domain.
+5. Enroll Anthropic WIF with the
+   [WIF setup SOP](sop/anthropic-wif-jwt-setup.md).
+6. Run the needed parts of the [acceptance test runbook](test-runbook.md).
 
-The controller-side 7b → 7d handoff is captured in
-[`production-rocky9.first-init.sh.example`](../ansible/inventory/examples/production-rocky9.first-init.sh.example).
-
-## Part 8 — First administrator and sign-off (15 minutes)
-
-1. Connect your directory and create the first administrator following
-   [identity operations](identity-operations.md) — the short version: a
-   Keycloak/directory procedure grants one named person the `aigw-admins`
-   role. Ansible has already configured and verified the LDAPS federation and
-   durable identity controller; there is no admin-portal initialization step.
-2. From an administrator machine (on the ADM network), open
-   `https://admin.<domain>` and `https://grafana.<domain>` — both should
-   redirect you to a login page and let the administrator in. In Grafana, the
-   "AI Gateway" folder should already hold every provisioned dashboard (see
-   [observability operations](observability-operations.md) for the current
-   list — eight at the time of writing); the newer dashboards link back to
-   AI Gateway Overview as their hub.
-3. From a machine on the ADM network, open `https://chat.<domain>` — you
-   should reach the chat login. From a user machine (on the internal
-   network), open `https://portal.<domain>` — you should reach the
-   developer portal login.
-4. Enroll the AI vendor credential (Anthropic) following the step-by-step
-   [Anthropic WIF setup SOP](sop/anthropic-wif-jwt-setup.md). The deep
-   reference behind that SOP is
-   [anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md).
-5. Before opening access to real users, run the applicable sections of the
-   [acceptance test runbook](test-runbook.md).
+Save only non-secret test evidence.
 
 ## Troubleshooting quick reference
 
-| Symptom | Likely cause | What to do |
-|---|---|---|
-| Preflight says `"status": "invalid"` | A blank or malformed field in `host_vars` | The receipt lists the exact keys; fix and rerun — nothing was touched |
-| `ping` fails in Part 4 | SSH target/user/key wrong | Verify `ssh <user>@<vm>` works by hand first |
-| Converge stops at a topology assertion | The values you entered disagree with the VM's live interfaces/routes | Re-run the Part 1 checks; correct `host_vars` |
-| Converge stops at SELinux / clock / encryption | VM doesn't meet Part 1 rows 4–6 | Fix the VM (this may need the VM team), rerun |
-| Converge stops part-way through the stack phase with a registry `401 Unauthorized`, an "failed to resolve reference" error, or a Vault-config validation that reports no output | The VM cannot pull the `dhi.io` Docker Hardened Images — Part 1 row 9 was not satisfied | Either log the VM's **root** Docker daemon in to `dhi.io`, or pre-stage the images and set the `offline_image_seed_*` values ([offline-image-seed.md](offline-image-seed.md)), then rerun |
-| First converge "waits only for core services" and mentions Vault | Not an error | Expected — do Part 7 |
-| A service is unhealthy after Part 7 | Vault sealed (e.g. after a reboot) | Re-run the Part 6 converge — it auto-unlocks Vault from the controller's stored key. For an immediate fix on the VM, pipe the stored unseal key into `sudo scripts/vault-unseal.sh` (see [operations](operations.md)) |
-| Step 7d stops: "initialized Vault requires vault_unseal_key" | You skipped Step 7b, so the controller has no stored unlock key | Do Step 7b (store the key), then rerun Step 7d |
-| Step 7d stops rejecting a placeholder / self-signed edge certificate | You are on a real-CA edge TLS mode and skipped Step 7c, so Vault never received your intermediate and the edges still serve the bootstrap placeholder | Do Step 7c (import the intermediate), confirm `Verify return code: 0 (ok)` against your root CA, then rerun Step 7d |
-| You need to change a secret later | — | `ansible-vault edit ansible/inventory/generated/<alias>/group_vars/production_rocky9/vault.yml --vault-id <alias>@<password-file>`, then rerun the converge |
+| Problem | What to do |
+| --- | --- |
+| Bootstrap says required options are missing | Pass `--inventory-alias`, `--vault-id`, and `--vault-password-file`, or run with no options for prompts |
+| Preflight status is `invalid` | Fix the exact listed host variable and rerun |
+| Ansible ping fails | Check `ansible_host`, `ansible_user`, SSH keys, and `sudo -n` |
+| Topology check fails | Make inventory match the live NICs, IPs, and default route |
+| Registry returns `401` | Log the root Docker daemon in to `dhi.io`, or use the production offline seed |
+| First run says Vault is not initialized | This is expected; complete Part 7 |
+| Run says Vault is sealed | Follow the [Vault unseal SOP](sop/vault-unseal-after-reboot.md) |
+| Run rejects a test edge certificate | Finish the selected CA ceremony and rerun |
+| Keycloak rejects a redirect URL | Check `aigw_domain`, DNS, and certificates, then rerun the full converge; do not hand-edit a second domain into Keycloak |
 
 ## Glossary
 
-- **Converge** — one full run of the Ansible automation that brings the VM to
-  the exact desired state. Safe to rerun; an unchanged system stays unchanged.
-- **Vault** — the built-in secrets safe holding provider credentials and
-  signing keys. Starts sealed (locked) until initialized/unsealed.
-- **Unseal key** — the key that unlocks Vault after every restart. Stored
-  offline by a human, and also kept as an encrypted copy on the controller
-  (Step 7b) so a later converge can unlock Vault automatically. Never held in
-  plain text and never on the VM.
-- **ADM / internal / egress** — the three network legs: administrators-only,
-  internal users, and outbound internet (AI vendors), respectively. Nothing
-  listens on the egress leg.
-- **Inventory** — the folder generated in Part 3 holding this deployment's
-  connection details, topology, and encrypted secrets.
-- **Inline-encrypted overlay** — a small inventory file in which each secret is
-  encrypted individually with your vault passphrase (rather than the whole file
-  at once). The operator-supplied secrets live in dedicated overlays like
-  `vault-unseal.yml`, kept separate from the auto-generated `vault.yml`.
-- **Preflight** — a check that reads and validates but changes nothing.
-- **Leaf certificate** — the actual server certificate a browser sees, as
-  opposed to the intermediate CA that signs it or the offline root above that.
-- **LDAPS** — LDAP over TLS: the encrypted way the gateway talks to a customer
-  directory (Active Directory). Plain, unencrypted `ldap://` is rejected.
-- **WIF (Workload Identity Federation)** — the keyless way the gateway
-  authenticates to Anthropic: it presents short-lived signed assertions instead
-  of a stored API key. Its Anthropic-side identifiers are set up once by a human
-  organization administrator (Part 8).
+- **Controller:** the system that runs Ansible.
+- **Converge:** an Ansible run that makes the target match the inventory.
+- **Inventory:** the files that hold host settings and encrypted secrets.
+- **Preflight:** a read-only input check.
+- **Vault:** the service that holds provider and signing secrets.
+- **Unseal key:** a key that unlocks Vault after a restart.
+- **LDAPS:** LDAP protected by TLS.
+- **WIF:** short-lived provider login without a stored vendor API key.
+
+## Next pages
+
+- [Identity operations](identity-operations.md)
+- [Production operations](operations.md)
+- [Image update workflow](image-update-workflow.md)
+- [Vault unseal after reboot](sop/vault-unseal-after-reboot.md)

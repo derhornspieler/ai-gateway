@@ -401,6 +401,11 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             self.assertIn(event, structured)
         self.assertIn("AIGW_SECURITY_EVENT", structured)
         self.assertNotIn('service=~\\"alloy|cribl-mock\\"', structured)
+        # Use RE2 character classes for literal dots. A backslash here must
+        # survive both Alloy and LogQL string parsing, and a single escaped
+        # dot makes Alloy fail at startup.
+        self.assertIn('security_action!~\\"key[.]generate|key[.]deactivate|', structured)
+        self.assertNotIn('security_action!~\\"key\\\\.generate', structured)
 
         # Alloy and the mock sink never enter either positive classifier, so
         # exporter failure/debug logs cannot recurse into their own queue.

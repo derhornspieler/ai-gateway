@@ -7,7 +7,9 @@ The gateway has two separate telemetry paths:
 
 Cribl is not a copy of the local stack. No metric, raw trace, ordinary service
 log, or alert payload may enter the Cribl exporter. The exact SOC contract is
-in [Cribl SOC logging handoff](cribl-soc-handoff.md).
+in [Cribl SOC logging handoff](cribl-soc-handoff.md). The
+[security model](security-model.md#local-operations-data-and-the-soc-feed)
+shows how this data boundary fits the rest of the system.
 
 ## Collection and routing
 
@@ -19,11 +21,11 @@ mount. Alloy never receives the Docker socket.
 flowchart LR
   APP[Applications and Docker logs] --> AL[Alloy]
   AL --> LK[(Loki<br/>local logs, 7 days)]
-  AL --> PR[(Prometheus<br/>local metrics, 30 days)]
+  AL --> PR[(Prometheus<br/>local metrics, 30 days or 5 GB)]
   PR -.approved backlog.-> AM[Future Alertmanager<br/>local group and resolve]
   LK --> GF[Grafana<br/>ADM only]
   PR --> GF
-  AL -->|OTLP logs over TLS<br/>reviewed SOC allow-list only| CR[Cribl<br/>24 hours]
+  AL -->|OTLP logs over TLS<br/>reviewed SOC allow-list only| CR[Cribl destination<br/>24-hour retention]
 ```
 
 The paths are:
@@ -35,7 +37,7 @@ The paths are:
 | Keycloak authentication events | Loki | Yes, reviewed event types only |
 | Curated trust and security-control events | Loki | Yes, reviewed structured events only |
 | Vault raw audit file | Loki | No |
-| Service and host metrics | Prometheus | No |
+| Service and host metrics | Prometheus, up to 30 days and 5 GB | No |
 | Raw traces | No local trace store | No |
 | Alerts and resolved notices | Prometheus rule state today; local Alertmanager and Grafana lifecycle view are backlog work | No |
 
@@ -147,15 +149,39 @@ There is no e-mail, Slack, Teams, webhook, or Cribl alert receiver. An operator
 must view Grafana. Alert payloads and resolved notices never enter the Cribl
 SOC log path.
 
-At minimum, alert on:
+The committed Prometheus rules currently alert on:
 
-- Cribl exporter send and enqueue failures;
-- queue age, queue size, overflow, and dropped records;
-- recovery after an exporter outage;
+- sustained Cribl exporter send failures;
+- Cribl enqueue failure, which means a record was lost;
+- Cribl queue use above 80 percent;
 - Loki write drops and retry growth;
 - Prometheus remote-write failures and backlog;
 - host filesystem below 15 percent and 5 percent free; and
 - predicted filesystem exhaustion within 24 hours.
+
+There is no reliable per-record queue-age metric or hard queue TTL today. Do
+not invent an age alert from queue size. The planned local Alertmanager and
+Grafana lifecycle work must show firing and resolved state for the signals the
+collector can actually measure.
+
+## Cribl delivery alerts
+
+Use this response for the three Cribl rules above:
+
+1. Check that Alloy is healthy in Grafana.
+2. Check the queue-use panel. A value above 80 percent means the outage buffer
+   is close to full.
+3. Ask the Cribl team to check its OTLP listener, TLS certificate, routes, and
+   destination health.
+4. Check the configured CA file, TLS server name, destination IP, port, and
+   firewall rule. Do not turn off certificate checks.
+5. When delivery resumes, confirm the queue falls and Cribl receives a known
+   test event. Cribl should deduplicate repeated event IDs.
+
+An enqueue-failure alert means at least one approved security record was lost
+before export. Record the time window and open an incident. A send-failure or
+high-queue alert does not prove loss by itself, but it needs prompt action.
+Keep inference and local metrics running while the Cribl path recovers.
 
 ## Retention and limits
 
@@ -163,18 +189,21 @@ At minimum, alert on:
 |---|---|
 | Docker stdout and stderr | 5 files x 20 MiB per container |
 | Loki | 7 days, including `aigw-requests` |
-| Prometheus | 30 days plus a byte cap; the first limit reached wins |
+| Prometheus | 30 days and 5 GB; the first limit reached wins |
 | Cribl destination | 24 hours, owned by the Cribl team |
 | Alloy process | 384 MiB normal limit plus 64 MiB spike allowance in a 512 MiB container |
-| Alloy to Cribl queue | Persistent, byte-bounded, and no record older than 24 hours |
+| Alloy to Cribl queue | Persistent 2 GiB cap; 24-hour retry window after a batch is dequeued; no hard per-record age limit |
 
-The Prometheus byte cap must be large enough to hold 30 days. Measure daily
-growth on production-shaped traffic and leave compaction headroom. A `30d`
-setting alone does not prove 30-day retention.
+The current Prometheus byte cap is 5 GB. Measure daily growth on
+production-shaped traffic and leave compaction headroom. A `30d` setting alone
+does not prove 30-day retention. If 5 GB is too small, change the reviewed
+Compose release and retest capacity; there is no inventory-only size override.
 
 The Cribl queue is an outage buffer, not an archive. It survives an Alloy
-restart, but it is bounded by age and bytes. If either limit is reached, the
-outbound copy is dropped. Local logging, metrics, and inference must continue.
+restart and is capped at 2 GiB. A failed batch is retried for at most 24 hours
+after the exporter dequeues it. Alloy has no per-record queue TTL, so a record
+waiting behind other work can be older than 24 hours. The byte cap can also
+cause an earlier drop. Local logging, metrics, and inference must continue.
 Delivery is at least once, so Cribl should deduplicate by stable event ID.
 
 Cribl retention is a separate 24-hour destination setting. A large gateway
@@ -194,8 +223,8 @@ ACL during converge, after Compose starts, and every 15 seconds for log
 rotation. Do not grant broad Docker-root read access to fix a missing ACL.
 
 Local preprod does not inspect the workstation's Docker root. Check the real
-ACL after a planned Docker restart on the production host. This does not
-require a separate Rocky or Parallels test VM.
+ACL after a planned Docker restart on the production host. Do not add a
+separate rehearsal VM for this host-only check.
 
 ## Cribl TLS, firewall, and queue
 
@@ -286,7 +315,7 @@ For the request audit, prove:
 Local seeded preprod must run the same allow-list against `cribl-mock`. A real
 Cribl connection, production Docker ACL, SELinux behavior, and host metrics are
 checked on the actual production host during its approved deployment or
-maintenance window. Do not create a separate Rocky or Parallels test VM.
+maintenance window. Do not create a separate rehearsal VM.
 
 Save the source commit, offline-seed manifest, commands, results, Cribl receipt
 proof, and any blocked check with the release evidence. A synthetic collector

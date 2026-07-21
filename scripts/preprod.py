@@ -59,6 +59,11 @@ ALLOWED_PROJECT = "aigw-preprod"
 ALLOWED_PREFIX = "aigw-preprod"
 ALLOWED_SUBNET_OCTET = 29
 PRODUCTION_COMPOSE_PROJECT = "ai-gateway"
+PRODUCTION_VENDOR_SUBNET = "172.28.7.0/24"
+# Clean-room may remove the exact vendor network made by releases that used
+# the separate preprod CIDR. Converge never creates or accepts this legacy
+# subnet after the production-image firewall ABI became part of acceptance.
+LEGACY_PREPROD_VENDOR_SUBNET = "172.29.7.0/24"
 ENVOY_EGRESS_IMAGE = "ai-gateway/envoy-egress:1"
 ROOT_SEED_DOCKER_SOCKET = Path("/run/docker.sock")
 POSTGRES_RECONCILE_SCRIPT = "/docker-entrypoint-initdb.d/01-init-databases.sh"
@@ -70,6 +75,14 @@ PREPROD_USERNAMES = frozenset(
     {"preprod-admin", "preprod-developer", "preprod-user"}
 )
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+CLEAN_ROOM_CONFIRMATION = "DESTROY_AIGW_PREPROD_RELEASE_IMAGES"
+CLEAN_ROOM_PLAN_SCHEMA = 1
+CLEAN_ROOM_RECEIPT_SCHEMA = 1
+CLEAN_ROOM_MAX_GROUPS = 256
+CLEAN_ROOM_MAX_RECORDS = 512
+CLEAN_ROOM_MAX_ALIASES = CLEAN_ROOM_MAX_RECORDS * 3
+CLEAN_ROOM_MAX_PLAN_BYTES = 512 * 1024
+CLEAN_ROOM_MAX_DOCKER_OBJECTS = 4096
 CUSTOM_TRANSFER_REFERENCE_RE = re.compile(
     r"^(?:[a-z0-9]+(?:[._-]+[a-z0-9]+)*/)*"
     r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*:aigw-seed-[0-9a-f]{64}$"
@@ -78,6 +91,24 @@ EXTERNAL_IMAGE_REFERENCE_RE = re.compile(
     r"^(?!ai-gateway/)(?:[a-z0-9]+(?:[._-]+[a-z0-9]+)*/)*"
     r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*:"
     r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[0-9a-f]{64}$"
+)
+CUSTOM_IMAGE_REFERENCE_RE = re.compile(
+    r"^(?:[a-z0-9]+(?:[._-]+[a-z0-9]+)*/)*"
+    r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$"
+)
+REPOSITORY_DIGEST_RE = re.compile(
+    r"^(?:[a-z0-9]+(?:[._-]+[a-z0-9]+)*/)*"
+    r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*@sha256:[0-9a-f]{64}$"
+)
+CLEAN_ROOM_ALIAS_KINDS = frozenset(
+    {
+        "custom-archive-reference",
+        "custom-image",
+        "external-reference",
+        "external-repository-digest",
+        "external-tag",
+    }
 )
 _LOCAL_DOCKER_CONTEXT = ""
 _LOCAL_DOCKER_ENDPOINT = ""
@@ -120,13 +151,13 @@ PREPROD_BIND_SOURCES = (
     "cribl-mock/config.yaml",
     "grafana/provisioning",
     "litellm/aigw_default_model_hook.py",
-    "litellm/config.yaml",
     "loki/config.yml",
     "postgres/init",
     "prometheus/prometheus.yml",
     "prometheus/rules.yml",
     "secrets/preprod-edge-certs",
     "secrets/preprod-edge-forwarder.yaml",
+    "secrets/preprod-litellm-config.yaml",
     "secrets/preprod-wif-envoy.yaml",
     "secrets/preprod-realms",
     "secrets/preprod-root-ca.pem",
@@ -348,6 +379,28 @@ def docker(*arguments: str, capture: bool = False) -> subprocess.CompletedProces
     )
 
 
+def clean_room_docker(*arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run one bounded clean-room Docker operation without hiding its result."""
+
+    return subprocess.run(
+        ["docker", "--host", local_docker_endpoint(), *arguments],
+        cwd=REPO_ROOT,
+        env=clean_environment(),
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def validate_local_docker_context() -> str:
+    """Validate the local engine without adding output to a caller's receipt."""
+
+    endpoint = local_docker_endpoint()
+    docker("info", "--format", "{{json .ServerVersion}}", capture=True)
+    return endpoint
+
+
 def compose_command(args: argparse.Namespace, *arguments: str) -> list[str]:
     command = [
         "docker", "--host", local_docker_endpoint(),
@@ -381,8 +434,7 @@ def compose(
 
 
 def check_context(_: argparse.Namespace) -> None:
-    endpoint = local_docker_endpoint()
-    docker("info", "--format", "{{json .ServerVersion}}", capture=True)
+    endpoint = validate_local_docker_context()
     print(
         "PREPROD_DOCKER_CONTEXT_OK "
         f"context={_LOCAL_DOCKER_CONTEXT} endpoint={endpoint}"
@@ -422,7 +474,7 @@ def load_local_preprod_seed(args: argparse.Namespace) -> None:
     uid, gid = recorded_preprod_owner()
     if (os.geteuid(), os.getegid()) != (uid, gid):
         fail("local Docker Desktop seed loading must run as the recorded checkout owner")
-    check_context(args)
+    validate_local_docker_context()
     loader = REPO_ROOT / "scripts/load-offline-image-seed.py"
     with tempfile.TemporaryDirectory(
         prefix="preprod-seed-loader-", dir=SECRETS_DIR
@@ -446,6 +498,501 @@ def load_local_preprod_seed(args: argparse.Namespace) -> None:
     if not re.fullmatch(r"(?:LOADED|RELOADED|SKIPPED) [0-9a-f]{64}", outcome):
         fail("the local preprod seed loader returned an invalid outcome")
     print(f"PREPROD_LOCAL_SEED_{outcome}")
+
+
+def _custom_image_effective_alias(value: str) -> str:
+    """Return Docker's exact spelling for an omitted custom-image tag."""
+
+    final_component = value.rsplit("/", 1)[-1]
+    return value if ":" in final_component else f"{value}:latest"
+
+
+def _canonical_docker_alias(value: str) -> str:
+    """Normalize Docker Hub shorthand only for ownership comparisons."""
+
+    tagged, separator, digest = value.rpartition("@")
+    if not separator:
+        tagged = value
+        digest = ""
+    final_component = tagged.rsplit("/", 1)[-1]
+    if ":" in final_component:
+        repository, tag = tagged.rsplit(":", 1)
+        tag_suffix = f":{tag}"
+    else:
+        repository = tagged
+        tag_suffix = "" if digest else ":latest"
+    components = repository.split("/")
+    first = components[0]
+    if first == "index.docker.io":
+        components[0] = "docker.io"
+        first = "docker.io"
+    if len(components) == 1:
+        components = ["docker.io", "library", components[0]]
+    elif first == "docker.io" and len(components) == 2:
+        components.insert(1, "library")
+    elif "." not in first and ":" not in first and first != "localhost":
+        components.insert(0, "docker.io")
+    repository = "/".join(components).lower()
+    digest_suffix = f"@{digest.lower()}" if digest else ""
+    return f"{repository}{tag_suffix}{digest_suffix}"
+
+
+def _custom_alias_repository(kind: str, value: str) -> str:
+    if kind == "custom-archive-reference":
+        return value.rsplit(":", 1)[0]
+    if kind != "custom-image":
+        fail("cannot derive a repository from a non-custom clean-room alias")
+    final_component = value.rsplit("/", 1)[-1]
+    return value.rsplit(":", 1)[0] if ":" in final_component else value
+
+
+def _validate_clean_room_plan(raw: object, manifest_sha256: str) -> dict[str, Any]:
+    """Revalidate the loader's small canonical mutation plan."""
+
+    expected_keys = {
+        "groups",
+        "manifest_sha256",
+        "record_count",
+        "schema_version",
+        "unique_image_id_count",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        fail("the clean-room purge plan has an invalid top-level shape")
+    if raw.get("schema_version") != CLEAN_ROOM_PLAN_SCHEMA:
+        fail("the clean-room purge plan has an unsupported schema")
+    if raw.get("manifest_sha256") != manifest_sha256:
+        fail("the clean-room purge plan is bound to a different manifest")
+    record_count = raw.get("record_count")
+    unique_count = raw.get("unique_image_id_count")
+    groups = raw.get("groups")
+    if (
+        not isinstance(record_count, int)
+        or isinstance(record_count, bool)
+        or record_count < 1
+        or record_count > CLEAN_ROOM_MAX_RECORDS
+        or not isinstance(unique_count, int)
+        or isinstance(unique_count, bool)
+        or unique_count < 1
+        or unique_count > CLEAN_ROOM_MAX_GROUPS
+        or unique_count > record_count
+        or not isinstance(groups, list)
+        or len(groups) != unique_count
+    ):
+        fail("the clean-room purge plan counts are invalid")
+
+    group_ids: list[str] = []
+    all_alias_values: set[str] = set()
+    total_aliases = 0
+    counted_records = 0
+    for group in groups:
+        if not isinstance(group, dict) or set(group) != {"aliases", "image_id"}:
+            fail("a clean-room purge group has an invalid shape")
+        image_id = group.get("image_id")
+        aliases = group.get("aliases")
+        if not isinstance(image_id, str) or IMAGE_ID_RE.fullmatch(image_id) is None:
+            fail("a clean-room purge group has an invalid image ID")
+        if not isinstance(aliases, list) or not aliases:
+            fail("a clean-room purge group has no aliases")
+        group_ids.append(image_id)
+        parsed_aliases: list[tuple[str, str]] = []
+        by_kind: dict[str, set[str]] = {kind: set() for kind in CLEAN_ROOM_ALIAS_KINDS}
+        for alias in aliases:
+            if not isinstance(alias, dict) or set(alias) != {"kind", "value"}:
+                fail("a clean-room purge alias has an invalid shape")
+            kind = alias.get("kind")
+            value = alias.get("value")
+            if (
+                not isinstance(kind, str)
+                or kind not in CLEAN_ROOM_ALIAS_KINDS
+                or not isinstance(value, str)
+                or not value
+                or len(value) > 512
+                or value.startswith("-")
+                or any(character.isspace() or ord(character) < 32 for character in value)
+            ):
+                fail("a clean-room purge alias is unsafe")
+            canonical_value = _canonical_docker_alias(value)
+            if canonical_value in all_alias_values:
+                fail("the clean-room purge plan repeats an image alias")
+            all_alias_values.add(canonical_value)
+            by_kind[kind].add(value)
+            parsed_aliases.append((kind, value))
+        if parsed_aliases != sorted(parsed_aliases) or len(set(parsed_aliases)) != len(parsed_aliases):
+            fail("clean-room purge aliases are not canonical")
+
+        expected_custom_archives: set[str] = set()
+        for value in by_kind["custom-image"]:
+            if CUSTOM_IMAGE_REFERENCE_RE.fullmatch(value) is None:
+                fail("a clean-room custom image alias is invalid")
+            expected_custom_archives.add(
+                f"{_custom_alias_repository('custom-image', value)}:"
+                f"aigw-seed-{image_id.removeprefix('sha256:')}"
+            )
+        if (
+            by_kind["custom-archive-reference"] != expected_custom_archives
+            or any(
+                CUSTOM_TRANSFER_REFERENCE_RE.fullmatch(value) is None
+                for value in by_kind["custom-archive-reference"]
+            )
+        ):
+            fail("clean-room custom aliases are not exact derivations")
+
+        expected_external_tags: set[str] = set()
+        expected_external_digests: set[str] = set()
+        for value in by_kind["external-reference"]:
+            if EXTERNAL_IMAGE_REFERENCE_RE.fullmatch(value) is None:
+                fail("a clean-room external image alias is invalid")
+            tagged, digest = value.rsplit("@", 1)
+            expected_external_tags.add(tagged)
+            expected_external_digests.add(f"{tagged.rsplit(':', 1)[0]}@{digest}")
+        if (
+            by_kind["external-tag"] != expected_external_tags
+            or by_kind["external-repository-digest"] != expected_external_digests
+            or any(
+                REPOSITORY_DIGEST_RE.fullmatch(value) is None
+                for value in by_kind["external-repository-digest"]
+            )
+        ):
+            fail("clean-room external aliases are not exact derivations")
+        custom_records = len(by_kind["custom-image"])
+        external_records = len(by_kind["external-reference"])
+        if custom_records + external_records < 1:
+            fail("a clean-room purge group has no release record")
+        counted_records += custom_records + external_records
+        total_aliases += len(parsed_aliases)
+
+    if group_ids != sorted(group_ids) or len(set(group_ids)) != len(group_ids):
+        fail("clean-room purge groups are not canonical")
+    if counted_records != record_count or total_aliases > CLEAN_ROOM_MAX_ALIASES:
+        fail("clean-room purge plan record accounting is invalid")
+    return raw
+
+
+def clean_room_purge_plan(args: argparse.Namespace) -> dict[str, Any]:
+    """Ask the read-only loader to validate and plan one exact preprod release."""
+
+    if os.geteuid() == ROOT_UID:
+        fail("clean-room seed removal must run as the non-root Docker operator")
+    endpoint = validate_local_docker_context()
+    loader = REPO_ROOT / "scripts/load-offline-image-seed.py"
+    result = run(
+        [
+            sys.executable,
+            "-I",
+            str(loader),
+            "local-preprod-purge-plan",
+            str(Path(args.archive).resolve()),
+            args.archive_sha256,
+            str(Path(args.manifest).resolve()),
+            args.manifest_sha256,
+            str(REPO_ROOT.resolve()),
+            endpoint,
+        ],
+        capture=True,
+    )
+    output = result.stdout
+    if not output.endswith("\n") or output.count("\n") != 1 or len(output.encode()) > CLEAN_ROOM_MAX_PLAN_BYTES:
+        fail("the clean-room purge planner returned an unbounded response")
+    try:
+        document = json.loads(output)
+    except json.JSONDecodeError:
+        fail("the clean-room purge planner returned invalid JSON")
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    if output != canonical:
+        fail("the clean-room purge planner response is not canonical")
+    return _validate_clean_room_plan(document, args.manifest_sha256)
+
+
+def _clean_room_command_result(
+    result: subprocess.CompletedProcess[str], operation: str
+) -> str:
+    if result.returncode != 0:
+        fail(f"Docker failed during clean-room {operation}")
+    if result.stderr:
+        fail(f"Docker returned unexpected diagnostics during clean-room {operation}")
+    return result.stdout
+
+
+def _clean_room_list(
+    kind: str, *arguments: str, deduplicate: bool = False
+) -> list[str]:
+    output = _clean_room_command_result(
+        clean_room_docker(kind, "ls", *arguments), f"{kind} inventory"
+    )
+    values = output.splitlines()
+    if len(values) > CLEAN_ROOM_MAX_DOCKER_OBJECTS:
+        fail(f"the clean-room {kind} inventory is invalid")
+    if any(not value or len(value) > 512 for value in values):
+        fail(f"the clean-room {kind} inventory contains an invalid value")
+    if len(values) != len(set(values)):
+        if not deduplicate:
+            fail(f"the clean-room {kind} inventory repeats an object")
+        values = list(dict.fromkeys(values))
+    return values
+
+
+def _clean_room_network_inventory() -> list[tuple[str, str, dict[str, Any]]]:
+    """Bind each listed network's full ID to its inspected name and settings."""
+
+    networks: list[tuple[str, str, dict[str, Any]]] = []
+    names: set[str] = set()
+    for network_id in _clean_room_list("network", "--no-trunc", "--quiet"):
+        if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+            fail("Docker returned an invalid full network ID")
+        document = _clean_room_inspect_required("network", network_id)
+        if document.get("Id") != network_id:
+            fail("a clean-room network inspection changed identity")
+        name = document.get("Name")
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 512
+            or name.startswith("-")
+            or any(character.isspace() or ord(character) < 32 for character in name)
+            or name in names
+        ):
+            fail("a clean-room network has an invalid or duplicate name")
+        names.add(name)
+        networks.append((network_id, name, document))
+    return networks
+
+
+def _clean_room_inspect_required(kind: str, value: str) -> dict[str, Any]:
+    output = _clean_room_command_result(
+        clean_room_docker(kind, "inspect", "--format", "{{json .}}", value),
+        f"{kind} inspection",
+    )
+    if len(output.encode()) > 1024 * 1024 or output.count("\n") > 1:
+        fail(f"the clean-room {kind} inspection was unbounded")
+    try:
+        document = json.loads(output)
+    except json.JSONDecodeError:
+        fail(f"Docker returned invalid clean-room {kind} inspection JSON")
+    if not isinstance(document, dict):
+        fail(f"Docker returned an invalid clean-room {kind} inspection")
+    return document
+
+
+def _expected_image_not_found_subject(value: str, kind: str | None) -> str:
+    if kind == "custom-image":
+        return _custom_image_effective_alias(value)
+    return value
+
+
+def _is_exact_image_not_found(
+    result: subprocess.CompletedProcess[str], value: str, kind: str | None
+) -> bool:
+    expected = _expected_image_not_found_subject(value, kind)
+    return (
+        result.returncode == 1
+        and result.stdout in {"", "\n"}
+        and result.stderr == f"Error response from daemon: No such image: {expected}\n"
+    )
+
+
+def _clean_room_inspect_image_optional(
+    value: str, kind: str | None = None
+) -> dict[str, Any] | None:
+    result = clean_room_docker(
+        "image", "inspect", "--format", "{{json .}}", value
+    )
+    if _is_exact_image_not_found(result, value, kind):
+        return None
+    return _clean_room_inspect_required_result(result, "image inspection")
+
+
+def _clean_room_inspect_required_result(
+    result: subprocess.CompletedProcess[str], operation: str
+) -> dict[str, Any]:
+    output = _clean_room_command_result(result, operation)
+    if len(output.encode()) > 1024 * 1024 or output.count("\n") > 1:
+        fail(f"the clean-room {operation} was unbounded")
+    try:
+        document = json.loads(output)
+    except json.JSONDecodeError:
+        fail(f"Docker returned invalid clean-room {operation} JSON")
+    if not isinstance(document, dict):
+        fail(f"Docker returned an invalid clean-room {operation}")
+    return document
+
+
+def _clean_room_image_aliases(document: dict[str, Any]) -> set[str]:
+    aliases: set[str] = set()
+    for field in ("RepoTags", "RepoDigests"):
+        values = document.get(field) or []
+        if not isinstance(values, list):
+            fail(f"Docker image {field} is invalid during clean-room inspection")
+        for value in values:
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > 512
+                or value.startswith("-")
+                or any(character.isspace() or ord(character) < 32 for character in value)
+            ):
+                fail("Docker exposed an unsafe image alias during clean-room inspection")
+            aliases.add(value)
+    return aliases
+
+
+def collect_clean_room_inventory(plan: dict[str, Any]) -> dict[str, Any]:
+    """Inspect every container and image before any clean-room mutation."""
+
+    target_groups = {group["image_id"]: group for group in plan["groups"]}
+    target_ids = set(target_groups)
+    container_ids = _clean_room_list(
+        "container", "--all", "--no-trunc", "--quiet"
+    )
+    containers: dict[str, dict[str, Any]] = {}
+    for container_id in container_ids:
+        if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+            fail("Docker returned an invalid full container ID")
+        document = _clean_room_inspect_required("container", container_id)
+        if document.get("Id") != container_id:
+            fail("a clean-room container inspection changed identity")
+        containers[container_id] = document
+
+    image_ids = _clean_room_list(
+        "image", "--all", "--no-trunc", "--quiet", deduplicate=True
+    )
+    images: dict[str, dict[str, Any]] = {}
+    observed_alias_owners: dict[str, str] = {}
+    exposed_children: set[str] = set()
+    for image_id in image_ids:
+        if IMAGE_ID_RE.fullmatch(image_id) is None:
+            fail("Docker returned an invalid full image ID")
+        document = _clean_room_inspect_required("image", image_id)
+        if document.get("Id") != image_id:
+            fail("a clean-room image inspection changed identity")
+        descriptor = document.get("Descriptor")
+        if descriptor is not None:
+            if not isinstance(descriptor, dict):
+                fail("Docker exposed invalid OCI descriptor metadata")
+            descriptor_digest = descriptor.get("digest")
+            if descriptor_digest is not None:
+                if (
+                    not isinstance(descriptor_digest, str)
+                    or IMAGE_ID_RE.fullmatch(descriptor_digest) is None
+                ):
+                    fail("Docker exposed an invalid OCI descriptor digest")
+                if descriptor_digest != image_id:
+                    if image_id in target_ids or descriptor_digest in target_ids:
+                        fail("an OCI descriptor digest differs from a clean-room target ID")
+                    exposed_children.add(descriptor_digest)
+        manifests = document.get("Manifests")
+        if manifests is not None:
+            if not isinstance(manifests, list):
+                fail("Docker exposed invalid OCI index children")
+            for manifest in manifests:
+                child = manifest.get("digest") if isinstance(manifest, dict) else None
+                if not isinstance(child, str) or IMAGE_ID_RE.fullmatch(child) is None:
+                    fail("Docker exposed an invalid OCI platform-child ID")
+                if child != image_id:
+                    exposed_children.add(child)
+        for alias in _clean_room_image_aliases(document):
+            canonical_alias = _canonical_docker_alias(alias)
+            owner = observed_alias_owners.get(canonical_alias)
+            if owner is not None and owner != image_id:
+                fail("Docker assigned one image alias to multiple image IDs")
+            observed_alias_owners[canonical_alias] = image_id
+        images[image_id] = document
+
+    approved_observed: dict[str, set[str]] = {}
+    present_aliases: list[tuple[str, str, str]] = []
+    generated_aliases: list[tuple[str, str, str]] = []
+    for image_id, group in target_groups.items():
+        approved = set()
+        generated_digests = {
+            f"{_custom_alias_repository(alias['kind'], alias['value'])}@{image_id}"
+            for alias in group["aliases"]
+            if alias["kind"] in {"custom-archive-reference", "custom-image"}
+        }
+        for alias in group["aliases"]:
+            value = alias["value"]
+            kind = alias["kind"]
+            effective = (
+                _custom_image_effective_alias(value)
+                if kind == "custom-image"
+                else value
+            )
+            canonical_effective = _canonical_docker_alias(effective)
+            approved.add(canonical_effective)
+            observed_owner = observed_alias_owners.get(canonical_effective)
+            if observed_owner is not None and observed_owner != image_id:
+                fail("a reviewed clean-room alias points to a foreign image ID")
+            resolved = _clean_room_inspect_image_optional(value, kind)
+            if resolved is not None:
+                resolved_id = resolved.get("Id")
+                if resolved_id != image_id:
+                    fail("a reviewed clean-room alias resolves to a foreign image ID")
+                present_aliases.append((image_id, kind, value))
+        for value in sorted(generated_digests):
+            canonical_value = _canonical_docker_alias(value)
+            approved.add(canonical_value)
+            observed_owner = observed_alias_owners.get(canonical_value)
+            if observed_owner is not None and observed_owner != image_id:
+                fail("a generated custom digest alias points to a foreign image ID")
+            resolved = _clean_room_inspect_image_optional(
+                value, "custom-generated-repository-digest"
+            )
+            if resolved is not None:
+                if resolved.get("Id") != image_id:
+                    fail("a generated custom digest alias resolves to a foreign image ID")
+                generated_aliases.append(
+                    (image_id, "custom-generated-repository-digest", value)
+                )
+        approved_observed[image_id] = approved
+
+        if image_id not in images:
+            resolved = _clean_room_inspect_image_optional(image_id)
+            if resolved is not None:
+                fail("Docker omitted a target image from its complete image inventory")
+
+    for image_id in target_ids.intersection(images):
+        if not any(
+            entry[0] == image_id for entry in present_aliases + generated_aliases
+        ):
+            fail("a clean-room target ID exists without a reviewed alias binding")
+        foreign = {
+            _canonical_docker_alias(value)
+            for value in _clean_room_image_aliases(images[image_id])
+        } - approved_observed[image_id]
+        if foreign:
+            fail("a clean-room target image has an unreviewed Docker alias")
+
+    for child in exposed_children:
+        if child in target_ids:
+            fail("an OCI platform child overlaps a distinct clean-room target ID")
+        if child not in images:
+            resolved = _clean_room_inspect_image_optional(child)
+            if resolved is not None:
+                fail("Docker omitted an exposed OCI platform child from image inventory")
+
+    for document in containers.values():
+        image_id = document.get("Image")
+        if not isinstance(image_id, str) or IMAGE_ID_RE.fullmatch(image_id) is None:
+            fail("a Docker container has an invalid image ID")
+        if image_id not in target_ids:
+            continue
+        name = str(document.get("Name", "")).removeprefix("/")
+        labels = document.get("Config", {}).get("Labels") or {}
+        if (
+            not isinstance(labels, dict)
+            or labels.get("com.docker.compose.project") != ALLOWED_PROJECT
+            or labels.get("com.aigw.preprod.project") != ALLOWED_PROJECT
+            or not name.startswith(ALLOWED_PROJECT + "-")
+        ):
+            fail("an unrelated running or stopped container uses a clean-room target image")
+
+    return {
+        "containers": containers,
+        "images": images,
+        "non_target_ids": set(images) - target_ids,
+        "generated_aliases": generated_aliases,
+        "present_aliases": present_aliases,
+        "present_target_ids": target_ids.intersection(images),
+        "target_ids": target_ids,
+    }
 
 
 def ensure_directory(path: Path, mode: int = 0o700) -> None:
@@ -1019,6 +1566,9 @@ static_resources:
           \"@type\": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
           sni: {hostname}
           common_tls_context:
+            tls_params:
+              tls_minimum_protocol_version: TLSv1_3
+              tls_maximum_protocol_version: TLSv1_3
             validation_context:
               trusted_ca: {{ filename: /etc/envoy/certs/preprod-root-ca.pem }}
               match_typed_subject_alt_names:
@@ -1026,6 +1576,34 @@ static_resources:
                   matcher: {{ exact: {hostname} }}
 """
     write_file(SECRETS_DIR / "preprod-wif-envoy.yaml", configuration, 0o644)
+
+
+def render_preprod_litellm_config() -> None:
+    """Keep production models while routing test inference to the TLS mock."""
+
+    source = COMPOSE_DIR / "litellm/config.yaml"
+    try:
+        configuration = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        fail(f"cannot read the production LiteLLM config: {exc}")
+
+    production_base = "api_base: http://envoy-egress:8080/anthropic"
+    preprod_base = "api_base: http://wif-egress-mock:8080/anthropic"
+    api_base_lines = [
+        line.strip()
+        for line in configuration.splitlines()
+        if line.strip().startswith("api_base:")
+    ]
+    if not api_base_lines or any(line != production_base for line in api_base_lines):
+        fail(
+            "the production LiteLLM provider routes changed; update the explicit "
+            "preprod renderer"
+        )
+
+    rendered = configuration.replace(production_base, preprod_base)
+    if production_base in rendered or rendered.count(preprod_base) != len(api_base_lines):
+        fail("the preprod LiteLLM provider routes were not rendered exactly")
+    write_file(SECRETS_DIR / "preprod-litellm-config.yaml", rendered, 0o644)
 
 
 def render_edge_forwarder() -> None:
@@ -1230,7 +1808,9 @@ def prepare(args: argparse.Namespace) -> None:
     ensure_directory(EDGE_CERTS_DIR)
     prepare_certificates(args.domain)
     render_realms(args.domain)
-    render_wif_mock_envoy(args.domain, f"172.{args.subnet_octet}.7.0")
+    vendor_subnet = desired_networks(args)[f"{args.prefix}-net-vendor"][0]
+    render_wif_mock_envoy(args.domain, vendor_subnet)
+    render_preprod_litellm_config()
     render_edge_forwarder()
     write_file(SECRETS_DIR / "preprod-samba-admin-password", "OnlyForTesting1!DomainAdmin\n", 0o600, replace=False)
     write_file(SECRETS_DIR / "preprod-samba-bind-password", "OnlyForTesting1!LdapBind\n", 0o600, replace=False)
@@ -1239,14 +1819,14 @@ def prepare(args: argparse.Namespace) -> None:
     write_file(SECRETS_DIR / "samba_user_preprod-user_password", "OnlyForTesting1!PreprodUser\n", 0o600, replace=False)
     redis_password = static_hex("redis")
     redis_password_hash = hashlib.sha256(redis_password.encode()).hexdigest()
-    # These values are fixed, local test credentials. Mode 0644 lets the
-    # image's fixed non-root user read the two exact bind-mounted files on
-    # Linux as well as Docker Desktop.
-    write_file(SECRETS_DIR / "redis_password", redis_password + "\n", 0o644)
+    # These values are fixed, local test credentials. Local preprod runs Redis
+    # as the recorded checkout owner, so Docker Desktop can bind these files
+    # without making the password readable by other users.
+    write_file(SECRETS_DIR / "redis_password", redis_password + "\n", 0o600)
     write_file(
         SECRETS_DIR / "redis_users.acl",
         f"user default reset on #{redis_password_hash} ~* &* +@all\n",
-        0o644,
+        0o600,
     )
     jwks_path = SECRETS_DIR / "preprod-wif-jwks.json"
     if not jwks_path.exists():
@@ -1822,7 +2402,16 @@ def verify_seed_images(args: argparse.Namespace) -> None:
 def desired_networks(args: argparse.Namespace) -> dict[str, tuple[str, bool]]:
     result = {}
     for suffix, (index, internal) in NETWORKS.items():
-        result[f"{args.prefix}-{suffix}"] = (f"172.{args.subnet_octet}.{index}.0/24", internal)
+        # The exact production Envoy image admits only the reviewed production
+        # vendor CIDR. Preprod uses that one CIDR so it tests the immutable
+        # image and its firewall ABI; every other namespaced network stays on
+        # the separate 172.29 test range.
+        subnet = (
+            PRODUCTION_VENDOR_SUBNET
+            if suffix == "net-vendor"
+            else f"172.{args.subnet_octet}.{index}.0/24"
+        )
+        result[f"{args.prefix}-{suffix}"] = (subnet, internal)
     return result
 
 
@@ -2048,8 +2637,12 @@ def vault_call(
         request["token"] = token
     result = compose(
         args,
-        "run", "--rm", "--no-deps", "-T", "--entrypoint", "/opt/venv/bin/python",
-        "key-rotator", "-c", VAULT_HTTP_HELPER,
+        # Compose v5.3 no longer forwards piped stdin to `compose run`, even
+        # with --interactive. The stack start gate already proves this
+        # container is running, so exec keeps the secret-bearing request on
+        # stdin without creating a second container.
+        "exec", "-T", "key-rotator", "/opt/venv/bin/python", "-c",
+        VAULT_HTTP_HELPER,
         input_text=json.dumps(request, separators=(",", ":")),
         capture=True,
         sensitive=True,
@@ -2488,6 +3081,212 @@ def replace_hosts_block(install: bool) -> None:
     print("PREPROD_HOSTS_INSTALLED" if install else "PREPROD_HOSTS_REMOVED")
 
 
+def _clean_room_source_args(args: argparse.Namespace) -> argparse.Namespace:
+    values = vars(args).copy()
+    values["image_mode"] = "source"
+    return argparse.Namespace(**values)
+
+
+def _validate_clean_room_generated_state() -> int:
+    """Validate every generated seed-state file before another mutation begins."""
+
+    allowed_owners = {(0, 0), (os.geteuid(), os.getegid())}
+    count = 0
+    for path, expected_mode in (
+        (SEED_RECEIPT, 0o644),
+        (SEED_OVERLAY, 0o644),
+        (VAULT_INIT_FILE, 0o600),
+    ):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+            or (metadata.st_uid, metadata.st_gid) not in allowed_owners
+        ):
+            fail(f"refusing unsafe generated clean-room state file {path}")
+        count += 1
+    return count
+
+
+def preflight_clean_room_resources(
+    args: argparse.Namespace, inventory: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate the complete project resource boundary before compose mutates it."""
+
+    source_args = _clean_room_source_args(args)
+    expected_volumes: set[str] = set()
+    if ENV_FILE.exists():
+        model = rendered_compose_model(source_args)
+        expected_volumes = verify_rendered_resource_ownership(source_args, model)
+        verify_existing_project_boundary(source_args, expected_volumes)
+
+    owned_container_ids: set[str] = set()
+    for container_id, document in inventory["containers"].items():
+        name = str(document.get("Name", "")).removeprefix("/")
+        labels = document.get("Config", {}).get("Labels") or {}
+        if not isinstance(labels, dict):
+            fail("a clean-room container has invalid labels")
+        compose_project = labels.get("com.docker.compose.project")
+        owner = labels.get("com.aigw.preprod.project")
+        belongs = (
+            compose_project == args.project
+            or owner == args.project
+            or name.startswith(args.project + "-")
+        )
+        if not belongs:
+            continue
+        if (
+            compose_project != args.project
+            or owner != args.project
+            or not name.startswith(args.project + "-")
+            or not ENV_FILE.exists()
+        ):
+            fail("refusing a container outside the exact clean-room project boundary")
+        owned_container_ids.add(container_id)
+
+    owned_volumes: set[str] = set()
+    for volume_name in _clean_room_list("volume", "--format", "{{.Name}}"):
+        document = _clean_room_inspect_required("volume", volume_name)
+        if document.get("Name") != volume_name:
+            fail("a clean-room volume inspection changed identity")
+        labels = document.get("Labels") or {}
+        if not isinstance(labels, dict):
+            fail("a clean-room volume has invalid labels")
+        compose_project = labels.get("com.docker.compose.project")
+        owner = labels.get("com.aigw.preprod.project")
+        belongs = (
+            volume_name in expected_volumes
+            or compose_project == args.project
+            or owner == args.project
+            or volume_name.startswith(args.project + "_")
+        )
+        if not belongs:
+            continue
+        if (
+            volume_name not in expected_volumes
+            or compose_project != args.project
+            or owner != args.project
+            or document.get("Driver") != "local"
+            or document.get("Scope") != "local"
+        ):
+            fail("refusing a volume outside the exact clean-room project boundary")
+        owned_volumes.add(volume_name)
+
+    desired = desired_networks(source_args)
+    owned_networks: set[str] = set()
+    for _network_id, network_name, document in _clean_room_network_inventory():
+        labels = document.get("Labels") or {}
+        if not isinstance(labels, dict):
+            fail("a clean-room network has invalid labels")
+        owner = labels.get("com.aigw.preprod.project")
+        belongs = (
+            network_name in desired
+            or owner == args.project
+            or network_name.startswith(args.prefix + "-")
+        )
+        endpoints = document.get("Containers") or {}
+        if not isinstance(endpoints, dict):
+            fail("a clean-room network has invalid endpoint metadata")
+        if not belongs:
+            if set(endpoints).intersection(owned_container_ids):
+                fail("a preprod container is attached to an unrelated Docker network")
+            continue
+        if network_name not in desired or owner != args.project:
+            fail("refusing a network outside the exact clean-room project boundary")
+        subnet, internal = desired[network_name]
+        actual_subnets = network_subnets(document)
+        allowed_subnets = {subnet}
+        if network_name == f"{args.prefix}-net-vendor":
+            allowed_subnets.add(LEGACY_PREPROD_VENDOR_SUBNET)
+        actual_subnet = actual_subnets[0] if len(actual_subnets) == 1 else ""
+        if (
+            document.get("Driver") != "bridge"
+            or document.get("Scope") != "local"
+            or bool(document.get("Internal")) is not internal
+            or actual_subnet not in allowed_subnets
+            or network_ip_ranges(document) != [dynamic_ip_range(actual_subnet)]
+        ):
+            fail("refusing a clean-room network with unexpected settings")
+        if not set(endpoints).issubset(owned_container_ids):
+            fail("a clean-room network has an unrelated container endpoint")
+        owned_networks.add(network_name)
+
+    return {
+        "containers": owned_container_ids,
+        "volumes": owned_volumes,
+        "networks": owned_networks,
+        "generated_state_files": _validate_clean_room_generated_state(),
+        "source_args": source_args,
+    }
+
+
+def prove_clean_room_resource_absence(args: argparse.Namespace) -> None:
+    """Prove no container, volume, network, or seed activation state remains."""
+
+    for container_id in _clean_room_list(
+        "container", "--all", "--no-trunc", "--quiet"
+    ):
+        document = _clean_room_inspect_required("container", container_id)
+        name = str(document.get("Name", "")).removeprefix("/")
+        labels = document.get("Config", {}).get("Labels") or {}
+        if (
+            isinstance(labels, dict)
+            and (
+                labels.get("com.docker.compose.project") == args.project
+                or labels.get("com.aigw.preprod.project") == args.project
+            )
+        ) or name.startswith(args.project + "-"):
+            fail("a preprod container remains after clean-room resource removal")
+    for value in _clean_room_list("volume", "--format", "{{.Name}}"):
+        document = _clean_room_inspect_required("volume", value)
+        labels = document.get("Labels") or {}
+        if (
+            isinstance(labels, dict)
+            and (
+                labels.get("com.docker.compose.project") == args.project
+                or labels.get("com.aigw.preprod.project") == args.project
+            )
+        ) or value.startswith(args.project + "_"):
+            fail("a preprod volume remains after clean-room resource removal")
+    for _network_id, value, document in _clean_room_network_inventory():
+        labels = document.get("Labels") or {}
+        if (
+            isinstance(labels, dict)
+            and (
+                labels.get("com.docker.compose.project") == args.project
+                or labels.get("com.aigw.preprod.project") == args.project
+            )
+        ) or value.startswith(args.project + "-"):
+            fail("a preprod network remains after clean-room resource removal")
+    for path in (SEED_RECEIPT, SEED_OVERLAY, VAULT_INIT_FILE):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        fail(f"generated preprod state remains after clean-room removal: {path}")
+
+
+def prove_clean_room_target_images_unused(target_ids: set[str]) -> None:
+    """Close the post-destroy container race before the first alias removal."""
+
+    for container_id in _clean_room_list(
+        "container", "--all", "--no-trunc", "--quiet"
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+            fail("Docker returned an invalid post-destroy container ID")
+        document = _clean_room_inspect_required("container", container_id)
+        image_id = document.get("Image")
+        if not isinstance(image_id, str) or IMAGE_ID_RE.fullmatch(image_id) is None:
+            fail("a post-destroy Docker container has an invalid image ID")
+        if image_id in target_ids:
+            fail("a container appeared using a clean-room target image after destroy")
+
+
 def remove_seed_output_files() -> None:
     """Remove only generated seed files after proving their exact boundaries."""
 
@@ -2524,13 +3323,27 @@ def remove_seed_output_files() -> None:
         fail(f"generated seed file still exists after cleanup: {path}")
 
 
-def destroy(args: argparse.Namespace) -> None:
-    check_context(args)
+def _destroy_project_resources(
+    args: argparse.Namespace, *, emit_context: bool, emit_receipt: bool
+) -> None:
+    quiet = not emit_context and not emit_receipt
+    if emit_context:
+        check_context(args)
+    else:
+        validate_local_docker_context()
     if ENV_FILE.exists():
         model = rendered_compose_model(args)
         expected_volume_names = verify_rendered_resource_ownership(args, model)
         verify_existing_project_boundary(args, expected_volume_names)
-        compose(args, "down", "--volumes", "--remove-orphans", "--timeout", "30")
+        compose(
+            args,
+            "down",
+            "--volumes",
+            "--remove-orphans",
+            "--timeout",
+            "30",
+            capture=quiet,
+        )
     existing_names = set(
         docker("network", "ls", "--format", "{{.Name}}", capture=True).stdout.splitlines()
     )
@@ -2542,12 +3355,134 @@ def destroy(args: argparse.Namespace) -> None:
         labels = document.get("Labels") or {}
         if labels.get("com.aigw.preprod.project") != args.project:
             fail(f"refusing to remove network {name} because its ownership label differs")
-        docker("network", "rm", name)
+        docker("network", "rm", name, capture=quiet)
     remove_seed_output_files()
     for path in (VAULT_INIT_FILE,):
         if path.exists():
             path.unlink()
-    print("PREPROD_DESTROYED_CA_PRESERVED")
+    if emit_receipt:
+        print("PREPROD_DESTROYED_CA_PRESERVED")
+
+
+def destroy(args: argparse.Namespace) -> None:
+    _destroy_project_resources(args, emit_context=True, emit_receipt=True)
+
+
+def _remove_clean_room_image_reference(value: str, kind: str | None) -> bool:
+    """Remove one exact alias or ID, allowing only its exact not-found result."""
+
+    result = clean_room_docker("image", "rm", "--no-prune", value)
+    if result.returncode == 0:
+        if result.stderr:
+            fail("Docker returned diagnostics while removing a clean-room image")
+        return True
+    if _is_exact_image_not_found(result, value, kind):
+        return False
+    fail("Docker failed while removing an exact clean-room image reference")
+
+
+def remove_clean_room_images(
+    plan: dict[str, Any], inventory: dict[str, Any]
+) -> dict[str, int]:
+    """Remove approved aliases first, then only their alias-proven image IDs."""
+
+    alias_bound_ids = {
+        entry[0]
+        for entry in inventory["present_aliases"] + inventory["generated_aliases"]
+    }
+    removed_aliases = 0
+    for group in plan["groups"]:
+        image_id = group["image_id"]
+        for alias in group["aliases"]:
+            kind = alias["kind"]
+            value = alias["value"]
+            resolved = _clean_room_inspect_image_optional(value, kind)
+            if resolved is None:
+                continue
+            if resolved.get("Id") != image_id:
+                fail("a clean-room alias changed image ID before removal")
+            _remove_clean_room_image_reference(value, kind)
+            removed_aliases += 1
+
+    for image_id, kind, value in sorted(inventory["generated_aliases"]):
+        resolved = _clean_room_inspect_image_optional(value, kind)
+        if resolved is None:
+            continue
+        if resolved.get("Id") != image_id:
+            fail("a generated custom digest alias changed image ID before removal")
+        _remove_clean_room_image_reference(value, kind)
+        removed_aliases += 1
+
+    removed_ids = len(inventory["present_target_ids"])
+    for image_id in sorted(inventory["present_target_ids"]):
+        if image_id not in alias_bound_ids:
+            fail("refusing to remove a clean-room image ID without an alias proof")
+        resolved = _clean_room_inspect_image_optional(image_id)
+        if resolved is None:
+            continue
+        if resolved.get("Id") != image_id:
+            fail("a clean-room target image changed identity before removal")
+        if _clean_room_image_aliases(resolved):
+            fail("a clean-room target image gained an unreviewed alias before ID removal")
+        _remove_clean_room_image_reference(image_id, None)
+    return {"aliases": removed_aliases, "image_ids": removed_ids}
+
+
+def prove_clean_room_image_absence(
+    plan: dict[str, Any], inventory: dict[str, Any]
+) -> None:
+    """Prove every target is absent and every snapshotted non-target survives."""
+
+    for group in plan["groups"]:
+        for alias in group["aliases"]:
+            if _clean_room_inspect_image_optional(
+                alias["value"], alias["kind"]
+            ) is not None:
+                fail("a reviewed clean-room image alias remains after removal")
+        if _clean_room_inspect_image_optional(group["image_id"]) is not None:
+            fail("a clean-room target image ID remains after removal")
+    for _image_id, kind, value in inventory["generated_aliases"]:
+        if _clean_room_inspect_image_optional(value, kind) is not None:
+            fail("a generated custom digest alias remains after removal")
+    for image_id in sorted(inventory["non_target_ids"]):
+        document = _clean_room_inspect_image_optional(image_id)
+        if document is None or document.get("Id") != image_id:
+            fail("a non-target image ID did not survive clean-room removal")
+
+
+def clean_room_seed(args: argparse.Namespace) -> None:
+    """Destroy one exact preprod deployment and only its planned release images."""
+
+    if args.confirm != CLEAN_ROOM_CONFIRMATION:
+        fail(f"clean-room seed removal requires {CLEAN_ROOM_CONFIRMATION}")
+    plan = clean_room_purge_plan(args)
+    inventory = collect_clean_room_inventory(plan)
+    resources = preflight_clean_room_resources(args, inventory)
+
+    _destroy_project_resources(
+        resources["source_args"], emit_context=False, emit_receipt=False
+    )
+    prove_clean_room_resource_absence(args)
+    prove_clean_room_target_images_unused(inventory["target_ids"])
+    removed = remove_clean_room_images(plan, inventory)
+    prove_clean_room_image_absence(plan, inventory)
+
+    receipt = {
+        "manifest_sha256": args.manifest_sha256,
+        "preserved_image_ids": len(inventory["non_target_ids"]),
+        "project": args.project,
+        "removed_aliases": removed["aliases"],
+        "removed_containers": len(resources["containers"]),
+        "removed_generated_state_files": resources["generated_state_files"],
+        "removed_image_ids": removed["image_ids"],
+        "removed_networks": len(resources["networks"]),
+        "removed_volumes": len(resources["volumes"]),
+        "schema_version": CLEAN_ROOM_RECEIPT_SCHEMA,
+    }
+    output = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    if len(output.encode()) > 1024:
+        fail("the clean-room receipt exceeded its output bound")
+    print(f"PREPROD_CLEAN_ROOM_OK {output}")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2588,6 +3523,12 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("remove-hosts")
     commands.add_parser("ensure-loopback-aliases")
     commands.add_parser("remove-loopback-aliases")
+    clean_room_parser = commands.add_parser("clean-room-seed")
+    clean_room_parser.add_argument("--archive", required=True)
+    clean_room_parser.add_argument("--archive-sha256", required=True)
+    clean_room_parser.add_argument("--manifest", required=True)
+    clean_room_parser.add_argument("--manifest-sha256", required=True)
+    clean_room_parser.add_argument("--confirm", required=True)
     commands.add_parser("destroy")
     return result
 
@@ -2617,6 +3558,7 @@ def main() -> int:
         "remove-hosts": lambda _: replace_hosts_block(False),
         "ensure-loopback-aliases": ensure_loopback_aliases,
         "remove-loopback-aliases": remove_loopback_aliases,
+        "clean-room-seed": clean_room_seed,
         "destroy": destroy,
     }
     actions[args.command](args)

@@ -10,9 +10,15 @@ local.
 > **Release gate:** Do not enable a real Cribl endpoint until automated tests
 > prove this allow-list. A healthy TLS connection does not prove the data scope.
 
+> **Queue-age limit:** Alloy has a 24-hour retry window but no hard per-record
+> queue TTL. If the data owner requires proof that no queued record can exceed
+> 24 hours before delivery, production cutover remains blocked until the
+> exporter can enforce and test that rule.
+
 Related pages:
 
 - [Observability operations](observability-operations.md)
+- [Security model](security-model.md#local-operations-data-and-the-soc-feed)
 - [Network security](network-security.md)
 - [Container security](docker-security.md)
 - [Architecture diagrams](architecture-diagrams.md#9-telemetry-and-soc-log-flow)
@@ -34,7 +40,7 @@ Related pages:
 | Source seen on the physical network | The gateway internal-leg host IP |
 | Host path | Internal NIC only, to one approved Cribl `/32` and TCP port |
 | Cribl retention | 24 hours |
-| Gateway outage buffer | Persistent and bounded to no more than 24 hours |
+| Gateway outage buffer | Persistent 2 GiB cap; 24-hour retry window after dequeue; no hard per-record age limit |
 
 The endpoint uses a literal IP because Alloy has no permission to query an
 external DNS resolver. The separate server name must match a SAN in the Cribl
@@ -109,6 +115,10 @@ Allowed records are:
 A startup record must carry the immutable policy digest, selected provider
 names, reviewed CA SHA-256 fingerprints, and final Envoy image ID. It must not
 carry certificate private material or an arbitrary upstream hostname.
+
+Today the structured marker path admits only the `startup_gate` action shown
+below. The other trust failures remain design requirements until a reviewed
+emitter and receipt test exist. Do not claim that they reach Cribl yet.
 
 ### 4. Key, Vault, directory, and security-gate events
 
@@ -210,20 +220,22 @@ Alloy keeps the local routes separate from the Cribl route:
 |---|---|---|
 | Service and security logs | Alloy to Loki | 7 days |
 | AI request audit | Alloy to Loki as `service_name="aigw-requests"` | 7 days |
-| Service and host metrics | Prometheus | 30 days and a size cap; the first limit reached wins |
+| Service and host metrics | Prometheus | 30 days and 5 GB; the first limit reached wins |
 | Dashboards | Grafana reads Loki, Prometheus, and LiteLLM spend data | Grafana is not a retention store |
 | Alerts | Prometheus evaluates rules today; local Alertmanager and the Grafana lifecycle view remain backlog work | No external notification receiver in the approved design |
 | Raw traces | No local trace store | Never sent to Cribl |
 
-Prometheus must be sized so its byte cap can hold 30 days of measured traffic.
-A `30d` time setting alone is not proof. Record actual disk growth and leave
-headroom for compaction and incident spikes.
+Prometheus currently has a 5 GB byte cap. A `30d` time setting alone is not
+proof that 30 days will fit. Record actual disk growth and leave headroom for
+compaction and incident spikes. Change the reviewed Compose release if the cap
+is too small.
 
-Local alerts must cover exporter send failures, retry activity, queue use,
-queue overflow, dropped records, and recovery. Warning alerts give the operator
-time to act. Critical alerts mean the route has failed badly. Local
-Alertmanager grouping and the Grafana lifecycle view remain backlog work.
-The approved design has no e-mail, Slack, Teams, webhook, or Cribl receiver.
+Current local rules cover sustained exporter send failure, enqueue loss, and
+queue use above 80 percent. They also protect the local Loki, Prometheus, and
+filesystem paths. A reliable per-record queue-age signal does not exist.
+Local Alertmanager grouping and the Grafana firing/resolved lifecycle view
+remain backlog work. The approved design has no e-mail, Slack, Teams, webhook,
+or Cribl alert receiver.
 
 ## Cribl source setup
 
@@ -241,7 +253,10 @@ The Cribl team owns these steps. Cribl's current source page calls this an
 7. Route only the reviewed class and structured-event pairs on this page.
 8. Drop and alert on a metric, trace, unknown dataset, or malformed record.
 9. Send accepted records to a destination with exactly 24 hours of retention.
-10. Give the gateway team the worker IP, port, server name, CA fingerprint,
+10. Confirm whether retention is measured from Cribl ingest time or the source
+    event time. If policy is based on event age, add and test a Cribl-side drop
+    for records that already exceed that age.
+11. Give the gateway team the worker IP, port, server name, CA fingerprint,
     route name, destination name, and retention proof.
 
 Do not use the in-stack `cribl-mock` settings for production. The mock is
@@ -286,13 +301,19 @@ The Cribl exporter uses a persistent file-backed queue in `alloy_data`. The
 queue survives an Alloy restart. Delivery is at least once, so the SOC must be
 able to handle a duplicate record ID.
 
-The buffer is not an archive. It is bounded by both age and bytes:
+The buffer is not an archive. Its byte use and retry work are bounded:
 
 - retry with backoff during a temporary outage;
-- keep a record for no more than 24 hours;
-- stop retrying and count a drop after 24 hours;
+- retry a failed batch for no more than 24 hours after it is dequeued;
+- stop retrying and count a drop when that batch reaches the retry limit;
 - cap bytes so an outage cannot fill the gateway disk; and
 - keep `block_on_overflow=false` so Cribl cannot stop inference.
+
+Alloy does not provide a per-record queue TTL. A record waiting behind other
+work can therefore be older than 24 hours before its batch is dequeued. The 2
+GiB cap may also drop records before 24 hours during a high-volume outage. Do
+not describe this as a hard 24-hour queue-age control. Cribl's separate
+destination retention must still be exactly 24 hours.
 
 When the queue fills, the gateway drops the new outbound copy. The local Loki
 and Prometheus routes must keep working. Local metrics and alerts must record
@@ -340,8 +361,9 @@ show allowed records and prove the denied records are absent.
    the Alertmanager backlog is implemented, also confirm the alert resolves.
 8. Confirm there is no metric, raw trace, or unapproved log in the recovered
    batch.
-9. Test an age or size limit in a bounded test profile. Confirm a local alert
-   and exact drop count.
+9. Test the byte cap and a shortened exporter retry window in a bounded test
+   profile. Confirm a local alert and exact drop count. Record that this does
+   not prove a hard per-record age limit.
 
 Never wait 24 hours in the normal test suite. Use a test-only short limit that
 exercises the same code path.

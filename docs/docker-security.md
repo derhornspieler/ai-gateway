@@ -7,6 +7,18 @@ publication. Host-level controls are in
 [OS security](os-security.md); packet-level controls in
 [network security](network-security.md).
 
+For the shorter, system-wide view, start with the
+[security model](security-model.md).
+
+In plain language:
+
+- images are pinned, reviewed, and loaded as one release;
+- services run with small permissions and no Docker socket;
+- configuration mounts are read-only and force recreation when bytes change;
+- only the two Traefik edges publish application ports; and
+- provider routes and provider CA bundles are built into the selected Envoy
+  image, not added to a running container.
+
 ## 1. Daemon configuration
 
 `/etc/docker/daemon.json` is an exact, validated contract — six keys, no
@@ -39,12 +51,13 @@ converge can never rebuild or retag an image.
 
 **Docker Hardened Images (DHI) by default.** Postgres 18.4 and BusyBox run
 directly from `dhi.io`. Reviewed single-layer images add only a static health
-probe to shellless DHI runtimes. This group includes Keycloak 26.6.4, Vault
-2.0.3, Redis 7.4.9, the four OAuth2 Proxy 7.15.3 gates, Alloy, Prometheus,
-Loki, Grafana, node-exporter, and the OTel collector. Traefik is a reviewed
-two-stage build that places the patched 3.7.8 binary on the non-root DHI
-runtime. The portals, key-rotator, and Envoy entrypoint build from DHI
-Python/Go bases with `--network=none`.
+probe to shellless DHI runtimes. This group includes Keycloak 26.7.0, Vault
+2.0.3, Redis 8.8.0, the four OAuth2 Proxy 7.15.3 gates, Alloy 1.17.1,
+Prometheus 3.13.1, Loki 3.7.3, Grafana 13.1.0, node-exporter 1.12.1, and the
+OTel collector 0.156.0-contrib. Traefik is a reviewed two-stage build that
+places the patched 3.7.8 binary on the non-root DHI runtime. The portals,
+key-rotator, and Envoy entrypoint build from DHI Python/Go bases with
+`--network=none`.
 
 **Documented exceptions.** Three upstream images remain, each pinned and
 reviewed: LiteLLM v1.93.0, Open WebUI 0.10.2, and the Debian-based Samba AD

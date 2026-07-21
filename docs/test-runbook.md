@@ -1,75 +1,56 @@
 # Acceptance test runbook
 
-Use this runbook before publishing a production image release. The required
-release rehearsal runs in local Docker preprod from the exact offline seed.
+Use this runbook before you publish a production image release. The main test
+runs in local Docker preprod. It loads the exact preprod offline archive.
 
-You do not need a Parallels VM, a Rocky test VM, or a second lab host. This
-runbook does not create or change a production host.
+You do not need a test VM. This runbook does not change production.
 
-Local preprod proves the application, identity, TLS, provider-policy, and seed
-contracts. It cannot prove a customer's physical NICs, SELinux state, disk
-encryption, routes, firewall, customer PKI, or customer directory. Ansible
-checks those facts on the real production host during the production preflight
-and converge. See the [production deployment runbook](deploy-runbook.md).
-
-Never put passwords, tokens, private keys, prompt text, Vault output, cookie
-values, or registry credentials in test evidence.
+Do not save passwords, tokens, keys, prompts, Vault output, cookies, or
+registry credentials in test evidence.
 
 ## What each test layer proves
 
 One green layer is not a complete release test.
 
-| Layer | What it proves | Where it runs |
-|---|---|---|
-| Unit | Small functions handle provider catalogs, CA files, policy generation, startup checks, and service logic. | CI and the developer workstation |
-| Contract | CLI arguments, manifests, image labels, loader rules, Compose, Ansible, links, and diagrams agree. | CI and the developer workstation |
-| Integration | Real image builds, Docker archives, image IDs, and the generated Envoy policy work together. | Local Docker or an approved self-hosted runner |
-| End to end | The exact preprod seed starts with no pull or build and passes LDAP, CA, Vault, WIF, OIDC, role, and inference flows. | Clean local Docker preprod |
-| Real browser | A browser follows redirects, stores safe cookies, enforces roles, and completes logout. | A dedicated local browser profile |
-| Release acceptance | Every required layer passed for the exact archive and manifest that will be published. | Evidence from the checks above |
+| Layer | Proof |
+| --- | --- |
+| Unit | Small functions handle good and bad input |
+| Contract | CLI, manifest, Compose, Ansible, links, and diagrams agree |
+| Integration | Real images, archives, image IDs, and provider policy work together |
+| End to end | The exact seed passes LDAPS, Vault, WIF, OIDC, roles, and inference |
+| Browser | Redirects, cookies, access rules, and logout work in a browser |
+| Release | Every required layer passed for the same files and source commit |
 
-GitHub-hosted CI runs static, unit, contract, and final container-security
-checks. The full image scan runs after a push to `main`. It requires DHI
-credentials and fails when they are missing. Hosted CI does not
-receive the local offline archive. It also does not run seeded preprod or a
+GitHub CI runs static, unit, contract, and container scan jobs. It does not get
+the archive built on the operator's system. It does not run local preprod or a
 real browser.
 
-If a required stage did not run, mark it `NOT RUN` or `BLOCKED`. Do not call it
-`PASS` because another stage was green.
+If a step did not run, write `NOT RUN` or `BLOCKED`. Do not call it a pass.
 
 ## Required rehearsal order
 
 Run these steps in order:
 
-1. Run static, unit, contract, lint, and security checks.
-2. Build new production and preprod schema-v2 release pairs.
-3. Destroy only the namespaced `aigw-preprod` environment and old seed
-   activation files.
-4. Load the new preprod archive through the offline-seed loader.
-5. Let Ansible start seed mode with `pull_policy: never` and no build sections.
-6. Pass service, LDAPS, Root CA, Vault, WIF, Keycloak/OIDC, role, logout, and
-   mocked-inference checks.
-7. Complete the real-browser login, redirect, cookie, allow, deny, and logout
+1. Pass static, unit, contract, lint, and security checks.
+2. Build new production and preprod schema-v2 pairs.
+3. Let the clean-room play destroy only owned `aigw-preprod` state.
+4. Purge the manifest-listed image aliases and IDs, then prove their absence.
+5. Load the new preprod archive and require an exact fresh `LOADED` receipt.
+6. Let Ansible start seed mode once, with no pull or build.
+7. Pass service, LDAPS, Root CA, Vault, WIF, OIDC, role, logout, and inference
    checks.
-8. Destroy namespaced preprod and record the release evidence.
+8. Pass the real-browser checks.
+9. Destroy preprod and save the non-secret local test record.
+10. Push the exact tested commit to `main`.
+11. Wait for every required GitHub job, including the release container scan.
+12. Save the final non-secret release record.
 
-The automated checks use real TLS, Samba AD, Keycloak, and HTTP session flows.
-They do not launch a browser engine. The browser step is separate.
-
-## Contents
-
-1. [Run static release checks](#1-run-static-release-checks)
-2. [Build and test the offline release](#2-build-and-test-the-offline-release)
-3. [Run the real-browser check](#3-run-the-real-browser-check)
-4. [Handle a failure and clean up](#4-handle-a-failure-and-clean-up)
-5. [Understand the production boundary](#5-understand-the-production-boundary)
-6. [Record the result](#6-record-the-result)
+The automated test uses real TLS, Samba AD, Keycloak, and web sessions. It does
+not launch a browser. The browser step is separate.
 
 ## 1. Run static release checks
 
-Run commands from the repository root unless a command changes directory.
-
-### Repository checks
+Run these commands from the repository root:
 
 ```bash
 bash scripts/validate-compose.sh
@@ -81,13 +62,12 @@ yamllint -c .yamllint.yml \
   .github .trivyignore.yaml .yamllint.yml ansible compose services
 ```
 
-Pass only if every command exits zero. `validate-compose.sh` renders Compose.
-It does not start containers.
+Every command must exit with status `0`. The Compose check only renders the
+model. It does not start containers.
 
 ### Python services
 
-Install each service's pinned development tools in a clean virtual
-environment. Run these commands inside each service directory:
+Use each service's pinned development tools. Run inside each service folder:
 
 ```bash
 cd services/dev-portal
@@ -112,324 +92,260 @@ for module in dhi-health-probe egress-proxy vault-ui-proxy wif-provider-mock; do
 done
 ```
 
-The provider tests must prove all of these:
+Provider tests must cover repeated values, sort order, duplicates, unknown
+names, and an empty provider list. They must reject custom hosts and CA paths.
+They must prove repeat builds match. They must also prove that a changed
+provider set changes the policy and image. CA, date, SNI, SAN, or fingerprint
+errors must fail closed.
 
-- repeated `--provider` values are sorted and deduplicated;
-- empty, malformed, and unknown selections fail;
-- a caller cannot pass an arbitrary hostname or CA path;
-- equal selections produce equal policy and config bytes;
-- different selections change policy and image identity;
-- only selected routes and CA files enter the image; and
-- changed fingerprints, dates, SNI, SANs, or CA files fail closed.
-
-### GitHub release container scan
-
-`.github/workflows/trivy.yml` is the final container scan. A pull request runs
-the smaller repository and configuration scan. A push to `main` also performs
-the full release scan. Manual dispatch is disabled so branch-selected workflow
-code cannot request the DHI release secrets. Do not replace this gate with an
-unrecorded local Trivy run.
-
-The committed selection is in
-`.github/release-container-security.json`. It currently selects
-`linux/amd64` and Anthropic. The workflow uses the offline-seed builder to find
-the full preprod union: every exact external image used by production or
-preprod, and every unique final custom image. It then:
-
-1. pulls each external image by its tag and digest;
-2. rebuilds each custom release image from the commit;
-3. fails for any `HIGH` or `CRITICAL` finding, including an unfixed finding;
-4. applies only reviewed, owned, unexpired waivers: repository waivers in
-   `.trivyignore.yaml` and version-scoped image PURLs in
-   `.github/trivyignore-images.yaml`; and
-5. uploads a Trivy JSON report, CycloneDX SBOM, and provenance record for each
-   image. It also uploads the resolved image inventory and Envoy policy
-   receipt.
-
-A repository administrator must create the GitHub Environment named
-`release-container-security`. Allow deployments from the protected `main`
-branch only. Store `DHI_USERNAME` and `DHI_PASSWORD` in that environment, and
-remove copies from repository-level or organization-level secrets available to
-this repository. This is the real branch security boundary. A check inside a
-workflow file cannot protect a repository secret from changed branch code.
-
-The workflow fails when either DHI secret is missing. A failed pull, build,
-scan, SBOM, provenance step, or artifact upload also fails the gate. The
-workflow limits parallel jobs so it does not flood the private registry.
-
-Read the evidence with these limits in mind:
-
-- The runner rebuilds candidates from the Git commit. It does not receive or
-  inspect the operator's local offline archive.
-- The provenance JSON is useful GitHub Actions audit metadata. It is not a
-  signed SLSA statement.
-- Trivy uses the vulnerability database available at run time. A later scan
-  can find a new issue in unchanged bytes.
-- The committed CI selection proves only its listed platform and providers.
-  The exact operator-selected offline release must still pass seeded preprod
-  below.
-
-The separate Go workflow keeps the network-disabled, repeat-build Envoy check.
-It compares deterministic archives and checks the live policy receipt. The
-complete release scan above is the authoritative container-security gate.
-
-### Local Ansible syntax
+### Ansible syntax
 
 ```bash
 ansible-playbook -i ansible/inventory/preprod.yml \
   ansible/preprod.yml --syntax-check
 ansible-playbook -i ansible/inventory/preprod.yml \
   ansible/preprod-destroy.yml --syntax-check
+ansible-playbook -i ansible/inventory/preprod.yml \
+  ansible/preprod-clean-room.yml --syntax-check
 ```
 
-Production syntax and preflight checks run with the real production inventory
-when an operator deploys. They are not a reason to create a test VM.
+### GitHub release container scan
+
+This gate runs after the clean-room and browser tests pass. A push to `main`
+starts the full release scan. It scans each exact external image and each
+unique custom image for the production and preprod union. It also writes an
+SBOM and a provenance record for each image.
+
+The job needs these two secrets in the GitHub Environment named
+`release-container-security`:
+
+```text
+DHI_USERNAME
+DHI_PASSWORD
+```
+
+Limit that environment to protected `main`. Missing secrets are a failure, not
+a skip. A pull, build, scan, SBOM, provenance, or upload error also fails the
+job.
+
+The scan blocks `HIGH` and `CRITICAL` findings unless a reviewed waiver covers
+the exact issue. Repository waivers live in `.trivyignore.yaml`. Image waivers
+live in `.github/trivyignore-images.yaml`. Each waiver needs an owner, reason,
+exact package version, and end date.
+
+Do not replace this job with an unrecorded local scan. The GitHub runner rebuilds
+from the commit. It does not inspect the local archive, so the seeded test below
+is still required.
 
 ## 2. Build and test the offline release
 
-This is the required release rehearsal. It proves the exact offline images can
-start without a pull or source build.
+This is the required release rehearsal. It proves that the exact archive can
+start with no pull or source build.
 
-### Prerequisites
+### Before the build
 
-- Docker uses the local Unix socket.
-- Docker is logged in to `dhi.io` with an entitled account.
-- Every selected provider is in the committed provider catalog.
+Check these facts:
+
+- Docker uses a local Unix socket.
+- Docker is logged in to `dhi.io`.
+- The provider is in the committed catalog.
 - Local Docker can run the target platform.
-- The private output directory has enough free space.
-- No unrelated Docker resource uses the `aigw-preprod` names.
+- The private output path has enough free space.
+- No unrelated resource uses an `aigw-preprod` name.
 
-Use `linux/arm64` instead of `linux/amd64` when ARM64 is the release target.
+Use `linux/arm64` for an ARM64 target. Use a new dated path for every build.
 
-### Step 1: Build both release pairs
+### Step 1 — Build both pairs
 
 ```bash
-install -d -m 0700 /absolute/private/path/candidate
+install -d -m 0700 /absolute/private/path/2026-07-21-linux-amd64
 python3 -I scripts/update-images.py prepare \
   --provider anthropic \
   --platform linux/amd64 \
-  --archive /absolute/private/path/candidate/aigw-candidate.docker.tar.zst \
-  --manifest /absolute/private/path/candidate/aigw-candidate.manifest.json
+  --archive /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst \
+  --manifest /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json
 ```
 
-The command writes four private files:
+The command writes:
 
 ```text
-aigw-candidate.docker.tar.zst
-aigw-candidate.manifest.json
-aigw-candidate.preprod.docker.tar.zst
-aigw-candidate.preprod.manifest.json
+aigw-2026-07-21-linux-amd64.docker.tar.zst
+aigw-2026-07-21-linux-amd64.manifest.json
+aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
+aigw-2026-07-21-linux-amd64.preprod.manifest.json
 ```
 
-The production pair contains no Samba AD or WIF mock bytes. The preprod pair
-contains the production images plus those two test images. The command also
-uses the reviewed missing-source-tag workaround after it checks each digest.
+The production archive has no Samba AD or WIF mock image. The preprod archive
+has the production images plus those two test images.
 
 Record all four SHA-256 values:
 
 ```bash
 # macOS
-shasum -a 256 /absolute/private/path/candidate/aigw-candidate*
+shasum -a 256 /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64*
 
 # Linux
-sha256sum /absolute/private/path/candidate/aigw-candidate*
+sha256sum /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64*
 ```
 
-Run the command for your operating system, not both.
+Run the command for your operating system.
 
-### Step 2: Destroy only old preprod
+### Step 2 — Clean, load, and test the exact preprod pair
+
+```bash
+python3 -I scripts/update-images.py test-preprod \
+  --archive /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
+  --manifest /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  --load-archive \
+  --become-password-file "$HOME/.ssh/become"
+```
+
+Use `--ask-become-pass` instead if you want an interactive prompt. Do not use
+both options. The password file must be absolute, owned by the current user,
+mode `0600`, a regular file, not a symbolic link, and have one hard link. The
+updater passes only its path to Ansible. It does not read or copy it.
+
+The updater runs these steps in order:
+
+1. Check the schema-v2 preprod manifest and archive allow-list.
+2. Run `ansible/preprod-clean-room.yml` with the exact paths and hashes.
+3. Prove Docker is local. On Linux, prove the root loader and operator use the
+   same Docker socket.
+4. Destroy only owned preprod containers, volumes, networks, and generated
+   seed state. Prove those resources are gone.
+5. Remove only the image aliases and IDs listed by the manifest. Stop if a
+   foreign container uses one.
+6. Prove the listed images are absent and unrelated images are unchanged.
+7. Remove only owned loopback aliases and the bounded hosts block.
+8. Stage private root-owned copies on rootful Linux. Docker Desktop uses the
+   caller-owned files.
+9. Load the archive. Require exactly `LOADED <archive-sha256>`. Reject
+   `SKIPPED` and `RELOADED`.
+10. Run `ansible/preprod.yml` once. It deploys with `pull_policy: never`, no
+   build sections, the bounded hosts block, and the full acceptance gate.
+11. Remove any private root staging copy.
+
+If the clean-room play fails, staging and deploy do not start. Do not use
+`docker system prune`, a broad Compose project, or a broad image delete.
+
+A pass includes these markers:
+
+```text
+PREPROD_CLEAN_ROOM_OK ...
+PREPROD_E2E_PASSED
+SEEDED_PREPROD_E2E_PASSED
+```
+
+You may add `--test-preprod` to the Step 1 `prepare` command instead. That
+uses the same clean-room, archive-load, and Ansible acceptance path for the
+newly built preprod pair.
+
+Running `test-preprod` without `--load-archive` skips clean-room cleanup and
+archive loading. It is only a quick development check. It is not release
+evidence.
+
+The run must prove:
+
+- all image IDs and the manifest scope match;
+- the Envoy labels match the provider policy;
+- each required service is ready;
+- the Root CA signs edge, LDAPS, and WIF test certificates;
+- Vault is ready;
+- Ansible set up Keycloak without a portal init step;
+- all three test users pass their allow and deny rules;
+- OIDC callbacks and logout work;
+- WIF checks a real Keycloak JWT;
+- LiteLLM gets `pong` through the preprod-only TLS Envoy;
+- the exact production Envoy passes its immutable policy and CA startup gate; and
+- the approved SOC test logs reach the Cribl mock without secret fields.
+
+See [Local preprod](preprod.md) for the users and network model.
+
+## 3. Run the real-browser check
+
+Keep seeded preprod running. Use a new browser profile with no old cookies.
+The Ansible deploy already installed the marker-bounded preprod block in
+`/etc/hosts`. Do not add unbounded or Docker bridge addresses by hand.
+
+Import `compose/secrets/preprod-root-ca.pem` into that test profile only. Use
+the accounts in [Local preprod](preprod.md#static-test-users).
+
+Pass only if:
+
+- each `aigw.internal` certificate is trusted;
+- each redirect stays on the right app and `auth.aigw.internal`;
+- the admin reaches admin and chat pages;
+- the developer reaches the developer portal and chat, but not admin pages;
+- the user reaches chat, but not portal or admin pages;
+- cookies are `Secure`, `HttpOnly`, and limited to the right host and path;
+- logout clears the app and Keycloak sessions; and
+- Back, then Refresh, does not reopen a protected page.
+
+Remove the Root CA from the browser profile. The bounded destroy command in
+the next section removes the preprod hosts block. Do not save cookie values in
+the test record.
+
+## 4. Clean up and handle a failure
+
+After a pass or failure, run the bounded destroy play:
 
 ```bash
 ansible-playbook -i ansible/inventory/preprod.yml \
   ansible/preprod-destroy.yml \
-  -e preprod_destroy_confirmation=DESTROY_AIGW_PREPROD
+  -e preprod_destroy_confirmation=DESTROY_AIGW_PREPROD \
+  --become-password-file "$HOME/.ssh/become"
 ```
 
-On macOS, append `--ask-become-pass`.
-
-The destroy play removes only the named preprod containers, volumes, networks,
-and generated seed activation files. It removes only loopback aliases it owns.
-It keeps the disposable preprod Root CA so the same browser trust can be used
-across clean test runs.
-
-Expected success marker:
+Use `--ask-become-pass` instead when needed. The destroy play removes only
+owned preprod resources, owned aliases, and the bounded hosts block. It
+preserves the test Root CA. A pass prints:
 
 ```text
 PREPROD_DESTROYED_CA_PRESERVED
 ```
 
-Do not use `docker system prune`, a broad Compose project, or a broad delete.
-
-### Step 3: Load and test the exact preprod seed
-
-```bash
-python3 -I scripts/update-images.py test-preprod \
-  --archive /absolute/private/path/candidate/aigw-candidate.preprod.docker.tar.zst \
-  --manifest /absolute/private/path/candidate/aigw-candidate.preprod.manifest.json \
-  --load-archive
-```
-
-On macOS, append `--ask-become-pass`. Ansible creates only the missing owned
-`127.0.2.1` and `127.0.3.1` aliases needed by Docker Desktop.
-
-The updater stages private copies, loads the archive, checks the source and
-manifest, and asks Ansible to start seed mode. Seed mode refuses every pull and
-build command. It checks every image ID before startup.
-
-Expected final markers:
-
-```text
-PREPROD_E2E_PASSED
-SEEDED_PREPROD_E2E_PASSED
-```
-
-Pass only if the run proves all of these:
-
-- every external and custom image ID matches the release receipt;
-- the manifest scope is `preprod`;
-- the Envoy image labels match the selected provider policy;
-- no unselected provider route or CA file enters the Envoy image;
-- every long-running service is healthy;
-- `volume-init` exited successfully once;
-- the Root CA signs the edge, Samba LDAPS, and WIF mock certificates;
-- every certificate hostname and chain check passes;
-- Vault is initialized, unsealed, and ready with disposable custody;
-- identity setup completed without a portal initialization step;
-- all three static users authenticate through Samba AD over LDAPS;
-- Keycloak advertises `https://auth.aigw.internal/realms/aigw`;
-- OIDC callback, role allow, role deny, and logout checks pass;
-- WIF exchanges a real Keycloak JWT at the TLS mock;
-- LiteLLM returns `pong` from the mocked provider path;
-- `cribl-mock` receives every approved SOC event class as OTLP logs;
-- `cribl-mock` receives no raw span, metric, alert, malformed event, Vault raw
-  audit record, or ordinary service log;
-- the SOC copy contains no credential, cookie, OIDC code, e-mail address, or
-  network peer address; and
-- unrelated Docker containers, volumes, and networks did not change.
-
-The detailed preprod design and public test credentials are in
-[Local Docker preprod](preprod.md). The exact event and receipt contract is in
-[Cribl SOC logging handoff](cribl-soc-handoff.md).
-
-`prepare --test-preprod` is a useful development shortcut. It is not the final
-clean-start rehearsal unless you ran the namespaced destroy step first.
-
-## 3. Run the real-browser check
-
-Keep the seeded preprod environment running. Use a new browser profile with no
-AI Gateway cookies.
-
-Install only the marker-bounded preprod hosts block:
-
-```bash
-sudo python3 -I scripts/preprod.py install-hosts
-```
-
-Import `compose/secrets/preprod-root-ca.pem` into that test browser profile.
-Do not add this CA to a normal user or production trust store.
-
-Use the static accounts in [Local Docker preprod](preprod.md#static-test-users).
-Record the result without recording cookie values.
-
-Pass only if:
-
-- every browser certificate is trusted for its `aigw.internal` name;
-- redirects stay on the expected relying party and
-  `auth.aigw.internal` issuer;
-- `preprod-admin` reaches admin, chat, and the allowed admin UIs;
-- `preprod-developer` reaches the developer portal and chat but is denied
-  admin paths;
-- `preprod-user` reaches chat but is denied portal and admin paths;
-- session cookies are `Secure`, `HttpOnly`, and limited to the expected host
-  and path;
-- logout returns to the expected app and clears its session;
-- Back followed by Refresh cannot reopen a protected page; and
-- no callback loop, wrong-domain redirect, mixed content, or TLS warning
-  appears.
-
-Remove the test CA from the browser profile. Then remove only the managed hosts
-block:
-
-```bash
-sudo python3 -I scripts/preprod.py remove-hosts
-```
-
-## 4. Handle a failure and clean up
-
-If any required check fails:
+If a required check fails:
 
 1. Mark the release `FAIL` or `BLOCKED`.
-2. Do not transfer or deploy the production archive.
-3. Save only non-secret output, manifest hashes, image IDs, and the failing
-   check name.
-4. Fix the source, then build a new release with new filenames.
-5. Repeat the full clean rehearsal. Do not hand-edit a manifest.
+2. Do not transfer the production pair.
+3. Save only safe output, hashes, image IDs, and the failed check name.
+4. Fix the source.
+5. Build new files with new names.
+6. Repeat the full clean rehearsal.
 
-Remove preprod with the bounded destroy play:
-
-```bash
-ansible-playbook -i ansible/inventory/preprod.yml \
-  ansible/preprod-destroy.yml \
-  -e preprod_destroy_confirmation=DESTROY_AIGW_PREPROD
-```
-
-On macOS, append `--ask-become-pass`.
-
-If cleanup refuses an ownership or boundary check, stop. Inspect the named
-resource. Do not weaken the check or delete unrelated Docker resources.
+Do not edit a manifest. Do not weaken an ownership check.
 
 ## 5. Understand the production boundary
 
-A locally accepted release produces a production-scoped archive that is ready
-for controlled transfer. Local acceptance does not deploy it.
+Local preprod does not prove production NICs, routes, SELinux, disk encryption,
+customer PKI, firewall rules, or the customer directory. Production Ansible
+checks those facts on the real host.
 
-For a first production deployment, follow the
-[production deployment runbook](deploy-runbook.md). It checks the real Rocky
-Linux host, three customer-owned NICs, routes, firewall, SELinux, encrypted
-storage, customer PKI, customer directory, Vault custody, and live services.
+For a first install, use the [production runbook](deploy-runbook.md). For an
+image update, use the
+[remote upgrade workflow](image-update-workflow.md#4-upgrade-the-remote-host).
 
-For a later image update, follow the
-[image update workflow](image-update-workflow.md#4-upgrade-the-remote-host).
-That command verifies the previous and candidate production seeds, takes an
-encrypted backup, deploys through Ansible, validates the result, and rolls back
-state, images, and the Envoy provider policy if a real validation fails.
+Do not create a rehearsal VM. Do not force a test failure on production. The
+upgrade state machine has contract tests. Real validation runs only in the
+approved maintenance window.
 
-Do not create a Rocky or Parallels rehearsal VM for this release gate. Do not
-force an artificial failure on a production host. The upgrade and rollback
-state machine is covered by contract tests; production validation runs during
-the real approved maintenance.
-
-PostgreSQL major changes do not use the normal image rollback. Follow the
+PostgreSQL major changes use the
 [PostgreSQL 18 migration SOP](sop/postgresql-18-migration.md).
 
 ## 6. Record the result
 
 Record:
 
-- source commit;
-- target platform;
-- selected providers;
-- all four release filenames and SHA-256 values;
-- both manifest `release_scope` values;
-- production and preprod manifest hashes;
-- egress-policy digest and Envoy image ID;
-- test date, workstation, Docker version, and operator;
-- each command's result and expected marker;
-- required CI job names and final status;
-- browser checks, with no cookie values; and
-- an owner and issue for every `FAIL`, `BLOCKED`, or `NOT RUN` result.
+- source commit and test date;
+- target platform and provider list;
+- all four filenames and SHA-256 values;
+- both release scopes;
+- policy hash and Envoy image ID;
+- Docker version and operator;
+- each command and result marker;
+- each required GitHub job and final state; and
+- browser results without cookies.
 
-Accept the release only when:
-
-- all static, unit, contract, lint, and security checks pass;
-- every required CI job is complete, not skipped;
-- the two scoped release pairs and hashes are recorded;
-- a clean local preprod loaded the exact new preprod archive;
-- Ansible seed mode used no pull or source build;
-- automated LDAPS, CA, Vault, WIF, OIDC, role, logout, and inference checks
-  passed;
-- the real-browser checks passed; and
-- bounded cleanup passed.
-
-If credentials, disk space, browser access, or another required input is
-missing, mark the release `BLOCKED`. Do not rename a missing test as a pass.
+Accept the release only when every required step passed for the same source
+and files. If access, disk, registry login, or another input is missing, mark
+the release `BLOCKED`.

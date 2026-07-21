@@ -2,7 +2,8 @@
 
 This document describes the implementation currently present in `compose/`,
 `ansible/`, and `services/`. The companion diagram set is in
-[architecture-diagrams.md](architecture-diagrams.md); the dedicated security
+[architecture-diagrams.md](architecture-diagrams.md); the plain-language
+security overview is [security-model.md](security-model.md). Exact security
 references are [network-security.md](network-security.md),
 [os-security.md](os-security.md), and [docker-security.md](docker-security.md).
 The following operator guides use this page as their architecture anchor:
@@ -21,6 +22,9 @@ documented in [Provider onboarding](provider-onboarding.md), the
 turnkey production appliance; historical design notes are superseded by the
 configuration described here.
 
+If you are new to the project, read the [security model](security-model.md)
+first, then use this page for exact service, network, and data-flow details.
+
 ## Scope and deployment model
 
 Production runs as one Docker Compose project on one existing Rocky Linux 9
@@ -32,16 +36,17 @@ customer-owned addresses, routes, gateways, or DNS.
 
 Local preprod is a separate localhost-only Ansible workflow. It uses one local
 Docker engine, the fixed `aigw.internal` domain, loopback HTTPS bindings, and
-three Docker networks that model egress, ADM, and internal planes. It includes
-a test root CA, Samba AD over LDAPS, a WIF provider mock, and static test users.
-It does not run the Rocky host roles. See [local preprod](preprod.md).
+three outer Docker networks that model egress, ADM, and internal planes. It
+includes a test root CA, Samba AD over LDAPS, a WIF provider mock, and static
+test users. It does not run the Rocky host roles. See
+[local preprod](preprod.md).
 
 The physical trust zones are:
 
 | Leg | Inbound policy | Outbound purpose |
 |---|---|---|
 | Egress | no gateway listener; zone target `DROP` | fixed Envoy identity only: approved DNS and vendor TCP/443 |
-| ADM (`ETH1_IP`) | VPN source CIDR only: host TCP/22 and published TCP/443; optional authoritative TCP/UDP 53 | source-based reply routing through the ADM gateway |
+| ADM (`ETH1_IP`) | VPN source CIDR only: configured management SSH port and published TCP/443; optional authoritative TCP/UDP 53 | source-based reply routing through the ADM gateway |
 | Internal (`ETH2_IP`) | internal source CIDR only: published TCP/443; optional authoritative TCP/UDP 53 | source-based replies and optional exact Alloy-to-Cribl tuple |
 
 The main routing table must already contain exactly one default route through
@@ -99,10 +104,10 @@ otherwise shellless final stage.
 | `envoy-egress` | sole vendor egress; immutable selected-provider routes, exact SNI/SAN rules, and reviewed CA bundles | no host port; loopback admin; read-only Prometheus facade |
 | `key-rotator` | static Anthropic seed, Anthropic WIF, scheduler, identity controller, and a reviewed driver interface for future providers | internal API with `X-Internal-Auth`; DB in `pg_data` |
 | `vault` | KV v2, PKI, rotator and identity key material, audit | isolated plaintext API on `net-vault`; ADM UI only through OAuth2 Proxy; `vault_data`, `vault_audit` |
-| `postgres` | separate LiteLLM, Keycloak, and rotator databases | `pg_data`; three isolated database planes |
+| `postgres` | separate LiteLLM, Keycloak, and rotator databases, plus a read-only Grafana reporting login | `pg_data`; four isolated client database planes |
 | `redis` | LiteLLM cache/router state | ACL-authenticated from root-rendered files (no server argv/environment credential), tmpfs only, intentionally non-persistent |
 | `alloy` | OTLP receive/fan-out, Docker log tail, Vault audit tail, spanmetrics | `alloy_data`; fixed receiver/export identities |
-| `prometheus` | metrics, Alloy remote-write receiver, and local alert evaluation | 30-day time limit plus a size cap in `prom_data`; ADM UI only through OAuth2 Proxy |
+| `prometheus` | metrics, Alloy remote-write receiver, and local alert evaluation | 30-day time limit plus a 5 GB cap in `prom_data`; the first limit wins; ADM UI only through OAuth2 Proxy |
 | `node-exporter` | host filesystem/capacity metrics for local alert rules | read-only host-root view; metrics-only network; no persistence |
 | `loki` | operational and Vault audit logs plus the prompt-bearing per-request stream (`service_name="aigw-requests"`) Alloy derives from `litellm_request` spans | 7-day `loki_data` |
 | `grafana` | query UI for Prometheus, Loki, and local alert state | `grafana_data`; ADM-only behind `oauth2-proxy-grafana`, auth-proxy header trust, org Admin auto-assign, own login form disabled |
@@ -112,7 +117,7 @@ otherwise shellless final stage.
 The four OAuth2 Proxy instances share one image
 (`ai-gateway/dhi-oauth2-proxy:7.15.3-probe`) and are reverse-proxy OIDC gates
 on the ADM leg behind `traefik-adm`, one per admin UI. The two portals share
-one image (`ai-gateway/portal:1`, the Flask/ASGI app in `services/dev-portal`)
+one image (`ai-gateway/portal:1`, the FastAPI/ASGI app in `services/dev-portal`)
 but run as different ASGI applications in different containers, Docker planes,
 OIDC clients, session secrets, and hostnames. `key-rotator` is the rotation
 engine and Keycloak identity controller built from `services/key-rotator`.
@@ -149,19 +154,20 @@ with CA and SNI validation.
 
 Ansible hashes the effective Compose definition for `volume-init`. Before
 starting the application graph it requires an existing successful one-shot
-container with that hash and compares the root owner/group/mode of all seven
-managed state volumes (`pg_data`, `vault_data`, `vault_audit`, `alloy_data`,
-`prom_data`, `loki_data`, `grafana_data`). It reruns the
-initializer only when the container is absent, its last exit was nonzero, its
-definition hash changed, or one of those metadata contracts drifted, then
-verifies the exact metadata again. `openwebui_data` is deliberately outside
-this set because Open WebUI owns its own volume.
+container with that hash and compares the owner/group/mode of all eight
+managed state volumes (`pg_data`, `openwebui_data`, `vault_data`,
+`vault_audit`, `alloy_data`, `prom_data`, `loki_data`, and `grafana_data`). It
+reruns the initializer only when the container is absent, its last exit was
+nonzero, its definition hash changed, or one of those metadata contracts
+drifted, then verifies the exact metadata again.
 
 The initializer has no network, a read-only root filesystem, all capabilities
 dropped, and only `CHOWN`, `FOWNER`, and `FSETID` added back. `FSETID` is
 required to retain `2750` on `vault_audit` after assigning group `473`.
-Initialization changes only each mounted volume root's ownership and mode; it
-does not recursively rewrite contents.
+Initialization changes only each mounted volume root's ownership and mode,
+except `openwebui_data`. That volume uses a reviewed recursive ownership fix
+because Open WebUI creates nested files that must stay owned by its non-root
+user.
 
 Lifecycle automation starts the long-running graph through
 `scripts/aigw-runtime-up.sh`, which derives the service list from the effective
@@ -210,9 +216,9 @@ working component. BusyBox `1.38.0-alpine` and Postgres `18.4` run directly
 from the DHI catalog. Ten local DHI images add the static
 `aigw-health-probe` to a shellless runtime:
 
-- OAuth2 Proxy `7.15.3`, Keycloak `26.6.4`, Vault `2.0.3`, and Redis `7.4.9`;
-- Alloy `1.17.1`, Prometheus `3.5.5`, node-exporter `1.11.1`, Loki `3.7.3`,
-  and Grafana `12.4.5`; and
+- OAuth2 Proxy `7.15.3`, Keycloak `26.7.0`, Vault `2.0.3`, and Redis `8.8.0`;
+- Alloy `1.17.1`, Prometheus `3.13.1`, node-exporter `1.12.1`, Loki `3.7.3`,
+  and Grafana `13.1.0`; and
 - the OpenTelemetry Collector `0.156.0-contrib` behind `cribl-mock`.
 
 Envoy, the portal image, and
@@ -225,7 +231,7 @@ re-evaluated at every image upgrade:
 |---|---|---|
 | DHI derivative | Traefik: `dhi.io/traefik:3.7.6` runtime plus upstream `v3.7.8` binary → `ai-gateway/dhi-traefik:3.7.8-patched` | the catalog DHI trails the fix for `GHSA-cxjq-mrr5-89rv`; the build keeps the non-root, shellless DHI runtime and replaces only `/usr/bin/traefik` from the immutable patched upstream image |
 | Non-DHI | LiteLLM upstream `v1.93.0` (`ghcr.io/berriai/litellm`) | the evaluated DHI artifact contained a fixable High CVE in `sigstore`; the signed upstream release passed the project scan and compatibility review |
-| Non-DHI | Open WebUI upstream `0.10.2` (`ai-gateway/open-webui:0.10.2-probe`) | no application-specific DHI catalog image was available; the shared probe is still layered on |
+| Non-DHI | Open WebUI upstream `0.10.2` (`ai-gateway/open-webui:0.10.2-aigw1`) | no application-specific DHI catalog image was available; the shared probe is still layered on |
 | Non-DHI | Preprod Samba AD: pinned Debian plus pinned Samba packages | no application-specific DHI image was available; this image is built only for disposable local preprod and is never a production directory |
 
 An exception is not permission to float a tag or skip scanning. Replace it with
@@ -560,15 +566,17 @@ is never elevated to organization administrator.
 
 ## Data, secrets, and telemetry
 
-Postgres uses three isolated network attachments, SCRAM host authentication,
-separate database users, and this exact `CONNECT` matrix. `PUBLIC` is revoked
-from all four databases; the `postgres` superuser retains maintenance access.
+Postgres uses four isolated client network attachments, SCRAM host
+authentication, separate database users, and this exact `CONNECT` matrix.
+`PUBLIC` is revoked from all four databases; the `postgres` superuser retains
+maintenance access.
 
 | Login role | `litellm` DB | `keycloak` DB | `rotator` DB | `postgres` DB |
 |---|---:|---:|---:|---:|
 | `litellm` | allow | deny | deny | deny |
 | `keycloak` | deny | allow | deny | deny |
 | `rotator` | deny | deny | allow | deny |
+| `grafana_ro` | allow | deny | deny | deny |
 
 On every converge, Ansible runs one repeatable reconciler over the trusted local
 Unix socket. It tests each password with real SCRAM TCP authentication and
@@ -580,8 +588,10 @@ Every service role must have `LOGIN`, no superuser rights, `NOCREATEDB`,
 `-1`, no role-local settings, and no expiry. The reconciler also enforces
 database ownership, removes role memberships involving a service role, and
 changes the `CONNECT` ACL only on drift. A separate read-only assertion
-verifies the 12 service-role/database decisions, all three owners, all three role
-contracts, zero memberships, and `postgres|postgres|true`.
+verifies all 16 service-role/database decisions, the three database owners,
+all four role contracts, zero memberships, and `postgres|postgres|true`.
+`grafana_ro` then receives column-level `SELECT` access to approved spend and
+identity fields only. It cannot read prompt-bearing spend columns.
 
 Redis is a password-protected, non-persistent cache. The server reads only a
 SHA-256 ACL verifier file. Docker command and environment metadata contain no
@@ -613,7 +623,8 @@ fields provide attribution, not authorization. The enforced identity remains
 `aigw.user.id` and `aigw.api_key.id`, which a forwarded header cannot change.
 Open WebUI's *enforced* identity remains a documented service/project-only
 attribution exception. Ordinary operations and raw Vault audit logs go to Loki,
-not Cribl. Metrics stay in Prometheus for 30 days, subject to its size cap.
+not Cribl. Metrics stay in Prometheus for up to 30 days, subject to its 5 GB
+size cap. The first limit reached wins.
 The approved future Alertmanager stays local and has no external receiver. See
 [observability operations](observability-operations.md) and the
 [Cribl SOC handoff](cribl-soc-handoff.md).
@@ -661,12 +672,14 @@ Important residuals before production:
   reviewed operator ceremonies and replacement initialization is forbidden on
   the restore path;
 - LUKS provisioning/unlock, backup scheduling/off-host custody, HA, and site
-  disaster recovery are external; Ansible enforces encrypted backing and a
-  recent-artifact pre-upgrade gate, but the single-VM deployment does not prove
-  controller or site loss, production custody, customer RTO/RPO, or HA;
+  disaster recovery are external; Ansible checks and warns about encrypted
+  backing and enforces a recent-artifact pre-upgrade gate, but the single-VM
+  deployment does not prove controller or site loss, production custody,
+  customer RTO/RPO, or HA;
 - full prompt capture is intentionally high sensitivity and can exhaust a small
-  disk; Cribl supports verified TLS but no bearer token or mTLS in the current
-  Alloy exporter;
+  disk; Cribl supports verified server TLS but no bearer token or mTLS in the
+  current Alloy exporter. The exporter has a 2 GiB queue and a 24-hour retry
+  window, but no hard per-record queue TTL;
 - filesystem capacity rules, node-exporter, and provisioned dashboards are
   present. Local Alertmanager lifecycle handling remains backlog work, with no
   external receiver in the approved design;
@@ -687,8 +700,7 @@ Important residuals before production:
   host are not host redundancy.
 
 Current release gates are recorded in [project-status.md](project-status.md).
-Retired Rocky environment evidence remains historical only in the
-[archived rehearsal record](archive/lab-dr-rehearsal.md).
+Archived lab material is historical evidence, not an active deployment path.
 
 ## Decision history
 

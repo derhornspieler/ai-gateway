@@ -6,6 +6,15 @@ setting.
 
 For routine release selection, skip to [Select providers](#select-providers).
 For CA changes, use the [provider CA maintenance SOP](sop/provider-ca-maintenance.md).
+The [security model](security-model.md#provider-egress-is-selected-at-release-time)
+explains why this is a release boundary.
+
+Four diagrams show the full path:
+
+- [provider selection and immutable build](architecture-diagrams.md#11-provider-selection-and-immutable-envoy-build);
+- [runtime request routing](architecture-diagrams.md#12-runtime-request-path-for-selected-providers);
+- [CA capture, review, and rotation](architecture-diagrams.md#13-ca-capture-review-rotation-and-approval); and
+- [offline validation and rollback](architecture-diagrams.md#14-offline-seed-validation-deployment-and-rollback).
 
 ## Safety rule
 
@@ -43,6 +52,12 @@ path fails before the Envoy image is built.
 The final image contains only the selected provider routes and CA bundles. If
 the selection changes, the generated policy digest and final image ID change.
 The schema-v2 manifest records both values.
+
+Provider selection grants only a reviewed network and TLS path. It does not
+create provider credentials or teach LiteLLM how to call a new API. A new
+provider may also need a reviewed LiteLLM configuration and a key-rotator
+driver. Keep that authentication work separate from the egress trust record,
+then test both together in the exact offline release.
 
 ## Catalog files
 
@@ -90,7 +105,8 @@ Use this process for every new provider.
 7. Add or update tests for the catalog record, selected-only image contents,
    generated route, exact SAN, SNI, CA failure cases, and manifest receipt.
 8. Update the caller configuration if LiteLLM or key-rotator needs the new
-   internal route prefix.
+   internal route prefix. Add a reviewed credential driver when the provider's
+   authentication method is not already supported.
 9. Build a new offline release with the new provider selected.
 10. Load that exact seed into local preprod and run the full end-to-end test.
 11. Review the diff and test evidence. Approve a release only after all gates

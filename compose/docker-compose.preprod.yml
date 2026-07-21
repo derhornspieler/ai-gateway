@@ -54,6 +54,14 @@ services:
 
   litellm:
     labels: *preprod-labels
+    # Keep the production model list and credential name, but send inference
+    # to the preprod-only TLS proxy. The exact production Envoy still starts
+    # below and must pass its immutable policy/CA startup gate.
+    volumes: !override
+      - ./secrets/preprod-litellm-config.yaml:/app/config.yaml:ro,Z
+      - ./litellm/aigw_default_model_hook.py:/app/aigw_default_model_hook.py:ro,Z
+    depends_on:
+      wif-egress-mock: { condition: service_healthy, required: true }
 
   # Build paths in the deployed production tree are ./services. In a source
   # checkout the same directories are one level above compose/.
@@ -183,8 +191,9 @@ services:
     # selected-provider policy, and CA bundles stay baked into the image.
     volumes: !override []
 
-  # The WIF exchange needs a local TLS endpoint. Keep that test path separate
-  # so it cannot replace or weaken the immutable production Envoy image above.
+  # WIF exchange and test inference need a local TLS endpoint. Keep that test
+  # path separate so it cannot replace or weaken the immutable production
+  # Envoy image above.
   wif-egress-mock:
     labels: *preprod-labels
     profiles: [preprod]
@@ -248,6 +257,14 @@ services:
     labels: *preprod-labels
     build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
     image: "${PREPROD_PROJECT}/redis:local"
+    # Docker Desktop bind mounts keep the controller file owner. Run this
+    # preprod-only cache as that same non-root owner so its 0600 credential
+    # files stay private and readable. Production remains 65532:65532 with
+    # root-rendered 0440 files.
+    user: "${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set}:${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set}"
+    tmpfs: !override
+      - /tmp:mode=1777
+      - /data:uid=${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set},gid=${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set},mode=0700
 
   alloy:
     labels: *preprod-labels

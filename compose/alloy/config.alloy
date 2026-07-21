@@ -673,7 +673,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "mismatched_security_emitter"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"key\\.generate|key\\.deactivate|egress\\.trust\\.verify|rotation\\.settings\\.update|rotation\\.trigger|provider\\.anthropic\\.(configure|disable|delete)|identity\\.member\\.remove|identity\\.group\\.policy|admin\\.key\\.(block|unblock|limits)\"}"
+    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"key[.]generate|key[.]deactivate|egress[.]trust[.]verify|rotation[.]settings[.]update|rotation[.]trigger|provider[.]anthropic[.](configure|disable|delete)|identity[.]member[.]remove|identity[.]group[.]policy|admin[.]key[.](block|unblock|limits)\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_portal_action"
   }

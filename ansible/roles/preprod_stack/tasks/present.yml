@@ -98,6 +98,13 @@
   become: true
   register: preprod_seed_load
   changed_when: "preprod_seed_load.stdout is search('^(LOADED|RELOADED) ')"
+  failed_when: >-
+    preprod_seed_load.rc != 0 or
+    (
+      preprod_seed_require_fresh_load | bool and
+      preprod_seed_load.stdout | trim !=
+      'LOADED ' ~ preprod_seed_archive_sha256
+    )
   when:
     - preprod_image_mode == 'seed'
     - preprod_seed_load_archive | bool
@@ -126,6 +133,13 @@
   become: false
   register: preprod_local_seed_load
   changed_when: "preprod_local_seed_load.stdout is search('PREPROD_LOCAL_SEED_(LOADED|RELOADED) ')"
+  failed_when: >-
+    preprod_local_seed_load.rc != 0 or
+    (
+      preprod_seed_require_fresh_load | bool and
+      preprod_local_seed_load.stdout | trim !=
+      'PREPROD_LOCAL_SEED_LOADED ' ~ preprod_seed_archive_sha256
+    )
   when:
     - preprod_image_mode == 'seed'
     - preprod_seed_load_archive | bool

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import socket
 import stat
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -296,6 +298,75 @@ class OfflineImageSeedTests(unittest.TestCase):
         }
         return manifest
 
+    def write_release_manifest(self, manifest: dict[str, object]) -> None:
+        self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        self.manifest.chmod(0o600)
+        self.manifest_digest = hashlib.sha256(self.manifest.read_bytes()).hexdigest()
+
+    @staticmethod
+    def add_verified_archive_metadata(metadata: dict[str, object]) -> None:
+        """Mark every mocked descriptor/config as content-hash verified."""
+
+        verified: set[str] = set()
+        for entry in metadata.get("manifest.json", []):
+            config = entry.get("Config") if isinstance(entry, dict) else None
+            if isinstance(config, str):
+                digest = config.removesuffix(".json").removeprefix("blobs/sha256/")
+                if len(digest) == 64:
+                    verified.add(f"sha256:{digest}")
+        index = metadata.get("index.json", {})
+        descriptors = index.get("manifests", []) if isinstance(index, dict) else []
+        for descriptor in descriptors:
+            digest = descriptor.get("digest") if isinstance(descriptor, dict) else None
+            if isinstance(digest, str):
+                verified.add(digest)
+        metadata["_verified_small_blobs"] = verified
+
+    def purge_plan_builder(
+        self,
+        manifest: dict[str, object],
+        *,
+        platform: str = "linux/arm64",
+        source_references: set[str] | None = None,
+        planned_build_inputs: object | None = None,
+    ) -> tuple[mock.Mock, mock.Mock, mock.Mock]:
+        client = mock.Mock()
+        planner = mock.Mock()
+        planner.PlanError = RuntimeError
+        planner.plan_compose_builds.return_value = {
+            "manifest": (
+                manifest.get("build_inputs")
+                if planned_build_inputs is None
+                else planned_build_inputs
+            ),
+            "services": [],
+        }
+        builder = mock.Mock()
+        builder.SeedBuildError = RuntimeError
+        builder.OutputPolicy.side_effect = lambda uid, gid, root: (uid, gid, root)
+        builder.resolve_docker_client.return_value = client
+        builder.platform.return_value = platform
+        if source_references is None:
+            source_references = {
+                image["reference"]
+                for image in manifest.get("images", [])
+                if isinstance(image, dict) and isinstance(image.get("reference"), str)
+            }
+        builder.collect_project_image_reference_scopes.return_value = {
+            "production": set(source_references),
+            "preprod": set(source_references),
+        }
+        builder.egress_plan_from_release_receipt.return_value = mock.sentinel.egress
+        builder.render_deployable_compose_model.return_value = (
+            {"services": {}},
+            client,
+            [],
+        )
+        builder._load_build_planner.return_value = planner
+        builder._find_executable.return_value = "zstd"
+        builder.COMPOSE_PROJECT_NAME = "ai-gateway"
+        return builder, client, planner
+
     def run_with_mocks(
         self, invalid_side_effect: list[list[str]]
     ) -> tuple[str, mock.Mock, mock.Mock]:
@@ -432,9 +503,352 @@ class OfflineImageSeedTests(unittest.TestCase):
         )
         output.assert_called_once_with(expected)
 
+    def test_local_preprod_purge_plan_cli_uses_exact_release_and_socket(self) -> None:
+        outcome = {
+            "groups": [],
+            "manifest_sha256": self.manifest_digest,
+            "record_count": 0,
+            "schema_version": 1,
+            "unique_image_id_count": 0,
+        }
+        with (
+            mock.patch.object(loader, "ROOT_UID", 0),
+            mock.patch.object(loader.os, "geteuid", return_value=501),
+            mock.patch.object(loader, "configure_local_controller_docker") as configure,
+            mock.patch.object(
+                loader, "local_preprod_purge_plan", return_value=outcome
+            ) as plan,
+            mock.patch("builtins.print") as output,
+        ):
+            returncode = loader.main(
+                [
+                    str(SCRIPT),
+                    "local-preprod-purge-plan",
+                    str(self.archive),
+                    self.archive_digest,
+                    str(self.manifest),
+                    self.manifest_digest,
+                    str(self.project),
+                    "unix:///private/docker.sock",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        configure.assert_called_once_with("unix:///private/docker.sock")
+        plan.assert_called_once_with(
+            self.archive,
+            self.archive_digest,
+            self.manifest,
+            self.manifest_digest,
+            self.project,
+        )
+        output.assert_called_once_with(
+            json.dumps(outcome, sort_keys=True, separators=(",", ":"))
+        )
+
+    def test_local_preprod_purge_plan_groups_only_canonical_reviewed_aliases(self) -> None:
+        manifest = self.schema_v2_manifest()
+        self.write_release_manifest(manifest)
+        builder, client, _ = self.purge_plan_builder(manifest)
+
+        with (
+            mock.patch.object(loader, "_load_local_builder", return_value=builder),
+            mock.patch.object(loader, "validate_archive_document_allowlist") as allowlist,
+            mock.patch.object(loader, "_inspect_local_release_image") as inspect,
+            mock.patch.object(loader, "load_archive") as load_archive,
+        ):
+            plan = loader.local_preprod_purge_plan(
+                self.archive,
+                self.archive_digest,
+                self.manifest,
+                self.manifest_digest,
+                self.project,
+            )
+
+        self.assertEqual(plan["manifest_sha256"], self.manifest_digest)
+        self.assertEqual(plan["record_count"], 5)
+        self.assertEqual(plan["unique_image_id_count"], 5)
+        self.assertEqual(
+            [group["image_id"] for group in plan["groups"]],
+            sorted(group["image_id"] for group in plan["groups"]),
+        )
+        external_group = next(
+            group for group in plan["groups"] if group["image_id"] == self.image_id
+        )
+        self.assertEqual(
+            external_group["aliases"],
+            [
+                {"kind": "external-reference", "value": self.reference},
+                {
+                    "kind": "external-repository-digest",
+                    "value": "registry.example/base@sha256:" + "a" * 64,
+                },
+                {
+                    "kind": "external-tag",
+                    "value": "registry.example/base:1",
+                },
+            ],
+        )
+        inspect.assert_not_called()
+        load_archive.assert_not_called()
+        client.run.assert_not_called()
+        allowlist.assert_called_once()
+
+    def test_local_preprod_purge_plan_rejects_schema_scope_and_platform_skew(self) -> None:
+        cases = []
+        schema_one = json.loads(self.manifest.read_text(encoding="utf-8"))
+        cases.append(("schema", schema_one, "linux/arm64", "schema-v2"))
+        production = self.schema_v2_production_manifest()
+        cases.append(("scope", production, "linux/arm64", "preprod-scoped"))
+        preprod = self.schema_v2_manifest()
+        cases.append(("platform", preprod, "linux/amd64", "does not match"))
+
+        for name, manifest, platform, error in cases:
+            with self.subTest(name=name):
+                self.write_release_manifest(manifest)
+                builder, _, _ = self.purge_plan_builder(
+                    manifest, platform=platform
+                )
+                with (
+                    mock.patch.object(
+                        loader, "_load_local_builder", return_value=builder
+                    ),
+                    mock.patch.object(loader, "validate_archive") as archive_check,
+                    mock.patch.object(loader, "validate_archive_document_allowlist"),
+                    self.assertRaisesRegex(loader.SeedError, error),
+                ):
+                    loader.local_preprod_purge_plan(
+                        self.archive,
+                        self.archive_digest,
+                        self.manifest,
+                        self.manifest_digest,
+                        self.project,
+                    )
+                if name in {"schema", "scope"}:
+                    archive_check.assert_not_called()
+                else:
+                    archive_check.assert_called_once()
+
+    def test_local_preprod_purge_plan_checks_digests_owner_and_mode(self) -> None:
+        manifest = self.schema_v2_manifest()
+        self.write_release_manifest(manifest)
+
+        with self.assertRaisesRegex(loader.SeedError, "image seed SHA-256"):
+            loader.local_preprod_purge_plan(
+                self.archive,
+                "0" * 64,
+                self.manifest,
+                self.manifest_digest,
+                self.project,
+            )
+        with self.assertRaisesRegex(loader.SeedError, "manifest SHA-256"):
+            loader.local_preprod_purge_plan(
+                self.archive,
+                self.archive_digest,
+                self.manifest,
+                "0" * 64,
+                self.project,
+            )
+
+        self.archive.chmod(0o644)
+        with self.assertRaisesRegex(loader.SeedError, "mode must be 0600"):
+            loader.local_preprod_purge_plan(
+                self.archive,
+                self.archive_digest,
+                self.manifest,
+                self.manifest_digest,
+                self.project,
+            )
+        self.archive.chmod(0o600)
+
+        with (
+            mock.patch.object(loader.os, "geteuid", return_value=os.geteuid() + 1),
+            self.assertRaisesRegex(loader.SeedError, "owned by the invoking user"),
+        ):
+            loader.local_preprod_purge_plan(
+                self.archive,
+                self.archive_digest,
+                self.manifest,
+                self.manifest_digest,
+                self.project,
+            )
+
+    def test_local_preprod_purge_plan_checks_source_build_and_oci_contracts(self) -> None:
+        manifest = self.schema_v2_manifest()
+        self.write_release_manifest(manifest)
+
+        builder, _, _ = self.purge_plan_builder(
+            manifest, source_references=set()
+        )
+        with (
+            mock.patch.object(loader, "_load_local_builder", return_value=builder),
+            self.assertRaisesRegex(loader.SeedError, "current source pins"),
+        ):
+            loader.local_preprod_purge_plan(
+                self.archive,
+                self.archive_digest,
+                self.manifest,
+                self.manifest_digest,
+                self.project,
+            )
+
+        builder, _, _ = self.purge_plan_builder(
+            manifest, planned_build_inputs={"schema": 1, "services": {}}
+        )
+        with (
+            mock.patch.object(loader, "_load_local_builder", return_value=builder),
+            self.assertRaisesRegex(loader.SeedError, "build inputs"),
+        ):
+            loader.local_preprod_purge_plan(
+                self.archive,
+                self.archive_digest,
+                self.manifest,
+                self.manifest_digest,
+                self.project,
+            )
+
+        builder, _, _ = self.purge_plan_builder(manifest)
+        with (
+            mock.patch.object(loader, "_load_local_builder", return_value=builder),
+            mock.patch.object(
+                loader,
+                "validate_archive_document_allowlist",
+                side_effect=loader.SeedError("unapproved OCI descriptor"),
+            ),
+            self.assertRaisesRegex(loader.SeedError, "unapproved OCI descriptor"),
+        ):
+            loader.local_preprod_purge_plan(
+                self.archive,
+                self.archive_digest,
+                self.manifest,
+                self.manifest_digest,
+                self.project,
+            )
+
+    def test_local_preprod_purge_plan_rejects_malformed_or_unreviewed_alias_data(self) -> None:
+        cases = []
+        bad_id = self.schema_v2_manifest()
+        bad_id["images"][0]["image_id"] = "sha256:not-an-id"
+        cases.append(("image ID", bad_id, "invalid image ID"))
+        bad_reference = self.schema_v2_manifest()
+        bad_reference["images"][0]["reference"] = "https://registry.example/base:1"
+        cases.append(("reference", bad_reference, "not digest-pinned"))
+        arbitrary_alias = self.schema_v2_manifest()
+        arbitrary_alias["images"][0]["alias"] = "attacker.example/image:latest"
+        cases.append(("alias", arbitrary_alias, "exact object"))
+        unexpected = self.schema_v2_manifest()
+        unexpected["unreviewed"] = True
+        cases.append(("root field", unexpected, "unexpected or missing fields"))
+
+        for name, manifest, error in cases:
+            with self.subTest(name=name):
+                self.write_release_manifest(manifest)
+                builder, _, _ = self.purge_plan_builder(manifest)
+                with (
+                    mock.patch.object(
+                        loader, "_load_local_builder", return_value=builder
+                    ),
+                    mock.patch.object(loader, "validate_archive_document_allowlist"),
+                    self.assertRaisesRegex(loader.SeedError, error),
+                ):
+                    loader.local_preprod_purge_plan(
+                        self.archive,
+                        self.archive_digest,
+                        self.manifest,
+                        self.manifest_digest,
+                        self.project,
+                    )
+
+    def test_local_preprod_purge_plan_rejects_one_alias_owned_by_two_ids(self) -> None:
+        manifest = self.schema_v2_manifest()
+        portal = manifest["custom_images"][0]
+        samba = manifest["custom_images"][1]
+        portal["image"] = samba["archive_reference"]
+        portal["archive_reference"] = (
+            "ai-gateway/samba-ad:aigw-seed-" + portal["image_id"][7:]
+        )
+        manifest["build_inputs"]["services"]["portal"]["image"] = portal["image"]
+        self.write_release_manifest(manifest)
+        builder, _, _ = self.purge_plan_builder(manifest)
+
+        with (
+            mock.patch.object(loader, "_load_local_builder", return_value=builder),
+            mock.patch.object(loader, "validate_archive_document_allowlist"),
+            self.assertRaisesRegex(loader.SeedError, "alias to multiple IDs"),
+        ):
+            loader.local_preprod_purge_plan(
+                self.archive,
+                self.archive_digest,
+                self.manifest,
+                self.manifest_digest,
+                self.project,
+            )
+
+    def test_purge_plan_rejects_docker_equivalent_alias_collisions(self) -> None:
+        first_id = "sha256:" + "1" * 64
+        second_id = "sha256:" + "2" * 64
+        digest = "sha256:" + "3" * 64
+        self.assertEqual(
+            loader._canonical_local_image_alias("docker.io/debian:stable"),
+            loader._canonical_local_image_alias(
+                "docker.io/library/debian:stable"
+            ),
+        )
+        self.assertNotEqual(
+            loader._canonical_local_image_alias(
+                "registry-1.docker.io/library/debian:stable"
+            ),
+            loader._canonical_local_image_alias(
+                "docker.io/library/debian:stable"
+            ),
+        )
+        with self.assertRaisesRegex(loader.SeedError, "alias to multiple IDs"):
+            loader._purge_plan_aliases(
+                {
+                    "external_images": [
+                        {
+                            "reference": f"debian:stable@{digest}",
+                            "image_id": first_id,
+                        },
+                        {
+                            "reference": (
+                                f"docker.io/library/debian:stable@{digest}"
+                            ),
+                            "image_id": second_id,
+                        },
+                    ],
+                    "custom_images": [],
+                }
+            )
+
+        with self.assertRaisesRegex(loader.SeedError, "alias to multiple IDs"):
+            loader._purge_plan_aliases(
+                {
+                    "external_images": [],
+                    "custom_images": [
+                        {
+                            "archive_reference": (
+                                "ai-gateway/tool:aigw-seed-" + "1" * 64
+                            ),
+                            "image": "ai-gateway/tool",
+                            "image_id": first_id,
+                        },
+                        {
+                            "archive_reference": (
+                                "docker.io/ai-gateway/tool:aigw-seed-" + "2" * 64
+                            ),
+                            "image": "docker.io/ai-gateway/tool:latest",
+                            "image_id": second_id,
+                        },
+                    ],
+                }
+            )
+
     def test_production_loader_cli_requires_production_scope(self) -> None:
         expected = "LOADED " + self.archive_digest
+        fake_environment = {"UNTRUSTED": "removed"}
         with (
+            mock.patch.object(loader.os, "environ", fake_environment),
             mock.patch.object(loader.os, "geteuid", return_value=loader.ROOT_UID),
             mock.patch.object(loader, "run", return_value=expected) as load,
             mock.patch("builtins.print") as output,
@@ -451,6 +865,7 @@ class OfflineImageSeedTests(unittest.TestCase):
             )
 
         self.assertEqual(returncode, 0)
+        self.assertEqual(fake_environment, {"PATH": loader.FIXED_PATH})
         load.assert_called_once_with(
             self.archive,
             self.archive_digest,
@@ -463,7 +878,9 @@ class OfflineImageSeedTests(unittest.TestCase):
 
     def test_root_preprod_loader_cli_requires_preprod_scope(self) -> None:
         expected = "LOADED " + self.archive_digest
+        fake_environment = {"UNTRUSTED": "removed"}
         with (
+            mock.patch.object(loader.os, "environ", fake_environment),
             mock.patch.object(loader.os, "geteuid", return_value=loader.ROOT_UID),
             mock.patch.object(loader, "run", return_value=expected) as load,
             mock.patch("builtins.print") as output,
@@ -481,6 +898,7 @@ class OfflineImageSeedTests(unittest.TestCase):
             )
 
         self.assertEqual(returncode, 0)
+        self.assertEqual(fake_environment, {"PATH": loader.FIXED_PATH})
         load.assert_called_once_with(
             self.archive,
             self.archive_digest,
@@ -1262,6 +1680,69 @@ class OfflineImageSeedTests(unittest.TestCase):
         )
         self.assertNotIn("egress_policy", receipt)
 
+    def test_archive_reader_hashes_oci_and_legacy_config_metadata(self) -> None:
+        legacy_content = b'{"architecture":"arm64","kind":"legacy"}'
+        oci_content = b'{"architecture":"arm64","kind":"oci"}'
+        legacy_digest = hashlib.sha256(legacy_content).hexdigest()
+        oci_digest = hashlib.sha256(oci_content).hexdigest()
+        large_layer = b"x" * (loader.MAX_ARCHIVE_METADATA_BYTES + 1)
+        large_layer_digest = hashlib.sha256(large_layer).hexdigest()
+
+        def process_for(entries: list[tuple[str, bytes]]) -> mock.Mock:
+            archive_stream = io.BytesIO()
+            with tarfile.open(fileobj=archive_stream, mode="w") as archive:
+                for name, content in entries:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(content)
+                    archive.addfile(info, io.BytesIO(content))
+            process = mock.Mock()
+            process.stdout = io.BytesIO(archive_stream.getvalue())
+            process.stderr = io.BytesIO(b"")
+            process.wait.return_value = 0
+            return process
+
+        entries = [
+            ("manifest.json", b"[]"),
+            ("index.json", b'{"schemaVersion":2,"manifests":[]}'),
+            (legacy_digest + ".json", legacy_content),
+            ("blobs/sha256/" + oci_digest, oci_content),
+            ("blobs/sha256/" + large_layer_digest, large_layer),
+        ]
+        with (
+            mock.patch.object(
+                loader.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, b"", b""),
+            ),
+            mock.patch.object(
+                loader.subprocess, "Popen", return_value=process_for(entries)
+            ),
+        ):
+            metadata = loader._read_archive_metadata(self.archive, "zstd")
+        self.assertEqual(
+            metadata["_verified_small_blobs"],
+            {f"sha256:{legacy_digest}", f"sha256:{oci_digest}"},
+        )
+        self.assertNotIn(
+            f"sha256:{large_layer_digest}", metadata["_verified_small_blobs"]
+        )
+
+        duplicate_entries = [*entries, (legacy_digest + ".json", legacy_content)]
+        with (
+            mock.patch.object(
+                loader.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, b"", b""),
+            ),
+            mock.patch.object(
+                loader.subprocess,
+                "Popen",
+                return_value=process_for(duplicate_entries),
+            ),
+            self.assertRaisesRegex(loader.SeedError, "duplicate image metadata"),
+        ):
+            loader._read_archive_metadata(self.archive, "zstd")
+
     def test_production_archive_allowlist_rejects_preprod_descriptor_and_tag(self) -> None:
         document = loader.validate_manifest_document(
             self.schema_v2_production_manifest(), self.archive, "linux/arm64"
@@ -1270,7 +1751,10 @@ class OfflineImageSeedTests(unittest.TestCase):
         external_tag = self.reference.rsplit("@sha256:", 1)[0]
         metadata = {
             "manifest.json": [
-                {"RepoTags": [external_tag]},
+                {
+                    "Config": self.image_id[7:] + ".json",
+                    "RepoTags": [external_tag],
+                },
                 *[
                     {
                         "Config": image["image_id"][7:] + ".json",
@@ -1303,6 +1787,7 @@ class OfflineImageSeedTests(unittest.TestCase):
                 ],
             },
         }
+        self.add_verified_archive_metadata(metadata)
         with mock.patch.object(loader, "_read_archive_metadata", return_value=metadata):
             loader.validate_archive_document_allowlist(self.archive, "zstd", document)
 
@@ -1319,6 +1804,7 @@ class OfflineImageSeedTests(unittest.TestCase):
                 },
             }
         )
+        self.add_verified_archive_metadata(metadata)
         with mock.patch.object(loader, "_read_archive_metadata", return_value=metadata):
             with self.assertRaisesRegex(loader.SeedError, "unapproved"):
                 loader.validate_archive_document_allowlist(
@@ -1365,7 +1851,10 @@ class OfflineImageSeedTests(unittest.TestCase):
         tag = self.reference.rsplit("@sha256:", 1)[0]
         metadata = {
             "manifest.json": [
-                {"RepoTags": [tag]},
+                {
+                    "Config": self.image_id[7:] + ".json",
+                    "RepoTags": [tag],
+                },
                 {
                     "Config": production["image_id"][7:] + ".json",
                     "RepoTags": [production["archive_reference"]],
@@ -1428,6 +1917,7 @@ class OfflineImageSeedTests(unittest.TestCase):
                 ],
             },
         }
+        self.add_verified_archive_metadata(metadata)
         with mock.patch.object(loader, "_read_archive_metadata", return_value=metadata):
             loader.validate_archive_document_allowlist(self.archive, "zstd", document)
 
@@ -1437,14 +1927,81 @@ class OfflineImageSeedTests(unittest.TestCase):
             "blobs/sha256/" + "8" * 64
         )
         metadata["index.json"]["manifests"][3]["digest"] = wif["image_id"]
+        self.add_verified_archive_metadata(metadata)
         with mock.patch.object(loader, "_read_archive_metadata", return_value=metadata):
             loader.validate_archive_document_allowlist(
                 self.archive, "zstd", document
             )
 
         metadata["index.json"]["manifests"][3]["digest"] = "sha256:" + "f" * 64
+        self.add_verified_archive_metadata(metadata)
         with mock.patch.object(loader, "_read_archive_metadata", return_value=metadata):
             with self.assertRaisesRegex(loader.SeedError, "immutable image ID"):
+                loader.validate_archive_document_allowlist(
+                    self.archive, "zstd", document
+                )
+
+    def test_schema_v2_archive_allowlist_binds_external_image_id(self) -> None:
+        document = loader.validate_manifest_document(
+            self.schema_v2_manifest(), self.archive, "linux/arm64"
+        )
+        tag = self.reference.rsplit("@sha256:", 1)[0]
+        metadata = {
+            "manifest.json": [
+                {
+                    "Config": self.image_id[7:] + ".json",
+                    "RepoTags": [tag],
+                },
+                *[
+                    {
+                        "Config": image["image_id"][7:] + ".json",
+                        "RepoTags": [image["archive_reference"]],
+                    }
+                    for image in document["custom_images"]
+                ],
+            ],
+            "index.json": {
+                "schemaVersion": 2,
+                "manifests": [
+                    {
+                        "digest": "sha256:" + "a" * 64,
+                        "annotations": {
+                            "io.containerd.image.name": tag,
+                            "containerd.io/distribution.source.registry.example": "base",
+                        },
+                    },
+                    *[
+                        {
+                            "digest": image["image_id"],
+                            "annotations": {
+                                "io.containerd.image.name": (
+                                    "docker.io/" + image["archive_reference"]
+                                )
+                            },
+                        }
+                        for image in document["custom_images"]
+                    ],
+                ],
+            },
+        }
+        self.add_verified_archive_metadata(metadata)
+
+        with mock.patch.object(loader, "_read_archive_metadata", return_value=metadata):
+            loader.validate_archive_document_allowlist(self.archive, "zstd", document)
+
+        metadata["_verified_small_blobs"] = set()
+        with mock.patch.object(loader, "_read_archive_metadata", return_value=metadata):
+            with self.assertRaisesRegex(loader.SeedError, "missing or unverified"):
+                loader.validate_archive_document_allowlist(
+                    self.archive, "zstd", document
+                )
+        self.add_verified_archive_metadata(metadata)
+
+        document["external_images"][0]["image_id"] = (
+            document["custom_images"][0]["image_id"]
+        )
+        with mock.patch.object(loader, "_read_archive_metadata", return_value=metadata):
+            with self.assertRaisesRegex(loader.SeedError, "external image.*immutable"):
                 loader.validate_archive_document_allowlist(
                     self.archive, "zstd", document
                 )

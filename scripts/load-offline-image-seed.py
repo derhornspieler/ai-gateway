@@ -34,6 +34,7 @@ MAX_ARCHIVE_METADATA_BYTES = 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 100_000
 MAX_CAPTURED_OCI_DOCUMENTS = 512
 OCI_BLOB_PATH_RE = re.compile(r"^blobs/sha256/([0-9a-f]{64})$")
+LEGACY_CONFIG_PATH_RE = re.compile(r"^([0-9a-f]{64})\.json$")
 OCI_IMAGE_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
 DOCKER_IMAGE_MANIFEST_MEDIA_TYPE = (
     "application/vnd.docker.distribution.manifest.v2+json"
@@ -543,6 +544,43 @@ def _image_repository(image: str) -> str:
     return image
 
 
+def _canonical_local_image_alias(value: str) -> str:
+    """Normalize the Docker reference forms that name the same local alias."""
+
+    named_reference, separator, digest = value.rpartition("@")
+    if not separator:
+        named_reference = value
+        digest = ""
+
+    final_component = named_reference.rsplit("/", 1)[-1]
+    if ":" in final_component:
+        repository, tag = named_reference.rsplit(":", 1)
+    else:
+        repository, tag = named_reference, "latest"
+
+    components = repository.split("/")
+    first = components[0]
+    if len(components) == 1 or not (
+        "." in first or ":" in first or first == "localhost"
+    ):
+        registry = "docker.io"
+        image_path = repository
+        if len(components) == 1:
+            image_path = f"library/{image_path}"
+    else:
+        registry = first
+        image_path = "/".join(components[1:])
+    if registry == "index.docker.io":
+        registry = "docker.io"
+    if registry == "docker.io" and "/" not in image_path:
+        image_path = f"library/{image_path}"
+
+    canonical_repository = f"{registry}/{image_path}"
+    if digest:
+        return f"{canonical_repository}@{digest}"
+    return f"{canonical_repository}:{tag}"
+
+
 def _validate_egress_policy(
     raw: object, custom_images: list[dict[str, str]]
 ) -> dict[str, object]:
@@ -876,6 +914,7 @@ def _read_archive_metadata(archive: Path, zstd: str) -> dict[str, object]:
     found: dict[str, object] = {}
     oci_documents: dict[str, dict[str, object]] = {}
     verified_small_blobs: set[str] = set()
+    seen_image_metadata_paths: set[str] = set()
     stream_error: SeedError | None = None
     try:
         with tarfile.open(fileobj=decompressor.stdout, mode="r|") as source:
@@ -900,19 +939,43 @@ def _read_archive_metadata(archive: Path, zstd: str) -> dict[str, object]:
                     continue
 
                 blob_match = OCI_BLOB_PATH_RE.fullmatch(member.name)
-                if (
-                    blob_match is None
-                    or not member.isfile()
+                legacy_config_match = LEGACY_CONFIG_PATH_RE.fullmatch(member.name)
+                if blob_match is None and legacy_config_match is None:
+                    continue
+                if member.name in seen_image_metadata_paths:
+                    raise SeedError(
+                        "image seed archive has unsafe or duplicate image metadata"
+                    )
+                seen_image_metadata_paths.add(member.name)
+                if legacy_config_match is not None and (
+                    not member.isfile()
                     or member.size < 1
                     or member.size > MAX_ARCHIVE_METADATA_BYTES
                 ):
+                    raise SeedError(
+                        "image seed archive has unsafe or duplicate image metadata"
+                    )
+                if blob_match is not None and (
+                    not member.isfile()
+                    or member.size < 1
+                    or member.size > MAX_ARCHIVE_METADATA_BYTES
+                ):
+                    # OCI layers use the same path form and are normally much
+                    # larger than metadata. Do not read them into memory. A
+                    # required descriptor/config remains unverified and fails
+                    # the later schema-v2 binding gate.
                     continue
                 member_file = source.extractfile(member)
                 if member_file is None:
                     raise SeedError("cannot read image seed OCI blob metadata")
                 content = member_file.read()
-                digest = f"sha256:{blob_match.group(1)}"
-                if hashlib.sha256(content).hexdigest() != blob_match.group(1):
+                digest_text = (
+                    blob_match.group(1)
+                    if blob_match is not None
+                    else legacy_config_match.group(1)
+                )
+                digest = f"sha256:{digest_text}"
+                if hashlib.sha256(content).hexdigest() != digest_text:
                     raise SeedError("image seed OCI blob digest does not match its path")
                 verified_small_blobs.add(digest)
                 try:
@@ -964,6 +1027,10 @@ def _normalised_oci_name(save_reference: str) -> tuple[str, str, str]:
     else:
         registry = components[0]
         image_path = "/".join(components[1:])
+    if registry == "index.docker.io":
+        registry = "docker.io"
+    if registry == "docker.io" and "/" not in image_path:
+        image_path = f"library/{image_path}"
     return registry, image_path, f"{registry}/{image_path}:{tag}"
 
 
@@ -1082,6 +1149,23 @@ def validate_archive_document_allowlist(
     if not isinstance(archive_manifest, list) or not isinstance(archive_index, dict):
         raise SeedError("image seed must be an OCI archive with manifest.json and index.json")
 
+    raw_oci_documents = metadata.get("_oci_documents", {})
+    raw_verified_small_blobs = metadata.get("_verified_small_blobs", set())
+    if not isinstance(raw_oci_documents, dict) or not isinstance(
+        raw_verified_small_blobs, set
+    ):
+        raise SeedError("image seed OCI support metadata is invalid")
+    oci_documents = {
+        digest: item
+        for digest, item in raw_oci_documents.items()
+        if isinstance(digest, str) and isinstance(item, dict)
+    }
+    if len(oci_documents) != len(raw_oci_documents) or any(
+        not isinstance(digest, str) for digest in raw_verified_small_blobs
+    ):
+        raise SeedError("image seed OCI support metadata is invalid")
+    verified_small_blobs = set(raw_verified_small_blobs)
+
     external_by_tag = {
         image["reference"].rsplit("@sha256:", 1)[0]: image
         for image in external_images
@@ -1091,6 +1175,7 @@ def validate_archive_document_allowlist(
     }
     expected_tags = set(external_by_tag) | set(custom_by_tag)
     seen_tags: set[str] = set()
+    external_config_matches: dict[str, bool] = {}
     custom_config_matches: dict[str, bool] = {}
     for entry in archive_manifest:
         if not isinstance(entry, dict):
@@ -1106,15 +1191,25 @@ def validate_archive_document_allowlist(
                     "image seed archive contains an unapproved or duplicate repository tag"
                 )
             seen_tags.add(tag)
+            external = external_by_tag.get(tag)
+            if external is not None:
+                external_config_matches[tag] = _config_matches_image_id(
+                    entry.get("Config"), external["image_id"]
+                ) and external["image_id"] in verified_small_blobs
             custom = custom_by_tag.get(tag)
             if custom is not None:
                 custom_config_matches[tag] = _config_matches_image_id(
                     entry.get("Config"), custom["image_id"]
-                )
+                ) and custom["image_id"] in verified_small_blobs
     if seen_tags != expected_tags:
         raise SeedError("image seed archive repository tags do not exactly match its manifest")
     if set(custom_config_matches) != set(custom_by_tag):
         raise SeedError("image seed archive omitted a custom image ID binding")
+    if (
+        document.get("schema_version") == 2
+        and set(external_config_matches) != set(external_by_tag)
+    ):
+        raise SeedError("image seed archive omitted an external image ID binding")
 
     descriptors = archive_index.get("manifests")
     if archive_index.get("schemaVersion") != 2 or not isinstance(descriptors, list):
@@ -1136,22 +1231,6 @@ def validate_archive_document_allowlist(
         for image in custom_images
     }
 
-    raw_oci_documents = metadata.get("_oci_documents", {})
-    raw_verified_small_blobs = metadata.get("_verified_small_blobs", set())
-    if not isinstance(raw_oci_documents, dict) or not isinstance(
-        raw_verified_small_blobs, set
-    ):
-        raise SeedError("image seed OCI support metadata is invalid")
-    oci_documents = {
-        digest: item
-        for digest, item in raw_oci_documents.items()
-        if isinstance(digest, str) and isinstance(item, dict)
-    }
-    if len(oci_documents) != len(raw_oci_documents) or any(
-        not isinstance(digest, str) for digest in raw_verified_small_blobs
-    ):
-        raise SeedError("image seed OCI support metadata is invalid")
-    verified_small_blobs = set(raw_verified_small_blobs)
     expected_external_digests = {key[0] for key in external_descriptors}
 
     seen_external: set[str] = set()
@@ -1183,16 +1262,28 @@ def validate_archive_document_allowlist(
             or IMAGE_ID.fullmatch(digest) is None
         ):
             raise SeedError("image seed OCI descriptor lacks digest provenance")
+        if document.get("schema_version") == 2 and digest not in verified_small_blobs:
+            raise SeedError("image seed OCI descriptor blob is missing or unverified")
 
         external = external_descriptors.get((digest, canonical_name))
         if external is not None:
             reference = external["reference"]
+            save_reference = reference.rsplit("@sha256:", 1)[0]
             if (
                 annotations.get(external["source_key"]) != external["source_value"]
                 or reference in seen_external
             ):
                 raise SeedError(
                     "image seed archive has invalid or duplicate OCI image provenance"
+                )
+            external_image = external_by_tag[save_reference]
+            if (
+                document.get("schema_version") == 2
+                and digest != external_image["image_id"]
+                and not external_config_matches[save_reference]
+            ):
+                raise SeedError(
+                    "external image archive tag does not bind its immutable image ID"
                 )
             seen_external.add(reference)
             continue
@@ -2212,6 +2303,155 @@ def local_release_receipt(
     )
 
 
+def _purge_plan_aliases(document: dict[str, object]) -> dict[str, object]:
+    """Return only manifest-reviewed names, grouped by immutable image ID."""
+
+    external_images = document["external_images"]
+    custom_images = document["custom_images"]
+    assert isinstance(external_images, list)
+    assert isinstance(custom_images, list)
+
+    groups: dict[str, set[tuple[str, str]]] = {}
+    alias_owners: dict[str, str] = {}
+
+    def add_alias(image_id: str, kind: str, value: str) -> None:
+        alias = (kind, value)
+        canonical_value = _canonical_local_image_alias(value)
+        owner = alias_owners.get(canonical_value)
+        if owner is not None and owner != image_id:
+            raise SeedError("release assigns one reviewed image alias to multiple IDs")
+        alias_owners[canonical_value] = image_id
+        groups.setdefault(image_id, set()).add(alias)
+
+    for image in external_images:
+        reference = image["reference"]
+        image_id = image["image_id"]
+        tagged_reference, digest = reference.rsplit("@", 1)
+        repository = _image_repository(tagged_reference)
+        add_alias(image_id, "external-reference", reference)
+        add_alias(
+            image_id,
+            "external-repository-digest",
+            f"{repository}@{digest}",
+        )
+        add_alias(image_id, "external-tag", tagged_reference)
+
+    for image in custom_images:
+        image_id = image["image_id"]
+        add_alias(
+            image_id,
+            "custom-archive-reference",
+            image["archive_reference"],
+        )
+        add_alias(image_id, "custom-image", image["image"])
+
+    canonical_groups = []
+    for image_id in sorted(groups):
+        canonical_groups.append(
+            {
+                "aliases": [
+                    {"kind": kind, "value": value}
+                    for kind, value in sorted(groups[image_id])
+                ],
+                "image_id": image_id,
+            }
+        )
+    return {
+        "groups": canonical_groups,
+        "record_count": len(external_images) + len(custom_images),
+        "schema_version": 1,
+        "unique_image_id_count": len(canonical_groups),
+    }
+
+
+def local_preprod_purge_plan(
+    archive: Path,
+    archive_digest: str,
+    manifest_path: Path,
+    manifest_digest: str,
+    project_root: Path,
+) -> dict[str, object]:
+    """Validate one release without inspecting, loading, tagging, or removing images."""
+
+    _validate_local_release_file(archive, "release archive", ".docker.tar.zst")
+    _validate_local_release_file(
+        manifest_path,
+        "release manifest",
+        ".manifest.json",
+        MAX_ARCHIVE_METADATA_BYTES,
+    )
+    if archive.parent.resolve() != manifest_path.parent.resolve():
+        raise SeedError("local release archive and manifest must share one directory")
+    for label, digest in (
+        ("archive", archive_digest),
+        ("manifest", manifest_digest),
+    ):
+        if DIGEST.fullmatch(digest) is None:
+            raise SeedError(
+                f"{label} SHA-256 must be 64 lowercase hexadecimal characters"
+            )
+
+    manifest = validate_manifest_file(manifest_path, manifest_digest)
+    claimed_platform = manifest.get("platform")
+    if claimed_platform not in {"linux/amd64", "linux/arm64"}:
+        raise SeedError("local preproduction requires a supported Linux platform")
+    document = validate_manifest_document(manifest, archive, claimed_platform)
+    if document["schema_version"] != 2:
+        raise SeedError("local preproduction requires a schema-v2 image release")
+    if document["release_scope"] != RELEASE_SCOPE_PREPROD:
+        raise SeedError("local preproduction requires a preprod-scoped image release")
+
+    # Hash the multi-gigabyte archive only after the small manifest has passed
+    # its complete schema, scope, and policy checks.
+    validate_archive(archive, archive_digest)
+    builder = _load_local_builder(project_root)
+    policy = builder.OutputPolicy(os.geteuid(), os.getegid(), False)
+    try:
+        client = builder.resolve_docker_client(
+            policy=policy,
+            docker_path=None,
+            docker_config=None,
+            docker_context=None,
+            docker_host=LOCAL_DOCKER_HOST,
+        )
+        platform = builder.platform(client)
+    except (OSError, builder.SeedBuildError) as exc:
+        raise SeedError(f"cannot select the local preprod Docker daemon: {exc}") from exc
+
+    if platform != claimed_platform:
+        raise SeedError(
+            f"image seed platform {claimed_platform!r} does not match {platform}"
+        )
+
+    external_images = document["external_images"]
+    assert isinstance(external_images, list)
+    try:
+        source_references = builder.collect_project_image_reference_scopes(
+            project_root
+        )[RELEASE_SCOPE_PREPROD]
+    except (KeyError, OSError, builder.SeedBuildError) as exc:
+        raise SeedError(f"cannot verify current preprod source pins: {exc}") from exc
+    if {image["reference"] for image in external_images} != source_references:
+        raise SeedError("local release manifest does not exactly match current source pins")
+
+    _verify_release_build_inputs(
+        builder,
+        client,
+        document,
+        project_root,
+        privileged=False,
+    )
+    try:
+        zstd = builder._find_executable("zstd", policy)
+    except (OSError, builder.SeedBuildError) as exc:
+        raise SeedError(f"cannot select the local zstd executable: {exc}") from exc
+    validate_archive_document_allowlist(archive, zstd, document)
+
+    plan = _purge_plan_aliases(document)
+    plan["manifest_sha256"] = manifest_digest
+    return plan
+
+
 def reconcile_build_plan(
     archive: Path,
     manifest_path: Path,
@@ -2663,6 +2903,28 @@ def main(argv: list[str]) -> int:
         print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))
         return 0
 
+    if len(argv) == 8 and argv[1] == "local-preprod-purge-plan":
+        if os.geteuid() == ROOT_UID:
+            print(
+                "ERROR: local preprod purge planning must run as the desktop Docker user",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            configure_local_controller_docker(argv[7])
+            outcome = local_preprod_purge_plan(
+                Path(argv[2]),
+                argv[3],
+                Path(argv[4]),
+                argv[5],
+                Path(argv[6]),
+            )
+        except (OSError, SeedError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))
+        return 0
+
     if len(argv) == 5 and argv[1] == "loaded-egress-policy-receipt":
         if os.geteuid() != ROOT_UID:
             print("ERROR: offline image seed loader must run as root", file=sys.stderr)
@@ -2741,6 +3003,9 @@ def main(argv: list[str]) -> int:
             "   or: load-offline-image-seed.py local-release-receipt "
             "ARCHIVE.docker.tar.zst MANIFEST.manifest.json "
             "MANIFEST_SHA256 PROJECT_ROOT\n"
+            "   or: load-offline-image-seed.py local-preprod-purge-plan "
+            "ARCHIVE.docker.tar.zst ARCHIVE_SHA256 MANIFEST.manifest.json "
+            "MANIFEST_SHA256 PROJECT_ROOT unix:///LOCAL/DOCKER.sock\n"
             "   or: load-offline-image-seed.py loaded-egress-policy-receipt "
             "ARCHIVE.docker.tar.zst MANIFEST.manifest.json MANIFEST_SHA256\n"
             "   or: load-offline-image-seed.py "

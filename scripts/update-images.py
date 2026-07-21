@@ -6,8 +6,9 @@ This is a controller-side operator tool. It has three commands:
   prepare       Pull every exact pin, build every custom image, and write a
                 schema-v2 offline release. It can also test that exact release
                 in local Ansible preprod.
-  test-preprod  Deploy an existing schema-v2 release to local preprod and run
-                its end-to-end test.
+  test-preprod  With --load-archive, clean local preprod, load an existing
+                schema-v2 release, and run its Ansible acceptance test. Without
+                that flag, run only a quick development check of loaded images.
   upgrade       Stage a candidate release on a Rocky host, take an encrypted
                 state backup, deploy with Ansible, run the external acceptance
                 gate, and automatically restore the prior release on failure.
@@ -55,6 +56,7 @@ REMOTE_SEED_ROOT = "/var/lib/ai-gateway/image-seeds"
 REMOTE_RECOVERY_IDENTITY = "/run/ai-gateway-image-update/rollback.agekey"
 PREPROD_INVENTORY = ROOT / "ansible/inventory/preprod.yml"
 PREPROD_PLAYBOOK = ROOT / "ansible/preprod.yml"
+PREPROD_CLEAN_ROOM_PLAYBOOK = ROOT / "ansible/preprod-clean-room.yml"
 STAGE_PLAYBOOK = ROOT / "ansible/stage-offline-image-seed.yml"
 RECOVERY_IDENTITY_PLAYBOOK = ROOT / "ansible/manage-update-recovery-identity.yml"
 PREPROD_SEED_STAGE_PLAYBOOK = ROOT / "ansible/stage-preprod-image-seed.yml"
@@ -87,6 +89,7 @@ PREPROD_IMAGE_BY_SERVICE = {
     "samba-ad": "ai-gateway/samba-ad:preprod",
     "wif-provider-mock": "ai-gateway/wif-provider-mock:preprod",
 }
+PREPROD_CLEAN_ROOM_CONFIRMATION = "DESTROY_AIGW_PREPROD_RELEASE_IMAGES"
 
 
 class WorkflowError(RuntimeError):
@@ -537,7 +540,10 @@ def ansible_command(
     vault_id: str | None,
     extra_vars: dict[str, object],
     ask_become_pass: bool = False,
+    become_password_file: Path | None = None,
 ) -> None:
+    if ask_become_pass and become_password_file is not None:
+        fail("choose --ask-become-pass or --become-password-file, not both")
     with write_extra_vars(extra_vars) as variables:
         command = [
             "ansible-playbook",
@@ -551,6 +557,8 @@ def ansible_command(
             command.extend(["--vault-id", vault_id])
         if ask_become_pass:
             command.append("--ask-become-pass")
+        if become_password_file is not None:
+            command.extend(["--become-password-file", str(become_password_file)])
         command.extend(["--extra-vars", f"@{variables}"])
         run_checked(
             command,
@@ -592,7 +600,11 @@ def preprod_release_paths(
 
 
 def stage_preprod_release(
-    release: Release, *, state: str, ask_become_pass: bool
+    release: Release,
+    *,
+    state: str,
+    ask_become_pass: bool,
+    become_password_file: Path | None = None,
 ) -> tuple[Path, Path]:
     require_release_scope(release, RELEASE_SCOPE_PREPROD)
     if state == "present":
@@ -615,20 +627,66 @@ def stage_preprod_release(
             "preprod_seed_stage_manifest": str(manifest),
         },
         ask_become_pass=ask_become_pass,
+        become_password_file=become_password_file,
     )
     return archive, manifest
 
 
-def test_preprod(release: Release, *, load_archive: bool, ask_become_pass: bool) -> None:
+def clean_room_preprod_release(
+    release: Release,
+    *,
+    ask_become_pass: bool,
+    become_password_file: Path | None = None,
+) -> None:
+    """Remove only release-owned preprod state and prove seed images are absent."""
+
+    require_release_scope(release, RELEASE_SCOPE_PREPROD)
+    validate_release_archive_allowlist(release)
+    ansible_command(
+        root=ROOT,
+        inventory=PREPROD_INVENTORY,
+        playbook=PREPROD_CLEAN_ROOM_PLAYBOOK,
+        limit=None,
+        vault_id=None,
+        extra_vars={
+            "preprod_seed_archive": str(release.archive),
+            "preprod_seed_archive_sha256": release.archive_sha256,
+            "preprod_seed_manifest": str(release.manifest),
+            "preprod_seed_manifest_sha256": release.manifest_sha256,
+            "preprod_clean_room_confirmation": PREPROD_CLEAN_ROOM_CONFIRMATION,
+        },
+        ask_become_pass=ask_become_pass,
+        become_password_file=become_password_file,
+    )
+
+
+def test_preprod(
+    release: Release,
+    *,
+    load_archive: bool,
+    ask_become_pass: bool,
+    become_password_file: Path | None = None,
+) -> None:
     require_release_scope(release, RELEASE_SCOPE_PREPROD)
     validate_release_source_pins(release, ROOT)
     loader_archive: Path | None = None
     loader_manifest: Path | None = None
     staged = False
     privileged_stage = load_archive and sys.platform != "darwin"
+    if load_archive:
+        # A release rehearsal starts from proved absence. If this cleanup
+        # fails, no root staging directory is created and no deploy starts.
+        clean_room_preprod_release(
+            release,
+            ask_become_pass=ask_become_pass,
+            become_password_file=become_password_file,
+        )
     if privileged_stage:
         loader_archive, loader_manifest = stage_preprod_release(
-            release, state="present", ask_become_pass=ask_become_pass
+            release,
+            state="present",
+            ask_become_pass=ask_become_pass,
+            become_password_file=become_password_file,
         )
         staged = True
     elif load_archive:
@@ -647,6 +705,9 @@ def test_preprod(release: Release, *, load_archive: bool, ask_become_pass: bool)
         "preprod_seed_manifest": str(release.manifest),
         "preprod_seed_manifest_sha256": release.manifest_sha256,
         "preprod_seed_load_archive": load_archive,
+        # Clean-room mode must consume archive bytes. A stale loader marker or
+        # surviving image would yield SKIPPED/RELOADED and fail the play.
+        "preprod_seed_require_fresh_load": load_archive,
         "preprod_seed_loader_archive": str(loader_archive or ""),
         "preprod_seed_loader_manifest": str(loader_manifest or ""),
     }
@@ -659,11 +720,15 @@ def test_preprod(release: Release, *, load_archive: bool, ask_become_pass: bool)
             vault_id=None,
             extra_vars=values,
             ask_become_pass=ask_become_pass,
+            become_password_file=become_password_file,
         )
     finally:
         if staged:
             stage_preprod_release(
-                release, state="absent", ask_become_pass=ask_become_pass
+                release,
+                state="absent",
+                ask_become_pass=ask_become_pass,
+                become_password_file=become_password_file,
             )
     print("SEEDED_PREPROD_E2E_PASSED")
 
@@ -683,8 +748,15 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         {args.archive, args.manifest, preprod_archive, preprod_manifest}
     ) != 4:
         fail("production and preprod release paths must be distinct")
-    if args.ask_become_pass and not args.test_preprod:
-        fail("--ask-become-pass requires --test-preprod")
+    if (
+        args.ask_become_pass or args.become_password_file is not None
+    ) and not args.test_preprod:
+        fail("--ask-become-pass and --become-password-file require --test-preprod")
+    become_password_file = (
+        normalize_become_password_file(args.become_password_file)
+        if args.become_password_file is not None
+        else None
+    )
     command = [
         sys.executable,
         "-I",
@@ -749,6 +821,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             preprod_release,
             load_archive=True,
             ask_become_pass=args.ask_become_pass,
+            become_password_file=become_password_file,
         )
     return 0
 
@@ -763,6 +836,11 @@ def cmd_test_preprod(args: argparse.Namespace) -> int:
         release,
         load_archive=args.load_archive,
         ask_become_pass=args.ask_become_pass,
+        become_password_file=(
+            normalize_become_password_file(args.become_password_file)
+            if args.become_password_file is not None
+            else None
+        ),
     )
     return 0
 
@@ -799,6 +877,50 @@ def normalize_inventory(path: Path) -> Path:
 
 def normalize_root_ca(path: Path) -> Path:
     return normalize_regular_controller_file(path, "--root-ca")
+
+
+def normalize_become_password_file(path: Path) -> Path:
+    """Validate a sudo password file without opening or copying it."""
+
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        fail("--become-password-file must be an absolute controller path")
+    require_caller_owned_parent(candidate, "become password file")
+    try:
+        metadata = candidate.lstat()
+    except FileNotFoundError as exc:
+        raise WorkflowError(
+            f"become password file does not exist: {candidate}"
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        fail("become password file must be a regular file, not a symlink")
+    if metadata.st_uid != os.geteuid():
+        fail("become password file must be owned by the current user")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        fail("become password file must have mode 0600")
+    if metadata.st_nlink != 1:
+        fail("become password file must have exactly one hard link")
+    resolved = candidate.resolve()
+    try:
+        resolved_metadata = resolved.lstat()
+    except FileNotFoundError as exc:
+        raise WorkflowError(
+            "become password file changed while it was being checked"
+        ) from exc
+    if (metadata.st_dev, metadata.st_ino) != (
+        resolved_metadata.st_dev,
+        resolved_metadata.st_ino,
+    ):
+        fail("become password file changed while it was being checked")
+    if (
+        not stat.S_ISREG(resolved_metadata.st_mode)
+        or stat.S_ISLNK(resolved_metadata.st_mode)
+        or resolved_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(resolved_metadata.st_mode) != 0o600
+        or resolved_metadata.st_nlink != 1
+    ):
+        fail("become password file changed while it was being checked")
+    return resolved
 
 
 def normalize_vault_id(value: str) -> str:
@@ -1514,6 +1636,24 @@ def add_release_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_preprod_become_arguments(parser: argparse.ArgumentParser) -> None:
+    become = parser.add_mutually_exclusive_group()
+    become.add_argument(
+        "--ask-become-pass",
+        action="store_true",
+        help="ask for sudo when preprod manages its owned local resources",
+    )
+    become.add_argument(
+        "--become-password-file",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "absolute caller-owned mode-0600 password file passed only to "
+            "ansible-playbook"
+        ),
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -1529,7 +1669,7 @@ def parser() -> argparse.ArgumentParser:
         "prepare",
         help="pull exact pins, build all custom images, and export schema v2",
         epilog=(
-            "Example:\n  python3 scripts/update-images.py prepare "
+            "Example:\n  python3 -I scripts/update-images.py prepare "
             "--provider anthropic --platform linux/amd64 "
             "--archive /srv/aigw/candidate.docker.tar.zst "
             "--manifest /srv/aigw/candidate.manifest.json --test-preprod"
@@ -1572,22 +1712,21 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--test-preprod",
         action="store_true",
-        help="deploy the just-built release to local Ansible preprod and run E2E",
+        help=(
+            "clean local preprod, load the just-built archive, and run Ansible "
+            "acceptance"
+        ),
     )
-    prepare.add_argument(
-        "--ask-become-pass",
-        action="store_true",
-        help="ask for sudo when macOS preprod creates its owned loopback aliases",
-    )
+    add_preprod_become_arguments(prepare)
     prepare.set_defaults(function=cmd_prepare)
 
     preprod = commands.add_parser(
         "test-preprod",
         help="deploy an existing schema-v2 release to local Ansible preprod",
         epilog=(
-            "Example:\n  python3 scripts/update-images.py test-preprod "
-            "--archive /srv/aigw/candidate.docker.tar.zst "
-            "--manifest /srv/aigw/candidate.manifest.json"
+            "Release example:\n  python3 -I scripts/update-images.py test-preprod "
+            "--archive /srv/aigw/candidate.preprod.docker.tar.zst "
+            "--manifest /srv/aigw/candidate.preprod.manifest.json --load-archive"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1595,16 +1734,12 @@ def parser() -> argparse.ArgumentParser:
     preprod.add_argument(
         "--load-archive",
         action="store_true",
-        help="load transferred archive bytes before testing instead of using local build images",
-    )
-    preprod.add_argument(
-        "--ask-become-pass",
-        action="store_true",
         help=(
-            "ask for sudo for macOS loopback aliases and, with --load-archive, "
-            "the root Docker loader"
+            "release-grade clean-room purge, fresh archive load, and Ansible "
+            "acceptance; without this flag the check is development-only"
         ),
     )
+    add_preprod_become_arguments(preprod)
     preprod.set_defaults(function=cmd_test_preprod)
 
     upgrade = commands.add_parser(

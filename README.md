@@ -6,12 +6,14 @@ Checks: [infrastructure](.github/workflows/infrastructure-ci.yml),
 [filesystem and IaC](.github/workflows/trivy.yml), and
 [GitHub Actions policy](.github/workflows/actions-security.yml).
 
-AI Gateway is a security-focused, self-hosted AI access platform for an existing
-Rocky Linux 9 VM. It puts OpenAI- and Anthropic-compatible API front doors,
-browser chat, per-user gateway keys, Keycloak OIDC, immutable provider-selected
-egress,
-Vault-backed provider credentials, local observability, and a narrow optional
-Cribl SOC log feed behind one hardened Docker Compose stack.
+AI Gateway is a self-hosted, security-focused AI access platform. Production
+runs on an existing Rocky Linux 9 VM. Local release tests run in Docker
+preprod. The stack provides compatible API endpoints, browser chat, user keys,
+Keycloak login, Vault-backed provider access, local monitoring, and an optional
+Cribl SOC log feed.
+
+Anthropic is the only approved egress provider today. API compatibility does
+not mean another provider is enabled.
 
 Ansible configures the host and containers. It does **not** create the VM or a
 NetworkManager profile, readdress an interface, or change customer-owned routes,
@@ -61,131 +63,100 @@ authentication, key-lifecycle, rotation, telemetry, and converge flows) is in
 
 ## Host interfaces
 
-The supported host has three customer-owned, already-addressed interfaces:
+Production needs three customer-owned network interfaces. They must already
+have their IP settings:
 
-- **egress** — the only default route; no gateway listener is published here.
-- **ADM** (`ETH1_IP`) — SSH and administrative HTTPS, restricted to the VPN
-  source CIDR.
-- **internal** (`ETH2_IP`) — user HTTPS and an optional exact Cribl SOC log export,
-  restricted to the internal source CIDR.
+- **egress:** the only default route; it has no gateway listener.
+- **ADM:** SSH and admin HTTPS for the approved VPN range.
+- **internal:** user HTTPS and the optional Cribl log feed.
 
 ## Status
 
-AI Gateway is a **customer prototype under active hardening** — one Compose
-project on one Rocky VM, not highly available and not a turnkey production
-appliance. Production Vault initialization and custody remain reviewed operator
-ceremonies; local preprod uses only disposable test custody. Implementation state,
-verification evidence, and the open items gating production live in
-[project status](docs/project-status.md); the historical destructive
-rebuild-and-restore evidence is archived in
-[docs/archive/lab-dr-rehearsal.md](docs/archive/lab-dr-rehearsal.md).
+AI Gateway is a **customer prototype under active hardening**. Production is
+one Compose project on one Rocky Linux VM. It is not highly available. Vault
+setup and key custody still need an approved operator ceremony. Preprod uses
+test-only key custody. See [project status](docs/project-status.md) for current
+limits and open work.
 
-## Documentation
+## Start here
 
-Choose one operator path:
+Pick the task that matches your goal:
 
-- **Local release test:** [Local Docker preprod](docs/preprod.md) →
-  [acceptance test runbook](docs/test-runbook.md).
-- **Production deployment:** [Production deployment runbook](docs/deploy-runbook.md)
-  → [operations and recovery](docs/operations.md) →
-  [Vault unseal after reboot](docs/sop/vault-unseal-after-reboot.md).
-- **Image release:** [Image update, local seeded test, production upgrade, and
-  rollback](docs/image-update-workflow.md).
+| Goal | Guide |
+| --- | --- |
+| Test a release in local Docker | [Local preprod](docs/preprod.md) |
+| Run the full release checks | [Acceptance test runbook](docs/test-runbook.md) |
+| Install on a production VM | [Production deployment](docs/deploy-runbook.md) |
+| Update images and build an offline seed | [Image update workflow](docs/image-update-workflow.md) |
+| Unlock Vault after a reboot | [Vault unseal SOP](docs/sop/vault-unseal-after-reboot.md) |
+| Run daily production tasks | [Production operations](docs/operations.md) |
 
-Use these pages when you need design detail:
+You do not need a test VM. The release gate runs in local Docker preprod with
+the fixed domain `aigw.internal`.
 
-- [Architecture and trust boundaries](docs/solution-map.md) and
-  [technical diagrams](docs/architecture-diagrams.md)
-- [Network rules](docs/network-security.md),
-  [FQDN and DNS inventory](docs/fqdn-inventory.md),
+Start preprod from source:
+
+```bash
+ansible-playbook -i ansible/inventory/preprod.yml ansible/preprod.yml \
+  --ask-become-pass
+```
+
+Ansible uses sudo only for the bounded `/etc/hosts` block and, on macOS, two
+loopback aliases. Docker still runs as your normal user. You may use a private
+become password file instead of the prompt. The
+[preprod guide](docs/preprod.md) shows both forms.
+
+Create a production inventory:
+
+```bash
+python3 -I scripts/bootstrap-rocky9-production.py \
+  --inventory-alias <alias> \
+  --vault-id <vault-id> \
+  --vault-password-file </absolute/private/password-file>
+```
+
+These three options are required for a non-interactive run. Run the script
+with no options in a terminal for guided prompts. Follow the production
+runbook after it creates the inventory.
+
+To check Compose without starting containers:
+
+```bash
+bash scripts/validate-compose.sh
+```
+
+## Documentation map
+
+- Design: [solution map](docs/solution-map.md) and
+  [architecture diagrams](docs/architecture-diagrams.md)
+- Network and names: [network rules](docs/network-security.md) and
+  [FQDN inventory](docs/fqdn-inventory.md)
+- Identity: [identity operations](docs/identity-operations.md),
+  [Keycloak design](docs/keycloak-realm-architecture.md), and
+  [Anthropic WIF](docs/anthropic-wif-bootstrap.md)
+- Images and trust: [offline seed details](docs/offline-image-seed.md),
+  [provider onboarding](docs/provider-onboarding.md), and
+  [provider CA maintenance](docs/sop/provider-ca-maintenance.md)
+- Security: [security model](docs/security-model.md),
   [OS security](docs/os-security.md), and
   [container security](docs/docker-security.md)
-- [Identity operations](docs/identity-operations.md),
-  [Keycloak realm design](docs/keycloak-realm-architecture.md), and
-  [Anthropic WIF](docs/anthropic-wif-bootstrap.md)
-- [Provider onboarding](docs/provider-onboarding.md),
-  [provider CA maintenance](docs/sop/provider-ca-maintenance.md), and
-  [offline seed internals](docs/offline-image-seed.md)
-- [Telemetry](docs/observability-operations.md),
-  [Cribl SOC logging handoff](docs/cribl-soc-handoff.md),
-  [LiteLLM scaling](docs/litellm-scaling.md), and
-  [high availability](docs/high-availability.md)
-
-Current state is in [project status](docs/project-status.md). Durable work is
-tracked in [TASKS.md](TASKS.md).
-
-The original
-[architecture skeleton](docs/archive/architecture-skeleton.md) is archived as
-historical input only. It is not an operational reference.
-
-## Deployment entry points
-
-Choose the environment before running anything:
-
-- For a disposable local Docker environment, follow the
-  [local preprod runbook](docs/preprod.md).
-- For a customer-owned Rocky Linux host, follow the
-  [production deployment runbook](docs/deploy-runbook.md).
-
-For a real customer host, generate a dedicated inventory with an encrypted
-secret overlay, fill in the topology, pass the controller-only preflight, and
-then converge:
-
-```bash
-ansible-galaxy collection install -r ansible/requirements.yml
-scripts/bootstrap-rocky9-production.py --inventory-alias <alias> \
-  --vault-id <vault-id> --vault-password-file <password-file>
-# edit ansible/inventory/generated/<alias>/host_vars/<alias>.yml
-ansible-playbook -i ansible/inventory/generated/<alias>/hosts.yml \
-  ansible/preflight-rocky9-production.yml --limit <alias> \
-  --vault-id <vault-id>@<password-file>
-ansible-playbook -i ansible/inventory/generated/<alias>/hosts.yml \
-  ansible/site.yml --limit <alias> --vault-id <vault-id>@<password-file>
-```
-
-The canonical profile is `rocky9-production` (Ansible group `production_rocky9`).
-The older `bootstrap-generic-rocky9.py` / `preflight-generic-rocky9.yml` /
-`generic-rocky9` names still work as DEPRECATED compatibility aliases and print a
-one-line deprecation notice pointing here.
-
-For disposable local preprod:
-
-```bash
-ansible-playbook -i ansible/inventory/preprod.yml ansible/preprod.yml
-```
-
-On macOS, append `--ask-become-pass` so the play can create the two missing
-Docker Desktop loopback aliases. Linux skips that privileged step.
-
-Production intentionally fails before mutating the host if the supplied
-topology disagrees with live interface/default-route facts. Preprod refuses a
-remote Docker context and does not run any Rocky Linux host role.
-
-Safe local validation that starts no containers and needs no secret overlay:
-
-```bash
-scripts/validate-compose.sh
-```
+- Monitoring and logs: [observability](docs/observability-operations.md) and
+  [Cribl SOC handoff](docs/cribl-soc-handoff.md)
+- Current work: [project status](docs/project-status.md) and
+  [TASKS.md](TASKS.md)
 
 ## Repository layout
 
 ```text
 ansible/
-  site.yml                 full converge = os-prep.yml then deploy-stack-only.yml
-  os-prep.yml              host preparation only (heavy preflight gates + roles
-                           through docker_networks); starts no containers
-  deploy-stack-only.yml    stack deploy + verify + marker promotion; refuses an
-                           unprepared host or a stale firewall/network ABI
+  site.yml                 full production run
+  os-prep.yml              production host setup; starts no containers
+  deploy-stack-only.yml    app deploy on a prepared production host
   inventory/               generated production inventories + local preprod
-  group_vars/all.yml       20 segmented bridge definitions and host variables
-  roles/                   host_preflight, firewall_preflight, time_sync,
-                           selinux_baseline, network_routing, firewalld_zones,
-                           os_baseline, docker_networks, docker_stack, verify,
-                           host_finalize
+  group_vars/all.yml       shared production defaults
+  roles/                   host, network, Docker, stack, and check roles
 compose/
-  docker-compose.yml       base stack, 24 services (22 selected by default,
-                           including volume-init; Vault UI pair profile-gated);
-                           images tag-and-digest pinned
+  docker-compose.yml       base stack with tag-and-digest image pins
   docker-compose.preprod.yml portable local overlay (Samba AD + WIF mock)
   .env.example             fail-closed variable contract templated by Ansible
   traefik/                 separate internal and ADM routing
@@ -208,43 +179,25 @@ scripts/
   state-restore.sh         authenticated offline restore; leaves graph stopped
   pre-upgrade-check.sh     recent-backup gate for stateful image changes
   update-images.py         seed build/test and remote upgrade/validate/rollback
-  plan-compose-builds.py / preserve-compose-rollbacks.py / *.py
-                           build planning, rollback retention, and portal tests
+  other tools              build plans, rollback retention, and portal tests
 docs/                      current operator and architecture documentation
 ```
 
 ## Primary security boundaries
 
-- Only Traefik publishes container ports, bound to the exact ADM/internal host
-  addresses; no container port is bound to the egress address or `0.0.0.0`.
-- Envoy at fixed `172.28.0.2` is the only workload allowed external DNS and
-  TCP/443. The offline release bakes only selected provider routes, exact
-  SNI/SAN rules, and reviewed CA bundles into one immutable image and policy.
-  Ansible never downloads CA trust during deployment.
-- Atomic `DOCKER-USER` rules and an independent native nftables guard deny
-  cross-plane, container-to-host, and unapproved bridge egress.
-- User/API, administrative, database, cache, Vault, telemetry, metrics,
-  observability, and trace planes use separate Docker bridges — 18 used by the
-  base stack, 20 pre-created by Ansible. Services join only the planes they need.
-- SSH is public-key-only: root, password, and interactive login and all
-  TCP/socket/agent/X11/tunnel forwarding are denied. Ansible proves a fresh
-  key-only login and non-interactive sudo after reloading the validated policy.
-- Keycloak realm roles gate chat, developer-key, and admin capabilities. The
-  LiteLLM Admin, Grafana, Prometheus, and Vault UIs are each fronted by their own
-  oauth2-proxy instance in reverse-proxy mode behind ADM-leg Traefik; open-source
-  Traefik provides TLS and routing but does not replace the Keycloak OIDC session
-  layer.
-- SELinux is a fail-closed deployment contract: the playbook requires Rocky's
-  `targeted` policy already enforcing, requires per-container MCS labels, and
-  asserts zero AVCs in the converge window. It does not convert a permissive or
-  disabled host.
-- Full prompts/completions are sensitive. Alloy converts the reviewed request
-  span into a sanitized audit log for local Loki and the optional Cribl SOC
-  feed. Raw traces, metrics, alerts, and ordinary service logs never enter
-  Cribl. Open WebUI uses one inference-only service key, so its enforced audit
-  identity is `svc-open-webui`.
-- Authenticated restore exits with zero running project containers under an exact
-  root-only marker; replacement initialization is forbidden on the recovery path.
+- Only edge services publish ports. Nothing binds to the egress IP or
+  `0.0.0.0`.
+- Envoy is the only app path to provider DNS and HTTPS. Its provider routes and
+  CA files are fixed in the release image.
+- Separate networks limit which services can talk to each other.
+- Keycloak roles protect chat, developer, and admin access.
+- Vault holds provider and signing secrets.
+- SELinux, firewall rules, and Ansible checks fail closed.
+- Cribl gets only the approved SOC log set. Metrics and alerts stay local.
+- Restore keeps the stack stopped until Ansible checks it.
+
+Read the [security model](docs/security-model.md) for the full controls and
+trust boundaries.
 
 This remains a customer prototype, not a turnkey production appliance. Review the
 documented residual risks, rehearse stateful upgrades and restore, and run the

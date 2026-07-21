@@ -6,11 +6,26 @@ layered, fail-closed network design. It is a customer-facing reference for
 the production configuration in `ansible/roles/network_routing`,
 `ansible/roles/firewalld_zones`, and `ansible/roles/docker_networks`.
 Companion visuals are in [technical diagrams](architecture-diagrams.md);
-component detail is in the [solution map](solution-map.md).
+component detail is in the [solution map](solution-map.md). The
+[security model](security-model.md) explains how this network layer fits with
+identity, containers, provider trust, and logging.
 
 Local preprod uses Docker networks only. It does not claim to test the Rocky
 host firewall or routing rules described here. See
 [local preprod](preprod.md).
+
+In plain language:
+
+- the egress interface accepts no inbound connection;
+- administrators enter only through the ADM interface and approved VPN range;
+- users enter only through the internal interface and approved source range;
+- containers on different service networks cannot talk unless the design puts
+  them on the same network;
+- only Envoy may use external DNS and provider TCP/443; and
+- optional Cribl export gets one separate Alloy-to-destination rule.
+
+Both `DOCKER-USER` and `aigw_guard` enforce the container packet rules. One is
+not a backup setting for the other; both must be live.
 
 ## Design principle
 

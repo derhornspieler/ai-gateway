@@ -1,0 +1,108 @@
+---
+- name: Require the exact release-image clean-room confirmation and seed inputs
+  ansible.builtin.assert:
+    that:
+      - preprod_clean_room_confirmation == 'DESTROY_AIGW_PREPROD_RELEASE_IMAGES'
+      - preprod_image_mode == 'seed'
+      - preprod_seed_archive | length > 0
+      - preprod_seed_archive_sha256 is match('^[0-9a-f]{64}$')
+      - preprod_seed_manifest | length > 0
+      - preprod_seed_manifest_sha256 is match('^[0-9a-f]{64}$')
+    quiet: true
+    fail_msg: >-
+      Use ansible/preprod-clean-room.yml with the exact
+      DESTROY_AIGW_PREPROD_RELEASE_IMAGES confirmation and all four release
+      archive/manifest inputs.
+
+- name: Prove clean-room and the Linux root loader use the same Docker engine
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - seed
+      - check-root-seed-engine
+  become: false
+  changed_when: false
+  when: preprod_host_kernel.stdout | trim == 'Linux'
+
+- name: Validate, destroy, purge, and prove the exact preprod release boundary
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - seed
+      - clean-room-seed
+      - --archive
+      - "{{ preprod_seed_archive }}"
+      - --archive-sha256
+      - "{{ preprod_seed_archive_sha256 }}"
+      - --manifest
+      - "{{ preprod_seed_manifest }}"
+      - --manifest-sha256
+      - "{{ preprod_seed_manifest_sha256 }}"
+      - --confirm
+      - "{{ preprod_clean_room_confirmation }}"
+  become: false
+  register: preprod_clean_room
+  changed_when: "'PREPROD_CLEAN_ROOM_OK ' in preprod_clean_room.stdout"
+  failed_when: >-
+    preprod_clean_room.rc != 0 or
+    preprod_clean_room.stdout_lines | length != 1 or
+    (preprod_clean_room.stdout | trim) is not match(
+      '^PREPROD_CLEAN_ROOM_OK \\{[^\\r\\n]{1,1024}\\}$'
+    )
+
+- name: Remove only macOS loopback aliases owned by this preprod after clean-room purge
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - seed
+      - remove-loopback-aliases
+  become: true
+  register: preprod_clean_room_loopback
+  changed_when: >-
+    'PREPROD_LOOPBACK_ALIASES_REMOVED' in preprod_clean_room_loopback.stdout
+  when: preprod_host_kernel.stdout | trim == 'Darwin'
+
+- name: Remove only the exact marker-bounded preprod hosts fragment after clean-room purge
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - remove-hosts
+  become: true
+  register: preprod_clean_room_hosts
+  changed_when: "'PREPROD_HOSTS_REMOVED' in preprod_clean_room_hosts.stdout"
+  when: preprod_manage_hosts | bool
+
+- name: Report the completed release-image clean-room receipt
+  ansible.builtin.debug:
+    msg: "{{ preprod_clean_room.stdout | trim }}"
