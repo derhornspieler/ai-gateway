@@ -57,6 +57,10 @@ VEX = load(
     ".github/scripts/manage-dhi-vex.py",
     "_test_manage_dhi_vex",
 )
+REVIEWED_VEX = load(
+    ".github/scripts/manage-reviewed-vex.py",
+    "_test_manage_reviewed_vex",
+)
 SEED = load(
     "scripts/rebuild-offline-image-seed.py",
     "_test_release_container_seed_builder",
@@ -240,6 +244,7 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
                     "references": [],
                     "document_sha256s": [],
                     "statuses": [],
+                    "reviewed_records": [],
                 },
             },
             "image": {
@@ -256,7 +261,7 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
                 provenance,
                 "linux/amd64",
                 "sha256:" + "b" * 64,
-                ("c" * 64, [], [], []),
+                ("c" * 64, [], [], [], []),
             )
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(EVIDENCE.EvidenceError):
@@ -410,12 +415,13 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
             )
             self.assertEqual([record["reference"] for record in selected["records"]], [reference])
             self.assertTrue((output / "vex" / filename).is_file())
-            _, references, document_sha256s, statuses = EVIDENCE.validate_vex_receipt(
+            _, references, document_sha256s, statuses, reviewed = EVIDENCE.validate_vex_receipt(
                 selected, output, "linux/amd64"
             )
             self.assertEqual(references, [reference])
             self.assertEqual(document_sha256s, [VEX.sha256_file(vex_path)])
             self.assertEqual(statuses, ["verified"])
+            self.assertEqual(reviewed, [])
             with self.assertRaises(VEX.VexError):
                 VEX.select_vex(
                     policy_path,
@@ -469,13 +475,62 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
                 output,
             )
             selected = EVIDENCE.read_json(output / "selected-dhi-vex.json")
-            _, references, document_sha256s, statuses = EVIDENCE.validate_vex_receipt(
+            _, references, document_sha256s, statuses, reviewed = EVIDENCE.validate_vex_receipt(
                 selected, output, "linux/amd64"
             )
             self.assertEqual(references, [reference])
             self.assertEqual(document_sha256s, [])
             self.assertEqual(statuses, ["unavailable"])
+            self.assertEqual(reviewed, [])
             self.assertEqual(list((output / "vex").iterdir()), [])
+
+    def test_local_openwebui_vex_is_exact_expiring_and_never_claimed_signed(self) -> None:
+        self.assertIn("manage-reviewed-vex.py", WORKFLOW)
+        self.assertIn(
+            "Docker Hardened Images <dhi@docker.com>,AI Gateway platform security "
+            "<security@aigw.internal>",
+            WORKFLOW,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "vex").mkdir()
+            receipt = {
+                "schema": 1,
+                "platform": "linux/amd64",
+                "policy_sha256": "a" * 64,
+                "public_key_sha256": "b" * 64,
+                "docker_scout_version": "v1.23.1",
+                "signature_verified": True,
+                "transparency_log_verified": False,
+                "transparency_log_note": "Signature verification used the reviewed Docker key; transparency proof was unavailable.",
+                "records": [],
+                "reviewed_records": [],
+            }
+            receipt_path = output / "selected-dhi-vex.json"
+            VEX.write_json(receipt_path, receipt)
+            REVIEWED_VEX.attach(
+                ROOT,
+                "open-webui",
+                "ai-gateway/open-webui:0.10.2-aigw2",
+                receipt_path,
+            )
+            selected = EVIDENCE.read_json(receipt_path)
+            _, references, signed_hashes, statuses, reviewed = (
+                EVIDENCE.validate_vex_receipt(selected, output, "linux/amd64")
+            )
+            self.assertEqual(references, [])
+            self.assertEqual(signed_hashes, [])
+            self.assertEqual(statuses, [])
+            self.assertEqual(len(reviewed), 1)
+            self.assertFalse(reviewed[0]["signature_verified"])
+            self.assertEqual(reviewed[0]["vulnerability"], "CVE-2026-45829")
+            with self.assertRaises(REVIEWED_VEX.ReviewedVexError):
+                REVIEWED_VEX.attach(
+                    ROOT,
+                    "open-webui",
+                    "ai-gateway/open-webui:wrong",
+                    receipt_path,
+                )
 
 
 class TrivyWaiverContractTests(unittest.TestCase):

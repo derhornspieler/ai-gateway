@@ -215,6 +215,7 @@ jobs:
           platform: ${{ matrix.platform }}
           only-severities: critical,high
           only-vex-affected: true
+          vex-author: Docker Hardened Images <dhi@docker.com>
           vex-location: security-artifacts/${{ matrix.slug }}/vex
           exit-code: true
           sarif-file: security-artifacts/${{ matrix.slug }}/scout-vulnerabilities.sarif
@@ -335,6 +336,18 @@ jobs:
             --platform "$IMAGE_PLATFORM" \
             --output-directory "$ARTIFACT_DIR"
 
+      - name: Attach reviewed VEX for this exact custom image
+        env:
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
+          IMAGE_NAME: ${{ matrix.image }}
+          SERVICE_NAME: ${{ matrix.service }}
+        run: |
+          python3 -I .github/scripts/manage-reviewed-vex.py \
+            --root "$GITHUB_WORKSPACE" \
+            --service "$SERVICE_NAME" \
+            --image "$IMAGE_NAME" \
+            --receipt "$ARTIFACT_DIR/selected-dhi-vex.json"
+
       - name: Authenticate to DHI
         env:
           DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
@@ -401,6 +414,7 @@ jobs:
           platform: ${{ matrix.platform }}
           only-severities: critical,high
           only-vex-affected: true
+          vex-author: Docker Hardened Images <dhi@docker.com>,AI Gateway platform security <security@aigw.internal>
           vex-location: security-artifacts/${{ matrix.slug }}/vex
           exit-code: true
           sarif-file: security-artifacts/${{ matrix.slug }}/scout-vulnerabilities.sarif

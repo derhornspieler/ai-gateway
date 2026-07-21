@@ -11,3 +11,14 @@
 !cmd/extract-plugin/main_test.go
 !patch_openwebui_oauth.py
 !verify_openwebui_oauth.py
+!patch_openwebui_chroma.py
+!verify_openwebui_chroma.py
+!openwebui-wheels/
+!openwebui-wheels/SHA256SUMS
+!openwebui-wheels/README.md
+!openwebui-wheels/amd64/
+!openwebui-wheels/amd64/*.whl
+!openwebui-wheels/arm64/
+!openwebui-wheels/arm64/*.whl
+!openwebui-wheels/any/
+!openwebui-wheels/any/*.whl

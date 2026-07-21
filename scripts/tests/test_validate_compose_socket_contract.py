@@ -89,13 +89,13 @@ class ValidateComposeSocketContractTests(unittest.TestCase):
             )
         for required in (
             "dockerfile: Dockerfile.open-webui",
-            "image: ai-gateway/open-webui:0.10.2-aigw1",
+            "image: ai-gateway/open-webui:0.10.2-aigw2",
             "BASE_IMAGE: ghcr.io/open-webui/open-webui:v0.10.2@sha256:9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4",
         ):
             self.assertIn(required, compose)
         for required in (
             'services["open-webui"]["build"]["dockerfile"] == "Dockerfile.open-webui"',
-            'services["open-webui"]["image"] == "ai-gateway/open-webui:0.10.2-aigw1"',
+            'services["open-webui"]["image"] == "ai-gateway/open-webui:0.10.2-aigw2"',
             'services["open-webui"]["build"]["args"]["BASE_IMAGE"] == (',
             "9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4",
         ):

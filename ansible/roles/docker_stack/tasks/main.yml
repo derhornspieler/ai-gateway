@@ -574,7 +574,7 @@
     # adding minutes to every converge and shipping dev tooling to the host.
     - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.venv|venv|\.tox|node_modules|\.git|secrets)(/|$)')
     - item.path is not regex('(^|/)\.env(?:\.|$)|\.(?:pyc|pyo|pyd|key|p12|pfx)$')
-    - item.path is regex('(^|/)(Dockerfile(?:\.open-webui|\.grafana)?|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch)|upstream-provenance\.json|oauth-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
+    - item.path is regex('(^|/)(Dockerfile(?:\.open-webui|\.grafana)?|\.dockerignore|README\.md|SHA256SUMS|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch|whl)|upstream-provenance\.json|(?:oauth|chroma)-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
 
 # Ansible vars are the single source of truth for the runtime DNS views. The
 # repo-committed services/platform-dns files staged above are reviewed defaults for

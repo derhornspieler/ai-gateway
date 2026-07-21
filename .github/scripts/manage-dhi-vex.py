@@ -450,6 +450,10 @@ def select_vex(
         )
     }
     selected_receipt["records"] = selected
+    # A second fail-closed selector may attach a git-reviewed disposition for
+    # one exact custom image. Signed DHI records and local reviews stay
+    # separate so the evidence never claims our local document was signed.
+    selected_receipt["reviewed_records"] = []
     write_json(output_directory / "selected-dhi-vex.json", selected_receipt)
 
 

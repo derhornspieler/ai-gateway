@@ -9,19 +9,40 @@ RUN --network=none go test ./... \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/aigw-health-probe ./
 
 FROM ${BASE_IMAGE}
-# Open WebUI installs its compiler toolchain, Debian development Python,
-# MariaDB headers, curl, and jq in the final image. This deployment builds no
-# plugins at runtime, uses PostgreSQL, and uses the Go probe below. Remove those
-# packages and their unused dependencies from the runtime filesystem. All
-# package metadata comes from the pinned base image; this step has no network.
+# This is a chat-only gateway image. Remove compilers, package managers used as
+# application helpers, local ML stacks, and document conversion tools that the
+# reviewed deployment does not use. Package metadata comes from the pinned base
+# image, and every command stays offline.
 RUN --network=none apt-get autopurge -y \
       build-essential gcc g++ make libmariadb-dev python3-dev curl jq \
+      git pandoc ffmpeg \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
     && ! command -v gcc \
     && ! command -v curl \
     && ! command -v jq \
-    && test -x /usr/local/bin/python3 \
-    && python3 -I -m pip check
+    && ! command -v git \
+    && ! command -v pandoc \
+    && ! command -v ffmpeg \
+    && test -x /usr/local/bin/python3
+# Update the four runtime packages that have fixed releases. The wheels and
+# their reviewed hashes are committed so this step needs no package index.
+RUN --network=none \
+    --mount=type=bind,source=openwebui-wheels,target=/tmp/aigw-wheels,readonly \
+    cd /tmp/aigw-wheels \
+    && sha256sum -c SHA256SUMS \
+    && architecture="$(dpkg --print-architecture)" \
+    && test "$architecture" = amd64 -o "$architecture" = arm64 \
+    && python3 -I -m pip install --no-index --no-deps --force-reinstall \
+      any/*.whl "$architecture"/*.whl \
+    && python3 -I -m pip uninstall -y \
+      accelerate colbert-ai ctranslate2 datasets faster-whisper nltk \
+      pyarrow pymilvus python-jose python-pptx rapidocr-onnxruntime \
+      sentence-transformers setuptools spacy thinc torch torchvision \
+      unstructured wheel ecdsa \
+    && rm -f /usr/local/bin/uv /usr/local/bin/uvx \
+    && python3 -I -m pip check \
+    && python3 -I -c \
+      "import cryptography,importlib.metadata,mcp,multipart,PIL; assert cryptography.__version__ == '48.0.1'; assert importlib.metadata.version('mcp') == '1.28.1'; assert multipart.__version__ == '0.0.30'; assert PIL.__version__ == '12.3.0'"
 # The immutable upstream image contains Python and this exact module. The
 # patcher verifies both complete source hashes and both narrow promotion
 # snippets before changing bytes; the verifier executes the patched role method
@@ -29,13 +50,25 @@ RUN --network=none apt-get autopurge -y \
 RUN --network=none \
     --mount=type=bind,source=patch_openwebui_oauth.py,target=/tmp/patch_openwebui_oauth.py \
     --mount=type=bind,source=verify_openwebui_oauth.py,target=/tmp/verify_openwebui_oauth.py \
+    --mount=type=bind,source=patch_openwebui_chroma.py,target=/tmp/patch_openwebui_chroma.py \
+    --mount=type=bind,source=verify_openwebui_chroma.py,target=/tmp/verify_openwebui_chroma.py \
     python3 -I /tmp/patch_openwebui_oauth.py \
       /app/backend/open_webui/utils/oauth.py \
     && python3 -I /tmp/verify_openwebui_oauth.py \
       /app/backend/open_webui/utils/oauth.py \
+    && python3 -I /tmp/patch_openwebui_chroma.py \
+      /app/backend/open_webui/retrieval/vector/dbs/chroma.py \
+    && python3 -I /tmp/verify_openwebui_chroma.py \
+      /app/backend/open_webui/retrieval/vector/dbs/chroma.py \
     && mkdir -p /app/backend/data/cache \
     && chown -R 65532:65532 /app/backend/data \
     && chmod 0700 /app/backend/data
+# No runtime path needs Debian's Perl interpreter. Remove it only after every
+# apt operation is complete; the pinned base cannot fetch a patched package.
+RUN --network=none apt-get purge -y --allow-remove-essential perl-base \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
+    && ! command -v perl \
+    && python3 -I -m pip check
 COPY --from=probe-builder --chmod=0555 /out/aigw-health-probe /usr/local/bin/aigw-health-probe
 # The upstream health check uses curl and jq. Keep direct image runs healthy
 # after removing them by using the same static probe Compose uses.

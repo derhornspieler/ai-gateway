@@ -23,6 +23,9 @@ def read_vex_receipt(path: Path) -> tuple[dict[str, object], str]:
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SystemExit("cannot read selected DHI VEX receipt") from exc
     records = payload.get("records") if isinstance(payload, dict) else None
+    reviewed_records = (
+        payload.get("reviewed_records") if isinstance(payload, dict) else None
+    )
     if (
         not isinstance(payload, dict)
         or payload.get("schema") != 1
@@ -30,6 +33,7 @@ def read_vex_receipt(path: Path) -> tuple[dict[str, object], str]:
         or payload.get("transparency_log_verified") is not False
         or not isinstance(payload.get("transparency_log_note"), str)
         or not isinstance(records, list)
+        or not isinstance(reviewed_records, list)
         or any(
             not isinstance(record, dict)
             or not isinstance(record.get("reference"), str)
@@ -39,6 +43,14 @@ def read_vex_receipt(path: Path) -> tuple[dict[str, object], str]:
                 and not isinstance(record.get("sha256"), str)
             )
             for record in records
+        )
+        or any(
+            not isinstance(record, dict)
+            or record.get("service") != "open-webui"
+            or record.get("signature_verified") is not False
+            or record.get("status") != "git_reviewed_not_affected"
+            or not isinstance(record.get("sha256"), str)
+            for record in reviewed_records
         )
     ):
         raise SystemExit("selected DHI VEX receipt is malformed")
@@ -183,6 +195,9 @@ def main() -> None:
                 "statuses": [
                     record["status"] for record in vex_receipt["records"]
                 ],
+                # These records are reviewed in git and deliberately marked
+                # unsigned. They are never presented as Docker-signed DHI VEX.
+                "reviewed_records": vex_receipt["reviewed_records"],
             },
         },
         "image": {

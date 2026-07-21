@@ -570,7 +570,7 @@ services:
       network: none
       args:
         BASE_IMAGE: ghcr.io/open-webui/open-webui:v0.10.2@sha256:9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4
-    image: ai-gateway/open-webui:0.10.2-aigw1
+    image: ai-gateway/open-webui:0.10.2-aigw2
     # The derivative fixes the runtime identity to uid/gid 65532. All required
     # mutable application/cache state is on the initialized named volume or
     # the bounded tmpfs; source code remains immutable at runtime.
@@ -660,6 +660,11 @@ services:
       # load code from a model repository, or call a web-search provider.
       ENABLE_WEB_SEARCH: "false"
       ENABLE_RAG_LOCAL_WEB_FETCH: "false"
+      # The gateway's reviewed chat scope does not run local ML models. Files
+      # may still pass their extracted text to a chat, but Open WebUI must not
+      # build a vector index or load a sentence-transformer model at startup.
+      BYPASS_EMBEDDING_AND_RETRIEVAL: "true"
+      RAG_EMBEDDING_MODEL: ""
       RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE: "false"
       RAG_RERANKING_MODEL_TRUST_REMOTE_CODE: "false"
       # These optional surfaces are outside this gateway's chat-only scope.

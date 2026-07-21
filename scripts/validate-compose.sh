@@ -1278,7 +1278,7 @@ assert "PORTAL_KEY_PROJECT_LIMITS" not in services["admin-portal"]["environment"
 assert "UI_PASSWORD" not in services["admin-portal"]["environment"]
 assert "UI_PASSWORD" not in services["dev-portal"]["environment"]
 assert services["open-webui"]["build"]["dockerfile"] == "Dockerfile.open-webui"
-assert services["open-webui"]["image"] == "ai-gateway/open-webui:0.10.2-aigw1"
+assert services["open-webui"]["image"] == "ai-gateway/open-webui:0.10.2-aigw2"
 assert services["open-webui"]["build"]["args"]["BASE_IMAGE"] == (
     "ghcr.io/open-webui/open-webui:v0.10.2@sha256:"
     "9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4"
@@ -1301,6 +1301,8 @@ assert open_webui["environment"]["HOME"] == "/app/backend/data"
 assert open_webui["environment"]["PYTHONNOUSERSITE"] == "1"
 assert open_webui["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
 assert open_webui["environment"]["STATIC_DIR"] == "/tmp/static"
+assert open_webui["environment"]["BYPASS_EMBEDDING_AND_RETRIEVAL"] == "true"
+assert open_webui["environment"]["RAG_EMBEDDING_MODEL"] == ""
 for disabled_openwebui_feature in (
     "ENABLE_CODE_EXECUTION",
     "ENABLE_CODE_INTERPRETER",

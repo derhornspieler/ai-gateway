@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import stat
+from datetime import date
 
 
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -18,6 +19,14 @@ NO_VEX_REASON = "Docker Scout reported no VEX attestation for this exact DHI ima
 
 class EvidenceError(RuntimeError):
     """Required image evidence is missing, malformed, or contradictory."""
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def read_json(path: Path) -> object:
@@ -107,7 +116,7 @@ def validate_sbom(payload: object) -> None:
 
 def validate_vex_receipt(
     payload: object, directory: Path, expected_platform: str
-) -> tuple[str, list[str], list[str], list[str]]:
+) -> tuple[str, list[str], list[str], list[str], list[dict[str, object]]]:
     """Prove every selected DHI VEX file is signed-policy evidence."""
 
     if (
@@ -124,6 +133,7 @@ def validate_vex_receipt(
         )
         is None
         or not isinstance(payload.get("records"), list)
+        or not isinstance(payload.get("reviewed_records"), list)
     ):
         raise EvidenceError("selected DHI VEX receipt has an invalid schema")
     references: list[str] = []
@@ -180,12 +190,67 @@ def validate_vex_receipt(
         statuses.append(str(status_value))
     if references != sorted(set(references)):
         raise EvidenceError("selected DHI VEX references are not canonical")
+    reviewed_records: list[dict[str, object]] = []
+    for record in payload["reviewed_records"]:
+        if not isinstance(record, dict) or set(record) != {
+            "author",
+            "document_id",
+            "file",
+            "image",
+            "package",
+            "review_expires_on",
+            "service",
+            "sha256",
+            "signature_verified",
+            "status",
+            "vulnerability",
+        }:
+            raise EvidenceError("git-reviewed VEX receipt record is malformed")
+        relative = record.get("file")
+        digest = record.get("sha256")
+        if (
+            record.get("author")
+            != "AI Gateway platform security <security@aigw.internal>"
+            or record.get("document_id")
+            != "https://aigw.internal/security/vex/openwebui-0.10.2-aigw2-1"
+            or record.get("image") != "ai-gateway/open-webui:0.10.2-aigw2"
+            or record.get("package") != "pkg:pypi/chromadb@1.5.9"
+            or record.get("service") != "open-webui"
+            or record.get("signature_verified") is not False
+            or record.get("status") != "git_reviewed_not_affected"
+            or record.get("vulnerability") != "CVE-2026-45829"
+            or not isinstance(relative, str)
+            or re.fullmatch(r"vex/[0-9a-f]{24}\.reviewed\.openvex\.json", relative)
+            is None
+            or IMAGE_ID_RE.fullmatch("sha256:" + str(digest)) is None
+        ):
+            raise EvidenceError("git-reviewed Open WebUI VEX record drifted")
+        try:
+            if date.fromisoformat(str(record["review_expires_on"])) < date.today():
+                raise EvidenceError("git-reviewed Open WebUI VEX record expired")
+        except ValueError as exc:
+            raise EvidenceError("git-reviewed Open WebUI VEX date is malformed") from exc
+        document_path = directory / relative
+        document = read_json(document_path)
+        if (
+            sha256_file(document_path) != digest
+            or not isinstance(document, dict)
+            or document.get("author") != record["author"]
+            or document.get("@id") != record["document_id"]
+            or not isinstance(document.get("statements"), list)
+            or len(document["statements"]) != 1
+        ):
+            raise EvidenceError("git-reviewed Open WebUI VEX document changed")
+        reviewed_records.append(dict(record))
+    if len(reviewed_records) > 1:
+        raise EvidenceError("too many git-reviewed VEX records were selected")
     receipt_path = directory / "selected-dhi-vex.json"
     return (
         hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
         references,
         document_sha256s,
         statuses,
+        reviewed_records,
     )
 
 
@@ -193,7 +258,9 @@ def validate_provenance(
     payload: object,
     expected_platform: str,
     expected_image_id: str,
-    vex_evidence: tuple[str, list[str], list[str], list[str]],
+    vex_evidence: tuple[
+        str, list[str], list[str], list[str], list[dict[str, object]]
+    ],
 ) -> None:
     operating_system, separator, architecture = expected_platform.partition("/")
     if separator != "/" or operating_system != "linux" or not architecture:
@@ -204,7 +271,13 @@ def validate_provenance(
     image = payload.get("image")
     scanner = payload.get("scanner")
     vex = scanner.get("vex") if isinstance(scanner, dict) else None
-    vex_sha256, vex_references, vex_document_sha256s, vex_statuses = vex_evidence
+    (
+        vex_sha256,
+        vex_references,
+        vex_document_sha256s,
+        vex_statuses,
+        reviewed_records,
+    ) = vex_evidence
     if (
         not isinstance(outcomes, dict)
         or outcomes.get("pull_or_build") != "success"
@@ -221,6 +294,7 @@ def validate_provenance(
         or vex.get("references") != vex_references
         or vex.get("document_sha256s") != vex_document_sha256s
         or vex.get("statuses") != vex_statuses
+        or vex.get("reviewed_records") != reviewed_records
         or not isinstance(image, dict)
         or image.get("available") is not True
         or IMAGE_ID_RE.fullmatch(str(image.get("id"))) is None
@@ -228,6 +302,13 @@ def validate_provenance(
         or image.get("architecture") != architecture
     ):
         raise EvidenceError("image provenance does not prove a complete successful scan")
+    if reviewed_records:
+        reviewed = reviewed_records[0]
+        if (
+            payload.get("build_service") != reviewed["service"]
+            or image.get("requested_reference") != reviewed["image"]
+        ):
+            raise EvidenceError("git-reviewed VEX is attached to another image build")
     if expected_image_id:
         if IMAGE_ID_RE.fullmatch(expected_image_id) is None:
             raise EvidenceError("expected custom image ID is malformed")

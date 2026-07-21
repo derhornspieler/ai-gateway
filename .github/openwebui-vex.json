@@ -1,0 +1,26 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://aigw.internal/security/vex/openwebui-0.10.2-aigw2-1",
+  "author": "AI Gateway platform security <security@aigw.internal>",
+  "role": "Document Creator",
+  "timestamp": "2026-07-21T00:00:00Z",
+  "last_updated": "2026-07-21T00:00:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "@id": "openwebui-chromadb-1.5.9-cve-2026-45829",
+      "vulnerability": {
+        "name": "CVE-2026-45829"
+      },
+      "products": [
+        {
+          "@id": "pkg:pypi/chromadb@1.5.9"
+        }
+      ],
+      "status": "not_affected",
+      "status_notes": "The exact aigw2 derivative removes Chroma's remote HTTP client and every remote Chroma setting. It uses one embedded PersistentClient, creates collections with fixed cosine metadata, and supplies embeddings directly. The build verifies these source rules before it can produce the image.",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "timestamp": "2026-07-21T00:00:00Z"
+    }
+  ]
+}

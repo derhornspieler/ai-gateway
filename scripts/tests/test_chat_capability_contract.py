@@ -100,6 +100,8 @@ class ChatCapabilityContractTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(f'{name}: "false"', compose)
                 self.assertNotIn(f'{name}: "true"', compose)
+        self.assertIn('BYPASS_EMBEDDING_AND_RETRIEVAL: "true"', compose)
+        self.assertIn('RAG_EMBEDDING_MODEL: ""', compose)
 
     def test_openwebui_rp_logout_returns_to_the_chat_login(self) -> None:
         """Open WebUI's /signout only appends post_logout_redirect_uri when
