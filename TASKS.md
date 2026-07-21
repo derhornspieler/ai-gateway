@@ -260,6 +260,26 @@
 
 ## Done
 
+- [x] ~~Run the final current-source schema-v2 seed rehearsal~~ (2026-07-21)
+  - Release r10 built a 40-image ARM64 production archive and a 43-image
+    preprod archive with Anthropic as the only selected provider. The
+    production manifest excludes the two preprod-only images.
+  - The clean-room play removed 26 owned containers, 19 owned networks, 11
+    owned volumes, and 43 old release image IDs. It preserved 129 unrelated
+    image IDs. The fresh load and one Ansible seed-mode deploy ended with
+    `PREPROD_CLEAN_ROOM_OK`, `PREPROD_E2E_PASSED`, and
+    `SEEDED_PREPROD_E2E_PASSED`.
+  - Production archive SHA-256:
+    `958ee15a3609a9bdee13d7144b941cbb4379136b1d674103f5ae887bf04cd453`.
+    Production manifest SHA-256:
+    `0960fab4f0133cf4be610c8e552a554eb3d795d5114bb108201243deb90c3da7`.
+    Preprod archive SHA-256:
+    `73e244dc6fc6fd347f7b8711a8710b586f554c603bcb1c4e0a3ca5938f0ad7e8`.
+    Preprod manifest SHA-256:
+    `80173e1a67fcb0997fd90572a1f1e8087d22ecd9a2438038f33f1191d93d7d02`.
+  - The exact seeded portal image contains the automatic-setup wording. A
+    later comment-only provider wording change was reconverged against the
+    same seed and passed the full acceptance and Cribl recovery gates again.
 - [x] ~~Run the credential-gated release rehearsal~~ (2026-07-21)
   - Release r7 built a schema-v2 ARM64 production archive with 40 images and a
     preprod archive with 43 images. The clean-room play removed only the owned
