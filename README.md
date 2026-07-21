@@ -31,7 +31,7 @@ flowchart LR
     TA[traefik-adm]
     OW[Open WebUI chat]
     DP[dev-portal]
-    AP[admin-portal and admin UIs<br/>behind per-UI oauth2-proxy]
+    AP[admin-portal<br/>and proxied admin UIs]
     KC[Keycloak OIDC]
     LL[LiteLLM<br/>OpenAI/Anthropic-compatible API]
     KR[key-rotator]
@@ -43,6 +43,7 @@ flowchart LR
   ADM[VPN administrators] -->|ADM IP :443| TA
 
   TI --> DP
+  TI --> OW
   TI -->|aigw realm| KC
   TI -->|inference paths| LL
   TA --> AP & OW
