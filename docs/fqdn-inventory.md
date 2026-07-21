@@ -1,60 +1,55 @@
-# Service FQDN Inventory and DNS Design
+# Service names and DNS
 
-This is the authoritative list of every fully-qualified domain name AI
-Gateway exposes, what each one serves, and how name resolution is designed.
-Hostnames are shown against the deployment's base domain (`<domain>`, e.g.
-`aigw.example.com`); deliberately, **no IP addresses appear here** — the
-addresses belong to each deployment's inventory and change per install. The
-routing behind each name is defined in the Traefik file-provider
-configuration and verified by the `verify` role on every converge.
+This page lists every full DNS name, or FQDN, that AI Gateway publishes. It
+also says what each name does. `<domain>` means the base domain for one
+install, such as `aigw.example.com`.
+
+IP addresses are not listed here. They belong in that install's Ansible
+inventory. Traefik routes each name to the right service. Ansible checks every
+route after each deploy.
 
 ## External FQDNs
 
 | FQDN | Purpose | Leg | Notes |
 |---|---|---|---|
-| `<domain>` (apex) | DNS zone apex | — | NS/A records only; no HTTPS router answers on the apex |
-| `dns.<domain>` | Authoritative, non-recursive platform DNS (TCP/UDP 53) | ADM + internal | Exists only when the platform-DNS overlay is enabled (`platform_authoritative_dns_enabled`) |
-| `api.<domain>` | LiteLLM inference API (OpenAI/Anthropic-compatible) | Internal | Only the allow-listed inference/model/health paths; every other path on this host is an explicit 403 |
+| `<domain>` (apex) | Base of the DNS zone | — | DNS records only. No HTTPS route uses this name. |
+| `dns.<domain>` | Platform DNS on TCP/UDP 53 | ADM + internal | Exists only when `platform_authoritative_dns_enabled` is on. It answers from its own records and does not forward queries. |
+| `api.<domain>` | LiteLLM inference API (OpenAI/Anthropic-compatible) | Internal | Only approved inference, model, and health paths work. Every other path returns 403. |
 | `portal.<domain>` | Developer self-service portal (gateway keys, tool snippets) | Internal | |
-| `auth.<domain>` | Keycloak | Internal + ADM | Internal edge serves only the scoped `aigw`-realm login paths; the full console and master realm are reachable only through the ADM edge |
+| `auth.<domain>` | Keycloak | Internal + ADM | The internal edge serves only `aigw` realm login paths. The full console and master realm are ADM-only. |
 | `chat.<domain>` | Open WebUI browser chat | Internal + ADM | The same OIDC client serves both source-restricted edges |
 | `admin.<domain>` | Platform administration portal | ADM | |
 | `litellm-admin.<domain>` | Native LiteLLM administration UI | ADM | Behind its oauth2-proxy gate; `/openapi.json`, `/docs`, `/redoc` are denied |
 | `grafana.<domain>` | Grafana dashboards | ADM | Behind its oauth2-proxy gate |
 | `prometheus.<domain>` | Prometheus UI | ADM | Behind its oauth2-proxy gate |
-| `vault.<domain>` | Vault browser UI and `/v1` API proxy | ADM | Exists only when the optional Vault UI profile is enabled (`aigw_vault_ui_enabled`); router and backend are omitted otherwise |
+| `vault.<domain>` | Vault browser UI and `/v1` API proxy | ADM | Exists only when `aigw_vault_ui_enabled` is on. The route and service do not exist when it is off. |
 
-Two non-entries worth stating explicitly: the VM's own hostname needs no
-platform DNS record, and `keycloak.<domain>` is a stale historical name that
-was never implemented — use `auth.<domain>`.
+The VM hostname does not need a platform DNS record. Do not use
+`keycloak.<domain>`. That old name was never active. Use `auth.<domain>`.
 
-**Everything else has no external FQDN.** This includes PostgreSQL, Redis,
-Vault's internal API, Envoy, key-rotator, the oauth2-proxy gates, Alloy, Loki,
-node-exporter, cribl-mock, Samba AD, and the Traefik edges. They use private
-Docker DNS names on isolated bridges and cannot be reached from a physical
-network.
+Every other service stays private. This includes PostgreSQL, Redis, Vault's
+internal API, Envoy, key-rotator, the OAuth2 Proxy gates, Alloy, Loki,
+node-exporter, the Cribl mock, Samba AD, and both Traefik edges. They use
+private Docker names on isolated networks. A physical network cannot reach
+them directly.
 
 ## DNS resolution design
 
-Name resolution is split into two non-overlapping planes; the firewall
-enforces the split, not just configuration.
+DNS uses two separate paths. The firewall enforces this split.
 
-**Internal plane — the customer's DNS.** Internal services, users, and
-administrators resolve `<domain>` names through `internal_dns_servers`. Put
-the records in corporate DNS, or point approved clients at `dns.<domain>` when
-the optional platform DNS is enabled. Platform DNS uses separate views and
-never sends a query to another DNS server. The internal view shows only user
-records. The ADM view also shows administration records, so user-network DNS
-does not reveal the admin surface. Every container except Envoy uses this
-internal DNS plane.
+**Internal path: customer DNS.** Internal services, users, and admins resolve
+`<domain>` through `internal_dns_servers`. Put the records in corporate DNS.
+You may instead point approved clients at `dns.<domain>` when platform DNS is
+on. Platform DNS has separate internal and ADM views. The internal view shows
+only user names. The ADM view also shows admin names. Platform DNS never sends
+a query to another DNS server. Every container except Envoy uses this path.
 
-**Egress plane — internet DNS, Envoy only.** Envoy resolves vendor APIs through
-the internet servers in `egress_dns_servers`. For this deployment, they are
-`1.1.1.1` and `9.9.9.9`. Queries leave only through the egress interface. Both
-packet filters allow only Envoy's fixed address. No other container or host
-process may use an internet resolver. The internal and egress resolver lists
-cannot overlap. Preflight also rejects loopback, link-local, and multicast
-addresses.
+**Egress path: internet DNS for Envoy only.** Envoy resolves provider API names
+through `egress_dns_servers`. The current values are `1.1.1.1` and `9.9.9.9`.
+Queries leave only through the egress interface. Both packet filters allow
+only Envoy's fixed address. No other container or host process may use these
+resolvers. The internal and egress DNS lists cannot overlap. Preflight also
+rejects loopback, link-local, and multicast addresses.
 
 **Expected resolution per audience:**
 
@@ -64,30 +59,26 @@ addresses.
 | Administrators (VPN) | corporate DNS (or `dns.<domain>` ADM view) | `auth`, `chat`, `admin`, `litellm-admin`, `grafana`, `prometheus`, and optional `vault` → ADM leg address; `api` and `portal` → internal leg address |
 | Gateway containers | per-plane resolvers rendered by Ansible | internal names via internal plane; Envoy alone via internet plane |
 
-The `verify` role resolves and probes each name after every converge, so a
-missing or wrong record fails the deployment rather than surfacing as a
-user-reported outage.
+The `verify` role checks each name after every deploy. A missing or wrong DNS
+record stops the deploy.
 
 ## The certificate that covers all of them
 
-Every published name above is a **one-level subdomain of the base domain**, so a
-single edge certificate with
+Every published service name is one level below the base domain. One edge
+certificate can therefore cover all names when it has these values:
 
 ```
 SAN = DNS:*.<domain>, DNS:<domain>
 ```
 
-covers every FQDN on **both** edges. `scripts/edge-tls.py` enforces exactly this
-shape: it refuses edge material whose SAN is missing either the wildcard or the
-apex, so a certificate that would leave one vhost unservable cannot reach the
-live store. The apex entry is not decorative — a `*.<domain>` wildcard does not
-match the bare `<domain>`.
+`scripts/edge-tls.py` requires both values. It rejects a certificate that is
+missing either one. The base-domain entry matters because `*.<domain>` does
+not match the bare `<domain>`.
 
-Both Traefik edges read the same store (`certs/int.crt` + `certs/int.key`).
-HTTPS terminates there and nowhere else; traffic behind the edges is plain HTTP
-on segmented internal bridges. See [operations](operations.md) §"Production edge
-TLS" for the three supported certificate modes and their ceremony commands.
+Both Traefik edges read `certs/int.crt` and `certs/int.key`. They end the HTTPS
+connection. Traffic behind them uses plain HTTP only on isolated Docker
+networks. See [operations](operations.md#production-edge-tls) for the three
+certificate modes and their commands.
 
-> If the signing CA carries `nameConstraints`, `<domain>` must fall within a
-> permitted DNS subtree or the chain will not verify. Pick the base domain to
-> satisfy the CA before deploying, not after.
+> If the signing CA has `nameConstraints`, `<domain>` must be in an allowed DNS
+> tree. Check this before you deploy. Otherwise, certificate checks will fail.
