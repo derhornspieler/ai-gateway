@@ -1,86 +1,79 @@
-# Scaling and High Availability Posture
+# Scaling and availability
 
-The implemented `rocky9-production` profile (deprecated alias
-`generic-rocky9`) runs one Docker Compose project on one Rocky Linux 9 VM.
-This deployment is **not highly available**. High availability on Docker
-Compose is not supported. The host, Docker daemon, kernel, storage, firewalls,
-network interfaces, and power all share one failure domain. Compose bridges
-and service-name DNS do not span hosts. Adding replicas on the same VM does
-not change that. The recovery and reboot exercises in
-[operations.md](operations.md) restore this single stack; they do not confer
-HA. Current posture is tracked in
-[project-status.md](project-status.md).
+Production runs one Docker Compose stack on one Rocky Linux 9 VM. The profile
+name is `rocky9-production`. `generic-rocky9` is an older alias.
 
-## Capacity on this deployment: scale the VM vertically
+This design is **not highly available**. The VM, Docker, storage, firewall,
+network cards, and power are one failure point. Docker Compose networks do not
+cross hosts. More copies of a container on the same VM do not fix this limit.
 
-The supported way to add capacity to the Compose deployment is vertical:
-increase the VM's CPU, memory, and disk, then raise the reviewed per-service
-resource limits. Per-service knobs — LiteLLM workers/connection pools first
-among them — are bounded in [litellm-scaling.md](litellm-scaling.md).
+The reboot and recovery steps in [production operations](operations.md) bring
+this one stack back. They do not provide high availability. See the
+[project status](project-status.md) for the current release limits.
 
-Ad hoc Compose `--scale` is not supported. Several services carry
-single-replica invariants: key-rotator's managed-group topology lock and the
-portals' key-lifecycle serialization are process-local, LiteLLM's worker/pool
-accounting assumes the reviewed container count, and Grafana, Loki,
-Prometheus, Vault, and Postgres all use local single-writer state. Keep one
-replica and one worker per service unless a change is explicitly reviewed.
+## Add capacity to the current VM
 
-## High availability and horizontal scaling: Kubernetes
+Give the VM more CPU, memory, or disk when it needs more capacity. Then review
+and raise the matching service limits. Start with LiteLLM worker and database
+pool limits in the [LiteLLM scaling guide](litellm-scaling.md).
 
-True HA and horizontal scaling require a separate Kubernetes design. Another
-Compose overlay on this VM is not enough. The Kubernetes design must include:
+Do not use `docker compose --scale`. Several services must have one process:
 
-- independent nodes in separate failure domains;
-- external HA PostgreSQL and Redis;
-- Vault Integrated Storage with TLS and a production unseal ceremony;
+- key-rotator and the portals use in-process locks;
+- LiteLLM limits assume the reviewed worker count; and
+- Grafana, Loki, Prometheus, Vault, and PostgreSQL use local state.
+
+Keep one container and one worker for each service unless a reviewed design
+changes these rules.
+
+## True high availability needs a new platform
+
+True high availability needs a separate Kubernetes design. A second Compose
+file on the same VM is not enough.
+
+That design must include:
+
+- nodes in separate failure zones;
+- highly available PostgreSQL and Redis services;
+- Vault storage, TLS, and a production unseal plan;
 - object storage for Loki;
-- customer-owned AD/LDAP and DNS;
-- readiness, drain, migration, and disruption rules for each service; and
-- the current isolation model, including exact egress identity, no Docker
-  socket discovery, and separate network planes.
+- customer AD or LDAP and DNS;
+- safe startup, drain, update, and disruption rules; and
+- the current network and egress security boundaries.
 
-Component-level blockers noted above (process-local locks in key-rotator and
-the portals) must be replaced with database-backed or leader-elected
-coordination before any of those services runs more than one replica.
+The in-process locks in key-rotator and the portals must move to a shared
+database or leader-election system before those services can have replicas.
 
-Sizing, node counts, storage services, RTO/RPO targets, and load-balancer
-ownership are customer infrastructure decisions; they are inputs to the
-Kubernetes design, not choices this repository can make. A Kubernetes profile
-would be specified, reviewed, and accepted on its own evidence — distinct from
-the single-stack drills in [test-runbook.md](test-runbook.md).
+The customer must set capacity, node count, storage, recovery targets, and
+load-balancer ownership. A Kubernetes release would need its own design,
+review, tests, and acceptance evidence. The current
+[test runbook](test-runbook.md) covers only the single-VM design.
 
-## Planning exercise (future): Blue/Green upgrades across two VMs
+## Future idea: blue and green VMs
 
-**Status: planning exercise only.** Nothing below is implemented, scheduled,
-or supported today; it is recorded so the option surfaces when upgrade
-downtime becomes a real constraint (owner request, 2026-07-16).
+**This is an idea, not a supported procedure.**
 
-The idea: two identical single-stack VMs ("blue" and "green") behind a small
-third VM running a TLS-passthrough L4 proxy (HAProxy or similar) that owns the
-published edge IPs. Upgrades converge the idle color, prove it with the
-acceptance runbook, then cut traffic over; the previous color remains a warm
-rollback until the next cycle. This buys zero-interruption *planned* upgrades
-without re-platforming, and is not HA — the proxy VM and each stack VM remain
-single failure domains.
+A future design could use two single-stack VMs called blue and green. A small
+third VM could pass TLS traffic to the active stack. An update would deploy to
+the idle stack, test it, and then move traffic. The old stack could stay ready
+for rollback.
 
-What makes this a design exercise rather than a procedure is state. Each data
-store has one local writer today. This includes Postgres, Vault, Open WebUI,
-Grafana, Loki, and Prometheus. Process-local locks in key-rotator and the
-portals also prevent replicas.
+This may reduce planned update downtime. It is still not full high
+availability. The proxy and each stack VM remain single failure points.
 
-A future cutover design needs:
+State is the hard part. PostgreSQL, Vault, Open WebUI, Grafana, Loki, and
+Prometheus each have one local writer today. A safe future design must decide,
+for each store, whether to:
 
-- a state map that says what each image update keeps or destroys;
-- a choice to replicate, restore during a write freeze, or accept loss for
-  each data store;
-- a Vault unseal step during cutover; and
-- a session plan, such as requiring users to sign in again.
+- copy changes between hosts;
+- stop writes and restore a backup; or
+- accept data loss.
 
-The existing [upgrade durability audit](research/upgrade-durability-audit-20260716.md)
-defines the restore and freeze order. Both stack VMs would need the full
-egress, ADM, and internal topology. The proxy VM would need its own small,
+It also needs a Vault unseal step and a user-session plan. Both stack VMs need
+the full egress, ADM, and internal network layout. The proxy needs a small,
 reviewed edge policy.
 
-If the state-map work concludes that most stores must be externalized to make
-cutover safe, that is the signal to spend the effort on the Kubernetes design
-above instead — externalized state is most of that migration's cost anyway.
+Use the current [image update workflow](image-update-workflow.md) and
+[production operations guide](operations.md) for supported backup, update,
+validation, and rollback steps. If most state must move to shared services,
+build the Kubernetes design instead. Shared state is most of that work.
