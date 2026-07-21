@@ -1360,6 +1360,19 @@ def test_wif_token_requires_explicit_stable_subject_and_audience() -> None:
             unstable, client_id="anthropic-token-broker"
         )
 
+    extra_audience = jwt.encode(
+        {
+            "sub": "service-account-anthropic-token-broker",
+            "aud": ["https://api.anthropic.com", "account"],
+        },
+        "test-only-secret-with-at-least-32-bytes",
+        algorithm="HS256",
+    )
+    with pytest.raises(ValueError, match="exact Anthropic audience"):
+        validate_wif_token_claims(
+            extra_audience, client_id="anthropic-token-broker"
+        )
+
 
 @pytest.mark.asyncio
 async def test_broker_reconciles_supported_hardcoded_subject_mapper() -> None:
@@ -1375,7 +1388,11 @@ async def test_broker_reconciles_supported_hardcoded_subject_mapper() -> None:
         settings(), FakeVault(), FakeDB(), transport=httpx.MockTransport(handler)
     )
     await admin._ensure_broker_subject_mapper(
-        {"id": "broker-uuid", "clientId": "anthropic-token-broker"},
+        {
+            "id": "broker-uuid",
+            "clientId": "anthropic-token-broker",
+            "enabled": False,
+        },
         "master-token",
     )
 
@@ -1386,6 +1403,218 @@ async def test_broker_reconciles_supported_hardcoded_subject_mapper() -> None:
         == "service-account-anthropic-token-broker"
     )
     assert created["config"]["access.token.claim"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_broker_removes_every_inherited_client_scope() -> None:
+    broker = {
+        "id": "broker-uuid",
+        "clientId": "anthropic-token-broker",
+        "fullScopeAllowed": True,
+    }
+    assigned = {
+        "default": [
+            {"id": "scope-roles", "name": "roles"},
+            {"id": "scope-account", "name": "account"},
+        ],
+        "optional": [{"id": "scope-phone", "name": "phone"}],
+    }
+    removed: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "PUT" and path.endswith("/clients/broker-uuid"):
+            broker.update(json.loads(request.content))
+            return httpx.Response(204)
+        if request.method == "GET" and path.endswith("/clients/broker-uuid"):
+            return httpx.Response(200, json=broker)
+        for assignment in ("default", "optional"):
+            base = (
+                "/admin/realms/anthropic-wif/clients/broker-uuid/"
+                f"{assignment}-client-scopes"
+            )
+            if request.method == "GET" and path == base:
+                return httpx.Response(200, json=assigned[assignment])
+            if request.method == "DELETE" and path.startswith(base + "/"):
+                scope_id = path.rsplit("/", 1)[1]
+                assigned[assignment] = [
+                    scope
+                    for scope in assigned[assignment]
+                    if scope["id"] != scope_id
+                ]
+                removed.append((assignment, scope_id))
+                return httpx.Response(204)
+        raise AssertionError((request.method, path))
+
+    admin = KeycloakAdmin(
+        settings(), FakeVault(), FakeDB(), transport=httpx.MockTransport(handler)
+    )
+    verified, changed = await admin._ensure_broker_scope_boundary(
+        broker, "master-token"
+    )
+
+    assert changed is True
+    assert verified["enabled"] is False
+    assert verified["fullScopeAllowed"] is False
+    assert assigned == {"default": [], "optional": []}
+    assert removed == [
+        ("default", "scope-account"),
+        ("default", "scope-roles"),
+        ("optional", "scope-phone"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_broker_scope_policy_is_idempotent() -> None:
+    broker = {
+        "id": "broker-uuid",
+        "clientId": "anthropic-token-broker",
+        "enabled": True,
+        "fullScopeAllowed": False,
+    }
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.method == "GET" and request.url.path.endswith(
+            ("default-client-scopes", "optional-client-scopes")
+        ):
+            return httpx.Response(200, json=[])
+        raise AssertionError((request.method, request.url.path))
+
+    admin = KeycloakAdmin(
+        settings(), FakeVault(), FakeDB(), transport=httpx.MockTransport(handler)
+    )
+
+    verified, changed = await admin._ensure_broker_scope_boundary(
+        broker, "master-token"
+    )
+
+    assert changed is False
+    assert verified == broker
+    assert methods == ["GET", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_broker_scope_cleanup_failure_leaves_broker_disabled() -> None:
+    broker = {
+        "id": "broker-uuid",
+        "clientId": "anthropic-token-broker",
+        "enabled": True,
+        "fullScopeAllowed": True,
+    }
+    assigned = {
+        "default": [{"id": "scope-roles", "name": "roles"}],
+        "optional": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "PUT" and path.endswith("/clients/broker-uuid"):
+            broker.update(json.loads(request.content))
+            return httpx.Response(204)
+        if request.method == "GET" and path.endswith("/clients/broker-uuid"):
+            return httpx.Response(200, json=broker)
+        for assignment in ("default", "optional"):
+            base = (
+                "/admin/realms/anthropic-wif/clients/broker-uuid/"
+                f"{assignment}-client-scopes"
+            )
+            if request.method == "GET" and path == base:
+                return httpx.Response(200, json=assigned[assignment])
+            if request.method == "DELETE" and path.startswith(base + "/"):
+                return httpx.Response(503)
+        raise AssertionError((request.method, path))
+
+    admin = KeycloakAdmin(
+        settings(), FakeVault(), FakeDB(), transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(IdentityError, match="HTTP 503"):
+        await admin._ensure_broker_scope_boundary(broker, "master-token")
+
+    assert broker["enabled"] is False
+    assert broker["fullScopeAllowed"] is False
+
+
+class BrokerProofHarness(KeycloakAdmin):
+    def __init__(self, audience: str | list[str]) -> None:
+        cfg = settings()
+        key_doc = {"private_key_pem": "test-key"}
+        super().__init__(
+            cfg,
+            FakeVault({cfg.kc_client_assertion_key_vault_path: key_doc}),
+            FakeDB(),
+        )
+        self.audience = audience
+        self.broker = {
+            "id": "broker-uuid",
+            "clientId": cfg.wif_broker_client_id,
+            "enabled": True,
+            "publicClient": False,
+            "serviceAccountsEnabled": True,
+            "standardFlowEnabled": False,
+            "directAccessGrantsEnabled": False,
+            "clientAuthenticatorType": "client-jwt",
+            "fullScopeAllowed": False,
+            "attributes": {
+                "token.endpoint.auth.signing.alg": "RS256",
+                "use.jwks.url": "false",
+            },
+        }
+        self.enabled_writes: list[bool] = []
+
+    async def _reconcile_wif_frontend_url(self, admin_token):
+        return False
+
+    async def _find_client(self, realm, client_id, admin_token):
+        return copy.deepcopy(self.broker)
+
+    async def _get_client(self, realm, client, admin_token):
+        return copy.deepcopy(self.broker)
+
+    async def _ensure_broker_scope_boundary(self, broker, admin_token):
+        self.broker["enabled"] = False
+        return copy.deepcopy(self.broker), True
+
+    async def _ensure_broker_subject_mapper(self, broker, admin_token):
+        return broker, False
+
+    async def _put_client(self, realm, client, admin_token):
+        self.broker.update(copy.deepcopy(client))
+        self.enabled_writes.append(self.broker["enabled"])
+
+    async def _client_credentials_with_key(self, realm, client_id, key_doc):
+        return jwt.encode(
+            {
+                "sub": "service-account-anthropic-token-broker",
+                "aud": self.audience,
+            },
+            "test-only-secret-with-at-least-32-bytes",
+            algorithm="HS256",
+        )
+
+
+@pytest.mark.asyncio
+async def test_broker_scope_cleanup_is_followed_by_exact_token_proof() -> None:
+    admin = BrokerProofHarness("https://api.anthropic.com")
+
+    _, changed = await admin._reconcile_broker("master-token")
+
+    assert changed is True
+    assert admin.broker["enabled"] is True
+    assert admin.enabled_writes == [True]
+
+
+@pytest.mark.asyncio
+async def test_failed_post_cleanup_claim_proof_disables_broker() -> None:
+    admin = BrokerProofHarness(["https://api.anthropic.com", "account"])
+
+    with pytest.raises(ValueError, match="exact Anthropic audience"):
+        await admin._reconcile_broker("master-token")
+
+    assert admin.broker["enabled"] is False
+    assert admin.enabled_writes == [True, False]
 
 
 def test_group_policy_parses_attributes_and_fails_closed_on_malformed() -> None:

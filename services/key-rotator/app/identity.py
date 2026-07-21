@@ -839,6 +839,30 @@ class KeycloakAdmin:
             raise IdentityError("Keycloak did not verify the WIF realm frontend URL")
         return changed
 
+    @staticmethod
+    def _security_event_policy_matches(
+        document: Any, desired_types: list[str]
+    ) -> bool:
+        """Compare the event policy without relying on Keycloak list order."""
+
+        if not isinstance(document, dict):
+            return False
+        actual_types = document.get("enabledEventTypes")
+        if (
+            not isinstance(actual_types, list)
+            or any(not isinstance(item, str) for item in actual_types)
+            or len(actual_types) != len(desired_types)
+            or set(actual_types) != set(desired_types)
+        ):
+            return False
+        return (
+            document.get("eventsEnabled") is True
+            and document.get("eventsExpiration") == 86400
+            and document.get("eventsListeners") == ["jboss-logging"]
+            and document.get("adminEventsEnabled") is False
+            and document.get("adminEventsDetailsEnabled") is False
+        )
+
     async def _reconcile_security_event_logging(self, admin_token: str) -> bool:
         """Enable only the reviewed Keycloak user-event log contract.
 
@@ -868,7 +892,7 @@ class KeycloakAdmin:
                 "adminEventsEnabled": False,
                 "adminEventsDetailsEnabled": False,
             }
-            if any(current.get(key) != value for key, value in desired.items()):
+            if not self._security_event_policy_matches(current, desired_types):
                 updated = dict(current)
                 updated.update(desired)
                 await self._request(
@@ -885,9 +909,7 @@ class KeycloakAdmin:
                 ),
                 "verified Keycloak security event realm",
             )
-            if not isinstance(verified, dict) or any(
-                verified.get(key) != value for key, value in desired.items()
-            ):
+            if not self._security_event_policy_matches(verified, desired_types):
                 raise IdentityError(
                     "Keycloak did not verify the security event logging policy"
                 )
@@ -1904,7 +1926,15 @@ class KeycloakAdmin:
         return key_doc
 
     async def _ensure_broker(self, admin_token: str) -> dict[str, Any]:
-        await self._reconcile_wif_frontend_url(admin_token)
+        key_doc, _ = await self._reconcile_broker(admin_token)
+        return key_doc
+
+    async def _reconcile_broker(
+        self, admin_token: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Reconcile and prove the WIF broker on every deployment."""
+
+        changed = await self._reconcile_wif_frontend_url(admin_token)
         broker = await self._find_client(
             self.settings.wif_realm,
             self.settings.wif_broker_client_id,
@@ -1915,42 +1945,116 @@ class KeycloakAdmin:
                 "the imported Anthropic WIF broker client is missing"
             )
         safe_realm = self.settings.wif_realm
+        broker = await self._get_client(safe_realm, broker, admin_token)
+        broker, scope_changed = await self._ensure_broker_scope_boundary(
+            broker, admin_token
+        )
+        changed = scope_changed or changed
+
+        desired_fields = {
+            "publicClient": False,
+            "serviceAccountsEnabled": True,
+            "standardFlowEnabled": False,
+            "directAccessGrantsEnabled": False,
+            "clientAuthenticatorType": "client-jwt",
+            "fullScopeAllowed": False,
+        }
+        desired_attributes = {
+            "token.endpoint.auth.signing.alg": "RS256",
+            "use.jwks.url": "false",
+        }
+        attributes = broker.get("attributes")
+        configuration_changed = any(
+            broker.get(name) != value for name, value in desired_fields.items()
+        ) or not isinstance(attributes, dict) or any(
+            attributes.get(name) != value
+            for name, value in desired_attributes.items()
+        )
+        if configuration_changed:
+            broker = dict(broker)
+            broker["enabled"] = False
+            broker.update(desired_fields)
+            updated_attributes = dict(attributes or {})
+            updated_attributes.update(desired_attributes)
+            broker["attributes"] = updated_attributes
+            await self._put_client(safe_realm, broker, admin_token)
+            broker = await self._get_client(safe_realm, broker, admin_token)
+            verified_attributes = broker.get("attributes")
+            if (
+                broker.get("enabled") is not False
+                or any(
+                    broker.get(name) != value
+                    for name, value in desired_fields.items()
+                )
+                or not isinstance(verified_attributes, dict)
+                or any(
+                    verified_attributes.get(name) != value
+                    for name, value in desired_attributes.items()
+                )
+            ):
+                raise IdentityError(
+                    "Keycloak did not verify the WIF broker configuration"
+                )
+            changed = True
+
+        broker, mapper_changed = await self._ensure_broker_subject_mapper(
+            broker, admin_token
+        )
+        changed = mapper_changed or changed
         try:
             existing_key = self.vault.read(
                 self.settings.kc_client_assertion_key_vault_path
             )
         except Exception:
             existing_key = None
-        if broker.get("enabled") and isinstance(existing_key, dict):
+        if isinstance(existing_key, dict):
             try:
-                await self._ensure_broker_subject_mapper(broker, admin_token)
+                if broker.get("enabled") is not True:
+                    broker = dict(broker)
+                    broker["enabled"] = True
+                    await self._put_client(safe_realm, broker, admin_token)
+                    broker = await self._get_client(safe_realm, broker, admin_token)
+                    if broker.get("enabled") is not True:
+                        raise IdentityError(
+                            "Keycloak did not enable the WIF broker for proof"
+                        )
+                    changed = True
                 issued_token = await self._client_credentials_with_key(
                     safe_realm, self.settings.wif_broker_client_id, existing_key
                 )
                 validate_wif_token_claims(
                     issued_token, client_id=self.settings.wif_broker_client_id
                 )
-                return existing_key
-            except (IdentityError, ValueError):
+                return existing_key, changed
+            except Exception as exc:
                 # A broker whose configured public key no longer matches the
-                # Vault-held private key must not remain enabled while setup
-                # attempts to repair it.
-                broker["enabled"] = False
-                await self._put_client(safe_realm, broker, admin_token)
+                # Vault-held private key, or whose claims are not exact, must
+                # not remain enabled while setup attempts to repair it.
+                broker, disabled = await self._disable_broker(
+                    broker, admin_token
+                )
+                changed = disabled or changed
+                if isinstance(exc, ValueError) or isinstance(
+                    exc, TransientIdentityError
+                ) or not isinstance(exc, IdentityError):
+                    raise
 
+        broker, disabled = await self._disable_broker(broker, admin_token)
+        changed = disabled or changed
+        broker = dict(broker)
         broker["enabled"] = False
         broker["publicClient"] = False
         broker["serviceAccountsEnabled"] = True
         broker["standardFlowEnabled"] = False
         broker["directAccessGrantsEnabled"] = False
         broker["clientAuthenticatorType"] = "client-jwt"
+        broker["fullScopeAllowed"] = False
         attributes = dict(broker.get("attributes") or {})
         attributes.update(
             {"token.endpoint.auth.signing.alg": "RS256", "use.jwks.url": "false"}
         )
         broker["attributes"] = attributes
         await self._put_client(safe_realm, broker, admin_token)
-        await self._ensure_broker_subject_mapper(broker, admin_token)
         key_doc = await self._generate_client_key(
             safe_realm,
             broker,
@@ -1970,14 +2074,131 @@ class KeycloakAdmin:
                 issued_token, client_id=self.settings.wif_broker_client_id
             )
         except Exception:
-            broker["enabled"] = False
-            await self._put_client(safe_realm, broker, admin_token)
+            await self._disable_broker(broker, admin_token)
             raise
-        return key_doc
+        return key_doc, True
+
+    async def _disable_broker(
+        self, broker: dict[str, Any], admin_token: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Disable the approved broker and verify the fail-closed state."""
+
+        if broker.get("clientId") != self.settings.wif_broker_client_id:
+            raise IdentityError("refusing to disable an unapproved WIF broker")
+        if broker.get("enabled") is False:
+            return broker, False
+        disabled = dict(broker)
+        disabled["enabled"] = False
+        await self._put_client(self.settings.wif_realm, disabled, admin_token)
+        disabled = await self._get_client(
+            self.settings.wif_realm, disabled, admin_token
+        )
+        if disabled.get("enabled") is not False:
+            raise IdentityError("Keycloak did not disable the WIF broker")
+        return disabled, True
+
+    async def _broker_client_scopes(
+        self,
+        broker: dict[str, Any],
+        assignment: str,
+        admin_token: str,
+    ) -> list[dict[str, Any]]:
+        """Read one exact set of scopes linked to the WIF broker."""
+
+        if assignment not in {"default", "optional"}:
+            raise IdentityError("refusing an invalid broker client-scope assignment")
+        if broker.get("clientId") != self.settings.wif_broker_client_id:
+            raise IdentityError("refusing to reconcile an unapproved WIF broker")
+        realm = path_segment(self.settings.wif_realm, label="WIF realm")
+        client_uuid = path_segment(broker.get("id"), label="WIF broker UUID")
+        response = await self._request(
+            "GET",
+            (
+                f"/admin/realms/{realm}/clients/{client_uuid}/"
+                f"{assignment}-client-scopes"
+            ),
+            token=admin_token,
+            expected=(200,),
+        )
+        payload = self._json(response, f"WIF broker {assignment} client scopes")
+        if not isinstance(payload, list):
+            raise IdentityError("Keycloak WIF broker client scopes were invalid")
+        scopes: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for scope in payload:
+            scope_id = scope.get("id") if isinstance(scope, dict) else None
+            scope_name = scope.get("name") if isinstance(scope, dict) else None
+            safe_id = path_segment(scope_id, label="WIF broker client-scope UUID")
+            if (
+                not isinstance(scope_name, str)
+                or not scope_name
+                or len(scope_name) > 128
+                or safe_id in seen_ids
+            ):
+                raise IdentityError("Keycloak WIF broker client scopes were invalid")
+            seen_ids.add(safe_id)
+            scopes.append(scope)
+        return scopes
+
+    async def _ensure_broker_scope_boundary(
+        self, broker: dict[str, Any], admin_token: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Remove inherited scopes while the broker is verified disabled."""
+
+        if broker.get("clientId") != self.settings.wif_broker_client_id:
+            raise IdentityError("refusing to reconcile an unapproved WIF broker")
+        realm = path_segment(self.settings.wif_realm, label="WIF realm")
+        client_uuid = path_segment(broker.get("id"), label="WIF broker UUID")
+        scopes_by_assignment = {
+            assignment: await self._broker_client_scopes(
+                broker, assignment, admin_token
+            )
+            for assignment in ("default", "optional")
+        }
+        if (
+            broker.get("fullScopeAllowed") is False
+            and not scopes_by_assignment["default"]
+            and not scopes_by_assignment["optional"]
+        ):
+            return broker, False
+
+        broker = dict(broker)
+        broker["enabled"] = False
+        broker["fullScopeAllowed"] = False
+        await self._put_client(self.settings.wif_realm, broker, admin_token)
+        broker = await self._get_client(self.settings.wif_realm, broker, admin_token)
+        if (
+            broker.get("enabled") is not False
+            or broker.get("fullScopeAllowed") is not False
+        ):
+            raise IdentityError(
+                "Keycloak did not disable the WIF broker scope boundary"
+            )
+
+        for assignment in ("default", "optional"):
+            scopes = scopes_by_assignment[assignment]
+            for scope in sorted(scopes, key=lambda item: str(item["id"])):
+                scope_id = path_segment(
+                    scope.get("id"), label="WIF broker client-scope UUID"
+                )
+                await self._request(
+                    "DELETE",
+                    (
+                        f"/admin/realms/{realm}/clients/{client_uuid}/"
+                        f"{assignment}-client-scopes/{scope_id}"
+                    ),
+                    token=admin_token,
+                    expected=(204,),
+                )
+            if await self._broker_client_scopes(broker, assignment, admin_token):
+                raise IdentityError(
+                    "Keycloak did not remove inherited WIF broker client scopes"
+                )
+        return broker, True
 
     async def _ensure_broker_subject_mapper(
         self, broker: dict[str, Any], admin_token: str
-    ) -> None:
+    ) -> tuple[dict[str, Any], bool]:
         """Reconcile the stable access-token subject used by Anthropic WIF.
 
         Keycloak's native client_credentials subject is the internal service
@@ -2011,6 +2232,7 @@ class KeycloakAdmin:
             if mapper.get("name") != BROKER_SUBJECT_MAPPER_NAME
         ]
         if unexpected or len(subject_mappers) > 1:
+            await self._disable_broker(broker, admin_token)
             raise IdentityConflict(
                 "the WIF broker has a competing subject protocol mapper"
             )
@@ -2033,6 +2255,16 @@ class KeycloakAdmin:
         }
         existing = subject_mappers[0] if subject_mappers else None
         base = f"/admin/realms/{realm}/clients/{client_uuid}/protocol-mappers/models"
+        if existing is not None and all(
+            existing.get(name) == desired[name]
+            for name in ("name", "protocol", "protocolMapper", "consentRequired")
+        ) and isinstance(existing.get("config"), dict) and all(
+            existing["config"].get(name) == value
+            for name, value in desired["config"].items()
+        ):
+            return broker, False
+
+        broker, _ = await self._disable_broker(broker, admin_token)
         if existing is None:
             await self._request(
                 "POST",
@@ -2041,7 +2273,7 @@ class KeycloakAdmin:
                 json_body=desired,
                 expected=(201, 204),
             )
-            return
+            return broker, True
         mapper_id = path_segment(existing.get("id"), label="subject mapper UUID")
         desired["id"] = mapper_id
         await self._request(
@@ -2051,6 +2283,7 @@ class KeycloakAdmin:
             json_body=desired,
             expected=(204,),
         )
+        return broker, True
 
     async def _find_component(
         self, realm: str, name: str, admin_token: str
@@ -3586,7 +3819,8 @@ class KeycloakAdmin:
             changed = (
                 await self._reconcile_security_event_logging(admin_token) or changed
             )
-            changed = await self._reconcile_wif_frontend_url(admin_token) or changed
+            _, broker_changed = await self._reconcile_broker(admin_token)
+            changed = broker_changed or changed
             spec = ldap_federation_spec(self.settings)
             if spec is None:
                 raise IdentityConflict(

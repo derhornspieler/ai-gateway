@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import unittest
 
@@ -52,7 +53,27 @@ class WifDomainContractTests(unittest.TestCase):
             identity.index("def _identity_state(")
         ]
         self.assertIn("await self._reconcile_wif_frontend_url(admin_token)", broker)
-        self.assertIn("await self._reconcile_wif_frontend_url(admin_token)", converge)
+        self.assertIn("await self._reconcile_broker(admin_token)", converge)
+
+    def test_every_fresh_broker_starts_without_inherited_scopes(self) -> None:
+        sources = (
+            ROOT / "compose/keycloak/realms/anthropic-wif-realm.json",
+            ROOT
+            / "ansible/roles/docker_stack/templates/keycloak-realms/anthropic-wif-realm.json.j2",
+        )
+        for source in sources:
+            rendered = source.read_text(encoding="utf-8").replace(
+                "{{ aigw_domain }}", "aigw.internal"
+            )
+            realm = json.loads(rendered)
+            broker = next(
+                client
+                for client in realm["clients"]
+                if client["clientId"] == "anthropic-token-broker"
+            )
+            self.assertIs(broker["fullScopeAllowed"], False, source)
+            self.assertEqual(broker["defaultClientScopes"], [], source)
+            self.assertEqual(broker["optionalClientScopes"], [], source)
 
 
 if __name__ == "__main__":

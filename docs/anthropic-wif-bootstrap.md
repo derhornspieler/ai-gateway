@@ -47,7 +47,10 @@ the same `aigw_domain` inventory value as the rest of the deployment. Its broker
 client `anthropic-token-broker`
 is imported disabled with service accounts enabled, `client-jwt`
 (`private_key_jwt`) authentication, RS256, no shared-secret fallback, a
-600-second access-token lifetime, and audience `https://api.anthropic.com`.
+600-second access-token lifetime, and only the audience
+`https://api.anthropic.com`. The client has no inherited default or optional
+scopes. This prevents Keycloak scopes such as `roles` from adding the
+`account` audience.
 
 Ansible runs this identity setup without a portal step. During setup,
 key-rotator keeps the broker disabled and does the following:
@@ -59,14 +62,15 @@ key-rotator keeps the broker disabled and does the following:
    `KC_CLIENT_ASSERTION_KEY_VAULT_PATH` selects that path. A mounted PEM file
    at `KC_CLIENT_ASSERTION_KEY_FILE` is the supported alternative.
 3. It registers the public certificate on the Keycloak client.
-4. It adds the fixed access-token subject mapper, enables the broker, proves
+4. It removes inherited client scopes and disables full-scope access.
+5. It adds the fixed access-token subject mapper, enables the broker, proves
    `private_key_jwt` works, and checks the returned token locally.
 
 The setup fails closed unless these exact claims are present:
 
 ```text
 sub = service-account-anthropic-token-broker
-aud contains https://api.anthropic.com
+aud = https://api.anthropic.com
 ```
 
 The mapper is necessary because Keycloak's native service-account `sub` is an
@@ -74,9 +78,9 @@ internal user UUID that changes across realm recreation or restore.
 Initialization rejects a competing `sub` mapper, and the broker stays disabled
 whenever key generation, the Vault write, the client proof, or the claim proof
 fails. This mapper and client-credentials behavior was runtime-verified against
-the repository-pinned DHI Keycloak 26.6.4 image: `sub` was the stable value
-above, `aud` contained the Anthropic audience, and `azp`/`client_id` identified
-`anthropic-token-broker`. Treat the runtime claim validator, not assumptions
+the repository-pinned DHI Keycloak 26.7.0 image: `sub` was the stable value
+above, `aud` was exactly the Anthropic audience, and `azp`/`client_id`
+identified `anthropic-token-broker`. Treat the runtime claim validator, not assumptions
 about Keycloak defaults, as the release gate after any image upgrade. No operator
 should import a private key through Keycloak or the portal; the portal displays
 only a SHA-256 certificate fingerprint.
@@ -225,7 +229,7 @@ even though the POST itself stays on the internal `keycloak:8080` origin and is
 never routed through egress.
 
 Next, key-rotator gets a 600-second Keycloak service-account token. It checks
-the stable `sub` and Anthropic audience locally. It exchanges that JWT at
+the stable `sub` and the one exact Anthropic audience locally. It exchanges that JWT at
 Anthropic's `/v1/oauth/token` through Envoy, using the recorded identifiers.
 It puts the returned short-lived bearer in the LiteLLM `anthropic-primary`
 credential. The next refresh is scheduled at about 80% of the reported token

@@ -101,6 +101,7 @@ class DeploymentHarness(KeycloakAdmin):
         provider_id: str = "ldap-provider-1",
         bad_bind: bool = False,
         wif_changed: bool = False,
+        broker_changed: bool = False,
         callback_changed: bool = False,
         cleanup_changed: bool = False,
         event_logging_changed: bool = False,
@@ -121,6 +122,7 @@ class DeploymentHarness(KeycloakAdmin):
         self.provider_id = provider_id
         self.bad_bind = bad_bind
         self.wif_changed = wif_changed
+        self.broker_changed = broker_changed
         self.callback_changed = callback_changed
         self.cleanup_changed = cleanup_changed
         self.event_logging_changed = event_logging_changed
@@ -128,6 +130,7 @@ class DeploymentHarness(KeycloakAdmin):
         self.ensure_calls = 0
         self.proof_calls = 0
         self.wif_calls = 0
+        self.broker_calls = 0
         self.callback_calls = 0
         self.cleanup_calls = 0
         self.event_logging_calls = 0
@@ -216,10 +219,14 @@ class DeploymentHarness(KeycloakAdmin):
         self.callback_calls += 1
         return self.callback_changed
 
-    async def _reconcile_wif_frontend_url(self, admin_token):
+    async def _reconcile_broker(self, admin_token):
         assert admin_token == "break-glass-token"
         self.wif_calls += 1
-        return self.wif_changed
+        self.broker_calls += 1
+        return (
+            {"certificate_sha256": "b" * 64},
+            self.wif_changed or self.broker_changed,
+        )
 
     async def _reconcile_security_event_logging(self, admin_token):
         assert admin_token == "break-glass-token"
@@ -245,6 +252,7 @@ async def test_complete_deployment_is_live_proved_and_idempotent() -> None:
     assert admin.ensure_calls == 1
     assert admin.proof_calls == 1
     assert admin.wif_calls == 1
+    assert admin.broker_calls == 1
     assert admin.event_logging_calls == 1
     assert admin.callback_calls == 1
     assert admin.cleanup_calls == 1
@@ -271,6 +279,15 @@ async def test_wif_frontend_domain_drift_is_repaired_and_reported() -> None:
 
     assert await admin.converge_deployment_identity() == "applied"
     assert admin.wif_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_brownfield_deployment_reconciles_broker_policy() -> None:
+    admin = DeploymentHarness(broker_changed=True)
+
+    assert await admin.converge_deployment_identity() == "applied"
+    assert admin.bootstrap_calls == 0
+    assert admin.broker_calls == 1
 
 
 @pytest.mark.asyncio
@@ -328,6 +345,35 @@ async def test_security_event_logging_is_idempotent() -> None:
 
     assert await admin._reconcile_security_event_logging("admin-token") is False
     assert admin.puts == []
+
+
+@pytest.mark.asyncio
+async def test_security_event_logging_accepts_keycloak_event_order() -> None:
+    admin = EventLoggingHarness(drifted=False)
+    for realm in admin.realms.values():
+        realm["enabledEventTypes"] = list(reversed(realm["enabledEventTypes"]))
+
+    assert await admin._reconcile_security_event_logging("admin-token") is False
+    assert admin.puts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_types", [
+    [*KEYCLOAK_SECURITY_EVENT_TYPES, KEYCLOAK_SECURITY_EVENT_TYPES[0]],
+    list(KEYCLOAK_SECURITY_EVENT_TYPES[:-1]),
+    [*KEYCLOAK_SECURITY_EVENT_TYPES[:-1], "UNREVIEWED_EVENT"],
+])
+async def test_security_event_logging_repairs_non_exact_event_sets(
+    event_types: list[str],
+) -> None:
+    admin = EventLoggingHarness(drifted=False)
+    admin.realms["master"]["enabledEventTypes"] = event_types
+
+    assert await admin._reconcile_security_event_logging("admin-token") is True
+    assert admin.puts == ["master"]
+    assert admin.realms["master"]["enabledEventTypes"] == list(
+        KEYCLOAK_SECURITY_EVENT_TYPES
+    )
 
 
 @pytest.mark.asyncio

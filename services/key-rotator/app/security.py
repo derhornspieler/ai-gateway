@@ -57,14 +57,9 @@ def validate_wif_token_claims(
     if claims.get("sub") != service_account_subject(client_id):
         raise ValueError("Keycloak WIF access token has an unstable subject claim")
     raw_audience = claims.get("aud")
-    audiences = (
-        {raw_audience}
-        if isinstance(raw_audience, str)
-        else set(raw_audience)
-        if isinstance(raw_audience, list)
-        and all(isinstance(item, str) for item in raw_audience)
-        else set()
-    )
-    if audience not in audiences:
-        raise ValueError("Keycloak WIF access token is missing the Anthropic audience")
+    exact_audience = raw_audience == audience or raw_audience == [audience]
+    if not exact_audience:
+        raise ValueError(
+            "Keycloak WIF access token does not have the exact Anthropic audience"
+        )
     return claims
