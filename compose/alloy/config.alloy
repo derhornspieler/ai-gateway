@@ -87,7 +87,8 @@ otelcol.processor.transform "aigw_correlation" {
 // before any signal can reach Prometheus, Loki, or customer Cribl.  The
 // application requirement to retain prompt/completion bodies is deliberate:
 // gen_ai.input.messages, gen_ai.output.messages, and their legacy prompt /
-// completion equivalents are not matched by these deletion rules.
+// completion equivalents remain, but obvious credential-shaped values inside
+// those strings are replaced before the prompt can enter a log or trace.
 // BEGIN AIGW MANAGED SENSITIVE ATTRIBUTE FILTER
 otelcol.processor.transform "aigw_sensitive_attributes" {
   // Attribute removal is a security boundary. A runtime transform failure
@@ -121,6 +122,18 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
   trace_statements {
     context = "span"
     statements = [
+      `replace_pattern(attributes["gen_ai.input.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.input.messages"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.input.messages"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.completion.0.content"])`,
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
       `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
@@ -272,6 +285,11 @@ otelcol.processor.filter "aigw_request_spans" {
   traces {
     span = [
       `resource.attributes["service.name"] != "litellm" or name != "litellm_request"`,
+      `not IsString(attributes["aigw.user.id"]) or not IsMatch(attributes["aigw.user.id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
+      `not IsString(attributes["aigw.user.name"]) or not IsMatch(attributes["aigw.user.name"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
+      `not IsString(attributes["aigw.api_key.id"]) or not IsMatch(attributes["aigw.api_key.id"], "^[0-9a-f]{64}$")`,
+      `not IsString(attributes["aigw.project.id"]) or not IsMatch(attributes["aigw.project.id"], "^[a-z0-9][a-z0-9_.-]{0,63}$")`,
+      `not IsString(attributes["aigw.request.id"]) or not IsMatch(attributes["aigw.request.id"], "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")`,
     ]
   }
   output {
@@ -596,6 +614,9 @@ loki.process "cribl_keycloak_auth" {
     values = {
       aigw_security_event_class = "keycloak_event",
       keycloak_event            = "",
+      keycloak_client_id        = "",
+      keycloak_realm_id         = "",
+      keycloak_user_id          = "",
     }
   }
   stage.static_labels {
@@ -608,6 +629,21 @@ loki.process "cribl_keycloak_auth" {
     action              = "drop"
     drop_counter_reason = "unapproved_keycloak_event"
   }
+  stage.match {
+    selector            = "{keycloak_realm_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_keycloak_realm"
+  }
+  stage.match {
+    selector            = "{keycloak_client_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_keycloak_client"
+  }
+  stage.match {
+    selector            = "{keycloak_user_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_keycloak_user"
+  }
   // Reconstruct from bounded fields instead of forwarding the original
   // Keycloak line. This drops IP, username/email, redirect URI, code/session
   // IDs, error detail, and any future unreviewed field by construction.
@@ -616,7 +652,14 @@ loki.process "cribl_keycloak_auth" {
     template = `schema_version=1 event=aigw.keycloak.authentication event_type={{ .keycloak_event }} realm_id={{ .keycloak_realm_id }} client_id={{ .keycloak_client_id }} user_id={{ .keycloak_user_id }}`
   }
   stage.output { source = "keycloak_security_line" }
-  stage.label_drop { values = ["keycloak_logger"] }
+  stage.label_drop {
+    values = [
+      "keycloak_client_id",
+      "keycloak_logger",
+      "keycloak_realm_id",
+      "keycloak_user_id",
+    ]
+  }
   forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
 }
 

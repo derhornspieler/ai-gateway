@@ -7,6 +7,10 @@ The Cribl feed is a small security-event feed. It is not a copy of the local
 observability stack. Metrics, raw traces, and ordinary service logs must stay
 local.
 
+Alloy sends only reviewed fields. For structured service events, it reads the
+approved scalar values and builds a new record. It never forwards the source
+JSON. Unknown fields, nested objects, and raw JSON stay on the gateway.
+
 > **Release gate:** Do not enable a real Cribl endpoint until automated tests
 > prove this allow-list. A healthy TLS connection does not prove the data scope.
 
@@ -71,21 +75,28 @@ record. The original span must not leave the gateway. The record may contain:
 
 Prompt and completion content is high-sensitivity data. It is allowed only in
 this dataset. It must not appear in runtime logs, metrics, or another SOC event
-class.
+class. For the four reviewed string prompt and completion attributes, Alloy
+applies three tested patterns: a named credential assignment, a Bearer or Basic
+token, and an `sk-` or `sk-ant-` key. Non-string or nested prompt values and
+broader secret formats are not covered yet. That gap remains open in
+[TASKS.md](../TASKS.md).
+
+The stable user, key, and project values come from the authenticated gateway
+key metadata. AI request export now fails closed unless bounded user ID,
+readable user name, key hash, project ID, and request ID fields are all present.
+`aigw.user.name` is readable attribution only. A direct API caller can label its
+own already-authorized request, so that name must not be treated as proof of
+identity. Source authenticity and readable-name quality checks for every
+client path remain open.
 
 ### 2. Authentication and authorization events
 
 Classes: `keycloak_event`, `aigw.portal.audit`, and `aigw.identity.audit`
 
 This class includes structured security events, not all Keycloak or portal
-logs. Allowed actions are:
-
-- authentication success and failure;
-- logout and token-exchange success or failure;
-- account lockout;
-- an authorization denial;
-- a privileged identity change; and
-- a break-glass account action.
+logs. The current implementation exports the Keycloak events listed below,
+reviewed portal audit actions, identity deployment results, and break-glass use
+during deployment.
 
 For Keycloak, accept records only from the `org.keycloak.events` category. The
 exact `EventType` success/error pairs are:
@@ -101,6 +112,10 @@ Each name also includes its matching `_ERROR` name. No other Keycloak event is
 allowed. Keycloak admin events, profile changes, registration events, and
 ordinary server logs stay local.
 
+This does not yet cover every application authorization denial, every
+privileged identity change, or the full break-glass lifecycle. Those event
+gaps remain open.
+
 ### 3. Provider and Envoy trust events
 
 Event: `aigw.egress.trust`
@@ -112,32 +127,40 @@ Allowed records are:
 - CA fingerprint, expiration, SAN, or SNI validation failure; and
 - upstream TLS handshake failure tied to a selected provider.
 
-A startup record must carry the immutable policy digest, selected provider
-names, reviewed CA SHA-256 fingerprints, and final Envoy image ID. It must not
-carry certificate private material or an arbitrary upstream hostname.
+A successful startup record is Anthropic-only in the current release. It must
+carry the immutable policy digest, `anthropic` provider name,
+`api.anthropic.com` SNI, the exact `api.anthropic.com` SAN, and both reviewed CA
+SHA-256 fingerprints. A startup failure carries only a reviewed failure reason.
+An upstream TLS failure carries only the selected provider and the fixed
+`tls_transport_failure` reason. Raw TLS errors and arbitrary hostnames stay
+local.
 
-Today the structured marker path admits only the `startup_gate` action shown
-below. The other trust failures remain design requirements until a reviewed
-emitter and receipt test exist. Do not claim that they reach Cribl yet.
+The startup event does not contain the final Envoy image ID. An image cannot
+safely embed its own final content ID. Release evidence gets the expected ID
+from the verified schema-v2 manifest and compares it with the running
+container's image ID from live Docker inspection. The policy digest joins that
+image evidence to the startup event. Do not claim the image ID was
+self-embedded in the event.
 
 ### 4. Key, Vault, directory, and security-gate events
 
-The reviewed contract also requires these structured security events:
+The current implementation exports:
 
-Allowed records are:
+- the terminal provider-rotation result: `success`, `failed`, `skipped`, or
+  `disabled`;
+- Vault state changes: `sealed`, `unsealed`, `uninitialized`, or `unavailable`;
+- bounded metadata derived from selected Vault audit records; and
+- identity deployment results and break-glass use during that deployment.
 
-- provider-key rotation start, success, failure, or rollback;
-- Vault seal, unseal, and selected audit outcomes;
-- break-glass activation, use, disable, or cleanup;
-- LDAP or managed-identity drift and reconcile failure;
-- an identity security-gate failure.
+The raw Vault audit record always stays local. The outbound copy contains only
+record type, approved operation, a short path class, outcome, and the fact that
+the source value was HMAC-protected. It never contains a Vault token, request
+body, response body, full path, or raw JSON.
 
-This is not permission to ship the raw Vault audit file or all key-rotator
-logs. Each record needs a reviewed structured event name and field allow-list.
-Some events in this section do not have a structured producer yet. Keep that
-release gate open until source and receipt tests prove each one. Controller-side
-Ansible output is not collected by Alloy today. Do not claim that a
-controller-only gate reached Cribl unless a separate reviewed sender exists.
+Controller-side Ansible output is not collected by Alloy. Rotation start and
+rollback stages, broader break-glass actions, authorization denials, and
+LDAP/managed-identity drift and recovery still need reviewed producers and
+receipt tests. Do not claim those events reach Cribl today.
 
 ### Current structured marker allow-list
 
@@ -147,12 +170,35 @@ Alloy accepts only these exact pairs:
 | `event` | Allowed `action` values |
 |---|---|
 | `aigw.portal.audit` | `key.generate`, `key.deactivate`, `egress.trust.verify`, `rotation.settings.update`, `rotation.trigger`, `provider.anthropic.configure`, `provider.anthropic.disable`, `provider.anthropic.delete`, `identity.member.remove`, `identity.group.policy`, `admin.key.block`, `admin.key.unblock`, `admin.key.limits` |
-| `aigw.identity.audit` | `bootstrap`, `deployment_converge`, `group_policy_update`, `group_create`, `group_delete`, `group_member_add`, `group_member_remove` |
+| `aigw.identity.audit` | `bootstrap`, `break_glass_use`, `deployment_converge`, `group_policy_update`, `group_create`, `group_delete`, `group_member_add`, `group_member_remove` |
+| `aigw.provider.rotation` | `rotate` |
+| `aigw.vault.state` | `state_observed` |
 | `aigw.egress.trust` | `startup_gate` |
 
 Allowed outcomes are `success`, `failure`, `failed`, `mismatch`,
 `denied-active-key`, and `denied-membership`. A service/event mismatch, an
 unknown action, or an unknown outcome is dropped.
+
+### Fixed-field projection
+
+The marker body is input only. Alloy never uses it as the outbound body. Alloy
+checks the emitter, event, action, outcome, and each approved scalar field. It
+then builds a new line from this fixed list:
+
+- `subject`, `project`, `changed`, `error_type`, and `ldap_provider`;
+- `purpose`, `vendor`, `rotation_status`, and `state`; and
+- `policy_sha256`, `providers`, `sni`, `exact_sans`,
+  `ca_sha256_fingerprints`, and `reason`.
+
+Each field has a short format or exact value rule. Required fields depend on
+the event. A missing, malformed, unknown, or nested value drops the outbound
+copy. The original local log remains available in Loki. There is no raw-JSON
+fallback.
+
+Keycloak, Envoy TLS, and Vault audit classifiers use the same rule: parse a
+known source, keep only approved scalar values, and build a new line. The AI
+request path selects an explicit span-field list and never exports the source
+span.
 
 ## Signals that must never reach Cribl
 
@@ -164,6 +210,7 @@ reject ordinary logs from:
 - Keycloak outside the reviewed security-event allow-list;
 - Envoy outside the reviewed trust-event allow-list;
 - Vault raw audit output;
+- source `AIGW_SECURITY_EVENT` JSON, unknown fields, and nested values;
 - Postgres, Redis, Grafana, Prometheus, Loki, Alloy, and node-exporter; and
 - the local `cribl-mock` receiver.
 
@@ -206,11 +253,40 @@ Alloy must remove these values before the allow-list check:
 - nested maps that cannot be proven safe.
 
 Use stable opaque IDs when possible. `aigw.user.name` is readable attribution,
-not proof of authorization. Certificate fingerprints, image IDs, and policy
-digests are integrity metadata and are safe to export.
+not proof of authorization. Certificate fingerprints and policy digests are
+safe integrity metadata. The Envoy image ID stays in the verified release and
+live-inspection evidence; it is not added to the startup event.
 
 The AI request dataset is the one exception for approved prompt and completion
-content. Credential redaction still applies inside those fields.
+content. The current redactor covers three obvious credential forms in the
+four reviewed string attributes. It does not cover a non-string or nested
+prompt representation or every possible secret format. Treat the remaining
+content as sensitive.
+
+## Remaining event and data gaps
+
+Keep the Cribl backlog item open until these gaps are closed:
+
+1. Extend prompt and completion redaction beyond the three current string
+   patterns. Handle non-string and nested representations and broader secret
+   formats without hiding the approved audit content.
+2. Prove attribution authenticity and readable-name quality for chat, direct
+   API, and every other supported client path. Keep readable names separate
+   from authorization evidence.
+3. Add a reviewed path for controller-only events. Alloy cannot read Ansible
+   output today.
+4. Add the provider-rotation start, attempt, rollback, and recovery lifecycle.
+   Only the terminal result is exported now.
+5. Add application authorization-denial and privileged-change events that are
+   not already covered by the exact Keycloak event list.
+6. Add LDAP and managed-identity drift detection, reconcile failure, and
+   recovery events.
+7. Add the remaining break-glass activation, disable, and cleanup events.
+8. Add natural producer receipt tests for each new event before calling it
+   implemented.
+
+The separate customer endpoint, 24-hour retention, and hard queue-age choices
+also remain open. See [TASKS.md](../TASKS.md).
 
 ## What stays local
 
@@ -329,23 +405,49 @@ pages.
 
 ## Receipt validation
 
-Run this test first against `cribl-mock` in local seeded preprod. Repeat the
-wire, TLS, firewall, and receipt checks against the real Cribl source during an
-approved production window.
+Run the automated check first against `cribl-mock` in local seeded preprod:
 
-1. Send one mock AI request with a unique request ID.
+```bash
+python3 -I scripts/test-preprod-cribl-security.py --image-mode seed
+```
+
+Know what this test proves:
+
+- The Docker-log records for Keycloak, portal, identity, provider rotation,
+  Vault state, Envoy startup, and Envoy TLS failure are synthetic fixtures.
+  They prove the Alloy classifiers, fixed-field projection, allow-list, and
+  deny rules. They do not prove that every live producer emitted every event.
+- The fixture includes an unknown field and a nested secret. The test proves
+  neither value reached the Cribl mock.
+- The AI request test uses Alloy's real OTLP receiver, filter, batch, and queue.
+  Its input is a test span, but it follows the natural OTLP path.
+- The Vault audit check reads the real Vault audit file path. It does not place
+  a fake Vault record in the Docker-log fixture.
+
+Producer unit and contract tests cover the current emitters. Add a natural
+producer receipt test for every new event family.
+
+Repeat these checks against the real Cribl source during an approved production
+window:
+
+1. Send one real approved AI request with a unique request ID.
 2. Perform one successful Keycloak login, one failed login, and one logout.
-3. Trigger one safe Envoy policy-gate event.
-4. Trigger one approved security-control canary.
-5. Confirm that Cribl received each allowed record once or with a documented
+3. Capture one real portal action, identity deployment result, provider
+   rotation terminal result, and Vault state change.
+4. Capture one safe Envoy startup record and, in a bounded test, one TLS
+   failure record.
+5. Correlate the startup policy digest with the Envoy image ID in the verified
+   manifest and the live Docker inspection result.
+6. Confirm that Cribl received each allowed record once or with a documented
    at-least-once duplicate.
-6. Confirm the required fields and redactions.
-7. Generate a portal log, a Vault audit line, an OTLP metric, and a raw span.
-8. Prove that Cribl received none of those denied signals.
+7. Confirm the exact fixed fields. Search for rejected unknown, nested, raw,
+   and secret values and prove they are absent.
+8. Generate an OTLP metric, a raw span, and an ordinary service log. Prove that
+   Cribl received none of them.
 9. Confirm Loki and Prometheus still received their local data.
 10. Save the source configuration, route configuration, 24-hour retention
-    proof, search results, source commit, and image manifest with the release
-    evidence.
+    proof, search results, source commit, manifest, and live image inspection
+    with the release evidence.
 
 A source health check or non-zero record count is not enough. The evidence must
 show allowed records and prove the denied records are absent.

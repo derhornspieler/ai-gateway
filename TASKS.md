@@ -20,52 +20,51 @@
     `sha256:c6608e76ef495925ff6724edcc48c3ace4fb8450e614cb56fcfe62f3e9248725`.
     It was healthy, the hardened-path check passed, raw Scout reported the one
     reviewed Chroma finding, and the VEX-aware result was zero.
-- [ ] **Send only approved SOC security events to Cribl** - Keep raw metrics,
-  raw traces, and ordinary operational container logs local for Prometheus,
-  Loki, Grafana, and alert evaluation. Export a curated, versioned security-log
-  contract instead of selecting whole containers or forwarding every message.
-  The reviewed event classes are: sanitized LiteLLM AI request audit records
-  (including the authenticated user, project/key identity, request ID, model,
-  prompt/completion content, outcome, token use, and cost); Keycloak
-  authentication and authorization success/failure events, lockouts, access
-  denials, and privileged changes; immutable Envoy provider-policy, CA
-  fingerprint, SAN, SNI, startup-gate, and TLS trust events; provider-key
-  rotation, Vault seal/unseal and HMAC-protected audit events, break-glass use,
-  LDAP/identity drift or sync failures, and other explicit security-gate
-  failures. Do not send metric alerts through this log contract. Do not mistake
-  general stdout for a complete or safe audit trail. Add a structured emitter
-  when an event cannot be classified reliably.
-  - Filter the Cribl branch in Alloy with a fail-closed event-class allowlist
-    before the persistent export queue. Use Cribl Stream's native OTLP input
-    over verified TLS for a real endpoint; plaintext remains legal only for the
-    namespaced preprod mock. Reject an untrusted CA, a server-name mismatch, an
-    invalid endpoint, a malformed event, or an event outside the allowlist.
-    Redact passwords, tokens, authorization headers, cookies, provider keys,
-    and any other secret before export. Prompt and completion bodies are an
-    explicit sensitive exception and must carry the authenticated attribution
-    fields and documented retention warning. Never export raw OTLP traces or
-    metrics.
-  - Bound the gateway's Cribl delivery queue to 24 hours and require the Cribl
-    team to set a 24-hour destination retention policy. Treat queue pressure as
-    a metric-driven operations alert through the separate Alertmanager path;
-    never feed Alloy's own exporter-error logs or alert payloads into Cribl.
-    Keep Prometheus metrics locally for 30 days. Document and size its byte
-    limit because Prometheus applies the time or size limit that is reached
-    first.
-  - Add contract tests and a seeded local-preprod receipt test proving that each
-    approved security-event class arrives and that raw metrics, raw traces,
-    malformed records, and ordinary non-security service logs do not. Test TLS
-    trust failure, queue outage/recovery, redaction, and allowlist rejection.
-  - Create or update a plain-language logging-team handoff. It must define the
-    versioned event/field contract, data classification, prompt-content warning,
-    redactions, Alloy ownership, OTLP/gRPC endpoint and port, CA and TLS
-    server-name requirements, firewall path, persistent queue, retry and
-    overflow behavior, Cribl-side source/routes, retention and access-control
-    expectations, receipt checks, outage/recovery test, troubleshooting steps,
-    and team ownership. Update the observability architecture, security model,
-    operator runbook, diagrams, links, anchors, and navigation. State clearly
-    what stays local, what leaves the host, and why. Create any missing document
-    or diagram and write it at about an eighth-grade reading level.
+- [ ] **Finish the approved Cribl security-event feed** - Alloy now sends a
+  small, versioned security feed over verified OTLP/gRPC TLS. Raw metrics, raw
+  traces, alerts, ordinary service logs, and the raw Vault audit file stay
+  local. The persistent queue is capped at 2 GiB and retries a dequeued batch
+  for up to 24 hours. Prometheus stays local with a 30-day and 5 GB cap.
+
+  - **Implemented event paths:** AI request audit, the exact Keycloak
+    authentication event list, reviewed portal actions, identity deployment
+    success/failure, deployment break-glass use, provider-rotation terminal
+    result, Vault state, bounded Vault audit metadata, Envoy startup success or
+    failure, and selected-provider TLS failure.
+  - **Fixed-field boundary:** Alloy rebuilds structured records from approved
+    scalar fields. It never exports the source JSON, an unknown field, a nested
+    value, or an unparsed fallback. The Anthropic startup record contains the
+    policy digest, provider, SNI, exact SAN, and reviewed CA fingerprints. The
+    Envoy image ID is correlated from the verified manifest and live Docker
+    inspection; it is not self-embedded in the image event.
+  - **Current test evidence:** the preprod Docker-log records are synthetic
+    classifier fixtures. They prove allow, deny, fixed-field, unknown-field,
+    and nested-secret behavior. The AI request follows Alloy's real OTLP path,
+    and the Vault audit check follows the real Vault file path. Verified TLS,
+    wrong-server-name rejection, queue outage/recovery, and Alloy restart also
+    pass. Do not use a synthetic fixture as proof that a live producer emitted
+    an event.
+  - **Prompt-value redaction gap:** Alloy now redacts three tested credential
+    forms from the four reviewed string fields: named credential assignments,
+    Bearer or Basic tokens, and `sk-` or `sk-ant-` keys. Still handle non-string
+    and nested prompt values and broader secret formats without hiding the
+    approved audit content.
+  - **Attribution gap:** AI request export now requires bounded user ID, user
+    name, key hash, project ID, and request ID fields. Still prove source
+    authenticity and readable-name quality for chat, direct API, and every
+    supported client path. `aigw.user.name` is readable attribution, not an
+    authorization fact. Keep stable subject, key, and project evidence
+    separate.
+  - **Event gaps:** add a reviewed sender for controller-only events; provider
+    rotation start, attempt, rollback, and recovery; application authorization
+    denials and uncovered privileged changes; LDAP and managed-identity drift,
+    reconcile failure, and recovery; and break-glass activation, disable, and
+    cleanup. Add natural producer receipt tests for every new event.
+  - **External acceptance:** the Cribl/SOC team must supply the approved
+    endpoint and CA, repeat the wire and field receipt, enforce and prove
+    24-hour destination retention, and decide whether the gateway also needs a
+    hard per-record 24-hour queue age. Keep queue alerts on the local metrics
+    path; never send alert payloads through the SOC feed.
 
 ## Waiting On
 

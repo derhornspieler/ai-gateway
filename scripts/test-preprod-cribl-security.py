@@ -86,8 +86,20 @@ allowed_span = {
         integer("gen_ai.usage.input_tokens", 2),
         integer("gen_ai.usage.output_tokens", 1),
         integer("gen_ai.usage.total_tokens", 3),
-        text("gen_ai.input.messages", "allowed-ai-input-" + token),
-        text("gen_ai.output.messages", "allowed-ai-output-" + token),
+        text(
+            "gen_ai.input.messages",
+            "allowed-ai-input-"
+            + token
+            + " password=PROMPT_PASSWORD_"
+            + token
+            + " sk-ant-"
+            + token
+            + token,
+        ),
+        text(
+            "gen_ai.output.messages",
+            "allowed-ai-output-" + token + " Bearer PROMPT_BEARER_" + token,
+        ),
         text("authorization", "Bearer TRACE_SECRET_" + token),
     ],
 }
@@ -101,6 +113,17 @@ denied_span = {
     "endTimeUnixNano": str(int(now) + 1000),
     "attributes": [text("receipt.denied", "DENIED_RAW_TRACE_" + token)],
 }
+unattributed_span = {
+    "traceId": trace_id,
+    "spanId": token[1:] + token[:1],
+    "name": "litellm_request",
+    "kind": 2,
+    "startTimeUnixNano": now,
+    "endTimeUnixNano": str(int(now) + 1000),
+    "attributes": [
+        text("gen_ai.input.messages", "DENIED_UNATTRIBUTED_TRACE_" + token)
+    ],
+}
 post(
     "/v1/traces",
     {
@@ -108,7 +131,7 @@ post(
             "resource": {"attributes": [text("service.name", "litellm")]},
             "scopeSpans": [{
                 "scope": {"name": "aigw.preprod.receipt"},
-                "spans": [allowed_span, denied_span],
+                "spans": [allowed_span, denied_span, unattributed_span],
             }],
         }]
     },
@@ -403,6 +426,16 @@ def fixture_lines(token: str) -> str:
         },
         separators=(",", ":"),
     )
+    keycloak_missing_user = json.dumps(
+        {
+            "log.logger": "org.keycloak.events",
+            "message": (
+                "type=LOGIN, realmId=aigw, clientId=portal, "
+                f"note=DENIED_KEYCLOAK_MISSING_USER_{token}"
+            ),
+        },
+        separators=(",", ":"),
+    )
     portal = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
         '"action":"rotation.trigger","outcome":"success",'
@@ -453,6 +486,7 @@ def fixture_lines(token: str) -> str:
         separators=(",", ":"),
     )
     denied = (
+        ("keycloak", keycloak_missing_user),
         ("dev-portal", f"DENIED_ORDINARY_LOG_{token}"),
         (
             "dev-portal",
@@ -618,6 +652,9 @@ def assert_initial_receipts(logs: str, token: str) -> None:
     allowed = (
         f"allowed-ai-input-{token}",
         f"allowed-ai-output-{token}",
+        "<redacted-credential>",
+        "<redacted-authorization>",
+        "<redacted-vendor-key>",
         f"receipt-call-{token}",
         "aigw.security.event_class: Str(ai_request_audit)",
         f"event_type=LOGIN realm_id=aigw client_id=portal user_id=receipt-{token}",
@@ -639,6 +676,9 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         fail("the Cribl receipt is missing one or more approved fields")
     forbidden = (
         f"TRACE_SECRET_{token}",
+        f"PROMPT_PASSWORD_{token}",
+        f"PROMPT_BEARER_{token}",
+        f"sk-ant-{token}{token}",
         f"KEYCLOAK_SECRET_{token}",
         f"PORTAL_SECRET_{token}",
         f"UNAPPROVED_FIELD_{token}",
@@ -650,6 +690,8 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"DENIED_VAULT_STATE_{token}",
         f"DENIED_MALFORMED_{token}",
         f"DENIED_RAW_TRACE_{token}",
+        f"DENIED_UNATTRIBUTED_TRACE_{token}",
+        f"DENIED_KEYCLOAK_MISSING_USER_{token}",
         f"denied_raw_metric_{token}",
         f"DENIED_RAW_LOG_{token}",
         "provider=openai reason=tls_transport_failure",
@@ -886,6 +928,20 @@ def main() -> int:
     preprod.wait_healthy("cribl-mock")
 
     receipt_since = log_cursor()
+    # Generate a fresh, real Vault audit record after the Docker log cursor.
+    # Depending on an old audit line makes repeated preprod runs flaky because
+    # Alloy correctly resumes the file at its saved position.
+    verification = run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/preprod.py"),
+            "--image-mode",
+            args.image_mode,
+            "verify",
+        ]
+    )
+    if "PREPROD_VERIFIED" not in verification:
+        fail("the live Vault audit receipt could not be generated")
     write_log_fixtures(preprod, model, token)
     send_otlp_fixtures(preprod, OTLP_FIXTURE_HELPER, token, "OTLP_FIXTURES_ACCEPTED")
     logs = wait_for_receipts(

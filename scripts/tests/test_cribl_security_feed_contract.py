@@ -141,6 +141,11 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         for marker in (
             "OTLP_FIXTURES_ACCEPTED",
             "DENIED_RAW_TRACE_",
+            "DENIED_UNATTRIBUTED_TRACE_",
+            "DENIED_KEYCLOAK_MISSING_USER_",
+            "PROMPT_PASSWORD_",
+            "PROMPT_BEARER_",
+            "sk-ant-",
             "denied_raw_metric_",
             "DENIED_RAW_LOG_",
             "DENIED_ORDINARY_LOG_",
@@ -158,6 +163,11 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             '"action":"break_glass_use"',
             "UNAPPROVED_FIELD_",
             "NESTED_SECRET_",
+            "<redacted-credential>",
+            "<redacted-authorization>",
+            "<redacted-vendor-key>",
+            '"verify",',
+            "the live Vault audit receipt could not be generated",
             "wait_for_queue(preprod, model, populated=True)",
             "exercise_tls_server_name_failure(preprod, model, tls_token)",
             "Alloy accepted a Cribl certificate with the wrong server name",
@@ -170,6 +180,28 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             PREPROD_TASKS,
         )
         self.assertIn("scripts/test-preprod-cribl-security.py", PREPROD_TASKS)
+
+    def test_keycloak_projection_requires_complete_attribution(self) -> None:
+        keycloak = ALLOY.split('loki.process "cribl_keycloak_auth"', 1)[1].split(
+            'loki.process "cribl_envoy_tls"', 1
+        )[0]
+        attribution_labels = keycloak.index(
+            "  stage.labels {", keycloak.index("?P<keycloak_user_id>")
+        )
+        for field, reason in (
+            ("keycloak_realm_id", "missing_keycloak_realm"),
+            ("keycloak_client_id", "missing_keycloak_client"),
+            ("keycloak_user_id", "missing_keycloak_user"),
+        ):
+            self.assertIn(field, keycloak)
+            self.assertIn(reason, keycloak)
+            self.assertLess(keycloak.index(f"?P<{field}>"), attribution_labels)
+            self.assertIn(
+                field,
+                keycloak[attribution_labels : keycloak.index(
+                    "  stage.static_labels", attribution_labels
+                )],
+            )
 
     def test_structured_security_events_use_a_fixed_field_projection(self) -> None:
         structured = ALLOY.split(

@@ -191,6 +191,28 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         ):
             self.assertIn(body_contract, self.sanitizer)
 
+        span_sanitizer = self.sanitizer.split('context = "span"', 1)[1].split(
+            "\n  }\n", 1
+        )[0]
+        for prompt_attribute in (
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+            "gen_ai.prompt.0.content",
+            "gen_ai.completion.0.content",
+        ):
+            self.assertEqual(
+                span_sanitizer.count(
+                    f'replace_pattern(attributes["{prompt_attribute}"]'
+                ),
+                3,
+            )
+            self.assertEqual(
+                span_sanitizer.count(
+                    f'where IsString(attributes["{prompt_attribute}"])'
+                ),
+                3,
+            )
+
         docker_logs = self.alloy.split('loki.process "docker"', 1)[1].split(
             'loki.process "external_file_logs"', 1
         )[0]
@@ -262,6 +284,21 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             '`resource.attributes["service.name"] != "litellm" or name != "litellm_request"`',
             span_filter,
         )
+        for required in (
+            "aigw.user.id",
+            "aigw.user.name",
+            "aigw.api_key.id",
+            "aigw.project.id",
+            "aigw.request.id",
+        ):
+            self.assertIn(
+                f'not IsString(attributes["{required}"])',
+                span_filter,
+            )
+            self.assertIn(
+                f'not IsMatch(attributes["{required}"]',
+                span_filter,
+            )
         self.assertIn('error_mode = "propagate"', span_filter)
         self.assertIn(
             "traces = [otelcol.connector.spanlogs.aigw_requests.input]", span_filter
