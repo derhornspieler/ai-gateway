@@ -15,12 +15,12 @@ Cribl SOC log feed.
 Anthropic is the only approved egress provider today. API compatibility does
 not mean another provider is enabled.
 
-Ansible configures the host and containers. It does **not** create the VM or a
-NetworkManager profile, readdress an interface, or change customer-owned routes,
-gateways, DNS, or static IP addressing. It owns exactly one bounded property on
-each supplied active physical profile — `connection.zone`, keyed by its live
-UUID — so a firewalld reload cannot move that interface back to the default
-zone. It neither cycles nor reactivates the connection.
+The VM and its three network connections must exist before Ansible runs.
+Ansible does not change their IP addresses, routes, gateways, or DNS. It also
+does not restart those connections. It changes only `connection.zone`, the
+firewall zone, on each selected connection. It matches the live connection
+UUID so it cannot change a different interface. This keeps the firewall zones
+in place after a reload.
 
 ## Architecture at a glance
 
