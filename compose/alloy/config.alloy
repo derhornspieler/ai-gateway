@@ -541,6 +541,7 @@ loki.process "docker" {
   forward_to = [
     loki.write.local.receiver,
     loki.process.cribl_keycloak_auth.receiver,
+    loki.process.cribl_envoy_tls.receiver,
     loki.process.cribl_structured_security.receiver,
   ]
 }
@@ -616,6 +617,61 @@ loki.process "cribl_keycloak_auth" {
   }
   stage.output { source = "keycloak_security_line" }
   stage.label_drop { values = ["keycloak_logger"] }
+  forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
+}
+
+// Envoy's access log exposes upstream transport failures. Forward only a
+// reviewed provider plus a known TLS failure token. Rebuild a fixed message so
+// the raw TLS library error, host details, and request metadata stay local.
+loki.process "cribl_envoy_tls" {
+  stage.match {
+    selector            = "{project!~\"ai-gateway|aigw-preprod\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_project"
+  }
+  stage.match {
+    selector            = "{service!=\"envoy-egress\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_service"
+  }
+  stage.json {
+    expressions = {
+      envoy_transport_failure = "upstream_transport_failure_reason",
+      envoy_upstream          = "upstream",
+    }
+  }
+  stage.regex {
+    source     = "envoy_transport_failure"
+    expression = `(?i)(?P<envoy_tls_failure>TLS_error|SSLV3_ALERT_[A-Z_]+|TLSV1_ALERT_[A-Z_]+|CERTIFICATE_VERIFY_FAILED|CERTIFICATE_[A-Z_]+)`
+  }
+  stage.labels {
+    values = {
+      envoy_tls_failure = "",
+      envoy_upstream    = "",
+    }
+  }
+  stage.match {
+    selector            = "{envoy_tls_failure=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "not_an_upstream_tls_failure"
+  }
+  stage.match {
+    selector            = "{envoy_upstream!=\"anthropic\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_egress_provider"
+  }
+  stage.template {
+    source   = "envoy_tls_security_line"
+    template = `schema_version=1 event=aigw.egress.trust action=upstream_tls_failure outcome=failed provider={{ .envoy_upstream }} reason=tls_transport_failure`
+  }
+  stage.output { source = "envoy_tls_security_line" }
+  stage.static_labels {
+    values = {
+      aigw_security_event_class = "egress_tls",
+      aigw_security_schema      = "1",
+    }
+  }
+  stage.label_drop { values = ["envoy_tls_failure", "envoy_upstream"] }
   forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
 }
 
@@ -812,7 +868,7 @@ loki.process "cribl_vault_audit" {
   forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
 }
 
-// Bridge only the three fail-closed security classifiers above into OTLP logs.
+// Bridge only the fail-closed security classifiers above into OTLP logs.
 // The request-audit spanlog joins the same queue directly after its exact
 // trace filter. No trace or metric output exists on this receiver or batch.
 otelcol.receiver.loki "cribl_security_logs" {

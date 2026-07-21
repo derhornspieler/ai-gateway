@@ -405,6 +405,20 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "otelcol.receiver.loki.cribl_security_logs.receiver", keycloak
         )
 
+        envoy_tls = self.alloy.split(
+            'loki.process "cribl_envoy_tls"', 1
+        )[1].split('\nloki.process "cribl_structured_security"', 1)[0]
+        for required in (
+            'service!=\\"envoy-egress\\"',
+            'envoy_upstream!=\\"anthropic\\"',
+            "CERTIFICATE_VERIFY_FAILED",
+            "event=aigw.egress.trust action=upstream_tls_failure",
+            'aigw_security_event_class = "egress_tls"',
+            "otelcol.receiver.loki.cribl_security_logs.receiver",
+        ):
+            self.assertIn(required, envoy_tls)
+        self.assertNotIn("{{ .envoy_transport_failure }}", envoy_tls)
+
         structured = self.alloy.split(
             'loki.process "cribl_structured_security"', 1
         )[1].split('loki.source.file "vault_audit"', 1)[0]

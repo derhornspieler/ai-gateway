@@ -148,6 +148,8 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             '"event":"aigw.provider.rotation"',
             '"event":"aigw.vault.state"',
             "event=aigw.vault.audit",
+            "action=upstream_tls_failure",
+            "provider=anthropic reason=tls_transport_failure",
             "hmac_protected=true",
             '"action":"break_glass_use"',
             "<redacted-authorization>",

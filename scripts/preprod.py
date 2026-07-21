@@ -1758,7 +1758,7 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "ENVOY_EGRESS_IP": f"172.{subnet}.0.2",
         "AIGW_EGRESS_SOURCE_DATE_EPOCH": "0",
         "AIGW_EGRESS_PROVIDERS": "anthropic",
-        "AIGW_EGRESS_POLICY_SHA256": "46792952f978335aa2681638f295d2208ab1d9a0154879a0d6dc9ef02d3a7907",
+        "AIGW_EGRESS_POLICY_SHA256": "8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6",
         "ALLOY_INTERNAL_IP": f"172.{subnet}.2.2",
         "ALLOY_TELEMETRY_IP": f"172.{subnet}.13.2",
         "ALLOY_OBSERVABILITY_IP": f"172.{subnet}.15.2",

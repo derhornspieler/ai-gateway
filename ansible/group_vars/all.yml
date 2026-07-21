@@ -102,7 +102,7 @@ cribl_otlp_server_name: "cribl-mock"
 aigw_egress_source_date_epoch: "0"
 aigw_egress_providers:
   - anthropic
-aigw_egress_policy_sha256: "46792952f978335aa2681638f295d2208ab1d9a0154879a0d6dc9ef02d3a7907"
+aigw_egress_policy_sha256: "8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6"
 # Set only from a loaded schema-v2 release. Source builds prove the same
 # policy labels but have no release-manifest image ID to compare.
 aigw_expected_envoy_image_id: ""

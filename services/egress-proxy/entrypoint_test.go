@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -92,6 +93,25 @@ func TestInternalCommandsRejectExtraArguments(t *testing.T) {
 	for _, arguments := range [][]string{{"validate", "extra"}, {"receipt", "extra"}, {"health", "extra"}} {
 		if err := run(arguments); err == nil {
 			t.Fatalf("expected %v to fail", arguments)
+		}
+	}
+}
+
+func TestStartupFailuresUseOnlyStableSOCCategories(t *testing.T) {
+	tests := map[string]string{
+		"ENVOY_CONFIG overrides are forbidden":                         "config_override_rejected",
+		"CA certificate is not valid yet":                              "ca_not_yet_valid",
+		"CA certificate is expired":                                    "ca_expired",
+		"CA certificate fingerprints do not match the reviewed order":  "ca_fingerprint_mismatch",
+		"exact SANs must be nonempty":                                  "san_policy_invalid",
+		"SNI must appear in the exact SAN list":                        "sni_policy_invalid",
+		"CA bundle contains malformed PEM":                             "ca_material_invalid",
+		"egress-policy digest file does not match the compiled digest": "policy_digest_mismatch",
+		"unexpected internal failure":                                  "immutable_policy_validation_failed",
+	}
+	for message, expected := range tests {
+		if actual := startupFailureReason(errors.New(message)); actual != expected {
+			t.Fatalf("%q: expected %q, got %q", message, expected, actual)
 		}
 	}
 }

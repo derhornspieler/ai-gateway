@@ -434,6 +434,16 @@ def fixture_lines(token: str) -> str:
         '"action":"startup_gate","outcome":"success",'
         f'"policy_sha256":"{token * 4}"}}'
     )
+    egress_tls = json.dumps(
+        {
+            "upstream": "anthropic",
+            "flags": "UF",
+            "upstream_transport_failure_reason": (
+                "TLS_error: CERTIFICATE_VERIFY_FAILED receipt-" + token
+            ),
+        },
+        separators=(",", ":"),
+    )
     denied = (
         ("dev-portal", f"DENIED_ORDINARY_LOG_{token}"),
         (
@@ -459,6 +469,17 @@ def fixture_lines(token: str) -> str:
             f'"marker":"DENIED_VAULT_STATE_{token}"}}',
         ),
         ("dev-portal", f"AIGW_SECURITY_EVENT not-json DENIED_MALFORMED_{token}"),
+        (
+            "envoy-egress",
+            json.dumps(
+                {
+                    "upstream": "openai",
+                    "flags": "UF",
+                    "upstream_transport_failure_reason": "TLS_error: DENIED_PROVIDER",
+                },
+                separators=(",", ":"),
+            ),
+        ),
     )
     records = [
         docker_log_line("keycloak", keycloak, timestamp),
@@ -469,6 +490,7 @@ def fixture_lines(token: str) -> str:
         docker_log_line("key-rotator", rotation, timestamp),
         docker_log_line("key-rotator", vault_state, timestamp),
         docker_log_line("envoy-egress", egress, timestamp),
+        docker_log_line("envoy-egress", egress_tls, timestamp),
     ]
     records.extend(docker_log_line(service, message, timestamp) for service, message in denied)
     return "\n".join(records) + "\n"
@@ -595,6 +617,7 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         "hmac_protected=true",
         '"event":"aigw.egress.trust"',
         f'"policy_sha256":"{token * 4}"',
+        "event=aigw.egress.trust action=upstream_tls_failure outcome=failed provider=anthropic reason=tls_transport_failure",
     )
     missing = [marker for marker in allowed if marker not in logs]
     if missing:
@@ -612,6 +635,7 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"DENIED_RAW_TRACE_{token}",
         f"denied_raw_metric_{token}",
         f"DENIED_RAW_LOG_{token}",
+        "provider=openai reason=tls_transport_failure",
     )
     leaked = [marker for marker in forbidden if marker in logs]
     if leaked:
@@ -855,6 +879,7 @@ def main() -> int:
             f'"receipt":"vault-state-{token}"',
             "event=aigw.vault.audit",
             f'"policy_sha256":"{token * 4}"',
+            "event=aigw.egress.trust action=upstream_tls_failure",
         ),
     )
     # One extra file-source interval proves denied records did not merely lag.

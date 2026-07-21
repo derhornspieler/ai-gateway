@@ -1046,7 +1046,7 @@ env \
   ENVOY_EGRESS_IP=172.28.0.2 \
   AIGW_EGRESS_SOURCE_DATE_EPOCH=0 \
   AIGW_EGRESS_PROVIDERS=anthropic \
-  AIGW_EGRESS_POLICY_SHA256=46792952f978335aa2681638f295d2208ab1d9a0154879a0d6dc9ef02d3a7907 \
+  AIGW_EGRESS_POLICY_SHA256=8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6 \
   ALLOY_INTERNAL_IP=172.28.2.2 \
   ALLOY_TELEMETRY_IP=172.28.13.2 \
   ALLOY_OBSERVABILITY_IP=172.28.15.2 \
@@ -1228,7 +1228,7 @@ assert services["oauth2-proxy-vault"]["depends_on"] == {
 assert services["envoy-egress"]["healthcheck"]["test"] == ["CMD", "/usr/local/bin/aigw-envoy-entrypoint", "health"]
 assert services["envoy-egress"]["image"] == "ai-gateway/envoy-egress:1"
 assert services["envoy-egress"]["build"]["args"] == {
-    "AIGW_EGRESS_POLICY_SHA256": "46792952f978335aa2681638f295d2208ab1d9a0154879a0d6dc9ef02d3a7907",
+    "AIGW_EGRESS_POLICY_SHA256": "8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6",
     "AIGW_EGRESS_PROVIDERS": "anthropic",
     "SOURCE_DATE_EPOCH": "0",
 }

@@ -51,12 +51,38 @@ func main() {
 				"event":          "aigw.egress.trust",
 				"action":         "startup_gate",
 				"outcome":        "failed",
-				"reason":         "immutable_policy_validation_failed",
+				"reason":         startupFailureReason(err),
 			})
 		}
 		fmt.Fprintln(os.Stderr, "FATAL:", err)
 		fmt.Fprintln(os.Stderr, "Refusing to start (fail closed).")
 		os.Exit(1)
+	}
+}
+
+// startupFailureReason turns internal validation errors into a short, stable
+// SOC category. The detailed error stays in the local container log.
+func startupFailureReason(err error) string {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "override") || strings.Contains(message, "config-"):
+		return "config_override_rejected"
+	case strings.Contains(message, "not valid yet"):
+		return "ca_not_yet_valid"
+	case strings.Contains(message, "expired"):
+		return "ca_expired"
+	case strings.Contains(message, "fingerprint") || strings.Contains(message, "CA bundle SHA-256"):
+		return "ca_fingerprint_mismatch"
+	case strings.Contains(message, "SNI"):
+		return "sni_policy_invalid"
+	case strings.Contains(message, "exact SAN"):
+		return "san_policy_invalid"
+	case strings.Contains(message, "CA bundle") || strings.Contains(message, "CA directory"):
+		return "ca_material_invalid"
+	case strings.Contains(message, "digest"):
+		return "policy_digest_mismatch"
+	default:
+		return "immutable_policy_validation_failed"
 	}
 }
 

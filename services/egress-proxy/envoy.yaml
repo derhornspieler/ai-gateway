@@ -26,6 +26,7 @@ static_resources:
                           upstream: "%UPSTREAM_CLUSTER%"
                           status: "%RESPONSE_CODE%"
                           flags: "%RESPONSE_FLAGS%"
+                          upstream_transport_failure_reason: "%UPSTREAM_TRANSPORT_FAILURE_REASON%"
                           duration_ms: "%DURATION%"
                           bytes_tx: "%BYTES_SENT%"
                 route_config:
