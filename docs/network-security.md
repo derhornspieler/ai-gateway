@@ -1,209 +1,161 @@
-# Network Architecture and Enforcement
+# Production network security
 
-This document describes how AI Gateway's routing, host interfaces, firewalld
-zones, iptables (`DOCKER-USER`), and native nftables policy connect into one
-layered, fail-closed network design. It is a customer-facing reference for
-the production configuration in `ansible/roles/network_routing`,
-`ansible/roles/firewalld_zones`, and `ansible/roles/docker_networks`.
-Companion visuals are in [technical diagrams](architecture-diagrams.md);
-component detail is in the [solution map](solution-map.md). The
-[security model](security-model.md) explains how this network layer fits with
-identity, containers, provider trust, and logging.
-
-Local preprod uses Docker networks only. It does not claim to test the Rocky
-host firewall or routing rules described here. See
+This page explains the production network rules. Local preprod uses Docker
+networks only. It does not test Rocky Linux routing or firewall rules. See
 [local preprod](preprod.md).
 
-In plain language:
+The main rules are:
 
-- the egress interface accepts no inbound connection;
-- administrators enter only through the ADM interface and approved VPN range;
-- users enter only through the internal interface and approved source range;
-- containers on different service networks cannot talk unless the design puts
-  them on the same network;
-- only Envoy may use external DNS and provider TCP/443; and
-- optional Cribl export gets one separate Alloy-to-destination rule.
+- no service listens on the egress connection;
+- admins enter through ADM from the approved VPN range;
+- users enter through the internal connection from the approved source range;
+- services can talk only when they share an approved Docker network;
+- only Envoy can use internet DNS and provider TCP port 443; and
+- Keycloak gets one exact path to the customer LDAPS server; and
+- Alloy gets one optional path to the Cribl endpoint.
 
-Both `DOCKER-USER` and `aigw_guard` enforce the container packet rules. One is
-not a backup setting for the other; both must be live.
+Both `DOCKER-USER` and the `aigw_guard` nftables table enforce container packet
+rules. Both must be active. See the [network diagrams](architecture-diagrams.md)
+and [security model](security-model.md) for related controls.
 
-## Design principle
+## Exact allow rules
 
-Every allow rule is pinned to an exact identity — a source CIDR, a specific
-host address, a specific bridge, or a specific container IP. There are no
-zone-wide port openings, no wildcard binds, and no "allow the subnet"
-shortcuts. Two independent enforcement planes (iptables `DOCKER-USER` and a
-native nftables table) carry the same policy, so a transient failure or
-reload of one cannot open the other.
+Each allow rule names an exact source range, host address, bridge, or container
+address. There are no open firewall zones, wildcard listeners, or whole-subnet
+shortcuts. Everything else is denied.
 
-## 1. Host interfaces and firewalld zones
+## 1. Host connections and firewall zones
 
-The VM's three customer-owned interfaces map to three dedicated zones. The
-zones are deliberately named with an `aigw-` prefix so no firewalld built-in
-zone template is silently activated.
+The VM has three customer-owned network connections:
 
-| Zone | Interface | Target | Permitted inbound |
-|---|---|---|---|
-| `aigw-egress` | egress NIC | `DROP` | nothing — no listener exists on this leg |
-| `aigw-adm` | ADM NIC (`ETH1_IP`) | `REJECT` | source `vpn_client_cidr` only: management SSH port/tcp and 443/tcp; optional authoritative DNS on 53/tcp+udp |
-| `aigw-internal` | internal NIC (`ETH2_IP`) | `REJECT` | source `internal_cidr` only: 443/tcp; optional authoritative DNS on 53/tcp+udp |
+| Zone | Connection | Default action | Allowed inbound traffic |
+| --- | --- | --- | --- |
+| `aigw-egress` | egress NIC | `DROP` | None |
+| `aigw-adm` | ADM NIC at `ETH1_IP` | `REJECT` | From `vpn_client_cidr`: management SSH and TCP 443. Optional platform DNS uses TCP and UDP 53. |
+| `aigw-internal` | internal NIC at `ETH2_IP` | `REJECT` | From `internal_cidr`: TCP 443. Optional platform DNS uses TCP and UDP 53. |
 
-All permissions are IPv4 source-scoped rich rules; verification fails if any
-zone carries a plain port opening, an unexpected service, masquerade, or
-intra-zone forwarding. Denied packets are logged (`--set-log-denied=unicast`).
+All allows include an IPv4 source range. A plain open port, unknown service,
+masquerade rule, or zone-forward rule fails verification. Denied packets are
+logged with `--set-log-denied=unicast`.
 
-**Zone persistence is anchored in NetworkManager, not firewalld alone.** On
-Rocky 9, NetworkManager is authoritative for an active interface's zone: a
-profile whose saved `connection.zone` is blank re-advertises its interface
-into the default zone after a firewalld reload. Ansible therefore resolves
-the one active connection UUID per interface, verifies all three UUIDs are
-valid and distinct, and persists only a drifted `connection.zone` — it never
-cycles, reactivates, or readdresses a connection. A NetworkManager dispatcher
-script (`91-aigw-firewalld-zones`) reasserts runtime zone ownership after
-link events. Verification requires the same interface-to-zone mapping in the
-saved profile, firewalld runtime, and firewalld permanent configuration.
+NetworkManager stores each connection's firewall zone. A blank saved zone can
+move a connection back to the default zone after a firewall reload. Ansible
+therefore finds the one live connection UUID for each NIC and sets only
+`connection.zone` when it is wrong. It does not change addresses or restart a
+connection. A dispatcher script restores the zone after link events. Ansible
+checks the same mapping in NetworkManager and in live and saved firewalld data.
 
-## 2. Source-policy routing
+## 2. Reply routing
 
-The main routing table keeps exactly one default route, through the egress
-interface. So that ADM and internal replies leave on the leg they arrived
-on, Ansible installs two additive policy tables:
+The main route table has one default route on the egress NIC. Replies from ADM
+and internal addresses must leave through the same NIC that received them.
+Two extra route tables do this:
 
-| Table | ID | Rule priority | Scope |
-|---|---|---|---|
-| `adm` | 101 | 10101 | replies sourced from `ETH1_IP` |
-| `internal` | 102 | 10102 | replies sourced from `ETH2_IP` |
+| Table | ID | Rule priority | Used for |
+| --- | --- | --- | --- |
+| `adm` | 101 | 10101 | replies from `ETH1_IP` |
+| `internal` | 102 | 10102 | replies from `ETH2_IP` |
 
-The applicator (`/usr/local/sbin/aigw-policy-routing`) refuses to act unless
-the interface actually owns the source address and the gateway resolves on
-that interface; each table must contain exactly one default route. It copies
-only the interface's connected routes into the policy table and never touches
-the main table or any NetworkManager profile. Persistence is a oneshot
-systemd unit ordered after `NetworkManager-wait-online.service` plus a
-dispatcher hook for interface events. If Rocky's `/etc/iproute2/rt_tables`
-override is absent, Ansible seeds it from the vendor registry rather than
-shadowing standard table names. After applying routing, the play proves a
-fresh key-only SSH connection over the ADM leg from inside `vpn_client_cidr`
-before continuing.
+`/usr/local/sbin/aigw-policy-routing` first proves that the NIC owns the source
+address and can reach its gateway. Each table must have one default route. The
+script copies only that NIC's connected routes. It does not change the main
+table or a NetworkManager profile.
 
-## 3. Container network planes
+A systemd unit applies the routes after NetworkManager is online. A dispatcher
+hook restores them after link events. After the change, Ansible opens a new
+key-only SSH session through ADM before it continues.
 
-Ansible pre-creates 20 fixed bridges from `172.28.0.0/24` through
-`172.28.20.0/24`, with `172.28.16.0/24` kept retired and reserved. Each active
-network is pinned to a stable, short Linux bridge name
-(`br-egress`, `br-chat`, `br-vault`, …) so firewall rules can reference
-bridges as a stable ABI. IPv6 is disabled on every bridge. Fifteen planes use
-Docker's `internal` setting, so they have no NAT path. The lower half of every
-subnet (`.0/25`) is reserved for fixed workload addresses. This keeps Compose
-from giving a firewall-pinned address, such as Envoy's `172.28.0.2`, to an
-ordinary service.
+## 3. Docker networks
 
-Two ordinary (non-internal) bridges exist solely so Docker will render
-published-port DNAT — Docker omits publication when every attached network is
-`internal` — and carry no application peers: `net-int-edge` (traefik-int)
-and the optional `net-platform-dns`. Their bridge-originated egress is still
-denied by both packet-filter planes.
+Ansible creates 20 fixed `/24` bridges in the `172.28.0.0/24` through
+`172.28.20.0/24` range. `172.28.16.0/24` stays unused and reserved. Each active
+network has a short, fixed bridge name such as `br-egress` or `br-vault`.
 
-A read-only preflight checks the live Docker daemon before any change. It
-checks the data root, foreign containers and networks, subnet overlap, and
-every network's driver, internal flag, bridge name, subnet, and IP range.
+IPv6 is off. Fifteen networks use Docker's `internal` flag, so they have no NAT
+path. The lower `.0/25` half of each subnet is reserved for fixed addresses.
+Docker cannot give Envoy's fixed `172.28.0.2` address to another service.
 
-## 4. Packet filtering — two independent planes
+Two non-internal bridges exist only so Docker can publish approved ports:
+`net-int-edge` and the optional `net-platform-dns`. They have no app peers.
+Both packet filters still block bridge egress.
 
-### 4.1 iptables `DOCKER-USER` (forward path)
+Before any change, Ansible checks the Docker data root, foreign resources,
+subnet overlap, drivers, bridge names, internal flags, subnets, and IP ranges.
 
-The complete chain is replaced in a single atomic
-`iptables-restore --wait --noflush` transaction — never rule-by-rule, so no
-fail-open interval exists during updates. Rule groups, in order:
+## 4. Container packet filters
 
-1. Same-bridge traffic returns (a plane may talk to itself).
-2. Cross-bridge traffic is dropped in both directions, including to and from
-   `docker0`.
-3. Established/related traffic is accepted **only in the reply direction** —
-   a deliberate narrowing so a flow opened during a reload gap cannot remain
-   authorized.
-4. Inbound publication is accepted only as an exact DNAT tuple: ADM-sourced
-   (`vpn_client_cidr`) TCP/443 whose original destination is exactly
-   `ETH1_IP:443`, and internal-sourced TCP/443 to exactly `ETH2_IP:443`
-   (plus the optional authoritative-DNS tuples). All other physical-interface ingress into the
-   bridge fabric is dropped.
-5. Container egress is accepted only for Envoy's exact address
-   (`172.28.0.2/32` on `br-egress`): DNS to the one approved resolver, and
-   TCP/443 out the egress NIC. The subnet is deliberately not allowed —
-   only the pinned /32. An optional, exactly-tupled Alloy-to-Cribl SOC log
-   export on the internal NIC is the only other egress allowance. It permits
-   one packet path, not metrics, traces, alerts, or unreviewed logs; Alloy's
-   allow-list enforces the data boundary.
-6. Default deny: any bridge-to-non-bridge traffic is dropped.
+### `DOCKER-USER`
 
-The IPv6 chain is the fail-closed subset — no allow rules at all.
+Ansible replaces the whole chain in one `iptables-restore` action. It never
+updates rules one at a time. Rules run in this order:
 
-### 4.2 Native nftables guard (`inet aigw_guard`)
+1. Allow traffic on the same bridge.
+2. Drop traffic between bridges, including `docker0`.
+3. Allow established replies only in the reply direction.
+4. Allow published traffic only for exact source, host IP, port, and DNAT
+   matches. Drop all other physical-NIC traffic into Docker.
+5. Allow only Envoy at `172.28.0.2` to use approved DNS and provider TCP 443 on
+   egress. Allow only the exact Keycloak-to-LDAPS tuple on internal. If Cribl
+   export is enabled, allow only the exact Alloy-to-Cribl tuple on internal.
+6. Drop every other bridge-to-physical-network packet.
 
-`DOCKER-USER` protects only the forward path and can be transiently flushed
-by a firewalld reload. The independent `aigw_guard` table closes both gaps,
-rebuilt atomically per run:
+The IPv6 chain has no allow rules.
 
-- `container_input` (input hook, priority −5): containers may never initiate
-  new connections to host listeners; only host-initiated replies return.
-  This covers all managed bridges, `docker0`, and any future `br-*`.
-- `container_forward` (forward hook, priority −5): a native mirror of the
-  `DOCKER-USER` policy — same-plane accept, cross-plane deny, exact DNAT
-  tuples, Envoy-pinned egress — that stays live even while firewalld's
-  reload momentarily removes `DOCKER-USER`.
+### `aigw_guard`
 
-### 4.3 Ordering and reload defense
+The separate `inet aigw_guard` nftables table stays active during a firewalld
+reload. It has two hooks:
 
-Both policy units are ordered `Before=docker.service`, so the packet policy
-is live before Docker can publish a port. A watch service subscribes to
-firewalld's D-Bus `Reloaded` signal and immediately reapplies the host-input
-rules and `DOCKER-USER` after every reload. The `docker_networks` role
-additionally asserts that Docker's `FORWARD` chain actually jumps to
-`DOCKER-USER` before creating any network.
+- `container_input` blocks containers from starting new connections to host
+  services. Host-started replies may return.
+- `container_forward` repeats the same-plane, cross-plane, published-port, and
+  Envoy egress rules from `DOCKER-USER`.
 
-## 5. Container DNS enforcement
+Both policy units start before Docker. A watcher reapplies host rules and
+`DOCKER-USER` after a firewalld reload. Ansible also proves that Docker's
+`FORWARD` chain jumps to `DOCKER-USER` before it creates a network.
 
-Ansible renders two separate DNS planes in `docker-compose.dns.yml`:
+## 5. DNS paths
 
-- `internal_dns_servers` is the corporate DNS plane. It is reachable only
-  through the ADM and internal legs.
-- `egress_dns_servers` is the internet DNS plane. Only Envoy can reach it,
-  and only through the egress leg.
+Ansible gives containers one of two DNS lists:
 
-The old shared `CONTAINER_DNS_SERVER` setting is gone. Each container has an
-explicit resolver because Docker 29 may send inherited DNS queries from the
-host namespace. That would bypass the container forward path. Explicit
-resolvers keep queries where `DOCKER-USER` and `aigw_guard` can enforce the
-rules. Loopback, link-local, and
-multicast values are rejected at preflight, the two lists may not overlap,
-and only Envoy's pinned address may reach an Internet resolver. When the
-platform runs its own authoritative DNS
-(`platform_authoritative_dns_enabled`, off by default in production),
-the `docker-compose.platform-dns.yml` overlay adds the CoreDNS service,
-which then publishes port 53 on the exact ADM and internal host addresses.
-The complete hostname inventory and per-audience resolution design are in the
-[FQDN inventory](fqdn-inventory.md).
+- `internal_dns_servers` is customer DNS on the ADM and internal paths.
+- `egress_dns_servers` is internet DNS. Only Envoy can reach it through egress.
+
+Every container gets an explicit resolver. This keeps DNS packets inside the
+paths checked by both packet filters. Preflight rejects loopback, link-local,
+and multicast DNS addresses. The two lists cannot overlap.
+
+When `platform_authoritative_dns_enabled` is on, CoreDNS publishes TCP and UDP
+53 only on the exact ADM and internal host addresses. See the
+[service name list](fqdn-inventory.md).
 
 ## 6. Kernel settings
 
-`/etc/sysctl.d/90-ai-gateway.conf` sets `net.ipv4.ip_forward=1` (required
-for bridges) and **loose** reverse-path filtering (`rp_filter=2`) on the ADM
-and internal interfaces. Loose mode is deliberate: strict mode would drop the
-asymmetric replies that source-policy routing produces. Egress anti-spoofing
-does not depend on rp_filter — the TCP/443 egress allowance is pinned to the
-`br-egress` ingress interface, so a container on another plane forging an
-egress-subnet source address still matches no allow rule.
+`/etc/sysctl.d/90-ai-gateway.conf` sets:
 
-## 7. What verification asserts
+```text
+net.ipv4.ip_forward=1
+rp_filter=2
+```
 
-After every converge, the `verify` role checks the live host again. It requires:
+IP forwarding is needed for Docker bridges. Loose reverse-path checks are
+needed for the reply routes above. Strict mode would drop valid replies.
+Envoy egress is still safe because the TCP 443 rule also requires the
+`br-egress` input bridge. A forged source address from another bridge does not
+match.
 
-- one default route on the egress NIC;
-- both policy rules and their single-default routing tables;
-- the saved, runtime, and permanent interface owner for every zone;
-- the identity-pinned `DOCKER-USER` and `aigw_guard` rules;
-- no physical accept rule based only on source and port;
-- the exact driver, internal flag, bridge name, subnet, and IP range for every
-  Docker network; and
-- only the two Traefik port bindings and optional authoritative DNS, with no
-  wildcard or egress binding.
+## 7. Checks after every deploy
+
+The `verify` role requires:
+
+- one default route through egress;
+- both source rules and both one-default route tables;
+- the same zone owner in NetworkManager and live and saved firewalld data;
+- the exact `DOCKER-USER` and `aigw_guard` rules;
+- no physical allow based only on source and port;
+- the exact settings for every Docker network; and
+- only approved Traefik and optional DNS host ports, with no wildcard or
+  egress listener.
+
+Any mismatch fails the deployment.

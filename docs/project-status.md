@@ -102,9 +102,9 @@ identity policy, documentation links, YAML lint, ShellCheck, Ruff, and Bandit.
 - **Production upgrade:** no approved remote VM or maintenance window was in
   scope. Do not create a Rocky or Parallels test VM. Run the guarded remote
   upgrade only on the approved target after the local and CI gates pass.
-- **Customer ceremonies:** customer TLS, external LDAPS, Vault key custody,
+- **Production ceremonies:** customer TLS, external LDAPS, Vault key custody,
   Anthropic enrollment, production backups, the real Cribl endpoint, and final
-  access approval need customer operators.
+  access approval need customer operators. This is operator-owned work.
 - **Cribl retention:** the seeded receipt and outage recovery passed. The Cribl
   team must still apply and prove its 24-hour destination retention. If a hard
   24-hour age limit is required on the local queue, that control is still a
