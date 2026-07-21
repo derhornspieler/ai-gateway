@@ -41,9 +41,9 @@ ruff check app tests                              # lint
 bandit -q -r app --severity-level medium --confidence-level medium  # security gate (CI variant; the runbook's --severity-level high is a looser release-flow supplement)
 ```
 
-Toolchain is pinned in each service's `requirements-dev.txt` (ruff 0.15.21, pytest 9.1.1, bandit 1.9.4); install with `pip install -r requirements-dev.txt` or use the clean-venv flow in `docs/test-runbook.md` §1. CI pins Python 3.12.13.
+Toolchain is pinned in each service's `requirements-dev.txt` (ruff 0.15.22, pytest 9.1.1, bandit 1.9.4); install with `pip install -r requirements-dev.txt` or use the clean-venv flow in `docs/test-runbook.md` §1. CI pins Python 3.14.6.
 
-### Go modules (services/{dhi-health-probe,egress-proxy,vault-ui-proxy} — stdlib-only, no go.sum)
+### Go modules (services/{dhi-health-probe,egress-proxy,vault-ui-proxy,wif-provider-mock} — stdlib-only, no go.sum)
 
 ```bash
 cd services/<module> && go test -race ./... && go vet ./...   # Go 1.26.x; four independent modules
@@ -128,7 +128,7 @@ Trivy fs scan (HIGH/CRITICAL, waivers only via `.trivyignore.yaml` with `expired
 - **SELinux relabel suffixes are load-bearing:** shared bind mounts (`./certs`, `ca.pem`) use `:ro,z`; private mounts use `:ro,Z`. Switching z→Z lets the last-created container steal the label from its peers. Short bind syntax (not the long mount form) is required.
 - **Don't "fix" intentional non-strict dependencies:** `key-rotator` uses `depends_on vault: service_started` (not healthy) and admin-portal similarly, because a fresh/sealed Vault keeps `/readyz` at 503 until the unseal ceremony — requiring health would deadlock the first converge.
 - **Single-worker constraint:** dev-portal runs uvicorn with exactly `--workers 1` and key-rotator keeps one replica — key-issuance dedupe and last-admin protection are process-local locks. Never scale these ad hoc.
-- **Python deps:** `requirements.txt` pins must be exact `==` and present in `requirements.lock`, regenerated with `uv pip compile requirements.txt --python-version 3.12 --python-platform linux --generate-hashes --output-file requirements.lock` (the header line is asserted). `requirements-dev.txt` must never enter production images.
+- **Python deps:** `requirements.txt` pins must be exact `==` and present in `requirements.lock`, regenerated with `uv pip compile requirements.txt --python-version 3.14 --python-platform linux --generate-hashes --output-file requirements.lock` (the header line is asserted). `requirements-dev.txt` must never enter production images.
 - **Keycloak realm JSON imports only into an empty database** — editing realm templates does nothing to an existing realm.
 
 ## Imported Claude Cowork project instructions
