@@ -1,82 +1,101 @@
 # Engineering backlog
 
-[TASKS.md](../TASKS.md) is the durable source of truth for task status. This
-page gives extra context for a few deferred engineering items. If the two files
-disagree, update `TASKS.md` first and then repair this page.
+[TASKS.md](../TASKS.md) is the source of truth for task status. This page adds
+short notes for the largest open jobs. If the files differ, fix `TASKS.md`
+first.
 
 ## Finish the plain-language documentation review
 
-The active guides now separate local preprod from production. CI checks active
-links, heading bookmarks, code fences, local images, and Mermaid node labels.
-The release rehearsal uses the offline seed in local Docker preprod. It does
-not require a Rocky or Parallels test VM.
+The active guides now separate local preprod from production. The automated
+documentation gate checks:
 
-The remaining work is a human review:
+- local links and heading bookmarks;
+- code fences;
+- local image links;
+- Mermaid syntax and node labels; and
+- navigation between related pages.
 
-- Ask a new operator to follow the local preprod path without verbal help.
-- Ask a production operator to review the production path and commands.
-- Replace any sentence or diagram they cannot understand on the first read.
-- Keep uncommon security terms, but define them in plain language.
-- Save the link-check result and review notes with the release evidence.
+The diagrams and main design guides were checked against the deployed code.
+The release test uses the offline seed in local Docker. It does not use a Rocky
+or Parallels test VM.
+
+One human review remains:
+
+1. Ask a new operator to follow local preprod with no verbal help.
+2. Ask a production operator to review the production commands.
+3. Fix any sentence, command, or diagram they cannot follow the first time.
+4. Define any security word they do not know.
+5. Save the notes and final link report with release evidence.
 
 ## Run a full security audit
 
-- Review authentication, authorization, secret handling, network boundaries,
-  file permissions, command execution, backups, upgrades, and rollback code.
-- Review Ansible, Compose, Python, Go, shell, and CI workflows by hand and with
-  the appropriate static-analysis tools.
-- Use the main/manual GitHub container-security workflow to build every custom
-  image and resolve the exact image IDs used by the committed release scan.
-- Review its Trivy result for every exact upstream and custom image in the
-  committed release, plus the repository scan. Do not substitute an unrecorded
-  local scan.
-- Review each finding. Fix it or record a time-limited waiver with an owner and
-  reason.
-- Verify SBOM and provenance data for DHI images and custom builds.
-- Publish a dated report with commands, tool versions, image IDs, findings, and
-  remaining risk.
+Review the full code and release, including:
+
+- login, roles, secrets, networks, files, commands, backup, upgrade, and
+  rollback;
+- Ansible, Compose, Python, Go, shell, and GitHub Actions;
+- every exact upstream and custom image in the release;
+- SBOM and provenance data; and
+- every open finding or waiver.
+
+Use the GitHub container-security workflow for the release scan. It must build
+the custom images, resolve exact image IDs, and run Trivy on source and images.
+Do not replace it with an unrecorded local scan.
+
+The workflow currently stops at its required DHI login gate because the
+protected GitHub environment has no approved DHI secrets. Do not weaken that
+gate. Add approved secrets, rerun the workflow, then fix each finding or add a
+short waiver with an owner, reason, and end date.
+
+Publish a dated report. Include commands, tool versions, image IDs, findings,
+fixes, waivers, and remaining risk.
 
 ## Rehearse the PostgreSQL 18 migration with production-sized data
 
-The source now pins PostgreSQL `18.4`. The image, data path, explicit physical
-volume name, backup checkpoint, logical restore tool, Ansible migration
-playbook, fail-closed cutover, and operator SOP are implemented. The normal
-image updater still refuses a PostgreSQL major change.
+The source pins stable PostgreSQL `18.4`. The migration playbook and
+[operator SOP](sop/postgresql-18-migration.md) are implemented.
 
-PostgreSQL 18.4 is a stable release. A bounded ARM64 check on 2026-07-21 ran
-the same application, logical-restore, and physical-restore checks against the
-exact DHI PostgreSQL 17.10 and 18.4 images. Both passed. The operator selected
-18.4. This does not close the seeded preprod or production-sized rehearsal
-gates below.
+The 2026-07-21 ARM64 `r10` seed test started a clean PostgreSQL 18.4 preprod
+stack. LiteLLM, Keycloak, key-rotator, and Grafana passed. Smaller tests also
+proved PostgreSQL 16 logical restore and PostgreSQL 18 same-major physical
+restore.
 
-The remaining work needs real deployment evidence:
+The remaining job needs production-sized test data:
 
-- build the exact image into the offline seed;
-- start a clean local preprod stack on PostgreSQL 18;
-- create production-sized PostgreSQL 16 test data;
-- run the complete encrypted backup and logical migration;
-- test LiteLLM, Keycloak, Grafana, and key-rotator after cutover;
-- force a restore failure and prove the pre-cutover PostgreSQL 16 rollback;
-- force a post-cutover failure and prove downgrade is refused; and
-- test a same-major PostgreSQL 18 physical backup restore on a clean host.
+1. Create a large, realistic PostgreSQL 16 test backup.
+2. Run the full encrypted backup and logical 16-to-18 migration.
+3. Test every database client after cutover.
+4. Force a pre-cutover failure and prove the PostgreSQL 16 rollback.
+5. Force a post-cutover failure and prove downgrade is refused.
+6. Restore a PostgreSQL 18 physical backup on a clean approved host.
 
-There is no recorded technical reason why the first project commit used
-PostgreSQL 16. The likely reason was a conservative first choice, but that is
-an inference. Read the
-[PostgreSQL 18 migration SOP](sop/postgresql-18-migration.md) before running
-this rehearsal.
+Git history gives no technical reason for the first PostgreSQL 16 choice. It
+may have been a careful first choice, but that is only an inference.
 
 ## Review every container image version
 
-- Inventory every DHI and non-DHI image, including build-stage images.
-- Record the upstream release, support status, current fix release, digest,
-  platform, and reason for the selected major.
-- Prefer a current supported release. Keep an older major only when a tested
-  compatibility or migration reason is written down.
-- Pull and build by digest, scan the exact result, run it in local preprod, and
-  test rollback before changing production.
-- Repeat the review on a schedule and when an upstream security advisory lands.
+For each runtime and build image, record:
 
-DHI tags are versioned and images can be pinned by digest. A newer tag must
-still pass this repository's compatibility and rollback tests before it is
-promoted. See the [DHI digest guidance](https://docs.docker.com/dhi/core-concepts/digests/).
+- current pin and digest;
+- newest supported stable release;
+- support state and security fixes;
+- CPU platform;
+- DHI availability; and
+- the reason for its selected major version.
+
+Prefer the newest tested stable release. Keep an older release only when a
+written compatibility or migration reason exists.
+
+A 2026-07-21 review found newer upstream releases for a few services that were
+not yet present in DHI. The current release keeps the newest compatible DHI
+pin rather than changing registries without review. Traefik uses the current
+patched upstream binary on the reviewed DHI runtime.
+
+For each promoted pin, build by digest, create the schema-v2 seed, destroy the
+owned preprod stack and old release images, load the seed, deploy with Ansible,
+run the full local test, and prove rollback. Scan the exact release in GitHub
+Actions before production approval.
+
+Repeat this review on a schedule and after an upstream security notice. See the
+[image update workflow](image-update-workflow.md) and
+[DHI digest guide](https://docs.docker.com/dhi/core-concepts/digests/).
