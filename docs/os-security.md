@@ -1,216 +1,207 @@
-# Operating System Security Baseline (Rocky Linux 9)
+# Rocky Linux 9 host security
 
-This document describes the host-level hardening AI Gateway's Ansible
-playbooks require and apply on the target Rocky Linux 9 VM: SELinux policy
-and verification, SSH hardening, encrypted state storage, package hygiene,
-auditing, and filesystem permission contracts. Network enforcement is covered
-separately in [network security](network-security.md); the container platform
-in [Docker security](docker-security.md). The shorter
-[security model](security-model.md) connects these host controls to identity,
-provider trust, and telemetry.
+This page explains the host rules applied by the production Ansible playbook.
+Local preprod does not change or prove these rules.
 
-In plain language, the production host must:
+Read [network security](network-security.md) for firewall and route details.
+Read [container security](docker-security.md) for Docker rules.
 
-- run Rocky Linux 9 with SELinux enforcing;
-- accept key-only SSH on the ADM interface from the approved VPN range;
-- use the exact reviewed Docker, Compose, containerd, `age`, and Python SDK
-  versions;
-- keep project files, secrets, and state at their required owners and modes;
-- report any new SELinux denial as a deployment failure; and
-- warn when sensitive state is not backed by customer-supplied LUKS storage.
+## Required host state
 
-Local preprod does not change or prove these production host controls.
+Production supports Rocky Linux 9 only. Ansible checks the host before it
+changes it.
 
-## Posture summary
+The host must:
 
-The playbook validates before it mutates. Most violated contracts stop the run
-instead of being silently repaired. The stated exception is LUKS backing:
-Ansible reports a clear warning because disk provisioning belongs to the
-customer, then continues. Only Rocky Linux 9 is supported; any other
-distribution or major version is refused.
+- run SELinux with the `targeted` policy in enforcing mode;
+- allow key-only SSH through ADM from the approved VPN range;
+- use reviewed Docker, Compose, containerd, `age`, and Python SDK versions;
+- keep project files and secrets at exact owners and modes; and
+- report any new SELinux denial as a failed deployment.
 
-## 1. SELinux
+The customer should put sensitive state on LUKS-encrypted storage. Ansible
+checks this, but it warns and continues when LUKS is missing. The repository
+does not create or unlock disks.
 
-**Required state.** The `targeted` policy, `Enforcing`, on Rocky 9. These
-values are hard-pinned; the play asserts them and refuses substitutes. With
-management disabled (`aigw_manage_selinux: false`) the play still requires
-the host to already be enforcing.
+## SELinux
 
-**Controlled transitions only.** A reboot may be needed when SELinux is
-disabled, the wrong policy is loaded, or the kernel uses `selinux=0`. The play
-refuses that reboot unless the operator sets
-`aigw_allow_selinux_reboot: true`. It also refuses to reboot while Docker is
-enabled or active. This prevents containers from starting before their host
-guards. Switching a *live* Docker host from permissive to enforcing
-additionally requires `aigw_allow_active_selinux_enforcement: true`, because
-that transition can surface latent labeling defects immediately.
+The required state is:
 
-**Installed tooling.** `selinux-policy-targeted`, `container-selinux`,
-`policycoreutils(-python-utils)`, `libselinux-utils`, `python3-libselinux`,
-and `grubby` for kernel-parameter management.
+```text
+Policy: targeted
+Mode:   Enforcing
+```
 
-**Persistent file contexts.** Docker's data root carries
-`container_var_lib_t`; every reviewed read-only bind source (certificates,
-Traefik/LiteLLM/Keycloak/Vault/telemetry configuration, and the secrets
-files) is persisted as `container_ro_file_t`. Relabeling runs only when no
-project container exists yet, so a live container's private MCS category is
-never erased, and `restorecon` is never applied to Docker's runtime tree.
+If `aigw_manage_selinux` is false, the host must already have this state. If
+Ansible manages SELinux, a change that needs a reboot is blocked unless the
+operator sets `aigw_allow_selinux_reboot: true` for an approved window.
 
-**Per-container confinement.** Every ordinary service must run as
-`container_t` with its own MCS category pair on both process and mount
-label, verified against `/proc/<pid>/attr/current`. Exactly two bounded
-exceptions run with `label=disable` (the log collector and the host-metrics
-exporter — see [Docker security](docker-security.md)); anything else
-unlabeled fails verification. Each bind mount must be read-only with exactly
-one relabel flag, and private (`Z`) binds must show the exact MCS category of
-their owning container.
+Ansible also refuses that reboot while Docker is active or enabled. This keeps
+containers from starting before host packet rules are ready.
 
-**Zero-AVC gate.** The play records a timestamp before host mutation and,
-after converge, requires `ausearch -m AVC,USER_AVC` to return no matches for
-the window. Any denial — even a tolerated one — fails the deployment.
+Changing a live Docker host from permissive to enforcing may expose old label
+errors. It needs the separate approval
+`aigw_allow_active_selinux_enforcement: true`.
 
-## 2. SSH hardening
+Ansible installs the Rocky SELinux and container policy tools. It then sets
+persistent labels:
 
-The baseline installs `/etc/ssh/sshd_config.d/00-ai-gateway-hardening.conf`,
-enforcing key-only authentication and disabling every forwarding channel:
+- Docker state uses `container_var_lib_t`.
+- Reviewed read-only bind files use `container_ro_file_t`.
+- Normal containers run as `container_t` with their own MCS label.
 
-| Category | Directives |
-|---|---|
-| Authentication | `AuthenticationMethods publickey`, `PubkeyAuthentication yes`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `ChallengeResponseAuthentication no`, `PermitEmptyPasswords no`, `HostbasedAuthentication no`, `GSSAPIAuthentication no`, `IgnoreRhosts yes` |
-| Privilege | `PermitRootLogin no`, `PermitUserEnvironment no`, `PermitUserRC no` |
-| Forwarding | `DisableForwarding yes`, `AllowTcpForwarding no`, `AllowStreamLocalForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, `GatewayPorts no` |
-| Rate limits | `MaxAuthTries 3`, `LoginGraceTime 30`, `MaxSessions 4`, `MaxStartups 10:30:30` |
+Alloy and node-exporter are the only two approved `label=disable` cases. They
+read host trees that must not be relabeled. Their mounts, users, capabilities,
+networks, and ports remain limited and checked.
 
-The hardened production profile keeps password authentication and every SSH
-forwarding mode disabled. Local preprod does not manage the workstation's SSH
-server.
+Each bind mount must be read-only and use the right shared `z` or private `Z`
+flag. A private bind must match its container's MCS label.
 
-**Lockout-safe application.** Before changing sshd, the controller proves a
-fresh key-only connection. It checks the candidate file with `sshd -t -f` and
-the full configuration with `sshd -t`. It reloads sshd instead of restarting
-it. Next, `sshd -T -C` checks all 23 rules for the real user and connection
-path. A second key-only login must then pass with non-interactive `sudo -n`
-before the play continues. SSH is
-reachable only on the ADM interface from `vpn_client_cidr`, on the exact
-managed port.
+Ansible records the time before it starts host work. At the end, it checks
+`AVC` and `USER_AVC` audit events for that window. Any new denial fails the
+deploy.
 
-## 2.5 Time synchronization
+## SSH
 
-The `time_sync` role requires a synchronized clock before SELinux or Docker can
-install signed packages or build images. `aigw_require_time_sync` is on by
-default. `aigw_time_sync_max_offset_seconds` defaults to five seconds. OIDC,
-TLS, and short-lived JWTs all need trustworthy time.
+Ansible writes this drop-in:
 
-## 3. Encrypted state storage
+```text
+/etc/ssh/sshd_config.d/00-ai-gateway-hardening.conf
+```
 
-LUKS (Linux Unified Key Setup — full-disk encryption) is a **build-time,
-disk-provisioning** concern that the converge deliberately does not manage: it
-never creates the encrypted volume, never unlocks it, and never holds the
-passphrase. The operator provisions the encrypted disk when the VM is built and
-**custodies the passphrase themselves** (offline, or in their own vault); the
-gateway never sees it.
+The main rules are:
 
-With `require_encrypted_state: true` (the default), a read-only preflight
-resolves both Docker's data root and `/opt/ai-gateway` to their backing block
-device and checks (via `findmnt`/`lsblk`) that the ancestry includes a
-`crypto_LUKS` volume. When a path is not on LUKS, the check **warns and
-continues** rather than failing closed: it emits
-`AIGW_ENCRYPTED_STATE_WARNING: …` and then a plain-language `WARNING: sensitive
-AI Gateway state is NOT on LUKS-encrypted storage …` line, and the converge
-proceeds. Both the host-prep phase (`os-prep.yml`) and the stack phase
-(`deploy-stack-only.yml`) run this same warn-only check. Local preprod is a
-separate workstation workflow and does not run Rocky host checks. State backups
-are encrypted with `age` (X25519) to an operator-supplied recipient; stateful image
-upgrades are refused unless a hash-verified backup receipt younger than 24 hours
-exists (`require_preupgrade_backup: true`).
+| Area | Rule |
+| --- | --- |
+| Login | Public key only; no password, keyboard, host, GSSAPI, or empty-password login |
+| Privilege | No root login, user environment, or user RC file |
+| Forwarding | No TCP, Unix socket, agent, X11, tunnel, or gateway forwarding |
+| Limits | 3 auth tries, 30-second grace, 4 sessions, `MaxStartups 10:30:30` |
 
-## 4. Package hygiene
+SSH listens only on the managed ADM path and port. firewalld limits it to
+`vpn_client_cidr`.
 
-The baseline uses Docker's GPG-checked repository and Rocky's signed EPEL. It
-installs Docker CE, the Compose plugin, `containerd.io`, `container-selinux`,
-`audit`, `openssl`, `bind-utils`, `acl`, `zstd`, and supporting Python tools.
+Ansible avoids lockout in this order:
 
-The live Docker packages use the exact versions proven by the test suite:
+1. Prove a new key-only login before the change.
+2. Check the new file and full sshd config with `sshd -t`.
+3. Reload sshd; do not restart it.
+4. Read back all effective rules with `sshd -T -C`.
+5. Prove another key-only login and non-interactive `sudo -n`.
 
-- `docker-ce` and `docker-ce-cli` `29.6.1-1.el9`;
-- `containerd.io` `2.2.6-1.el9`; and
-- `docker-compose-plugin` `5.3.1-1.el9`.
+## Time
 
-The values live in `ansible/group_vars/all.yml` and may be overridden in
-`host_vars`. An unpinned `docker-ce-stable` install twice
-adopted a Compose-v5 release that broke a live converge, so the pin is a
-stability control. `state: present` makes the converge stop if the mirror no
-longer has the exact version. It never installs the newest version silently.
-`allow_downgrade: false` also stops a host that has already moved to a newer
-version; Ansible will not downgrade Docker under a running stack.
+OIDC, TLS, signed packages, and short-lived WIF tokens need correct time.
+`aigw_require_time_sync` is on by default. The allowed clock offset defaults
+to five seconds.
 
-Two further dependencies are exact-pinned
-the same way — the `age-1.3.1-1.el9` package and the `docker==7.2.0` Python
-SDK — so a privileged converge can never resolve an unbounded future version.
-There is no `dnf versionlock`. The converge checks every pin on each run and is
-the approved change path for the dedicated host. The repository also pins the
-`age` package, Docker SDK, and every container image. No automatic-update
-service is configured; a version bump is
-an operator action executed through the reviewed converge and its backup
-gates — see the deliberate-upgrade path in `docs/operations.md`.
+## Encrypted state and backups
 
-## 5. Auditing and scheduled maintenance
+The customer creates and unlocks LUKS storage when the VM is built. AI Gateway
+never receives the LUKS passphrase.
 
-- **auditd** backs the zero-AVC deployment gate (§1).
-- **`aigw-vault-audit-rotate.timer`** (15-minute cadence) rotates Vault's
-  file audit device once it exceeds 100 MiB, using a locked, networkless,
-  capability-dropped helper container; Vault is signaled to reopen its audit
-  file before compression, and a bounded number of archives is retained.
-- **`aigw-docker-log-acl.timer`** (15-second cadence) maintains
-  least-privilege POSIX ACLs so the log collector (uid 473) can read only
-  the current project's container JSON logs — named-deny entries cover every
-  other runtime file. The reconciler runs in an aggressively sandboxed
-  systemd unit (read-only socket bind, three DAC capabilities, private
-  devices/network, `ProtectSystem=strict`).
+With `require_encrypted_state: true`, Ansible checks the storage below:
 
-## 6. Filesystem permission contracts
+- Docker's data root; and
+- `/opt/ai-gateway`.
 
-Deployment applies deterministic ownership and modes rather than trusting
-checkout state, and `verify` proves them (rejecting symlinks and multi-link
-files):
+It follows each path to its block device and looks for a `crypto_LUKS`
+ancestor. A missing LUKS layer prints `AIGW_ENCRYPTED_STATE_WARNING` and a
+plain warning, then continues. Both host prep and stack-only deploy run this
+check.
 
-- Rendered runtime environment `/opt/ai-gateway/.env`: `root:root 0600`.
-- Secrets directory: `root:root 0700`; Redis authentication sources
-  `root:65532 0440` (the server receives only a SHA-256 verifier — no
-  plaintext in its command line or environment); external-LDAPS bind password
-  `root:65532 0440`.
-- Files a non-root (uid 65532) container must read are group-owned 65532
-  with `0640`/`0440` and `0750` directories (Keycloak realms, Traefik key);
-  public certificates remain world-readable `0644`.
-- Reviewed non-secret configuration is `root:root 0755/0644`, with exactly
-  one executable exception (the PostgreSQL initializer).
-- Root-only state markers (dedicated-host marker, rollback manifest, restore
-  marker, bind-digest key) are `0600`, single-link, exact-content files.
+State backups use `age` X25519 encryption to an operator-owned recipient. A
+stateful image upgrade is blocked unless a verified backup receipt is less
+than 24 hours old when `require_preupgrade_backup` is true.
 
-## 7. Dedicated-host contract and preflight refusals
+## Package pins
 
-The VM is a dedicated Docker host for this stack. A verified host carries
-`/etc/ai-gateway/dedicated-docker-host-v1`. During host preparation,
-`os_baseline` first writes the matching `.pending` marker. This tells
-`deploy-stack-only.yml` that host preparation passed. `host_finalize` replaces
-it with the completed marker only after `verify` passes.
+Ansible uses signed Rocky, EPEL, and Docker repositories. It installs exact
+versions instead of silently taking the newest package.
 
-The read-only preflight refuses:
+Current host pins are:
 
-- a controller connection outside the future ADM firewall rule;
-- conflicting Docker daemon flags or indirect systemd environment files;
-- symlinked, group-writable, or non-root path ancestry;
-- foreign containers or networks on a live daemon;
+| Package | Version |
+| --- | --- |
+| `docker-ce` | `29.6.1-1.el9` |
+| `docker-ce-cli` | `29.6.1-1.el9` |
+| `containerd.io` | `2.2.6-1.el9` |
+| `docker-compose-plugin` | `5.3.1-1.el9` |
+| `age` | `1.3.1-1.el9` |
+| Python Docker SDK | `7.2.0` |
+
+The values live in `ansible/group_vars/all.yml`. A reviewed inventory may
+override them. If a repository no longer has the exact version, the deploy
+stops. If a host already has a newer Docker version, Ansible will not silently
+downgrade it.
+
+There is no automatic package update service and no `dnf versionlock`. A pin
+change is a reviewed release step with backup and test gates. See
+[operations](operations.md).
+
+## Audit and maintenance jobs
+
+The host runs these controls:
+
+- `auditd` records the SELinux events used by the zero-denial gate.
+- `aigw-vault-audit-rotate.timer` checks every 15 minutes. It rotates the
+  Vault audit file after 100 MiB and keeps a limited archive set.
+- `aigw-docker-log-acl.timer` checks every 15 seconds. It gives Alloy UID 473
+  read access only to this project's Docker JSON log files.
+
+The log ACL job runs in a locked systemd sandbox. It gets only the file rights
+needed to repair those ACLs. It does not give Alloy broad Docker state access.
+
+## File owners and modes
+
+Ansible sets and verifies these main rules:
+
+| Path or type | Owner and mode |
+| --- | --- |
+| Runtime `.env` | `root:root 0600` |
+| Secrets directory | `root:root 0700` |
+| Redis verifier/client sources | `root:65532 0440` |
+| External LDAPS bind password | `root:65532 0440` |
+| Private files read by UID 65532 | group `65532`, usually `0640` or `0440` |
+| Public certificates | `0644` |
+| Normal non-secret config | `root:root`, directories `0755`, files `0644` |
+| Root-only markers and keys | `0600` |
+
+Verification rejects unsafe symlinks and files with extra hard links.
+
+The Redis server reads only a SHA-256 password verifier. Its command and
+environment do not contain the password. Clients use a separate mounted file.
+
+## Dedicated-host marker
+
+The production VM is a dedicated Docker host for this stack.
+
+Host prep writes:
+
+```text
+/etc/ai-gateway/dedicated-docker-host-v1.pending
+```
+
+After the stack passes verification, Ansible promotes it to:
+
+```text
+/etc/ai-gateway/dedicated-docker-host-v1
+```
+
+`deploy-stack-only.yml` accepts the exact pending or completed marker. It
+refuses an unknown host.
+
+The read-only preflight also refuses:
+
+- a controller outside the future ADM SSH rule;
+- unsafe path owners, modes, symlinks, or ancestry;
+- foreign containers or Docker networks;
 - active Swarm mode;
-- a changed `daemon.json` on a marked host;
-- a non-standard or non-root Docker CLI;
-- extra daemon sockets, unreviewed systemd overrides, Docker plugins, rootless
-  Docker, or a second container runtime; and
-- adoption of existing Docker, firewall, or AIGW sshd state without the exact
-  acknowledgement flag.
+- unknown Docker sockets, plugins, systemd overrides, or daemon flags;
+- rootless Docker or another container runtime;
+- drifted Docker config on a marked host; and
+- existing Docker, firewall, or SSH state without the exact adoption approval.
 
-Those flags are `aigw_adopt_dedicated_docker_host`,
-`aigw_adopt_firewalld_state`, and `aigw_adopt_ssh_state`. The firewall flag can
-only resume a validated pending converge. A `firewall_preflight` role audits
-existing firewall state, and `host_finalize` promotes the dedicated-host
-marker only after a fully verified converge.
+Adoption flags are narrow and one-time. Firewall adoption can only resume a
+validated pending converge. Verification must still pass before the final
+marker is written.
