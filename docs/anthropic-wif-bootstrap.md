@@ -1,336 +1,271 @@
-# Anthropic Workload Identity Federation
+# Anthropic workload identity federation
 
-For the step-by-step operator procedure, start with the
-[Anthropic WIF setup SOP](sop/anthropic-wif-jwt-setup.md); this document is
-the authoritative reference behind it.
+This page explains the Anthropic WIF design. Use the
+[WIF setup SOP](sop/anthropic-wif-jwt-setup.md) for the exact operator steps.
 
-This runbook describes the implemented Keycloak-to-Anthropic WIF path, which has
-two deliberately separate authority domains. AI Gateway automatically creates
-and proves the Keycloak broker's `private_key_jwt` key, mints short-lived
-workload assertions, exchanges them through pinned Envoy egress, and refreshes
-LiteLLM. A human Anthropic organization administrator creates the initial issuer,
-service account, and federation rule, and manually approves every inline-JWKS
-change.
+WIF lets the gateway use short-lived provider tokens. It removes the need for
+a long-lived Anthropic API key in LiteLLM. Keycloak proves the gateway's
+identity with a signed JWT. Anthropic exchanges that JWT for a short-lived
+access token.
 
-The inference broker never receives `org:admin`. Anthropic issuer mutation
-requires an `org:admin` OAuth bearer, and granting that authority to the
-inference path would turn a model-credential compromise into organization-wide
-administration; the recurring watcher therefore detects and records drift but
-makes no Anthropic administration call. The external product behavior here was
-checked against the official Anthropic WIF documentation on 2026-07-12 — recheck
-the linked API contract at deployment time, because it is outside this
-repository's version control. The identity controller that performs the Keycloak
-side of this flow is documented in
-[identity-operations.md](identity-operations.md); see
-[solution-map.md](solution-map.md) for the egress trust boundary and
-[project-status.md](project-status.md) for overall posture.
+## The two authority areas
 
-## Current release status
+Two owners take part:
 
-Local preprod exercises Keycloak token minting, the WIF exchange shape, Envoy,
-LiteLLM, and provider-response handling against a custom TLS WIF mock. That
-proves the local integration path, but it does not prove Anthropic billing,
-workspace scope, organization policy, or model output.
+| Owner | What it controls |
+| --- | --- |
+| AI Gateway | Keycloak signing key, JWT creation, token exchange, refresh, and LiteLLM update |
+| Human Anthropic org admin | Anthropic issuer, service account, rule, workspace, and inline public keys |
 
-Every production deployment still needs its own Anthropic issuer, rule,
-service account, workspace, and approved inline JWKS. Complete the external
-ceremony and a real inference canary before marking production WIF as passed.
-An HTTP 401 before Envoy is not a network or inference pass. Current evidence
-and blockers are listed in [project status](project-status.md) and the
-[acceptance runbook](test-runbook.md).
+The gateway never gets `org:admin`. A stolen inference credential must not
+become an Anthropic organization admin credential.
 
-## Implemented Keycloak contract
+The gateway can detect an Anthropic public-key mismatch. It cannot approve a
+new key set in Anthropic. A human must do that with a fresh admin session.
 
-The `anthropic-wif` realm is separate from the user-authentication `aigw` realm
-and advertises the distinct frontend URL `https://idp.wif.<domain>`, derived from
-the same `aigw_domain` inventory value as the rest of the deployment. Its broker
-client `anthropic-token-broker`
-is imported disabled with service accounts enabled, `client-jwt`
-(`private_key_jwt`) authentication, RS256, no shared-secret fallback, a
-600-second access-token lifetime, and only the audience
-`https://api.anthropic.com`. The client has no inherited default or optional
-scopes. This prevents Keycloak scopes such as `roles` from adding the
-`account` audience.
+## What local preprod proves
 
-Ansible runs this identity setup without a portal step. During setup,
-key-rotator keeps the broker disabled and does the following:
+Local preprod tests this full shape against local TLS mocks:
 
-1. It asks Keycloak to create a 3072-bit PKCS#12 key pair. The archive uses a
-   random password that is used once.
-2. It extracts the private key in memory. It stores the key only at the Vault
-   KV-v2 path `ai-gateway/anthropic-wif-client-key` under the `kv/` mount.
-   `KC_CLIENT_ASSERTION_KEY_VAULT_PATH` selects that path. A mounted PEM file
-   at `KC_CLIENT_ASSERTION_KEY_FILE` is the supported alternative.
-3. It registers the public certificate on the Keycloak client.
-4. It removes inherited client scopes and disables full-scope access.
-5. It adds the fixed access-token subject mapper, enables the broker, proves
-   `private_key_jwt` works, and checks the returned token locally.
+- Keycloak creates and signs the token.
+- The token has the required subject and audience.
+- Envoy carries the exchange request.
+- key-rotator updates LiteLLM.
+- LiteLLM sends a mock inference request.
 
-The setup fails closed unless these exact claims are present:
+This does not prove a real Anthropic organization, workspace, bill, policy, or
+model response. Each production deployment still needs its own Anthropic
+enrollment and real inference canary. See [project status](project-status.md).
+
+## Automatic Keycloak setup
+
+Ansible performs the Keycloak setup. The admin portal has no initialization
+button.
+
+The WIF realm is separate from the user login realm:
+
+```text
+User login realm:  aigw
+WIF realm:         anthropic-wif
+Public WIF issuer: https://idp.wif.<domain>/realms/anthropic-wif
+Broker client:     anthropic-token-broker
+```
+
+`<domain>` comes from the Ansible inventory. A domain change also changes the
+WIF issuer. Anthropic must receive that issuer change in the same maintenance
+window.
+
+The broker uses these fixed rules:
+
+- `private_key_jwt` client authentication;
+- RS256 signing;
+- a 3072-bit key pair;
+- no shared client secret;
+- a 600-second Keycloak token;
+- no inherited client scopes; and
+- only the audience `https://api.anthropic.com`.
+
+During setup, key-rotator:
+
+1. Keeps the broker disabled.
+2. Asks Keycloak to make the key pair.
+3. moves the private key into Vault.
+4. Registers the public certificate in Keycloak.
+5. Adds the fixed subject mapper.
+6. Enables the broker and proves `private_key_jwt` works.
+7. Checks the returned claims before it marks setup ready.
+
+The private key normally lives at:
+
+```text
+kv/ai-gateway/anthropic-wif-client-key
+```
+
+The supported file option is `KC_CLIENT_ASSERTION_KEY_FILE`. Do not import a
+private key through Keycloak or the portal. The portal shows only the public
+certificate SHA-256 fingerprint.
+
+The release gate requires these exact claims:
 
 ```text
 sub = service-account-anthropic-token-broker
 aud = https://api.anthropic.com
 ```
 
-The mapper is necessary because Keycloak's native service-account `sub` is an
-internal user UUID that changes across realm recreation or restore.
-Initialization rejects a competing `sub` mapper, and the broker stays disabled
-whenever key generation, the Vault write, the client proof, or the claim proof
-fails. This mapper and client-credentials behavior was runtime-verified against
-the repository-pinned DHI Keycloak 26.7.0 image: `sub` was the stable value
-above, `aud` was exactly the Anthropic audience, and `azp`/`client_id`
-identified `anthropic-token-broker`. Treat the runtime claim validator, not assumptions
-about Keycloak defaults, as the release gate after any image upgrade. No operator
-should import a private key through Keycloak or the portal; the portal displays
-only a SHA-256 certificate fingerprint.
+Keycloak's normal service-account subject is an internal UUID. That UUID can
+change after a restore. The fixed mapper above keeps the Anthropic rule stable.
+Setup fails if another subject mapper competes with it.
 
-## Prerequisites
+## One-time Anthropic enrollment
 
-Complete the full three-interface deployment and Vault initialization and unseal,
-complete the automatic Ansible identity setup, and record a ready WIF broker plus its
-certificate fingerprint. Confirm time synchronization on the host and on the
-Anthropic administrator's workstation, and identify the approved Anthropic
-organization and workspace. The one-time Console ceremony requires an Anthropic
-Admin, Owner, or Primary Owner; an Admin API key is not accepted for WIF
-administration. Decide the narrowest rule scope: `workspace:inference` is
-preferred for this gateway's Messages and Models calls, and `workspace:developer`
-is used only if an approved workload also needs non-inference workspace APIs.
+Complete these steps only after the full deploy passes and Vault is unsealed.
+The [WIF setup SOP](sop/anthropic-wif-jwt-setup.md) gives the commands and
+expected output.
 
-## One-time external bootstrap
+### 1. Export public keys
 
-### 1. Export the public JWKS and canonical hash
+Run the SOP export on the target VM. It prints:
 
-Run from `/opt/ai-gateway` on the target. This prints public keys only; it never
-mints or prints a bearer token, and its canonicalization matches the watcher's
-exactly (keys sorted by `kid` then `alg`, compact separators):
+- the public JWKS;
+- the exact issuer URL; and
+- a canonical SHA-256 hash of the public key set.
 
-```bash
-scripts/aigw-compose.sh exec -T key-rotator python3 - <<'PY'
-import hashlib
-import json
-import urllib.request
+It prints no private key, assertion, or provider token. Stop if the export has
+no keys or the broker is not ready.
 
-url = (
-    "http://keycloak:8080/realms/anthropic-wif/"
-    "protocol/openid-connect/certs"
-)
-discovery_url = (
-    "http://keycloak:8080/realms/anthropic-wif/"
-    ".well-known/openid-configuration"
-)
-with urllib.request.urlopen(url, timeout=10) as response:
-    keys = json.load(response)["keys"]
-with urllib.request.urlopen(discovery_url, timeout=10) as response:
-    issuer = json.load(response)["issuer"]
-ordered = sorted(
-    keys,
-    key=lambda key: (str(key.get("kid", "")), str(key.get("alg", ""))),
-)
-canonical = json.dumps(ordered, sort_keys=True, separators=(",", ":"))
-print(json.dumps({"type": "inline", "keys": keys}, indent=2))
-print("issuer_url=" + issuer)
-print("federation_jwks_sha256=" + hashlib.sha256(canonical.encode()).hexdigest())
-PY
-```
+### 2. Create the Anthropic objects
 
-Record the hash in the controlled deployment evidence and copy the complete
-`keys` array — never a private key. If the command returns no keys or the broker
-is not ready, stop rather than creating an unverified federation.
+Use a human Anthropic Admin, Owner, or Primary Owner session. An Admin API key
+is not enough for this task.
 
-### 2. Create the Anthropic resources
+Create these objects:
 
-In Claude Console, open **Settings → Workload identity → Connect workload** and
-choose **Custom OIDC**. Create an inline federation issuer whose issuer URL is
-exactly `https://idp.wif.<domain>/realms/anthropic-wif`, using the deployment's
-`aigw_domain`, or copy the exact `issuer_url` printed by the helper. Use JWKS
-type `inline` with the full `keys` array
-from step 1, replay/JTI checking enabled, and a maximum assertion lifetime
-compatible with the 600-second Keycloak token lifetime. Create a developer-role
-service account named for AI Gateway and add it to the target workspace. Then
-create a federation rule with these exact limits:
+- one Custom OIDC issuer with inline JWKS;
+- one developer-role service account;
+- membership in the approved workspace; and
+- one federation rule.
 
-- subject `service-account-anthropic-token-broker`, with no wildcard;
-- audience `https://api.anthropic.com`;
-- the new service account as the target;
-- only the approved workspace;
-- `workspace:inference`, unless broader developer APIs were approved; and
-- a short access-token lifetime, normally 600 seconds.
+The rule must use these exact limits:
 
-An audience-only rule is invalid and unsafe; the exact subject is the workload
-identity boundary. Do not use a trailing `*`, do not match the Keycloak-native
-UUID, and do not create an `org:admin` rule for this broker. Record the returned
-issuer (`fdis_...`), rule (`fdrl_...`), service-account (`svac_...`),
-organization UUID, and workspace (`wrkspc_...`) identifiers; they are
-configuration identifiers rather than bearer credentials, but still belong in the
-controlled Vault record rather than browser storage.
+| Field | Required value |
+| --- | --- |
+| Issuer | The exact URL printed by the export |
+| Subject | `service-account-anthropic-token-broker` |
+| Audience | `https://api.anthropic.com` |
+| Target | The new service account |
+| Workspace | Only the approved workspace |
+| Scope | `workspace:inference`, unless broader access was approved |
+| Token life | Normally 600 seconds |
 
-### 3. Create the rotator bootstrap record
+Do not use a subject wildcard. Do not use the Keycloak UUID. Do not give this
+broker `org:admin`.
 
-Establish a Vault operator token through the approved process. The example passes
-it as an ephemeral exec environment variable, not an argument, and supplies the
-recorded identifiers without angle brackets:
+The controller helper can perform the reviewed Anthropic Admin API actions.
+It reads the short-lived `org:admin` token on stdin and does not store it:
 
 ```bash
-cd /opt/ai-gateway
-read -rsp 'Vault operator token: ' VAULT_TOKEN; printf '\n'
-export VAULT_TOKEN
-scripts/aigw-compose.sh exec -T -e VAULT_TOKEN vault vault kv put \
-  kv/ai-gateway/anthropic-wif \
-  kc_token_url=http://keycloak:8080/realms/anthropic-wif/protocol/openid-connect/token \
-  kc_client_id=anthropic-token-broker \
-  federation_issuer_id=fdis_... \
-  federation_rule_id=fdrl_... \
-  organization_id=00000000-0000-0000-0000-000000000000 \
-  service_account_id=svac_... \
-  workspace_id=wrkspc_... \
-  federation_jwks_sha256=<64-character-hash-from-step-1>
-unset VAULT_TOKEN
+python3 -I scripts/anthropic-wif-enroll.py --help
 ```
 
-The driver requires `kc_token_url`, `kc_client_id`, `federation_rule_id`,
-`organization_id`, and `service_account_id`; it validates `kc_token_url` against
-the configured `KEYCLOAK_URL` origin and the canonical
-`/realms/<realm>/protocol/openid-connect/token` path. `workspace_id` is required
-only when the rule covers multiple workspaces and is kept here even for a single
-workspace to make the billing and rate-limit boundary explicit.
-`federation_jwks_sha256` is required for the watcher to accept its first
-baseline. `federation_issuer_id` is retained for operator evidence only; the
-watcher does not use it to mutate Anthropic.
+Using the helper does not remove the human approval boundary.
 
-### 4. Prove exchange and promotion
+### 3. Save the non-secret IDs
 
-In the admin portal, enable the Anthropic WIF rotation row with the reviewed
-interval and grace values. Then select **Rotate now**. The test passes only when
-all of these checks pass:
+Record these values in the admin portal enrollment form or the approved Vault
+record:
+
+```text
+federation_issuer_id
+federation_rule_id
+organization_id
+service_account_id
+workspace_id
+federation_jwks_sha256
+```
+
+These are IDs and a public-key hash, not bearer tokens. They still belong in a
+controlled record. The portal requires the literal confirmation `ENROLLED`.
+It refuses enrollment if the live Keycloak key hash differs from the approved
+hash.
+
+### 4. Prove the first exchange
+
+Select **Rotate now** in the admin portal. A pass requires all of these checks:
 
 - Keycloak `private_key_jwt` authentication;
-- the local subject and audience checks;
-- `POST /v1/oauth/token` through `envoy-egress`;
-- a short-lived `sk-ant-oat01-...` token;
+- exact local subject and audience checks;
+- `POST /v1/oauth/token` through Envoy;
+- a short-lived Anthropic token;
 - an update to the LiteLLM credential `anthropic-primary`;
-- an inference canary through `api.<domain>`; and
-- healthy `anthropic.token_exchange` and `anthropic.jwks` flags.
+- healthy `anthropic.token_exchange` and `anthropic.jwks` flags; and
+- a real inference canary through `api.<domain>`.
 
-The test must not print the assertion or access token. The JWKS watcher accepts
-its first baseline only when the live canonical hash equals
-`federation_jwks_sha256`. A matching hash records operator approval of the
-Console keys. It does not replace the required token exchange.
+No test may print the assertion or access token. An HTTP 401 before Envoy is
+not a provider or network pass.
 
-## Recurring automated token flow
+## Normal token refresh
 
-For every scheduled or manual rotation, key-rotator signs a unique 60-second
-RFC 7523 client assertion with the Vault-held broker key. Both `iss` and `sub`
-are `anthropic-token-broker`. The audience is the WIF realm's canonical
-frontend token endpoint:
-`https://idp.wif.<domain>/realms/anthropic-wif/protocol/openid-connect/token`.
-That audience is deliberately the public/frontend URL, which Keycloak validates,
-even though the POST itself stays on the internal `keycloak:8080` origin and is
-never routed through egress.
+For each refresh, key-rotator creates a unique 60-second client assertion. Its
+`iss` and `sub` both name `anthropic-token-broker`. The assertion audience is
+the public Keycloak token URL:
 
-Next, key-rotator gets a 600-second Keycloak service-account token. It checks
-the stable `sub` and the one exact Anthropic audience locally. It exchanges that JWT at
-Anthropic's `/v1/oauth/token` through Envoy, using the recorded identifiers.
-It puts the returned short-lived bearer in the LiteLLM `anthropic-primary`
-credential. The next refresh is scheduled at about 80% of the reported token
-lifetime.
-
-Changing `aigw_domain` changes this issuer. For an already-enrolled deployment,
-schedule a maintenance window and update the Anthropic Custom OIDC issuer to the
-new helper-reported URL as part of the same change. Token exchange fails closed
-until Keycloak and Anthropic agree on the exact issuer; no automatic code can
-change the Anthropic Console setting for you.
-
-Failures use bounded exponential backoff with jitter, capped so a persistent
-failure never idles past the normal refresh cadence. If the active token is past
-90% of its lifetime while refresh keeps failing, the rotator raises an explicit
-inference-at-risk alert. The driver never silently falls back to a static client
-secret: `ANTHROPIC_WIF_ALLOW_INSECURE_CLIENT_SECRET` is a development escape
-hatch that must remain false in production and logs an error on every use.
-
-## Manual inline-JWKS rotation
-
-Inline JWKS has no remote discovery, so rotate Keycloak signing keys without an
-exchange outage. Add the new Keycloak realm signing provider at a lower priority
-so its public key is published while the old key still signs. Wait for
-`anthropic.jwks` to report the candidate canonical SHA-256 and independently
-export the full old-plus-new JWKS with the helper above. Using a fresh
-interactive Anthropic `org:admin` Console session, replace the issuer's entire
-inline `keys` array — do not give that token to key-rotator or store it in Vault.
-Then patch only the approved hash in the existing Vault document:
-
-```bash
-read -rsp 'Vault operator token: ' VAULT_TOKEN; printf '\n'
-export VAULT_TOKEN
-scripts/aigw-compose.sh exec -T -e VAULT_TOKEN vault vault kv patch \
-  kv/ai-gateway/anthropic-wif \
-  federation_jwks_sha256=<new-64-character-canonical-hash>
-unset VAULT_TOKEN
+```text
+https://idp.wif.<domain>/realms/anthropic-wif/protocol/openid-connect/token
 ```
 
-Wait for watcher history `manual_update_confirmed` and a healthy
-`anthropic.jwks`, then make the new Keycloak key active and prove a fresh token
-exchange and inference. After every old assertion has expired, retire the old
-Keycloak key and repeat the full-array Console update and approved-hash patch for
-the resulting key-removal drift.
+The request itself stays on the private Keycloak network. Keycloak then issues
+a 600-second service token. key-rotator checks its claims and exchanges it at
+Anthropic through Envoy.
 
-The watcher persists the pending public JWKS and hash and emits one history row
-per newly observed candidate without five-minute log spam. It never assumes a
-first observation is correct after database loss or restore. Do not clear an
-alert by writing the candidate hash before the Anthropic Console update; that
-records a false operator attestation and the next token exchange can still fail.
+The returned token replaces `anthropic-primary` in LiteLLM. Refresh is planned
+at about 80% of the token life. Failures use bounded backoff. At 90%, a
+continued refresh failure raises an inference-at-risk alert.
 
-## Troubleshooting and recovery
+There is no production fallback to a static client secret.
+
+## Public-key rotation
+
+Anthropic uses inline JWKS for this design. It does not fetch new keys from
+Keycloak. Rotate keys in this order:
+
+1. Add the new Keycloak signing key at lower priority. Keep the old key active.
+2. Export the full old-plus-new public key set and its hash.
+3. In a fresh Anthropic org-admin session, replace the whole inline key set.
+4. Record the new approved hash in the portal or Vault.
+5. Wait for `manual_update_confirmed` and healthy JWKS status.
+6. Make the new Keycloak key active.
+7. Run a fresh exchange and inference canary.
+8. After old assertions expire, remove the old key and repeat the approval
+   steps for the final key set.
+
+Never approve the new hash before Anthropic receives the new public keys. That
+would create false evidence while the next exchange could still fail.
+
+The watcher stores the pending public candidate and hash. It does not call the
+Anthropic admin API and does not assume the first value after a restore is
+correct.
+
+## Disable and delete
+
+The bounded key-rotator API and admin portal can enroll, disable, or delete the
+Anthropic record. The enrollment payload contains no private key.
+
+Disable stops refresh and lets the short-lived token expire. Delete requires
+the literal confirmation `DELETE anthropic`. Delete is blocked while a valid
+short-lived token may still exist.
+
+## Troubleshooting
 
 | Symptom | Check |
-|---|---|
-| Keycloak client authentication fails | broker fingerprint, Vault key path, client enabled state, `client-jwt` authenticator, canonical frontend token audience |
-| "unstable subject claim" | identity initialization completed, one hardcoded `sub` mapper exists, no competing subject mapper |
-| missing Anthropic audience | `anthropic-audience` mapper and exact `https://api.anthropic.com` value |
-| Anthropic `invalid_grant` | exact issuer, subject, audience, expiry/clock, rule and workspace IDs, service-account membership, and current inline JWKS in Console history |
-| `baseline_unconfirmed` | export live JWKS, update the Console with an interactive org admin, then record the exact canonical hash in Vault |
-| `drift_detected` | complete the manual old-plus-new or key-removal ceremony; do not activate or retire signing keys first |
-| token minted but LiteLLM promotion fails | LiteLLM health and credential API, and rotator database persistence — a token exchange alone is not a healthy rotation |
+| --- | --- |
+| Keycloak client auth fails | Broker enabled state, Vault key path, public fingerprint, `client-jwt`, and public token URL |
+| `unstable subject claim` | Automatic identity setup and the one fixed subject mapper |
+| Missing audience | Exact `https://api.anthropic.com` audience mapper |
+| Anthropic `invalid_grant` | Clock, issuer, subject, audience, rule IDs, workspace, service account, and current inline keys |
+| `baseline_unconfirmed` | Export keys, update Anthropic, then approve the exact hash |
+| `drift_detected` | Complete the overlap or key-removal ceremony |
+| Token exchange passes but LiteLLM update fails | LiteLLM health, credential API, and rotator database |
 
-Anthropic returns an opaque HTTP 400 `invalid_grant` for every exchange failure,
-including a signature mismatch against a stale inline JWKS, so the driver raises a
-loud `anthropic.token_exchange` alert on 400/401 responses from `/oauth/token`.
-After a restore, compare the recorded broker fingerprint, the Keycloak public
-certificate, the Vault private key, the stable subject mapper, and the approved
-JWKS hash. Use [identity recovery](identity-operations.md) if the broker key
-proof fails, and never copy the private key into a ticket or browser or replace
-`private_key_jwt` with a long-lived client secret to recover quickly.
+Anthropic may return the same HTTP 400 `invalid_grant` for several causes,
+including an old inline key set. Check each field instead of guessing.
 
-## Residual operational boundary
+After a restore, compare the broker fingerprint, Keycloak certificate, Vault
+private key, fixed subject mapper, and approved JWKS hash. Never copy the
+private key into a ticket or replace WIF with a long-lived secret as a quick
+fix.
 
-External Anthropic resources and every inline-JWKS approval remain a human
-`org:admin` ceremony by design. The portal does not collect the external WIF
-identifiers; an operator writes the complete Vault record. No Anthropic
-organization-admin token is stored, so there is no automatic issuer update or
-emergency rollback. This repository cannot prove the customer's Anthropic
-organization, workspace membership, billing attribution, or Console audit
-retention in local unit tests, so the acceptance runbook in
-[test-runbook.md](test-runbook.md) requires a real external canary before the WIF
-disposition changes.
+## What remains human-owned
+
+Anthropic objects and each inline-key approval remain human-owned. The gateway
+stores no Anthropic organization-admin token. Local tests cannot prove the
+customer's organization, workspace, bill, or Console audit history.
+
+The external contract was last checked against Anthropic's official pages on
+2026-07-12. Recheck it before a production enrollment because Anthropic owns
+that API.
 
 Official references:
 
 - [Anthropic Workload Identity Federation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation)
 - [Anthropic WIF reference](https://platform.claude.com/docs/en/manage-claude/wif-reference)
-- [Manage WIF with the Admin API](https://platform.claude.com/docs/en/manage-claude/wif-admin-api)
-
-## Enrollment control plane
-
-Enrollment, disable, and delete use bounded key-rotator routes
-(`GET/PUT/DELETE /providers/anthropic` and
-`POST /providers/anthropic/disable`) shown in the admin portal. The enrollment
-payload contains only non-secret identifiers: organization, service account,
-federation rule, optional workspace, and the approved federation JWKS SHA-256
-fingerprint. It also requires the literal confirmation `ENROLLED`.
-
-Enrollment is rejected unless identity setup already created the
-`private_key_jwt` key in Vault. A difference between the live Keycloak JWKS and
-the approved fingerprint becomes a `jwks_drift` state; it is never accepted
-silently. Disable stops refresh and lets the active short-lived credential
-expire. Delete requires the literal `DELETE anthropic` and proof that the last
-short-lived credential was never issued or has expired.
+- [Anthropic WIF Admin API](https://platform.claude.com/docs/en/manage-claude/wif-admin-api)
