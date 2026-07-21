@@ -169,7 +169,7 @@ blind `docker compose pull`.
 ## Conventions that will bite you
 
 - **Exact-string contract tests pin the reviewed text.** `scripts/tests/*.py` and `validate-compose.sh` assert exact task names, ordering, mount flags, healthcheck arrays, Dockerfile lines, and workflow text across `ansible/`, `compose/`, `scripts/`, and `.github/workflows/`. Most edits there require a matching test/validator update — this is by design, not test brittleness. Python `assert` statements are the release gates; don't refactor them into logging.
-- **Operational script manifest:** a new script in `scripts/` that ships to the VM must be added to the manifest in `ansible/roles/docker_stack/tasks/main.yml` (24 entries) AND the expected list in `validate-compose.sh`.
+- **Operational script manifest:** a new script in `scripts/` that ships to the VM must be added to the manifest in `ansible/roles/docker_stack/tasks/main.yml` (26 entries) AND the expected list in `validate-compose.sh`.
 - **Secrets travel on stdin only** — never argv, env vars, or logs. `vault-unseal.sh` and `store-vault-unseal-key.py` refuse a TTY; Ansible uses `no_log` with `stdin:`. Follow the `read -rsp` + pipe idiom. Never print, diff, or commit decrypted vault overlay values.
 - **unittest vs pytest split:** `scripts/tests` is stdlib unittest run from the repo root; service tests are pytest run from inside the service dir. Runtime acceptance harnesses are hyphenated on purpose; do not add them to unit-test discovery.
 - **SELinux relabel suffixes are load-bearing:** shared bind mounts (`./certs`, `ca.pem`) use `:ro,z`; private mounts use `:ro,Z`. Switching z→Z lets the last-created container steal the label from its peers. Short bind syntax (not the long mount form) is required.
