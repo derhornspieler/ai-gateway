@@ -48,17 +48,42 @@
     operator runbook, diagrams, links, anchors, and navigation. State clearly
     what stays local, what leaves the host, and why. Create any missing document
     or diagram and write it at about an eighth-grade reading level.
+
 ## Waiting On
 
+- [ ] **Add approved DHI credentials to GitHub release scans** - The ordinary
+  `main` checks are green. The final DHI image build and Trivy jobs stop at the
+  required credential gate because the protected
+  `release-container-security` environment has no `DHI_USERNAME` or
+  `DHI_PASSWORD` secret. A repository administrator must add approved
+  credentials and rerun the failed jobs. Do not copy a developer's local login
+  into GitHub or weaken the gate without explicit approval.
+- [ ] **Run real-browser release acceptance** - The seeded HTTP, OIDC, role,
+  callback, and logout contracts pass, but no in-app browser backend is
+  attached. A person or approved browser runner must test login, redirects,
+  cookies, logout, allowed roles, and denied roles against the live preprod
+  deployment and save the receipt.
+- [ ] **Run the guarded production upgrade and rollback** - No approved remote
+  target or maintenance window was provided. Use the exact production-scoped
+  `r10` release only on an approved Docker host. Do not create a Rocky Linux or
+  Parallels rehearsal VM and do not send the preprod-only images to production.
+- [ ] **Complete the customer Cribl acceptance ceremony** - The local TLS mock,
+  allow-list, redaction, queue outage, and recovery tests pass. The Cribl/SOC
+  team must supply its approved endpoint and CA, enforce and prove 24-hour
+  destination retention, and decide whether a hard per-record 24-hour limit is
+  also required on the gateway queue.
 - [ ] **GitHub history and owner cleanup decision** - Forward-tree cleanup is in scope now. Removing personal author metadata from old commits or changing the repository owner requires an explicit repository transfer/history-rewrite decision.
 
 ## Someday
 
-- [ ] **Immutable, provider-selectable Envoy egress image builds** - Replace
-  the hard-coded Envoy build configuration with a reviewed,
-  immutable build-time provider-selection design. A future developer must be
-  able to implement this task from this entry without relying on the original
-  conversation.
+- [ ] **Finish external acceptance for immutable, provider-selectable Envoy
+  releases** - The reviewed catalog, repeated `--provider` interface,
+  network-disabled image build, baked CA bundles, startup gate, schema-v2
+  release record, loader contracts, documentation, diagrams, and exact seeded
+  local preprod proof are complete. Release `r10` selected only `anthropic` and
+  reproduced the same Envoy image ID twice. Keep the full design below so a
+  future developer can finish the remaining protected GitHub image scan and
+  approved remote promote/validate/rollback proof without this conversation.
   - **Operator interface:** Accept repeated provider selections while preparing
     the offline seed. The intended command shape is:
 
@@ -138,36 +163,12 @@
     documentation links and diagram references. The task is complete only when
     all tests pass and the tested artifacts show the Envoy image ID and policy
     digest promoted and rolled back as one unit.
-- [ ] **Rewrite all documentation at an 8th-grade reading level** - Separate
-  preprod and production paths and rewrite every active page in direct,
-  eighth-grade-level language with working commands and examples. Review and
-  update every architecture, deployment, identity, networking, security,
-  upgrade, rollback, and operator diagram. Verify every bookmark, heading
-  anchor, internal link, external hyperlink, table of contents, and navigation
-  path, and add automated link and diagram-reference checks. Create any missing
-  page, diagram, index, or navigation aid needed for a complete operator path.
-  Remove or archive obsolete, duplicate, contradictory, or unsupported material
-  and repair every inbound link to it. This remains the repository-wide audit;
-  provider-specific documentation and diagrams belong to the immutable Envoy
-  task above so the work is not tracked twice. Completion requires a clean
-  generated link/reference report and a manual review that diagrams match the
-  deployed preprod and production designs.
-  - Add one plain-language testing section that explains the purpose and order
-    of unit tests, contract tests, integration tests, end-to-end tests, real
-    browser tests, and the final release-acceptance gate. Show which checks run
-    in GitHub Actions and which require local Docker or a dedicated self-hosted
-    runner. Do not call a release tested when a credential or runner limitation
-    caused a required stage to be skipped.
-  - Document the exact final rehearsal: build new production and preprod
-    offline-seed archives from reviewed pins and provider selections; destroy
-    the namespaced preprod containers, volumes, networks, and old seed
-    activation files; load the new preprod archive; deploy it with Ansible in
-    seed mode with pulls and source builds disabled; run service, LDAP/LDAPS,
-    Root CA, Vault, WIF, Keycloak/OIDC, role, upgrade, validation, and rollback
-    checks; then use a real browser to test portal login, redirects to and from
-    Keycloak, cookies, logout, allowed roles, and denied roles. Include the
-    commands, expected success markers, evidence to save, and failure steps.
-- [ ] **Run a full security audit** - Review the complete codebase and run Trivy against source plus every exact upstream and custom container image. Record fixes, waivers, SBOMs, provenance, and remaining risk.
+- [ ] **Finish the credential-gated security audit** - Local quality, security,
+  dependency, CodeQL, secret-scanning, and release-contract gates are green.
+  GitHub still must run Trivy against the source and every exact upstream and
+  custom image after an administrator supplies the protected DHI credentials.
+  Record fixes, waivers, SBOMs, provenance, and remaining risk; do not describe
+  a credential-blocked scan as passed.
 - [ ] **Add proactive capacity alerts to the Grafana dashboard** - Build
   this after the current release work is complete. Docker health checks only
   mark one container healthy or unhealthy; they do not forecast host pressure
@@ -217,31 +218,28 @@
   exact DHI PostgreSQL 17.10 and 18.4 images both work with the current
   database setup, LiteLLM, Keycloak, key-rotator, Grafana access rules,
   PostgreSQL 16 logical restore, and same-major physical restore. PostgreSQL
-  18.4 is stable, and the operator selected it. This check is useful evidence,
-  but it is not the full seeded preprod rehearsal. Finish this item by building
-  PostgreSQL 18 into the
-  exact offline seed, proving a clean preprod start, migrating production-sized
-  PostgreSQL 16 test data, testing all database consumers, forcing both a safe
-  pre-cutover rollback and a refused post-cutover downgrade, and rehearsing a
-  same-major PostgreSQL 18 physical restore. Git history contains no recorded
+  18.4 is stable, and the operator selected it. Release `r10` then put the exact
+  PostgreSQL 18 image in both seeds and passed two clean seeded preprod starts
+  with every database consumer healthy. Finish this item with
+  production-sized PostgreSQL 16 test data, a forced safe pre-cutover rollback,
+  a refused post-cutover downgrade, and a same-major PostgreSQL 18 physical
+  restore on an approved production-like host. Git history contains no recorded
   technical reason for the original PostgreSQL 16 choice; describe any claim
   beyond that as an inference.
-- [ ] **Upgrade every DHI and upstream image to its newest supported stable release** -
-  Check the authoritative upstream and DHI catalogs for every base and runtime
-  image. Pin each approved release by an exact version and digest; never use a
-  moving `latest` tag. Record the version, support status, selection reason,
-  and provenance. If a newer image changes its user, paths, health checks,
-  configuration, storage layout, or other runtime contract, update the
-  Compose/Ansible integration to match the image instead of holding an older
-  version without evidence. Build, scan, load from the offline seed, and run
-  the full local preprod suite for every promoted image before the production
-  release can pass.
+- [ ] **Finish protected scans for the newest supported image release** - The
+  authoritative upstream and DHI catalog review, exact version-and-digest pins,
+  compatibility fixes, software/toolchain review, network-disabled custom
+  builds, schema-v2 seeds, and two full seeded local preprod passes are
+  complete. The release cannot pass until GitHub builds and scans every final
+  DHI-derived image with its protected credentials and records any fixes,
+  waivers, SBOMs, provenance, and remaining risk.
   - Update the image-update SOP and operator runbook with the complete engineer
     workflow: identify whether the exact pin belongs in Compose, a Dockerfile,
     or a Compose build argument; review upstream compatibility and security
     notes; change the Git-tracked `tag@sha256:digest`; update configuration and
-  health checks for the new image contract; run `scripts/update-images.py
-    prepare` with selected providers and the seeded preprod option; require the
+    health checks for the new image contract; run
+    `scripts/update-images.py prepare` with selected providers and the seeded
+    preprod option; require the
     full stack to pass from the generated preprod archive; and promote only the
     generated production-scoped archive through the remote upgrade/rollback
     command. State clearly that generated schema-v2 manifests are immutable
@@ -260,6 +258,17 @@
 
 ## Done
 
+- [x] ~~Rewrite and verify all active documentation and diagrams~~ (2026-07-21)
+  - All 48 active documentation pages now separate preprod from production and
+    use short, direct operator language at about an eighth-grade reading level.
+    Obsolete lab material is archived and labeled as non-operational.
+  - Architecture, deployment, identity, network, security, provider, release,
+    Cribl, PostgreSQL, Vault, and testing diagrams and procedures match the
+    deployed design. The automated link, anchor/bookmark, navigation, and
+    Mermaid-reference validator is green.
+  - The test runbook explains unit, contract, integration, end-to-end, browser,
+    and final release gates. The real-browser execution remains an explicit
+    external acceptance item above; it is not misreported as complete.
 - [x] ~~Run the final current-source schema-v2 seed rehearsal~~ (2026-07-21)
   - Release r10 built a 40-image ARM64 production archive and a 43-image
     preprod archive with Anthropic as the only selected provider. The
