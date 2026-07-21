@@ -11,10 +11,10 @@ explains why this is a release boundary.
 
 Four diagrams show the full path:
 
-- [provider selection and immutable build](architecture-diagrams.md#11-provider-selection-and-immutable-envoy-build);
-- [runtime request routing](architecture-diagrams.md#12-runtime-request-path-for-selected-providers);
-- [CA capture, review, and rotation](architecture-diagrams.md#13-ca-capture-review-rotation-and-approval); and
-- [offline validation and rollback](architecture-diagrams.md#14-offline-seed-validation-deployment-and-rollback).
+- [Provider selection and immutable build](architecture-diagrams.md#11-provider-selection-and-immutable-envoy-build).
+- [Runtime request routing](architecture-diagrams.md#12-runtime-request-path-for-selected-providers).
+- [CA capture, review, and rotation](architecture-diagrams.md#13-ca-capture-review-rotation-and-approval).
+- [Offline validation and rollback](architecture-diagrams.md#14-offline-seed-validation-deployment-and-rollback).
 
 ## Safety rule
 
@@ -140,13 +140,13 @@ Do not copy example hashes into a real record.
 
 The provenance file is part of the reviewed input. It must record:
 
-- schema version `1`;
-- provider name and API hostname;
-- status `current-chain-verified`;
-- the review date and what was checked;
-- the bundle SHA-256 and ordered certificate fingerprints;
-- at least one clear verification statement; and
-- at least one clear limitation statement.
+- Schema version `1`.
+- Provider name and API hostname.
+- Status `current-chain-verified`.
+- The review date and what was checked.
+- The bundle SHA-256 and ordered certificate fingerprints.
+- At least one clear verification statement.
+- At least one clear limitation statement.
 
 The bundle hash and fingerprint list must exactly match the catalog. The
 catalog also pins the hash of the provenance file itself.

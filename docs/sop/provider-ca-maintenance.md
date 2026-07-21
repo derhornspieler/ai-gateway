@@ -24,12 +24,12 @@ one of those bundles into the provider catalog.
 
 You need:
 
-- an approved provider API hostname;
-- a trusted, patched maintenance system with network access;
-- the provider's or CA operator's official certificate repository;
-- a second reviewer who did not perform the capture;
-- a private directory for candidate files; and
-- enough time to build and test a full offline release before a cutover.
+- An approved provider API hostname.
+- A trusted, patched maintenance system with network access.
+- The provider's or CA operator's official certificate repository.
+- A second reviewer who did not perform the capture.
+- A private directory for candidate files.
+- Enough time to build and test a full offline release before a cutover.
 
 Keep the previous approved release archive, manifest, source commit, and
 rollback backup available.
@@ -75,12 +75,12 @@ endpoint sent it.
 
 For every certificate in the candidate bundle, check:
 
-- subject and issuer;
-- `notBefore` and `notAfter` dates;
-- `CA:TRUE` basic constraint;
-- certificate-signing key usage;
-- SHA-256 fingerprint; and
-- its place and order in the endpoint chain.
+- Subject and issuer.
+- `notBefore` and `notAfter` dates.
+- `CA:TRUE` basic constraint.
+- Certificate-signing key usage.
+- SHA-256 fingerprint.
+- Its place and order in the endpoint chain.
 
 Inspect one certificate with:
 
@@ -115,14 +115,14 @@ checked and what the evidence cannot prove.
 
 The record must contain:
 
-- `schema_version` set to `1`;
-- exact provider name and API hostname;
-- `verification_status` set to `current-chain-verified`;
-- review date and scope;
-- the bundle SHA-256;
-- ordered certificate SHA-256 fingerprints;
-- verification statements naming the official source; and
-- limitations of the evidence.
+- `schema_version` set to `1`.
+- Exact provider name and API hostname.
+- `verification_status` set to `current-chain-verified`.
+- Review date and scope.
+- The bundle SHA-256.
+- Ordered certificate SHA-256 fingerprints.
+- Verification statements naming the official source.
+- Limitations of the evidence.
 
 At a minimum, the limitations must say that a live check is a point-in-time
 observation, a matching hash does not prove the original capture path, and a
@@ -193,12 +193,12 @@ that the image contains no unselected CA file or route.
 
 Approve the release only when:
 
-- the independent CA review is complete;
-- component and contract tests pass;
-- the exact seed passes local preprod;
-- real approved-provider TLS and inference checks pass where policy allows;
-- the previous release and state backup are ready; and
-- the rotation window keeps rollback safe.
+- The independent CA review is complete.
+- Component and contract tests pass.
+- The exact seed passes local preprod.
+- Real approved-provider TLS and inference checks pass where policy allows.
+- The previous release and state backup are ready.
+- The rotation window keeps rollback safe.
 
 Use the remote `upgrade` command in the
 [image update workflow](../image-update-workflow.md#4-upgrade-the-remote-host).
