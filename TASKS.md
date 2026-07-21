@@ -2,24 +2,27 @@
 
 ## Active
 
-- [ ] **Finish `r11` visual browser acceptance** - Candidate `r11` was built
-  from pushed commit `5c43a83`. Its exact preprod pair passed clean-room purge,
-  fresh archive loading, one Ansible seed-mode deploy, and the full integration
-  and end-to-end gate. The receipt removed 26 containers, 19 networks, 11
-  volumes, 62 aliases, and all 43 target image IDs while preserving 148
-  unrelated IDs. Pulls and source builds stayed off. Redis first start, Vault,
-  automatic Keycloak and LDAPS identity, all three users, WIF, OIDC roles and
-  logout, edge inference, and Cribl queue recovery passed with
-  `SEEDED_PREPROD_E2E_PASSED`. After a Vault restart, a second identical
-  converge auto-unsealed Vault and passed end to end again. The visual browser
-  replay could not run because the current test runtime exposed no browser.
-  Run that replay when a browser is available. Keep the `r10` Chrome result as
-  historical evidence; do not use it as `r11` proof.
+- [ ] **Finish `r12` visual browser acceptance** - Candidate `r12` was built
+  from pushed commit `d63b70f7c9e7cac3762de4594264b41267f3912d`. Its exact
+  preprod pair passed clean-room purge, fresh archive loading, one Ansible
+  seed-mode deploy, and the full integration and end-to-end gate. The receipt
+  removed 26 containers, 19 networks, 11 volumes, 62 aliases, and all 43 target
+  image IDs while preserving 167 unrelated IDs. Pulls and source builds stayed
+  off. All 25 long-running containers were healthy on the exact manifest image
+  IDs. The run ended with `PREPROD_CLEAN_ROOM_OK`, `PREPROD_E2E_PASSED`, and
+  `SEEDED_PREPROD_E2E_PASSED`.
 
-  - The exact Open WebUI runtime image is
-    `sha256:c6608e76ef495925ff6724edcc48c3ace4fb8450e614cb56fcfe62f3e9248725`.
-    It was healthy, the hardened-path check passed, raw Scout reported the one
-    reviewed Chroma finding, and the VEX-aware result was zero.
+  The exact Open WebUI runtime image is
+  `sha256:92fe8394bb59b912f05ca0987e89b119d02b8fbebdc097898488a045b66d20cc`.
+  It was healthy, and its hardened-path gate passed.
+
+  After a Vault restart, the test proved `initialized=true`, `sealed=true`, and
+  HTTP 503. A second identical seed-mode converge auto-unsealed Vault, proved
+  `sealed=false` and HTTP 200, and passed the full end-to-end and Cribl tests
+  again. The visual browser replay could not run because the current test
+  runtime exposed no browser. Run that replay when a browser is available.
+  Keep the `r10` Chrome result as historical evidence; do not use it as `r12`
+  proof.
 - [ ] **Finish the approved Cribl security-event feed** - Alloy now sends a
   small, versioned security feed over verified OTLP/gRPC TLS. Raw metrics, raw
   traces, alerts, ordinary service logs, and the raw Vault audit file stay
@@ -94,11 +97,15 @@
   network-disabled image build, baked CA bundles, startup gate, schema-v2
   release record, loader contracts, documentation, diagrams, and exact seeded
   local preprod proof are complete. Release `r10` selected only `anthropic` and
-  reproduced the same Envoy image ID twice. Candidate `r11` used the same
-  single provider and passed the exact seeded local preprod gate. Its visual
-  browser replay is still active above. Keep the full design below so a future
-  developer can finish the remaining protected GitHub image scan and approved
-  remote promote/validate/rollback proof without this conversation.
+  reproduced the same Envoy image ID twice. Candidate `r12` also selects only
+  `anthropic` and passed the exact seeded local preprod gate. Its policy digest
+  is `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`,
+  and its Envoy image ID is
+  `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
+  Its visual browser replay is still active above. Keep the full design below
+  so a future developer can finish the remaining protected GitHub image scan
+  and approved remote promote/validate/rollback proof without this
+  conversation.
   - **Operator interface:** Accept repeated provider selections while preparing
     the offline seed. The intended command shape is:
 
@@ -243,8 +250,8 @@
   beyond that as an inference.
 - [ ] **Finish protected scans for the newest supported image release** - The
   authoritative upstream and DHI catalog review, exact version-and-digest pins,
-  compatibility fixes, software/toolchain review, network-disabled `r11`
-  builds, and exact seeded local preprod checks are complete. The visual `r11`
+  compatibility fixes, software/toolchain review, network-disabled `r12`
+  builds, and exact seeded local preprod checks are complete. The visual `r12`
   browser replay is still active above. The release cannot pass until that
   replay is complete and GitHub builds and scans every final image with
   protected credentials. Save raw Trivy JSON, VEX-aware Scout results,
@@ -342,6 +349,35 @@
     release, verify every checksum and image ID, and keep image plus state
     rollback fail closed. Contract tests cover source-tag materialization,
     exact transfer IDs, preprod-byte rejection, validation, and rollback.
+
+- [x] ~~Build, hash-check, and seed-test the `r12` schema-v2 candidate~~
+  (2026-07-21)
+  - The candidate was built from pushed commit
+    `d63b70f7c9e7cac3762de4594264b41267f3912d`. Production contains 23 exact
+    external and 17 repository-built references, for 40 total. Preprod contains
+    24 exact external and 19 repository-built references, for 43 total.
+    Anthropic is the only selected provider.
+  - Production archive SHA-256:
+    `89b77840300ebd555dc73bb1ec8a2cae4a23422031b0df05af7a4e0d9ca15f63`.
+    Production manifest SHA-256:
+    `b09ef4b194e1c7c1a090119b5f95ca6ec1543a24acaeeb8736f6e5fc566d0d66`.
+    Preprod archive SHA-256:
+    `b5f4ae324cf6801b8102ae7f4418d532a16f4f5309bf3e88278472a0e3a29e5c`.
+    Preprod manifest SHA-256:
+    `b81df70057f1b0c8f8c00950cd201038555efa892ff389adb94a4d2ee8ba535d`.
+  - The Envoy policy digest is
+    `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
+    The exact Envoy image ID is
+    `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
+  - The clean-room run removed 26 containers, 19 networks, 11 volumes, 62
+    aliases, and all 43 target image IDs. It preserved 167 unrelated IDs. Fresh
+    seed loading and Ansible ended with `PREPROD_CLEAN_ROOM_OK`,
+    `PREPROD_E2E_PASSED`, and `SEEDED_PREPROD_E2E_PASSED`. All 25 long-running
+    containers were healthy on the exact manifest image IDs.
+  - After a Vault restart, the test proved `initialized=true`, `sealed=true`,
+    and HTTP 503. The same seed-mode converge auto-unsealed Vault, proved
+    `sealed=false` and HTTP 200, and passed the full end-to-end and Cribl tests
+    again. Visual browser acceptance did not run and remains active above.
 
 - [x] ~~Build and hash-check the `r11` schema-v2 release candidate~~
   (2026-07-21)

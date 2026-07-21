@@ -49,20 +49,21 @@ before it changes anything.
 - Production keeps its firewall, routing, SELinux, encrypted-state, backup,
   Vault, and network checks. Preprod does not weaken those production rules.
 
-## Current release candidate: r11
+## Current release candidate: r12
 
-Release candidate `r11` was built from pushed commit `5c43a83`. Its production
-scope has 23 external and 17 custom image references, for 40 total. Its preprod
-scope has 24 external and 19 custom image references, for 43 total.
+Release candidate `r12` was built from pushed commit
+`d63b70f7c9e7cac3762de4594264b41267f3912d`. Its production scope has 23
+external and 17 custom image references, for 40 total. Its preprod scope has 24
+external and 19 custom image references, for 43 total.
 
 There are two preprod-only custom services: `samba-ad:preprod` and
 `wif-provider-mock:preprod`. The Debian 13.6-slim base used by those builds is
 the third extra preprod image reference. None of these three references is in
 the production seed. Anthropic is the only selected provider.
 
-The exact `r11` preprod archive passed the clean-room Ansible test. The receipt
+The exact `r12` preprod archive passed the clean-room Ansible test. The receipt
 removed 26 containers, 19 networks, 11 volumes, 62 image aliases, and all 43
-target image IDs. It preserved 148 unrelated image IDs. The archive then
+target image IDs. It preserved 167 unrelated image IDs. The archive then
 loaded fresh. Seed mode skipped pulls and source builds.
 
 The seeded test passed Redis first start, Vault, automatic Keycloak and LDAPS
@@ -76,36 +77,39 @@ SEEDED_PREPROD_E2E_PASSED
 ```
 
 After a Vault restart, Vault returned initialized and sealed. A second
-identical Ansible converge auto-unsealed it and passed the full end-to-end gate
-again. This also proves the documented post-reboot unseal path in local
-preprod.
+identical seed-mode Ansible converge auto-unsealed it and passed the full
+end-to-end and Cribl gates again. Before the second converge, the checks showed
+`initialized=true`, `sealed=true`, and HTTP 503. After it, they showed
+`sealed=false` and HTTP 200. This also proves the documented post-reboot unseal
+path in local preprod.
 
+All 25 long-running containers were healthy on the exact manifest image IDs.
 The exact Open WebUI runtime image is
-`sha256:c6608e76ef495925ff6724edcc48c3ace4fb8450e614cb56fcfe62f3e9248725`.
-It was healthy, and the hardened-path check passed.
+`sha256:92fe8394bb59b912f05ca0987e89b119d02b8fbebdc097898488a045b66d20cc`.
+It was healthy, and its hardened-path gate passed.
 
-| `r11` artifact | SHA-256 |
+| `r12` artifact | SHA-256 |
 | --- | --- |
-| Production archive | `fd38eec7d7769c102ab6ad018342f52236877727159db638258a74b3d87b52ad` |
-| Production manifest | `3f5db8d7b8b7548f84975015182cb134132075c748a30984d9bf1b419d34f9b7` |
-| Preprod archive | `df65120821a48f99741493cdfaf31d5a8e9ad569db975d338d2c81898f2b06fa` |
-| Preprod manifest | `891601332abb46c58afa3359d73125f73f8e264252f849a31d029378eab967fd` |
+| Production archive | `89b77840300ebd555dc73bb1ec8a2cae4a23422031b0df05af7a4e0d9ca15f63` |
+| Production manifest | `b09ef4b194e1c7c1a090119b5f95ca6ec1543a24acaeeb8736f6e5fc566d0d66` |
+| Preprod archive | `b5f4ae324cf6801b8102ae7f4418d532a16f4f5309bf3e88278472a0e3a29e5c` |
+| Preprod manifest | `b81df70057f1b0c8f8c00950cd201038555efa892ff389adb94a4d2ee8ba535d` |
 
-The `r11` Envoy policy digest is
+The `r12` Envoy policy digest is
 `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
 Its Envoy image ID is
-`sha256:4fc925d12af6f8a693c363a5249ff7b71851c2276a3fcab7b3f6379fc2f66b35`.
+`sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
 
-The visual browser replay has not run for `r11` because the current test
+The visual browser replay has not run for `r12` because the current test
 runtime exposed no browser. Do not use the accepted `r10` browser result as
-proof for `r11`.
+proof for `r12`.
 
-The Open WebUI derivative in `r11` is `0.10.2-aigw2`. Its committed local
+The Open WebUI derivative in `r12` is `0.10.2-aigw2`. Its committed local
 OpenVEX review covers the one raw Scout finding, `CVE-2026-45829`, and expires
-on 2026-10-19. The local VEX-aware result was zero findings. That review is
-unsigned and Git-reviewed; it is separate from Docker-signed DHI VEX. The
-protected GitHub release scan is still blocked on its required DHI
-credentials, so this candidate is not release-approved.
+on 2026-10-19. That review is unsigned and Git-reviewed; it is separate from
+Docker-signed DHI VEX. The protected GitHub release scan for the exact `r12`
+images is still blocked on its required DHI credentials, so this candidate is
+not release-approved.
 
 ## Final local release evidence
 
@@ -170,9 +174,9 @@ certificate tests proved the Root CA chain and names.
 
 ## Gates that remain open
 
-- **r11 browser acceptance:** the exact `r11` seed passed clean-room loading,
+- **r12 browser acceptance:** the exact `r12` seed passed clean-room loading,
   Ansible deployment, integration, end-to-end, restart, and auto-unseal checks.
-  Repeat the real-browser test for `r11` when a browser runtime is available.
+  Repeat the real-browser test for `r12` when a browser runtime is available.
   Until then, `r10` remains the last release with full local and visual browser
   acceptance.
 - **GitHub container scans:** ordinary GitHub checks are green. The DHI image
