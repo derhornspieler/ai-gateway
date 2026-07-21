@@ -334,7 +334,7 @@
       - 00-ai-gateway-hardening.conf
   changed_when: false
 
-- name: Install default-deny SSH policy with explicit ADM SOCKS exceptions
+- name: Install default-deny key-only SSH policy
   ansible.builtin.copy:
     dest: /etc/ssh/sshd_config.d/00-ai-gateway-hardening.conf
     owner: root
@@ -342,10 +342,10 @@
     mode: "0644"
     content: |
       # Managed by AI Gateway. The firewalld ADM rule limits all SSH ingress
-      # to vpn_client_cidr; password authentication is a temporary rocky9-lab
-      # exception while root login remains prohibited.
+      # to vpn_client_cidr; password authentication, root login, and forwarding
+      # are prohibited.
       PubkeyAuthentication yes
-      PasswordAuthentication {{ 'yes' if ((deployment_profile | default('')) == 'rocky9-lab' and (aigw_ssh_password_authentication | bool)) else 'no' }}
+      PasswordAuthentication no
       KbdInteractiveAuthentication no
       ChallengeResponseAuthentication no
       PermitEmptyPasswords no
@@ -368,26 +368,6 @@
       LoginGraceTime 30
       MaxSessions 4
       MaxStartups 10:30:30
-      {% if ((deployment_profile | default('')) == 'rocky9-lab') and (aigw_adm_socks_enabled | bool) %}
-      # Trusted ADM-operator SOCKS `ssh -D` is local TCP forwarding. The
-      # inventory acknowledgement records that PermitOpen any reaches every
-      # host-routable destination. It remains unavailable to every other
-      # account/source; remote forwarding, gateway binds, agent, stream-local,
-      # X11, and tunnels remain denied by the global policy.
-      {% if aigw_adm_socks_users | length > 0 %}
-      Match User {{ aigw_adm_socks_users | join(',') }} Address {{ aigw_adm_socks_source_cidrs | join(',') }}
-        DisableForwarding no
-        AllowTcpForwarding local
-        PermitOpen any
-      {% endif %}
-      {% if aigw_adm_socks_groups | length > 0 %}
-      Match Group {{ aigw_adm_socks_groups | join(',') }} Address {{ aigw_adm_socks_source_cidrs | join(',') }}
-        DisableForwarding no
-        AllowTcpForwarding local
-        PermitOpen any
-      {% endif %}
-      Match all
-      {% endif %}
     validate: /usr/sbin/sshd -t -f %s
   notify: reload sshd
 
@@ -417,11 +397,7 @@
   ansible.builtin.assert:
     that:
       - effective_sshd_policy.stdout is search('(?m)^pubkeyauthentication yes$')
-      - >-
-        effective_sshd_policy.stdout is search(
-          '(?m)^passwordauthentication ' ~
-          ('yes' if ((deployment_profile | default('')) == 'rocky9-lab' and (aigw_ssh_password_authentication | bool)) else 'no') ~ '$'
-        )
+      - effective_sshd_policy.stdout is search('(?m)^passwordauthentication no$')
       - effective_sshd_policy.stdout is search('(?m)^kbdinteractiveauthentication no$')
       - effective_sshd_policy.stdout is search('(?m)^permitemptypasswords no$')
       - effective_sshd_policy.stdout is search('(?m)^hostbasedauthentication no$')
@@ -463,127 +439,6 @@
       - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^permittunnel no$')
       - aigw_denied_sshd_forwarding_policy.stdout is search('(?m)^gatewayports no$')
     quiet: true
-
-- name: Derive an sshd Match probe for every approved ADM SOCKS source CIDR
-  ansible.builtin.command:
-    argv:
-      - python3
-      - -I
-      - -c
-      - |
-        import ipaddress
-        import sys
-
-        network = ipaddress.ip_network(sys.argv[1], strict=True)
-        print(next(network.hosts(), network.network_address))
-      - "{{ item }}"
-  loop: "{{ aigw_adm_socks_source_cidrs }}"
-  register: aigw_adm_socks_source_probe
-  changed_when: false
-  when: aigw_adm_socks_enabled | bool
-
-- name: Record approved ADM SOCKS probe addresses
-  ansible.builtin.set_fact:
-    aigw_adm_socks_probe_sources: >-
-      {{ aigw_adm_socks_source_probe.results | map(attribute='stdout') | map('trim') | list }}
-  when: aigw_adm_socks_enabled | bool
-
-- name: Read effective SSH SOCKS policy for every approved user/source pair
-  ansible.builtin.command:
-    argv:
-      - /usr/sbin/sshd
-      - -T
-      - -C
-      - "user={{ item.0 }},host={{ item.1 }},addr={{ item.1 }},laddr={{ eth1_ip }},lport={{ aigw_management_ssh_port }}"
-  loop: "{{ aigw_adm_socks_users | product(aigw_adm_socks_probe_sources | default([])) | list }}"
-  loop_control:
-    label: "{{ item.0 }} from {{ item.1 }}"
-  register: aigw_adm_socks_user_policy
-  changed_when: false
-  when:
-    - aigw_adm_socks_enabled | bool
-    - aigw_adm_socks_users | length > 0
-
-- name: Assert approved user/source SSH SOCKS policy is local-only
-  ansible.builtin.assert:
-    that:
-      - item.stdout is search('(?m)^disableforwarding no$')
-      - item.stdout is search('(?m)^allowtcpforwarding local$')
-      - item.stdout is search('(?m)^permitopen any$')
-      - item.stdout is search('(?m)^allowstreamlocalforwarding no$')
-      - item.stdout is search('(?m)^allowagentforwarding no$')
-      - item.stdout is search('(?m)^permittunnel no$')
-      - item.stdout is search('(?m)^gatewayports no$')
-      - item.stdout is search('(?m)^permitlisten none$')
-    quiet: true
-  loop: "{{ aigw_adm_socks_user_policy.results | default([]) }}"
-  loop_control:
-    label: "{{ item.item.0 }} from {{ item.item.1 }}"
-  when:
-    - aigw_adm_socks_enabled | bool
-    - aigw_adm_socks_users | length > 0
-
-- name: Verify every declared SSH SOCKS group test user is a current member
-  ansible.builtin.command:
-    argv: [id, -nG, "{{ item.value }}"]
-  loop: "{{ aigw_adm_socks_group_test_users | dict2items }}"
-  loop_control:
-    label: "{{ item.value }} in {{ item.key }}"
-  register: aigw_adm_socks_group_membership
-  changed_when: false
-  when:
-    - aigw_adm_socks_enabled | bool
-    - aigw_adm_socks_groups | length > 0
-
-- name: Require each declared SSH SOCKS group test user to match its group
-  ansible.builtin.assert:
-    that:
-      - item.item.key in item.stdout.split()
-    quiet: true
-    fail_msg: >-
-      SSH SOCKS Match Group {{ item.item.key }} cannot be evaluated because
-      its declared test user {{ item.item.value }} is not a current member.
-  loop: "{{ aigw_adm_socks_group_membership.results | default([]) }}"
-  loop_control:
-    label: "{{ item.item.value }} in {{ item.item.key }}"
-  when:
-    - aigw_adm_socks_enabled | bool
-    - aigw_adm_socks_groups | length > 0
-
-- name: Read effective SSH SOCKS policy for every approved group/source pair
-  ansible.builtin.command:
-    argv:
-      - /usr/sbin/sshd
-      - -T
-      - -C
-      - "user={{ item.0.value }},host={{ item.1 }},addr={{ item.1 }},laddr={{ eth1_ip }},lport={{ aigw_management_ssh_port }}"
-  loop: "{{ (aigw_adm_socks_group_test_users | dict2items) | product(aigw_adm_socks_probe_sources | default([])) | list }}"
-  loop_control:
-    label: "{{ item.0.value }} via {{ item.0.key }} from {{ item.1 }}"
-  register: aigw_adm_socks_group_policy
-  changed_when: false
-  when:
-    - aigw_adm_socks_enabled | bool
-    - aigw_adm_socks_groups | length > 0
-
-- name: Assert approved group/source SSH SOCKS policy is local-only
-  ansible.builtin.assert:
-    that:
-      - item.stdout is search('(?m)^disableforwarding no$')
-      - item.stdout is search('(?m)^allowtcpforwarding local$')
-      - item.stdout is search('(?m)^permitopen any$')
-      - item.stdout is search('(?m)^allowstreamlocalforwarding no$')
-      - item.stdout is search('(?m)^allowagentforwarding no$')
-      - item.stdout is search('(?m)^permittunnel no$')
-      - item.stdout is search('(?m)^gatewayports no$')
-      - item.stdout is search('(?m)^permitlisten none$')
-    quiet: true
-  loop: "{{ aigw_adm_socks_group_policy.results | default([]) }}"
-  loop_control:
-    label: "{{ item.item.0.value }} via {{ item.item.0.key }} from {{ item.item.1 }}"
-  when:
-    - aigw_adm_socks_enabled | bool
-    - aigw_adm_socks_groups | length > 0
 
 - name: Postflight — prove a fresh key-only SSH connection and passwordless become
   ansible.builtin.command:

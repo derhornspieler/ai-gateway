@@ -3,8 +3,8 @@
 The `vault` relying party (Keycloak realm aigw) plus the root-token ceremony
 scripts/vault-oidc-setup.sh retire routine root-token logins. That control
 spans the rotator service (client reconcile + secret escrow), the Compose
-environment, the Ansible-rendered .env, the Vault rotator policy written by
-the bootstrap ceremony, and the ceremony script itself. These pins keep the
+environment, the Ansible-rendered .env, the local-preprod rotator policy, and
+the ceremony script itself. These pins keep the
 surfaces in lockstep so no single edit can silently break the login flow or
 widen either the rotator's or the vault-admins policy's Vault authority.
 """
@@ -58,20 +58,15 @@ class VaultOidcSetupContractTest(unittest.TestCase):
             group_vars,
         )
 
-    def test_vault_bootstrap_grants_only_the_exact_escrow_path(self) -> None:
-        bootstrap = (ROOT / "scripts/vault-bootstrap.sh").read_text()
-        self.assertIn(
-            'validate_vault_path VAULT_OIDC_RP_VAULT_PATH '
-            '"$VAULT_OIDC_RP_VAULT_PATH"',
-            bootstrap,
-        )
+    def test_preprod_rotator_policy_grants_only_the_exact_escrow_path(self) -> None:
+        preprod = (ROOT / "scripts/preprod.py").read_text()
         policy_match = re.search(
-            r"vlt policy write rotator - <<HCL\n(.*?)\nHCL", bootstrap, re.DOTALL
+            r'ROTATOR_POLICY = """\n(.*?)\n"""\.strip\(\)', preprod, re.DOTALL
         )
         self.assertIsNotNone(policy_match, "rotator policy heredoc is missing")
         policy = policy_match.group(1)
         escrow_stanzas = re.findall(
-            r'^path\s+"([^"]*VAULT_OIDC_RP_VAULT_PATH[^"]*)"\s*'
+            r'^path\s+"([^"]*vault-oidc-rp[^"]*)"\s*'
             r"\{\s*capabilities\s*=\s*\[([^\]]*)\]\s*\}",
             policy,
             re.MULTILINE,
@@ -82,7 +77,7 @@ class VaultOidcSetupContractTest(unittest.TestCase):
             "the escrow path must appear in exactly one policy stanza",
         )
         stanza_path, capabilities = escrow_stanzas[0]
-        self.assertEqual(stanza_path, "kv/data/${VAULT_OIDC_RP_VAULT_PATH}")
+        self.assertEqual(stanza_path, "kv/data/ai-gateway/keycloak/vault-oidc-rp")
         granted = {
             token.strip().strip('"') for token in capabilities.split(",")
         }
@@ -90,7 +85,7 @@ class VaultOidcSetupContractTest(unittest.TestCase):
         mentions = [
             line
             for line in policy.splitlines()
-            if "VAULT_OIDC_RP_VAULT_PATH" in line
+            if "vault-oidc-rp" in line
         ]
         self.assertEqual(len(mentions), 1, mentions)
 
@@ -252,8 +247,9 @@ class VaultOidcSetupContractTest(unittest.TestCase):
         )
         self.assertIn('    "vault",\n)', identity)
 
-    def test_live_lab_acceptance_requires_the_escrow(self) -> None:
-        verifier = (ROOT / "scripts/verify-live-lab-identity.py").read_text()
+    def test_preprod_acceptance_requires_readable_escrow(self) -> None:
+        verifier = (ROOT / "scripts/preprod.py").read_text()
+        self.assertIn('"vault_oidc_rp_escrow_readable": True,', verifier)
         self.assertIn('"vault_oidc_rp_escrowed": True,', verifier)
 
 

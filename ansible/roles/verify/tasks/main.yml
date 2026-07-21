@@ -99,11 +99,10 @@
         bounded_caps = {
             "traefik-int": 0x400,
             "traefik-adm": 0x400,
-            "lab-dns": 0x400,
+            "platform-dns": 0x400,
             "vault": 0x4000,
-            "samba-ad": 0x2004C3,
         }
-        effective_caps = {"samba-ad": 0x2004C3}
+        effective_caps = {}
         checked_bind_objects = 0
 
         def require_bind_context(source, expected):
@@ -537,8 +536,7 @@
           ]
           + (['oauth2-proxy-vault', 'vault-ui-proxy']
              if (aigw_vault_ui_enabled | bool) else [])
-          + (['lab-dns'] if (platform_authoritative_dns_enabled | bool) else [])
-          + (['samba-ad'] if (samba_lab_enabled | bool) else []))
+          + (['platform-dns'] if (platform_authoritative_dns_enabled | bool) else []))
           | to_json
         }}
       - "{{ ['alloy', 'node-exporter'] | to_json }}"
@@ -941,37 +939,6 @@
   loop_control:
     label: "{{ item.item.name }}"
 
-- name: Wait for the lab Samba AD health contract
-  ansible.builtin.command:
-    argv:
-      - docker
-      - --host
-      - unix:///run/docker.sock
-      - inspect
-      - "{{ compose_project_name }}-samba-ad-1"
-  register: samba_lab_inspect
-  changed_when: false
-  retries: 45
-  delay: 4
-  until: >-
-    samba_lab_inspect.rc == 0 and
-    ((((samba_lab_inspect.stdout | from_json | first).State.Health | default({})).Status) | default('')) == 'healthy'
-  when: samba_lab_enabled | bool
-
-- name: Samba lab runtime matches the reviewed isolation boundary
-  ansible.builtin.assert:
-    that:
-      - not ((samba_lab_inspect.stdout | from_json | first).HostConfig.Privileged | bool)
-      - (samba_lab_inspect.stdout | from_json | first).HostConfig.ReadonlyRootfs | bool
-      - ((samba_lab_inspect.stdout | from_json | first).HostConfig.CapDrop | sort) == ['ALL']
-      - ((samba_lab_inspect.stdout | from_json | first).HostConfig.CapAdd | sort) == ['CAP_CHOWN', 'CAP_DAC_OVERRIDE', 'CAP_NET_BIND_SERVICE', 'CAP_SETGID', 'CAP_SETUID', 'CAP_SYS_ADMIN']
-      - (((samba_lab_inspect.stdout | from_json | first).HostConfig.PortBindings | default({}, true)) | length) == 0
-      - ((samba_lab_inspect.stdout | from_json | first).NetworkSettings.Networks | dict2items | map(attribute='key') | list) == ['net-identity']
-    fail_msg: >-
-      Samba AD is unhealthy, privileged, externally published, over-capable,
-      writable, or attached outside net-identity.
-  when: samba_lab_enabled | bool
-
 - name: Wait for the authoritative platform DNS health contract
   ansible.builtin.command:
     argv:
@@ -979,30 +946,30 @@
       - --host
       - unix:///run/docker.sock
       - inspect
-      - "{{ compose_project_name }}-lab-dns-1"
-  register: lab_dns_inspect
+      - "{{ compose_project_name }}-platform-dns-1"
+  register: platform_dns_inspect
   changed_when: false
   retries: 30
   delay: 2
   until: >-
-    lab_dns_inspect.rc == 0 and
-    ((((lab_dns_inspect.stdout | from_json | first).State.Health | default({})).Status) | default('')) == 'healthy'
+    platform_dns_inspect.rc == 0 and
+    ((((platform_dns_inspect.stdout | from_json | first).State.Health | default({})).Status) | default('')) == 'healthy'
   when: platform_authoritative_dns_enabled | bool
 
 - name: Platform DNS runtime matches the reviewed isolation boundary
   ansible.builtin.assert:
     that:
-      - not ((lab_dns_inspect.stdout | from_json | first).HostConfig.Privileged | bool)
-      - (lab_dns_inspect.stdout | from_json | first).HostConfig.ReadonlyRootfs | bool
-      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.CapDrop | sort) == ['ALL']
-      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.CapAdd | sort) == ['CAP_NET_BIND_SERVICE']
-      - ((lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks | dict2items | map(attribute='key') | list) == ['net-lab-dns']
-      - (lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-lab-dns'].IPAddress == lab_dns_ip
-      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings | dict2items | map(attribute='key') | sort | list) == ['53/tcp', '53/udp']
-      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/tcp'] | map(attribute='HostIp') | sort | list) == ([eth1_ip, eth2_ip] | sort)
-      - ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/udp'] | map(attribute='HostIp') | sort | list) == ([eth1_ip, eth2_ip] | sort)
-      - eth0_ip not in ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/tcp'] | map(attribute='HostIp') | list)
-      - eth0_ip not in ((lab_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/udp'] | map(attribute='HostIp') | list)
+      - not ((platform_dns_inspect.stdout | from_json | first).HostConfig.Privileged | bool)
+      - (platform_dns_inspect.stdout | from_json | first).HostConfig.ReadonlyRootfs | bool
+      - ((platform_dns_inspect.stdout | from_json | first).HostConfig.CapDrop | sort) == ['ALL']
+      - ((platform_dns_inspect.stdout | from_json | first).HostConfig.CapAdd | sort) == ['CAP_NET_BIND_SERVICE']
+      - ((platform_dns_inspect.stdout | from_json | first).NetworkSettings.Networks | dict2items | map(attribute='key') | list) == ['net-platform-dns']
+      - (platform_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-platform-dns'].IPAddress == platform_dns_ip
+      - ((platform_dns_inspect.stdout | from_json | first).HostConfig.PortBindings | dict2items | map(attribute='key') | sort | list) == ['53/tcp', '53/udp']
+      - ((platform_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/tcp'] | map(attribute='HostIp') | sort | list) == ([eth1_ip, eth2_ip] | sort)
+      - ((platform_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/udp'] | map(attribute='HostIp') | sort | list) == ([eth1_ip, eth2_ip] | sort)
+      - eth0_ip not in ((platform_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/tcp'] | map(attribute='HostIp') | list)
+      - eth0_ip not in ((platform_dns_inspect.stdout | from_json | first).HostConfig.PortBindings['53/udp'] | map(attribute='HostIp') | list)
     fail_msg: >-
       Platform DNS is unhealthy, privileged, writable, over-capable, attached to an
       application plane, or published outside TCP/UDP 53.
@@ -1118,7 +1085,7 @@
   ansible.builtin.command:
     argv:
       - dig
-      - "@{{ (lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-lab-dns'].IPAddress }}"
+      - "@{{ (platform_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-platform-dns'].IPAddress }}"
       - "{{ item.name }}"
       - A
       - +short
@@ -1130,21 +1097,21 @@
     # Owner decision: chat is dual-homed — the internal view resolves it to
     # the internal edge for LAN users while the ADM view keeps the VPN path.
     - { name: "chat.{{ aigw_domain }}", transport: +tcp }
-  register: lab_dns_restricted_queries
+  register: platform_dns_restricted_queries
   changed_when: false
   failed_when: >-
-    lab_dns_restricted_queries.rc != 0 or
-    lab_dns_restricted_queries.stdout | trim != eth2_ip
+    platform_dns_restricted_queries.rc != 0 or
+    platform_dns_restricted_queries.stdout | trim != eth2_ip
   when: platform_authoritative_dns_enabled | bool
 
 # The host reaches the isolated DNS bridge from its Docker address, which is
-# deliberately outside LAB_DNS_ADM_CIDR.  It can therefore exercise the
+# deliberately outside PLATFORM_DNS_ADM_CIDR. It can therefore exercise the
 # fail-closed/default view, but must never be used to assert ADM-only names.
 - name: Verify the restricted platform DNS view does not disclose ADM-only names
   ansible.builtin.command:
     argv:
       - dig
-      - "@{{ (lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-lab-dns'].IPAddress }}"
+      - "@{{ (platform_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-platform-dns'].IPAddress }}"
       - "{{ item.name }}"
       - A
       - +noall
@@ -1157,18 +1124,18 @@
     - { name: "prometheus.{{ aigw_domain }}", transport: +tcp }
     - { name: "vault.{{ aigw_domain }}", transport: +notcp }
     - { name: "vault.{{ aigw_domain }}", transport: +tcp }
-  register: lab_dns_restricted_negative_queries
+  register: platform_dns_restricted_negative_queries
   changed_when: false
   failed_when: >-
-    lab_dns_restricted_negative_queries.rc != 0 or
-    'status: NXDOMAIN' not in lab_dns_restricted_negative_queries.stdout
+    platform_dns_restricted_negative_queries.rc != 0 or
+    'status: NXDOMAIN' not in platform_dns_restricted_negative_queries.stdout
   when: platform_authoritative_dns_enabled | bool
 
 - name: Prove the restricted DNS view cannot recurse public names
   ansible.builtin.command:
     argv:
       - dig
-      - "@{{ (lab_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-lab-dns'].IPAddress }}"
+      - "@{{ (platform_dns_inspect.stdout | from_json | first).NetworkSettings.Networks['net-platform-dns'].IPAddress }}"
       - www.example.com
       - A
       - +noall
@@ -1207,13 +1174,13 @@
     - { name: "chat.{{ aigw_domain }}", expected: "{{ eth1_ip }}", transport: +tcp }
     - { name: "api.{{ aigw_domain }}", expected: "{{ eth2_ip }}", transport: +tcp }
     - { name: "portal.{{ aigw_domain }}", expected: "{{ eth2_ip }}", transport: +notcp }
-  register: lab_dns_adm_queries
+  register: platform_dns_adm_queries
   delegate_to: localhost
   become: false
   changed_when: false
   failed_when: >-
-    lab_dns_adm_queries.rc != 0 or
-    lab_dns_adm_queries.stdout | trim != item.expected
+    platform_dns_adm_queries.rc != 0 or
+    platform_dns_adm_queries.stdout | trim != item.expected
   when: platform_authoritative_dns_enabled | bool
 
 - name: Verify enabled Vault UI is published in the ADM DNS view
@@ -1227,13 +1194,13 @@
       - "{{ '+tcp' if item == 'tcp' else '+notcp' }}"
       - +time=5
       - +tries=1
-  register: lab_dns_vault_ui_enabled
+  register: platform_dns_vault_ui_enabled
   delegate_to: localhost
   become: false
   changed_when: false
   failed_when: >-
-    lab_dns_vault_ui_enabled.rc != 0 or
-    lab_dns_vault_ui_enabled.stdout | trim != eth1_ip
+    platform_dns_vault_ui_enabled.rc != 0 or
+    platform_dns_vault_ui_enabled.stdout | trim != eth1_ip
   loop: [udp, tcp]
   loop_control:
     label: "{{ item }}"
@@ -1253,13 +1220,13 @@
       - "{{ '+tcp' if item == 'tcp' else '+notcp' }}"
       - +time=5
       - +tries=1
-  register: lab_dns_vault_ui_disabled
+  register: platform_dns_vault_ui_disabled
   delegate_to: localhost
   become: false
   changed_when: false
   failed_when: >-
-    lab_dns_vault_ui_disabled.rc != 0 or
-    'status: NXDOMAIN' not in lab_dns_vault_ui_disabled.stdout
+    platform_dns_vault_ui_disabled.rc != 0 or
+    'status: NXDOMAIN' not in platform_dns_vault_ui_disabled.stdout
   loop: [udp, tcp]
   loop_control:
     label: "{{ item }}"
@@ -1294,38 +1261,12 @@
       - --host
       - unix:///run/docker.sock
       - exec
-      - "{{ compose_project_name }}-lab-dns-1"
+      - "{{ compose_project_name }}-platform-dns-1"
       - /dns-healthcheck
       - --assert-no-egress
       - "{{ egress_dns_servers | first }}"
   changed_when: false
   when: platform_authoritative_dns_enabled | bool
-
-# This raw `docker compose exec` resolves the project from the deployed .env
-# (COMPOSE_FILE includes the lab overlay here) plus this process environment.
-# Modern Compose validates the whole project model even for exec, so the
-# reviewed profile set from docker_stack must stay active or the profile-gated
-# samba-ad service is excluded and the project is rejected as invalid.
-- name: Samba lab directory database is internally consistent
-  ansible.builtin.command:
-    argv:
-      - docker
-      - --host
-      - unix:///run/docker.sock
-      - compose
-      - exec
-      - -T
-      - samba-ad
-      - samba-tool
-      - dbcheck
-      - --cross-ncs
-  args:
-    chdir: "{{ stack_dir }}"
-  environment:
-    COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
-    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
-  changed_when: false
-  when: samba_lab_enabled | bool
 
 - name: Read TCP listeners
   ansible.builtin.shell: |
@@ -1359,8 +1300,7 @@
         import sys
 
         root = Path(sys.argv[1])
-        samba_enabled = sys.argv[2] == "true"
-        identity_ldap_enabled = sys.argv[3] == "true"
+        identity_ldap_enabled = sys.argv[2] == "true"
         expected = {
             "certs": ("dir", 0, 65532, 0o750),
             "certs/int.key": ("file", 0, 65532, 0o640),
@@ -1396,14 +1336,6 @@
             "secrets/redis_password": ("file", 0, 65532, 0o440),
             "secrets/redis_users.acl": ("file", 0, 65532, 0o440),
         }
-        if samba_enabled:
-            expected.update({
-                "secrets/samba_ad_admin_password": ("file", 0, 0, 0o400),
-                "secrets/samba_ad_bind_password": ("file", 0, 65532, 0o440),
-                "secrets/samba_user_lab-admin_password": ("file", 0, 0, 0o400),
-                "secrets/samba_user_lab-developer_password": ("file", 0, 0, 0o400),
-                "secrets/samba_user_lab-user_password": ("file", 0, 0, 0o400),
-            })
         if identity_ldap_enabled:
             expected.update({
                 "keycloak/identity-ldap-ca.pem": ("file", 0, 65532, 0o440),
@@ -1425,7 +1357,6 @@
         if errors:
             raise SystemExit("; ".join(errors))
       - "{{ stack_dir }}"
-      - "{{ samba_lab_enabled | bool | lower }}"
       - "{{ identity_ldap_enabled | bool | lower }}"
   changed_when: false
 
@@ -1970,7 +1901,49 @@
     var: aigw_chat_gate_health.stdout_lines | default([])
   when: (vault_public_status.stdout | from_json).initialized | bool
 
-- name: Egress canary — vendor reachable only via the pinned reverse proxy
+- name: Read the live immutable Envoy policy receipt
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - exec
+      - "{{ compose_project_name }}-envoy-egress-1"
+      - /usr/local/bin/aigw-envoy-entrypoint
+      - receipt
+  register: live_envoy_policy_raw
+  changed_when: false
+  failed_when: >-
+    live_envoy_policy_raw.rc != 0 or
+    (live_envoy_policy_raw.stdout | from_json).schema_version != 1 or
+    (live_envoy_policy_raw.stdout | from_json).egress_policy_sha256
+      != aigw_egress_policy_sha256 or
+    (live_envoy_policy_raw.stdout | from_json).selected_providers
+      != aigw_egress_providers
+
+- name: Record the live immutable Envoy policy receipt
+  ansible.builtin.set_fact:
+    live_envoy_policy: "{{ live_envoy_policy_raw.stdout | from_json }}"
+
+- name: Read the live Envoy container image ID
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - inspect
+      - --format
+      - "{% raw %}{{.Image}}{% endraw %}"
+      - "{{ compose_project_name }}-envoy-egress-1"
+  register: live_envoy_image_id
+  changed_when: false
+  failed_when: >-
+    live_envoy_image_id.rc != 0 or
+    live_envoy_image_id.stdout is not match('^sha256:[0-9a-f]{64}$') or
+    (aigw_expected_envoy_image_id | length > 0 and
+     live_envoy_image_id.stdout != aigw_expected_envoy_image_id)
+
+- name: Egress canary — each selected vendor is reachable only through Envoy
   ansible.builtin.command:
     argv:
       - docker
@@ -1980,16 +1953,29 @@
       - "{{ compose_project_name }}-key-rotator-1"
       - python3
       - -c
-      - >-
-        import urllib.request,sys;
-        r=urllib.request.urlopen(urllib.request.Request('http://envoy-egress:8080/anthropic/v1/models'),timeout=15);
-        print(r.status)
-  register: canary
-  changed_when: false
-  failed_when: false   # 401 (no key) still proves path+TLS; informational
-  # expected: HTTPError 401 from api.anthropic.com through envoy — proves the
-  # pinned egress path works; a connection error means routing/DNS/eth0 issue.
+      - |
+        import sys
+        import urllib.error
+        import urllib.request
 
-- name: Show canary result
+        request = urllib.request.Request(sys.argv[1])
+        try:
+            response = urllib.request.urlopen(request, timeout=15)
+        except urllib.error.HTTPError as error:
+            if not 400 <= error.code < 500:
+                raise
+            print(error.code)
+        else:
+            print(response.status)
+      - "http://envoy-egress:8080{{ item.route_prefix }}"
+  loop: "{{ live_envoy_policy.providers }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: egress_canaries
+  changed_when: false
+  # A 4xx response is acceptable because no provider credential is sent. A
+  # DNS, TLS, route, or connection failure is not acceptable.
+
+- name: Show selected-provider egress canary results
   ansible.builtin.debug:
-    var: canary.stdout_lines + canary.stderr_lines | default([])
+    var: egress_canaries.results

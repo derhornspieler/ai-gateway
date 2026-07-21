@@ -41,11 +41,9 @@ ENV_J2 = ROOT / "ansible" / "roles" / "docker_stack" / "templates" / "env.j2"
 COMPOSE = ROOT / "compose" / "docker-compose.yml"
 DIGEST_INPUTS = ROOT / "compose" / "bind-source-digest-inputs.json"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap-generic-rocky9.py"
-LAB_VARS = ROOT / "ansible" / "inventory" / "host_vars" / "lab-aigw01.yml"
 EDGE_TLS = ROOT / "scripts" / "edge-tls.py"
 VAULT_PKI = ROOT / "scripts" / "vault-pki-intermediate.sh"
 SIGN_SCRIPT = ROOT / "scripts" / "sign-vault-intermediate.sh"
-VAULT_BOOTSTRAP = ROOT / "scripts" / "vault-bootstrap.sh"
 
 
 def find_openssl3() -> str | None:
@@ -81,10 +79,7 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertEqual(contract["schema"], "aigw.generic-rocky9/v1")
 
         group_vars = GROUP_VARS.read_text(encoding="utf-8")
-        self.assertIn(
-            "aigw_edge_tls_mode: \"{{ 'lab' if deployment_profile == 'rocky9-lab' else '' }}\"",
-            group_vars,
-        )
+        self.assertIn('aigw_edge_tls_mode: ""', group_vars)
         self.assertIn('cribl_otlp_ca_file: "/etc/ssl/certs/aigw-cribl-ca.pem"', group_vars)
         self.assertIn('cribl_otlp_ca_pem_file: ""', group_vars)
         self.assertIn("aigw_edge_tls_min_days_remaining: 30", group_vars)
@@ -120,23 +115,14 @@ class EdgeTlsContractTests(unittest.TestCase):
             "cribl_otlp_ca_pem_file: \"\"",
         ):
             self.assertIn(key, bootstrap)
-
-        # The committed lab opts into the real customer-CA path.
-        self.assertIn("aigw_edge_tls_mode: vault-intermediate", LAB_VARS.read_text(encoding="utf-8"))
-
-    def test_site_gate_is_fail_closed_and_lab_may_use_the_real_ca_path(self) -> None:
+    def test_site_gate_is_fail_closed_to_real_ca_paths(self) -> None:
         site = OS_PREP.read_text(encoding="utf-8")
         self.assertIn("Preflight — require exactly one reviewed edge TLS mode", site)
         self.assertIn(
-            "(deployment_profile == 'rocky9-lab' and\n"
-            "             aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate']) or",
+            "aigw_edge_tls_mode in ['customer-supplied', 'vault-intermediate', 'customer-intermediate']",
             site,
         )
-        self.assertIn(
-            "(deployment_profile != 'rocky9-lab' and\n"
-            "             aigw_edge_tls_mode in ['customer-supplied', 'vault-intermediate', 'customer-intermediate'])",
-            site,
-        )
+        self.assertNotIn("aigw_edge_tls_mode in ['lab'", site)
         self.assertIn("aigw_edge_tls_min_days_remaining | int >= 7", site)
         # customer-intermediate mutual-exclusivity: its trio must be complete when
         # selected and empty for every other mode, and the customer-supplied trio
@@ -184,7 +170,7 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertEqual(
             2,
             source.count(
-                "aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate'] and\n"
+                "aigw_edge_tls_mode in ['vault-intermediate', 'customer-intermediate'] and\n"
                 "    not (aigw_edge_tls_issued_marker.stat.exists | default(false))"
             ),
         )
@@ -206,31 +192,6 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertIn("- edge-tls.py", source)
         self.assertIn("- vault-pki-intermediate.sh", source)
         self.assertNotIn("- sign-vault-intermediate.sh", source)
-
-    def test_docker_stack_gates_edge_removal_to_lab_and_asserts_before_deletion(self) -> None:
-        """Real-CA edge material is validated before any deletion (finding #1).
-
-        The removal task used to run in ALL modes and BEFORE the marker assert
-        and the customer-supplied install, so a domain change on a real-CA
-        profile deleted the live cert/key/chain and left certs/ empty for
-        Traefik's self-signed default to fill. The removal is now confined to
-        lab mode (free regeneration); on the real-CA modes the material is
-        never deleted — a vault-intermediate mismatch fails the assert first,
-        and customer-supplied is overwritten atomically only after validation.
-        """
-        source = DOCKER_STACK.read_text(encoding="utf-8")
-        marker = source.index("Inspect the vault-intermediate issuance marker")
-        refuse = source.index(
-            "Refuse to mask lost production edge material with a placeholder"
-        )
-        remove = source.index("Remove edge material that belongs to a different lab domain")
-        # Marker inspection and the hard-fail SAN assert both precede the removal.
-        self.assertLess(marker, refuse)
-        self.assertLess(refuse, remove)
-        # The removal only runs in lab mode; it never deletes real-CA material.
-        removal_block = source[remove : source.index("- name:", remove + 1)]
-        self.assertIn("aigw_edge_tls_mode == 'lab' and", removal_block)
-        self.assertIn("state: absent", removal_block)
 
     def test_docker_stack_separates_the_cribl_export_ca(self) -> None:
         source = DOCKER_STACK.read_text(encoding="utf-8")
@@ -281,12 +242,12 @@ class EdgeTlsContractTests(unittest.TestCase):
 
     def test_the_customer_signed_issuer_is_promoted_not_merely_imported(self) -> None:
         # set-signed only IMPORTS an issuer. A mount previously bootstrapped with
-        # the self-signed TEST root -- the brownfield case, an existing deployment
+        # a retired self-signed test root -- the brownfield case, an existing deployment
         # migrating onto the customer CA -- already holds issuers, and Vault's
         # default_follows_latest_issuer is false. Without an explicit promotion the
         # mount keeps signing leaves with the OLD test intermediate while the
         # customer-signed issuer sits unused, and every leaf chains to the test
-        # root. Observed on the live lab before this was fixed.
+        # root. This regression was observed on an earlier nonproduction deployment.
         text = VAULT_PKI.read_text(encoding="utf-8")
         for required in (
             "imported_issuers",
@@ -390,25 +351,14 @@ class EdgeTlsContractTests(unittest.TestCase):
             "-verify_hostname",
             "permitted name-constraint subtree",
             # PKI-B2: the name-constraint self-test uses a representative one-label
-            # probe host, not a pinned samba-ad hostname the gateway never issues
+            # probe host, not a pinned directory hostname the gateway never issues
             # in production.
             "NAME_CONSTRAINT_PROBE_LABEL",
         ):
             self.assertIn(required, source)
-        # PKI-B2: the self-test no longer pins the lab-only samba-ad host, which
+        # PKI-B2: the self-test no longer pins a disposable-directory host, which
         # would false-reject a production intermediate that excludes it.
         self.assertNotIn("DNS:samba-ad.{domain}", source)
-
-    def test_vault_bootstrap_accepts_customer_intermediate_and_defers_its_edge(self) -> None:
-        text = VAULT_BOOTSTRAP.read_text(encoding="utf-8")
-        subprocess.run(["bash", "-n", str(VAULT_BOOTSTRAP)], check=True)
-        self.assertIn("lab|vault-intermediate|customer-intermediate)", text)
-        # customer-intermediate mints no test root: the root generation stays
-        # inside the lab-only branch, and the deferral points at import-intermediate.
-        self.assertIn("import-intermediate", text)
-        lab_branch = text.split('if [[ "$AIGW_EDGE_TLS_MODE" == "lab" ]]; then', 1)[1]
-        deferral = lab_branch.split("else", 1)[1]
-        self.assertNotIn("pki/root/generate/internal", deferral)
 
     def test_sign_script_is_offline_only_and_pins_the_intermediate_extensions(self) -> None:
         text = SIGN_SCRIPT.read_text(encoding="utf-8")
@@ -416,14 +366,6 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertIn("basicConstraints = critical,CA:true,pathlen:0", text)
         self.assertIn("keyUsage = critical,digitalSignature,cRLSign,keyCertSign", text)
         self.assertIn("PRIVATE KEY", text)  # refuses key material in the CSR
-
-    def test_vault_bootstrap_defers_edge_pki_in_vault_intermediate_mode(self) -> None:
-        text = VAULT_BOOTSTRAP.read_text(encoding="utf-8")
-        subprocess.run(["bash", "-n", str(VAULT_BOOTSTRAP)], check=True)
-        self.assertIn('if [[ "$AIGW_EDGE_TLS_MODE" == "lab" ]]; then', text)
-        # The test root is only minted in lab mode; it lives inside that branch.
-        lab_branch = text.split('if [[ "$AIGW_EDGE_TLS_MODE" == "lab" ]]; then', 1)[1]
-        self.assertIn("pki/root/generate/internal", lab_branch)
 
 
 class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
@@ -822,7 +764,7 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
 
         ``constraints`` is the full OpenSSL nameConstraints value, so a caller
         can supply both permitted and excluded subtrees (e.g.
-        ``permitted;DNS:aegisgroup.ch,excluded;DNS:samba-ad.aigw.aegisgroup.ch``).
+        ``permitted;DNS:aigw.test,excluded;DNS:samba-ad.preprod.aigw.test``).
         Returns (intermediate_cert, intermediate_key, chain).
         """
         work = Path(tempfile.mkdtemp(prefix="edge-tls-nc-pki-"))
@@ -976,7 +918,7 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
         self.assertIn("symlink", result.stderr)
 
     def test_domain_outside_name_constraint_subtree_rejected_and_inside_passes(self) -> None:
-        int_cert, int_key, chain = self._build_constrained_pki("aegisgroup.ch")
+        int_cert, int_key, chain = self._build_constrained_pki("aigw.test")
         common = {
             "--intermediate": str(int_cert),
             "--intermediate-key": str(int_key),
@@ -990,7 +932,7 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
         self.assertIn("permitted subtree violation", outside.stderr)
         self.assert_no_key_bytes(outside)
         # A domain inside the subtree passes: the offline test leaf verifies.
-        inside = self.validate_intermediate(**{**common, "--domain": "aigw.aegisgroup.ch"})
+        inside = self.validate_intermediate(**{**common, "--domain": "preprod.aigw.test"})
         self.assertEqual(inside.returncode, 0, inside.stderr)
         self.assertIn("edge-tls=valid", inside.stdout)
         self.assert_no_key_bytes(inside)
@@ -1020,12 +962,12 @@ class EdgeTlsValidatorFunctionalTests(unittest.TestCase):
         # aigw role issues -- the wildcard *.DOMAIN and the apex DOMAIN. A
         # production CA can permit the whole one-label DOMAIN namespace yet
         # EXCLUDE a specific service host the gateway never issues (here
-        # samba-ad.DOMAIN; Samba is a lab-only ceremony). Pre-fix the self-test
+        # samba-ad.DOMAIN; directory LDAPS has its own ceremony). Pre-fix the self-test
         # probed samba-ad.DOMAIN and was false-rejected (returncode 1); the fix
         # no longer probes it, so a leaf the gateway will actually issue verifies.
-        domain = "aigw.aegisgroup.ch"
+        domain = "preprod.aigw.test"
         int_cert, int_key, chain = self._build_name_constrained_pki(
-            f"permitted;DNS:aegisgroup.ch,excluded;DNS:samba-ad.{domain}"
+            f"permitted;DNS:aigw.test,excluded;DNS:samba-ad.{domain}"
         )
         result = self.validate_intermediate(
             **{

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# e2e-fresh-vm-check.sh — READ-ONLY post-deploy acceptance verification for an
-# AI Gateway VM (lab Parallels aigw01 or production). It starts nothing, changes
+# e2e-fresh-vm-check.sh — READ-ONLY post-deploy acceptance verification for a
+# production AI Gateway VM. The legacy filename is kept for compatibility; the
+# script does not create or require a rehearsal VM. It starts nothing, changes
 # nothing, and prints no secret material. It proves, from a controller/jump host
 # that can reach BOTH published edges on tcp/443, that:
 #
@@ -21,22 +22,22 @@
 #   F. Samba LDAPS testLDAPConnection is reported as a token-gated manual step
 #      (it needs a Keycloak admin token this read-only script must not custody).
 #
-# Interactive OIDC login (typing credentials, landing on an authenticated page)
-# and any real browser "green lock" screenshot require a human Chrome click and
-# are NOT performed here; see docs/acceptance-e2e-fresh-vm.md Phase 5.
+# Interactive OIDC login and browser certificate checks are not performed here.
+# Use docs/deploy-runbook.md Part 8 for production sign-off. The exact seeded
+# local browser rehearsal is in docs/test-runbook.md section 3.
 #
 # Exit status: 0 only if every executed check passed; non-zero on any failure.
 #
 # Usage:
 #   scripts/e2e-fresh-vm-check.sh \
-#       --domain aigw.aegisgroup.ch \
+#       --domain example.internal \
 #       --adm-ip 10.8.10.10 --internal-ip 10.20.0.10 \
 #       --root-ca ansible/inventory/local-pki/ca-chain.pem \
-#       [--vault-ui] [--system-trust] [--ssh ansible@10.8.10.10] [--timeout 8]
+#       [--vault-ui] [--system-trust] [--ssh user@gateway --ssh-port 22] [--timeout 8]
 #
 # Every flag also has an environment fallback: AIGW_DOMAIN, AIGW_ADM_IP,
 # AIGW_INTERNAL_IP, AIGW_ROOT_CA, AIGW_VAULT_UI (true/false), AIGW_SYSTEM_TRUST,
-# AIGW_SSH_TARGET, AIGW_TIMEOUT.
+# AIGW_SSH_TARGET, AIGW_SSH_PORT, AIGW_TIMEOUT.
 set -euo pipefail
 
 DOMAIN="${AIGW_DOMAIN:-}"
@@ -46,6 +47,7 @@ ROOT_CA="${AIGW_ROOT_CA:-}"
 VAULT_UI="${AIGW_VAULT_UI:-false}"
 SYSTEM_TRUST="${AIGW_SYSTEM_TRUST:-false}"
 SSH_TARGET="${AIGW_SSH_TARGET:-}"
+SSH_PORT="${AIGW_SSH_PORT:-22}"
 TIMEOUT="${AIGW_TIMEOUT:-8}"
 # Fixed workload address from ansible/group_vars/all.yml (envoy_egress_ip). It is
 # part of the host-firewall ABI and never derived per-deployment.
@@ -65,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --vault-ui)     VAULT_UI=true; shift ;;
     --system-trust) SYSTEM_TRUST=true; shift ;;
     --ssh)          SSH_TARGET="${2:-}"; shift 2 ;;
+    --ssh-port)     SSH_PORT="${2:-}"; shift 2 ;;
     --timeout)      TIMEOUT="${2:-}"; shift 2 ;;
     -h|--help)      usage 0 ;;
     *) printf 'FATAL: unknown argument: %s\n' "$1" >&2; usage 2 ;;
@@ -79,6 +82,8 @@ fatal() { printf 'FATAL: %s\n' "$1" >&2; exit 2; }
 [[ -n "$ROOT_CA" ]]     || fatal "--root-ca (or AIGW_ROOT_CA) is required"
 [[ -f "$ROOT_CA" ]]     || fatal "root CA file does not exist: $ROOT_CA"
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || fatal "--timeout must be an integer"
+[[ "$SSH_PORT" =~ ^[0-9]+$ && "$SSH_PORT" -ge 1 && "$SSH_PORT" -le 65535 ]] || \
+  fatal "--ssh-port must be an integer from 1 through 65535"
 command -v curl >/dev/null    || fatal "curl is required"
 command -v openssl >/dev/null || fatal "openssl is required"
 
@@ -275,8 +280,10 @@ if [[ -z "$SSH_TARGET" ]]; then
   skip "  re-prove here read-only: --ssh <user@ADM_IP> (runs iptables/nft only)"
 else
   du=""; guard=""
-  du="$(ssh -o BatchMode=yes "$SSH_TARGET" 'sudo iptables -S DOCKER-USER' 2>/dev/null || true)"
-  guard="$(ssh -o BatchMode=yes "$SSH_TARGET" 'sudo nft list table inet aigw_guard' 2>/dev/null || true)"
+  du="$(ssh -o BatchMode=yes -o ClearAllForwardings=yes -p "$SSH_PORT" \
+    "$SSH_TARGET" 'sudo -n iptables -S DOCKER-USER' 2>/dev/null || true)"
+  guard="$(ssh -o BatchMode=yes -o ClearAllForwardings=yes -p "$SSH_PORT" \
+    "$SSH_TARGET" 'sudo -n nft list table inet aigw_guard' 2>/dev/null || true)"
   if [[ -z "$du" || -z "$guard" ]]; then
     fail "could not read DOCKER-USER / aigw_guard over SSH (need sudo, BatchMode key)"
   else
@@ -298,12 +305,11 @@ else
   fi
 fi
 
-# ── F. Samba LDAPS testLDAPConnection (token-gated manual step) ──────────────
-section "F. Samba/directory LDAPS testLDAPConnection (manual — needs admin token)"
-skip "Keycloak's POST /admin/realms/aigw/testLDAPConnection needs a realm-admin"
-skip "  bearer token this read-only script must not custody. Run it by hand per"
-skip "  docs/acceptance-e2e-fresh-vm.md Phase 5F; expect HTTP 204 for both"
-skip "  testConnection and testAuthentication over ldaps://samba-ad.${DOMAIN}:636."
+# ── F. Directory LDAPS evidence boundary ────────────────────────────────────
+section "F. Directory LDAPS evidence (owned by the Ansible identity gate)"
+skip "This read-only script does not custody a Keycloak realm-admin token."
+skip "  The normal converge configures and verifies the production directory."
+skip "  Local seeded preprod separately proves Samba LDAPS; see docs/test-runbook.md."
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 printf '\n== SUMMARY ==\n  passed=%d failed=%d skipped=%d\n' "$PASS" "$FAIL" "$SKIP"

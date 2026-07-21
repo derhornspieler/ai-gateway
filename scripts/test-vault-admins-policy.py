@@ -12,7 +12,7 @@ aigw-admins.
 
 Flow, entirely headless:
 
-  1. Log in through oauth2-proxy-vault as lab-admin exactly like
+  1. Log in through oauth2-proxy-vault as preprod-admin exactly like
      test-oidc-callbacks.py's "vault" target -- this both proves the edge
      gate and leaves a live Keycloak SSO session in the same cookie jar.
   2. POST /v1/auth/oidc/oidc/auth_url for role=aigw with the CLI loopback
@@ -34,7 +34,7 @@ Flow, entirely headless:
   6. Best-effort self-revoke the acquired token so no acceptance-run
      artifact is left live longer than necessary.
 
-The disposable lab-admin password is accepted only on stdin and is never
+The static preprod-admin password is accepted only on stdin and is never
 logged, persisted, placed in argv, or included in an exception message. No
 Vault root or unseal material is ever touched by this script.
 """
@@ -65,7 +65,7 @@ sys.modules[_OIDC_SPEC.name] = oidc
 _OIDC_SPEC.loader.exec_module(oidc)
 
 
-HOST = "vault.aigw.aegisgroup.ch"
+HOST = "vault.aigw.internal"
 ORIGIN = f"https://{HOST}"
 ALLOWED_HOSTS = frozenset({HOST, oidc.AUTH_HOST})
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -73,7 +73,7 @@ LOCALHOST_CALLBACK = "http://localhost:8250/oidc/callback"
 # Only an aigw-admins identity can reach Vault's `aigw` OIDC role at all; a
 # non-admin cannot even pass the oauth2-proxy edge gate in front of it (that
 # denial is covered by test-admin-denial.py's "vault" target).
-ACCEPTANCE_USERNAME = "lab-admin"
+ACCEPTANCE_USERNAME = "preprod-admin"
 # A name that unambiguously marks this as a bounded, never-mounted acceptance
 # probe. The assertion is that Vault denies the request before it ever
 # performs the mount -- a 403 proves no auth backend was enabled.
@@ -106,16 +106,16 @@ class CaptureLocalhostRedirect(urllib.request.HTTPRedirectHandler):
 
 def read_password() -> str:
     if sys.stdin.isatty():
-        raise SystemExit("pipe the disposable lab-admin password on stdin")
+        raise SystemExit("pipe the static preprod-admin password on stdin")
     raw = sys.stdin.buffer.read(513)
     if not raw or len(raw) > 512:
-        raise SystemExit("invalid lab password length")
+        raise SystemExit("invalid preprod password length")
     try:
         password = raw.strip().decode("utf-8")
     except UnicodeDecodeError:
-        raise SystemExit("lab password is not UTF-8") from None
+        raise SystemExit("preprod password is not UTF-8") from None
     if not password:
-        raise SystemExit("invalid lab password")
+        raise SystemExit("invalid preprod password")
     return password
 
 
@@ -131,7 +131,7 @@ def _decode(body: bytes) -> str:
 def acquire_vault_admins_token(
     context: ssl.SSLContext, cookies: http.cookiejar.CookieJar, password: str
 ) -> tuple[str, urllib.request.OpenerDirector]:
-    """Log in as lab-admin and complete Vault's own OIDC role=aigw exchange."""
+    """Log in as preprod-admin and complete Vault's OIDC role=aigw exchange."""
 
     target = oidc.TARGET_BY_NAME["vault"]
     edge_redirects = oidc.RestrictedRedirects(target)
@@ -299,6 +299,7 @@ def main() -> int:
     parser.add_argument("--ca", required=True)
     args = parser.parse_args()
     password = read_password()
+    oidc.install_preprod_resolution()
     try:
         context = ssl.create_default_context(cafile=args.ca)
     except (OSError, ssl.SSLError) as exc:

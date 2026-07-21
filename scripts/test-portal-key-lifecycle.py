@@ -25,7 +25,7 @@ if SPEC is None or SPEC.loader is None:
 flow = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(flow)
 
-API_ORIGIN = "https://api.aigw.aegisgroup.ch"
+API_ORIGIN = "https://api.aigw.internal"
 
 
 class OneTimeSecretParser(HTMLParser):
@@ -213,13 +213,14 @@ def main() -> int:
     parser.add_argument("--ca", required=True)
     args = parser.parse_args()
     if sys.stdin.isatty():
-        raise SystemExit("pipe the lab-developer Samba password on stdin")
+        raise SystemExit("pipe the preprod-developer Samba password on stdin")
     raw = sys.stdin.buffer.read(513)
     if not raw or len(raw) > 512:
-        raise SystemExit("invalid lab password length")
+        raise SystemExit("invalid preprod password length")
     password = raw.strip().decode("utf-8")
 
     context = ssl.create_default_context(cafile=args.ca)
+    flow.install_preprod_resolution()
     cookies = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
@@ -239,7 +240,7 @@ def main() -> int:
         opener,
         page_url,
         login_forms[0],
-        {"username": "lab-developer", "password": password},
+        {"username": "preprod-developer", "password": password},
         allowed_hosts=flow.PORTAL_ALLOWED_HOSTS,
     )
     if urllib.parse.urlsplit(page_url).path != "/":

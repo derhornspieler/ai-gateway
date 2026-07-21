@@ -20,11 +20,11 @@ class PortalAcceptanceOriginTests(unittest.TestCase):
     def test_user_and_admin_redirect_boundaries_are_distinct(self) -> None:
         self.assertEqual(
             flow.PORTAL_ALLOWED_HOSTS,
-            frozenset({"portal.aigw.aegisgroup.ch", "auth.aigw.aegisgroup.ch"}),
+            frozenset({"portal.aigw.internal", "auth.aigw.internal"}),
         )
         self.assertEqual(
             flow.ADMIN_PORTAL_ALLOWED_HOSTS,
-            frozenset({"admin.aigw.aegisgroup.ch", "auth.aigw.aegisgroup.ch"}),
+            frozenset({"admin.aigw.internal", "auth.aigw.internal"}),
         )
         with self.assertRaises(ValueError):
             flow.RestrictedRedirects(
@@ -55,30 +55,20 @@ class PortalAcceptanceOriginTests(unittest.TestCase):
                 flow.PORTAL_ORIGIN + "/",
             )
 
-    def test_bootstrap_uses_separate_sessions_and_admin_step_up(self) -> None:
+    def test_automated_identity_uses_separate_sessions_and_admin_step_up(self) -> None:
         portal_opener = object()
         admin_opener = object()
-        csrf = "c" * 32
-        admin_html = (
-            '<form method="post" action="/admin/identity/bootstrap">'
-            f'<input name="csrf_token" value="{csrf}">'
-            "</form>"
-        )
         login_results = [
             (flow.ADMIN_PORTAL_ORIGIN + "/admin", ""),
-            (flow.ADMIN_PORTAL_ORIGIN + "/admin", admin_html),
+            (flow.ADMIN_PORTAL_ORIGIN + "/admin", "<h1>Identity &amp; access</h1>"),
             (flow.PORTAL_ORIGIN + "/", ""),
         ]
-        initialized = (
-            flow.ADMIN_PORTAL_ORIGIN + "/admin",
-            "Keycloak identity setup completed.",
-        )
 
         with (
             mock.patch.object(
                 flow, "keycloak_login", side_effect=login_results
             ) as login,
-            mock.patch.object(flow, "post_form", return_value=initialized) as post,
+            mock.patch.object(flow, "post_form") as post,
             mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
             flow.identity_flow(portal_opener, admin_opener, "not-logged")
@@ -106,14 +96,20 @@ class PortalAcceptanceOriginTests(unittest.TestCase):
                 ),
             ],
         )
-        post.assert_called_once_with(
-            admin_opener,
-            flow.ADMIN_PORTAL_ORIGIN + "/admin",
-            mock.ANY,
-            {"confirmation": "INITIALIZE", "csrf_token": csrf},
-            allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
-        )
+        post.assert_not_called()
+        self.assertIn("PORTAL_IDENTITY_AUTOMATION_PASS", output.getvalue())
         self.assertNotIn("not-logged", output.getvalue())
+
+    def test_admin_portal_has_no_manual_identity_bootstrap_route(self) -> None:
+        portal = (ROOT / "services/dev-portal/app/main.py").read_text(
+            encoding="utf-8"
+        )
+        template = (
+            ROOT / "services/dev-portal/app/templates/admin.html"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('@admin_app.post("/admin/identity/bootstrap")', portal)
+        self.assertNotIn('action="/admin/identity/bootstrap"', template)
+        self.assertIn("there is no browser initialization step", template)
 
     def test_admin_group_harness_has_no_user_portal_admin_routes(self) -> None:
         source = (ROOT / "scripts/test-portal-group-flow.py").read_text(
@@ -127,7 +123,7 @@ class PortalAcceptanceOriginTests(unittest.TestCase):
         source = (ROOT / "scripts/test-portal-key-lifecycle.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('API_ORIGIN = "https://api.aigw.aegisgroup.ch"', source)
+        self.assertIn('API_ORIGIN = "https://api.aigw.internal"', source)
         self.assertIn('API_ORIGIN + "/v1/models"', source)
         self.assertIn('"Authorization": f"Bearer {secret}"', source)
         self.assertIn("require_gateway_key_accepted(context, first)", source)

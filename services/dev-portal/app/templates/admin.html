@@ -28,34 +28,15 @@
 
 {% if not identity_status.configured %}
 <div class="card">
-  <h3>Initialize identity control</h3>
-  {% if identity_status.bootstrap_available %}
-  <p class="muted">Creates Vault-backed private_key_jwt clients, configures the read-only lab LDAP federation, and consumes the temporary Keycloak bootstrap client.</p>
-  {% if identity_step_up_recent %}
-  <form method="post" action="/admin/identity/bootstrap" data-confirm="Initialize Keycloak identity control and consume the one-time bootstrap credential?">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="identity-confirmation">Type INITIALIZE to continue</label>
-    <input type="text" id="identity-confirmation" name="confirmation" required maxlength="32" autocomplete="off">
-    <div style="margin-top: 14px;"><button type="submit">Initialize</button></div>
-  </form>
-  {% endif %}
-  {% else %}
-  <p class="muted">The temporary bootstrap client is unavailable or already consumed. Follow the documented Keycloak recovery procedure; setup never falls back to a static admin password.</p>
-  {% endif %}
+  <h3>Identity setup is not ready</h3>
+  <p class="muted">Ansible sets up Keycloak and the read-only LDAPS connection during deployment. Check the latest playbook run; there is no browser initialization step.</p>
 </div>
 {% else %}
 
 {% if identity_status.bootstrap_cleanup_required %}
 <div class="card">
   <h3>Bootstrap cleanup required</h3>
-  <p class="muted">The durable identity controller is ready, but Keycloak still accepts temporary bootstrap administration. Retry setup to delete the Keycloak-marked temporary principals after re-verifying Vault state.</p>
-  {% if identity_step_up_recent %}
-  <form method="post" action="/admin/identity/bootstrap" data-confirm="Re-verify identity state and delete temporary Keycloak bootstrap administration?">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="hidden" name="confirmation" value="INITIALIZE">
-    <button type="submit" class="danger">Finalize bootstrap cleanup</button>
-  </form>
-  {% endif %}
+  <p class="muted">The temporary Keycloak administrator is still active. Re-run the Ansible deployment so it can verify the durable controller and remove the temporary account.</p>
 </div>
 {% endif %}
 
@@ -65,7 +46,7 @@
     {% if identity_groups %}
     <div class="glist">
       {% for group in identity_groups %}
-      {# data-group precedes href on purpose: the live-lab acceptance harness
+      {# data-group precedes href on purpose: the preprod acceptance harness
          resolves a group's id from "<name> ... href=/admin?group_id=<id>". #}
       <a class="grow" data-group="{{ group.name }}" href="/admin?group_id={{ group.id }}" aria-current="{{ 'true' if group.id == selected_group_id else 'false' }}">
         <span class="gname">{{ group.name }} <span class="memct">{{ group.member_count }} member{{ '' if group.member_count == 1 else 's' }}</span></span>
@@ -282,7 +263,7 @@
       <div class="rail"><div class="node">{{ '✓' if controller_ready else '1' }}</div><div class="line"></div></div>
       <div class="body">
         <h4>Identity controller bootstrapped</h4>
-        <p class="note">{% if controller_ready %}The Keycloak controller is ready and the broker realm is provisioned.{% else %}Initialize identity control on the Identity &amp; Access tab first.{% endif %}</p>
+        <p class="note">{% if controller_ready %}The Keycloak controller is ready and the broker realm is provisioned.{% else %}Automatic identity setup did not finish. Check the latest Ansible run.{% endif %}</p>
       </div>
     </div>
     <div class="step {{ 'done' if jwt_ready else ('active' if controller_ready else 'pending') }}">

@@ -54,7 +54,7 @@ def main() -> int:
         "aigw-chat",
     }:
         raise SystemExit("invalid acceptance capability")
-    if not re.fullmatch(r"lab-(?:admin|developer|user)", args.directory_user):
+    if not re.fullmatch(r"preprod-(?:admin|developer|user)", args.directory_user):
         raise SystemExit("invalid acceptance directory user")
     if sum(
         bool(value)
@@ -66,10 +66,10 @@ def main() -> int:
     ) > 1:
         raise SystemExit("cleanup modes and last-admin protection are mutually exclusive")
     if sys.stdin.isatty():
-        raise SystemExit("pipe the disposable testadmin password on stdin")
+        raise SystemExit("pipe the static preprod-admin password on stdin")
     raw = sys.stdin.buffer.read(513)
     if not raw or len(raw) > 512:
-        raise SystemExit("invalid testadmin password length")
+        raise SystemExit("invalid preprod-admin password length")
     password = raw.strip().decode("utf-8")
 
     import http.cookiejar
@@ -77,6 +77,7 @@ def main() -> int:
     import urllib.request
 
     context = ssl.create_default_context(cafile=args.ca)
+    flow.install_preprod_resolution()
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=context),
@@ -96,7 +97,7 @@ def main() -> int:
         allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
+    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
         raise RuntimeError("portal step-up did not return to /admin")
 
     group_pattern = re.compile(

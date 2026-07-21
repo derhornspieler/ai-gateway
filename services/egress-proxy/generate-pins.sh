@@ -1,35 +1,28 @@
 #!/usr/bin/env bash
-# generate-pins.sh — build the pinning material for envoy-egress.
+# generate-pins.sh — capture candidate pinning material for review.
 #
-# The PRIMARY enforcement in envoy.yaml is CA pinning: each vendor cluster's
-# `trusted_ca` is narrowed to a curated bundle holding ONLY that vendor's
-# issuing CA(s) (intermediate + root), instead of the full public root store.
-# This script's main job is to fetch and emit that issuing-CA chain as PEM so
-# you can populate certs/<vendor>-ca.pem.
+# The immutable Envoy image uses reviewed CA bundles from the provider catalog.
+# This helper fetches and emits one point-in-time issuing-CA chain as PEM. Its
+# output is a candidate, not an approved release input. Review its provenance,
+# fingerprints, validity, CA constraints, and official CA source separately.
 #
-# It ALSO prints leaf SPKI pins — base64(SHA-256(DER SubjectPublicKeyInfo)) —
-# for the OPTIONAL `verify_certificate_spki` defense-in-depth layer. Be aware:
-# Envoy's verify_certificate_spki matches the LEAF certificate ONLY (it does
-# not walk the chain), so leaf pins are strict but rotation-fragile — vendor
-# CDN leaf certs rotate ~every 90 days. CA pins (this script's PEM output) are
-# stable and are what you rely on day to day.
+# It also prints the leaf SPKI hash as review evidence. The current provider
+# catalog and generated policy do not enable leaf SPKI pinning. Adding that
+# control would require a reviewed schema, generator, test, and release change.
+# Do not paste a leaf hash into a live config. Leaf keys rotate often, and
+# Envoy matches `verify_certificate_spki` against the leaf only.
 #
-# ROTATION RUNBOOK:
-#   * CA bundle (primary): stable. Re-run this script only when a vendor
-#     changes issuing CA (rare, multi-year). To rotate safely, APPEND the new
-#     CA cert to certs/<vendor>-ca.pem (keep the old one) BEFORE the vendor
-#     cuts over, deploy, then prune the retired CA afterwards.
-#   * Leaf SPKI pins (optional): if you enable verify_certificate_spki, you
-#     must refresh them ~every 90 days. Add the incoming leaf pin to the
-#     second slot before the vendor rotates, deploy, then drop the old one.
+# This script does not update the catalog, provenance record, release manifest,
+# image, or deployment. Follow docs/sop/provider-ca-maintenance.md. A rotation
+# needs review, a new immutable release, offline-seed preprod testing, and
+# release approval.
 #
-# Run on a NETWORKED host you trust. Ideally verify from two independent
-# network vantage points before committing the CA bundle, to reduce the chance
-# of pinning a MITM certificate. Certs that fail TLS chain verification are
-# REFUSED (never emitted) — see -verify_return_error below.
+# Run on a NETWORKED host you trust. A second network vantage point is useful,
+# but it does not prove provenance by itself. Certs that fail TLS chain
+# verification are REFUSED (never emitted) — see -verify_return_error below.
 #
 # Usage: ./generate-pins.sh [host ...]
-#        (defaults to the vendor hosts pinned in envoy.yaml)
+#        (defaults to api.anthropic.com)
 #   env: CONNECT_TIMEOUT (seconds, default 15)
 #        CERTS_DIR (default: <script dir>/certs)
 
@@ -43,7 +36,7 @@ CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-15}"
 
 HOSTS=("$@")
 if [ "${#HOSTS[@]}" -eq 0 ]; then
-    HOSTS=(api.anthropic.com api.openai.com)
+    HOSTS=(api.anthropic.com)
 fi
 
 for tool in openssl base64 awk; do
@@ -127,7 +120,7 @@ for host in "${HOSTS[@]}"; do
             subject="$(printf '%s' "${cert}" | openssl x509 -noout -subject 2>/dev/null)"
             pin="$(printf '%s' "${cert}" | spki_pin 2>/dev/null)"
             case "${idx}" in
-                0) role="leaf   (OPTIONAL leaf SPKI pin — rotates ~90d)" ;;
+                0) role="leaf   (SPKI hash is review evidence only)" ;;
                 1) role="intermediate CA  -> goes in trusted_ca bundle" ;;
                 *) role="CA[${idx}]         -> goes in trusted_ca bundle" ;;
             esac
@@ -192,16 +185,14 @@ done
 
 cat <<'EOF'
 Next steps:
-  1. Verify the issuing-CA bundle(s) in certs/*.pem look right (re-run from a
-     second network vantage point if you can) and commit them. These are the
-     PRIMARY pin — envoy.yaml trusted_ca points at them.
-  2. (Optional) To also enable leaf SPKI pinning, uncomment the
-     verify_certificate_spki block for the vendor in envoy.yaml and paste two
-     leaf pins from above (current + an incoming rotation slot).
-  3. Ensure certs/*.pem are mounted into the envoy container at the paths in
-     envoy.yaml (/etc/envoy/certs/<vendor>-ca.pem), then restart envoy-egress.
-     The entrypoint fails closed if a bundle is missing, empty, a placeholder,
-     or the system root store.
+  1. Treat every written PEM as a candidate, not an approved CA bundle.
+  2. Follow docs/sop/provider-ca-maintenance.md. Verify each certificate
+     against an official CA source, record provenance and limitations, and
+     obtain an independent review.
+  3. Update the reviewed bundle, provenance record, and provider catalog in
+     one code review. Do not mount this file into a running container.
+  4. Build a new immutable offline release, load its exact preprod seed, and
+     pass validation before deployment.
 EOF
 
 if [ "${FAIL}" -ne 0 ]; then

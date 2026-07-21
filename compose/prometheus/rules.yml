@@ -11,65 +11,42 @@ groups:
 
       - alert: AIGatewayAlloyExporterSendFailures
         expr: >-
-          sum by (component_id, exporter, data_type) (
-            label_replace(
-              increase(otelcol_exporter_send_failed_spans_total{
-                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}[2m]),
-              "data_type", "traces", "component_id", ".+"
-            ) or label_replace(
-              increase(otelcol_exporter_send_failed_log_records_total{
-                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}[2m]),
-              "data_type", "logs", "component_id", ".+"
-            ) or label_replace(
-              increase(otelcol_exporter_send_failed_metric_points_total{
-                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}[2m]),
-              "data_type", "metrics", "component_id", ".+"
-            )
-          ) > 0
+          increase(otelcol_exporter_send_failed_log_records_total{
+            job="alloy",component_id="otelcol.exporter.otlp.cribl"}[2m]) > 0
         # One transient retry must not page. Requiring a non-zero two-minute
         # window continuously for five minutes detects a sustained outage.
         for: 5m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: platform-operations }
         annotations:
-          summary: "Alloy OTLP exporter is failing to send telemetry"
-          description: "Exporter {{ $labels.component_id }} has sustained failed {{ $labels.data_type }} sends; its persistent queue is retaining data for retry."
+          summary: "Alloy cannot deliver security logs to Cribl"
+          description: "The Cribl log exporter has failed for five minutes; its persistent queue is retaining approved security logs for retry."
+          runbook_url: "https://docs.aigw.internal/observability-operations#cribl-delivery-alerts"
 
       - alert: AIGatewayAlloyExporterEnqueueFailures
         expr: >-
-          sum by (component_id, exporter, data_type) (
-            label_replace(
-              otelcol_exporter_enqueue_failed_spans_total{
-                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"},
-              "data_type", "traces", "component_id", ".+"
-            ) or label_replace(
-              otelcol_exporter_enqueue_failed_log_records_total{
-                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"},
-              "data_type", "logs", "component_id", ".+"
-            ) or label_replace(
-              otelcol_exporter_enqueue_failed_metric_points_total{
-                job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"},
-              "data_type", "metrics", "component_id", ".+"
-            )
-          ) > 0
+          otelcol_exporter_enqueue_failed_log_records_total{
+            job="alloy",component_id="otelcol.exporter.otlp.cribl"} > 0
         # block_on_overflow=false protects collector availability, but a full
         # queue then rejects new telemetry. Latch the cumulative loss signal
         # until Alloy restarts: a range increase can miss the first failure
         # when its labeled counter series is first created at a non-zero value.
         for: 0m
-        labels: { severity: critical }
+        labels: { severity: critical, owner: platform-operations }
         annotations:
-          summary: "Alloy OTLP exporter rejected telemetry at its queue"
-          description: "Exporter {{ $labels.component_id }} could not enqueue {{ $labels.data_type }} telemetry; audit data was lost before export."
+          summary: "Cribl security-log queue rejected a record"
+          description: "The Cribl exporter could not enqueue an approved security log; delivery data was lost before export."
+          runbook_url: "https://docs.aigw.internal/observability-operations#cribl-delivery-alerts"
 
       - alert: AIGatewayAlloyExporterQueueSaturation
         expr: >-
-          (otelcol_exporter_queue_size{job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}
-          / otelcol_exporter_queue_capacity{job="alloy",component_id=~"otelcol\\.exporter\\.otlp\\..+"}) > 0.80
+          (otelcol_exporter_queue_size{job="alloy",component_id="otelcol.exporter.otlp.cribl"}
+          / otelcol_exporter_queue_capacity{job="alloy",component_id="otelcol.exporter.otlp.cribl"}) > 0.80
         for: 5m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: platform-operations }
         annotations:
-          summary: "Alloy OTLP exporter queue is over 80% full"
-          description: "Exporter {{ $labels.component_id }} {{ $labels.data_type }} queue is close to exhaustion."
+          summary: "Cribl security-log queue is over 80% full"
+          description: "The approved security-log delivery queue is close to exhaustion."
+          runbook_url: "https://docs.aigw.internal/observability-operations#cribl-delivery-alerts"
 
       - alert: AIGatewayLokiWriteDrops
         expr: increase(loki_write_dropped_entries_total{job="alloy"}[5m]) > 0

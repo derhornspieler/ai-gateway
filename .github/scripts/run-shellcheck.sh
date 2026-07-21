@@ -31,8 +31,6 @@ SHELLCHECK_IMAGE="koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea
 TARGETS=(
   .github/scripts/run-shellcheck.sh
   ansible/inventory/examples/production-rocky9.first-init.sh.example
-  ansible/inventory/examples/rocky9-lab.first-init.sh.example
-  ansible/inventory/examples/rocky9-lab.stage-customer-intermediate.sh.example
   ansible/roles/network_routing/files/90-aigw-policy-routing
   compose/postgres/init/01-init-databases.sh
   scripts/aigw-compose.sh
@@ -46,16 +44,15 @@ TARGETS=(
   scripts/validate-compose.sh
   scripts/validate-compose-on-vm.sh
   scripts/validate-vault-config.sh
-  scripts/vault-bootstrap.sh
   scripts/vault-oidc-setup.sh
   scripts/vault-pki-intermediate.sh
   scripts/vault-unseal.sh
   services/egress-proxy/generate-pins.sh
-  services/samba-ad-lab/policy-rc.d
-  services/samba-ad-lab/samba-ad-entrypoint
-  services/samba-ad-lab/samba-ad-healthcheck
-  services/samba-ad-lab/tests/test-lockout-policy.sh
-  services/samba-ad-lab/tests/test-secret-argv.sh
+  services/samba-ad-preprod/policy-rc.d
+  services/samba-ad-preprod/samba-ad-entrypoint
+  services/samba-ad-preprod/samba-ad-healthcheck
+  services/samba-ad-preprod/tests/test-lockout-policy.sh
+  services/samba-ad-preprod/tests/test-secret-argv.sh
 )
 
 # Fail closed when a listed target is renamed or deleted: a linter that silently

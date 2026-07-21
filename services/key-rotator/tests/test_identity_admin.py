@@ -365,130 +365,10 @@ async def test_relying_party_scope_reconciliation_converges_exact_role_ids() -> 
 
 
 @pytest.mark.asyncio
-async def test_prebootstrap_scope_reconciliation_is_gated_and_scope_only() -> None:
-    class PrebootstrapAdmin(KeycloakAdmin):
-        def __init__(self, *args, applicable: bool, state_absent: bool = True, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.applicable = applicable
-            self.state_absent = state_absent
-            self.calls: list[str] = []
-
-        async def status(self):
-            return {
-                "configured": False if self.applicable else True,
-                "identity_state_absent": self.state_absent,
-                "controller_usable": False,
-                "bootstrap_available": True,
-            }
-
-        async def _bootstrap_token(self):
-            self.calls.append("bootstrap-token")
-            return "bootstrap-token"
-
-        async def _capability_role_representations(self, realm, admin_token):
-            self.calls.append("capability-roles")
-            return [
-                {"id": f"role-{name}", "name": name}
-                for name in sorted(CAPABILITY_ROLES)
-            ]
-
-        async def _find_client(self, realm, client_id, admin_token):
-            self.calls.append(f"find:{client_id}")
-            return {"id": f"{client_id}-uuid", "clientId": client_id}
-
-        async def _get_client(self, realm, client, admin_token):
-            self.calls.append(f"get:{client['clientId']}")
-            return {
-                "id": client["id"],
-                "clientId": client["clientId"],
-                "fullScopeAllowed": False,
-                "protocolMappers": [self._realm_roles_mapper()],
-            }
-
-        async def _reconcile_client_realm_role_scope_mappings(
-            self, realm, client, desired_roles, admin_token
-        ):
-            self.calls.append(f"scope:{client['clientId']}")
-
-        async def _put_client(self, realm, client, admin_token):
-            raise AssertionError("pre-bootstrap scope repair must not PUT clients")
-
-        async def _delete_bootstrap_principals(self, admin_token):
-            raise AssertionError("pre-bootstrap scope repair must not consume bootstrap")
-
-    applicable = PrebootstrapAdmin(
-        settings(), FakeVault(), FakeDB(), applicable=True
-    )
-    assert await applicable.reconcile_prebootstrap_relying_party_role_scopes() is True
-    assert applicable.calls == [
-        "bootstrap-token",
-        "capability-roles",
-        *[
-            entry
-            for client_id in RELYING_PARTY_CLIENT_IDS
-            for entry in (
-                f"find:{client_id}",
-                f"get:{client_id}",
-                f"scope:{client_id}",
-                f"get:{client_id}",
-            )
-        ],
-    ]
-
-    inapplicable = PrebootstrapAdmin(
-        settings(), FakeVault(), FakeDB(), applicable=False
-    )
-    assert (
-        await inapplicable.reconcile_prebootstrap_relying_party_role_scopes()
-        is False
-    )
-    assert inapplicable.calls == []
-
-    # `configured` becomes false if a durable controller cannot issue a token.
-    # Its existing state document must still permanently close this narrow
-    # master-bootstrap recovery path.
-    postbootstrap_controller_outage = PrebootstrapAdmin(
-        settings(), FakeVault(), FakeDB(), applicable=True, state_absent=False
-    )
-    assert (
-        await postbootstrap_controller_outage.reconcile_prebootstrap_relying_party_role_scopes()
-        is False
-    )
-    assert postbootstrap_controller_outage.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status",
-    [
-        {"configured": True, "controller_usable": False, "bootstrap_available": True},
-        {"configured": False, "controller_usable": True, "bootstrap_available": True},
-        {"configured": False, "controller_usable": False, "bootstrap_available": False},
-        {"configured": 0, "controller_usable": False, "bootstrap_available": True},
-    ],
-)
-async def test_prebootstrap_scope_reconciliation_requires_the_exact_status_gate(
-    monkeypatch, status
-) -> None:
-    admin = KeycloakAdmin(settings(), FakeVault(), FakeDB())
-
-    async def status_check():
-        return status
-
-    async def forbidden_bootstrap_token():
-        raise AssertionError("inapplicable recovery must not obtain a bootstrap token")
-
-    monkeypatch.setattr(admin, "status", status_check)
-    monkeypatch.setattr(admin, "_bootstrap_token", forbidden_bootstrap_token)
-
-    assert await admin.reconcile_prebootstrap_relying_party_role_scopes() is False
-
-
-@pytest.mark.asyncio
 async def test_private_key_jwt_uses_public_audience_over_internal_transport() -> None:
     pem, _ = private_key_pem()
     expected_audience = (
-        "https://auth.aigw.aegisgroup.ch/realms/aigw/protocol/openid-connect/token"
+        "https://auth.aigw.internal/realms/aigw/protocol/openid-connect/token"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -502,7 +382,7 @@ async def test_private_key_jwt_uses_public_audience_over_internal_transport() ->
         return httpx.Response(200, json={"access_token": "controller-token"})
 
     admin = KeycloakAdmin(
-        settings(KEYCLOAK_PUBLIC_URL="https://auth.aigw.aegisgroup.ch"),
+        settings(KEYCLOAK_PUBLIC_URL="https://auth.aigw.internal"),
         FakeVault(),
         FakeDB(),
         transport=httpx.MockTransport(handler),
@@ -517,7 +397,7 @@ async def test_private_key_jwt_uses_public_audience_over_internal_transport() ->
 
 @pytest.mark.asyncio
 async def test_keycloak_redirect_is_not_followed_and_error_body_is_redacted() -> None:
-    secret_echo = "CN=svc-keycloak,DC=lab,DC=internal"
+    secret_echo = "CN=svc-keycloak,DC=directory,DC=internal"
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1435,13 +1315,10 @@ async def test_cleanup_deletes_only_marked_temporary_bootstrap_principals() -> N
         raise AssertionError((request.method, request.url.path))
 
     admin = KeycloakAdmin(
-        settings(RETAIN_BOOTSTRAP_ADMIN_USER=False),
-        FakeVault(),
-        FakeDB(),
-        transport=httpx.MockTransport(handler),
+        settings(), FakeVault(), FakeDB(), transport=httpx.MockTransport(handler)
     )
 
-    assert await admin._delete_bootstrap_principals("master-token") is False
+    assert await admin._delete_bootstrap_principals("master-token") is None
     assert calls == [
         ("GET", "/admin/realms/master/users"),
         ("DELETE", "/admin/realms/master/users/temporary-user"),
@@ -1449,53 +1326,6 @@ async def test_cleanup_deletes_only_marked_temporary_bootstrap_principals() -> N
         ("GET", "/admin/realms/master/clients/temporary-client"),
         ("DELETE", "/admin/realms/master/clients/temporary-client"),
     ]
-
-
-@pytest.mark.asyncio
-async def test_lab_retention_fails_closed_if_keycloak_keeps_temporary_marker() -> None:
-    """Do not claim a durable recovery admin when Keycloak ignores its update."""
-
-    calls: list[tuple[str, str]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append((request.method, request.url.path))
-        temporary = {
-            "id": "temporary-user",
-            "username": "admin",
-            "attributes": {"is_temporary_admin": ["true"]},
-        }
-        if request.url.path == "/admin/realms/master/users":
-            return httpx.Response(200, json=[temporary])
-        if request.url.path == "/admin/realms/master/users/temporary-user":
-            if request.method == "PUT":
-                return httpx.Response(204)
-            if request.method == "GET":
-                # Keycloak v26 preserves this internal marker; retaining the
-                # account would leave an unverified temporary master admin.
-                return httpx.Response(200, json=temporary)
-        raise AssertionError((request.method, request.url.path))
-
-    admin = KeycloakAdmin(
-        settings(RETAIN_BOOTSTRAP_ADMIN_USER=True),
-        FakeVault(),
-        FakeDB(),
-        transport=httpx.MockTransport(handler),
-    )
-
-    with pytest.raises(IdentityError, match="did not verify the lab recovery operator"):
-        await admin._delete_bootstrap_principals("master-token")
-    assert calls == [
-        ("GET", "/admin/realms/master/users"),
-        ("PUT", "/admin/realms/master/users/temporary-user"),
-        ("GET", "/admin/realms/master/users/temporary-user"),
-    ]
-
-
-def test_lab_bind_secret_path_is_confined_to_docker_secrets() -> None:
-    with pytest.raises(ValueError, match="/run/secrets"):
-        settings(LAB_SAMBA_BIND_PASSWORD_FILE="/tmp/operator-controlled")
-
-
 def test_assertion_expiration_is_not_derived_from_caller_input() -> None:
     pem, _ = private_key_pem()
     before = int(time.time())

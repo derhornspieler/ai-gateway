@@ -1,22 +1,7 @@
-# envoy-egress — the ONLY container with a path out eth0.
-#
-# Why a reverse proxy and not an HTTPS_PROXY/CONNECT proxy: with CONNECT the
-# client does TLS end-to-end and envoy only sees an opaque tunnel — pinning
-# would be unenforceable without MITM. Here clients speak plain HTTP to
-# envoy on the backend network (http://envoy-egress:8080/<vendor>/...) and
-# envoy ORIGINATES the vendor TLS itself against a pinned trust store.
-# (Design refinement over solution-map v3 §1.7 — recorded in decision log.)
-
+# Generated from the reviewed provider catalog. Do not edit the generated
+# /etc/envoy/envoy.yaml inside an image.
 admin:
   address:
-    # SECURITY: loopback only. Admin exposes /quitquitquit, /runtime_modify,
-    # etc. unauthenticated — binding 0.0.0.0 let any attached container
-    # kill or reconfigure the sole egress control point.
-    # Consequence for consumers: compose healthchecks and Prometheus scrapes
-    # can no longer reach :9901 over the network. Healthchecks must exec
-    # inside the container (e.g. `curl -sf http://127.0.0.1:9901/ready`);
-    # metrics need a sidecar/exec-based scrape or an explicitly routed,
-    # read-only stats listener if ever required.
     socket_address: { address: 127.0.0.1, port_value: 9901 }
 
 static_resources:
@@ -44,7 +29,7 @@ static_resources:
                           duration_ms: "%DURATION%"
                           bytes_tx: "%BYTES_SENT%"
                 route_config:
-                  name: vendors
+                  name: selected_providers
                   virtual_hosts:
                     - name: egress
                       domains: ["*"]
@@ -55,22 +40,9 @@ static_resources:
                             cluster: anthropic
                             prefix_rewrite: "/"
                             host_rewrite_literal: api.anthropic.com
-                            timeout: 600s          # streaming completions
-                        - match: { prefix: "/openai/" }
-                          name: openai-api
-                          route:
-                            cluster: openai
-                            prefix_rewrite: "/"
-                            host_rewrite_literal: api.openai.com
                             timeout: 600s
-                        # NO default route: anything not on the vendor
-                        # allow-list gets 404. Add vendors here + a cluster.
+                        # There is no default route. Unselected paths return 404.
                 http_filters:
-                  # This listener is reachable on both net-vendor and
-                  # net-metrics so Prometheus can scrape the separate :9902
-                  # listener. Authorize the vendor request plane by the direct
-                  # Docker peer address rather than an X-Forwarded-For value:
-                  # only LiteLLM and key-rotator share 172.28.7.0/24.
                   - name: envoy.filters.http.rbac
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
@@ -88,9 +60,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
-    # Prometheus must not receive the unauthenticated Envoy admin API. This
-    # listener proxies one exact, read-only GET to loopback; /quitquitquit,
-    # /runtime_modify, prefix variants, and non-GET methods have no route.
+    # Prometheus gets one read-only stats path, not the Envoy admin API.
     - name: read_only_metrics
       address:
         socket_address: { address: 0.0.0.0, port_value: 9902 }
@@ -150,65 +120,7 @@ static_resources:
           sni: api.anthropic.com
           common_tls_context:
             validation_context:
-              # PRIMARY ENFORCEMENT — CA pinning via a narrowed trust store.
-              # trusted_ca is NOT the full public root bundle; it is a curated
-              # per-vendor file containing ONLY the issuing CA(s) this vendor
-              # actually uses (see certs/anthropic-ca.pem). Envoy builds the
-              # chain against this store, so a valid public-CA cert issued by
-              # any OTHER CA for api.anthropic.com is rejected — that is the
-              # real pin. These CA certs are stable (roots/intermediates
-              # rotate on multi-year cadence), so this survives routine leaf
-              # rotation. Populate/rotate with ./generate-pins.sh. The
-              # entrypoint FAILS CLOSED if this file is missing/empty or still
-              # points at the system bundle.
               trusted_ca: { filename: /etc/envoy/certs/anthropic-ca.pem }
-              # OPTIONAL defense-in-depth — LEAF SPKI pinning.
-              # verify_certificate_spki matches base64(SHA-256(DER SPKI)) of
-              # the LEAF certificate ONLY (Envoy does NOT walk the chain for
-              # this check — verified against Envoy source: it compares the
-              # peer/leaf cert's SPKI). It is therefore rotation-fragile:
-              # vendor CDN leaf certs rotate roughly every ~90 days, so an
-              # active pin here must be refreshed on that cadence or egress
-              # breaks. Leave it OUT (as below) to rely on CA pinning + SAN
-              # alone, OR uncomment and paste live leaf pins from
-              # ./generate-pins.sh (keep >= 2 slots: current + incoming).
-              # verify_certificate_spki:
-              #   - "<paste LEAF SPKI pin from generate-pins.sh>"
-              #   - "<paste incoming LEAF SPKI pin (rotation slot)>"
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher: { exact: api.anthropic.com }
-
-    - name: openai
-      type: LOGICAL_DNS
-      dns_lookup_family: V4_ONLY
-      connect_timeout: 10s
-      load_assignment:
-        cluster_name: openai
-        endpoints:
-          - lb_endpoints:
-              - endpoint:
-                  address:
-                    socket_address: { address: api.openai.com, port_value: 443 }
-      transport_socket:
-        name: envoy.transport_sockets.tls
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          sni: api.openai.com
-          common_tls_context:
-            validation_context:
-              # PRIMARY ENFORCEMENT — narrowed CA trust store (issuing CA(s)
-              # only). See the anthropic cluster comment for the full rationale
-              # and the leaf-SPKI vs CA-bundle distinction. The entrypoint
-              # fails closed if this file is missing/empty or is the system
-              # bundle.
-              trusted_ca: { filename: /etc/envoy/certs/openai-ca.pem }
-              # OPTIONAL defense-in-depth — LEAF-ONLY SPKI pinning (rotates
-              # ~90d). Left out by default; uncomment + paste live leaf pins
-              # from ./generate-pins.sh to enable.
-              # verify_certificate_spki:
-              #   - "<paste LEAF SPKI pin from generate-pins.sh>"
-              #   - "<paste incoming LEAF SPKI pin (rotation slot)>"
-              match_typed_subject_alt_names:
-                - san_type: DNS
-                  matcher: { exact: api.openai.com }

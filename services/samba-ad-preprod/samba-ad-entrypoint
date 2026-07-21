@@ -1,0 +1,163 @@
+#!/bin/sh
+set -eu
+
+umask 077
+
+STATE_DB=/var/lib/samba/private/sam.ldb
+CONFIG=/etc/samba/smb.conf
+BOOTSTRAP_MARKER=/var/lib/samba/.aigw-bootstrap-complete
+TLS_DIR=/var/lib/samba/private/tls
+# Fixed preprod password-spray control. Keep this non-permanent and bounded: an
+# attacker who knows a username can cause at most a 15-minute denial, while
+# five bad attempts still stop high-rate guessing against the preprod directory.
+LOCKOUT_THRESHOLD=5
+LOCKOUT_DURATION_MINUTES=15
+LOCKOUT_RESET_MINUTES=15
+
+die() {
+    printf '%s\n' "samba-ad-preprod: $*" >&2
+    exit 1
+}
+
+require_name() {
+    label=$1
+    value=$2
+    pattern=$3
+    printf '%s' "$value" | grep -Eq "$pattern" \
+        || die "$label contains unsupported characters"
+}
+
+realm=${SAMBA_REALM:-PREPROD.AIGW.INTERNAL}
+domain=${SAMBA_DOMAIN:-AIGWPREPROD}
+hostname_short=${SAMBA_HOSTNAME:-samba-ad}
+admin_password_file=${SAMBA_ADMIN_PASSWORD_FILE:-/run/secrets/samba_ad_admin_password}
+bind_password_file=${SAMBA_BIND_PASSWORD_FILE:-/run/secrets/samba_ad_bind_password}
+bind_user=${SAMBA_BIND_USER:-svc-keycloak-ldap}
+human_users_ou=${SAMBA_HUMAN_USERS_OU:-AIGWUsers}
+# The FQDN the LDAPS endpoint is addressed by and the leaf certificate must
+# bear. Defaults to <host>.<realm> so a bare `docker run` still works, but the
+# preprod overlay always supplies samba-ad.$DOMAIN — the only name a root-CA
+# certificate can carry under the platform name constraints.
+ldaps_fqdn=${SAMBA_LDAPS_FQDN:-$(printf '%s.%s' "$hostname_short" "$realm" | tr '[:upper:]' '[:lower:]')}
+# Bind-mounted files carrying the local preprod Root CA, LDAPS leaf, and key.
+tls_cert_src=${SAMBA_TLS_CERT_FILE:-/run/secrets/samba_ad_tls_cert}
+tls_key_src=${SAMBA_TLS_KEY_FILE:-/run/secrets/samba_ad_tls_key}
+tls_ca_src=${SAMBA_TLS_CA_FILE:-/run/secrets/preprod_root_ca}
+
+require_name SAMBA_REALM "$realm" '^[A-Z0-9][A-Z0-9.-]{2,252}[A-Z0-9]$'
+require_name SAMBA_DOMAIN "$domain" '^[A-Z0-9][A-Z0-9-]{0,14}$'
+require_name SAMBA_HOSTNAME "$hostname_short" '^[a-z0-9][a-z0-9-]{0,62}$'
+require_name SAMBA_BIND_USER "$bind_user" '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+require_name SAMBA_HUMAN_USERS_OU "$human_users_ou" '^[A-Za-z][A-Za-z0-9-]{0,63}$'
+require_name SAMBA_LDAPS_FQDN "$ldaps_fqdn" \
+    '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+require_name SAMBA_TLS_CERT_FILE "$tls_cert_src" '^/run/secrets/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+require_name SAMBA_TLS_KEY_FILE "$tls_key_src" '^/run/secrets/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+require_name SAMBA_TLS_CA_FILE "$tls_ca_src" '^/run/secrets/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+
+domain_dn="DC=$(printf '%s' "$realm" | sed 's/\./,DC=/g')"
+human_users_dn="OU=$human_users_ou,$domain_dn"
+
+if [ ! -f "$STATE_DB" ]; then
+    if [ -e "$CONFIG" ] || find /var/lib/samba -mindepth 1 \
+        \( -type f -o -type l \) -print -quit | grep -q .; then
+        die "refusing to overwrite a partial or inconsistent domain provision"
+    fi
+
+    samba-ad-secret-tool domain-provision \
+        "$admin_password_file" "$realm" "$domain" "$hostname_short"
+fi
+
+if [ ! -f "$BOOTSTRAP_MARKER" ]; then
+    [ -s "$STATE_DB" ] || die "bootstrap state is missing the domain database"
+    [ -s "$CONFIG" ] || die "bootstrap state is missing smb.conf"
+
+    if samba-tool user show "$bind_user" >/dev/null 2>&1; then
+        samba-ad-secret-tool user-setpassword "$bind_password_file" "$bind_user"
+    else
+        samba-ad-secret-tool bind-user-create "$bind_password_file" "$bind_user"
+    fi
+    samba-tool user setexpiry "$bind_user" --noexpiry
+    touch "$BOOTSTRAP_MARKER"
+fi
+
+[ -s "$CONFIG" ] || die "domain database exists but smb.conf is missing"
+
+# Domain policy lives in sam.ldb, so reconcile it on every start rather than
+# assuming the one-time bootstrap marker still represents current state.
+samba-tool domain passwordsettings set \
+    --account-lockout-threshold="$LOCKOUT_THRESHOLD" \
+    --account-lockout-duration="$LOCKOUT_DURATION_MINUTES" \
+    --reset-account-lockout-after="$LOCKOUT_RESET_MINUTES" \
+    --quiet
+password_settings=$(samba-tool domain passwordsettings show)
+printf '%s\n' "$password_settings" \
+    | grep -Eq "^Account lockout threshold \(attempts\):[[:space:]]+$LOCKOUT_THRESHOLD$" \
+    || die "account lockout threshold did not persist"
+printf '%s\n' "$password_settings" \
+    | grep -Eq "^Account lockout duration \(mins\):[[:space:]]+$LOCKOUT_DURATION_MINUTES$" \
+    || die "account lockout duration did not persist"
+printf '%s\n' "$password_settings" \
+    | grep -Eq "^Reset account lockout after \(mins\):[[:space:]]+$LOCKOUT_RESET_MINUTES$" \
+    || die "account lockout reset window did not persist"
+
+# Keep disposable human identities out of AD's broad CN=Users container,
+# which also holds privileged/system principals such as Administrator.  The
+# Keycloak preprod provider is rooted at this OU, making those built-ins
+# impossible to import or assign through the portal. Existing preprod volumes are
+# migrated idempotently below.
+if ! samba-tool ou list --full-dn | grep -Fxiq "$human_users_dn"; then
+    samba-tool ou create "OU=$human_users_ou" \
+        --description='AI Gateway disposable preprod identities'
+fi
+
+# Seed only explicitly requested disposable preprod identities. Passwords remain
+# Samba-owned and arrive through per-user secret files; a restart never resets
+# an existing user's password.
+old_ifs=$IFS
+IFS=,
+for seed_user in ${SAMBA_SEED_USERS:-}; do
+    IFS=$old_ifs
+    require_name SAMBA_SEED_USERS "$seed_user" '^[a-z][a-z0-9-]{0,31}$'
+    if ! samba-tool user show "$seed_user" >/dev/null 2>&1; then
+        samba-ad-secret-tool user-create \
+            "/run/secrets/samba_user_${seed_user}_password" \
+            "$seed_user" "OU=$human_users_ou"
+        samba-tool user setexpiry "$seed_user" --noexpiry
+    else
+        current_dn=$(samba-tool user show "$seed_user" \
+            --attributes=distinguishedName \
+            | sed -n 's/^distinguishedName: //p')
+        case "$current_dn" in
+            *",$human_users_dn") ;;
+            *) samba-tool user move "$seed_user" "$human_users_dn" ;;
+        esac
+    fi
+    IFS=,
+done
+IFS=$old_ifs
+
+# Local preprod has one trust path: the Root CA generated by preprod.py. There
+# is no self-signed fallback. Missing, mismatched, expired, or wrongly named
+# material stops the directory before it can report healthy.
+for tls_file in "$tls_cert_src" "$tls_key_src" "$tls_ca_src"; do
+    [ -s "$tls_file" ] || die "required LDAPS file is missing or empty: $tls_file"
+done
+openssl x509 -in "$tls_cert_src" -noout >/dev/null 2>&1 \
+    || die "the LDAPS certificate is invalid"
+openssl pkey -in "$tls_key_src" -noout >/dev/null 2>&1 \
+    || die "the LDAPS private key is invalid"
+[ "$(openssl x509 -in "$tls_cert_src" -noout -pubkey 2>/dev/null)" \
+  = "$(openssl pkey -in "$tls_key_src" -pubout 2>/dev/null)" ] \
+    || die "the LDAPS certificate and private key do not match"
+openssl verify -CAfile "$tls_ca_src" -verify_hostname "$ldaps_fqdn" \
+    "$tls_cert_src" >/dev/null 2>&1 \
+    || die "the LDAPS certificate is not valid for the preprod Root CA and hostname"
+
+mkdir -p "$TLS_DIR"
+# Samba refuses an LDAPS key with group or other permission bits.
+install -m 0600 "$tls_key_src" "$TLS_DIR/key.pem"
+install -m 0644 "$tls_cert_src" "$TLS_DIR/cert.pem"
+install -m 0644 "$tls_ca_src" "$TLS_DIR/ca.pem"
+
+exec "$@"

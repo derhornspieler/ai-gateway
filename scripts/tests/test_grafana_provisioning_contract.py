@@ -417,7 +417,7 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "  cribl-mock:\n", 1
         )[0]
         self.assertIn("dockerfile: Dockerfile.grafana", grafana)
-        self.assertIn("image: ai-gateway/dhi-grafana:12.4.5-aigw1", grafana)
+        self.assertIn("image: ai-gateway/dhi-grafana:13.1.0-aigw1", grafana)
         apps = (
             ROOT / "compose/grafana/provisioning/plugins/loki-drilldown.yml"
         ).read_text()
@@ -437,6 +437,7 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "url: postgres:5432",
             "user: grafana_ro",
             "database: litellm",
+            "postgresVersion: 1800",
             "password: $__env{AIGW_PG_GRAFANA_RO_PASSWORD}",
         ):
             self.assertIn(required, datasources)
@@ -550,7 +551,7 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         }
         for grant in expected_grants.values():
             self.assertIn(grant, init)
-        # An already-initialized lab DB carrying the retired whole-table grant
+        # An already-initialized nonproduction DB carrying the retired whole-table grant
         # must be demoted, not left in place: the fixer actively revokes the
         # table-wide SELECT and the three prompt-bearing columns before it
         # re-grants at column level.
@@ -591,7 +592,7 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
 
     def test_db_grafana_bridge_abi_is_synchronized(self) -> None:
         """net-db-grafana is a firewall-ABI addition: inventory topology, the
-        os-prep exact-topology gate, the lab reset pin, and both Compose
+        os-prep exact-topology gate and both Compose
         attachments must move together."""
         group_vars = (ROOT / "ansible/group_vars/all.yml").read_text()
         self.assertIn(
@@ -602,8 +603,6 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertIn(
             '"net-db-grafana": ("br-db-graf", "172.28.20.0/24", True),', os_prep
         )
-        reset = (ROOT / "ansible/reset-rocky9-lab.yml").read_text()
-        self.assertIn("- net-db-grafana", reset)
         self.assertIn("net-db-grafana:   { external: true }", self.compose)
         self.assertIn(
             "networks: [net-db-litellm, net-db-keycloak, net-db-rotator, net-db-grafana]",

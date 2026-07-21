@@ -98,23 +98,13 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "AIGatewayScrapeTargetDown": ("up == 0",),
             "AIGatewayAlloyExporterSendFailures": (
                 "increase(",
-                "otelcol_exporter_send_failed_spans_total",
                 "otelcol_exporter_send_failed_log_records_total",
-                "otelcol_exporter_send_failed_metric_points_total",
-                '"data_type", "traces"',
-                '"data_type", "logs"',
-                '"data_type", "metrics"',
-                "component_id=~\"otelcol\\\\.exporter\\\\.otlp\\\\..+\"",
+                'component_id="otelcol.exporter.otlp.cribl"',
                 "[2m]",
             ),
             "AIGatewayAlloyExporterEnqueueFailures": (
-                "otelcol_exporter_enqueue_failed_spans_total",
                 "otelcol_exporter_enqueue_failed_log_records_total",
-                "otelcol_exporter_enqueue_failed_metric_points_total",
-                '"data_type", "traces"',
-                '"data_type", "logs"',
-                '"data_type", "metrics"',
-                "component_id=~\"otelcol\\\\.exporter\\\\.otlp\\\\..+\"",
+                'component_id="otelcol.exporter.otlp.cribl"',
             ),
             "AIGatewayAlloyExporterQueueSaturation": (
                 "otelcol_exporter_queue_size",
@@ -150,15 +140,19 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
         self.assertIn("for: 5m", send_failures)
         self.assertIn("severity: warning", send_failures)
         self.assertIn("persistent queue", send_failures)
+        self.assertNotIn("send_failed_spans", send_failures)
+        self.assertNotIn("send_failed_metric_points", send_failures)
 
         enqueue_failures = alert_block(
             self.rules, "AIGatewayAlloyExporterEnqueueFailures"
         )
         self.assertIn("for: 0m", enqueue_failures)
         self.assertIn("severity: critical", enqueue_failures)
-        self.assertIn("audit data was lost", enqueue_failures)
+        self.assertIn("delivery data was lost", enqueue_failures)
         self.assertNotIn("increase(", enqueue_failures)
-        self.assertIn(") > 0", enqueue_failures)
+        self.assertIn('component_id="otelcol.exporter.otlp.cribl"} > 0', enqueue_failures)
+        self.assertNotIn("enqueue_failed_spans", enqueue_failures)
+        self.assertNotIn("enqueue_failed_metric_points", enqueue_failures)
 
         self.assertNotIn("\nalerting:", self.prometheus)
 

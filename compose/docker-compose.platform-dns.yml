@@ -1,17 +1,17 @@
-# Optional authoritative-only DNS overlay for both generic Rocky 9 and lab
-# deployments. Ansible renders the zone/view files for the supplied domain and
+# Optional authoritative-only DNS overlay for production Rocky 9 deployments.
+# Ansible renders the zone/view files for the supplied domain and
 # loads this file only when platform_authoritative_dns_enabled=true.
 
 networks:
-  net-lab-dns:
+  net-platform-dns:
     external: true
 
 services:
-  lab-dns:
+  platform-dns:
     build:
-      context: ./services/lab-dns
+      context: ./services/platform-dns
       network: none
-    image: ai-gateway/lab-dns:1.14.4
+    image: ai-gateway/platform-dns:1.14.6
     command: [-conf, /etc/coredns/Corefile]
     restart: unless-stopped
     privileged: false
@@ -23,24 +23,24 @@ services:
     pids_limit: 64
     labels:
       com.aigw.contract.selinux-generation: "1"
-      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_LAB_DNS:?AIGW_BIND_DIGEST_LAB_DNS must be set}
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_PLATFORM_DNS:?AIGW_BIND_DIGEST_PLATFORM_DNS must be set}
     deploy:
       resources:
         limits: { memory: 64M, cpus: "0.25", pids: 64 }
     environment:
-      LAB_DNS_ADM_CIDR: ${LAB_DNS_ADM_CIDR:?LAB_DNS_ADM_CIDR must be set}
+      PLATFORM_DNS_ADM_CIDR: ${PLATFORM_DNS_ADM_CIDR:?PLATFORM_DNS_ADM_CIDR must be set}
     ports:
       - "${ETH1_IP:?ETH1_IP must be set}:53:53/tcp"
       - "${ETH1_IP:?ETH1_IP must be set}:53:53/udp"
       - "${ETH2_IP:?ETH2_IP must be set}:53:53/tcp"
       - "${ETH2_IP:?ETH2_IP must be set}:53:53/udp"
     volumes:
-      - ./services/lab-dns/Corefile:/etc/coredns/Corefile:ro,Z
-      - ./services/lab-dns/db.aigw.aegisgroup.ch:/etc/coredns/zones/db.aigw.aegisgroup.ch:ro,Z
-      - ./services/lab-dns/db.aigw.aegisgroup.ch.adm:/etc/coredns/zones/db.aigw.aegisgroup.ch.adm:ro,Z
+      - ./services/platform-dns/Corefile:/etc/coredns/Corefile:ro,Z
+      - ./services/platform-dns/db.aigw.internal:/etc/coredns/zones/db.aigw.internal:ro,Z
+      - ./services/platform-dns/db.aigw.internal.adm:/etc/coredns/zones/db.aigw.internal.adm:ro,Z
     networks:
-      net-lab-dns:
-        ipv4_address: ${LAB_DNS_IP:?LAB_DNS_IP must be set}
+      net-platform-dns:
+        ipv4_address: ${PLATFORM_DNS_IP:?PLATFORM_DNS_IP must be set}
     healthcheck:
       test: [CMD, /dns-healthcheck]
       interval: 10s

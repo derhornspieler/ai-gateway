@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -29,12 +30,14 @@ import jwt
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
 
-from app.config import LAB_LDAP_PROVIDER_NAME, Settings
+from app.config import Settings
 from app.security import (
     path_segment,
     service_account_subject,
     validate_wif_token_claims,
 )
+
+logger = logging.getLogger("key_rotator.identity")
 
 # aigw-chat is the DEDICATED Open WebUI chat capability (aigw-users no
 # longer gates chat and is retained only for existing assignments).
@@ -146,16 +149,35 @@ MASTER_BRUTE_FORCE_POLICY: dict[str, Any] = {
     "maxFailureWaitSeconds": 900,
     "maxDeltaTimeSeconds": 43200,
 }
-BROKER_SUBJECT_MAPPER_NAME = "anthropic-stable-subject"
-# The lab federation's user filter, kept byte-identical to the representation
-# that existing lab components already carry. Changing it would make an
-# existing lab provider fail verification and be reprovisioned.
-LAB_LDAP_USER_FILTER = (
-    "(&(objectCategory=person)(objectClass=user)"
-    "(!(sAMAccountName=svc-keycloak-ldap)))"
+# Keycloak 26.7 EventType names reviewed for the SOC authentication feed.
+# Keep this tuple sorted and identical to both realm imports. The dynamic
+# reconcile is required because --import-realm skips an existing database.
+KEYCLOAK_SECURITY_EVENT_TYPES = (
+    "CLIENT_LOGIN",
+    "CLIENT_LOGIN_ERROR",
+    "CODE_TO_TOKEN",
+    "CODE_TO_TOKEN_ERROR",
+    "IDENTITY_PROVIDER_FIRST_LOGIN",
+    "IDENTITY_PROVIDER_FIRST_LOGIN_ERROR",
+    "IDENTITY_PROVIDER_LOGIN",
+    "IDENTITY_PROVIDER_LOGIN_ERROR",
+    "IDENTITY_PROVIDER_POST_LOGIN",
+    "IDENTITY_PROVIDER_POST_LOGIN_ERROR",
+    "IMPERSONATE",
+    "IMPERSONATE_ERROR",
+    "LOGIN",
+    "LOGIN_ERROR",
+    "LOGOUT",
+    "LOGOUT_ERROR",
+    "REFRESH_TOKEN",
+    "REFRESH_TOKEN_ERROR",
+    "USER_DISABLED_BY_PERMANENT_LOCKOUT",
+    "USER_DISABLED_BY_PERMANENT_LOCKOUT_ERROR",
+    "USER_DISABLED_BY_TEMPORARY_LOCKOUT",
+    "USER_DISABLED_BY_TEMPORARY_LOCKOUT_ERROR",
 )
-
-
+KEYCLOAK_SECURITY_EVENT_REALMS = ("master", "aigw", "anthropic-wif")
+BROKER_SUBJECT_MAPPER_NAME = "anthropic-stable-subject"
 @dataclass(frozen=True)
 class LdapFederationSpec:
     """The one resolved directory federation source for this deployment."""
@@ -171,38 +193,8 @@ class LdapFederationSpec:
     uuid_attribute: str
     user_object_classes: str
     user_filter: str
-    # Prove the directory, its trust chain, and the bind credential against
-    # Keycloak before persisting a provider. This guards an EXTERNAL customer
-    # directory, where a wrong CA bundle, a certificate that fails hostname
-    # verification, or wrong bind credentials must fail closed rather than
-    # leave a broken component behind. The lab DC is an in-stack,
-    # healthcheck-gated dependency with a published CA and is deliberately
-    # exempt: its creation path is unchanged, so a lab converge cannot regress.
-    prove_directory_before_create: bool
-
-
 def ldap_federation_spec(settings: Settings) -> LdapFederationSpec | None:
-    """Resolve the single enabled federation source, or None.
-
-    Settings already refuses to enable both sources at once. The lab branch
-    reproduces today's hardcoded lab representation exactly, so the existing
-    ``lab-samba-ad`` component keeps its id, name, and config across converges.
-    """
-    if settings.lab_samba_ldap_enabled:
-        return LdapFederationSpec(
-            provider_name=LAB_LDAP_PROVIDER_NAME,
-            connection_url=settings.lab_samba_ldap_url,
-            users_dn=settings.lab_samba_users_dn,
-            bind_dn=settings.lab_samba_bind_dn,
-            bind_password_file=settings.lab_samba_bind_password_file,
-            vendor="ad",
-            username_attribute="sAMAccountName",
-            rdn_attribute="cn",
-            uuid_attribute="objectGUID",
-            user_object_classes="person, organizationalPerson, user",
-            user_filter=LAB_LDAP_USER_FILTER,
-            prove_directory_before_create=False,
-        )
+    """Resolve the inventory-owned production directory, or None."""
     if settings.identity_ldap_enabled:
         return LdapFederationSpec(
             provider_name=settings.identity_ldap_provider_name,
@@ -216,7 +208,6 @@ def ldap_federation_spec(settings: Settings) -> LdapFederationSpec | None:
             uuid_attribute=settings.identity_ldap_uuid_attribute,
             user_object_classes=settings.identity_ldap_user_object_classes,
             user_filter=settings.identity_ldap_user_filter,
-            prove_directory_before_create=True,
         )
     return None
 
@@ -722,57 +713,8 @@ class KeycloakAdmin:
             )
         return changed
 
-    async def reconcile_prebootstrap_relying_party_role_scopes(self) -> bool:
-        """Repair only RP role scopes before the interactive identity bootstrap.
-
-        This is deliberately narrower than :meth:`bootstrap`: it never writes
-        Vault, creates a controller, mutates client settings, or deletes the
-        temporary master-realm bootstrap client.  It is usable only while the
-        exact pre-bootstrap state is positively observed, preventing an
-        Ansible migration helper from becoming a recurring privileged client
-        reconciler after normal identity setup has completed.
-        """
-
-        status = await self.status()
-        if not (
-            # ``configured`` deliberately includes a controller-token probe so
-            # the admin UI can report a broken durable controller.  It is not
-            # by itself proof that bootstrap never progressed: an existing
-            # state document plus a transiently unusable controller also
-            # reports configured=false.  This privileged recovery bridge is
-            # allowed only before that document has ever been written.
-            status.get("identity_state_absent") is True
-            and status.get("configured") is False
-            and status.get("controller_usable") is False
-            and status.get("bootstrap_available") is True
-        ):
-            return False
-
-        admin_token = await self._bootstrap_token()
-        realm = self.settings.identity_realm
-        desired_roles = await self._capability_role_representations(realm, admin_token)
-        for client_id in RELYING_PARTY_CLIENT_IDS:
-            found = await self._find_client(realm, client_id, admin_token)
-            if found is None:
-                raise IdentityError(f"OIDC client {client_id} is missing")
-            client = await self._get_client(realm, found, admin_token)
-            if client.get("fullScopeAllowed") is not False:
-                raise IdentityConflict(
-                    f"OIDC client {client_id} must retain fullScopeAllowed=false"
-                )
-            await self._reconcile_client_realm_role_scope_mappings(
-                realm, client, desired_roles, admin_token
-            )
-            verified = await self._get_client(realm, client, admin_token)
-            if verified.get("fullScopeAllowed") is not False:
-                raise IdentityConflict(
-                    f"OIDC client {client_id} must retain fullScopeAllowed=false"
-                )
-            self._verify_realm_roles_mapper(verified, client_id)
-        return True
-
     async def _reconcile_relying_party_redirect_uris(self, admin_token: str) -> bool:
-        """Converge ONLY the domain-derived callback allow-lists of the four
+        """Converge ONLY the domain-derived callback allow-lists of the five
         managed first-party OIDC clients.
 
         A domain migration moves only the callback hostnames, so this is
@@ -844,6 +786,113 @@ class KeycloakAdmin:
                     )
         return changed
 
+    async def _reconcile_wif_frontend_url(self, admin_token: str) -> bool:
+        """Keep the isolated WIF issuer on this deployment's domain."""
+
+        realm = path_segment(self.settings.wif_realm, label="WIF realm")
+        desired = f"https://idp.wif.{self.settings.aigw_domain}"
+        if self.settings.wif_keycloak_public_url != desired:
+            raise IdentityConflict(
+                "the WIF public URL does not match the configured AI Gateway domain"
+            )
+
+        response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}",
+            token=admin_token,
+            expected=(200,),
+        )
+        current = self._json(response, "WIF realm representation")
+        if not isinstance(current, dict) or current.get("realm") != self.settings.wif_realm:
+            raise IdentityError("Keycloak returned an invalid WIF realm")
+        raw_attributes = current.get("attributes")
+        if raw_attributes is not None and not isinstance(raw_attributes, dict):
+            raise IdentityConflict("the WIF realm attributes are invalid")
+        attributes = dict(raw_attributes or {})
+        changed = attributes.get("frontendUrl") != desired
+        if changed:
+            attributes["frontendUrl"] = desired
+            updated = dict(current)
+            updated["attributes"] = attributes
+            await self._request(
+                "PUT",
+                f"/admin/realms/{realm}",
+                token=admin_token,
+                json_body=updated,
+                expected=(204,),
+            )
+
+        verified_response = await self._request(
+            "GET",
+            f"/admin/realms/{realm}",
+            token=admin_token,
+            expected=(200,),
+        )
+        verified = self._json(verified_response, "verified WIF realm representation")
+        verified_attributes = (
+            verified.get("attributes") if isinstance(verified, dict) else None
+        )
+        if (
+            not isinstance(verified_attributes, dict)
+            or verified_attributes.get("frontendUrl") != desired
+        ):
+            raise IdentityError("Keycloak did not verify the WIF realm frontend URL")
+        return changed
+
+    async def _reconcile_security_event_logging(self, admin_token: str) -> bool:
+        """Enable only the reviewed Keycloak user-event log contract.
+
+        Realm imports apply only to an empty database. Every deployment also
+        reads, updates, and verifies all three managed realms so an upgrade or
+        brownfield converge cannot silently lose authentication events.
+        """
+
+        changed = False
+        desired_types = list(KEYCLOAK_SECURITY_EVENT_TYPES)
+        for realm_name in KEYCLOAK_SECURITY_EVENT_REALMS:
+            realm = path_segment(realm_name, label="security event realm")
+            path = f"/admin/realms/{realm}"
+            current = self._json(
+                await self._request(
+                    "GET", path, token=admin_token, expected=(200,)
+                ),
+                "Keycloak security event realm",
+            )
+            if not isinstance(current, dict) or current.get("realm") != realm_name:
+                raise IdentityError("Keycloak returned an invalid security event realm")
+            desired = {
+                "eventsEnabled": True,
+                "eventsExpiration": 86400,
+                "eventsListeners": ["jboss-logging"],
+                "enabledEventTypes": desired_types,
+                "adminEventsEnabled": False,
+                "adminEventsDetailsEnabled": False,
+            }
+            if any(current.get(key) != value for key, value in desired.items()):
+                updated = dict(current)
+                updated.update(desired)
+                await self._request(
+                    "PUT",
+                    path,
+                    token=admin_token,
+                    json_body=updated,
+                    expected=(204,),
+                )
+                changed = True
+            verified = self._json(
+                await self._request(
+                    "GET", path, token=admin_token, expected=(200,)
+                ),
+                "verified Keycloak security event realm",
+            )
+            if not isinstance(verified, dict) or any(
+                verified.get(key) != value for key, value in desired.items()
+            ):
+                raise IdentityError(
+                    "Keycloak did not verify the security event logging policy"
+                )
+        return changed
+
     async def reconcile_prebootstrap_relying_party_redirect_uris(self) -> str:
         """Realign managed OIDC callbacks to ``aigw_domain`` while bootstrap is
         still available, or fail closed toward the re-bootstrap ceremony.
@@ -895,7 +944,7 @@ class KeycloakAdmin:
     @staticmethod
     def _validate_pre_vault_identity_spec(
         spec: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, str]], bool]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         """Validate the complete, inventory-owned pre-Vault mutation set.
 
         The temporary master-realm client is intentionally powerful.  This
@@ -907,17 +956,12 @@ class KeycloakAdmin:
 
         if not isinstance(spec, dict) or set(spec) != {
             "schema",
-            "ensure_lab_federation",
             "groups",
             "bootstrap_admin_identities",
         }:
             raise IdentityConflict("pre-Vault identity specification is invalid")
         if spec.get("schema") != PRE_VAULT_IDENTITY_SCHEMA:
             raise IdentityConflict("pre-Vault identity specification schema is invalid")
-        ensure_lab_federation = spec.get("ensure_lab_federation")
-        if not isinstance(ensure_lab_federation, bool):
-            raise IdentityConflict("pre-Vault federation policy is invalid")
-
         raw_groups = spec.get("groups")
         if (
             not isinstance(raw_groups, list)
@@ -991,11 +1035,7 @@ class KeycloakAdmin:
                     "federation_provider": provider,
                 }
             )
-        if ensure_lab_federation and {
-            identity["federation_provider"] for identity in identities
-        } != {LAB_LDAP_PROVIDER_NAME}:
-            raise IdentityConflict("lab federation bootstrap identity is invalid")
-        return groups, identities, ensure_lab_federation
+        return groups, identities
 
     async def _pre_vault_direct_child(
         self, root_id: str, group_name: str, admin_token: str
@@ -1207,11 +1247,7 @@ class KeycloakAdmin:
         with the durable controller after the regular bootstrap completes.
         """
 
-        groups, identities, ensure_lab_federation = (
-            self._validate_pre_vault_identity_spec(spec)
-        )
-        if ensure_lab_federation and not self.settings.lab_samba_ldap_enabled:
-            raise IdentityConflict("lab federation bootstrap is not enabled")
+        groups, identities = self._validate_pre_vault_identity_spec(spec)
 
         admin_token = await self._bootstrap_token()
         changed = False
@@ -1219,13 +1255,6 @@ class KeycloakAdmin:
             await self._ensure_relying_parties(admin_token, preserve_unmanaged=True)
             or changed
         )
-        if ensure_lab_federation:
-            before = await self._find_component(
-                self.settings.identity_realm, LAB_LDAP_PROVIDER_NAME, admin_token
-            )
-            await self._ensure_ldap_federation(admin_token, self._ldap_bind_password())
-            changed = changed or before is None
-
         resolved_identities: list[tuple[dict[str, str], str]] = []
         expected_members: dict[str, set[str]] = {}
         for identity in identities:
@@ -1875,6 +1904,7 @@ class KeycloakAdmin:
         return key_doc
 
     async def _ensure_broker(self, admin_token: str) -> dict[str, Any]:
+        await self._reconcile_wif_frontend_url(admin_token)
         broker = await self._find_client(
             self.settings.wif_realm,
             self.settings.wif_broker_client_id,
@@ -2148,6 +2178,51 @@ class KeycloakAdmin:
             refreshed = existing
         return await self._verify_bound_ldap_component(refreshed, admin_token)
 
+    async def _refresh_ldap_bind_credential(
+        self,
+        component: dict[str, Any],
+        spec: LdapFederationSpec,
+        admin_token: str,
+        bind_password: str,
+    ) -> str:
+        """Store the current bind password without comparing masked readback.
+
+        Keycloak returns a placeholder instead of the saved password. Comparing
+        that placeholder with the mounted secret would report drift forever, so
+        an existing managed component receives the supplied password on every
+        converge. The caller proves the password against LDAPS before this write.
+        """
+
+        safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        component_id = path_segment(component.get("id"), label="LDAP provider UUID")
+        current_config = component.get("config")
+        if not isinstance(current_config, dict):
+            raise IdentityConflict("the LDAP federation component config is invalid")
+
+        updated = dict(component)
+        updated_config = dict(current_config)
+        updated_config["bindCredential"] = [bind_password]
+        updated["config"] = updated_config
+        await self._request(
+            "PUT",
+            f"/admin/realms/{safe_realm}/components/{component_id}",
+            token=admin_token,
+            json_body=updated,
+            expected=(204,),
+        )
+
+        refreshed = await self._find_component(
+            self.settings.identity_realm, spec.provider_name, admin_token
+        )
+        if refreshed is None:
+            raise IdentityError(
+                "the LDAP federation component vanished during credential refresh"
+            )
+        verified_id = await self._verify_bound_ldap_component(refreshed, admin_token)
+        if verified_id != component_id:
+            raise IdentityError("Keycloak returned a different LDAP provider after update")
+        return verified_id
+
     def _require_ldap_bind_password(self, bind_password: str | None) -> str:
         if (
             not isinstance(bind_password, str)
@@ -2168,15 +2243,11 @@ class KeycloakAdmin:
             self.settings.identity_realm, spec.provider_name, admin_token
         )
         if existing is not None:
-            # Reconcile drifted MANAGED config on an already-existing provider
-            # BEFORE verifying it. The live regression (LDAP-CONNURL): after the
-            # lab DC's LDAPS endpoint moved from the bare host `samba-ad` to its
-            # FQDN (so the customer-CA leaf's only SAN is the FQDN), the persisted
-            # connectionUrl `ldaps://samba-ad:636` broke Keycloak's hostname
-            # verification on EVERY federated login ("No subject alternative DNS
-            # name matching samba-ad found") while the component still "looked"
-            # provisioned. A create-or-verify that never mutates leaves that drift
-            # in place. Push the spec-owned managed fields (connectionUrl,
+            # Reconcile drifted managed config on an already-existing provider
+            # before verifying it. A changed LDAPS endpoint can leave a stale
+            # connection URL that breaks hostname verification while the
+            # component still appears provisioned. Push the spec-owned fields
+            # (connectionUrl,
             # editMode, vendor, usersDn, bindDn, useTruststoreSpi, ...) to the
             # desired values, clearing the realm user cache when anything changed
             # so the new connection takes effect for already-imported users, then
@@ -2185,25 +2256,30 @@ class KeycloakAdmin:
             component_id = await self._reconcile_ldap_component_config(
                 existing, spec, admin_token
             )
-            # An EXISTING external provider whose managed config equals the
-            # inventory contract is still NOT proof that a login will succeed: a
-            # rotated DC certificate, a swapped/wrong CA truststore, or a
+            # An EXISTING provider whose managed config equals the
+            # inventory contract is still NOT proof that a login will succeed:
+            # a rotated DC certificate, a swapped/wrong CA truststore, or a
             # rotated bind credential all keep the persisted config identical
             # while breaking the live LDAPS handshake or bind. Re-exercise the
-            # read-only, idempotent live proof on every reconcile so the
-            # converge fails closed here instead of converging green and
-            # failing at first login. The in-stack lab DC is deliberately
-            # exempt (prove_directory_before_create=False), so a lab converge
-            # is unchanged.
-            if spec.prove_directory_before_create:
-                await self._prove_ldap_directory(
-                    spec, admin_token, self._require_ldap_bind_password(bind_password)
+            # read-only, idempotent live proof on every reconcile.
+            bind_password = self._require_ldap_bind_password(bind_password)
+            await self._prove_ldap_directory(spec, admin_token, bind_password)
+            refreshed = await self._find_component(
+                self.settings.identity_realm, spec.provider_name, admin_token
+            )
+            if refreshed is None:
+                raise IdentityError(
+                    "the LDAP federation component vanished before credential refresh"
                 )
-            return component_id
+            refreshed_id = await self._refresh_ldap_bind_credential(
+                refreshed, spec, admin_token, bind_password
+            )
+            if refreshed_id != component_id:
+                raise IdentityError("Keycloak changed the LDAP provider during reconcile")
+            return refreshed_id
         bind_password = self._require_ldap_bind_password(bind_password)
         safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
-        if spec.prove_directory_before_create:
-            await self._prove_ldap_directory(spec, admin_token, bind_password)
+        await self._prove_ldap_directory(spec, admin_token, bind_password)
         realm_response = await self._request(
             "GET",
             f"/admin/realms/{safe_realm}",
@@ -2728,6 +2804,33 @@ class KeycloakAdmin:
             return doc
         return None
 
+    async def _break_glass_admin_token(self) -> str:
+        """Log in with the escrowed administrator for deployment repair."""
+
+        escrow = self._break_glass_escrow_doc()
+        if escrow is None:
+            raise IdentityConflict(
+                "the break-glass administrator is unavailable for deployment repair"
+            )
+        response = await self._request(
+            "POST",
+            "/realms/master/protocol/openid-connect/token",
+            form={
+                "grant_type": "password",
+                "client_id": "admin-cli",
+                "username": str(escrow["username"]),
+                "password": str(escrow["password"]),
+            },
+            expected=(200,),
+        )
+        payload = self._json(response, "break-glass administrator token")
+        token = payload.get("access_token") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not token:
+            raise IdentityError(
+                "Keycloak did not issue a deployment-repair administrator token"
+            )
+        return token
+
     async def _set_break_glass_enabled(
         self, user: dict[str, Any], enabled: bool, admin_token: str
     ) -> None:
@@ -2995,14 +3098,9 @@ class KeycloakAdmin:
             "escrowed_at": str(escrow.get("created_at", "")),
         }
 
-    async def _delete_bootstrap_principals(self, admin_token: str) -> bool:
-        """Delete temporary principals; optionally retain a lab UI operator.
+    async def _bootstrap_admin_users(self, admin_token: str) -> list[dict[str, Any]]:
+        """Return exact matches for the configured temporary admin username."""
 
-        Returns true only when the marked password-backed bootstrap user was
-        deliberately converted to the lab recovery operator.  The
-        broad temporary service client is always deleted.
-        """
-        retained_user = False
         users_response = await self._request(
             "GET",
             "/admin/realms/master/users",
@@ -3027,6 +3125,11 @@ class KeycloakAdmin:
         ]
         if len(matches) > 1:
             raise IdentityConflict("multiple bootstrap administrator users exist")
+        return matches
+
+    async def _delete_bootstrap_principals(self, admin_token: str) -> None:
+        """Delete only marked temporary bootstrap principals."""
+        matches = await self._bootstrap_admin_users(admin_token)
         if matches:
             attributes = matches[0].get("attributes") or {}
             if attributes.get("is_temporary_admin") not in (["true"], "true"):
@@ -3034,54 +3137,18 @@ class KeycloakAdmin:
                     "refusing to delete an unmarked master-realm administrator"
                 )
             user_id = path_segment(matches[0].get("id"), label="bootstrap user UUID")
-            if self.settings.retain_bootstrap_admin_user:
-                user = dict(matches[0])
-                updated_attributes = dict(attributes)
-                updated_attributes.pop("is_temporary_admin", None)
-                updated_attributes["aigw.lab-recovery-operator"] = ["true"]
-                user["attributes"] = updated_attributes
-                await self._request(
-                    "PUT",
-                    f"/admin/realms/master/users/{user_id}",
-                    token=admin_token,
-                    json_body=user,
-                    expected=(204,),
-                )
-                verified_response = await self._request(
-                    "GET",
-                    f"/admin/realms/master/users/{user_id}",
-                    token=admin_token,
-                    expected=(200,),
-                )
-                verified_user = self._json(verified_response, "lab recovery operator")
-                verified_attributes = (
-                    verified_user.get("attributes")
-                    if isinstance(verified_user, dict)
-                    else None
-                )
-                if (
-                    not isinstance(verified_attributes, dict)
-                    or "is_temporary_admin" in verified_attributes
-                    or verified_attributes.get("aigw.lab-recovery-operator")
-                    not in (["true"], "true")
-                ):
-                    raise IdentityError(
-                        "Keycloak did not verify the lab recovery operator"
-                    )
-                retained_user = True
-            else:
-                await self._request(
-                    "DELETE",
-                    f"/admin/realms/master/users/{user_id}",
-                    token=admin_token,
-                    expected=(204,),
-                )
+            await self._request(
+                "DELETE",
+                f"/admin/realms/master/users/{user_id}",
+                token=admin_token,
+                expected=(204,),
+            )
 
         client = await self._find_client(
             "master", self.settings.keycloak_bootstrap_admin_client_id, admin_token
         )
         if client is None:
-            return retained_user
+            return
         client_uuid = path_segment(client.get("id"), label="bootstrap client UUID")
         client_response = await self._request(
             "GET",
@@ -3103,7 +3170,66 @@ class KeycloakAdmin:
             token=admin_token,
             expected=(204,),
         )
-        return retained_user
+
+    async def _reconcile_deployment_bootstrap_cleanup(
+        self, admin_token: str
+    ) -> bool:
+        """Remove only marked temporary principals and prove they are retired."""
+
+        changed = False
+        matches = await self._bootstrap_admin_users(admin_token)
+        if matches:
+            attributes = matches[0].get("attributes") or {}
+            if attributes.get("is_temporary_admin") in (["true"], "true"):
+                await self._delete_bootstrap_principals(admin_token)
+                changed = True
+            else:
+                raise IdentityConflict(
+                    "the bootstrap administrator username is held by an "
+                    "unmarked master-realm user"
+                )
+
+        client = await self._find_client(
+            "master", self.settings.keycloak_bootstrap_admin_client_id, admin_token
+        )
+        if client is not None:
+            client_uuid = path_segment(client.get("id"), label="bootstrap client UUID")
+            response = await self._request(
+                "GET",
+                f"/admin/realms/master/clients/{client_uuid}",
+                token=admin_token,
+                expected=(200,),
+            )
+            full_client = self._json(response, "bootstrap client")
+            attributes = (
+                full_client.get("attributes")
+                if isinstance(full_client, dict)
+                else None
+            )
+            if not isinstance(attributes, dict) or attributes.get(
+                "is_temporary_admin"
+            ) not in ("true", ["true"]):
+                raise IdentityConflict(
+                    "refusing to delete an unmarked master-realm client"
+                )
+            await self._request(
+                "DELETE",
+                f"/admin/realms/master/clients/{client_uuid}",
+                token=admin_token,
+                expected=(204,),
+            )
+            changed = True
+
+        if await self._find_client(
+            "master", self.settings.keycloak_bootstrap_admin_client_id, admin_token
+        ) is not None:
+            raise IdentityError("Keycloak did not remove the temporary bootstrap client")
+        final_users = await self._bootstrap_admin_users(admin_token)
+        if final_users:
+            raise IdentityError(
+                "Keycloak did not retire the temporary bootstrap administrator"
+            )
+        return changed
 
     def _vault_oidc_rp_escrow_doc(self) -> dict[str, Any] | None:
         try:
@@ -3179,104 +3305,120 @@ class KeycloakAdmin:
             )
         except Exception:  # noqa: BLE001 - control action already completed
             pass
+        # Database history remains the detailed local record. The SOC copy is
+        # an explicit, bounded summary and never serializes nested policy or a
+        # credential-bearing exception.
+        safe_detail = {
+            key: value
+            for key, value in detail.items()
+            if isinstance(value, (bool, int, str))
+            and key
+            in {
+                "changed",
+                "error_type",
+                "federation_configured",
+                "ldap_provider",
+                "project",
+                "temporary_bootstrap_service_deleted",
+                "break_glass_admin_ensured",
+                "vault_oidc_rp_escrowed",
+            }
+        }
+        event = {
+            "schema_version": 1,
+            "event": "aigw.identity.audit",
+            "action": action,
+            "outcome": status,
+            **safe_detail,
+        }
+        logger.info(
+            "AIGW_SECURITY_EVENT %s",
+            json.dumps(event, separators=(",", ":"), sort_keys=True),
+        )
+
+    async def _bootstrap_locked(self) -> dict[str, Any]:
+        """Establish durable controls while ``_bootstrap_lock`` is held."""
+
+        try:
+            admin_token = await self._bootstrap_token()
+            await self._ensure_relying_parties(admin_token)
+            controller_key = await self._ensure_controller(admin_token)
+            controller_token = await self._client_credentials_with_key(
+                self.settings.identity_realm,
+                self.settings.identity_controller_client_id,
+                controller_key,
+            )
+            root = await self._root_group(controller_token, create=True)
+            if root is None:
+                raise IdentityError("managed identity root group was not created")
+            federation_id = await self._ensure_ldap_federation(
+                admin_token, self._ldap_bind_password()
+            )
+            federation_spec = ldap_federation_spec(self.settings)
+            broker_key = await self._ensure_broker(admin_token)
+            # The temporary administrator is never destroyed until the durable
+            # administrator is proven and escrowed.
+            break_glass = await self._ensure_break_glass_admin(admin_token)
+            if break_glass is None:
+                raise IdentityConflict(
+                    "refusing to consume the bootstrap without a durable "
+                    "administrator: BREAK_GLASS_ADMIN_ENABLED must remain true"
+                )
+            vault_oidc_rp_escrowed_at = self._escrow_vault_oidc_rp_secret()
+            state_doc = {
+                "schema_version": IDENTITY_STATE_SCHEMA,
+                "managed_root_group_id": path_segment(
+                    root.get("id"), label="managed root group UUID"
+                ),
+                "federation_provider_id": federation_id or "",
+                "federation_provider_name": (
+                    federation_spec.provider_name
+                    if (federation_id and federation_spec is not None)
+                    else ""
+                ),
+                "identity_controller_client_id": (
+                    self.settings.identity_controller_client_id
+                ),
+                "controller_certificate_sha256": controller_key.get(
+                    "certificate_sha256", ""
+                ),
+                "broker_certificate_sha256": broker_key.get(
+                    "certificate_sha256", ""
+                ),
+                "relying_parties_reconciled": True,
+                "break_glass_username": break_glass["username"],
+                "break_glass_escrowed_at": break_glass["escrowed_at"],
+                "vault_oidc_rp_escrowed_at": vault_oidc_rp_escrowed_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if not self.vault.write_verified(
+                self.settings.identity_state_vault_path, state_doc
+            ):
+                raise IdentityError("Vault did not verify identity state")
+            await self._delete_bootstrap_principals(admin_token)
+            await self._audit(
+                "bootstrap",
+                "success",
+                {
+                    "managed_root_group_id": state_doc["managed_root_group_id"],
+                    "federation_configured": bool(federation_id),
+                    "temporary_bootstrap_service_deleted": True,
+                    "break_glass_admin_ensured": True,
+                    "vault_oidc_rp_escrowed": True,
+                },
+            )
+            return await self.status()
+        except Exception as exc:
+            await self._audit(
+                "bootstrap", "failed", {"error_type": type(exc).__name__}
+            )
+            raise
 
     async def bootstrap(self) -> dict[str, Any]:
         """Consume the one-time Keycloak admin and establish durable controls."""
+
         async with self._bootstrap_lock:
-            try:
-                admin_token = await self._bootstrap_token()
-                await self._ensure_relying_parties(admin_token)
-                controller_key = await self._ensure_controller(admin_token)
-                controller_token = await self._client_credentials_with_key(
-                    self.settings.identity_realm,
-                    self.settings.identity_controller_client_id,
-                    controller_key,
-                )
-                root = await self._root_group(controller_token, create=True)
-                if root is None:
-                    raise IdentityError("managed identity root group was not created")
-                federation_id = await self._ensure_ldap_federation(
-                    admin_token, self._ldap_bind_password()
-                )
-                federation_spec = ldap_federation_spec(self.settings)
-                broker_key = await self._ensure_broker(admin_token)
-                # Ensured strictly before the verified state write and the
-                # bootstrap teardown below: the temporary administrator is
-                # never destroyed until the durable one is proven and escrowed.
-                break_glass = await self._ensure_break_glass_admin(admin_token)
-                if break_glass is None:
-                    # The durable administrator is mandatory in every profile.
-                    # A disabled flag may park the bootstrap; it must never be
-                    # able to produce an instance with no interactive
-                    # administrator at all.
-                    raise IdentityConflict(
-                        "refusing to consume the bootstrap without a durable "
-                        "administrator: BREAK_GLASS_ADMIN_ENABLED must remain "
-                        "true"
-                    )
-                # Escrowed before the verified state write and teardown, like
-                # the break-glass credential: the vault-oidc-setup.sh ceremony
-                # must always find the secret Keycloak verifiably holds. On a
-                # rotator whose Vault policy predates this path, amend the
-                # policy first (docs/identity-operations.md) — this write
-                # fails closed rather than consuming the bootstrap without
-                # the escrow.
-                vault_oidc_rp_escrowed_at = self._escrow_vault_oidc_rp_secret()
-                state_doc = {
-                    "schema_version": IDENTITY_STATE_SCHEMA,
-                    "managed_root_group_id": path_segment(
-                        root.get("id"), label="managed root group UUID"
-                    ),
-                    "federation_provider_id": federation_id or "",
-                    "federation_provider_name": (
-                        federation_spec.provider_name
-                        if (federation_id and federation_spec is not None)
-                        else ""
-                    ),
-                    "identity_controller_client_id": (
-                        self.settings.identity_controller_client_id
-                    ),
-                    "controller_certificate_sha256": controller_key.get(
-                        "certificate_sha256", ""
-                    ),
-                    "broker_certificate_sha256": broker_key.get(
-                        "certificate_sha256", ""
-                    ),
-                    "relying_parties_reconciled": True,
-                    "break_glass_username": (
-                        break_glass["username"] if break_glass else ""
-                    ),
-                    "break_glass_escrowed_at": (
-                        break_glass["escrowed_at"] if break_glass else ""
-                    ),
-                    "vault_oidc_rp_escrowed_at": vault_oidc_rp_escrowed_at,
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                }
-                if not self.vault.write_verified(
-                    self.settings.identity_state_vault_path, state_doc
-                ):
-                    raise IdentityError("Vault did not verify identity state")
-                bootstrap_user_retained = await self._delete_bootstrap_principals(
-                    admin_token
-                )
-                await self._audit(
-                    "bootstrap",
-                    "success",
-                    {
-                        "managed_root_group_id": state_doc["managed_root_group_id"],
-                        "federation_configured": bool(federation_id),
-                        "temporary_bootstrap_service_deleted": True,
-                        "lab_recovery_operator_retained": bootstrap_user_retained,
-                        "break_glass_admin_ensured": bool(break_glass),
-                        "vault_oidc_rp_escrowed": True,
-                    },
-                )
-                return await self.status()
-            except Exception as exc:
-                await self._audit(
-                    "bootstrap", "failed", {"error_type": type(exc).__name__}
-                )
-                raise
+            return await self._bootstrap_locked()
 
     async def status(self) -> dict[str, Any]:
         try:
@@ -3379,6 +3521,132 @@ class KeycloakAdmin:
                 and len(vault_oidc_rp_doc["client_secret"]) >= 32
             ),
         }
+
+    @staticmethod
+    def _deployment_status_verified(status: dict[str, Any]) -> bool:
+        """Return whether the durable, non-secret identity status is complete."""
+
+        required = (
+            "configured",
+            "controller_usable",
+            "ldap_configured",
+            "break_glass_escrow_readable",
+            "break_glass_escrowed",
+            "vault_oidc_rp_escrow_readable",
+            "vault_oidc_rp_escrowed",
+        )
+        return (
+            all(status.get(name) is True for name in required)
+            and status.get("bootstrap_available") is False
+            and status.get("bootstrap_cleanup_required") is False
+        )
+
+    def _update_deployment_federation_state(
+        self, federation_id: str, provider_name: str
+    ) -> bool:
+        """Keep Vault's provider pointer aligned after a safe recreation."""
+
+        state_doc = self._identity_state()
+        if (
+            state_doc.get("schema_version") != IDENTITY_STATE_SCHEMA
+            or state_doc.get("identity_controller_client_id")
+            != self.settings.identity_controller_client_id
+        ):
+            raise IdentityConflict("the durable identity state contract is invalid")
+        if (
+            state_doc.get("federation_provider_id") == federation_id
+            and state_doc.get("federation_provider_name") == provider_name
+        ):
+            return False
+        updated = dict(state_doc)
+        updated["federation_provider_id"] = federation_id
+        updated["federation_provider_name"] = provider_name
+        if not self.vault.write_verified(
+            self.settings.identity_state_vault_path, updated
+        ):
+            raise IdentityError("Vault did not verify the reconciled identity state")
+        return True
+
+    async def converge_deployment_identity(self) -> str:
+        """Idempotently deploy and prove Keycloak identity control.
+
+        This is the single Ansible entry point. The same process-local lock used
+        by the legacy internal bootstrap route serializes the one-time client,
+        live LDAPS proof, callback repair, and temporary-principal cleanup.
+        """
+
+        async with self._bootstrap_lock:
+            changed = False
+            before = await self.status()
+            if not self._deployment_status_verified(before):
+                await self._bootstrap_locked()
+                changed = True
+
+            admin_token = await self._break_glass_admin_token()
+            changed = (
+                await self._reconcile_security_event_logging(admin_token) or changed
+            )
+            changed = await self._reconcile_wif_frontend_url(admin_token) or changed
+            spec = ldap_federation_spec(self.settings)
+            if spec is None:
+                raise IdentityConflict(
+                    "automatic identity deployment requires one LDAPS source"
+                )
+            bind_password = self._ldap_bind_password()
+            existing = await self._find_component(
+                self.settings.identity_realm, spec.provider_name, admin_token
+            )
+            desired_config = {
+                name: [value]
+                for name, value in self._managed_ldap_config(spec).items()
+            }
+            current_config = (
+                existing.get("config") if isinstance(existing, dict) else None
+            )
+            ldap_changed = (
+                existing is None
+                or not isinstance(current_config, dict)
+                or any(
+                    current_config.get(name) != value
+                    for name, value in desired_config.items()
+                )
+            )
+            federation_id = await self._ensure_ldap_federation(
+                admin_token, bind_password
+            )
+            if not isinstance(federation_id, str) or not federation_id:
+                raise IdentityError("Keycloak did not return an LDAPS provider ID")
+            changed = ldap_changed or changed
+            changed = (
+                self._update_deployment_federation_state(
+                    federation_id, spec.provider_name
+                )
+                or changed
+            )
+            changed = (
+                await self._reconcile_relying_party_redirect_uris(admin_token)
+                or changed
+            )
+            changed = (
+                await self._reconcile_deployment_bootstrap_cleanup(admin_token)
+                or changed
+            )
+
+            after = await self.status()
+            if not self._deployment_status_verified(after):
+                raise IdentityError("automatic identity deployment did not verify")
+            state_doc = self._identity_state()
+            if (
+                state_doc.get("federation_provider_id") != federation_id
+                or state_doc.get("federation_provider_name") != spec.provider_name
+            ):
+                raise IdentityError("durable identity state does not match live LDAPS")
+            await self._audit(
+                "deployment_converge",
+                "success",
+                {"changed": changed, "ldap_provider": spec.provider_name},
+            )
+            return "applied" if changed else "verified"
 
     def _identity_state(self) -> dict[str, Any]:
         try:

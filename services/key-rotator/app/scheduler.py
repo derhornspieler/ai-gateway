@@ -51,7 +51,6 @@ JOB_PREFIX = "rotate_"
 # System (non-vendor) recurring jobs — outside JOB_PREFIX so reload()'s
 # vendor-row reconcile never touches them.
 JWKS_WATCH_JOB_ID = "sys_jwks_watch"
-OPENAI_CLEANUP_JOB_ID = "sys_openai_orphan_cleanup"
 SETTINGS_RECOVERY_JOB_ID = "sys_settings_recovery"
 CREDENTIAL_PRESENCE_JOB_ID = "sys_litellm_credential_presence"
 PORTAL_KEY_RECONCILE_JOB_ID = "sys_portal_key_reconciliation"
@@ -159,16 +158,14 @@ class RotationScheduler:
         """Map static seed and real drivers that own the same credential to
         one exclusion domain.
 
-        ``static-openai`` and ``openai`` both write ``openai-primary`` (and
-        likewise for Anthropic). Separate locks allowed an enable/rotation
+        ``static-anthropic`` and ``anthropic`` both write
+        ``anthropic-primary``. Separate locks allowed an enable/rotation
         race to put the stale static key back after a successful rotation.
         """
         return vendor.removeprefix("static-")
 
     def is_rotating(self, vendor: str) -> bool:
-        """True while a rotation (or the openai cleanup pass) holds the
-        vendor's lock — used by POST /rotate/{vendor} to 409 fast.
-        """
+        """True while a rotation holds the vendor's lock."""
         return self._lock_for(vendor).locked()
 
     def start(self) -> None:
@@ -194,20 +191,6 @@ class RotationScheduler:
                 max_instances=1,
                 coalesce=True,
                 misfire_grace_time=60,
-            )
-        if "openai" in self._drivers:
-            self._scheduler.add_job(
-                self._run_openai_orphan_cleanup,
-                trigger=IntervalTrigger(
-                    seconds=max(
-                        60, self._settings.openai_orphan_cleanup_interval_seconds
-                    )
-                ),
-                id=OPENAI_CLEANUP_JOB_ID,
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=300,
             )
         if self._identity is None:
             # Do not silently start a production scheduler without the direct
@@ -265,7 +248,7 @@ class RotationScheduler:
         )
         logger.info(
             "system jobs scheduled (settings recovery, credential presence, jwks watch, "
-            "openai orphan cleanup, portal-key reconciliation)"
+            "portal-key reconciliation)"
         )
 
     async def _recover_schedule(self) -> None:
@@ -321,35 +304,6 @@ class RotationScheduler:
                 vendor,
             )
             await self.run_rotation(vendor)
-
-    async def _run_openai_orphan_cleanup(self) -> None:
-        driver = self._drivers.get("openai")
-        if driver is None or not hasattr(driver, "cleanup_orphans"):
-            return
-        lock = self._lock_for("openai")
-        if lock.locked():
-            # A rotation is in flight; it rewrites the same state doc.
-            # Skip — the next cleanup interval retries.
-            return
-        async with lock:
-            async with self._db.rotation_lock("openai") as acquired:
-                if not acquired:
-                    logger.info(
-                        "openai orphan cleanup skipped; another instance holds the lock"
-                    )
-                    return
-                row = await self._db.get_settings("openai") or {}
-                ctx = DriverContext(
-                    settings=self._settings,
-                    vault=self._vault,
-                    litellm=self._litellm,
-                    db=self._db,
-                    vendor_settings=row,
-                )
-                try:
-                    await driver.cleanup_orphans(ctx)
-                except Exception:  # noqa: BLE001
-                    logger.exception("openai orphan cleanup pass failed")
 
     @staticmethod
     def _valid_reconcile_integer(value: Any) -> bool:

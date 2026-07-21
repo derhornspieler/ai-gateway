@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "name": "anthropic",
+      "api_hostname": "api.anthropic.com",
+      "route_prefix": "/anthropic/",
+      "sni": "api.anthropic.com",
+      "exact_sans": [
+        "api.anthropic.com"
+      ],
+      "ca_bundle": "certs/anthropic-ca.pem",
+      "ca_bundle_sha256": "105d0a49dc2709a3c1ee9e28d4d12a592a2fdd07946052484d499123cd1ebb92",
+      "ca_sha256_fingerprints": [
+        "1dfc1605fbad358d8bc844f76d15203fac9ca5c1a79fd4857ffaf2864fbebf96",
+        "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d"
+      ],
+      "provenance_file": "providers/provenance/anthropic.json",
+      "provenance_sha256": "a72ea049dcecae19751134891dfbe9adc1b06f66ce42cbe4a662abb7a4e9dd02"
+    }
+  ]
+}

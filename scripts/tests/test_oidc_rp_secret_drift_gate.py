@@ -153,7 +153,7 @@ class OidcRelyingPartySecretDriftGateTests(unittest.TestCase):
             "stat.nlink | int) == 1",
             "stat.size | int) <= 262144",
             "/usr/bin/docker",
-            '"{{ compose_project_name }}_pg_data"',
+            '"{{ pg_data_volume_name }}"',
             "no such volume",
             "stdin_add_newline: false",
             "no_log: true",
@@ -163,13 +163,13 @@ class OidcRelyingPartySecretDriftGateTests(unittest.TestCase):
         self.assertNotIn("rotate_oidc", gate_section.lower())
         self.assertNotIn("aigw_existing_env.content | b64decode", gate_section)
 
-    def test_lab_dns_adm_view_is_rendered_and_bound_as_deployed_state(self) -> None:
+    def test_platform_dns_adm_view_is_rendered_and_bound_as_deployed_state(self) -> None:
         template = ENV_TEMPLATE.read_text(encoding="utf-8")
-        self.assertIn("LAB_DNS_ADM_CIDR={{ vpn_client_cidr }}", template)
+        self.assertIn("PLATFORM_DNS_ADM_CIDR={{ vpn_client_cidr }}", template)
         self.assertIn("Validate the platform DNS administrative view selector", self.source)
         self.assertIn("db\\.aigw\\.internal(?:\\.adm)?", self.source)
         self.assertIn(
-            "stack_dir ~ '/services/lab-dns/db.aigw.aegisgroup.ch.adm'",
+            "stack_dir ~ '/services/platform-dns/db.aigw.internal.adm'",
             self.source,
         )
 

@@ -5,24 +5,27 @@ misconfigurations:
       - services/dhi-health-probe/Dockerfile.grafana
     expired_at: 2027-07-13
     statement: >-
-      The final image is a caller-supplied immutable DHI that retains its
+      Owner: platform security. The final image is a caller-supplied immutable
+      DHI that retains its
       reviewed non-root user; a literal USER would override service-specific
       DHI identities such as Postgres. Dockerfile.grafana's final stage is
-      FROM the Grafana DHI (uid 472) for the same reason.
+      FROM the Grafana DHI (uid 65532) for the same reason.
 
   - id: AVD-DS-0002
     paths:
       - services/traefik/Dockerfile
     expired_at: 2027-07-13
     statement: >-
-      The final stage is the immutable non-root Traefik DHI and both Compose
-      services independently enforce user 65532:65532.
+      Owner: platform security. The final stage is the immutable non-root
+      Traefik DHI and both Compose services independently enforce user
+      65532:65532.
 
   - id: AVD-DS-0002
     paths:
-      - services/samba-ad-lab/Dockerfile
+      - services/samba-ad-preprod/Dockerfile
     expired_at: 2027-07-13
     statement: >-
-      The lab-only Samba AD DC requires root for provisioning and identity
-      switching; Compose drops all capabilities then restores only its
-      reviewed minimum and also enforces read-only plus no-new-privileges.
+      Owner: platform security. The preprod-only Samba AD DC requires root for
+      provisioning and identity switching; Compose drops all capabilities then
+      restores only its reviewed minimum and also enforces read-only plus
+      no-new-privileges.

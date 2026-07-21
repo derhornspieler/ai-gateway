@@ -3,8 +3,8 @@
 # the deployment's Keycloak, retiring routine root-token logins.
 #
 # Run ON THE VM from the stack directory (default /opt/ai-gateway) as root,
-# AFTER the identity initialization ceremony (admin-portal "Initialize
-# identity control") has escrowed the `vault` relying-party client secret.
+# AFTER the normal Ansible converge has automatically deployed identity control
+# and escrowed the `vault` relying-party client secret.
 # Idempotent and re-runnable; every write is read back and verified.
 #
 # What it does:
@@ -142,7 +142,7 @@ print(f"{str(initialized).lower()} {str(sealed).lower()}")
 ')" || die "could not read Vault status"
 read -r vault_initialized vault_sealed <<<"$vault_state"
 if [[ "$vault_initialized" != true ]]; then
-  die "Vault is not initialized. Run the Vault init ceremony first (lab: scripts/vault-bootstrap.sh; production: the operator init ceremony + scripts/store-vault-unseal-key.py on the controller)."
+  die "Vault is not initialized. Run the production operator init ceremony, then scripts/store-vault-unseal-key.py on the controller."
 fi
 if [[ "$vault_sealed" != false ]]; then
   die "Vault is sealed. Unseal it first: printf '%s\\n' \"\$SHARE\" | sudo scripts/vault-unseal.sh"
@@ -155,11 +155,11 @@ if ! escrow_json="$(vlt kv get -format=json "kv/$VAULT_OIDC_RP_VAULT_PATH")"; th
 FATAL: no readable escrow at kv/$VAULT_OIDC_RP_VAULT_PATH.
 
 The key-rotator escrows the 'vault' relying-party client secret during the
-identity initialization ceremony (admin-portal -> Initialize identity
-control). Run that ceremony first. On a host bootstrapped before this
-feature, first re-write the rotator policy from scripts/vault-bootstrap.sh
-step 5 (it now grants the escrow path), then re-run the identity
-initialization, then re-run this ceremony. See docs/identity-operations.md.
+automatic Ansible identity setup. Run the normal playbook first. On a host
+bootstrapped before this feature, first re-write the rotator policy from
+the documented Vault policy ceremony, restore the
+temporary bootstrap service if needed, and re-run Ansible. See
+docs/identity-operations.md.
 EOF
   exit 1
 fi

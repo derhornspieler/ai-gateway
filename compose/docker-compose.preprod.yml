@@ -1,0 +1,400 @@
+# Local preprod overlay. Run it through ansible/preprod.yml, not by hand.
+# The base stack keeps its production segmentation. Three names below model
+# the egress, ADM, and internal host planes on a single Docker engine.
+
+name: ${PREPROD_PROJECT:?PREPROD_PROJECT must be set}
+
+x-preprod-labels: &preprod-labels
+  com.aigw.preprod.project: "${PREPROD_PROJECT:?PREPROD_PROJECT must be set}"
+  com.aigw.preprod.config-digest: "${AIGW_PREPROD_CONFIG_DIGEST:?AIGW_PREPROD_CONFIG_DIGEST must be set}"
+
+x-preprod-build-labels: &preprod-build-labels
+  com.aigw.preprod.image-owner: "${PREPROD_PROJECT:?PREPROD_PROJECT must be set}"
+
+networks:
+  net-egress:       { name: "${PREPROD_PREFIX}-plane-egress", external: true }
+  net-adm:          { name: "${PREPROD_PREFIX}-plane-adm", external: true }
+  net-int-edge:     { name: "${PREPROD_PREFIX}-plane-internal", external: true }
+  net-internal:     { name: "${PREPROD_PREFIX}-net-internal", external: true }
+  net-chat:         { name: "${PREPROD_PREFIX}-net-chat", external: true }
+  net-portal:       { name: "${PREPROD_PREFIX}-net-portal", external: true }
+  net-admin-app:    { name: "${PREPROD_PREFIX}-net-admin-app", external: true }
+  net-grafana:      { name: "${PREPROD_PREFIX}-net-grafana", external: true }
+  net-vendor:       { name: "${PREPROD_PREFIX}-net-vendor", external: true }
+  net-vault:        { name: "${PREPROD_PREFIX}-net-vault", external: true }
+  net-db-litellm:   { name: "${PREPROD_PREFIX}-net-db-litellm", external: true }
+  net-db-keycloak:  { name: "${PREPROD_PREFIX}-net-db-keycloak", external: true }
+  net-db-rotator:   { name: "${PREPROD_PREFIX}-net-db-rotator", external: true }
+  net-db-grafana:   { name: "${PREPROD_PREFIX}-net-db-grafana", external: true }
+  net-cache:        { name: "${PREPROD_PREFIX}-net-cache", external: true }
+  net-telemetry:    { name: "${PREPROD_PREFIX}-net-telemetry", external: true }
+  net-metrics:      { name: "${PREPROD_PREFIX}-net-metrics", external: true }
+  net-observability: { name: "${PREPROD_PREFIX}-net-observability", external: true }
+  net-identity:     { name: "${PREPROD_PREFIX}-net-identity", external: true }
+
+volumes:
+  pg_data: { labels: *preprod-labels }
+  openwebui_data: { labels: *preprod-labels }
+  vault_data: { labels: *preprod-labels }
+  vault_audit: { labels: *preprod-labels }
+  alloy_data: { labels: *preprod-labels }
+  prom_data: { labels: *preprod-labels }
+  loki_data: { labels: *preprod-labels }
+  grafana_data: { labels: *preprod-labels }
+  preprod_empty_docker_logs: { labels: *preprod-labels }
+  samba_ad_config: { labels: *preprod-labels }
+  samba_ad_state: { labels: *preprod-labels }
+
+services:
+  volume-init:
+    labels: *preprod-labels
+
+  postgres:
+    labels: *preprod-labels
+
+  litellm:
+    labels: *preprod-labels
+
+  # Build paths in the deployed production tree are ./services. In a source
+  # checkout the same directories are one level above compose/.
+  traefik-int:
+    labels: *preprod-labels
+    build: { context: ../services/traefik, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/traefik:local"
+    user: "${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set}:${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set}"
+    # Docker Desktop reserves one IPv4 host port per container, even when the
+    # host IPs differ. The preprod-only forwarder below owns both publications.
+    ports: !override []
+    volumes:
+      - ./traefik/traefik-int.yml:/etc/traefik/traefik.yml:ro,Z
+      - ./traefik/dynamic-int.yml:/etc/traefik/dynamic/dynamic.yml:ro,Z
+      - ./secrets/preprod-edge-certs:/certs:ro,z
+
+  traefik-adm:
+    labels: *preprod-labels
+    build: { context: ../services/traefik, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/traefik:local"
+    user: "${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set}:${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set}"
+    ports: !override []
+    volumes:
+      - ./traefik/traefik-adm.yml:/etc/traefik/traefik.yml:ro,Z
+      - ./traefik/dynamic-adm.yml:/etc/traefik/dynamic/dynamic.yml:ro,Z
+      - ./secrets/preprod-edge-certs:/certs:ro,z
+
+  # Envoy does raw TCP passthrough; TLS still terminates in the separate
+  # Traefik edges. Keeping both host publications on this one container works
+  # around Docker Desktop's duplicate-IPv4-port limitation without changing
+  # the production Compose model or using a wildcard host bind.
+  preprod-edge-forwarder:
+    labels: *preprod-labels
+    profiles: [preprod]
+    image: "${PREPROD_WIF_ENVOY_IMAGE:?PREPROD_WIF_ENVOY_IMAGE must be set}"
+    entrypoint: [/usr/local/bin/envoy]
+    command: [-c, /etc/envoy/preprod-edge-forwarder.yaml, --log-level, warning]
+    user: "65532:65532"
+    read_only: true
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 128
+    tmpfs: [/tmp]
+    ports:
+      - "${ETH2_IP:?ETH2_IP must be set}:443:8443"
+      - "${ETH1_IP:?ETH1_IP must be set}:443:9443"
+    volumes:
+      - ./secrets/preprod-edge-forwarder.yaml:/etc/envoy/preprod-edge-forwarder.yaml:ro,Z
+    networks:
+      net-int-edge: {}
+      net-adm: {}
+    depends_on:
+      traefik-int: { condition: service_healthy, required: true }
+      traefik-adm: { condition: service_healthy, required: true }
+    healthcheck:
+      test: [CMD, /usr/local/bin/envoy, --mode, validate, -c, /etc/envoy/preprod-edge-forwarder.yaml]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  oauth2-proxy:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/oauth2-proxy:local"
+
+  oauth2-proxy-grafana:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/oauth2-proxy:local"
+
+  oauth2-proxy-prometheus:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/oauth2-proxy:local"
+
+  oauth2-proxy-vault:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/oauth2-proxy:local"
+
+  open-webui:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/open-webui:local"
+    volumes:
+      - ./secrets/preprod-root-ca.pem:/etc/ssl/certs/aigw-ca.pem:ro,z
+
+  keycloak:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/keycloak:local"
+    environment:
+      KC_TRUSTSTORE_PATHS: /etc/aigw/preprod-root-ca.pem
+      KC_TLS_HOSTNAME_VERIFIER: DEFAULT
+    volumes: !override
+      - ./secrets/preprod-realms:/opt/keycloak/data/import:ro,Z
+      - ./secrets/preprod-root-ca.pem:/etc/aigw/preprod-root-ca.pem:ro,z
+    networks:
+      net-chat: {}
+      net-portal: {}
+      net-admin-app:
+        aliases: [keycloak-adm]
+      net-db-keycloak: {}
+      net-metrics: {}
+      net-identity: {}
+    depends_on:
+      postgres: { condition: service_started }
+      samba-ad: { condition: service_healthy, required: true }
+
+  dev-portal:
+    labels: *preprod-labels
+    build: { context: ../services/dev-portal, network: host, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/dev-portal:local"
+
+  admin-portal:
+    labels: *preprod-labels
+    build: { context: ../services/dev-portal, network: host, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/dev-portal:local"
+
+  envoy-egress:
+    labels: *preprod-labels
+    build: { context: ../services/egress-proxy, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/envoy-egress:local"
+    # Exercise the exact production image. Its generated configuration,
+    # selected-provider policy, and CA bundles stay baked into the image.
+    volumes: !override []
+
+  # The WIF exchange needs a local TLS endpoint. Keep that test path separate
+  # so it cannot replace or weaken the immutable production Envoy image above.
+  wif-egress-mock:
+    labels: *preprod-labels
+    profiles: [preprod]
+    image: "${PREPROD_WIF_ENVOY_IMAGE:?PREPROD_WIF_ENVOY_IMAGE must be set}"
+    entrypoint: [/usr/local/bin/envoy]
+    command: [-c, /etc/envoy/preprod-wif.yaml, --log-level, warning]
+    user: "65532:65532"
+    read_only: true
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 128
+    tmpfs: [/tmp]
+    volumes:
+      - ./secrets/preprod-wif-envoy.yaml:/etc/envoy/preprod-wif.yaml:ro,Z
+      - ./secrets/preprod-root-ca.pem:/etc/envoy/certs/preprod-root-ca.pem:ro,z
+    networks: [net-vendor, net-egress]
+    healthcheck:
+      test: [CMD, /usr/local/bin/envoy, --mode, validate, -c, /etc/envoy/preprod-wif.yaml]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  key-rotator:
+    labels: *preprod-labels
+    build: { context: ../services/key-rotator, network: host, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/key-rotator:local"
+    user: "${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set}:${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set}"
+    environment:
+      EGRESS_BASE: http://wif-egress-mock:8080
+      WIF_KEYCLOAK_PUBLIC_URL: "https://idp.wif.${DOMAIN}"
+      IDENTITY_LDAP_ENABLED: "true"
+      IDENTITY_LDAP_PROVIDER_NAME: preprod-samba-ad
+      IDENTITY_LDAP_URL: "ldaps://samba-ad.${DOMAIN}:636"
+      IDENTITY_LDAP_USERS_DN: OU=AIGWUsers,DC=preprod,DC=aigw,DC=internal
+      IDENTITY_LDAP_BIND_DN: CN=svc-keycloak-ldap,CN=Users,DC=preprod,DC=aigw,DC=internal
+      IDENTITY_LDAP_BIND_PASSWORD_FILE: /run/secrets/preprod_samba_bind_password
+      IDENTITY_LDAP_VENDOR: ad
+      IDENTITY_LDAP_USERNAME_ATTRIBUTE: sAMAccountName
+      IDENTITY_LDAP_RDN_ATTRIBUTE: cn
+      IDENTITY_LDAP_UUID_ATTRIBUTE: objectGUID
+      IDENTITY_LDAP_USER_OBJECT_CLASSES: person, organizationalPerson, user
+      IDENTITY_LDAP_USER_FILTER: "(&(objectCategory=person)(objectClass=user)(!(sAMAccountName=svc-keycloak-ldap)))"
+    volumes:
+      - ./secrets/preprod-samba-bind-password:/run/secrets/preprod_samba_bind_password:ro,z
+    depends_on:
+      wif-egress-mock: { condition: service_healthy, required: true }
+
+  vault-ui-proxy:
+    labels: *preprod-labels
+    build: { context: ../services/vault-ui-proxy, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/vault-ui-proxy:local"
+
+  vault:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/vault:local"
+
+  redis:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/redis:local"
+
+  alloy:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/alloy:local"
+    security_opt: !override [no-new-privileges:true]
+    # Local preprod must never read another local project's Docker logs.
+    # Keep Alloy's production pipeline intact, but give its file source an
+    # empty preprod-owned volume instead of the Docker data root.
+    volumes: !override
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro,Z
+      - ./secrets/preprod-root-ca.pem:/etc/ssl/certs/aigw-cribl-ca.pem:ro,z
+      - alloy_data:/var/lib/alloy
+      - preprod_empty_docker_logs:/var/lib/docker/containers:ro
+      - vault_audit:/var/log/aigw/vault:ro
+
+  prometheus:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/prometheus:local"
+
+  node-exporter:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/node-exporter:local"
+    # A portable local test must not mount the workstation root. The exporter
+    # reports only its own container namespace in preprod.
+    security_opt: !override [no-new-privileges:true]
+    tmpfs: !override [/tmp]
+    command: !override
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run)($|/)
+    volumes: !override []
+
+  loki:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/loki:local"
+
+  grafana:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/grafana:local"
+
+  cribl-mock:
+    labels: *preprod-labels
+    build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/cribl-mock:local"
+
+  samba-ad:
+    labels: *preprod-labels
+    profiles: [preprod]
+    build: { context: ../services/samba-ad-preprod, network: host, labels: *preprod-build-labels }
+    image: "${PREPROD_PROJECT}/samba-ad:local"
+    hostname: samba-ad
+    restart: unless-stopped
+    privileged: false
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, NET_BIND_SERVICE, SETGID, SETUID, SYS_ADMIN]
+    dns: [127.0.0.1]
+    pids_limit: 2048
+    tmpfs:
+      - /run
+      - /tmp
+      - /var/cache/samba
+      - /var/log/samba
+    environment:
+      SAMBA_REALM: PREPROD.AIGW.INTERNAL
+      SAMBA_DOMAIN: AIGWPREPROD
+      SAMBA_HOSTNAME: samba-ad
+      SAMBA_BIND_USER: svc-keycloak-ldap
+      SAMBA_ADMIN_PASSWORD_FILE: /run/secrets/samba_ad_admin_password
+      SAMBA_BIND_PASSWORD_FILE: /run/secrets/samba_ad_bind_password
+      SAMBA_SEED_USERS: preprod-admin,preprod-developer,preprod-user
+      SAMBA_LDAPS_FQDN: "samba-ad.${DOMAIN}"
+      SAMBA_TLS_CERT_FILE: /run/secrets/samba_ad_tls_cert
+      SAMBA_TLS_KEY_FILE: /run/secrets/samba_ad_tls_key
+      SAMBA_TLS_CA_FILE: /run/secrets/preprod_root_ca
+    volumes: !override
+      - ./secrets/preprod-samba-admin-password:/run/secrets/samba_ad_admin_password:ro,Z
+      - ./secrets/preprod-samba-bind-password:/run/secrets/samba_ad_bind_password:ro,z
+      - ./secrets/samba_user_preprod-admin_password:/run/secrets/samba_user_preprod-admin_password:ro,Z
+      - ./secrets/samba_user_preprod-developer_password:/run/secrets/samba_user_preprod-developer_password:ro,Z
+      - ./secrets/samba_user_preprod-user_password:/run/secrets/samba_user_preprod-user_password:ro,Z
+      - ./secrets/preprod-samba.crt:/run/secrets/samba_ad_tls_cert:ro,Z
+      - ./secrets/preprod-samba.key:/run/secrets/samba_ad_tls_key:ro,Z
+      - ./secrets/preprod-root-ca.pem:/run/secrets/preprod_root_ca:ro,z
+      - samba_ad_config:/etc/samba
+      - samba_ad_state:/var/lib/samba
+    networks:
+      net-identity:
+        aliases: ["samba-ad.${DOMAIN}"]
+    healthcheck:
+      test: [CMD, /usr/local/sbin/samba-ad-healthcheck]
+      interval: 15s
+      timeout: 8s
+      retries: 4
+      start_period: 90s
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  wif-provider-mock:
+    labels: *preprod-labels
+    profiles: [preprod]
+    build:
+      context: ../services/wif-provider-mock
+      network: none
+      labels: *preprod-build-labels
+    image: "${PREPROD_PROJECT}/wif-provider-mock:local"
+    user: "${PREPROD_HOST_UID:?PREPROD_HOST_UID must be set}:${PREPROD_HOST_GID:?PREPROD_HOST_GID must be set}"
+    read_only: true
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 64
+    tmpfs: [/tmp]
+    environment:
+      TLS_CERT_FILE: /run/preprod/wif.crt
+      TLS_KEY_FILE: /run/preprod/wif.key
+      TLS_CA_FILE: /run/preprod/ca.pem
+      TLS_SERVER_NAME: "wif-provider-mock.${DOMAIN}"
+      KEYCLOAK_JWKS_FILE: /run/preprod/jwks.json
+      EXPECTED_ISSUER: "https://idp.wif.${DOMAIN}/realms/anthropic-wif"
+      EXPECTED_SUBJECT: service-account-anthropic-token-broker
+      EXPECTED_AUDIENCE: https://api.anthropic.com
+      EXPECTED_ORGANIZATION_ID: preprod-org
+      EXPECTED_SERVICE_ACCOUNT_ID: preprod-service-account
+      EXPECTED_FEDERATION_RULE_ID: preprod-federation-rule
+      EXPECTED_WORKSPACE_ID: preprod-workspace
+    volumes:
+      - ./secrets/preprod-wif.crt:/run/preprod/wif.crt:ro,Z
+      - ./secrets/preprod-wif.key:/run/preprod/wif.key:ro,Z
+      - ./secrets/preprod-root-ca.pem:/run/preprod/ca.pem:ro,z
+      - ./secrets/preprod-wif-jwks.json:/run/preprod/jwks.json:ro,Z
+    networks:
+      net-egress:
+        aliases: ["wif-provider-mock.${DOMAIN}"]
+    healthcheck:
+      test: [CMD, /wif-provider-mock, health]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      keycloak: { condition: service_healthy }
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }

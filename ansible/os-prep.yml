@@ -16,7 +16,7 @@
 # for a first stack deploy, and host_finalize promotes the completed marker
 # only after the stack converged and the runtime verify passed.
 - name: AI Gateway host — OS preparation
-  hosts: gateway:generic_rocky9
+  hosts: generic_rocky9
   become: true
   pre_tasks:
     # These checks intentionally run before os_baseline. A stale NIC mapping
@@ -89,7 +89,7 @@
             (internal_dns_servers | sort == [eth1_ip, eth2_ip] | sort)
           - envoy_egress_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - alloy_internal_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
-          - lab_dns_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
+          - platform_dns_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - not (cribl_external_export_enabled | bool) or
             cribl_otlp_allowed_cidr is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[1-9]|[12][0-9]|3[0-2])$')
           - not (cribl_external_export_enabled | bool) or
@@ -98,9 +98,6 @@
           - not (cribl_external_export_enabled | bool) or cribl_otlp_endpoint != 'cribl-mock:4317'
           - keycloak_internal_ip is match('^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$')
           - identity_ldap_enabled is boolean
-          # Exactly one identity source may own the Keycloak truststore and the
-          # federation reconciliation inputs.
-          - not (identity_ldap_enabled | bool) or not (samba_lab_enabled | bool)
           # Plaintext LDAP is refused before any host mutation.
           - not (identity_ldap_enabled | bool) or identity_ldap_url is match('^ldaps://')
           - not (identity_ldap_enabled | bool) or
@@ -118,9 +115,6 @@
           - pbr_tables | map(attribute='id') | unique | length == pbr_tables | length
           - pbr_tables | map(attribute='name') | unique | length == pbr_tables | length
           - pbr_tables | map(attribute='priority') | unique | length == pbr_tables | length
-          - aigw_ssh_password_authentication is boolean
-          - aigw_adm_socks_enabled is boolean
-          - aigw_adm_socks_trusted_operator_ack is string
         fail_msg: >-
           Refusing to mutate host: supply a bounded canonical lowercase FQDN,
           canonical bounded stack/Docker paths, a safe Compose project name,
@@ -128,129 +122,6 @@
           ADM/internal source CIDRs, and distinct internal/egress resolver lists
           via an environment inventory, --extra-vars, or the AIGW_* controller
           environment.
-
-    - name: Preflight — restrict SSH password and SOCKS exceptions to rocky9-lab
-      ansible.builtin.assert:
-        that:
-          - >-
-            (deployment_profile | default('')) == 'rocky9-lab' or
-            not (aigw_ssh_password_authentication | bool)
-          - >-
-            (deployment_profile | default('')) == 'rocky9-lab' or
-            not (aigw_adm_socks_enabled | bool)
-        quiet: true
-        fail_msg: >-
-          Password SSH authentication and trusted-operator SOCKS forwarding
-          are temporary rocky9-lab-only access exceptions. Generic/customer
-          inventories must keep both disabled.
-
-    # SOCKS uses SSH local/dynamic forwarding, not host packet forwarding.  It
-    # is therefore an explicit, source-scoped sshd Match exception rather than
-    # a broad ADM routing/NAT policy.  Reject arbitrary Match input before it
-    # is rendered into the root-owned sshd fragment.
-    - name: Preflight — validate default-deny ADM SSH SOCKS exception inputs
-      ansible.builtin.command:
-        argv:
-          - python3
-          - -I
-          - -c
-          - |
-            import ipaddress
-            import json
-            import re
-            import sys
-
-            deployment_profile = sys.argv[1]
-            password_authentication = sys.argv[2] == "true"
-            enabled = sys.argv[3] == "true"
-            users = json.loads(sys.argv[4])
-            groups = json.loads(sys.argv[5])
-            source_cidrs = json.loads(sys.argv[6])
-            group_test_users = json.loads(sys.argv[7])
-            trusted_operator_ack = sys.argv[8]
-            vpn_network = ipaddress.ip_network(sys.argv[9], strict=True)
-            errors = []
-            safe_principal = re.compile(r"[a-z_][a-z0-9_-]{0,31}$")
-
-            if deployment_profile != "rocky9-lab":
-                if password_authentication:
-                    errors.append(
-                        "password SSH authentication is allowed only in deployment_profile=rocky9-lab"
-                    )
-                if enabled:
-                    errors.append(
-                        "SSH SOCKS is allowed only in deployment_profile=rocky9-lab"
-                    )
-
-            if not isinstance(users, list) or not isinstance(groups, list):
-                errors.append("aigw_adm_socks_users/groups must be lists")
-                users, groups = [], []
-            if not isinstance(source_cidrs, list):
-                errors.append("aigw_adm_socks_source_cidrs must be a list")
-                source_cidrs = []
-            if not isinstance(group_test_users, dict):
-                errors.append("aigw_adm_socks_group_test_users must be a mapping")
-                group_test_users = {}
-
-            for label, values in (("user", users), ("group", groups)):
-                if any(not isinstance(value, str) or not safe_principal.fullmatch(value)
-                       for value in values):
-                    errors.append(f"unsafe SSH SOCKS {label} name")
-                if len(set(values)) != len(values):
-                    errors.append(f"duplicate SSH SOCKS {label} name")
-            if "root" in users:
-                errors.append("root cannot receive an SSH SOCKS exception")
-
-            parsed_sources = []
-            for value in source_cidrs:
-                try:
-                    network = ipaddress.ip_network(value, strict=True)
-                except ValueError:
-                    errors.append(f"invalid SSH SOCKS source CIDR {value!r}")
-                    continue
-                if network.version != 4 or network.prefixlen == 0 or not network.subnet_of(vpn_network):
-                    errors.append(
-                        f"SSH SOCKS source CIDR {value!r} is not a bounded ADM subset of {vpn_network}"
-                    )
-                    continue
-                parsed_sources.append(str(network))
-            if len(set(parsed_sources)) != len(parsed_sources):
-                errors.append("duplicate SSH SOCKS source CIDR")
-
-            if set(group_test_users) != set(groups):
-                errors.append("every SSH SOCKS group needs exactly one declared test user")
-            for group, user in group_test_users.items():
-                if (not isinstance(group, str) or not safe_principal.fullmatch(group) or
-                        not isinstance(user, str) or not safe_principal.fullmatch(user) or
-                        user == "root"):
-                    errors.append("unsafe SSH SOCKS group test-user mapping")
-
-            if enabled:
-                if not source_cidrs:
-                    errors.append("enabled SSH SOCKS requires an ADM source CIDR")
-                if not users and not groups:
-                    errors.append("enabled SSH SOCKS requires an approved user or group")
-                if trusted_operator_ack != "I_UNDERSTAND_SOCKS_REACHES_ALL_HOST_ROUTES":
-                    errors.append(
-                        "enabled SSH SOCKS requires the trusted-operator acknowledgement because PermitOpen any reaches every host-routable destination"
-                    )
-            elif users or groups or source_cidrs or group_test_users or trusted_operator_ack:
-                errors.append(
-                    "disabled SSH SOCKS must not retain approved principals, source CIDRs, or a trusted-operator acknowledgement"
-                )
-
-            if errors:
-                raise SystemExit("; ".join(dict.fromkeys(errors)))
-          - "{{ deployment_profile | default('') }}"
-          - "{{ 'true' if (aigw_ssh_password_authentication | bool) else 'false' }}"
-          - "{{ 'true' if (aigw_adm_socks_enabled | bool) else 'false' }}"
-          - "{{ aigw_adm_socks_users | to_json }}"
-          - "{{ aigw_adm_socks_groups | to_json }}"
-          - "{{ aigw_adm_socks_source_cidrs | to_json }}"
-          - "{{ aigw_adm_socks_group_test_users | to_json }}"
-          - "{{ aigw_adm_socks_trusted_operator_ack }}"
-          - "{{ vpn_client_cidr }}"
-      changed_when: false
 
     # Docker bridge names and firewalld zone/interface values are interpolated
     # into root-run firewall scripts. The platform graph is fixed, so accept
@@ -294,7 +165,7 @@
                 # 172.28.16.0/24 (net-traces) is retired with Tempo; the
                 # subnet stays reserved and must never be reassigned.
                 "net-identity": ("br-ident", "172.28.17.0/24", True),
-                "net-lab-dns": ("br-lab-dns", "172.28.18.0/24", False),
+                "net-platform-dns": ("br-platform-dns", "172.28.18.0/24", False),
                 "net-int-edge": ("br-int-edge", "172.28.19.0/24", False),
                 "net-db-grafana": ("br-db-graf", "172.28.20.0/24", True),
             }
@@ -454,7 +325,7 @@
                          for value in json.loads(sys.argv[3])]
             envoy_ip = ipaddress.ip_address(sys.argv[4])
             alloy_ip = ipaddress.ip_address(sys.argv[5])
-            lab_dns_ip = ipaddress.ip_address(sys.argv[6])
+            platform_dns_ip = ipaddress.ip_address(sys.argv[6])
             declared_egress = ipaddress.ip_network(sys.argv[7], strict=True)
             keycloak_ip = ipaddress.ip_address(sys.argv[8])
 
@@ -487,7 +358,7 @@
 
             check_workload_ip("envoy_egress_ip", envoy_ip, "net-egress")
             check_workload_ip("alloy_internal_ip", alloy_ip, "net-internal")
-            check_workload_ip("lab_dns_ip", lab_dns_ip, "net-lab-dns")
+            check_workload_ip("platform_dns_ip", platform_dns_ip, "net-platform-dns")
             check_workload_ip("keycloak_internal_ip", keycloak_ip, "net-internal")
             if keycloak_ip == alloy_ip:
                 errors.append("keycloak_internal_ip must differ from alloy_internal_ip")
@@ -524,7 +395,7 @@
                    if (identity_ldap_enabled | bool) else [])) | to_json }}
           - "{{ envoy_egress_ip }}"
           - "{{ alloy_internal_ip }}"
-          - "{{ lab_dns_ip }}"
+          - "{{ platform_dns_ip }}"
           - "{{ net_egress_subnet }}"
           - "{{ keycloak_internal_ip }}"
       changed_when: false
@@ -929,19 +800,13 @@
           profile before running the mutating full converge.
 
     # Edge TLS mode selection is fail-closed: an unset or unknown mode stops the
-    # converge before any role runs. 'lab' means a self-signed TEST root and is
-    # therefore legal only on a disposable lab; a production profile must choose
-    # a real CA path. The lab MAY choose vault-intermediate, and the committed
-    # lab inventory does, so the lab exercises the same ceremony a customer runs.
+    # converge before any role runs. Production must choose a reviewed real-CA
+    # path.
     - name: Preflight — require exactly one reviewed edge TLS mode
       ansible.builtin.assert:
         that:
           - aigw_edge_tls_mode is string
-          - >-
-            (deployment_profile == 'rocky9-lab' and
-             aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate']) or
-            (deployment_profile != 'rocky9-lab' and
-             aigw_edge_tls_mode in ['customer-supplied', 'vault-intermediate', 'customer-intermediate'])
+          - aigw_edge_tls_mode in ['customer-supplied', 'vault-intermediate', 'customer-intermediate']
           - >-
             aigw_edge_tls_mode != 'customer-supplied' or
             (aigw_edge_tls_leaf_cert_file | length > 0 and
@@ -966,8 +831,7 @@
         fail_msg: >-
           Select exactly one edge TLS mode with its complete, unambiguous input
           set. Production profiles must use customer-supplied, vault-intermediate,
-          or customer-intermediate; the self-signed 'lab' mode is legal only on
-          rocky9-lab. customer-intermediate requires exactly the three
+          or customer-intermediate. customer-intermediate requires exactly the three
           aigw_edge_tls_intermediate_* files and no customer-supplied files.
 
     # Inspect the customer's TLS inputs on the CONTROLLER, before any role can
@@ -1046,21 +910,6 @@
       loop_control:
         label: "{{ item.item | basename }}"
       when: aigw_edge_tls_mode == 'customer-intermediate'
-
-    - name: Preflight — validate concrete lab profile
-      ansible.builtin.assert:
-        that:
-          - nic_egress == 'enp0s5'
-          - nic_adm == 'enp0s7'
-          - nic_internal == 'enp0s8'
-          - eth0_ip == '10.211.55.3'
-          - eth0_gateway == '10.211.55.1'
-          - eth1_gateway == '10.8.10.2'
-          - eth2_gateway == '10.20.0.2'
-          - vpn_client_cidr == '10.8.10.0/24'
-          - internal_cidr == '10.20.0.0/24'
-        fail_msg: The rocky9-lab profile does not match verified wiring.
-      when: deployment_profile | default('') == 'rocky9-lab'
 
     - name: Preflight — require encrypted backing for all sensitive state
       ansible.builtin.command:

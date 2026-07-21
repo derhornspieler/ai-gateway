@@ -5,8 +5,8 @@ Anthropic JWKS watcher, docs/anthropic-wif-bootstrap.md Phase 1a) can
 raise loud, queryable alerts without knowing about FastAPI. main.py
 exposes the snapshot on /healthz and per-vendor on /status.
 
-Flag naming convention: "{vendor}.{subsystem}", e.g.
-"anthropic.token_exchange", "anthropic.jwks", "openai.orphaned_credentials".
+Flag naming convention: "{vendor}.{subsystem}", for example
+"anthropic.token_exchange" and "anthropic.jwks".
 """
 from __future__ import annotations
 

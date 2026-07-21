@@ -4,9 +4,6 @@ The security claims proved here are:
 
 * plaintext ``ldap://`` and every malformed directory input is refused before
   the service can start;
-* the reserved lab provider name can never be adopted by a production converge,
-  and the lab federation spec stays byte-identical to today's representation
-  (a drift there would silently reprovision the lab directory);
 * a wrong CA bundle, a certificate that fails hostname verification, or wrong
   bind credentials make Keycloak's ``testLDAPConnection`` fail, and no
   federation component is ever written;
@@ -16,6 +13,7 @@ The security claims proved here are:
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 
@@ -23,9 +21,8 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from app.config import LAB_LDAP_PROVIDER_NAME, Settings
+from app.config import Settings
 from app.identity import (
-    LAB_LDAP_USER_FILTER,
     IdentityConflict,
     IdentityError,
     KeycloakAdmin,
@@ -86,7 +83,6 @@ def generic_settings(**overrides) -> Settings:
         ("ip_literal", {"IDENTITY_LDAP_URL": "ldaps://10.20.5.10:636"}),
         ("port_389", {"IDENTITY_LDAP_URL": "ldaps://dc1.corp.example.com:389"}),
         ("port_3269", {"IDENTITY_LDAP_URL": "ldaps://dc1.corp.example.com:3269"}),
-        ("reserved_lab_name", {"IDENTITY_LDAP_PROVIDER_NAME": LAB_LDAP_PROVIDER_NAME}),
         ("empty_provider_name", {"IDENTITY_LDAP_PROVIDER_NAME": ""}),
         ("empty_users_dn", {"IDENTITY_LDAP_USERS_DN": ""}),
         ("empty_bind_dn", {"IDENTITY_LDAP_BIND_DN": ""}),
@@ -112,11 +108,6 @@ def test_settings_refuse_unsafe_directory_inputs(label, overrides) -> None:
         generic_settings(**overrides)
 
 
-def test_settings_refuse_two_simultaneous_federation_sources() -> None:
-    with pytest.raises(ValidationError, match="exactly one LDAP federation source"):
-        generic_settings(LAB_SAMBA_LDAP_ENABLED=True)
-
-
 def test_settings_accept_a_bounded_production_directory() -> None:
     resolved = generic_settings()
     assert resolved.identity_ldap_enabled is True
@@ -134,38 +125,7 @@ def test_a_disabled_feature_tolerates_empty_directory_inputs() -> None:
     assert ldap_federation_spec(resolved) is None
 
 
-# ── Provider-identity preservation (the lab regression gate) ───────────────
-
-
-def test_lab_spec_is_byte_identical_to_the_deployed_lab_representation() -> None:
-    """A drift here silently reprovisions the live lab directory."""
-    resolved = settings(LAB_SAMBA_LDAP_ENABLED=True)
-    assert ldap_federation_spec(resolved) == LdapFederationSpec(
-        provider_name="lab-samba-ad",
-        # FQDN under the lab domain — the only name the customer-CA-signed leaf
-        # can bear (a bare-hostname SAN violates the Aegis name constraints).
-        connection_url="ldaps://samba-ad.aigw.aegisgroup.ch:636",
-        users_dn="OU=AIGWUsers,DC=lab,DC=aigw,DC=internal",
-        bind_dn="CN=svc-keycloak-ldap,CN=Users,DC=lab,DC=aigw,DC=internal",
-        bind_password_file="/run/secrets/samba_keycloak_bind_password",
-        vendor="ad",
-        username_attribute="sAMAccountName",
-        rdn_attribute="cn",
-        uuid_attribute="objectGUID",
-        user_object_classes="person, organizationalPerson, user",
-        user_filter=(
-            "(&(objectCategory=person)(objectClass=user)"
-            "(!(sAMAccountName=svc-keycloak-ldap)))"
-        ),
-        # The lab's creation path must stay exactly as it is today: the DC is an
-        # in-stack healthcheck-gated dependency, so no new admin-API call is
-        # introduced into a lab converge.
-        prove_directory_before_create=False,
-    )
-    assert LAB_LDAP_USER_FILTER == (
-        "(&(objectCategory=person)(objectClass=user)"
-        "(!(sAMAccountName=svc-keycloak-ldap)))"
-    )
+# ── Inventory-to-provider mapping ───────────────────────────────────────────────
 
 
 def test_generic_spec_maps_every_inventory_field() -> None:
@@ -185,26 +145,9 @@ def test_generic_spec_maps_every_inventory_field() -> None:
             "(&(objectCategory=person)(objectClass=user)"
             "(!(sAMAccountName=svc-aigw-ldap)))"
         ),
-        prove_directory_before_create=True,
     )
 
 
-@pytest.mark.asyncio
-async def test_creating_the_lab_provider_issues_no_new_admin_call() -> None:
-    """The lab creation path is byte-for-byte what it was before this feature."""
-    keycloak = RecordingKeycloak()
-    admin = admin_for(keycloak, settings(LAB_SAMBA_LDAP_ENABLED=True))
-
-    component_id = await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
-
-    assert component_id == "component-uuid"
-    assert keycloak.probe_actions == []
-    assert not any(path.endswith("/testLDAPConnection") for _, path in keycloak.calls)
-    assert keycloak.created["name"] == "lab-samba-ad"
-    assert keycloak.created["config"]["editMode"] == ["READ_ONLY"]
-    assert keycloak.created["config"]["customUserSearchFilter"] == [
-        "(&(objectCategory=person)(objectClass=user)(!(sAMAccountName=svc-keycloak-ldap)))"
-    ]
 
 
 # ── Reconciliation against a mocked Keycloak admin API ─────────────────────
@@ -221,12 +164,14 @@ class RecordingKeycloak:
         probe_status: int = 204,
         sync_status: int = 200,
         delete_status: int = 204,
+        update_status: int = 204,
         existing: dict | None = None,
         mappers: list[dict] | None = None,
     ) -> None:
         self.probe_status = probe_status
         self.sync_status = sync_status
         self.delete_status = delete_status
+        self.update_status = update_status
         self.existing = existing
         self.mappers = mappers or []
         self.calls: list[tuple[str, str]] = []
@@ -236,6 +181,16 @@ class RecordingKeycloak:
         # Config-drift reconcile bookkeeping (LDAP-CONNURL).
         self.updated: list[dict] = []
         self.user_cache_cleared = False
+
+    @staticmethod
+    def _masked(component: dict) -> dict:
+        """Return the representation Keycloak exposes after saving a secret."""
+
+        visible = copy.deepcopy(component)
+        config = visible.get("config")
+        if isinstance(config, dict) and "bindCredential" in config:
+            config["bindCredential"] = ["**********"]
+        return visible
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -254,10 +209,12 @@ class RecordingKeycloak:
             import json
 
             body = json.loads(request.content)
+            self.updated.append(body)
+            if self.update_status != 204:
+                return httpx.Response(self.update_status, json={"error": "denied"})
             # The reconcile PUTs the full representation; adopt it so a
             # subsequent re-fetch reflects the reconciled managed config.
             self.existing = body
-            self.updated.append(body)
             return httpx.Response(204)
         if request.method == "GET" and path.endswith("/components"):
             # The mapper enumeration is a parent+type filtered lookup; keep it
@@ -265,8 +222,11 @@ class RecordingKeycloak:
             if request.url.params.get("type") == self.MAPPER_TYPE:
                 return httpx.Response(200, json=self.mappers)
             if self.created is not None:
-                return httpx.Response(200, json=[self.created])
-            return httpx.Response(200, json=[self.existing] if self.existing else [])
+                return httpx.Response(200, json=[self._masked(self.created)])
+            return httpx.Response(
+                200,
+                json=[self._masked(self.existing)] if self.existing else [],
+            )
         if request.method == "GET" and path == "/admin/realms/aigw":
             return httpx.Response(200, json={"id": "realm-uuid"})
         if request.method == "POST" and path.endswith("/components"):
@@ -384,8 +344,8 @@ def _existing_generic_component() -> dict:
     }
 
 
-# The Keycloak defaults a READ_ONLY provider carries (verified against the live
-# lab directory): every user-attribute / full-name mapper is read.only=true, and
+# The Keycloak defaults a READ_ONLY provider carries: every user-attribute /
+# full-name mapper is read.only=true, and
 # there is no group/role mapper carrying a write-back ``mode``.
 KEYCLOAK_DEFAULT_READONLY_MAPPERS = [
     {
@@ -409,9 +369,9 @@ KEYCLOAK_DEFAULT_READONLY_MAPPERS = [
 
 
 @pytest.mark.asyncio
-async def test_an_existing_production_provider_is_reproved_and_not_rewritten() -> None:
+async def test_existing_provider_is_reproved_and_receives_current_bind_password() -> None:
     """An EXISTING external provider must still re-exercise the live LDAPS
-    proof on reconcile; matching config is not proof a login will succeed."""
+    proof and save the current mounted credential on every reconcile."""
     keycloak = RecordingKeycloak(
         existing=_existing_generic_component(),
         mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS,
@@ -424,9 +384,38 @@ async def test_an_existing_production_provider_is_reproved_and_not_rewritten() -
     )
     # The read-only live proof runs against the EXISTING provider ...
     assert keycloak.probe_actions == ["testConnection", "testAuthentication"]
-    # ... and the component is adopted, never rewritten.
+    # ... before the masked credential is replaced with the supplied current
+    # value. Masked readback is never treated as a comparable secret.
     assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+    assert len(keycloak.updated) == 1
+    assert keycloak.updated[0]["config"]["bindCredential"] == [BIND_PASSWORD]
+    credential_put = keycloak.calls.index(
+        ("PUT", "/admin/realms/aigw/components/existing-uuid")
+    )
+    probe_calls = [
+        index
+        for index, call in enumerate(keycloak.calls)
+        if call == ("POST", "/admin/realms/aigw/testLDAPConnection")
+    ]
+    assert probe_calls
+    assert max(probe_calls) < credential_put
     assert keycloak.deleted == []
+
+    # A second converge sees the same masked readback, proves LDAPS again, and
+    # sends the real credential again. It does not report secret drift or put a
+    # placeholder back into Keycloak.
+    assert (
+        await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
+        == "existing-uuid"
+    )
+    assert keycloak.probe_actions == [
+        "testConnection",
+        "testAuthentication",
+        "testConnection",
+        "testAuthentication",
+    ]
+    assert len(keycloak.updated) == 2
+    assert keycloak.updated[1]["config"]["bindCredential"] == [BIND_PASSWORD]
 
 
 @pytest.mark.asyncio
@@ -464,138 +453,30 @@ async def test_an_existing_provider_with_a_rotated_cert_fails_closed(
         await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
 
     assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+    assert keycloak.updated == []
     assert keycloak.deleted == []
 
 
 @pytest.mark.asyncio
-async def test_an_existing_lab_provider_is_not_reproved() -> None:
-    """Preserve the lab byte-for-byte: the in-stack DC stays exempt from the
-    live proof on the existing path, exactly as on its creation path."""
-    resolved = settings(LAB_SAMBA_LDAP_ENABLED=True)
-    existing = {
-        "id": "existing-uuid",
-        "name": LAB_LDAP_PROVIDER_NAME,
-        "providerId": "ldap",
-        "providerType": "org.keycloak.storage.UserStorageProvider",
-        "config": {
-            "enabled": ["true"],
-            "editMode": ["READ_ONLY"],
-            "importEnabled": ["true"],
-            "syncRegistrations": ["false"],
-            "authType": ["simple"],
-            "searchScope": ["2"],
-            "useTruststoreSpi": ["always"],
-            "startTls": ["false"],
-            "allowKerberosAuthentication": ["false"],
-            "useKerberosForPasswordAuthentication": ["false"],
-            "vendor": ["ad"],
-            "usernameLDAPAttribute": ["sAMAccountName"],
-            "rdnLDAPAttribute": ["cn"],
-            "uuidLDAPAttribute": ["objectGUID"],
-            "userObjectClasses": ["person, organizationalPerson, user"],
-            "connectionUrl": [resolved.lab_samba_ldap_url],
-            "usersDn": [resolved.lab_samba_users_dn],
-            "bindDn": [resolved.lab_samba_bind_dn],
-            "bindCredential": ["**********"],
-            "customUserSearchFilter": [
-                "(&(objectCategory=person)(objectClass=user)"
-                "(!(sAMAccountName=svc-keycloak-ldap)))"
-            ],
-        },
-    }
+async def test_failed_credential_refresh_is_redacted_and_fails_closed() -> None:
     keycloak = RecordingKeycloak(
-        existing=existing, mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS
-    )
-    admin = admin_for(keycloak, resolved)
-
-    assert await admin._ensure_ldap_federation("bootstrap-token", None) == "existing-uuid"
-    assert keycloak.probe_actions == []
-    assert not any(path.endswith("/testLDAPConnection") for _, path in keycloak.calls)
-    assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
-    # Config already matched the desired spec: no drift reconcile, no PUT, no
-    # user-cache clear.
-    assert keycloak.updated == []
-    assert keycloak.user_cache_cleared is False
-
-
-def _drifted_lab_component(resolved: Settings, connection_url: str) -> dict:
-    return {
-        "id": "existing-uuid",
-        "name": LAB_LDAP_PROVIDER_NAME,
-        "providerId": "ldap",
-        "providerType": "org.keycloak.storage.UserStorageProvider",
-        "config": {
-            "enabled": ["true"],
-            "editMode": ["READ_ONLY"],
-            "importEnabled": ["true"],
-            "syncRegistrations": ["false"],
-            "authType": ["simple"],
-            "searchScope": ["2"],
-            "useTruststoreSpi": ["always"],
-            "startTls": ["false"],
-            "allowKerberosAuthentication": ["false"],
-            "useKerberosForPasswordAuthentication": ["false"],
-            "vendor": ["ad"],
-            "usernameLDAPAttribute": ["sAMAccountName"],
-            "rdnLDAPAttribute": ["cn"],
-            "uuidLDAPAttribute": ["objectGUID"],
-            "userObjectClasses": ["person, organizationalPerson, user"],
-            "connectionUrl": [connection_url],
-            "usersDn": [resolved.lab_samba_users_dn],
-            "bindDn": [resolved.lab_samba_bind_dn],
-            "bindCredential": ["**********"],
-            "customUserSearchFilter": [
-                "(&(objectCategory=person)(objectClass=user)"
-                "(!(sAMAccountName=svc-keycloak-ldap)))"
-            ],
-        },
-    }
-
-
-@pytest.mark.asyncio
-async def test_existing_lab_provider_drifted_connection_url_is_reconciled() -> None:
-    """LDAP-CONNURL (proved live): after the Samba LDAPS endpoint moved from the
-    bare host `samba-ad` to its FQDN, the live lab-samba-ad provider still held
-    ``ldaps://samba-ad:636`` and every federated login failed hostname
-    verification. A create-or-verify that never mutates leaves that drift in
-    place (pre-fix it instead RAISED "inventory-bound"). The reconcile now pushes
-    the desired managed config back onto the existing component and clears the
-    user cache, preserving the component id/name/providerId and the READ_ONLY /
-    syncRegistrations=false posture.
-    """
-    resolved = settings(LAB_SAMBA_LDAP_ENABLED=True)
-    desired_url = resolved.lab_samba_ldap_url
-    assert desired_url == "ldaps://samba-ad.aigw.aegisgroup.ch:636"
-    keycloak = RecordingKeycloak(
-        existing=_drifted_lab_component(resolved, "ldaps://samba-ad:636"),
+        existing=_existing_generic_component(),
         mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS,
+        update_status=500,
     )
-    admin = admin_for(keycloak, resolved)
+    admin = admin_for(keycloak, generic_settings())
 
-    # The lab needs no bind password and no live directory probe.
-    assert await admin._ensure_ldap_federation("bootstrap-token", None) == "existing-uuid"
-    assert keycloak.probe_actions == []
-    # Exactly one PUT that fixes the connectionUrl, plus a user-cache clear.
-    assert len(keycloak.updated) == 1
-    put = keycloak.updated[0]
-    assert put["id"] == "existing-uuid"
-    assert put["name"] == LAB_LDAP_PROVIDER_NAME
-    assert put["providerId"] == "ldap"
-    assert put["config"]["connectionUrl"] == [desired_url]
-    # Preserved posture and secret handling.
-    assert put["config"]["editMode"] == ["READ_ONLY"]
-    assert put["config"]["syncRegistrations"] == ["false"]
-    assert put["config"]["bindCredential"] == ["**********"]
-    assert keycloak.user_cache_cleared is True
-    # Never re-created.
-    assert ("POST", "/admin/realms/aigw/components") not in keycloak.calls
+    with pytest.raises(IdentityError) as excinfo:
+        await admin._ensure_ldap_federation("bootstrap-token", BIND_PASSWORD)
 
-    # Idempotent: a second converge now sees no drift and issues no further PUT
-    # or cache clear.
-    keycloak.user_cache_cleared = False
-    assert await admin._ensure_ldap_federation("bootstrap-token", None) == "existing-uuid"
+    assert BIND_PASSWORD not in str(excinfo.value)
+    assert "HTTP 500" in str(excinfo.value)
+    assert keycloak.probe_actions == ["testConnection", "testAuthentication"]
     assert len(keycloak.updated) == 1
-    assert keycloak.user_cache_cleared is False
+    assert keycloak.updated[0]["config"]["bindCredential"] == [BIND_PASSWORD]
+    # The mock, like Keycloak, keeps the previous stored component when the PUT
+    # is rejected; the converge cannot continue to callbacks or claim success.
+    assert keycloak.existing["config"]["bindCredential"] == ["**********"]
 
 
 @pytest.mark.parametrize(
@@ -685,7 +566,7 @@ async def test_a_failed_sync_and_failed_cleanup_raises_a_stranded_fatal() -> Non
 
 @pytest.mark.asyncio
 async def test_verify_ldap_mappers_accepts_the_keycloak_default_readonly_set() -> None:
-    """The live-lab default mapper set (read.only=true, no write-back mode)
+    """The default mapper set (read.only=true, no write-back mode)
     must pass, so the gate is not vacuous and does not churn a real provider."""
     keycloak = RecordingKeycloak(mappers=KEYCLOAK_DEFAULT_READONLY_MAPPERS)
     admin = admin_for(keycloak, generic_settings())
@@ -835,7 +716,7 @@ async def test_a_missing_bind_password_never_reaches_the_directory() -> None:
 # The bind-password FILE path is validated to /run/secrets/* at construction,
 # so the tests point the resolved instance attribute at a temp file after the
 # fact (pydantic BaseSettings does not re-validate on assignment). The read
-# path is the O_NOFOLLOW fstat-bounded flow shared with the lab federation.
+# path is the O_NOFOLLOW fstat-bounded flow used by the production federation.
 
 
 def _admin_reading(path: Path) -> KeycloakAdmin:

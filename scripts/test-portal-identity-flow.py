@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise the real portal OIDC step-up and INITIALIZE form flow.
+"""Exercise portal OIDC after Ansible has configured identity control.
 
-The disposable lab password is accepted only on stdin and is never logged,
+The static preprod password is accepted only on stdin and is never logged,
 persisted, placed in argv, or included in an exception message.
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import http.cookiejar
+import socket
 import ssl
 import sys
 import urllib.parse
@@ -16,16 +17,40 @@ import urllib.request
 from html.parser import HTMLParser
 
 
-PORTAL_ORIGIN = "https://portal.aigw.aegisgroup.ch"
-ADMIN_PORTAL_ORIGIN = "https://admin.aigw.aegisgroup.ch"
-AUTH_HOST = "auth.aigw.aegisgroup.ch"
-PORTAL_ALLOWED_HOSTS = frozenset({"portal.aigw.aegisgroup.ch", AUTH_HOST})
+PORTAL_ORIGIN = "https://portal.aigw.internal"
+ADMIN_PORTAL_ORIGIN = "https://admin.aigw.internal"
+AUTH_HOST = "auth.aigw.internal"
+PORTAL_ALLOWED_HOSTS = frozenset({"portal.aigw.internal", AUTH_HOST})
 ADMIN_PORTAL_ALLOWED_HOSTS = frozenset(
-    {"admin.aigw.aegisgroup.ch", AUTH_HOST}
+    {"admin.aigw.internal", AUTH_HOST}
 )
 REVIEWED_HOST_SETS = frozenset(
     {PORTAL_ALLOWED_HOSTS, ADMIN_PORTAL_ALLOWED_HOSTS}
 )
+PREPROD_HOST_ADDRESSES = {
+    "api.aigw.internal": "127.0.2.1",
+    "portal.aigw.internal": "127.0.2.1",
+    "admin.aigw.internal": "127.0.3.1",
+    "auth.aigw.internal": "127.0.3.1",
+}
+_SYSTEM_GETADDRINFO = socket.getaddrinfo
+
+
+def preprod_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if not isinstance(host, str) or host not in PREPROD_HOST_ADDRESSES:
+        raise socket.gaierror(
+            socket.EAI_NONAME,
+            "hostname is outside the reviewed preprod portal boundary",
+        )
+    return _SYSTEM_GETADDRINFO(
+        PREPROD_HOST_ADDRESSES[host], port, family, type, proto, flags
+    )
+
+
+def install_preprod_resolution() -> None:
+    if socket.getaddrinfo is not _SYSTEM_GETADDRINFO:
+        raise RuntimeError("socket name resolution was already replaced")
+    socket.getaddrinfo = preprod_getaddrinfo
 
 
 class RestrictedRedirects(urllib.request.HTTPRedirectHandler):
@@ -123,7 +148,7 @@ def keycloak_login(
     password: str,
     *,
     allowed_hosts: frozenset[str],
-    username: str = "testadmin",
+    username: str = "preprod-admin",
 ) -> tuple[str, str]:
     final_url, html = read_page(opener, start_url)
     forms = [
@@ -143,12 +168,6 @@ def keycloak_login(
 
 
 def identity_flow(portal_opener, admin_opener, password: str) -> None:
-    # A fresh deployment deliberately fails closed for developer-project
-    # lookups until the one-time identity controller has been initialized.
-    # Bootstrap through the separate administrator application first; testing
-    # a normal developer landing page before that would correctly produce a
-    # 503 rather than test the OIDC callback.
-    #
     # The administrator application has its own OIDC client, signing key, and
     # cookie name. Establish that independent session before requesting its
     # prompt=login/max_age=0 step-up route.
@@ -159,7 +178,7 @@ def identity_flow(portal_opener, admin_opener, password: str) -> None:
         allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
+    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
         raise RuntimeError("ordinary admin OIDC login did not reach /admin")
     print("ADMIN_PORTAL_OIDC_LOGIN_PASS")
 
@@ -170,7 +189,7 @@ def identity_flow(portal_opener, admin_opener, password: str) -> None:
         allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
+    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
         raise RuntimeError("forced OIDC reauthentication did not return to /admin")
     print("PORTAL_FORCED_REAUTH_PASS")
 
@@ -182,27 +201,16 @@ def identity_flow(portal_opener, admin_opener, password: str) -> None:
         ).path
         == "/admin/identity/bootstrap"
     ]
-    if len(bootstrap_forms) != 1:
-        raise RuntimeError("portal did not expose exactly one INITIALIZE form")
-    csrf = str(bootstrap_forms[0]["inputs"].get("csrf_token", ""))
-    if len(csrf) < 32:
-        raise RuntimeError("portal INITIALIZE form had no valid CSRF token")
-    final_url, html = post_form(
-        admin_opener,
-        final_url,
-        bootstrap_forms[0],
-        {"confirmation": "INITIALIZE", "csrf_token": csrf},
-        allowed_hosts=ADMIN_PORTAL_ALLOWED_HOSTS,
-    )
-    parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
-        raise RuntimeError("INITIALIZE did not return to the admin portal")
-    if "Keycloak identity setup completed." not in html:
-        raise RuntimeError("portal did not report successful identity setup")
-    print("PORTAL_IDENTITY_INITIALIZE_PASS")
+    if bootstrap_forms:
+        raise RuntimeError("admin portal still exposes a manual identity setup form")
+    if "Identity setup is not ready" in html:
+        raise RuntimeError("Ansible did not complete automatic identity setup")
+    if "Bootstrap cleanup required" in html:
+        raise RuntimeError("Ansible did not remove temporary identity credentials")
+    print("PORTAL_IDENTITY_AUTOMATION_PASS")
 
-    # Only after the controller state is durable should the developer portal
-    # be expected to perform its fail-closed live project-membership lookup.
+    # The developer portal now starts with durable controller state already in
+    # place. It must complete its own separate OIDC login.
     final_url, _ = keycloak_login(
         portal_opener,
         PORTAL_ORIGIN + "/login/start",
@@ -210,7 +218,7 @@ def identity_flow(portal_opener, admin_opener, password: str) -> None:
         allowed_hosts=PORTAL_ALLOWED_HOSTS,
     )
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "portal.aigw.aegisgroup.ch" or parsed.path != "/":
+    if parsed.hostname != "portal.aigw.internal" or parsed.path != "/":
         raise RuntimeError("ordinary OIDC login did not reach the portal home page")
     print("PORTAL_OIDC_LOGIN_PASS")
 
@@ -220,16 +228,17 @@ def main() -> int:
     parser.add_argument("--ca", required=True)
     args = parser.parse_args()
     if sys.stdin.isatty():
-        raise SystemExit("pipe the disposable lab password on stdin")
+        raise SystemExit("pipe the static preprod password on stdin")
     raw_password = sys.stdin.buffer.read(513)
     if not raw_password or len(raw_password) > 512:
-        raise SystemExit("invalid lab password length")
+        raise SystemExit("invalid preprod password length")
     try:
         password = raw_password.strip().decode("utf-8")
     except UnicodeDecodeError:
-        raise SystemExit("lab password is not UTF-8") from None
+        raise SystemExit("preprod password is not UTF-8") from None
 
     context = ssl.create_default_context(cafile=args.ca)
+    install_preprod_resolution()
     portal_opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=context),

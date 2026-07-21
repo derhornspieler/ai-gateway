@@ -22,12 +22,12 @@ values are hard-pinned; the play asserts them and refuses substitutes. With
 management disabled (`aigw_manage_selinux: false`) the play still requires
 the host to already be enforcing.
 
-**Controlled transitions only.** If reaching enforcing requires a reboot
-(disabled policy, wrong loaded policy, or `selinux=0` on the kernel command
-line), the play refuses unless the operator explicitly sets
-`aigw_allow_selinux_reboot: true`, and it will not reboot at all while the
-Docker unit is enabled or active — the host must never boot into an unguarded
-container start. Switching a *live* Docker host from permissive to enforcing
+**Controlled transitions only.** A reboot may be needed when SELinux is
+disabled, the wrong policy is loaded, or the kernel uses `selinux=0`. The play
+refuses that reboot unless the operator sets
+`aigw_allow_selinux_reboot: true`. It also refuses to reboot while Docker is
+enabled or active. This prevents containers from starting before their host
+guards. Switching a *live* Docker host from permissive to enforcing
 additionally requires `aigw_allow_active_selinux_enforcement: true`, because
 that transition can surface latent labeling defects immediately.
 
@@ -67,28 +67,25 @@ enforcing key-only authentication and disabling every forwarding channel:
 | Forwarding | `DisableForwarding yes`, `AllowTcpForwarding no`, `AllowStreamLocalForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, `GatewayPorts no` |
 | Rate limits | `MaxAuthTries 3`, `LoginGraceTime 30`, `MaxSessions 4`, `MaxStartups 10:30:30` |
 
-The hardened profile keeps password authentication off by default
-(`aigw_ssh_password_authentication` defaults to `false`); password SSH and the
-ADM SOCKS forwarder are permitted only on the lab profile, and SOCKS
-additionally requires an explicit operator acknowledgement string.
+The hardened production profile keeps password authentication and every SSH
+forwarding mode disabled. Local preprod does not manage the workstation's SSH
+server.
 
-**Lockout-safe application.** Before touching sshd, the controller proves a
-fresh, strictly key-only connection. The candidate file is validated in
-isolation (`sshd -t -f`), the complete daemon configuration is validated
-(`sshd -t`), sshd is *reloaded* rather than restarted, the effective policy
-is evaluated for the real automation user and connection path (`sshd -T -C`)
-with all 23 directives asserted, and a second independent key-only login with
-non-interactive `sudo -n` is proved before the play proceeds. SSH is
+**Lockout-safe application.** Before changing sshd, the controller proves a
+fresh key-only connection. It checks the candidate file with `sshd -t -f` and
+the full configuration with `sshd -t`. It reloads sshd instead of restarting
+it. Next, `sshd -T -C` checks all 23 rules for the real user and connection
+path. A second key-only login must then pass with non-interactive `sudo -n`
+before the play continues. SSH is
 reachable only on the ADM interface from `vpn_client_cidr`, on the exact
 managed port.
 
 ## 2.5 Time synchronization
 
-A dedicated `time_sync` role gates the converge on a proven synchronized clock
-(`aigw_require_time_sync`, default on; maximum offset
-`aigw_time_sync_max_offset_seconds`, default 5 s) before SELinux or Docker can
-install signed packages or build images — OIDC, TLS, and short-lived JWTs all
-depend on trustworthy time.
+The `time_sync` role requires a synchronized clock before SELinux or Docker can
+install signed packages or build images. `aigw_require_time_sync` is on by
+default. `aigw_time_sync_max_offset_seconds` defaults to five seconds. OIDC,
+TLS, and short-lived JWTs all need trustworthy time.
 
 ## 3. Encrypted state storage
 
@@ -107,35 +104,39 @@ continues** rather than failing closed: it emits
 `AIGW_ENCRYPTED_STATE_WARNING: …` and then a plain-language `WARNING: sensitive
 AI Gateway state is NOT on LUKS-encrypted storage …` line, and the converge
 proceeds. Both the host-prep phase (`os-prep.yml`) and the stack phase
-(`deploy-stack-only.yml`) run this same warn-only check. Only the disposable lab
-inventory opts out entirely (`require_encrypted_state: false`). State backups are
-encrypted with `age` (X25519) to an operator-supplied recipient; stateful image
+(`deploy-stack-only.yml`) run this same warn-only check. Local preprod is a
+separate workstation workflow and does not run Rocky host checks. State backups
+are encrypted with `age` (X25519) to an operator-supplied recipient; stateful image
 upgrades are refused unless a hash-verified backup receipt younger than 24 hours
 exists (`require_preupgrade_backup: true`).
 
 ## 4. Package hygiene
 
-The baseline installs from Docker's GPG-checked official repository and
-Rocky's signed EPEL: Docker CE + Compose plugin, `containerd.io`,
-`container-selinux`, `audit`, `openssl`, `bind-utils`, `acl`, `zstd`, and
-supporting Python tooling. The four runtime packages that decide the live
-Docker/Compose behaviour are pinned to the exact NEVRA the verify/e2e suite
-proved green — `docker-ce`/`docker-ce-cli` `29.6.1-1.el9`, `containerd.io`
-`2.2.6-1.el9`, and `docker-compose-plugin` `5.3.1-1.el9` — set once in
-`ansible/group_vars/all.yml` (`aigw_docker_ce_version` and its siblings,
-overridable per `host_vars`). An unpinned `docker-ce-stable` install twice
+The baseline uses Docker's GPG-checked repository and Rocky's signed EPEL. It
+installs Docker CE, the Compose plugin, `containerd.io`, `container-selinux`,
+`audit`, `openssl`, `bind-utils`, `acl`, `zstd`, and supporting Python tools.
+
+The live Docker packages use the exact versions proven by the test suite:
+
+- `docker-ce` and `docker-ce-cli` `29.6.1-1.el9`;
+- `containerd.io` `2.2.6-1.el9`; and
+- `docker-compose-plugin` `5.3.1-1.el9`.
+
+The values live in `ansible/group_vars/all.yml` and may be overridden in
+`host_vars`. An unpinned `docker-ce-stable` install twice
 adopted a Compose-v5 release that broke a live converge, so the pin is a
-stability control, not cosmetic. `state: present` on an exact version makes
-the converge fail loudly if the mirror no longer offers that NEVRA (it never
-silently installs the newest), and `allow_downgrade: false` makes it refuse
-to roll a host that already drifted newer back under a running stack rather
-than downgrade Docker automatically. Two further dependencies are exact-pinned
+stability control. `state: present` makes the converge stop if the mirror no
+longer has the exact version. It never installs the newest version silently.
+`allow_downgrade: false` also stops a host that has already moved to a newer
+version; Ansible will not downgrade Docker under a running stack.
+
+Two further dependencies are exact-pinned
 the same way — the `age-1.3.1-1.el9` package and the `docker==7.2.0` Python
 SDK — so a privileged converge can never resolve an unbounded future version.
-There is deliberately no `dnf versionlock`: the converge re-asserts every pin
-on each run and is the sole sanctioned change path on a dedicated host,
-matching how the repo pins the `age`/SDK packages and every container image
-(tag + digest). No automatic-update service is configured; a version bump is
+There is no `dnf versionlock`. The converge checks every pin on each run and is
+the approved change path for the dedicated host. The repository also pins the
+`age` package, Docker SDK, and every container image. No automatic-update
+service is configured; a version bump is
 an operator action executed through the reviewed converge and its backup
 gates — see the deliberate-upgrade path in `docs/operations.md`.
 
@@ -162,8 +163,8 @@ files):
 - Rendered runtime environment `/opt/ai-gateway/.env`: `root:root 0600`.
 - Secrets directory: `root:root 0700`; Redis authentication sources
   `root:65532 0440` (the server receives only a SHA-256 verifier — no
-  plaintext in its command line or environment); lab Samba secrets
-  `root:root 0400` (bind password `root:65532 0440`).
+  plaintext in its command line or environment); external-LDAPS bind password
+  `root:65532 0440`.
 - Files a non-root (uid 65532) container must read are group-owned 65532
   with `0640`/`0440` and `0750` directories (Keycloak realms, Traefik key);
   public certificates remain world-readable `0644`.
@@ -174,25 +175,28 @@ files):
 
 ## 7. Dedicated-host contract and preflight refusals
 
-The VM is a dedicated Docker host for this stack, recorded by a marker at
-`/etc/ai-gateway/dedicated-docker-host-v1` that is promoted only after a
-fully verified converge. During host preparation (`os-prep.yml`, or the
-host-prep phase of `site.yml`), `os_baseline` first records the same contract
-at `/etc/ai-gateway/dedicated-docker-host-v1.pending`; that pending marker is
-the host-prep-done ownership signal `deploy-stack-only.yml` accepts for a
-first stack deploy, and `host_finalize` replaces it with the completed marker
-once `verify` passes. The read-only preflight refuses, among other
-conditions: a controller connection that does not already traverse the
-future ADM firewall rule; conflicting Docker daemon flags or environment
-indirection in systemd drop-ins; unsafe (symlinked, group-writable,
-non-root) path ancestry for the stack, data root, or configuration;
-foreign containers or networks on a live daemon; active Swarm mode; a
-drifted `daemon.json` on a marked host; a non-canonical or non-root Docker
-CLI, auxiliary daemon sockets, unreviewed systemd overrides, retained Docker
-plugins, or an active rootless/second container runtime; and adoption of any
-pre-existing Docker, firewall, or AIGW sshd state without its matching
-explicit acknowledgement flag (`aigw_adopt_dedicated_docker_host`,
-`aigw_adopt_firewalld_state` — now narrowed to resuming a validated pending
-converge — and `aigw_adopt_ssh_state`). A `firewall_preflight` role audits
+The VM is a dedicated Docker host for this stack. A verified host carries
+`/etc/ai-gateway/dedicated-docker-host-v1`. During host preparation,
+`os_baseline` first writes the matching `.pending` marker. This tells
+`deploy-stack-only.yml` that host preparation passed. `host_finalize` replaces
+it with the completed marker only after `verify` passes.
+
+The read-only preflight refuses:
+
+- a controller connection outside the future ADM firewall rule;
+- conflicting Docker daemon flags or indirect systemd environment files;
+- symlinked, group-writable, or non-root path ancestry;
+- foreign containers or networks on a live daemon;
+- active Swarm mode;
+- a changed `daemon.json` on a marked host;
+- a non-standard or non-root Docker CLI;
+- extra daemon sockets, unreviewed systemd overrides, Docker plugins, rootless
+  Docker, or a second container runtime; and
+- adoption of existing Docker, firewall, or AIGW sshd state without the exact
+  acknowledgement flag.
+
+Those flags are `aigw_adopt_dedicated_docker_host`,
+`aigw_adopt_firewalld_state`, and `aigw_adopt_ssh_state`. The firewall flag can
+only resume a validated pending converge. A `firewall_preflight` role audits
 existing firewall state, and `host_finalize` promotes the dedicated-host
 marker only after a fully verified converge.

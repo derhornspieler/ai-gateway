@@ -207,9 +207,8 @@ class VaultClient:
         retrying up to `attempts` times.
 
         Returns True only when a subsequent read shows every field that was
-        written. Used for state whose loss would orphan a live credential
-        (e.g. the openai rotation-state doc: the old service-account id +
-        the pending-revocation orphan list). A plain `write()` returning
+        written. Used for state whose loss could orphan a live credential.
+        A plain `write()` returning
         True is not sufficient proof of durability under a flaky vault, so
         this closes the loop with a read-back.
         """

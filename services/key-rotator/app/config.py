@@ -3,8 +3,8 @@
 Design ref: docs/solution-map.md §1.7 / §3 — key-rotator lives on segmented
 internal networks with no direct internet route. ALL vendor-bound HTTP calls MUST
 be routed through EGRESS_BASE (envoy-egress, CA-pinned per §"Egress proxy
-+ cert pinning" in the component table). Never call vendor domains
-(api.anthropic.com, api.openai.com) directly from this service.
++ cert pinning" in the component table). Never call api.anthropic.com
+directly from this service.
 """
 from __future__ import annotations
 
@@ -15,12 +15,6 @@ from urllib.parse import SplitResult, urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# The lab Samba federation owns this exact Keycloak component name. A
-# production external-directory converge must never be able to adopt it: the
-# lab provider identity (component id/name) has to survive lab converges
-# untouched, and reusing the name would silently reprovision that directory.
-LAB_LDAP_PROVIDER_NAME = "lab-samba-ad"
 
 # Bounded LDAP filter grammar. `$` is deliberately excluded so a value carried
 # through Compose interpolation can never be re-expanded.
@@ -178,11 +172,11 @@ class Settings(BaseSettings):
     keycloak_public_url: str = Field(
         default="http://keycloak:8080", alias="KEYCLOAK_PUBLIC_URL"
     )
-    # The isolated WIF realm deliberately advertises a distinct fabricated
-    # issuer. Keycloak validates private_key_jwt audience against that realm's
-    # frontend URL while the actual POST remains on KEYCLOAK_URL.
+    # The isolated WIF realm uses a distinct deployment-domain issuer. Keycloak
+    # validates private_key_jwt audience against that realm's frontend URL while
+    # the actual POST remains on KEYCLOAK_URL.
     wif_keycloak_public_url: str = Field(
-        default="https://idp.wif-a.example.invalid",
+        default="https://idp.wif.aigw.example.internal",
         alias="WIF_KEYCLOAK_PUBLIC_URL",
     )
 
@@ -244,20 +238,13 @@ class Settings(BaseSettings):
         default="ai-gateway/keycloak/vault-oidc-rp",
         alias="VAULT_OIDC_RP_VAULT_PATH",
     )
-    # Disposable lab only: keep the password-backed bootstrap user
-    # as a durable ADM-console recovery operator while still deleting the
-    # much broader temporary bootstrap service client. Customer profiles keep
-    # this false and use their reviewed Keycloak break-glass process.
-    retain_bootstrap_admin_user: bool = Field(
-        default=False, alias="RETAIN_BOOTSTRAP_ADMIN_USER"
-    )
     # Durable group-gated Keycloak administration. During the one-time
     # bootstrap window the rotator provisions a marked master-realm
     # administrators group carrying master's composite admin role plus a
     # marked break-glass user whose generated password is escrowed in Vault
-    # before the account is enabled. Unlike RETAIN_BOOTSTRAP_ADMIN_USER this
-    # applies to every profile: without it no interactive Keycloak
-    # administrator exists after the temporary principals are deleted.
+    # before the account is enabled. This applies to every profile: without
+    # it no interactive Keycloak administrator exists after the temporary
+    # principals are deleted.
     break_glass_admin_enabled: bool = Field(
         default=True, alias="BREAK_GLASS_ADMIN_ENABLED"
     )
@@ -283,40 +270,7 @@ class Settings(BaseSettings):
         default="anthropic-token-broker", alias="WIF_BROKER_CLIENT_ID"
     )
 
-    # Lab-only AD federation. Generic/customer deployments leave this false
-    # and configure their real directory through a separately reviewed
-    # deployment overlay. The URL and DNs are not browser input, preventing
-    # the setup wizard from becoming an LDAP SSRF primitive.
-    lab_samba_ldap_enabled: bool = Field(
-        default=False, alias="LAB_SAMBA_LDAP_ENABLED"
-    )
-    # FQDN, never the bare `samba-ad` container name: the lab DC's LDAPS leaf is
-    # issued from the customer (Aegis) CA, whose critical name constraints
-    # forbid a bare-hostname SAN, so hostname verification is only meaningful
-    # against samba-ad.<lab-domain>. The committed lab domain is
-    # aigw.aegisgroup.ch; the Compose lab overlay renders this from ${DOMAIN}.
-    lab_samba_ldap_url: str = Field(
-        default="ldaps://samba-ad.aigw.aegisgroup.ch:636", alias="LAB_SAMBA_LDAP_URL"
-    )
-    lab_samba_users_dn: str = Field(
-        # Human lab identities live in a dedicated OU.  Using AD's broad
-        # built-in CN=Users container also imports the domain Administrator
-        # and other system principals into Keycloak's assignable user list.
-        default="OU=AIGWUsers,DC=lab,DC=aigw,DC=internal",
-        alias="LAB_SAMBA_USERS_DN",
-    )
-    lab_samba_bind_dn: str = Field(
-        default="CN=svc-keycloak-ldap,CN=Users,DC=lab,DC=aigw,DC=internal",
-        alias="LAB_SAMBA_BIND_DN",
-    )
-    lab_samba_bind_password_file: str = Field(
-        default="/run/secrets/samba_keycloak_bind_password",
-        alias="LAB_SAMBA_BIND_PASSWORD_FILE",
-    )
-
-    # Production external directory federation. Mutually exclusive with the lab
-    # Samba path; the reserved lab provider name is refused here so a production
-    # converge can never adopt the lab component identity. Every value is
+    # Production external directory federation. Every value is
     # inventory-owned and reaches this service only through Ansible-rendered
     # Compose environment, except the bind credential, which is read from a
     # root-owned file bind-mounted at IDENTITY_LDAP_BIND_PASSWORD_FILE.
@@ -379,13 +333,6 @@ class Settings(BaseSettings):
         default=300, alias="JWKS_WATCH_INTERVAL_SECONDS"
     )
 
-    # OpenAI orphaned-credential cleanup pass: how often to retry deleting /
-    # verifying revocation of service accounts left behind by a rotation
-    # whose old-account teardown failed.
-    openai_orphan_cleanup_interval_seconds: int = Field(
-        default=3600, alias="OPENAI_ORPHAN_CLEANUP_INTERVAL_SECONDS"
-    )
-
     # Direct Keycloak ADM-console mutations are intentionally possible for
     # break-glass administration.  Reconcile portal-issued static LiteLLM
     # keys against live managed-project membership on this bounded cadence so
@@ -416,9 +363,8 @@ class Settings(BaseSettings):
         default="http://alloy:4318", alias="OTEL_EXPORTER_OTLP_ENDPOINT"
     )
 
-    # Pinned egress forward proxy (Envoy). All Anthropic/OpenAI calls route
-    # through path-based mappings on this base URL — see anthropic_base /
-    # openai_base below.
+    # Pinned egress reverse proxy (Envoy). Anthropic calls route through the
+    # reviewed path mapping on this base URL; see anthropic_base below.
     egress_base: str = Field(default="http://envoy-egress:8080", alias="EGRESS_BASE")
 
     # REQUIRED shared-secret header check (X-Internal-Auth). The service
@@ -532,6 +478,15 @@ class Settings(BaseSettings):
             raise ValueError("AIGW_DOMAIN is not a canonical lowercase DNS name")
         return value
 
+    @model_validator(mode="after")
+    def validate_wif_public_domain(self) -> "Settings":
+        expected = f"https://idp.wif.{self.aigw_domain}"
+        if self.wif_keycloak_public_url != expected:
+            raise ValueError(
+                "WIF_KEYCLOAK_PUBLIC_URL must be https://idp.wif.<AIGW_DOMAIN>"
+            )
+        return self
+
     @field_validator(
         "identity_controller_key_vault_path",
         "identity_state_vault_path",
@@ -546,19 +501,12 @@ class Settings(BaseSettings):
             raise ValueError(f"{info.field_name} must be a canonical Vault KV path")
         return value
 
-    @field_validator("lab_samba_ldap_url")
-    @classmethod
-    def validate_lab_ldap_url(cls, value: str) -> str:
-        return _validate_ldaps_origin(value, "LAB_SAMBA_LDAP_URL")
-
     @field_validator(
-        "lab_samba_users_dn",
-        "lab_samba_bind_dn",
         "identity_ldap_users_dn",
         "identity_ldap_bind_dn",
     )
     @classmethod
-    def validate_lab_dns(cls, value: str, info) -> str:
+    def validate_ldap_dns(cls, value: str, info) -> str:
         # The external directory DNs are empty when the feature is disabled;
         # validate_ldap_federation_boundary enforces non-empty when enabled.
         if not value and info.field_name.startswith("identity_ldap"):
@@ -569,11 +517,9 @@ class Settings(BaseSettings):
             raise ValueError(f"{info.field_name} must be an explicit LDAP DN")
         return value
 
-    @field_validator(
-        "lab_samba_bind_password_file", "identity_ldap_bind_password_file"
-    )
+    @field_validator("identity_ldap_bind_password_file")
     @classmethod
-    def validate_lab_bind_password_file(cls, value: str, info) -> str:
+    def validate_ldap_bind_password_file(cls, value: str, info) -> str:
         if not re.fullmatch(r"/run/secrets/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
             raise ValueError(
                 f"{info.field_name} must name a file under /run/secrets"
@@ -584,12 +530,9 @@ class Settings(BaseSettings):
     def validate_ldap_federation_boundary(self) -> "Settings":
         """Fail closed on any ambiguous or unsafe directory federation input.
 
-        Exactly one LDAP federation source may be enabled: the lab Samba
-        overlay and the production external directory would otherwise contend
-        for the Keycloak truststore and the same reconciliation inputs.
+        The production directory must be unambiguous, LDAPS-only, and bounded
+        to inventory-owned reconciliation inputs.
         """
-        if self.identity_ldap_enabled and self.lab_samba_ldap_enabled:
-            raise ValueError("exactly one LDAP federation source may be enabled")
         if not self.identity_ldap_enabled:
             return self
 
@@ -622,12 +565,6 @@ class Settings(BaseSettings):
 
         if _LDAP_PROVIDER_NAME_RE.fullmatch(self.identity_ldap_provider_name) is None:
             raise ValueError("IDENTITY_LDAP_PROVIDER_NAME contains unsupported characters")
-        if self.identity_ldap_provider_name == LAB_LDAP_PROVIDER_NAME:
-            raise ValueError(
-                "IDENTITY_LDAP_PROVIDER_NAME must not reuse the reserved lab "
-                "federation provider name"
-            )
-
         if self.identity_ldap_vendor not in {"ad", "rhds", "other"}:
             raise ValueError("IDENTITY_LDAP_VENDOR is not a supported directory vendor")
         for field_name, alias in (
@@ -768,16 +705,6 @@ class Settings(BaseSettings):
         at envoy-egress. Never call api.anthropic.com directly.
         """
         return f"{self.egress_base.rstrip('/')}/anthropic"
-
-    @property
-    def openai_base(self) -> str:
-        """OpenAI API, routed through the pinned egress proxy.
-
-        {EGRESS_BASE}/openai/... maps to https://api.openai.com/... at
-        envoy-egress. Never call api.openai.com directly.
-        """
-        return f"{self.egress_base.rstrip('/')}/openai"
-
 
 @lru_cache
 def get_settings() -> Settings:

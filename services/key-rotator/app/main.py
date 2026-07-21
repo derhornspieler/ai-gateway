@@ -28,7 +28,6 @@ from app import health
 from app.config import Settings, get_settings
 from app.db import Database
 from app.drivers.anthropic_wif import AnthropicWifDriver
-from app.drivers.openai_svcacct import OpenAISvcAcctDriver
 from app.drivers.static_seed import StaticSeedDriver
 from app.litellm_client import LiteLLMClient
 from app.identity import (
@@ -87,6 +86,10 @@ class SettingsUpdate(BaseModel):
 
 
 class IdentityBootstrapRequest(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=32)
+
+
+class IdentityDeploymentRequest(BaseModel):
     confirmation: str = Field(min_length=1, max_length=32)
 
 
@@ -231,9 +234,7 @@ async def on_startup() -> None:
 
     drivers = {
         "anthropic": AnthropicWifDriver(),
-        "openai": OpenAISvcAcctDriver(),
         "static-anthropic": StaticSeedDriver("anthropic"),
-        "static-openai": StaticSeedDriver("openai"),
     }
     state["drivers"] = drivers
 
@@ -256,20 +257,17 @@ async def on_startup() -> None:
 
     # Seed expected health subsystems in a "pending" (ok=False) state so
     # /healthz alerts_ok is not falsely green before each has run once.
-    # The two system jobs (JWKS watch, orphan cleanup) always run on their
-    # intervals; the per-vendor rotation subsystems are only seeded when
+    # The JWKS system job always runs on its interval. The per-vendor rotation
+    # subsystem is only seeded when
     # that vendor is enabled (a disabled vendor is not expected to run, so
     # it should not hold health red forever).
     health.register_pending("anthropic.jwks")
-    health.register_pending("openai.orphaned_credentials")
     try:
         rows_by_vendor = {r["vendor"]: r for r in await db.list_settings()}
     except Exception:  # noqa: BLE001
         rows_by_vendor = {}
     if rows_by_vendor.get("anthropic", {}).get("enabled"):
         health.register_pending("anthropic.token_exchange")
-    if rows_by_vendor.get("openai", {}).get("enabled"):
-        health.register_pending("openai.rotation")
 
     logger.info("key-rotator startup complete (db_degraded=%s)", db.degraded)
 
@@ -334,8 +332,11 @@ async def get_status() -> list[dict[str, Any]]:
     scheduler: RotationScheduler = state["scheduler"]
 
     rows = await db.list_settings()
+    drivers: dict[str, Any] = state["drivers"]
     result: list[dict[str, Any]] = []
     for row in rows:
+        if row["vendor"] not in drivers:
+            continue
         last = await db.last_history(row["vendor"])
         next_run = scheduler.next_run_time(row["vendor"])
         result.append(
@@ -368,7 +369,10 @@ async def get_alerts() -> list[dict[str, Any]]:
 @app.get("/settings")
 async def get_all_settings() -> list[dict[str, Any]]:
     db: Database = state["db"]
-    return await db.list_settings()
+    drivers: dict[str, Any] = state["drivers"]
+    return [
+        row for row in await db.list_settings() if row["vendor"] in drivers
+    ]
 
 
 @app.put("/settings/{vendor}")
@@ -599,6 +603,24 @@ async def identity_bootstrap(body: IdentityBootstrapRequest) -> dict[str, Any]:
         return await identity.bootstrap()
     except IdentityError as exc:
         raise _identity_http_error(exc) from exc
+
+
+@app.post("/identity/deployment")
+async def identity_deployment(body: IdentityDeploymentRequest) -> dict[str, str]:
+    """Ansible-only, locked and idempotent Keycloak/LDAPS converge."""
+
+    if not hmac.compare_digest(body.confirmation, "AUTO_BOOTSTRAP_IDENTITY"):
+        raise HTTPException(status_code=400, detail="invalid deployment confirmation")
+    identity: KeycloakAdmin = state["identity"]
+    try:
+        return {"result": await identity.converge_deployment_identity()}
+    except IdentityError as exc:
+        # This endpoint exists only for unattended deployment. Keep its
+        # response fixed so a wrapped directory or Vault diagnostic can never
+        # become Ansible output, even if a future IdentityError is less careful.
+        raise HTTPException(
+            status_code=502, detail="identity deployment failed"
+        ) from exc
 
 
 @app.get("/identity/groups")

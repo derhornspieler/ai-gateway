@@ -5,6 +5,10 @@ paid for it? Is LiteLLM Kubernetes capable?" — expanded to the whole stack, wi
 an Envoy AI Gateway comparison for a Kubernetes-shaped future and license-cost
 estimates for planning.
 
+> **Historical research:** Component versions and telemetry routes on this page
+> are not operational guidance. Current Cribl scope is the curated log-only
+> contract in [Cribl SOC logging handoff](../cribl-soc-handoff.md).
+
 **Status of numbers:** feature claims verified against the repo and vendor docs
 where marked; prices are list where public, otherwise labeled *reported* or
 *quote-only*. Confirm every number with the vendor before budgeting — this doc
@@ -52,13 +56,9 @@ attacks the custom Python surface we maintain, not just a feature checkbox.
   model groups sees nothing).
 - **Virtual-key rotation half of key-rotator** → scheduled key rotations
   (enterprise) + audit logs (enterprise).
-- **Prometheus `/metrics`** → enterprise-gated endpoint becomes available;
-  today's workaround (OTel callback → Alloy → Cribl spans + the Loki
-  `aigw-requests` stream; edge metrics from
-  Traefik/Envoy; no `litellm` scrape job in `compose/prometheus/prometheus.yml`)
-  stops being the only source of request metrics. *(Implemented 2026-07-17:
-  Tempo has since been removed — traces go to Cribl only and the local
-  per-request audit lives in the Loki `aigw-requests` stream.)*
+- **Prometheus `/metrics`** → enterprise-gated endpoint becomes available.
+  The current free-tier path derives local request metrics and one sanitized
+  request log from the LiteLLM span. Raw spans and metrics never enter Cribl.
 - **JWT auth** (enterprise) → API callers could present Keycloak-issued JWTs
   instead of static `sk-` keys — a posture upgrade nothing in the current
   stack offers.
@@ -119,17 +119,15 @@ owner has ruled out.
 
 **Follow-on facts verified for the owner's side questions:**
 
-- *"If we enable OpenAI through LiteLLM, do the portals pick it up?"* — Yes,
-  automatically. Both portals enumerate models live from LiteLLM `/v1/models`
-  (`services/dev-portal/app/litellm_client.py`); nothing is hardcoded. Add the
-  OpenAI model block + credential and converge; gpt models appear as admin
-  checkboxes and in developer tables with no portal change.
+- *"Would the portals discover a future provider through LiteLLM?"* — Yes,
+  after that provider passes the catalog, CA review, offline-release, and
+  preprod gates. Both portals enumerate models live from LiteLLM `/v1/models`
+  (`services/dev-portal/app/litellm_client.py`); nothing is hardcoded. Anthropic
+  is the only approved outbound provider today.
 - *"We pull logs via OTel because Prometheus export is enterprise, right?"* —
-  Correct in substance: LiteLLM's `/metrics` is enterprise-gated, so the
-  free-tier design uses the OTel callback (spans → Alloy → Cribl, with
-  key/project attribution and, since 2026-07-17, a derived per-request Loki
-  stream instead of local Tempo) and container logs → Loki. Request metrics
-  today come from the Traefik/Envoy edges, not from LiteLLM itself.
+  Correct in substance: LiteLLM's `/metrics` is enterprise-gated. Alloy derives
+  local metrics and a request-audit log from LiteLLM OTLP. Only the sanitized
+  log may enter the curated Cribl SOC feed.
 
 ---
 

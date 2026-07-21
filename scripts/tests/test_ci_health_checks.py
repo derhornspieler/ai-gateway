@@ -101,7 +101,7 @@ class RuntimeCanaryMatchesTheVerifyRole(unittest.TestCase):
         # `--profile` may be discussed in a comment, but must never be an argv token.
         self.assertNotIn('"--profile"', source)
         # A default service whose overlay dependency is profile-gated: the exact
-        # shape of the lab overlay's keycloak -> samba-ad edge.
+        # shape of local preprod's keycloak -> samba-ad edge.
         self.assertIn(f"profiles: [{CANARY.GATED_PROFILE}]", CANARY.OVERLAY_COMPOSE)
         self.assertIn("condition: service_started", CANARY.OVERLAY_COMPOSE)
 

@@ -7,7 +7,7 @@ absolute ceiling so no app session can outlive the SSO session that minted it
 by more than the cap:
 
 - Keycloak realm: ssoSessionIdleTimeout=28800 (8h), ssoSessionMaxLifespan=36000
-  (10h) in BOTH realm sources (the Ansible template that converges the lab and
+  (10h) in BOTH realm sources (the Ansible template used for deployment and
   the compose example copy that validate-compose renders).
 - oauth2-proxy apps (litellm-admin, grafana, prometheus, vault): cookie expires
   at 10h; the 5m cookie refresh re-validates against Keycloak, which is what

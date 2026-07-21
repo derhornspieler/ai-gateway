@@ -1,8 +1,7 @@
 # Production external directory (LDAPS) overlay.
 #
-# Loaded by Ansible only when identity_ldap_enabled=true and never together
-# with docker-compose.lab.yml: exactly one identity source may own the
-# Keycloak truststore and the federation reconciliation inputs.
+# Loaded by Ansible only when identity_ldap_enabled=true. One identity source
+# owns the Keycloak truststore and federation reconciliation inputs.
 
 networks:
   net-internal:

@@ -12,13 +12,9 @@ from pydantic import ValidationError
 from app import health
 from app import vault_client as vault_client_module
 from app.config import Settings
-from app.db import Database
+from app.db import Database, RETIRED_SETTINGS_VENDORS
 from app.drivers.anthropic_wif import AnthropicWifDriver
 from app.drivers.base import DriverContext, RotationResult
-from app.drivers.openai_svcacct import (
-    PENDING_PROMOTION_FIELD,
-    OpenAISvcAcctDriver,
-)
 from app.drivers.static_seed import StaticSeedDriver, VAULT_RETRY_SECONDS
 from app.identity import IdentityError
 from app.main import SettingsUpdate, app, readyz, state
@@ -105,23 +101,17 @@ def test_keycloak_bootstrap_url_is_same_origin_and_canonical() -> None:
 
 def test_keycloak_assertion_audiences_follow_each_realm_frontend() -> None:
     cfg = settings(
-        KEYCLOAK_PUBLIC_URL="https://auth.aigw.aegisgroup.ch",
-        WIF_KEYCLOAK_PUBLIC_URL="https://idp.wif-a.example.invalid",
+        KEYCLOAK_PUBLIC_URL="https://auth.aigw.internal",
+        WIF_KEYCLOAK_PUBLIC_URL="https://idp.wif.aigw.example.internal",
     )
     assert cfg.keycloak_assertion_audience("aigw") == (
-        "https://auth.aigw.aegisgroup.ch/realms/aigw/protocol/openid-connect/token"
+        "https://auth.aigw.internal/realms/aigw/protocol/openid-connect/token"
     )
     internal = "http://keycloak:8080/realms/anthropic-wif/protocol/openid-connect/token"
     assert cfg.keycloak_assertion_audience_for_token_url(internal) == (
-        "https://idp.wif-a.example.invalid/realms/anthropic-wif/"
+        "https://idp.wif.aigw.example.internal/realms/anthropic-wif/"
         "protocol/openid-connect/token"
     )
-
-
-def test_lab_directory_defaults_to_dedicated_human_users_ou() -> None:
-    cfg = settings()
-    assert cfg.lab_samba_users_dn == "OU=AIGWUsers,DC=lab,DC=aigw,DC=internal"
-    assert "CN=Users" not in cfg.lab_samba_users_dn
 
 
 def test_outbound_path_segments_cannot_escape_endpoint() -> None:
@@ -353,8 +343,8 @@ async def test_auth_fails_closed_and_public_health_redacts_details() -> None:
         state.clear()
         health._flags.clear()
         health.set_alert(
-            "openai.rotation",
-            "vault=http://vault:8200 account=svcacct_sensitive internal-only detail",
+            "anthropic.rotation",
+            "vault=http://vault:8200 token=credential_sensitive internal-only detail",
         )
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
@@ -363,7 +353,7 @@ async def test_auth_fails_closed_and_public_health_redacts_details() -> None:
             health_response = await client.get("/healthz")
             assert health_response.status_code == 200
             assert health_response.json() == {"ok": True, "alerts_ok": False}
-            assert "svcacct_sensitive" not in health_response.text
+            assert "credential_sensitive" not in health_response.text
             assert health_response.headers["cache-control"] == "no-store"
 
             # Before startup has installed valid settings, protected routes
@@ -446,24 +436,141 @@ async def test_portal_token_is_limited_to_exact_project_membership_reads() -> No
         state.update(old_state)
 
 
+@pytest.mark.asyncio
+async def test_identity_deployment_route_is_admin_only_confirmed_and_redacted() -> None:
+    old_state = dict(state)
+
+    class Identity:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.fail = False
+
+        async def converge_deployment_identity(self):
+            self.calls += 1
+            if self.fail:
+                raise IdentityError("secret LDAP bind password from upstream")
+            return "verified"
+
+    identity = Identity()
+    try:
+        cfg = settings()
+        state.clear()
+        state.update({"settings": cfg, "identity": identity})
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rotator"
+        ) as client:
+            body = {"confirmation": "AUTO_BOOTSTRAP_IDENTITY"}
+            assert (
+                await client.post("/identity/deployment", json=body)
+            ).status_code == 401
+            portal = await client.post(
+                "/identity/deployment",
+                headers={"X-Internal-Auth": cfg.portal_identity_token},
+                json=body,
+            )
+            assert portal.status_code == 401
+
+            admin_headers = {"X-Internal-Auth": cfg.rotator_internal_token}
+            invalid = await client.post(
+                "/identity/deployment",
+                headers=admin_headers,
+                json={"confirmation": "INITIALIZE"},
+            )
+            assert invalid.status_code == 400
+            assert identity.calls == 0
+
+            verified = await client.post(
+                "/identity/deployment", headers=admin_headers, json=body
+            )
+            assert verified.status_code == 200
+            assert verified.json() == {"result": "verified"}
+            assert verified.headers["cache-control"] == "no-store"
+
+            identity.fail = True
+            failed = await client.post(
+                "/identity/deployment", headers=admin_headers, json=body
+            )
+            assert failed.status_code == 502
+            assert failed.json() == {"detail": "identity deployment failed"}
+            assert "password" not in failed.text
+    finally:
+        state.clear()
+        state.update(old_state)
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_is_hidden_and_rejected_for_brownfield_rows() -> None:
+    class BrownfieldDB:
+        async def list_settings(self):
+            return [
+                {
+                    "vendor": "anthropic",
+                    "enabled": False,
+                    "interval_seconds": 3000,
+                    "grace_seconds": 300,
+                    "config": {},
+                },
+                {
+                    "vendor": "openai",
+                    "enabled": True,
+                    "interval_seconds": 3600,
+                    "grace_seconds": 300,
+                    "config": {"legacy": True},
+                },
+            ]
+
+        async def last_history(self, _vendor):
+            return None
+
+    class BrownfieldScheduler:
+        def next_run_time(self, _vendor):
+            return None
+
+        def is_rotating(self, _vendor):
+            return False
+
+    old_state = dict(state)
+    try:
+        state.clear()
+        state.update(
+            {
+                "settings": settings(),
+                "db": BrownfieldDB(),
+                "scheduler": BrownfieldScheduler(),
+                "drivers": {"anthropic": object()},
+            }
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            headers = {"X-Internal-Auth": AUTH_TOKEN}
+            listed = await client.get("/settings", headers=headers)
+            status = await client.get("/status", headers=headers)
+            update = await client.put(
+                "/settings/openai",
+                headers=headers,
+                json={
+                    "enabled": True,
+                    "interval_seconds": 3600,
+                    "grace_seconds": 300,
+                },
+            )
+            rotate = await client.post("/rotate/openai", headers=headers)
+
+        assert [row["vendor"] for row in listed.json()] == ["anthropic"]
+        assert [row["vendor"] for row in status.json()] == ["anthropic"]
+        assert update.status_code == 404
+        assert rotate.status_code == 404
+    finally:
+        state.clear()
+        state.update(old_state)
+
+
 class FakeVault:
     def __init__(self) -> None:
-        self.docs = {
-            "ai-gateway/openai-admin": {
-                "admin_api_key": "admin-key",
-                "project_id": "proj_test",
-            },
-            "ai-gateway/vendors/openai": {
-                "api_key": "old-key",
-                "service_account_id": "svcacct_old",
-                "project_id": "proj_test",
-            },
-            "ai-gateway/openai-state": {
-                "service_account_id": "svcacct_old",
-                "project_id": "proj_test",
-                "orphans": [],
-            },
-        }
+        self.docs = {}
 
     def read(self, path):
         value = self.docs.get(path)
@@ -478,71 +585,12 @@ class FakeVault:
         return True
 
 
-class FlakyLiteLLM:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def upsert_credential(self, name, values):
-        self.calls += 1
-        if self.calls == 1:
-            # A timeout is ambiguous: LiteLLM may have applied the PATCH.
-            raise httpx.ReadTimeout("ambiguous promotion timeout")
-
-
 class FakeDB:
     def __init__(self) -> None:
         self.history = []
 
     async def record_history(self, *args):
         self.history.append(args)
-
-
-class DeterministicOpenAIDriver(OpenAISvcAcctDriver):
-    def __init__(self) -> None:
-        self.created = 0
-        self.deleted = []
-
-    async def _create_service_account(self, ctx, admin_key, project_id):
-        self.created += 1
-        return "svcacct_new", "new-key"
-
-    async def _canary_check(self, ctx, api_key):
-        return True
-
-    async def _delete_service_account(self, ctx, admin_key, project_id, sa_id):
-        self.deleted.append((project_id, sa_id))
-
-    async def _verify_old_key_revoked(self, ctx, old_key, max_attempts=5):
-        return True
-
-
-@pytest.mark.asyncio
-async def test_openai_ambiguous_promotion_resumes_same_tracked_account() -> None:
-    vault = FakeVault()
-    litellm = FlakyLiteLLM()
-    driver = DeterministicOpenAIDriver()
-    ctx = DriverContext(
-        settings=settings(),
-        vault=vault,
-        litellm=litellm,
-        db=FakeDB(),
-        vendor_settings={"enabled": True, "interval_seconds": 3600, "grace_seconds": 0},
-    )
-
-    first = await driver.rotate(ctx)
-    assert first.status == "failed"
-    pending = vault.docs["ai-gateway/openai-state"][PENDING_PROMOTION_FIELD]
-    assert pending["new_service_account_id"] == "svcacct_new"
-    assert pending["previous_service_account_id"] == "svcacct_old"
-    assert pending["previous_api_key"] == "old-key"
-
-    second = await driver.rotate(ctx)
-    assert second.status == "success"
-    assert driver.created == 1, "retry must not mint a second live account"
-    assert driver.deleted == [("proj_test", "svcacct_old")]
-    final_state = vault.docs["ai-gateway/openai-state"]
-    assert final_state["service_account_id"] == "svcacct_new"
-    assert PENDING_PROMOTION_FIELD not in final_state
 
 
 class SettingsDB:
@@ -554,7 +602,7 @@ class SettingsDB:
             return []
         return [
             {
-                "vendor": "openai",
+                "vendor": "anthropic",
                 "enabled": True,
                 "interval_seconds": 3600,
                 "grace_seconds": 0,
@@ -567,25 +615,25 @@ class SettingsDB:
 async def test_scheduler_reload_does_not_cancel_accepted_manual_job() -> None:
     db = SettingsDB()
     scheduler = RotationScheduler(
-        settings(), db, object(), object(), {"openai": object()}
+        settings(), db, object(), object(), {"anthropic": object()}
     )
-    manual_id = "rotate_openai_manual_test"
+    manual_id = "rotate_anthropic_manual_test"
     scheduler._scheduler.add_job(
         scheduler.run_rotation,
         trigger=DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(minutes=5)),
-        args=["openai"],
+        args=["anthropic"],
         id=manual_id,
     )
 
     await scheduler.reload()
 
     assert scheduler._scheduler.get_job(manual_id) is not None
-    assert scheduler._scheduler.get_job("rotate_openai") is not None
-    assert scheduler._lock_for("static-openai") is scheduler._lock_for("openai")
+    assert scheduler._scheduler.get_job("rotate_anthropic") is not None
+    assert scheduler._lock_for("static-anthropic") is scheduler._lock_for("anthropic")
 
     db.available = False
     await scheduler.reload()
-    assert scheduler._scheduler.get_job("rotate_openai") is not None
+    assert scheduler._scheduler.get_job("rotate_anthropic") is not None
 
 
 @pytest.mark.asyncio
@@ -688,7 +736,7 @@ class SelfDisablingDriver(SequenceDriver):
     async def rotate(self, ctx: DriverContext) -> RotationResult:
         self.calls += 1
         await ctx.db.upsert_settings(
-            "static-openai",
+            "static-anthropic",
             enabled=False,
             interval_seconds=0,
             grace_seconds=0,
@@ -701,7 +749,7 @@ class SelfDisablingDriver(SequenceDriver):
         )
 
 
-def zero_interval_row(vendor: str = "static-openai") -> dict:
+def zero_interval_row(vendor: str = "static-anthropic") -> dict:
     return {
         "vendor": vendor,
         "enabled": True,
@@ -718,7 +766,7 @@ def remove_canonical_job(scheduler: RotationScheduler, vendor: str) -> None:
 
 @pytest.mark.asyncio
 async def test_zero_interval_defers_while_vault_sealed_then_runs_once() -> None:
-    vendor = "static-openai"
+    vendor = "static-anthropic"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=False)
     driver = SequenceDriver(RotationResult(status="success", detail="seeded"))
@@ -753,7 +801,7 @@ async def test_zero_interval_defers_while_vault_sealed_then_runs_once() -> None:
 
 @pytest.mark.asyncio
 async def test_zero_interval_explicit_transient_retry_is_bounded_and_rearmed() -> None:
-    vendor = "static-openai"
+    vendor = "static-anthropic"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=True)
     driver = SequenceDriver(
@@ -782,7 +830,7 @@ async def test_zero_interval_explicit_transient_retry_is_bounded_and_rearmed() -
 
 @pytest.mark.asyncio
 async def test_zero_interval_generic_failure_does_not_retry_forever() -> None:
-    vendor = "static-openai"
+    vendor = "static-anthropic"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=True)
     driver = SequenceDriver(
@@ -803,7 +851,7 @@ async def test_zero_interval_generic_failure_does_not_retry_forever() -> None:
 
 @pytest.mark.asyncio
 async def test_zero_interval_reload_does_not_duplicate_deferred_job() -> None:
-    vendor = "static-openai"
+    vendor = "static-anthropic"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=False)
     driver = SequenceDriver(RotationResult(status="success"))
@@ -826,7 +874,7 @@ async def test_zero_interval_reload_does_not_duplicate_deferred_job() -> None:
 
 @pytest.mark.asyncio
 async def test_zero_interval_success_self_disable_allows_later_reenable() -> None:
-    vendor = "static-openai"
+    vendor = "static-anthropic"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=True)
     driver = SelfDisablingDriver(RotationResult(status="success"))
@@ -847,7 +895,7 @@ async def test_zero_interval_success_self_disable_allows_later_reenable() -> Non
 
 @pytest.mark.asyncio
 async def test_manual_self_disable_clears_latch_before_later_reenable() -> None:
-    vendor = "static-openai"
+    vendor = "static-anthropic"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=True)
     driver = SelfDisablingDriver(RotationResult(status="success"))
@@ -878,7 +926,7 @@ async def test_manual_self_disable_clears_latch_before_later_reenable() -> None:
 
 @pytest.mark.asyncio
 async def test_self_disable_settings_read_loss_defers_gated_reconciliation() -> None:
-    vendor = "static-openai"
+    vendor = "static-anthropic"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=True)
 
@@ -979,7 +1027,7 @@ async def test_dynamic_rearm_survives_transient_latest_settings_failure() -> Non
 
 @pytest.mark.asyncio
 async def test_zero_interval_dynamic_result_cannot_undo_inflight_disable() -> None:
-    vendor = "static-openai"
+    vendor = "static-anthropic"
     db = SchedulerDB(zero_interval_row(vendor))
     vault = SchedulerVault(ready=True)
 
@@ -1008,15 +1056,15 @@ async def test_static_seed_marks_only_vault_error_for_bounded_retry() -> None:
         def read(self, path: str):
             raise VaultError("sealed")
 
-    db = SchedulerDB(zero_interval_row("static-openai"))
+    db = SchedulerDB(zero_interval_row("static-anthropic"))
     ctx = DriverContext(
         settings=settings(),
         vault=SealedVault(),
         litellm=object(),
         db=db,
-        vendor_settings=zero_interval_row("static-openai"),
+        vendor_settings=zero_interval_row("static-anthropic"),
     )
-    result = await StaticSeedDriver("openai").rotate(ctx)
+    result = await StaticSeedDriver("anthropic").rotate(ctx)
 
     assert result.status == "failed"
     assert result.next_run_seconds == VAULT_RETRY_SECONDS
@@ -1031,22 +1079,22 @@ async def test_static_seed_success_explicitly_reports_self_disable() -> None:
 
     class RecordingLiteLLM:
         async def upsert_credential(self, name: str, values: dict) -> None:
-            assert name == "openai-primary"
+            assert name == "anthropic-primary"
             assert values == {"api_key": "static-test-key"}
 
-    db = SchedulerDB(zero_interval_row("static-openai"))
+    db = SchedulerDB(zero_interval_row("static-anthropic"))
     ctx = DriverContext(
         settings=settings(),
         vault=SeedVault(),
         litellm=RecordingLiteLLM(),
         db=db,
-        vendor_settings=zero_interval_row("static-openai"),
+        vendor_settings=zero_interval_row("static-anthropic"),
     )
-    result = await StaticSeedDriver("openai").rotate(ctx)
+    result = await StaticSeedDriver("anthropic").rotate(ctx)
 
     assert result.status == "success"
     assert result.settings_self_disabled is True
-    assert db.rows["static-openai"]["enabled"] is False
+    assert db.rows["static-anthropic"]["enabled"] is False
 
 
 def test_settings_update_omission_preserves_driver_config_contract() -> None:
@@ -1079,6 +1127,21 @@ class RecordingConnection:
 
     def cursor(self):
         return self.cursor_obj
+
+
+@pytest.mark.asyncio
+async def test_brownfield_openai_rows_are_disabled_without_deletion() -> None:
+    db = Database(settings())
+    conn = RecordingConnection()
+    db._conn = conn
+
+    await db._disable_retired_settings()
+
+    sql, params = conn.cursor_obj.calls[-1]
+    assert sql.startswith("UPDATE rotator_settings")
+    assert "SET enabled = false" in sql
+    assert "DELETE" not in sql
+    assert params == (list(RETIRED_SETTINGS_VENDORS),)
 
 
 @pytest.mark.asyncio
@@ -1238,60 +1301,3 @@ async def test_anthropic_failure_keeps_retry_deadline_when_state_db_is_down() ->
     assert result.status == "failed"
     assert result.next_run_seconds is not None
     assert 0 < result.next_run_seconds <= 1800
-
-
-@pytest.mark.asyncio
-async def test_openai_project_change_revokes_old_account_in_original_project() -> None:
-    vault = FakeVault()
-    vault.docs["ai-gateway/openai-admin"]["project_id"] = "proj_new"
-    vault.docs["ai-gateway/vendors/openai"]["project_id"] = "proj_old"
-    vault.docs["ai-gateway/openai-state"]["project_id"] = "proj_old"
-    driver = DeterministicOpenAIDriver()
-    ctx = DriverContext(
-        settings=settings(),
-        vault=vault,
-        litellm=FlakyLiteLLM(),
-        db=FakeDB(),
-        vendor_settings={"enabled": True, "interval_seconds": 3600, "grace_seconds": 0},
-    )
-    # This test is about project ownership, not an ambiguous LiteLLM timeout.
-    ctx.litellm.calls = 1
-
-    result = await driver.rotate(ctx)
-
-    assert result.status == "success"
-    assert driver.deleted == [("proj_old", "svcacct_old")]
-    assert vault.docs["ai-gateway/openai-state"]["project_id"] == "proj_new"
-
-
-class CanaryFailureDriver(DeterministicOpenAIDriver):
-    async def _canary_check(self, ctx, api_key):
-        return False
-
-    async def _verify_old_key_revoked(self, ctx, old_key, max_attempts=5):
-        return False
-
-
-@pytest.mark.asyncio
-async def test_canary_failed_key_is_tracked_until_revocation_is_verified() -> None:
-    vault = FakeVault()
-    driver = CanaryFailureDriver()
-    ctx = DriverContext(
-        settings=settings(),
-        vault=vault,
-        litellm=object(),
-        db=FakeDB(),
-        vendor_settings={"enabled": True, "interval_seconds": 3600, "grace_seconds": 0},
-    )
-
-    result = await driver.rotate(ctx)
-
-    assert result.status == "failed"
-    orphan = vault.docs["ai-gateway/openai-state"]["orphans"][-1]
-    assert orphan == {
-        "service_account_id": "svcacct_new",
-        "api_key": "new-key",
-        "project_id": "proj_test",
-        "deleted": True,
-        "first_seen": orphan["first_seen"],
-    }

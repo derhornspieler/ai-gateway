@@ -21,15 +21,15 @@ class DeployedIdentityPolicyValidationTests(unittest.TestCase):
         self.root = Path(temporary.name)
         (self.root / "scripts").mkdir()
         (self.root / "keycloak").mkdir()
-        (self.root / "services" / "samba-ad-lab").mkdir(parents=True)
+        (self.root / "services" / "samba-ad-preprod").mkdir(parents=True)
         shutil.copy2(VALIDATOR, self.root / "scripts" / VALIDATOR.name)
         shutil.copytree(
             ROOT / "compose" / "keycloak" / "realms",
             self.root / "keycloak" / "realms",
         )
         shutil.copy2(
-            ROOT / "services" / "samba-ad-lab" / "samba-ad-entrypoint",
-            self.root / "services" / "samba-ad-lab" / "samba-ad-entrypoint",
+            ROOT / "services" / "samba-ad-preprod" / "samba-ad-entrypoint",
+            self.root / "services" / "samba-ad-preprod" / "samba-ad-entrypoint",
         )
 
     def run_validator(self, domain: str | None) -> subprocess.CompletedProcess[str]:
@@ -63,7 +63,7 @@ class DeployedIdentityPolicyValidationTests(unittest.TestCase):
         self.assertIn("disagree", mismatched.stderr)
 
     def test_unsafe_explicit_domain_is_rejected(self) -> None:
-        result = self.run_validator("aigw.aegisgroup.ch\nINJECTED=value")
+        result = self.run_validator("aigw.internal\nINJECTED=value")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("safe DNS name", result.stderr)
 

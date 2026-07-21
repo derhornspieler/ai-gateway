@@ -41,7 +41,7 @@ datasources:
       maxOpenConns: 4
       maxIdleConns: 2
       connMaxLifetime: 14400
-      postgresVersion: 1600
+      postgresVersion: 1800
       timescaledb: false
     secureJsonData:
       password: $__env{AIGW_PG_GRAFANA_RO_PASSWORD}

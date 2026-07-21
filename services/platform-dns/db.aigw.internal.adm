@@ -1,0 +1,27 @@
+$ORIGIN aigw.internal.
+$TTL 60
+
+@       IN SOA  dns.aigw.internal. hostmaster.aigw.internal. (
+                    2026071303 ; serial
+                    3600       ; refresh
+                    900        ; retry
+                    604800     ; expire
+                    60         ; negative cache TTL
+                )
+        IN NS   dns.aigw.internal.
+        IN A    10.8.10.10
+
+; ADM-view administration surfaces terminate only on the ADM host-only NIC.
+dns          IN A 10.8.10.10
+admin        IN A 10.8.10.10
+litellm-admin IN A 10.8.10.10
+grafana      IN A 10.8.10.10
+prometheus   IN A 10.8.10.10
+vault        IN A 10.8.10.10
+auth         IN A 10.8.10.10
+chat         IN A 10.8.10.10
+
+; The developer portal and inference API remain on the internal edge even for
+; a workstation whose DNS query arrives through the ADM scoped resolver.
+api          IN A 10.20.0.10
+portal       IN A 10.20.0.10

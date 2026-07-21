@@ -10,9 +10,6 @@ class DnsPlaneContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.group_vars = (ROOT / "ansible/group_vars/all.yml").read_text()
-        cls.lab_vars = (
-            ROOT / "ansible/inventory/host_vars/lab-aigw01.yml"
-        ).read_text()
         cls.site = (ROOT / "ansible/site.yml").read_text()
         cls.os_prep = (ROOT / "ansible/os-prep.yml").read_text()
         cls.stack = (
@@ -22,7 +19,6 @@ class DnsPlaneContractTests(unittest.TestCase):
         cls.platform_compose = (
             ROOT / "compose/docker-compose.platform-dns.yml"
         ).read_text()
-        cls.lab_compose = (ROOT / "compose/docker-compose.lab.yml").read_text()
         cls.dns_overlay = (
             ROOT
             / "ansible/roles/docker_stack/templates/docker-compose.dns.yml.j2"
@@ -46,7 +42,7 @@ class DnsPlaneContractTests(unittest.TestCase):
 
     def test_legacy_shared_resolver_contract_is_gone(self) -> None:
         checked = "\n".join(
-            [self.group_vars, self.lab_vars, self.site, self.os_prep,
+            [self.group_vars, self.site, self.os_prep,
              self.compose,
              self.dns_overlay, self.env_example, self.iptables, self.nft]
         ).lower()
@@ -64,17 +60,9 @@ class DnsPlaneContractTests(unittest.TestCase):
         self.assertNotIn("lab_dns_enabled", ansible_sources)
         for source in (self.stack, self.iptables, self.nft):
             self.assertIn("platform_authoritative_dns_enabled", source)
-        self.assertIn("  lab-dns:", self.platform_compose)
-        self.assertNotIn("  lab-dns:", self.lab_compose)
+        self.assertIn("  platform-dns:", self.platform_compose)
+        self.assertNotIn("  lab-dns:", self.platform_compose)
         self.assertIn("docker-compose.platform-dns.yml", self.stack)
-
-    def test_lab_compose_argv_activates_the_literal_lab_profile(self) -> None:
-        selector = self.stack.split(
-            "aigw_compose_cli_overlay_args:", 1
-        )[1].split("\n\n", 1)[0]
-        self.assertIn("+ (['--profile', 'lab-ad']", selector)
-        self.assertNotIn("regex_replace", selector)
-        self.assertNotIn("\\\\1", selector)
 
     def test_env_never_persists_an_implicit_compose_profile(self) -> None:
         compose_file_lines = [
@@ -171,20 +159,20 @@ class DnsPlaneContractTests(unittest.TestCase):
                 source,
             )
             self.assertNotIn(
-                "net.name not in ['net-egress', 'net-lab-dns']", source
+                "net.name not in ['net-egress', 'net-platform-dns']", source
             )
         self.assertIn("-d {{ resolver }}/32 -o {{ nic_egress }}", self.iptables)
         self.assertIn('oifname "{{ nic_egress }}" ip saddr {{ envoy_egress_ip }}', self.nft)
 
     def test_platform_dns_has_exact_reply_rules_before_cross_bridge_drop(self) -> None:
         iptables_reply = (
-            "-A DOCKER-USER -i br-lab-dns -o {{ net.bridge }} "
-            "-s {{ lab_dns_ip }}/32 -p udp --sport 53 -m conntrack "
+            "-A DOCKER-USER -i br-platform-dns -o {{ net.bridge }} "
+            "-s {{ platform_dns_ip }}/32 -p udp --sport 53 -m conntrack "
             "--ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN"
         )
         nft_reply = (
-            'iifname "br-lab-dns" oifname "{{ net.bridge }}" '
-            "ip saddr {{ lab_dns_ip }} udp sport 53 ct state "
+            'iifname "br-platform-dns" oifname "{{ net.bridge }}" '
+            "ip saddr {{ platform_dns_ip }} udp sport 53 ct state "
             "established,related ct direction reply accept"
         )
         iptables_tcp_reply = iptables_reply.replace(
@@ -246,11 +234,11 @@ class DnsPlaneContractTests(unittest.TestCase):
         self.assertNotRegex(core, r"(?m)^\s*forward(?:\s|$)")
         internal = (
             ROOT
-            / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.j2"
+            / "ansible/roles/docker_stack/templates/db.aigw.internal.j2"
         ).read_text()
         adm = (
             ROOT
-            / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.adm.j2"
+            / "ansible/roles/docker_stack/templates/db.aigw.internal.adm.j2"
         ).read_text()
         # Owner decision: chat is dual-homed. The internal view resolves it to
         # the internal edge for LAN users; the ADM view keeps the VPN path.
@@ -304,12 +292,12 @@ class DnsPlaneContractTests(unittest.TestCase):
         for marker in (
             "stack_only_du.stdout",
             "stack_only_host_input.stdout",
-            "br-lab-dns",
-            "lab_dns_ip",
+            "br-platform-dns",
+            "platform_dns_ip",
             "--sport 53",
             "ct direction reply accept",
-            "not (('-i br-lab-dns' in stack_only_du.stdout)",
-            "not (('iifname \"br-lab-dns\"' in stack_only_host_input.stdout)",
+            "not (('-i br-platform-dns' in stack_only_du.stdout)",
+            "not (('iifname \"br-platform-dns\"' in stack_only_host_input.stdout)",
             'loop: "{{ internal_dns_servers }}"',
         ):
             self.assertIn(marker, task)
@@ -330,7 +318,7 @@ class DnsPlaneContractTests(unittest.TestCase):
     def test_pinned_coredns_plugins_are_runtime_gated(self) -> None:
         self.assertIn("Inventory the pinned CoreDNS runtime plugins", self.stack)
         self.assertIn("loop: [cache, errors, file, health, template, view]", self.stack)
-        self.assertIn("ai-gateway/lab-dns:1.14.4", self.stack)
+        self.assertIn("ai-gateway/platform-dns:1.14.6", self.stack)
 
 
 if __name__ == "__main__":

@@ -1,45 +1,59 @@
-// aigw-envoy-entrypoint validates the egress trust policy before execing the
-// shellless DHI Envoy runtime. It also provides the in-container ready probe.
+// aigw-envoy-entrypoint validates the immutable egress policy before execing
+// the shellless DHI Envoy runtime. It also provides the in-container probe and
+// a non-secret release receipt.
 package main
 
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
-	"encoding/pem"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
+
+	"ai-gateway/egress-proxy/internal/egresspolicy"
 )
 
 const (
-	defaultConfig   = "/etc/envoy/envoy.yaml"
-	defaultEnvoyBin = "/usr/local/bin/envoy"
-	defaultReadyURL = "http://127.0.0.1:9901/ready"
-	maxConfigBytes  = 4 << 20
-	maxBundleBytes  = 2 << 20
-	maxHealthBytes  = 64 << 10
+	defaultConfig        = "/etc/envoy/envoy.yaml"
+	defaultPolicy        = "/etc/envoy/provider-policy.json"
+	defaultPolicyDigest  = "/etc/envoy/provider-policy.sha256"
+	defaultPolicyReceipt = "/etc/envoy/provider-policy-receipt.json"
+	defaultCertDir       = "/etc/envoy/certs"
+	defaultEnvoyBin      = "/usr/local/bin/envoy"
+	defaultReadyURL      = "http://127.0.0.1:9901/ready"
+	maxHealthBytes       = 64 << 10
 )
 
-var (
-	trustedCA     = regexp.MustCompile(`trusted_ca:\s*\{\s*filename:\s*([^,}\s]+)`)
-	systemBundles = map[string]struct{}{
-		"/etc/ssl/certs/ca-certificates.crt": {},
-		"/etc/ssl/cert.pem":                  {},
-		"/etc/pki/tls/certs/ca-bundle.crt":   {},
-		"/etc/ssl/certs/ca-bundle.crt":       {},
-	}
-)
+// Docker sets this with -X after policygen independently regenerates and
+// verifies the expected digest. A normal local go build intentionally fails
+// closed if someone tries to use it as the image launcher.
+var expectedPolicySHA256 = ""
+
+var installPaths = egresspolicy.InstallPaths{
+	Policy:       defaultPolicy,
+	PolicyDigest: defaultPolicyDigest,
+	Receipt:      defaultPolicyReceipt,
+	Config:       defaultConfig,
+	CertDir:      defaultCertDir,
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		if isStartup(os.Args[1:]) {
+			emitSecurityEvent(map[string]any{
+				"schema_version": 1,
+				"event":          "aigw.egress.trust",
+				"action":         "startup_gate",
+				"outcome":        "failed",
+				"reason":         "immutable_policy_validation_failed",
+			})
+		}
 		fmt.Fprintln(os.Stderr, "FATAL:", err)
 		fmt.Fprintln(os.Stderr, "Refusing to start (fail closed).")
 		os.Exit(1)
@@ -47,9 +61,8 @@ func main() {
 }
 
 func run(args []string) error {
-	config := os.Getenv("ENVOY_CONFIG")
-	if config == "" {
-		config = defaultConfig
+	if os.Getenv("ENVOY_CONFIG") != "" {
+		return errors.New("ENVOY_CONFIG overrides are forbidden; the image policy is immutable")
 	}
 	if len(args) > 0 {
 		switch args[0] {
@@ -57,7 +70,22 @@ func run(args []string) error {
 			if len(args) != 1 {
 				return errors.New("validate accepts no arguments")
 			}
-			return validateConfig(config)
+			_, err := validateInstallation()
+			return err
+		case "receipt":
+			if len(args) != 1 {
+				return errors.New("receipt accepts no arguments")
+			}
+			receipt, err := validateInstallation()
+			if err != nil {
+				return err
+			}
+			content, err := egresspolicy.CanonicalReceiptBytes(receipt)
+			if err != nil {
+				return err
+			}
+			_, err = os.Stdout.Write(content)
+			return err
 		case "health":
 			if len(args) != 1 {
 				return errors.New("health accepts no arguments")
@@ -68,120 +96,70 @@ func run(args []string) error {
 	if err := rejectConfigOverrides(args); err != nil {
 		return err
 	}
-	if err := validateConfig(config); err != nil {
+	receipt, err := validateInstallation()
+	if err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "gate: pinning enforcement present; starting envoy")
-	envoyArgs := append([]string{"envoy", "-c", config}, args...)
+	providers := make([]map[string]any, 0, len(receipt.Providers))
+	for _, provider := range receipt.Providers {
+		providers = append(providers, map[string]any{
+			"name":                   provider.Name,
+			"sni":                    provider.SNI,
+			"exact_sans":             provider.ExactSANs,
+			"ca_sha256_fingerprints": provider.CASHA256Fingerprints,
+		})
+	}
+	emitSecurityEvent(map[string]any{
+		"schema_version": 1,
+		"event":          "aigw.egress.trust",
+		"action":         "startup_gate",
+		"outcome":        "success",
+		"policy_sha256":  receipt.EgressPolicySHA256,
+		"providers":      providers,
+	})
+	fmt.Fprintln(os.Stderr, "gate: immutable provider policy validated; starting envoy")
+	envoyArgs := append([]string{"envoy", "-c", defaultConfig}, args...)
 	return syscall.Exec(defaultEnvoyBin, envoyArgs, os.Environ())
+}
+
+func isStartup(args []string) bool {
+	return len(args) == 0 || (args[0] != "validate" && args[0] != "receipt" && args[0] != "health")
+}
+
+func emitSecurityEvent(event map[string]any) {
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "AIGW_SECURITY_EVENT "+string(encoded))
 }
 
 func rejectConfigOverrides(args []string) error {
 	for _, argument := range args {
-		if argument == "-c" || argument == "--config-path" || argument == "--config-yaml" ||
-			strings.HasPrefix(argument, "--config-path=") || strings.HasPrefix(argument, "--config-yaml=") {
+		shortConfig := strings.HasPrefix(argument, "-c") && !strings.HasPrefix(argument, "--")
+		if shortConfig || strings.HasPrefix(argument, "--config-") {
 			return fmt.Errorf("refusing config-override flag %q", argument)
 		}
 	}
 	return nil
 }
 
-func validateConfig(configPath string) error {
-	if !filepath.IsAbs(configPath) {
-		return errors.New("ENVOY_CONFIG must be an absolute path")
-	}
-	configuration, err := readBounded(configPath, maxConfigBytes)
+func validateInstallation() (egresspolicy.Receipt, error) {
+	receipt, err := egresspolicy.ValidateInstallation(
+		installPaths,
+		expectedPolicySHA256,
+		time.Now().UTC(),
+	)
 	if err != nil {
-		return fmt.Errorf("read Envoy config: %w", err)
+		return egresspolicy.Receipt{}, err
 	}
-	active := uncomment(configuration)
-	if bytes.Contains(active, []byte("REPLACE_WITH_SPKI")) {
-		return errors.New("Envoy config contains an active REPLACE_WITH_SPKI placeholder")
-	}
-	tlsContexts := bytes.Count(active, []byte("UpstreamTlsContext"))
-	if tlsContexts < 1 {
-		return errors.New("Envoy config contains no upstream TLS context")
-	}
-	matches := trustedCA.FindAllSubmatch(active, -1)
-	if len(matches) != tlsContexts {
-		return fmt.Errorf("found %d upstream TLS contexts but %d trusted_ca files", tlsContexts, len(matches))
-	}
-	for _, match := range matches {
-		path := strings.Trim(string(match[1]), `"'`)
-		if err := validateBundle(path); err != nil {
-			return err
-		}
-		fmt.Fprintln(os.Stderr, "gate: trusted_ca OK ->", path)
-	}
-	return nil
-}
-
-func uncomment(configuration []byte) []byte {
-	lines := bytes.Split(configuration, []byte("\n"))
-	for index, line := range lines {
-		if comment := bytes.IndexByte(line, '#'); comment >= 0 {
-			lines[index] = line[:comment]
-		}
-	}
-	return bytes.Join(lines, []byte("\n"))
-}
-
-func validateBundle(path string) error {
-	if !filepath.IsAbs(path) {
-		return fmt.Errorf("trusted_ca path %q is not absolute", path)
-	}
-	if _, forbidden := systemBundles[filepath.Clean(path)]; forbidden {
-		return fmt.Errorf("trusted_ca %q is a system/public root bundle", path)
-	}
-	bundle, err := readBounded(path, maxBundleBytes)
-	if err != nil {
-		return fmt.Errorf("read trusted_ca %q: %w", path, err)
-	}
-	if bytes.Contains(bundle, []byte("REPLACE_WITH_")) {
-		return fmt.Errorf("trusted_ca %q contains a placeholder", path)
-	}
-	rest := bundle
-	validCAs := 0
-	for {
-		block, remaining := pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		rest = remaining
-		if block.Type != "CERTIFICATE" {
-			continue
-		}
-		certificate, parseErr := x509.ParseCertificate(block.Bytes)
-		if parseErr != nil {
-			return fmt.Errorf("trusted_ca %q contains an invalid certificate", path)
-		}
-		if certificate.IsCA {
-			validCAs++
-		}
-	}
-	if validCAs == 0 {
-		return fmt.Errorf("trusted_ca %q contains no valid CA certificate", path)
-	}
-	return nil
-}
-
-func readBounded(path string, limit int64) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	content, err := io.ReadAll(io.LimitReader(file, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(content)) > limit {
-		return nil, errors.New("file exceeds size limit")
-	}
-	if len(content) == 0 {
-		return nil, errors.New("file is empty")
-	}
-	return content, nil
+	fmt.Fprintf(
+		os.Stderr,
+		"gate: policy %s providers=%s\n",
+		receipt.EgressPolicySHA256,
+		strings.Join(receipt.SelectedProviders, ","),
+	)
+	return receipt, nil
 }
 
 func health() error {
@@ -189,7 +167,8 @@ func health() error {
 	if readyURL == "" {
 		readyURL = defaultReadyURL
 	}
-	if !strings.HasPrefix(readyURL, "http://127.0.0.1:") && !strings.HasPrefix(readyURL, "http://localhost:") {
+	if !strings.HasPrefix(readyURL, "http://127.0.0.1:") &&
+		!strings.HasPrefix(readyURL, "http://localhost:") {
 		return errors.New("Envoy health URL must use loopback HTTP")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -217,7 +196,8 @@ func health() error {
 	if err != nil {
 		return err
 	}
-	if response.StatusCode != http.StatusOK || len(body) > maxHealthBytes || !bytes.Contains(body, []byte("LIVE")) {
+	if response.StatusCode != http.StatusOK || len(body) > maxHealthBytes ||
+		!bytes.Contains(body, []byte("LIVE")) {
 		return errors.New("Envoy admin endpoint is not LIVE")
 	}
 	return nil

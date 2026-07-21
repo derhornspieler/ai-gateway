@@ -79,7 +79,7 @@ def settings() -> Settings:
         PORTAL_IDENTITY_TOKEN="abcdef0123456789abcdef0123456789",
         VAULT_TOKEN="vault-token",
         KEYCLOAK_URL="http://keycloak:8080",
-        WIF_KEYCLOAK_PUBLIC_URL="https://idp.wif-a.example.invalid",
+        WIF_KEYCLOAK_PUBLIC_URL="https://idp.wif.aigw.example.internal",
     )
 
 
@@ -261,7 +261,7 @@ async def test_status_returns_only_public_allowlisted_material():
     assert result["client_certificate_sha256"] == "a" * 64
     assert result["nonsecret_ids"] == enrollment().persisted_ids()
     assert result["setup_bundle"] == {
-        "issuer": "https://idp.wif-a.example.invalid/realms/anthropic-wif",
+        "issuer": "https://idp.wif.aigw.example.internal/realms/anthropic-wif",
         "client_id": "anthropic-token-broker",
         "subject": "service-account-anthropic-token-broker",
         "audience": "https://api.anthropic.com",

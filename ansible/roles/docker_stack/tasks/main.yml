@@ -5,23 +5,16 @@
       {{ ['docker-compose.yml', 'docker-compose.dns.yml']
          + (['docker-compose.platform-dns.yml']
             if (platform_authoritative_dns_enabled | bool) else [])
-         + (['docker-compose.lab.yml']
-            if (samba_lab_enabled | bool) else [])
          + (['docker-compose.identity-ldap.yml']
             if (identity_ldap_enabled | bool) else []) }}
     aigw_compose_profiles: >-
-      {{ (['lab-ad'] if (samba_lab_enabled | bool) else [])
-         + (['vault-ui'] if (aigw_vault_ui_enabled | bool) else []) }}
+      {{ ['vault-ui'] if (aigw_vault_ui_enabled | bool) else [] }}
     aigw_compose_cli_overlay_args: >-
       {{ ['--file', 'docker-compose.yml', '--file', 'docker-compose.dns.yml']
          + (['--file', 'docker-compose.platform-dns.yml']
             if (platform_authoritative_dns_enabled | bool) else [])
-         + (['--file', 'docker-compose.lab.yml']
-            if (samba_lab_enabled | bool) else [])
          + (['--file', 'docker-compose.identity-ldap.yml']
             if (identity_ldap_enabled | bool) else [])
-         + (['--profile', 'lab-ad']
-            if (samba_lab_enabled | bool) else [])
          + (['--profile', 'vault-ui']
             if (aigw_vault_ui_enabled | bool) else []) }}
 
@@ -37,7 +30,7 @@
       - alloy_telemetry_ip == '172.28.13.2'
       - alloy_observability_ip == '172.28.15.2'
       - prometheus_observability_ip == '172.28.15.3'
-      - lab_dns_ip == '172.28.18.2'
+      - platform_dns_ip == '172.28.18.2'
       - keycloak_internal_ip == '172.28.2.3'
       - (docker_networks | selectattr('name', 'equalto', 'net-chat') | map(attribute='subnet') | first) == '172.28.3.0/24'
       - (docker_networks | selectattr('name', 'equalto', 'net-portal') | map(attribute='subnet') | first) == '172.28.4.0/24'
@@ -46,7 +39,7 @@
       - (docker_networks | selectattr('name', 'equalto', 'net-telemetry') | map(attribute='subnet') | first) == '172.28.13.0/24'
       - (docker_networks | selectattr('name', 'equalto', 'net-observability') | map(attribute='subnet') | first) == '172.28.15.0/24'
       - (docker_networks | selectattr('name', 'equalto', 'net-identity') | map(attribute='subnet') | first) == '172.28.17.0/24'
-      - (docker_networks | selectattr('name', 'equalto', 'net-lab-dns') | map(attribute='subnet') | first) == '172.28.18.0/24'
+      - (docker_networks | selectattr('name', 'equalto', 'net-platform-dns') | map(attribute='subnet') | first) == '172.28.18.0/24'
     fail_msg: >-
       Fixed Traefik IPs and application subnets are a proxy-trust ABI. Update
       Compose, Keycloak/oauth2-proxy/Uvicorn trust, and these assertions as one
@@ -67,6 +60,32 @@
 - name: Process optional offline external-image seed before Compose
   ansible.builtin.include_tasks: offline_image_seed.yml
 
+- name: Validate immutable Envoy release build inputs
+  ansible.builtin.assert:
+    that:
+      - aigw_egress_source_date_epoch is match('^[0-9]+$')
+      - aigw_egress_source_date_epoch == '0'
+      - aigw_egress_providers is sequence
+      - aigw_egress_providers is not string
+      - aigw_egress_providers | length > 0
+      - aigw_egress_providers == (aigw_egress_providers | unique | sort)
+      - >-
+        aigw_egress_providers |
+        select('match', '^[a-z][a-z0-9-]{0,31}$') |
+        list | length == aigw_egress_providers | length
+      - aigw_egress_policy_sha256 is match('^[0-9a-f]{64}$')
+      - >-
+        aigw_expected_envoy_image_id | length == 0 or
+        aigw_expected_envoy_image_id is match('^sha256:[0-9a-f]{64}$')
+      - >-
+        not (offline_image_seed_enabled | bool) or
+        aigw_expected_envoy_image_id | length > 0
+    quiet: true
+    fail_msg: >-
+      Envoy provider selection must be a nonempty, sorted, reviewed name list
+      with one exact policy digest. Offline releases must also supply the exact
+      Envoy image ID from their validated schema-v2 receipt.
+
 - name: Stack directory
   ansible.builtin.file:
     path: "{{ stack_dir }}"
@@ -74,6 +93,91 @@
     owner: root
     group: root
     mode: "0750"
+
+- name: Validate the PostgreSQL 18 physical-volume contract
+  ansible.builtin.assert:
+    that:
+      - pg_data_volume_name is string
+      - pg_data_volume_name is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
+      - pg_data_volume_name != compose_project_name ~ '_pg_data'
+    quiet: true
+    fail_msg: >-
+      PostgreSQL 18 must use a canonical fresh physical volume name. Never
+      point it at the legacy {{ compose_project_name }}_pg_data PG16 volume.
+
+- name: Inspect legacy and desired PostgreSQL volumes before deployment
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - volume
+      - inspect
+      - "{{ item }}"
+  loop:
+    - "{{ compose_project_name }}_pg_data"
+    - "{{ pg_data_volume_name }}"
+  register: aigw_postgres_volume_transition
+  changed_when: false
+  failed_when: false
+
+- name: Inspect the PostgreSQL major-migration receipt
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
+    follow: false
+    get_checksum: false
+  register: aigw_postgres_migration_receipt_stat
+  changed_when: false
+
+- name: Read the PostgreSQL major-migration receipt
+  ansible.builtin.slurp:
+    src: "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
+  register: aigw_postgres_migration_receipt_raw
+  when: aigw_postgres_migration_receipt_stat.stat.exists | default(false)
+  no_log: true
+
+- name: Record the PostgreSQL major-migration receipt
+  ansible.builtin.set_fact:
+    aigw_postgres_migration_receipt: >-
+      {{
+        (aigw_postgres_migration_receipt_raw.content | b64decode | from_json)
+        if (aigw_postgres_migration_receipt_stat.stat.exists | default(false))
+        else {}
+      }}
+  no_log: true
+
+- name: Refuse a PostgreSQL 18 cutover without the exact logical-migration receipt
+  ansible.builtin.assert:
+    that:
+      - >-
+        aigw_postgres_volume_transition.results[0].rc != 0 or
+        (
+          aigw_postgres_volume_transition.results[1].rc == 0 and
+          (aigw_postgres_migration_receipt_stat.stat.isreg | default(false)) and
+          not (aigw_postgres_migration_receipt_stat.stat.islnk | default(false)) and
+          aigw_postgres_migration_receipt_stat.stat.uid == 0 and
+          aigw_postgres_migration_receipt_stat.stat.gid == 0 and
+          aigw_postgres_migration_receipt_stat.stat.mode == '0600' and
+          (aigw_postgres_migration_receipt_stat.stat.nlink | int) == 1 and
+          aigw_postgres_migration_receipt.format == 'aigw-postgres-major-migration-v1' and
+          aigw_postgres_migration_receipt.project == compose_project_name and
+          aigw_postgres_migration_receipt.source_major == '16' and
+          aigw_postgres_migration_receipt.target_major == '18' and
+          aigw_postgres_migration_receipt.source_volume == compose_project_name ~ '_pg_data' and
+          aigw_postgres_migration_receipt.target_volume == pg_data_volume_name and
+          aigw_postgres_migration_receipt.postgres_image ==
+            'dhi.io/postgres:18.4@sha256:a807e832c1fc9ded731956abcb53dc98ed003fd82e27275eaef8dcf52fb90236' and
+          aigw_postgres_migration_receipt.phase in ['migrated', 'writes_opened', 'validated'] and
+          ((aigw_postgres_volume_transition.results[1].stdout | from_json)[0].Labels['com.aigw.postgres.major'] | default('')) == '18' and
+          ((aigw_postgres_volume_transition.results[1].stdout | from_json)[0].Labels['com.aigw.postgres.migration-id'] | default('')) ==
+            aigw_postgres_migration_receipt.migration_id
+        )
+    quiet: true
+    fail_msg: >-
+      The legacy PostgreSQL 16 volume exists. Run ansible/migrate-postgres18.yml
+      with a new authenticated backup before an ordinary converge. The general
+      image-update workflow may not perform a PostgreSQL major upgrade.
+  no_log: true
 
 # Keycloak imports client secrets only while a realm is first created. The
 # post-bootstrap identity controller deliberately has no manage-clients role,
@@ -114,7 +218,7 @@
       - unix:///run/docker.sock
       - volume
       - inspect
-      - "{{ compose_project_name }}_pg_data"
+      - "{{ pg_data_volume_name }}"
   register: aigw_clean_state_pg_volume
   changed_when: false
   failed_when: false
@@ -329,7 +433,6 @@
     - bind-source-digest-inputs.json
     - docker-compose.yml
     - docker-compose.platform-dns.yml
-    - docker-compose.lab.yml
     - docker-compose.identity-ldap.yml
     - alloy/config.alloy
     - cribl-mock/config.yaml
@@ -470,28 +573,29 @@
     # allow-list below and syncs thousands of files into the deployed tree,
     # adding minutes to every converge and shipping dev tooling to the host.
     - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.venv|venv|\.tox|node_modules|\.git|secrets)(/|$)')
+    - item.path is not regex('(^|/)\.env(?:\.|$)|\.(?:pyc|pyo|pyd|key|p12|pfx)$')
     - item.path is regex('(^|/)(Dockerfile(?:\.open-webui|\.grafana)?|\.dockerignore|README\.md|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch)|upstream-provenance\.json|oauth-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
 
 # Ansible vars are the single source of truth for the runtime DNS views. The
-# repo-committed services/lab-dns files staged above are reviewed defaults for
+# repo-committed services/platform-dns files staged above are reviewed defaults for
 # the build context; these templates overwrite them with the var-driven,
-# environment-specific content that the lab-dns container bind-mounts. This
+# environment-specific content that the platform-dns container bind-mounts. This
 # render must stay after the build-context staging: the staging tasks create
-# {{ stack_dir }}/services/lab-dns on a fresh host (rendering earlier fails
+# {{ stack_dir }}/services/platform-dns on a fresh host (rendering earlier fails
 # there), and the file sync above would otherwise overwrite the rendered
 # Corefile with the static repo copy. The bind-source digest for these three
 # files is computed later over exactly this rendered content.
 - name: Render the environment-specific authoritative DNS views
   ansible.builtin.template:
     src: "{{ item.src }}"
-    dest: "{{ stack_dir }}/services/lab-dns/{{ item.dest }}"
+    dest: "{{ stack_dir }}/services/platform-dns/{{ item.dest }}"
     owner: root
     group: root
     mode: "0644"
   loop:
     - { src: Corefile.authoritative.j2, dest: Corefile }
-    - { src: db.aigw.aegisgroup.ch.j2, dest: db.aigw.aegisgroup.ch }
-    - { src: db.aigw.aegisgroup.ch.adm.j2, dest: db.aigw.aegisgroup.ch.adm }
+    - { src: db.aigw.internal.j2, dest: db.aigw.internal }
+    - { src: db.aigw.internal.adm.j2, dest: db.aigw.internal.adm }
   when: platform_authoritative_dns_enabled | bool
 
 - name: Find stale unsafe build-context artifacts from older recursive syncs
@@ -505,8 +609,17 @@
       - __pycache__
       - .pytest_cache
       - .ruff_cache
+      - .venv
+      - venv
+      - .tox
+      - node_modules
+      - .git
+      - secrets
       - "*.pyc"
+      - "*.pyo"
+      - "*.pyd"
       - .env
+      - ".env.*"
       - "*.key"
       - "*.p12"
       - "*.pfx"
@@ -531,6 +644,8 @@
     state: absent
   loop:
     - egress-proxy/docker-entrypoint.sh
+    - lab-dns
+    - samba-ad-lab
 
 - name: Reconcile the exact operational-script deployment boundary
   vars:
@@ -544,10 +659,10 @@
       - edge-tls.py
       - load-offline-image-seed.py
       - plan-compose-builds.py
+      - postgres-major-migrate.py
       - preserve-compose-rollbacks.py
       - pre-upgrade-check.sh
       - reconcile-openwebui-key.py
-      - remove-lab-local-keycloak-users.py
       - restore_archive.py
       - rotate-vault-audit.sh
       - state-backup.sh
@@ -560,11 +675,9 @@
       - validate-compose.sh
       - validate-identity-policy.py
       - validate-vault-config.sh
-      - vault-bootstrap.sh
       - vault-oidc-setup.sh
       - vault-pki-intermediate.sh
       - vault-unseal.sh
-      - verify-live-lab-identity.py
   block:
     - name: Inspect the deployed scripts path without following a link
       ansible.builtin.stat:
@@ -639,11 +752,7 @@
         # Match the two later container-readability tasks on the copy itself so
         # an unchanged converge does not oscillate 0750 -> 0555 on every run.
         mode: >-
-          {{ '0555' if
-             (item == 'reconcile-openwebui-key.py' or
-              (item == 'remove-lab-local-keycloak-users.py' and
-               (samba_lab_enabled | bool)))
-             else '0750' }}
+          {{ '0555' if item == 'reconcile-openwebui-key.py' else '0750' }}
       loop: "{{ aigw_operational_scripts }}"
 
     - name: Inventory the complete deployed scripts tree without following links
@@ -688,17 +797,6 @@
     owner: root
     group: root
     mode: "0555"
-
-# This one script is bind-mounted into a non-root, one-shot key-rotator
-# container after the directory administrator is proven. It contains no
-# secret material and still requires an exact destructive confirmation.
-- name: Make the bounded lab local-user cleanup tool readable in its container
-  ansible.builtin.file:
-    path: "{{ stack_dir }}/scripts/remove-lab-local-keycloak-users.py"
-    owner: root
-    group: root
-    mode: "0555"
-  when: samba_lab_enabled | bool
 
 # Install these non-secret runtime artifacts before the render-only gate.
 # On a genuinely pristine host the deployed validator has no controller-side
@@ -1049,57 +1147,14 @@
       for the accepted shapes (the literal string "none" disables one knob).
       The dev portal itself re-validates and refuses to start on ambiguity.
 
-- name: Fail closed on missing or unsafe Samba lab secrets
-  ansible.builtin.assert:
-    that:
-      - lookup('vars', item, default='') | length >= 16
-      - lookup('vars', item, default='') is regex('^[A-Za-z0-9_-]+$')
-      # Samba AD's default password policy requires three character classes.
-      # Prove that here, before a failed first bootstrap can leave a
-      # repeatedly-restarting directory container with no useful diagnostics.
-      - lookup('vars', item, default='') is regex('.*[A-Z].*')
-      - lookup('vars', item, default='') is regex('.*[a-z].*')
-      - lookup('vars', item, default='') is regex('.*[0-9].*')
-      - lookup('vars', item, default='') | lower not in ['change_me', 'changeme', 'replace_me', 'password', 'secret']
-    quiet: true
-    fail_msg: >-
-      {{ item }} must be a non-placeholder 16+ character [A-Za-z0-9_-]
-      secret in the encrypted lab overlay.
-  loop:
-    - samba_ad_admin_password
-    - samba_ad_bind_password
-    - samba_user_lab_admin_password
-    - samba_user_lab_developer_password
-    - samba_user_lab_user_password
-  when: samba_lab_enabled | bool
-  no_log: true
-
-- name: Require distinct Samba lab credentials
-  ansible.builtin.assert:
-    that:
-      - >-
-        [samba_ad_admin_password, samba_ad_bind_password,
-         samba_user_lab_admin_password, samba_user_lab_developer_password,
-         samba_user_lab_user_password] | unique | length == 5
-    quiet: true
-    fail_msg: Samba administrator, bind, and seeded-user credentials must be distinct.
-  when: samba_lab_enabled | bool
-  no_log: true
-
 - name: Validate the external directory federation inventory contract
   ansible.builtin.assert:
     that:
-      # Exactly one identity source may own the Keycloak truststore and the
-      # federation reconciliation inputs.
-      - not (samba_lab_enabled | bool)
       # ldaps:// only, on the standard port. A plaintext ldap:// origin, an
       # IP-literal host, userinfo, a path, or a query never reaches Keycloak.
       - 'identity_ldap_url is match("^ldaps://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+(?::636)?$")'
       - (identity_ldap_url | urlsplit('port')) in [none, 636]
-      # The lab component identity is reserved: a production converge must
-      # never be able to adopt or reprovision the lab directory provider.
       - 'identity_ldap_provider_name is match("^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")'
-      - identity_ldap_provider_name != 'lab-samba-ad'
       - identity_ldap_users_dn | length <= 512
       - identity_ldap_bind_dn | length <= 512
       - 'identity_ldap_users_dn is match("(?i)^(CN|OU)=")'
@@ -1120,8 +1175,7 @@
     quiet: true
     fail_msg: >-
       The external directory federation inventory is incomplete or unsafe.
-      LDAPS on port 636 is mandatory, the lab provider name is reserved, and
-      the lab Samba overlay may never be enabled at the same time.
+      LDAPS on port 636 and a complete bounded provider contract are mandatory.
   when: identity_ldap_enabled | bool
 
 - name: Require the external directory bind credential boundary
@@ -1233,113 +1287,6 @@
   loop_control:
     label: "{{ item.item }}"
 
-- name: Materialize Samba lab Docker secret source files
-  ansible.builtin.copy:
-    content: "{{ lookup('vars', item.variable) }}\n"
-    dest: "{{ stack_dir }}/secrets/{{ item.filename }}"
-    owner: root
-    # The bind secret is shared only with root Samba and gid-65532 key-rotator.
-    # Keep every other Samba credential root-only and never use world-read.
-    group: "{{ '65532' if item.variable == 'samba_ad_bind_password' else 'root' }}"
-    mode: "{{ '0440' if item.variable == 'samba_ad_bind_password' else '0400' }}"
-  loop:
-    - { variable: samba_ad_admin_password, filename: samba_ad_admin_password }
-    - { variable: samba_ad_bind_password, filename: samba_ad_bind_password }
-    - { variable: samba_user_lab_admin_password, filename: samba_user_lab-admin_password }
-    - { variable: samba_user_lab_developer_password, filename: samba_user_lab-developer_password }
-    - { variable: samba_user_lab_user_password, filename: samba_user_lab-user_password }
-  loop_control:
-    label: "{{ item.filename }}"
-  when: samba_lab_enabled | bool
-  no_log: true
-
-- name: Inspect the Samba lab secret-file boundary
-  ansible.builtin.stat:
-    path: "{{ stack_dir }}/secrets/{{ item.filename }}"
-    follow: false
-  loop:
-    - { filename: samba_ad_admin_password, gid: 0, mode: '0400' }
-    - { filename: samba_ad_bind_password, gid: 65532, mode: '0440' }
-    - { filename: samba_user_lab-admin_password, gid: 0, mode: '0400' }
-    - { filename: samba_user_lab-developer_password, gid: 0, mode: '0400' }
-    - { filename: samba_user_lab-user_password, gid: 0, mode: '0400' }
-  register: samba_secret_files
-  when: samba_lab_enabled | bool
-
-- name: Require exact Samba lab secret-file ownership and modes
-  ansible.builtin.assert:
-    that:
-      - item.stat.isreg | default(false)
-      - not (item.stat.islnk | default(false))
-      - item.stat.uid == 0
-      - item.stat.gid == item.item.gid
-      - item.stat.mode == item.item.mode
-      - (item.stat.nlink | default(1) | int) == 1
-    quiet: true
-    fail_msg: "Unsafe Samba secret-file boundary: {{ item.item.filename }}"
-  loop: "{{ samba_secret_files.results }}"
-  loop_control:
-    label: "{{ item.item.filename }}"
-  when: samba_lab_enabled | bool
-
-# The lab DC's LDAPS leaf and key are ISSUED from the customer-CA-signed Vault
-# intermediate by the operator ceremony (scripts/vault-pki-intermediate.sh
-# samba-tls), NOT by this converge — the converge holds no Vault token. On a
-# FRESH first converge Vault is uninitialized, so these bind sources must still
-# EXIST for the digest computation and the read-only bind mount to succeed:
-# create empty placeholders and let the samba-ad entrypoint self-sign until the
-# ceremony delivers real material. force=false never overwrites CA-issued
-# material once it is present; a later converge simply re-digests the new bytes
-# and recreates samba-ad so it adopts them.
-- name: Provide empty Samba LDAPS certificate placeholders on first converge
-  ansible.builtin.copy:
-    content: ""
-    dest: "{{ stack_dir }}/secrets/{{ item.filename }}"
-    owner: root
-    group: root
-    mode: "{{ item.mode }}"
-    force: false
-  loop:
-    - { filename: samba_ad_tls_cert, mode: '0644' }
-    - { filename: samba_ad_tls_key, mode: '0600' }
-  loop_control:
-    label: "{{ item.filename }}"
-  when: samba_lab_enabled | bool
-
-- name: Inspect the Samba LDAPS certificate material boundary
-  ansible.builtin.stat:
-    path: "{{ stack_dir }}/secrets/{{ item.filename }}"
-    follow: false
-  loop:
-    - { filename: samba_ad_tls_cert, mode: '0644' }
-    - { filename: samba_ad_tls_key, mode: '0600' }
-  loop_control:
-    label: "{{ item.filename }}"
-  register: samba_tls_files
-  when: samba_lab_enabled | bool
-
-# The private key must be exactly 0600: Samba's CVE-2013-4476 guard rejects any
-# group/other bit on the LDAPS key and refuses to start the ldap server task.
-# root:root (cert 0644 public, key 0600 owner-only); the ceremony and the
-# container entrypoint both write exactly these modes.
-- name: Require exact Samba LDAPS certificate material ownership and modes
-  ansible.builtin.assert:
-    that:
-      - item.stat.isreg | default(false)
-      - not (item.stat.islnk | default(false))
-      - item.stat.uid == 0
-      - item.stat.gid == 0
-      - item.stat.mode == item.item.mode
-      - (item.stat.nlink | default(1) | int) == 1
-    quiet: true
-    fail_msg: >-
-      Samba LDAPS certificate material must be a root:root regular single-link
-      file (cert 0644, key 0600): {{ item.item.filename }}
-  loop: "{{ samba_tls_files.results }}"
-  loop_control:
-    label: "{{ item.item.filename }}"
-  when: samba_lab_enabled | bool
-
 # The directory bind credential never becomes a Compose environment value, an
 # argv element, or a log line. It exists on the host only as this root-owned
 # file, bind-mounted read-only into the single reconciliation component.
@@ -1446,7 +1393,7 @@
         path: "{{ stack_dir }}/.state/edge-tls-staging-identity-ca"
         state: absent
 
-- name: Placeholder certs dir (vault-bootstrap issues real ones)
+- name: Create the edge certificate directory
   ansible.builtin.file:
     path: "{{ stack_dir }}/certs"
     state: directory
@@ -1509,26 +1456,6 @@
       restore state or run renew-leaf. A self-signed placeholder must never
       silently replace a CA-signed certificate.
   when: aigw_edge_tls_mode in ['vault-intermediate', 'customer-intermediate']
-
-# Only lab mode deletes stale edge material, because regenerating a self-signed
-# placeholder there is free. On the real-CA modes the material is NEVER deleted:
-# a vault-intermediate mismatch already failed the assert above, and
-# customer-supplied is overwritten atomically by edge-tls.py install only after
-# it validates. A failed real-CA converge therefore can never leave certs/ empty
-# and served by Traefik's built-in self-signed default.
-- name: Remove edge material that belongs to a different lab domain
-  ansible.builtin.file:
-    path: "{{ stack_dir }}/certs/{{ item }}"
-    state: absent
-  loop:
-    - int.crt
-    - int.key
-    - ca.pem
-  when: >-
-    aigw_edge_tls_mode == 'lab' and
-    (existing_edge_certificate.rc != 0 or
-     ('DNS:*.' ~ aigw_domain) not in existing_edge_certificate.stdout or
-     ('DNS:' ~ aigw_domain) not in existing_edge_certificate.stdout)
 
 # ── Mode customer-supplied: validate on the target, then install atomically ──
 # The private key is staged with no_log and every crypto check runs BEFORE the
@@ -1663,7 +1590,7 @@
       -keyout {{ stack_dir }}/certs/int.key -out {{ stack_dir }}/certs/int.crt
     creates: "{{ stack_dir }}/certs/int.crt"
   when: >-
-    aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate'] and
+    aigw_edge_tls_mode in ['vault-intermediate', 'customer-intermediate'] and
     not (aigw_edge_tls_issued_marker.stat.exists | default(false))
 
 - name: Placeholder CA bundle (replaced by the reviewed edge TLS ceremony)
@@ -1674,7 +1601,7 @@
     force: false
     mode: "0644"
   when: >-
-    aigw_edge_tls_mode in ['lab', 'vault-intermediate', 'customer-intermediate'] and
+    aigw_edge_tls_mode in ['vault-intermediate', 'customer-intermediate'] and
     not (aigw_edge_tls_issued_marker.stat.exists | default(false))
 
 - name: Reconcile public edge certificate material permissions
@@ -1717,10 +1644,9 @@
       - --reject-self-signed
   changed_when: false
   when: >-
-    deployment_profile != 'rocky9-lab' and
-    (aigw_edge_tls_mode == 'customer-supplied' or
+    aigw_edge_tls_mode == 'customer-supplied' or
      (aigw_edge_tls_mode in ['vault-intermediate', 'customer-intermediate'] and
-      (aigw_edge_tls_issued_marker.stat.exists | default(false))))
+      (aigw_edge_tls_issued_marker.stat.exists | default(false)))
 
 # ── Cribl export CA bundle (separate trust anchor from the edge CA) ──────────
 # alloy always mounts certs/cribl-ca.pem, so the bind source must always exist.
@@ -1927,11 +1853,6 @@
         )
         |
         combine(
-          (aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).lab_identity
-          if (samba_lab_enabled | bool) else {}
-        )
-        |
-        combine(
           (aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).identity_ldap
           if (identity_ldap_enabled | bool) else {}
         )
@@ -2037,20 +1958,10 @@
         ]
         +
         ([
-          {'path': stack_dir ~ '/services/lab-dns/Corefile', 'recursive': false},
-          {'path': stack_dir ~ '/services/lab-dns/db.aigw.aegisgroup.ch', 'recursive': false},
-          {'path': stack_dir ~ '/services/lab-dns/db.aigw.aegisgroup.ch.adm', 'recursive': false}
+          {'path': stack_dir ~ '/services/platform-dns/Corefile', 'recursive': false},
+          {'path': stack_dir ~ '/services/platform-dns/db.aigw.internal', 'recursive': false},
+          {'path': stack_dir ~ '/services/platform-dns/db.aigw.internal.adm', 'recursive': false}
         ] if (platform_authoritative_dns_enabled | bool) else [])
-        +
-        ([
-          {'path': stack_dir ~ '/secrets/samba_ad_admin_password', 'recursive': false},
-          {'path': stack_dir ~ '/secrets/samba_ad_bind_password', 'recursive': false},
-          {'path': stack_dir ~ '/secrets/samba_ad_tls_cert', 'recursive': false},
-          {'path': stack_dir ~ '/secrets/samba_ad_tls_key', 'recursive': false},
-          {'path': stack_dir ~ '/secrets/samba_user_lab-admin_password', 'recursive': false},
-          {'path': stack_dir ~ '/secrets/samba_user_lab-developer_password', 'recursive': false},
-          {'path': stack_dir ~ '/secrets/samba_user_lab-user_password', 'recursive': false}
-        ] if (samba_lab_enabled | bool) else [])
         +
         ([
           {'path': stack_dir ~ '/keycloak/identity-ldap-ca.pem', 'recursive': false},
@@ -2375,7 +2286,7 @@
         import subprocess
         import sys
 
-        project = sys.argv[1]
+        project, postgres_volume = sys.argv[1:]
         expected = {
             "pg_data": (70, 70, 0o700),
             "openwebui_data": (65532, 65532, 0o700),
@@ -2388,8 +2299,9 @@
         }
         drift = []
         for volume, contract in expected.items():
+            physical = postgres_volume if volume == "pg_data" else f"{project}_{volume}"
             result = subprocess.run(
-                ["docker", "--host", "unix:///run/docker.sock", "volume", "inspect", f"{project}_{volume}"],
+                ["docker", "--host", "unix:///run/docker.sock", "volume", "inspect", physical],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -2410,6 +2322,7 @@
                 drift.append(f"{volume}:owner-or-mode")
         print("\n".join(drift))
       - "{{ compose_project_name }}"
+      - "{{ pg_data_volume_name }}"
   register: volume_init_permission_drift
   changed_when: false
 
@@ -2469,7 +2382,7 @@
         import subprocess
         import sys
 
-        project = sys.argv[1]
+        project, postgres_volume = sys.argv[1:]
         expected = {
             "pg_data": (70, 70, 0o700),
             "openwebui_data": (65532, 65532, 0o700),
@@ -2482,8 +2395,9 @@
         }
         drift = []
         for volume, contract in expected.items():
+            physical = postgres_volume if volume == "pg_data" else f"{project}_{volume}"
             result = subprocess.run(
-                ["docker", "--host", "unix:///run/docker.sock", "volume", "inspect", f"{project}_{volume}"],
+                ["docker", "--host", "unix:///run/docker.sock", "volume", "inspect", physical],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -2504,9 +2418,35 @@
                 drift.append(f"{volume}:owner-or-mode")
         print("\n".join(drift))
       - "{{ compose_project_name }}"
+      - "{{ pg_data_volume_name }}"
   register: verified_volume_init_permissions
   changed_when: false
   failed_when: verified_volume_init_permissions.stdout_lines | length > 0
+
+# Replacing the old PostgreSQL container is the last point where the exact
+# stopped PG16 graph can be restarted safely. Close that rollback window before
+# Compose touches PostgreSQL 18. Any later failure must keep PG18 and fix
+# forward; PostgreSQL does not support writing on 18 and then downgrading to 16.
+- name: Close the PostgreSQL 16 rollback window before PostgreSQL 18 starts
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ stack_dir }}/scripts/postgres-major-migrate.py"
+      - mark-writes-opened
+      - --receipt
+      - "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
+      - --project
+      - "{{ compose_project_name }}"
+      - --target-volume
+      - "{{ pg_data_volume_name }}"
+  register: aigw_postgres_migration_writes_opened
+  changed_when: aigw_postgres_migration_receipt.phase == 'migrated'
+  failed_when: >-
+    aigw_postgres_migration_writes_opened.rc != 0 or
+    'POSTGRES_MIGRATION_WRITES_OPENED' not in aigw_postgres_migration_writes_opened.stdout
+  when: aigw_postgres_volume_transition.results[0].rc == 0
+  no_log: true
 
 - name: Start PostgreSQL before credential reconciliation
   community.docker.docker_compose_v2:
@@ -2529,10 +2469,7 @@
 # Raw `docker compose exec`-style tasks resolve the project from the deployed
 # .env (COMPOSE_FILE) plus this process environment only. Modern Compose
 # validates the complete project model even for exec and live-project queries,
-# so emptying COMPOSE_PROFILES while the lab overlay is loaded leaves the
-# overlay's keycloak depends_on pointing at the excluded profile-gated
-# samba-ad service and rejects the whole project. Live-project exec/queries
-# therefore carry the exact reviewed profile set; an empty ambient
+# so live-project exec/queries carry the exact reviewed profile set; an empty ambient
 # COMPOSE_PROFILES stays reserved for tasks that pass files and profiles
 # explicitly (module `profiles:` or aigw_compose_cli_overlay_args) and for the
 # Vault UI removal reconciliation, where profile-gated services must remain
@@ -2802,6 +2739,33 @@
     compose_build_plan: "{{ compose_build_plan_raw.stdout | from_json }}"
   no_log: true
 
+- name: Match custom-image plan to the reviewed offline release
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - /usr/local/sbin/aigw-load-offline-image-seed
+      - reconcile-build-plan
+      - "{{ offline_image_seed_remote_path }}"
+      - "{{ offline_image_seed_manifest_remote_path }}"
+      - "{{ offline_image_seed_manifest_sha256 }}"
+      - "{{ stack_dir }}"
+  args:
+    chdir: "{{ stack_dir }}"
+    stdin: "{{ compose_build_plan | to_json }}"
+    stdin_add_newline: false
+  register: offline_image_seed_build_reconciliation
+  changed_when: false
+  no_log: true
+  when: offline_image_seed_enabled | bool
+
+- name: Use the offline release build plan
+  ansible.builtin.set_fact:
+    compose_build_plan: >-
+      {{ (offline_image_seed_build_reconciliation.stdout | from_json).plan }}
+  no_log: true
+  when: offline_image_seed_enabled | bool
+
 # The containerd image store can discard the prior image record as soon as a
 # stable tag moves and Compose removes the old container. Resolve the exact
 # running container image—not merely that mutable tag—then retain one verified
@@ -2854,6 +2818,39 @@
       any mutable build tag is replaced.
   when: compose_build_plan.services | length > 0
 
+# Schema-v2 seeds carry tested custom images under content-addressed transfer
+# tags. The prior running images are now preserved, so it is safe to move the
+# Compose tags to those exact IDs. Schema-v1 seeds pass the local build plan
+# through unchanged for backward compatibility.
+- name: Activate tested custom images after rollback preservation
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - /usr/local/sbin/aigw-load-offline-image-seed
+      - activate-custom-images
+      - "{{ offline_image_seed_remote_path }}"
+      - "{{ offline_image_seed_manifest_remote_path }}"
+      - "{{ offline_image_seed_manifest_sha256 }}"
+      - "{{ stack_dir }}"
+  args:
+    chdir: "{{ stack_dir }}"
+    stdin: "{{ compose_build_plan | to_json }}"
+    stdin_add_newline: false
+  register: offline_image_seed_custom_activation
+  changed_when: >-
+    (offline_image_seed_custom_activation.stdout | from_json).schema_version == 2
+    and (compose_build_plan.services | length > 0)
+  no_log: true
+  when: offline_image_seed_enabled | bool
+
+- name: Use activated custom images without a target-side rebuild
+  ansible.builtin.set_fact:
+    compose_build_plan: >-
+      {{ (offline_image_seed_custom_activation.stdout | from_json).plan }}
+  no_log: true
+  when: offline_image_seed_enabled | bool
+
 - name: Build only missing or build-input-changed custom images
   ansible.builtin.command:
     argv: >-
@@ -2884,7 +2881,7 @@
       - --read-only
       - --cap-drop
       - ALL
-      - ai-gateway/lab-dns:1.14.4
+      - ai-gateway/platform-dns:1.14.6
       - -plugins
   register: aigw_coredns_plugins
   changed_when: false
@@ -2932,21 +2929,6 @@
   register: finalized_compose_build_manifest
   changed_when: false
   no_log: true
-
-# A previous fresh realm import omitted explicit realm-role scope mappings.
-# The repair remains an inventory-bound one-time action: its temporary
-# Keycloak master-realm client is powerful until interactive bootstrap deletes
-# it, so it must never become a routine privileged converge.
-- name: Require explicit acknowledgement for pre-bootstrap OIDC scope reconciliation
-  ansible.builtin.assert:
-    that:
-      - aigw_prebootstrap_oidc_scope_reconciliation | bool
-      - aigw_prebootstrap_oidc_scope_reconciliation_ack == 'RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES'
-    quiet: true
-    fail_msg: >-
-      Pre-bootstrap OIDC role-scope reconciliation requires the exact
-      RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES inventory acknowledgement.
-  when: aigw_prebootstrap_oidc_scope_reconciliation | bool
 
 - name: Deploy stack without implicitly rebuilding custom images
   community.docker.docker_compose_v2:
@@ -3248,7 +3230,7 @@
     chdir: "{{ stack_dir }}"
   environment:
     # Live-project exec: Compose v5+ validates the full model, so the real
-    # profile set must be active or lab overlays render the project invalid.
+    # profile set must be active when optional profile-gated services are enabled.
     COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: vault_status_before_unseal
@@ -3372,7 +3354,7 @@
     chdir: "{{ stack_dir }}"
   environment:
     # Live-project exec: Compose v5+ validates the full model, so the real
-    # profile set must be active or lab overlays render the project invalid.
+    # profile set must be active when optional profile-gated services are enabled.
     COMPOSE_PROFILES: "{{ aigw_compose_profiles | join(',') }}"
     VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
   register: vault_strict_readiness
@@ -3444,7 +3426,7 @@
     quiet: true
     fail_msg: >-
       A restore marker exists but Vault reports uninitialized. Do not run
-      vault-bootstrap.sh or create replacement identity; preserve the target
+      a replacement initialization ceremony or create replacement identity; preserve the target
       and investigate the authenticated restore.
   when: restore_required_unseal_marker.stat.exists | default(false)
 
@@ -3466,14 +3448,10 @@
       - aigw_pre_vault_identity_bootstrap_admin_identities is sequence
       - aigw_pre_vault_identity_bootstrap_admin_identities is not string
       - aigw_pre_vault_identity_bootstrap_admin_identities | length > 0
-      - >-
-        not (aigw_pre_vault_identity_ensure_lab_federation | bool) or
-        (deployment_profile == 'rocky9-lab' and samba_lab_enabled | bool)
     quiet: true
     fail_msg: >-
       Pre-Vault identity recovery requires an exact acknowledgement and an
-      explicitly configured, non-empty group/admin set. Lab federation is
-      permitted only by the committed disposable Rocky 9 lab profile.
+      explicitly configured, non-empty group/admin set.
   when: aigw_pre_vault_identity_baseline_reconciliation | bool
 
 - name: Build the exact pre-Vault managed-identity recovery specification
@@ -3482,7 +3460,6 @@
       {{
         {
           'schema': 1,
-          'ensure_lab_federation': aigw_pre_vault_identity_ensure_lab_federation | bool,
           'groups': aigw_pre_vault_identity_baseline_groups,
           'bootstrap_admin_identities': aigw_pre_vault_identity_bootstrap_admin_identities,
         }
@@ -3649,43 +3626,12 @@
     - not (aigw_pre_vault_identity_baseline_receipt.stat.exists | default(false))
   no_log: true
 
-# Do not make the legacy OIDC repair part of the fresh-Vault bootstrap path:
-# an uninitialized or sealed Vault intentionally prevents the rotator from
-# reading its durable identity state. The stack is already started above, so
-# wait only for Keycloak here when the public Vault state proves the one-shot
-# runner can safely perform its narrow state-gated action. A short-lived 403
-# from an edge before this point is availability-only; authorization remains
-# fail-closed.
-- name: Wait for Keycloak before applicable pre-bootstrap OIDC scope reconciliation
-  community.docker.docker_compose_v2:
-    docker_host: unix:///run/docker.sock
-    tls: false
-    validate_certs: false
-    project_src: "{{ stack_dir }}"
-    project_name: "{{ compose_project_name }}"
-    files: "{{ aigw_compose_files }}"
-    profiles: "{{ aigw_compose_profiles }}"
-    services: [keycloak]
-    dependencies: false
-    state: present
-    build: never
-    wait: true
-    # Keep this individual Keycloak wait aligned with the reviewed longest
-    # Compose health window; a slow but healthy initial Keycloak migration
-    # must not be misclassified as an OIDC-repair failure.
-    wait_timeout: 600
-  environment:
-    COMPOSE_PROFILES: ""
-    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
-  when:
-    - aigw_prebootstrap_oidc_scope_reconciliation | bool
-    - vault_strict_readiness.rc == 0
-    - vault_public_status.rc == 0
-    - (vault_public_status.stdout | from_json).initialized | bool
-    - not ((vault_public_status.stdout | from_json).sealed | bool)
-  no_log: true
-
-- name: Reconcile only applicable pre-bootstrap Keycloak OIDC role scopes
+# Once the LDAPS bind credential is mounted, deployment owns identity setup.
+# The one internal route serializes bootstrap and later repair in the running
+# one-worker service. Every converge live-proves LDAPS, reconciles callbacks to
+# aigw_domain, removes only marked temporary principals, and verifies the final
+# durable state before it returns a fixed success marker.
+- name: Automatically configure Keycloak identity control from LDAPS
   ansible.builtin.command:
     argv:
       - "{{ stack_dir }}/scripts/aigw-compose.sh"
@@ -3694,113 +3640,30 @@
       - key-rotator
       - /opt/venv/bin/python
       - -m
-      - app.reconcile_oidc_role_scopes
+      - app.auto_bootstrap_identity
       - --confirm
-      - RECONCILE_PREBOOTSTRAP_OIDC_ROLE_SCOPES
+      - AUTO_BOOTSTRAP_IDENTITY
   args:
     chdir: "{{ stack_dir }}"
   environment:
     STACK_DIR: "{{ stack_dir }}"
     COMPOSE_PROJECT_NAME: "{{ compose_project_name }}"
-  register: prebootstrap_oidc_scope_reconciliation
+  register: identity_auto_bootstrap
   changed_when: >-
-    'OIDC_ROLE_SCOPE_PREBOOTSTRAP_RECONCILIATION_APPLIED' in
-    prebootstrap_oidc_scope_reconciliation.stdout
-  failed_when: prebootstrap_oidc_scope_reconciliation.rc != 0
+    'IDENTITY_AUTO_BOOTSTRAP_APPLIED' in identity_auto_bootstrap.stdout
+  failed_when: >-
+    identity_auto_bootstrap.rc != 0 or
+    not (
+      'IDENTITY_AUTO_BOOTSTRAP_APPLIED' in identity_auto_bootstrap.stdout or
+      'IDENTITY_AUTO_BOOTSTRAP_VERIFIED' in identity_auto_bootstrap.stdout
+    )
   when:
-    - aigw_prebootstrap_oidc_scope_reconciliation | bool
+    - identity_ldap_enabled | bool
     - vault_strict_readiness.rc == 0
     - vault_public_status.rc == 0
     - (vault_public_status.stdout | from_json).initialized | bool
     - not ((vault_public_status.stdout | from_json).sealed | bool)
   no_log: true
-
-# A domain migration on an already-seeded realm (e.g. aigw.internal ->
-# aigw.aegisgroup.ch) cannot be repaired by re-importing the realm JSON:
-# Keycloak imports realm JSON only into an empty database, so every managed
-# first-party client keeps its stale callback allow-list and browser SSO fails
-# with "Invalid parameter: redirect_uri". While the temporary master-realm
-# bootstrap client still exists (the interactive identity bootstrap has not yet
-# deleted it), realign only the four managed clients' redirectUris/webOrigins
-# (and the two RP-initiated logout allow-lists) to the configured aigw_domain
-# using that already-reviewed credential. This is deliberately safe to run on
-# every initialized converge: it touches only the domain-derived callbacks —
-# never client secrets, flows, mappers, realm-role scopes, the controller, or
-# the broker — never contacts Vault, and self-disables the moment the
-# interactive bootstrap consumes the client, reporting that a domain change
-# then needs the re-bootstrap ceremony rather than granting the durable
-# controller any manage-clients authority.
-- name: Wait for Keycloak before managed OIDC redirect-URI reconciliation
-  community.docker.docker_compose_v2:
-    docker_host: unix:///run/docker.sock
-    tls: false
-    validate_certs: false
-    project_src: "{{ stack_dir }}"
-    project_name: "{{ compose_project_name }}"
-    files: "{{ aigw_compose_files }}"
-    profiles: "{{ aigw_compose_profiles }}"
-    services: [keycloak]
-    dependencies: false
-    state: present
-    build: never
-    wait: true
-    wait_timeout: 600
-  environment:
-    COMPOSE_PROFILES: ""
-    VAULT_UI_ENABLED: "{{ aigw_vault_ui_enabled | bool | lower }}"
-  when:
-    - vault_strict_readiness.rc == 0
-    - vault_public_status.rc == 0
-    - (vault_public_status.stdout | from_json).initialized | bool
-    - not ((vault_public_status.stdout | from_json).sealed | bool)
-  no_log: true
-
-- name: Reconcile managed OIDC client redirect URIs to the configured domain
-  ansible.builtin.command:
-    argv:
-      - "{{ stack_dir }}/scripts/aigw-compose.sh"
-      - exec
-      - -T
-      - key-rotator
-      - /opt/venv/bin/python
-      - -m
-      - app.reconcile_oidc_redirect_uris
-      - --confirm
-      - RECONCILE_PREBOOTSTRAP_OIDC_REDIRECT_URIS
-  args:
-    chdir: "{{ stack_dir }}"
-  environment:
-    STACK_DIR: "{{ stack_dir }}"
-    COMPOSE_PROJECT_NAME: "{{ compose_project_name }}"
-  register: managed_oidc_redirect_reconciliation
-  changed_when: >-
-    'OIDC_REDIRECT_URI_PREBOOTSTRAP_RECONCILIATION_APPLIED' in
-    managed_oidc_redirect_reconciliation.stdout
-  failed_when: managed_oidc_redirect_reconciliation.rc != 0
-  when:
-    - vault_strict_readiness.rc == 0
-    - vault_public_status.rc == 0
-    - (vault_public_status.stdout | from_json).initialized | bool
-    - not ((vault_public_status.stdout | from_json).sealed | bool)
-  no_log: true
-
-# Post-bootstrap hosts (temporary client already consumed) return the
-# rebootstrap-required marker with rc 0, so the converge does not fail; surface
-# it loudly so a silent domain change cannot leave SSO broken unnoticed.
-- name: Report when an OIDC domain migration needs the identity bootstrap ceremony
-  ansible.builtin.debug:
-    msg: >-
-      Managed OIDC redirect-URI reconciliation is unavailable: the temporary
-      master-realm bootstrap client has been consumed by the interactive
-      identity bootstrap, and the durable controller holds no manage-clients
-      role. If the deployment domain changed, browser SSO stays broken until an
-      operator re-runs the identity bootstrap ceremony — see
-      docs/identity-operations.md, "Domain migration on an existing realm".
-  when:
-    - managed_oidc_redirect_reconciliation is defined
-    - >-
-      'OIDC_REDIRECT_URI_PREBOOTSTRAP_RECONCILIATION_REBOOTSTRAP_REQUIRED' in
-      (managed_oidc_redirect_reconciliation.stdout | default(''))
 
 - name: Wait for the complete post-bootstrap stack
   community.docker.docker_compose_v2:
@@ -4046,7 +3909,7 @@
         import subprocess
         import sys
 
-        project, egress_ip, adm_ip, internal_ip, lab_dns = sys.argv[1:]
+        project, egress_ip, adm_ip, internal_ip, platform_dns = sys.argv[1:]
         container_ids = subprocess.check_output(
             ["docker", "--host", "unix:///run/docker.sock", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"],
             text=True,
@@ -4072,10 +3935,10 @@
             (adm_ip, "tcp", 443),
             (internal_ip, "tcp", 443),
         }
-        if lab_dns == "true":
+        if platform_dns == "true":
             for host_ip in (adm_ip, internal_ip):
                 for protocol in ("tcp", "udp"):
-                    expected.add(("lab-dns", protocol, 53, host_ip, 53))
+                    expected.add(("platform-dns", protocol, 53, host_ip, 53))
                     nat_expected.add((host_ip, protocol, 53))
         if actual != expected:
             raise SystemExit(f"published-port runtime mismatch: {sorted(actual)}")
@@ -4108,8 +3971,8 @@
     msg: >-
       This fresh deployment's Vault is uninitialized and the deployment is
       intentionally not claiming full readiness. Only this no-restore-marker
-      state may use the approved lab scripts/vault-bootstrap.sh ceremony,
-      which performs its own final full-stack wait.
+      state requires the documented production Vault initialization ceremony,
+      followed by the identical converge for strict full-stack readiness.
   when:
     - vault_strict_readiness.rc != 0
     - not (restore_required_unseal_marker.stat.exists | default(false))

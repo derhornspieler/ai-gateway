@@ -1,4 +1,4 @@
-name: Filesystem and IaC security
+name: Repository and release container security
 
 on:
   pull_request:
@@ -7,7 +7,6 @@ on:
     branches: [main]
   schedule:
     - cron: "43 9 * * 1"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,15 +16,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  scan:
-    name: High and critical findings
+  filesystem:
+    name: Repository high and critical findings
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Validate reviewed Trivy waivers
+        run: python3 -I .github/scripts/validate-trivy-waivers.py
 
       - name: Scan dependencies and infrastructure configuration
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -42,3 +44,350 @@ jobs:
           hide-progress: "true"
           skip-dirs: .git,.cache
           timeout: 10m0s
+
+  release-plan:
+    name: Resolve the committed release image inventory
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    environment: release-container-security
+    timeout-minutes: 25
+    outputs:
+      external_matrix: ${{ steps.inventory.outputs.external_matrix }}
+      custom_matrix: ${{ steps.inventory.outputs.custom_matrix }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require complete DHI credentials
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_PASSWORD: ${{ secrets.DHI_PASSWORD }}
+        run: |
+          if [[ -z "$DHI_USERNAME" || -z "$DHI_PASSWORD" ]]; then
+            echo "::error::DHI_USERNAME and DHI_PASSWORD are required for every main release scan"
+            exit 1
+          fi
+
+      - name: Authenticate to DHI
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_PASSWORD: ${{ secrets.DHI_PASSWORD }}
+        run: printf '%s' "$DHI_PASSWORD" | docker login dhi.io --username "$DHI_USERNAME" --password-stdin
+
+      - name: Validate reviewed Trivy waivers
+        run: python3 -I .github/scripts/validate-trivy-waivers.py
+
+      - name: Resolve exact release images and build inputs
+        id: inventory
+        run: |
+          python3 -I .github/scripts/plan-release-container-security.py \
+            --root "$GITHUB_WORKSPACE" \
+            --config .github/release-container-security.json \
+            --output release-container-inventory.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Remove DHI registry credentials
+        if: ${{ always() }}
+        run: docker logout dhi.io
+
+      - name: Upload the resolved release inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-container-security-inventory
+          path: release-container-inventory.json
+          if-no-files-found: error
+          retention-days: 30
+
+  external-images:
+    name: External ${{ matrix.slug }}
+    needs: release-plan
+    runs-on: ubuntu-24.04
+    environment: release-container-security
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.release-plan.outputs.external_matrix) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to DHI
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_PASSWORD: ${{ secrets.DHI_PASSWORD }}
+        run: |
+          if [[ -z "$DHI_USERNAME" || -z "$DHI_PASSWORD" ]]; then
+            echo "::error::DHI credentials disappeared after the release plan"
+            exit 1
+          fi
+          printf '%s' "$DHI_PASSWORD" | docker login dhi.io --username "$DHI_USERNAME" --password-stdin
+
+      - name: Prepare evidence directory
+        env:
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
+        run: mkdir -p "$ARTIFACT_DIR"
+
+      - name: Pull the exact external image
+        id: acquire
+        continue-on-error: true
+        env:
+          IMAGE_REFERENCE: ${{ matrix.reference }}
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+        run: docker pull --platform "$IMAGE_PLATFORM" "$IMAGE_REFERENCE"
+
+      - name: Remove DHI registry credentials
+        if: ${{ always() }}
+        run: docker logout dhi.io
+
+      - name: Scan high and critical vulnerabilities
+        id: vulnerability
+        if: ${{ steps.acquire.outcome == 'success' }}
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          scan-type: image
+          image-ref: ${{ matrix.reference }}
+          scanners: vuln
+          trivyignores: .github/trivyignore-images.yaml
+          severity: HIGH,CRITICAL
+          ignore-unfixed: "false"
+          exit-code: "1"
+          format: json
+          output: security-artifacts/${{ matrix.slug }}/trivy-vulnerabilities.json
+          hide-progress: "true"
+          timeout: 20m0s
+
+      - name: Generate CycloneDX SBOM
+        id: sbom
+        if: ${{ always() && steps.acquire.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          scan-type: image
+          image-ref: ${{ matrix.reference }}
+          format: cyclonedx
+          output: security-artifacts/${{ matrix.slug }}/sbom.cdx.json
+          hide-progress: "true"
+          timeout: 20m0s
+
+      - name: Write image and scan provenance
+        if: ${{ always() }}
+        env:
+          IMAGE_REFERENCE: ${{ matrix.reference }}
+          IMAGE_SCOPE: ${{ matrix.scope }}
+          ACQUIRE_OUTCOME: ${{ steps.acquire.outcome }}
+          SCAN_OUTCOME: ${{ steps.vulnerability.outcome }}
+          SBOM_OUTCOME: ${{ steps.sbom.outcome }}
+          PROVENANCE: security-artifacts/${{ matrix.slug }}/provenance.json
+        run: |
+          python3 -I .github/scripts/write-image-provenance.py \
+            --kind external \
+            --image "$IMAGE_REFERENCE" \
+            --source-reference "$IMAGE_REFERENCE" \
+            --scope "$IMAGE_SCOPE" \
+            --acquisition-outcome "$ACQUIRE_OUTCOME" \
+            --scan-outcome "$SCAN_OUTCOME" \
+            --sbom-outcome "$SBOM_OUTCOME" \
+            --waiver-file .github/trivyignore-images.yaml \
+            --output "$PROVENANCE"
+
+      - name: Validate complete external image evidence
+        id: evidence
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 -I .github/scripts/validate-image-security-evidence.py \
+            --directory "$ARTIFACT_DIR" \
+            --platform "$IMAGE_PLATFORM"
+
+      - name: Upload external image security evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-security-${{ matrix.slug }}
+          path: security-artifacts/${{ matrix.slug }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce exact pull and vulnerability gate
+        if: ${{ always() }}
+        env:
+          ACQUIRE_OUTCOME: ${{ steps.acquire.outcome }}
+          SCAN_OUTCOME: ${{ steps.vulnerability.outcome }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+        run: |
+          if [[ "$ACQUIRE_OUTCOME" != "success" ]]; then
+            echo "::error::Exact external image pull failed"
+            exit 1
+          fi
+          if [[ "$SCAN_OUTCOME" != "success" ]]; then
+            echo "::error::External image has HIGH/CRITICAL findings or the scan failed"
+            exit 1
+          fi
+          if [[ "$EVIDENCE_OUTCOME" != "success" ]]; then
+            echo "::error::External image security evidence is incomplete"
+            exit 1
+          fi
+
+  custom-images:
+    name: Custom ${{ matrix.service }}
+    needs: release-plan
+    runs-on: ubuntu-24.04
+    environment: release-container-security
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.release-plan.outputs.custom_matrix) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to DHI
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_PASSWORD: ${{ secrets.DHI_PASSWORD }}
+        run: |
+          if [[ -z "$DHI_USERNAME" || -z "$DHI_PASSWORD" ]]; then
+            echo "::error::DHI credentials disappeared after the release plan"
+            exit 1
+          fi
+          printf '%s' "$DHI_PASSWORD" | docker login dhi.io --username "$DHI_USERNAME" --password-stdin
+
+      - name: Prepare evidence directory
+        env:
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
+        run: mkdir -p "$ARTIFACT_DIR"
+
+      - name: Build the exact custom release image
+        id: acquire
+        continue-on-error: true
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+          SERVICE_NAME: ${{ matrix.service }}
+          INPUT_DIGEST: ${{ matrix.input_digest }}
+        run: |
+          python3 -I .github/scripts/build-release-image.py \
+            --root "$GITHUB_WORKSPACE" \
+            --config .github/release-container-security.json \
+            --service "$SERVICE_NAME" \
+            --image "$IMAGE_NAME" \
+            --input-digest "$INPUT_DIGEST" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Remove DHI registry credentials
+        if: ${{ always() }}
+        run: docker logout dhi.io
+
+      - name: Scan high and critical vulnerabilities
+        id: vulnerability
+        if: ${{ steps.acquire.outcome == 'success' }}
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          scan-type: image
+          image-ref: ${{ matrix.image }}
+          scanners: vuln
+          trivyignores: .github/trivyignore-images.yaml
+          severity: HIGH,CRITICAL
+          ignore-unfixed: "false"
+          exit-code: "1"
+          format: json
+          output: security-artifacts/${{ matrix.slug }}/trivy-vulnerabilities.json
+          hide-progress: "true"
+          timeout: 20m0s
+
+      - name: Generate CycloneDX SBOM
+        id: sbom
+        if: ${{ always() && steps.acquire.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          scan-type: image
+          image-ref: ${{ matrix.image }}
+          format: cyclonedx
+          output: security-artifacts/${{ matrix.slug }}/sbom.cdx.json
+          hide-progress: "true"
+          timeout: 20m0s
+
+      - name: Write image and build provenance
+        if: ${{ always() }}
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+          IMAGE_SCOPE: ${{ matrix.scope }}
+          SERVICE_NAME: ${{ matrix.service }}
+          INPUT_DIGEST: ${{ matrix.input_digest }}
+          ACQUIRE_OUTCOME: ${{ steps.acquire.outcome }}
+          SCAN_OUTCOME: ${{ steps.vulnerability.outcome }}
+          SBOM_OUTCOME: ${{ steps.sbom.outcome }}
+          EXPECTED_IMAGE_ID: ${{ steps.acquire.outputs.image_id }}
+          PROVENANCE: security-artifacts/${{ matrix.slug }}/provenance.json
+        run: |
+          python3 -I .github/scripts/write-image-provenance.py \
+            --kind custom \
+            --image "$IMAGE_NAME" \
+            --source-reference "$GITHUB_SHA" \
+            --scope "$IMAGE_SCOPE" \
+            --service "$SERVICE_NAME" \
+            --input-digest "$INPUT_DIGEST" \
+            --expected-image-id "$EXPECTED_IMAGE_ID" \
+            --acquisition-outcome "$ACQUIRE_OUTCOME" \
+            --scan-outcome "$SCAN_OUTCOME" \
+            --sbom-outcome "$SBOM_OUTCOME" \
+            --waiver-file .github/trivyignore-images.yaml \
+            --output "$PROVENANCE"
+
+      - name: Validate complete custom image evidence
+        id: evidence
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          ARTIFACT_DIR: security-artifacts/${{ matrix.slug }}
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_IMAGE_ID: ${{ steps.acquire.outputs.image_id }}
+        run: |
+          python3 -I .github/scripts/validate-image-security-evidence.py \
+            --directory "$ARTIFACT_DIR" \
+            --platform "$IMAGE_PLATFORM" \
+            --expected-image-id "$EXPECTED_IMAGE_ID"
+
+      - name: Upload custom image security evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-security-${{ matrix.slug }}
+          path: security-artifacts/${{ matrix.slug }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce exact build and vulnerability gate
+        if: ${{ always() }}
+        env:
+          ACQUIRE_OUTCOME: ${{ steps.acquire.outcome }}
+          SCAN_OUTCOME: ${{ steps.vulnerability.outcome }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+        run: |
+          if [[ "$ACQUIRE_OUTCOME" != "success" ]]; then
+            echo "::error::Exact custom release image build failed"
+            exit 1
+          fi
+          if [[ "$SCAN_OUTCOME" != "success" ]]; then
+            echo "::error::Custom image has HIGH/CRITICAL findings or the scan failed"
+            exit 1
+          fi
+          if [[ "$EVIDENCE_OUTCOME" != "success" ]]; then
+            echo "::error::Custom image security evidence is incomplete"
+            exit 1
+          fi

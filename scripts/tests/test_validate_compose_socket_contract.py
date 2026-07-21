@@ -61,22 +61,22 @@ class ValidateComposeSocketContractTests(unittest.TestCase):
         self.assertIn('assert "BindReadOnlyPaths=/run/docker.sock" not in unit', validator)
         self.assertNotIn("BindReadOnlyPaths=/run/docker.sock\n", tasks)
 
-    def test_lab_dns_administrative_view_is_rendered_and_bound_read_only(self) -> None:
+    def test_platform_dns_administrative_view_is_rendered_and_bound_read_only(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")
         for required in (
-            "LAB_DNS_ADM_CIDR=10.8.10.0/24",
-            'dns["environment"] == {"LAB_DNS_ADM_CIDR": "10.8.10.0/24"}',
-            'if mount["target"] == "/etc/coredns/zones/db.aigw.aegisgroup.ch.adm"',
+            "PLATFORM_DNS_ADM_CIDR=10.8.10.0/24",
+            'dns["environment"] == {"PLATFORM_DNS_ADM_CIDR": "10.8.10.0/24"}',
+            'if mount["target"] == "/etc/coredns/zones/db.aigw.internal.adm"',
             'assert adm_zone["read_only"] is True',
             'assert adm_zone["bind"]["selinux"] == "Z"',
-            "LAB_DNS_ADM_CIDR: ${LAB_DNS_ADM_CIDR:?LAB_DNS_ADM_CIDR must be set}",
-            "expr incidr(client_ip(), '{$LAB_DNS_ADM_CIDR}')",
+            "PLATFORM_DNS_ADM_CIDR: ${PLATFORM_DNS_ADM_CIDR:?PLATFORM_DNS_ADM_CIDR must be set}",
+            "expr incidr(client_ip(), '{$PLATFORM_DNS_ADM_CIDR}')",
             'SERVICES_DIR="$ROOT/services"',
-            '"$SERVICES_DIR/lab-dns/Corefile"',
+            '"$SERVICES_DIR/platform-dns/Corefile"',
             're.search(r"(?m)^\\s*forward(?:\\s|$)", corefile) is None',
         ):
             self.assertIn(required, source)
-        self.assertNotIn('"$COMPOSE_DIR/services/lab-dns/Corefile"', source)
+        self.assertNotIn('"$COMPOSE_DIR/services/platform-dns/Corefile"', source)
 
     def test_openwebui_secure_cookie_flags_are_rendered_exactly(self) -> None:
         validator = SOURCE.read_text(encoding="utf-8")

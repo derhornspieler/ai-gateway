@@ -36,8 +36,9 @@ first — a half-ready broker produces an unverifiable federation.
 - [ ] **Stack is fully deployed and Vault is unsealed.** The three-interface
   converge completed and the `verify` role passed (this is what makes Envoy
   egress — the gateway's only path to `api.anthropic.com` — reachable).
-- [ ] **Identity controller is bootstrapped.** In the admin portal, the
-  **Keycloak controller** card shows the badge **`ready`**.
+- [ ] **Identity controller was reconciled automatically by Ansible.** Operators
+  do not initialize it in a portal; verify that the admin portal's **Keycloak
+  controller** card shows **`ready`** after the converge.
 - [ ] **Broker `private_key_jwt` key is ready.** The same **Identity and
   authorization** section shows an **Anthropic broker certificate SHA-256**, and
   the **Anthropic Workload Identity Federation** card shows
@@ -126,13 +127,14 @@ portal's *Nonsecret external enrollment bundle*):
 
 | Field | Exact value |
 |---|---|
-| Issuer URL | `https://idp.wif-a.example.invalid/realms/anthropic-wif` |
+| Issuer URL | `https://idp.wif.<domain>/realms/anthropic-wif` (copy the exact `issuer_url` from Step 2) |
 | Subject | `service-account-anthropic-token-broker` |
 | Audience | `https://api.anthropic.com` |
 
-> The issuer URL uses `.example.invalid` on purpose — it is a **non-routable**
-> label. Because JWKS is inline, **Anthropic never contacts Keycloak**, so the
-> issuer name only has to *match* the tokens, not resolve in DNS.
+> The WIF hostname is derived from the deployment's `aigw_domain`. Because JWKS
+> is inline, **Anthropic never contacts Keycloak**, but the issuer still has to
+> match the tokens exactly. A domain change therefore requires updating this
+> Anthropic Console setting in the same maintenance window.
 
 1. Open **Settings → Workload identity → Connect workload** and choose
    **Custom OIDC**.

@@ -7,13 +7,6 @@ on:
     branches: [main]
   schedule:
     - cron: "31 8 * * 1"
-  workflow_dispatch:
-    inputs:
-      require_dhi_auth:
-        description: Fail instead of explicitly skipping final-image SBOMs when DHI credentials are unavailable
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -30,20 +23,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [dhi-health-probe, egress-proxy, vault-ui-proxy]
+        module: [dhi-health-probe, egress-proxy, vault-ui-proxy, wif-provider-mock]
     defaults:
       run:
         working-directory: services/${{ matrix.module }}
     steps:
       - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: 1.25.x
+          go-version: 1.26.x
           cache: true
           cache-dependency-path: services/${{ matrix.module }}/go.mod
 
@@ -55,7 +48,11 @@ jobs:
 
   final-image-sbom:
     name: ${{ matrix.image }} final image and SBOM
+    if: >-
+      ${{ github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'schedule') }}
     runs-on: ubuntu-24.04
+    environment: release-container-security
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -70,9 +67,12 @@ jobs:
           - image: vault-ui-proxy
             context: services/vault-ui-proxy
             base_image: ""
+          - image: wif-provider-mock
+            context: services/wif-provider-mock
+            base_image: ""
     steps:
       - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -81,20 +81,15 @@ jobs:
         env:
           DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
           DHI_PASSWORD: ${{ secrets.DHI_PASSWORD }}
-          EVENT_NAME: ${{ github.event_name }}
-          REQUIRE_DHI_AUTH: ${{ inputs.require_dhi_auth || false }}
         run: |
           if [[ -n "$DHI_USERNAME" && -n "$DHI_PASSWORD" ]]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           elif [[ -n "$DHI_USERNAME" || -n "$DHI_PASSWORD" ]]; then
             echo "::error::DHI_USERNAME and DHI_PASSWORD must be configured together"
             exit 1
-          elif [[ "$EVENT_NAME" == "schedule" || "$REQUIRE_DHI_AUTH" == "true" ]]; then
-            echo "::error::DHI authentication is required for this final-image run"
-            exit 1
           else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Final-image build and SBOM explicitly skipped because DHI auth is unavailable"
+            echo "::error::DHI authentication is required for every main or scheduled final-image run"
+            exit 1
           fi
 
       - name: Authenticate to DHI
@@ -111,11 +106,48 @@ jobs:
           BUILD_CONTEXT: ${{ matrix.context }}
           BASE_IMAGE: ${{ matrix.base_image }}
         run: |
+          if [[ "$IMAGE_NAME" == "egress-proxy" ]]; then
+            planner="ai-gateway/ci-egress-policy-planner:${GITHUB_SHA}"
+            final="ai-gateway/ci-${IMAGE_NAME}:${GITHUB_SHA}"
+            docker build --pull --network=none --target policy-planner \
+              --build-arg SOURCE_DATE_EPOCH=0 --tag "$planner" "$BUILD_CONTEXT"
+            receipt="$({ docker run --rm --network none --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=4m,mode=1777 \
+              --user 65532:65532 --cap-drop ALL \
+              --security-opt no-new-privileges:true "$planner" plan \
+              --provider anthropic; } 2>/dev/null)"
+            policy_sha="$(python3 -I -c \
+              'import json,sys; print(json.load(sys.stdin)["egress_policy_sha256"])' \
+              <<<"$receipt")"
+            first="${RUNNER_TEMP}/egress-first.docker.tar"
+            second="${RUNNER_TEMP}/egress-second.docker.tar"
+            for output in "$first" "$second"; do
+              docker buildx build --no-cache --pull=false --network=none \
+                --platform linux/amd64 --provenance=false --sbom=false \
+                --build-arg SOURCE_DATE_EPOCH=0 \
+                --build-arg AIGW_EGRESS_PROVIDERS=anthropic \
+                --build-arg "AIGW_EGRESS_POLICY_SHA256=$policy_sha" \
+                --tag "$final" \
+                --output "type=docker,dest=$output,rewrite-timestamp=true" \
+                "$BUILD_CONTEXT"
+            done
+            cmp --silent "$first" "$second"
+            docker image load --input "$first"
+            live_receipt="$({ docker run --rm --network none --read-only \
+              --user 65532:65532 --cap-drop ALL \
+              --security-opt no-new-privileges:true "$final" receipt; } 2>/dev/null)"
+            test "$live_receipt" = "$receipt"
+            exit 0
+          fi
           build_args=(--pull --tag "ai-gateway/ci-${IMAGE_NAME}:${GITHUB_SHA}")
           if [[ -n "$BASE_IMAGE" ]]; then
             build_args+=(--build-arg "BASE_IMAGE=$BASE_IMAGE")
           fi
           docker build "${build_args[@]}" "$BUILD_CONTEXT"
+
+      - name: Remove DHI registry credentials
+        if: ${{ always() && steps.dhi.outputs.available == 'true' }}
+        run: docker logout dhi.io
 
       - name: Generate the final-image CycloneDX SBOM
         if: steps.dhi.outputs.available == 'true'

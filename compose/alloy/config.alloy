@@ -4,10 +4,10 @@
 // - OTLP listens only on Alloy's fixed net-telemetry address. Attaching Alloy
 //   to storage/export networks must never expose its unauthenticated receiver
 //   or HTTP UI on those networks.
-// - Full prompt/completion bodies are deliberate span attributes (§9.7). They
-//   go to the customer Cribl endpoint and, for litellm_request spans only, to
-//   the local per-request Loki stream (service_name="aigw-requests"); they are
-//   not metric labels and are never written to stdout by this configuration.
+// - Full prompt/completion bodies are deliberate span attributes (§9.7). Only
+//   the exact sanitized litellm_request span is converted to a log for the
+//   customer Cribl security feed and the local per-request Loki stream
+//   (service_name="aigw-requests"). Raw traces and metrics never leave.
 // - Docker logs are read from the host's json-file directory, read-only. The
 //   Docker API socket is intentionally not mounted.
 
@@ -235,16 +235,13 @@ otelcol.processor.batch "default" {
   send_batch_max_size = 1024
   output {
     traces = [
-      otelcol.exporter.otlp.cribl.input,
       otelcol.connector.spanmetrics.default.input,
       otelcol.processor.filter.aigw_request_spans.input,
     ]
     logs = [
-      otelcol.exporter.otlp.cribl.input,
       otelcol.exporter.loki.local.input,
     ]
     metrics = [
-      otelcol.exporter.otlp.cribl.input,
       otelcol.exporter.prometheus.local.input,
     ]
   }
@@ -268,14 +265,13 @@ otelcol.connector.spanmetrics "default" {
 // sensitive-attribute sanitizer above has already removed every credential
 // and raw-identity source before this branch; prompt bodies are deliberately
 // retained here, in this stream only. Sibling spans (raw_gen_ai_request,
-// Received Proxy Server Request) never enter it — the filter drops everything
-// that is not the exact litellm_request span; they still reach Cribl through
-// the batch fan-out with everything else.
+// Received Proxy Server Request), a look-alike span from another service, and
+// every malformed record fail closed before the external queue.
 otelcol.processor.filter "aigw_request_spans" {
-  error_mode = "ignore"
+  error_mode = "propagate"
   traces {
     span = [
-      `name != "litellm_request"`,
+      `resource.attributes["service.name"] != "litellm" or name != "litellm_request"`,
     ]
   }
   output {
@@ -331,11 +327,22 @@ otelcol.connector.spanlogs "aigw_requests" {
 // OTel-semantic service_name label, so pin the resource service.name to the
 // dedicated stream value before label promotion.
 otelcol.processor.transform "aigw_request_stream" {
-  error_mode = "ignore"
+  // These static fields are part of the reviewed external event contract.
+  // Drop the record if they cannot be applied; never export an unclassified
+  // request log after a transform failure.
+  error_mode = "propagate"
   log_statements {
     context = "resource"
     statements = [
       `set(attributes["service.name"], "aigw-requests")`,
+    ]
+  }
+  log_statements {
+    context = "log"
+    statements = [
+      `set(attributes["aigw.security.event_class"], "ai_request_audit")`,
+      `set(attributes["aigw.security.schema_version"], 1)`,
+      `set(attributes["aigw.security.source"], "litellm_request")`,
     ]
   }
   output {
@@ -360,7 +367,38 @@ otelcol.processor.attributes "aigw_request_stream_labels" {
     value  = "aigw.user.name, aigw.project.id"
   }
   output {
-    logs = [otelcol.exporter.loki.local.input]
+    logs = [
+      otelcol.exporter.loki.local.input,
+      otelcol.processor.transform.cribl_security_contract.input,
+    ]
+  }
+}
+
+// Every approved external log carries the same versioned contract attribute,
+// regardless of whether it began as a request spanlog or a classified Docker
+// record. A transform failure propagates and therefore cannot bypass the gate.
+otelcol.processor.transform "cribl_security_contract" {
+  error_mode = "propagate"
+  log_statements {
+    context = "log"
+    statements = [
+      `set(attributes["aigw.security.schema_version"], 1)`,
+    ]
+  }
+  output {
+    logs = [otelcol.processor.batch.cribl_security.input]
+  }
+}
+
+// This is the only queue ingress for the customer security feed. Every input
+// is already reduced to a reviewed log schema. Do not connect a raw receiver,
+// trace, metric, ordinary service log, Vault audit file, or Alloy's own logs.
+otelcol.processor.batch "cribl_security" {
+  timeout             = "1s"
+  send_batch_size     = 512
+  send_batch_max_size = 1024
+  output {
+    logs = [otelcol.exporter.otlp.cribl.input]
   }
 }
 
@@ -389,7 +427,9 @@ loki.write "local" {
 
 // Persistent exporter queue survives Alloy restarts and endpoint outages.
 // queue_size remains byte-bounded at the exporter; fsync trades a small
-// amount of throughput for a durable customer audit trail.
+// amount of throughput for a durable customer audit trail. Alloy has no
+// per-record queue TTL. The 24-hour retry limit is the strongest supported
+// time bound; the byte cap may shorten it during a high-volume outage.
 otelcol.storage.file "cribl_queue" {
   directory             = "/var/lib/alloy/queues/cribl"
   directory_permissions = "0700"
@@ -407,7 +447,7 @@ otelcol.storage.file "cribl_queue" {
 
 // Customer Cribl (or the cribl-mock stand-in). The queue is byte-bounded so
 // one endpoint outage cannot consume all collector memory. Plaintext remains
-// an explicit lab-only switch enforced by Ansible.
+// an explicit test-only switch enforced by Ansible.
 otelcol.exporter.otlp "cribl" {
   client {
     endpoint = sys.env("CRIBL_OTLP_ENDPOINT")
@@ -425,8 +465,8 @@ otelcol.exporter.otlp "cribl" {
     enabled           = true
     num_consumers     = 2
     // Owner decision: the on-disk queue is the Cribl-outage buffer and must
-    // hold roughly 24 hours of this deployment's telemetry (prompt-bearing
-    // spans included). 2 GiB is deliberately generous for the lab volume.
+    // hold at most the intended 24-hour delivery window. The 2 GiB cap is a
+    // safety limit, not proof that every workload gets exactly 24 hours.
     queue_size        = 2147483648
     sizer             = "bytes"
     block_on_overflow = false
@@ -436,7 +476,7 @@ otelcol.exporter.otlp "cribl" {
     enabled          = true
     initial_interval = "1s"
     max_interval     = "30s"
-    max_elapsed_time = "0s"
+    max_elapsed_time = "24h"
   }
 }
 
@@ -498,52 +538,186 @@ loki.process "docker" {
   stage.label_drop { values = ["filename"] }
   forward_to = [
     loki.write.local.receiver,
-    loki.process.external_file_logs.receiver,
+    loki.process.cribl_keycloak_auth.receiver,
+    loki.process.cribl_structured_security.receiver,
   ]
 }
 
-// Do not feed the collector's own logs or the development Cribl debug sink
-// back into Cribl: either path forms a recursive log-amplification loop.
-loki.process "external_file_logs" {
+// Keycloak authentication events are emitted by its reviewed jboss-logging
+// event listener in JSON console logs. The project, service, logger, and event
+// type must all match exactly. Missing or malformed fields are dropped.
+loki.process "cribl_keycloak_auth" {
   stage.match {
-    selector            = "{service=~\"alloy|cribl-mock\"}"
+    selector            = "{project!~\"ai-gateway|aigw-preprod\"}"
     action              = "drop"
-    drop_counter_reason = "telemetry_feedback_loop"
+    drop_counter_reason = "unapproved_project"
   }
-  forward_to = [otelcol.receiver.loki.file_logs.receiver]
+  stage.match {
+    selector            = "{service!=\"keycloak\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_service"
+  }
+  stage.json {
+    expressions = {
+      keycloak_logger  = "\"log.logger\"",
+      keycloak_message = "message",
+    }
+  }
+  stage.labels {
+    values = {
+      keycloak_logger = "",
+    }
+  }
+  stage.match {
+    selector            = "{keycloak_logger!=\"org.keycloak.events\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_keycloak_logger"
+  }
+  stage.regex {
+    source     = "keycloak_message"
+    expression = `^type=(?P<keycloak_event>CLIENT_LOGIN|CLIENT_LOGIN_ERROR|CODE_TO_TOKEN|CODE_TO_TOKEN_ERROR|IDENTITY_PROVIDER_FIRST_LOGIN|IDENTITY_PROVIDER_FIRST_LOGIN_ERROR|IDENTITY_PROVIDER_LOGIN|IDENTITY_PROVIDER_LOGIN_ERROR|IDENTITY_PROVIDER_POST_LOGIN|IDENTITY_PROVIDER_POST_LOGIN_ERROR|IMPERSONATE|IMPERSONATE_ERROR|LOGIN|LOGIN_ERROR|LOGOUT|LOGOUT_ERROR|REFRESH_TOKEN|REFRESH_TOKEN_ERROR|USER_DISABLED_BY_PERMANENT_LOCKOUT|USER_DISABLED_BY_PERMANENT_LOCKOUT_ERROR|USER_DISABLED_BY_TEMPORARY_LOCKOUT|USER_DISABLED_BY_TEMPORARY_LOCKOUT_ERROR)(?:,|$)`
+  }
+  stage.regex {
+    source     = "keycloak_message"
+    expression = `(?:^|, )[Rr]ealm[Ii]d=(?P<keycloak_realm_id>[A-Za-z0-9_.:@-]{1,128})(?:,|$)`
+  }
+  stage.regex {
+    source     = "keycloak_message"
+    expression = `(?:^|, )[Cc]lient[Ii]d=(?P<keycloak_client_id>[A-Za-z0-9_.:@/-]{1,128})(?:,|$)`
+  }
+  stage.regex {
+    source     = "keycloak_message"
+    expression = `(?:^|, )[Uu]ser[Ii]d=(?P<keycloak_user_id>[A-Za-z0-9_.:@-]{1,128})(?:,|$)`
+  }
+  stage.labels {
+    values = {
+      aigw_security_event_class = "keycloak_event",
+      keycloak_event            = "",
+    }
+  }
+  stage.static_labels {
+    values = {
+      aigw_security_schema = "1",
+    }
+  }
+  stage.match {
+    selector            = "{keycloak_event=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_keycloak_event"
+  }
+  // Reconstruct from bounded fields instead of forwarding the original
+  // Keycloak line. This drops IP, username/email, redirect URI, code/session
+  // IDs, error detail, and any future unreviewed field by construction.
+  stage.template {
+    source   = "keycloak_security_line"
+    template = `schema_version=1 event=aigw.keycloak.authentication event_type={{ .keycloak_event }} realm_id={{ .keycloak_realm_id }} client_id={{ .keycloak_client_id }} user_id={{ .keycloak_user_id }}`
+  }
+  stage.output { source = "keycloak_security_line" }
+  stage.label_drop { values = ["keycloak_logger"] }
+  forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
+}
+
+// Gateway-owned components prefix reviewed, bounded JSON records with one
+// marker. Exact service/event/action/outcome allow-lists prevent ordinary
+// stdout, stack traces, or a look-alike container from entering the SOC feed.
+loki.process "cribl_structured_security" {
+  stage.match {
+    selector            = "{project!~\"ai-gateway|aigw-preprod\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_project"
+  }
+  stage.match {
+    selector            = "{service!~\"dev-portal|admin-portal|key-rotator|envoy-egress\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_service"
+  }
+  stage.regex {
+    expression = `(?:^|.*[[:space:]])AIGW_SECURITY_EVENT[[:space:]]+(?P<aigw_security_json>\{.*\})[[:space:]]*$`
+  }
+  stage.json {
+    source = "aigw_security_json"
+    expressions = {
+      security_action  = "action",
+      security_event   = "event",
+      security_outcome = "outcome",
+      security_schema  = "schema_version",
+    }
+  }
+  stage.labels {
+    values = {
+      aigw_security_event_class = "security_event",
+      aigw_security_schema      = "",
+      security_action           = "",
+      security_event            = "",
+      security_outcome          = "",
+    }
+  }
+  stage.match {
+    selector            = "{aigw_security_schema!=\"1\"}"
+    action              = "drop"
+    drop_counter_reason = "unsupported_security_schema"
+  }
+  stage.match {
+    selector            = "{service=~\"dev-portal|admin-portal\",security_event!=\"aigw.portal.audit\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_security_emitter"
+  }
+  stage.match {
+    selector            = "{service=\"key-rotator\",security_event!=\"aigw.identity.audit\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_security_emitter"
+  }
+  stage.match {
+    selector            = "{service=\"envoy-egress\",security_event!=\"aigw.egress.trust\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_security_emitter"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"key\\.generate|key\\.deactivate|egress\\.trust\\.verify|rotation\\.settings\\.update|rotation\\.trigger|provider\\.anthropic\\.(configure|disable|delete)|identity\\.member\\.remove|identity\\.group\\.policy|admin\\.key\\.(block|unblock|limits)\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_portal_action"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action!~\"bootstrap|deployment_converge|group_policy_update|group_create|group_delete|group_member_add|group_member_remove\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_identity_action"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.egress.trust\",security_action!=\"startup_gate\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_egress_action"
+  }
+  stage.match {
+    selector            = "{security_outcome!~\"success|failure|failed|mismatch|denied-active-key|denied-membership\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_outcome"
+  }
+  stage.output { source = "aigw_security_json" }
+  forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
 }
 
 // Vault audit records are HMAC-redacted by Vault and live on a dedicated
-// read-only mount in Alloy. They are retained locally and dual-exported.
+// read-only mount in Alloy. They are retained locally only. Unsealing happens
+// while the audit device is unavailable, so these records are not a reliable
+// structured seal/unseal feed and must not be guessed into the SOC stream.
 loki.source.file "vault_audit" {
   targets = [{
     __path__ = "/var/log/aigw/vault/audit.log",
     job      = "vault-audit",
     service  = "vault-audit",
   }]
-  forward_to = [
-    loki.write.local.receiver,
-    otelcol.receiver.loki.file_logs.receiver,
-  ]
+  forward_to = [loki.write.local.receiver]
   file_match {
     enabled     = true
     sync_period = "10s"
   }
 }
 
-// Bridge stable Loki file tailing into OTLP for the Cribl copy. Keep it on a
-// separate batch path so the local Loki write is never duplicated.
-otelcol.receiver.loki "file_logs" {
+// Bridge only the two fail-closed security classifiers above into OTLP logs.
+// The request-audit spanlog joins the same queue directly after its exact
+// trace filter. No trace or metric output exists on this receiver or batch.
+otelcol.receiver.loki "cribl_security_logs" {
   output {
-    logs = [otelcol.processor.batch.file_logs.input]
-  }
-}
-
-otelcol.processor.batch "file_logs" {
-  timeout             = "1s"
-  send_batch_size     = 512
-  send_batch_max_size = 1024
-  output {
-    logs = [otelcol.exporter.otlp.cribl.input]
+    logs = [otelcol.processor.transform.cribl_security_contract.input]
   }
 }

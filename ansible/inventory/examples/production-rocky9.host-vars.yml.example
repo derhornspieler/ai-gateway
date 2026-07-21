@@ -49,7 +49,4 @@ pbr_tables:
 require_encrypted_state: true
 require_preupgrade_backup: true
 aigw_ssh_password_authentication: false
-samba_lab_enabled: false
 aigw_seed_test_users: false
-retain_bootstrap_admin_user: false
-

@@ -8,10 +8,9 @@ Docker CE (`ansible/roles/os_baseline/tasks/main.yml` installs `docker-ce` and
 converge gets whatever Compose shipped that week):
 
   A. Compose model validation on live-project `exec`
-     `docker compose exec` validates the *whole* project model. With
-     `COMPOSE_PROFILES=""` on a lab host the profile-gated `samba-ad` service
-     disappears while the lab overlay's `keycloak: depends_on: samba-ad`
-     survives, so Compose rejects the project with
+     `docker compose exec` validates the *whole* project model. With an empty
+     `COMPOSE_PROFILES`, a profile-gated dependency can disappear while its
+     dependent service survives, so Compose rejects the project with
      `depends on undefined service`. Fixed by activating the real joined
      profile set on every exec-style task.
 
@@ -76,7 +75,7 @@ FORBIDDEN_TMPFS_TOKEN = "ro"
 
 PROBE_IMAGE = "aigw-ci-compose-canary:local"
 PROJECT = "aigw-canary"
-GATED_PROFILE = "lab-ad"
+GATED_PROFILE = "vault-ui"
 
 # CI builds the probe with the runner's own Go toolchain, so the canary pulls
 # nothing at all. A controller workstation without Go falls back to this

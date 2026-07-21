@@ -1,0 +1,22 @@
+---
+- name: Remove only local AI Gateway preprod resources
+  hosts: preprod
+  gather_facts: false
+  become: false
+  pre_tasks:
+    - name: Require the exact preprod destroy confirmation
+      ansible.builtin.assert:
+        that:
+          - preprod_state == 'absent'
+          - preprod_destroy_confirmation | default('') == 'DESTROY_AIGW_PREPROD'
+        fail_msg: >-
+          Pass -e preprod_destroy_confirmation=DESTROY_AIGW_PREPROD.
+          Only resources carrying the exact preprod project name are removed.
+  vars:
+    preprod_state: absent
+    aigw_domain: aigw.internal
+    preprod_project_name: aigw-preprod
+    preprod_resource_prefix: aigw-preprod
+    preprod_subnet_octet: 29
+  roles:
+    - preprod_stack

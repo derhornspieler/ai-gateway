@@ -12,7 +12,6 @@ rotator's Vault authority.
 from __future__ import annotations
 
 import pathlib
-import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -57,55 +56,17 @@ class BreakGlassContractTest(unittest.TestCase):
             group_vars,
         )
 
-    def test_vault_bootstrap_grants_only_the_exact_escrow_path(self) -> None:
-        bootstrap = (ROOT / "scripts/vault-bootstrap.sh").read_text()
+    def test_preprod_vault_policy_grants_only_the_exact_escrow_path(self) -> None:
+        preprod = (ROOT / "scripts/preprod.py").read_text()
         self.assertIn(
-            'validate_vault_path BREAK_GLASS_ADMIN_VAULT_PATH '
-            '"$BREAK_GLASS_ADMIN_VAULT_PATH"',
-            bootstrap,
+            'path "kv/data/ai-gateway/keycloak/break-glass-admin" '
+            '{ capabilities = ["create", "read", "update"] }',
+            preprod,
         )
-        # Parse the rotator policy heredoc and prove the PROPERTY (the escrow
-        # path is granted exactly create/read/update, once, with no delete and
-        # no metadata authority), not one exact capability string — a
-        # reordered or duplicated grant elsewhere in the policy must fail.
-        policy_match = re.search(
-            r"vlt policy write rotator - <<HCL\n(.*?)\nHCL", bootstrap, re.DOTALL
+        self.assertNotIn(
+            'path "kv/metadata/ai-gateway/keycloak/break-glass-admin"', preprod
         )
-        self.assertIsNotNone(policy_match, "rotator policy heredoc is missing")
-        policy = policy_match.group(1)
-        escrow_stanzas = re.findall(
-            r'^path\s+"([^"]*BREAK_GLASS_ADMIN_VAULT_PATH[^"]*)"\s*'
-            r"\{\s*capabilities\s*=\s*\[([^\]]*)\]\s*\}",
-            policy,
-            re.MULTILINE,
-        )
-        self.assertEqual(
-            len(escrow_stanzas),
-            1,
-            "the escrow path must appear in exactly one policy stanza",
-        )
-        stanza_path, capabilities = escrow_stanzas[0]
-        self.assertEqual(stanza_path, "kv/data/${BREAK_GLASS_ADMIN_VAULT_PATH}")
-        granted = {
-            token.strip().strip('"') for token in capabilities.split(",")
-        }
-        self.assertEqual(granted, {"create", "read", "update"})
-        # No other line of the policy may mention the escrow path (that
-        # includes kv/metadata: the version-retention bound below must stay
-        # root-owned).
-        mentions = [
-            line
-            for line in policy.splitlines()
-            if "BREAK_GLASS_ADMIN_VAULT_PATH" in line
-        ]
-        self.assertEqual(len(mentions), 1, mentions)
-        # Version-destruction resistance: KV v2's default max_versions (10)
-        # would let ten rotator writes expire the real credential version.
-        self.assertIn(
-            'vlt kv metadata put -max-versions=100 '
-            '"kv/${BREAK_GLASS_ADMIN_VAULT_PATH}"',
-            bootstrap,
-        )
+        self.assertIn('body={"max_versions": 100}', preprod)
 
     def test_rotator_defaults_match_the_deployment_contract(self) -> None:
         config = (
@@ -129,8 +90,8 @@ class BreakGlassContractTest(unittest.TestCase):
         self.assertIn('MANAGED_ADMIN_GROUP_ATTRIBUTE = "aigw.managed-admin-group"', identity)
         self.assertIn('BREAK_GLASS_ATTRIBUTE = "aigw.break-glass"', identity)
 
-    def test_live_lab_acceptance_requires_the_escrow(self) -> None:
-        verifier = (ROOT / "scripts/verify-live-lab-identity.py").read_text()
+    def test_preprod_acceptance_requires_the_escrow(self) -> None:
+        verifier = (ROOT / "scripts/preprod.py").read_text()
         self.assertIn('"break_glass_escrowed": True,', verifier)
 
 

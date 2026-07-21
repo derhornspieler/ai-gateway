@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Prove the default-model pre-call hook against the real deployed lab LiteLLM.
+"""Prove the default-model pre-call hook against local preprod LiteLLM.
 
-Mints a real one-time dev-portal key for the lab-developer's project and
+Mints a real one-time dev-portal key for the preprod-developer's project and
 drives the public inference edge directly:
 
   * a request that OMITS ``model`` resolves to the project's configured
@@ -24,7 +24,7 @@ run.
 
 Model resolution is proved at the LiteLLM *router* layer rather than by
 requiring a full vendor round trip: a resolved model always appears either
-as the successful response's ``model`` field, or — if the lab's downstream
+as the successful response's ``model`` field, or — if preprod's downstream
 vendor credentials are not currently enrolled — as the ``Received Model
 Group=<name>`` router diagnostic LiteLLM attaches to the resulting vendor
 auth error. Both are equally strong proof of what the pre-call hook handed
@@ -35,7 +35,7 @@ router at all (LiteLLM's own "Invalid model name passed in model=None"),
 which is the distinguishing, credential-independent signal used below.
 
 Follows the same conventions as ``test-portal-key-lifecycle.py`` and
-``test-portal-login.py``: headless urllib OIDC flow, the lab-developer
+``test-portal-login.py``: headless urllib OIDC flow, the preprod-developer
 Samba password accepted only on stdin and never logged or persisted, a
 restricted-redirect handler bounding every hop to the reviewed portal/auth
 hosts, and a ``--ca`` flag for the deployment CA. The minted key's plaintext
@@ -159,13 +159,14 @@ def main() -> int:
     parser.add_argument("--ca", required=True)
     args = parser.parse_args()
     if sys.stdin.isatty():
-        raise SystemExit("pipe the lab-developer Samba password on stdin")
+        raise SystemExit("pipe the preprod-developer Samba password on stdin")
     raw = sys.stdin.buffer.read(513)
     if not raw or len(raw) > 512:
-        raise SystemExit("invalid lab password length")
+        raise SystemExit("invalid preprod password length")
     password = raw.strip().decode("utf-8")
 
     context = ssl.create_default_context(cafile=args.ca)
+    flow.install_preprod_resolution()
     cookies = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
@@ -179,16 +180,16 @@ def main() -> int:
         flow.PORTAL_ORIGIN + "/login/start",
         password,
         allowed_hosts=flow.PORTAL_ALLOWED_HOSTS,
-        username="lab-developer",
+        username="preprod-developer",
     )
     if urllib.parse.urlsplit(page_url).path != "/":
-        raise RuntimeError("lab-developer login did not reach the key page")
+        raise RuntimeError("preprod-developer login did not reach the key page")
     print("DEFAULT_MODEL_HOOK_LOGIN_PASS")
 
     form = lifecycle.exact_form(page_url, body, "/keys")
     project_id = str(form["inputs"].get("project_id", ""))
     if not project_id:
-        raise RuntimeError("lab-developer has no active project binding")
+        raise RuntimeError("preprod-developer has no active project binding")
 
     # LiteLLM enforces key_alias uniqueness at the database layer even
     # across deactivated keys, so a fixed alias would fail every run after

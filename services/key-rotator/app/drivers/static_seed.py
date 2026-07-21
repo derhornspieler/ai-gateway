@@ -1,12 +1,11 @@
 """static_seed driver — seeds an initial vendor API key into LiteLLM from a
 static secret held in Vault.
 
-This exists purely to bootstrap local/dev testing before the real
-Anthropic WIF (app/drivers/anthropic_wif.py) or OpenAI blue/green
-(app/drivers/openai_svcacct.py) drivers are configured and enabled — see
+This exists purely to bootstrap local/dev testing before the real Anthropic
+WIF driver (app/drivers/anthropic_wif.py) is configured and enabled — see
 docs/solution-map.md §1.7 fallback note ("static sk-ant-api key in Vault")
 and §9.4 (driver plugin interface). It is registered under the
-"static-anthropic" / "static-openai" vendor rows (rotator_settings,
+"static-anthropic" vendor row (rotator_settings,
 interval_seconds=0 => run once at boot).
 
 Reads Vault KV v2 at logical path "ai-gateway/vendors/{vendor}"
@@ -56,7 +55,7 @@ class StaticSeedDriver(BaseDriver):
 
     async def rotate(self, ctx: DriverContext) -> RotationResult:
         # Never clobber a live rotated key. The real vendor driver
-        # (anthropic_wif / openai_svcacct) owns the SAME vault path
+        # (anthropic_wif) owns the SAME vault path
         # (ai-gateway/vendors/{vendor}) and the SAME litellm credential
         # ({vendor}-primary). If the real driver is enabled, this static
         # seed must do nothing — otherwise a reload triggered by any

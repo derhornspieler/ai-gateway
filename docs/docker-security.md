@@ -37,27 +37,27 @@ condition, not an auto-repair.
 `latest`, and Compose runs with implicit builds disabled — an unchanged
 converge can never rebuild or retag an image.
 
-**Docker Hardened Images (DHI) by default.** Catalog-supported components
-run directly on `dhi.io` images (Postgres 16.14, BusyBox) or on
-reviewed single-layer derivatives that add only a static health-probe binary
-to an otherwise shellless DHI runtime (Keycloak 26.6.4, Vault 2.0.3, Redis
-7.4.9, the four OAuth2 Proxy 7.15.3 gates, Alloy, Prometheus, Loki, Grafana,
-node-exporter, the OTel collector). Traefik is a reviewed two-stage build
-that places the patched 3.7.7 binary on the non-root DHI runtime. The
-portals, key-rotator, and Envoy entrypoint build from DHI Python/Go bases
-with `--network=none`.
+**Docker Hardened Images (DHI) by default.** Postgres 18.4 and BusyBox run
+directly from `dhi.io`. Reviewed single-layer images add only a static health
+probe to shellless DHI runtimes. This group includes Keycloak 26.6.4, Vault
+2.0.3, Redis 7.4.9, the four OAuth2 Proxy 7.15.3 gates, Alloy, Prometheus,
+Loki, Grafana, node-exporter, and the OTel collector. Traefik is a reviewed
+two-stage build that places the patched 3.7.8 binary on the non-root DHI
+runtime. The portals, key-rotator, and Envoy entrypoint build from DHI
+Python/Go bases with `--network=none`.
 
-**Documented exceptions.** Three upstream images remain, each pinned past a
-known-vulnerable release with the rationale recorded inline: LiteLLM
-v1.92.0, Open WebUI 0.10.2, and the lab-only Debian Samba build.
+**Documented exceptions.** Three upstream images remain, each pinned and
+reviewed: LiteLLM v1.93.0, Open WebUI 0.10.2, and the Debian-based Samba AD
+image used only by local preprod. The Samba image is never deployed as a
+production customer directory.
 
 **Extracted, never executed.** The optional Vault browser UI
-(`vault-ui-proxy`) is a stdlib-only Go proxy whose UI assets are extracted
-from the official `hashicorp/vault:2.0.3` image *as data* — the upstream
-binary is never run — with the exact embedded file set pinned in
-`upstream-provenance.json`, analytics force-disabled, a strict no-external
-CSP, and a startup proof that the proxy is PID 1 with no other process in
-the container.
+(`vault-ui-proxy`) is a Go proxy that uses only the standard library. Its UI
+assets are extracted from the official `hashicorp/vault:2.0.3` image as data;
+the upstream binary never runs. `upstream-provenance.json` pins the exact
+embedded files. The image disables analytics, applies a strict no-external
+content security policy, and proves at startup that the proxy is the only
+process and runs as PID 1.
 
 **Deterministic builds and rollback.** A build planner digests each
 service's effective build definition and complete build context
@@ -68,6 +68,37 @@ content-addressed rollback reference. The portal image installs its complete
 transitive dependency set from a SHA-256-hashed lock file with pip
 `--require-hashes`; installing from an unhashed requirements list is
 forbidden.
+
+### Immutable provider egress policy
+
+The Envoy image is built for an explicit set of reviewed provider names. The
+release command accepts no provider hostname or CA path. A network-disabled
+planner resolves each name through the committed provider catalog and checks:
+
+- the exact API hostname, route prefix, SNI, and SAN list;
+- complete CA-bundle hashes and ordered certificate fingerprints;
+- CA validity dates, CA constraints, and certificate-signing use; and
+- the reviewed provenance file and its hash.
+
+The network-disabled image build copies only the selected routes, CA bundles,
+and generated policy into the final shellless image. An unselected provider
+has no route or CA file. Changing the selection changes the policy digest and
+immutable image ID.
+
+The schema-v2 release manifest records that evidence and binds it to the final
+Envoy image ID. The offline loader checks the matching image labels before
+activation. Ansible never discovers or downloads CA trust. It deploys the
+already-reviewed image and policy as one release unit.
+
+At startup, the compiled gate rejects changed policy or config bytes; missing,
+extra, malformed, expired, or fingerprint-mismatched CA files; invalid SNI or
+SAN rules; the `ENVOY_CONFIG` variable; and caller-supplied config flags. It
+does not fall back to the system trust store. Do not add a CA bind mount or
+override the image entrypoint.
+
+See [Provider onboarding](provider-onboarding.md), the
+[Provider CA maintenance SOP](sop/provider-ca-maintenance.md), and
+[offline image releases](offline-image-seed.md#envoy-image-and-policy-binding).
 
 ## 3. Runtime hardening
 
@@ -82,16 +113,18 @@ unless-stopped`. On top of that baseline:
   only root container is the one-shot volume initializer — networkless,
   read-only, PID-limited, and exiting before any stateful service starts.
 - **Minimal capabilities.** Almost every service runs with zero
-  capabilities. The exceptions are explicit and narrow: `NET_BIND_SERVICE`
-  for the two Traefik edges (and lab DNS), `IPC_LOCK` for Vault (with
-  unlimited memlock so key material never swaps), `CHOWN/FOWNER/FSETID` for
-  the volume initializer, and the lab-only Samba set.
+  capabilities. The production exceptions are explicit and narrow:
+  `NET_BIND_SERVICE` for the two Traefik edges and optional platform DNS,
+  `IPC_LOCK` for Vault (with unlimited memlock so key material never swaps),
+  and `CHOWN/FOWNER/FSETID` for the volume initializer. Local preprod Samba
+  has its own reviewed capability set because it must act as an AD domain
+  controller; that set is not part of production.
 - **Read-only root filesystems** with per-purpose `tmpfs` mounts, except
   three documented writable-rootfs exceptions whose upstreams require it
   (LiteLLM, Open WebUI, Keycloak) — each justified inline in the Compose
   file.
 - **Resource ceilings** on every service (memory, CPU, PIDs), from 64 MiB
-  for lab DNS to 4 GiB for LiteLLM.
+  for platform DNS to 4 GiB for LiteLLM.
 - **Shellless health checks.** DHI runtimes carry no shell, so health checks
   use a static, purpose-built probe binary (`aigw-health-probe`) or the
   component's own native health command — never `curl | sh` patterns.
@@ -100,7 +133,7 @@ unless-stopped`. On top of that baseline:
   justified: Alloy (must read Docker's runtime-owned logs, which must never
   be relabeled) and node-exporter (read-only host-root metrics view). Both
   remain non-root, capability-dropped, read-only, and unpublished.
-- **No privileged containers** anywhere, including the lab overlay.
+- **No privileged containers** anywhere, including local preprod.
 
 ## 4. Secrets handling
 
@@ -112,9 +145,9 @@ unless-stopped`. On top of that baseline:
 - **No secret in a command line or environment where a file will do.**
   Redis receives only a SHA-256 ACL verifier via file; its health probe
   reads a separate password file; neither value appears in the container's
-  command or environment metadata. Lab Samba passwords are file-backed
-  Docker secrets read with `O_NOFOLLOW` and driven through the Samba API —
-  never a child-process argument.
+  command or environment metadata. Preprod Samba passwords are file-backed
+  test secrets read with `O_NOFOLLOW` and driven through the Samba API — never
+  a child-process argument.
 - **Verified absence.** The converge proves the Open WebUI workload key's
   plaintext appears in no project container log, and stores only its hash in
   the gateway database. Provider credentials live in Vault and are brokered
@@ -151,11 +184,16 @@ systemd ACL reconciler with a read-only socket bind.
 
 ## 7. Port publication
 
-Exactly two services publish host ports in the base stack, each bound to one
-exact address: `traefik-int` on `ETH2_IP:443` and `traefik-adm` on
-`ETH1_IP:443` (the optional platform-DNS overlay adds authoritative DNS on
-port 53, bound to the same two addresses).
-The converge asserts the live publication set equals that expectation,
-rejects any binding on `0.0.0.0`, `::`, or the egress address, and verifies
-the corresponding NAT rules — Envoy's admin endpoint and every telemetry
-listener remain unpublished on fixed internal bridge addresses.
+Exactly two services publish host ports in the base stack. `traefik-int`
+binds only to `ETH2_IP:443`. `traefik-adm` binds only to `ETH1_IP:443`. The
+optional platform-DNS overlay also binds port 53 to those two addresses.
+
+The converge checks the live publication set. It rejects `0.0.0.0`, `::`, and
+the egress address, and it checks the matching NAT rules. Envoy's admin
+endpoint and every telemetry listener stay unpublished on fixed internal
+bridge addresses.
+
+Alloy may open one outbound OTLP/TLS connection to the approved Cribl `/32`.
+Only the curated security-log allow-list can use it. Metrics, raw traces,
+alerts, and ordinary service logs stay local. See the
+[Cribl SOC logging handoff](cribl-soc-handoff.md).

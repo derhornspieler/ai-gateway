@@ -56,7 +56,7 @@ the evidence column or a linked evidence bundle. Never paste secrets into it.
 ## Current 2026-07-13 execution evidence
 
 The recovery workstation directory
-`/Users/jamesrudisill/.aigw-lab-dr/20260713-pre-rebuild` is mode `0700`; its
+`$HOME/.aigw-lab-dr/20260713-pre-rebuild` is mode `0700`; its
 artifacts are mode `0600`. G0 verified all of the following before the old VM
 was deleted:
 
@@ -75,7 +75,7 @@ was deleted:
   `d4f87d3409c867b3cb4d6bb22fdeffe1eb908dea6227a2ac644a0f4c1246fc6d`;
   and
 - the attempt-4 post-re-key, post-ACL-order deployment-source archive
-  `/Users/jamesrudisill/.aigw-lab-dr/20260713-pre-rebuild/ai-gateway-source-post-acl-order-20260713T052206Z.tar.gz`,
+  `$HOME/.aigw-lab-dr/20260713-pre-rebuild/ai-gateway-source-post-acl-order-20260713T052206Z.tar.gz`,
   396,669 bytes and 230 archive members, SHA-256
   `15a8bf3f61aa8395e02aabc2eec3e43b2e76cb25e48b5b11ac366d6d10623b50`.
 
@@ -127,7 +127,7 @@ deleted:
 | hypervisor identity | `aigw01`, UUID `eb1cdcf8-af33-4057-bf43-85ec1f6cd71d` |
 | Capacity/firmware | 6 vCPU, 16 GiB RAM, 80 GiB disk, ARM64 EFI, Secure Boot off |
 | OS/kernel | Rocky Linux 9.8, `5.14.0-687.24.1.el9_8.aarch64` |
-| Static hostname | `aigw01.aigw.aegisgroup.ch` |
+| Static hostname | `aigw01.aigw.internal` |
 | egress | `enp0s5`, MAC `00:1c:42:1f:b2:86`, `10.211.55.3/24`, sole main default via `10.211.55.1` |
 | ADM | `enp0s7`, MAC `00:1c:42:d1:c3:fb`, `10.8.10.10/24`, no main default |
 | internal | `enp0s8`, MAC `00:1c:42:a0:d3:fa`, `10.20.0.10/24`, no main default |
@@ -555,7 +555,7 @@ Attach three adapters in this role order:
 
 The Mac-side host-only addresses/gateways must already be `10.8.10.2` and
 `10.20.0.2`, without DHCP assigning the VM a conflicting address. The initial
-Rocky resolver is `10.211.55.1`. The authoritative `aigw.aegisgroup.ch` lab DNS
+Rocky resolver is `10.211.55.1`. The authoritative `aigw.internal` lab DNS
 service does not exist until the stack is deployed.
 
 Interface enumeration can change when virtual hardware/order changes. This

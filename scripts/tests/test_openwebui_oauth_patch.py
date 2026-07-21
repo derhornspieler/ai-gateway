@@ -111,6 +111,34 @@ class OpenWebUiOauthPatchTests(unittest.TestCase):
         self.assertIn("source=verify_openwebui_oauth.py", dockerfile)
         self.assertIn("python3 -I /tmp/verify_openwebui_oauth.py", dockerfile)
 
+    def test_runtime_image_removes_unused_build_and_database_packages(self) -> None:
+        dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
+        purge = dockerfile.split("RUN --network=none apt-get autopurge -y", 1)[1].split(
+            "# The immutable upstream image", 1
+        )[0]
+        for package in (
+            "build-essential",
+            "gcc",
+            "g++",
+            "make",
+            "libmariadb-dev",
+            "python3-dev",
+            "curl",
+            "jq",
+        ):
+            self.assertIn(package, purge)
+        self.assertIn("test -x /usr/local/bin/python3", purge)
+        self.assertIn("python3 -I -m pip check", purge)
+        self.assertNotIn("apt-get update", purge)
+
+    def test_direct_image_healthcheck_uses_the_static_probe(self) -> None:
+        dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            'HEALTHCHECK CMD ["/usr/local/bin/aigw-health-probe", "http", '
+            '"--url", "http://127.0.0.1:8080/health"]',
+            dockerfile,
+        )
+
     def test_derivative_drops_to_a_nonroot_runtime_identity(self) -> None:
         dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
         self.assertIn("chown -R 65532:65532 /app/backend/data", dockerfile)

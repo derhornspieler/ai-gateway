@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "platform": "linux/amd64",
+  "providers": [
+    "anthropic"
+  ]
+}

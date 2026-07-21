@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Prove WIF-backed Anthropic inference through the gateway as lab-developer.
+"""Prove WIF-backed inference through local preprod as preprod-developer.
 
-Mints a one-time portal key for lab-developer, then proves a real Claude
-(haiku) completion returns via BOTH the Anthropic Messages format
+Mints a one-time portal key for preprod-developer, then proves a completion
+returns via BOTH the Anthropic Messages format
 (POST /v1/messages) and the OpenAI Chat format (POST /v1/chat/completions) —
 exercising LiteLLM -> Envoy -> Anthropic through the WIF-minted
 `anthropic-primary` credential. Deactivates the key on exit.
 
 Controller-side, hyphenated (excluded from unittest discovery / the VM
-manifest / validate-compose). The disposable lab password is accepted only on
+manifest / validate-compose). The static preprod password is accepted only on
 stdin and is never logged; the minted key is masked and deactivated.
 """
 
@@ -40,7 +40,7 @@ def _load(name: str, path: Path):
 HERE = Path(__file__).resolve().parent
 klc = _load("aigw_key_lifecycle", HERE / "test-portal-key-lifecycle.py")
 flow = klc.flow
-API = klc.API_ORIGIN  # https://api.aigw.aegisgroup.ch
+API = klc.API_ORIGIN  # https://api.aigw.internal
 
 
 def _plain_opener(ctx: ssl.SSLContext):
@@ -86,13 +86,14 @@ def main() -> int:
     ap.add_argument("--ca", required=True)
     args = ap.parse_args()
     if sys.stdin.isatty():
-        raise SystemExit("pipe the lab-developer password on stdin")
+        raise SystemExit("pipe the preprod-developer password on stdin")
     raw = sys.stdin.buffer.read(513)
     if not raw or len(raw) > 512:
-        raise SystemExit("invalid lab password length")
+        raise SystemExit("invalid preprod password length")
     password = raw.strip().decode("utf-8")
 
     ctx = ssl.create_default_context(cafile=args.ca)
+    flow.install_preprod_resolution()
     cookies = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
@@ -101,7 +102,7 @@ def main() -> int:
         flow.RestrictedRedirects(flow.PORTAL_ALLOWED_HOSTS),
     )
 
-    # OIDC login as lab-developer -> land on the key page.
+    # OIDC login as preprod-developer -> land on the key page.
     page_url, body = flow.read_page(opener, flow.PORTAL_ORIGIN + "/login/start")
     forms = [
         f for f in flow.parse_forms(body)
@@ -113,11 +114,11 @@ def main() -> int:
         opener,
         page_url,
         forms[0],
-        {"username": "lab-developer", "password": password},
+        {"username": "preprod-developer", "password": password},
         allowed_hosts=flow.PORTAL_ALLOWED_HOSTS,
     )
     if urllib.parse.urlsplit(page_url).path != "/":
-        raise RuntimeError("lab-developer login did not reach the key page")
+        raise RuntimeError("preprod-developer login did not reach the key page")
 
     # One active key per user per project: a crashed prior run can leave a
     # stale active key that blocks the mint. Deactivate it first if present.
@@ -136,7 +137,7 @@ def main() -> int:
     key, _, post = klc.generate(opener, page_url, body, alias)
     if key not in post:
         raise RuntimeError("minted key not present in creation response")
-    print("MINTED lab-developer key (masked): %s...%s" % (key[:10], key[-4:]))
+    print("MINTED preprod-developer key (masked): %s...%s" % (key[:10], key[-4:]))
 
     ok = True
     try:

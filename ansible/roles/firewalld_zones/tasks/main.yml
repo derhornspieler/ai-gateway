@@ -307,21 +307,6 @@
 # NetworkManager owns the durable interface-to-zone relationship on Rocky 9.
 # A normal clean host may use the built-in `public` zone (or no saved zone),
 # but a customer-specific zone must not be silently replaced by this platform.
-- name: Preflight — derive the exact fail-closed Rocky 9 lab reset handoff
-  ansible.builtin.set_fact:
-    aigw_lab_reset_handoff_drop_bindings: >-
-      {{
-        [
-          {'interface': nic_egress, 'zone': 'aigw-egress'},
-          {'interface': nic_internal, 'zone': 'aigw-internal'}
-        ]
-        if (
-          (deployment_profile | default('')) == 'rocky9-lab'
-          and (aigw_lab_reset_handoff_drop_interfaces | default([]) | length) == 2
-          and (aigw_lab_reset_handoff_drop_interfaces | default([]) | sort) == ([nic_egress, nic_internal] | sort)
-        )
-        else []
-      }}
 
 - name: Preflight — read active NetworkManager profiles before zone ownership changes
   ansible.builtin.command:
@@ -378,13 +363,7 @@
 - name: Preflight — reject customer-owned saved NetworkManager zones
   ansible.builtin.assert:
     that:
-      - >-
-        (item.stdout | trim) in ['', 'public', item.item.zone]
-        or (
-          (item.stdout | trim) == 'drop'
-          and {'interface': item.item.interface, 'zone': item.item.zone}
-              in aigw_lab_reset_handoff_drop_bindings
-        )
+      - (item.stdout | trim) in ['', 'public', item.item.zone]
     quiet: true
     fail_msg: >-
       {{ item.item.interface }} is persistently assigned to customer-owned
@@ -407,13 +386,7 @@
 - name: Preflight — reject customer-owned runtime interface zones
   ansible.builtin.assert:
     that:
-      - >-
-        (item.stdout | trim) in ['', 'no zone', 'public', item.item.zone]
-        or (
-          (item.stdout | trim) == 'drop'
-          and {'interface': item.item.interface, 'zone': item.item.zone}
-              in aigw_lab_reset_handoff_drop_bindings
-        )
+      - (item.stdout | trim) in ['', 'no zone', 'public', item.item.zone]
     quiet: true
     fail_msg: >-
       {{ item.item.interface }} is currently assigned to customer-owned zone

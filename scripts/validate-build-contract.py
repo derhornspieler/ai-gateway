@@ -9,8 +9,8 @@ import sys
 
 
 DOCKERFILE_FRONTEND = (
-    "# syntax=docker/dockerfile:1.7@sha256:"
-    "a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+    "# syntax=docker/dockerfile:1.25.0@sha256:"
+    "0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12"
 )
 FRONTEND_DOCKERFILES = {
     "services/dev-portal/Dockerfile",
@@ -19,14 +19,17 @@ FRONTEND_DOCKERFILES = {
     "services/dhi-health-probe/Dockerfile.open-webui",
     "services/egress-proxy/Dockerfile",
     "services/key-rotator/Dockerfile",
-    "services/lab-dns/Dockerfile",
+    "services/platform-dns/Dockerfile",
     "services/vault-ui-proxy/Dockerfile",
+    "services/wif-provider-mock/Dockerfile",
 }
 
 
 def main() -> None:
-    if len(sys.argv) != 3 or sys.argv[2] not in {"base", "lab"}:
-        raise SystemExit("usage: validate-build-contract.py ROOT base|lab")
+    if len(sys.argv) != 3 or sys.argv[2] not in {"base", "platform-dns", "preprod"}:
+        raise SystemExit(
+            "usage: validate-build-contract.py ROOT base|platform-dns|preprod"
+        )
 
     root = Path(sys.argv[1]).resolve()
     profile = sys.argv[2]
@@ -77,11 +80,12 @@ def main() -> None:
     }
     expected_host_networks = {"dev-portal", "admin-portal", "key-rotator"}
     expected_no_networks = set(expected_contexts) - expected_host_networks
-    if profile == "lab":
-        expected_contexts["samba-ad"] = root / "services/samba-ad-lab"
-        expected_contexts["lab-dns"] = root / "services/lab-dns"
+    if profile == "preprod":
+        expected_contexts["samba-ad"] = root / "services/samba-ad-preprod"
         expected_host_networks.add("samba-ad")
-        expected_no_networks.add("lab-dns")
+    if profile in {"platform-dns", "preprod"}:
+        expected_contexts["platform-dns"] = root / "services/platform-dns"
+        expected_no_networks.add("platform-dns")
 
     host_network_builds: set[str] = set()
     for name, service in services.items():
@@ -142,7 +146,12 @@ def main() -> None:
         },
         "services/egress-proxy": {
             "*", "!Dockerfile", "!go.mod", "!entrypoint.go", "!entrypoint_test.go",
-            "!envoy.yaml", "!certs/", "!certs/*.pem",
+            "!envoy.yaml", "!envoy.yaml.tmpl",
+            "!cmd/", "!cmd/policygen/", "!cmd/policygen/*.go",
+            "!internal/", "!internal/egresspolicy/", "!internal/egresspolicy/*.go",
+            "!providers/", "!providers/catalog.json",
+            "!providers/provenance/", "!providers/provenance/*.json",
+            "!certs/", "!certs/*.pem",
         },
         "services/vault-ui-proxy": {
             "*", "!Dockerfile", "!go.mod", "!main.go", "!main_test.go",
@@ -160,10 +169,10 @@ def main() -> None:
         if rules != required:
             raise SystemExit(f"{relative} build context is not exact-file allow-listed")
 
-    if profile == "lab":
+    if profile == "preprod":
         rules = [
             line.strip()
-            for line in (root / "services/samba-ad-lab/.dockerignore").read_text().splitlines()
+            for line in (root / "services/samba-ad-preprod/.dockerignore").read_text().splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
         required = {
@@ -177,13 +186,14 @@ def main() -> None:
         if not required.issubset(rules) or rules[0] != "*":
             raise SystemExit("Samba build context is not exact-file allow-listed")
 
+    if profile in {"platform-dns", "preprod"}:
         dns_rules = [
             line.strip()
-            for line in (root / "services/lab-dns/.dockerignore").read_text().splitlines()
+            for line in (root / "services/platform-dns/.dockerignore").read_text().splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
         if dns_rules != ["*", "!Dockerfile", "!healthcheck.go"]:
-            raise SystemExit("lab-dns build context is not exact-file allow-listed")
+            raise SystemExit("platform-dns build context is not exact-file allow-listed")
 
 
 if __name__ == "__main__":

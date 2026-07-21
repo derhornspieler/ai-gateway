@@ -1,9 +1,8 @@
 """Driver base class + shared types for key-rotator vendor plugins.
 
-Design ref: docs/solution-map.md §9.4 — "per-vendor driver plugin
-interface in the key-rotator ... initial drivers: Anthropic (WIF), OpenAI
-(service-account blue/green); designed-in but dormant: Azure OpenAI,
-Bedrock ... future custom vendors = new driver + config, no core change."
+Design ref: docs/solution-map.md §9.4 — the key-rotator uses a per-vendor
+driver interface. Anthropic WIF is the only registered driver today. A future
+provider requires a reviewed driver, catalog entry, release, and tests.
 """
 from __future__ import annotations
 
@@ -15,10 +14,7 @@ from typing import Any, Optional
 class RotationResult:
     """Outcome of a single driver.rotate() call.
 
-    status: one of "success" | "skipped" | "disabled" | "failed" |
-        "rotated_pending_revocation" (new credential live, but the old
-        one could not be confirmed deleted/revoked — a cleanup pass will
-        retry; see app/drivers/openai_svcacct.py).
+    status: one of "success" | "skipped" | "disabled" | "failed".
     next_run_seconds: optional dynamic next-run override, honored by
         app.scheduler.RotationScheduler (used by the Anthropic WIF driver
         to reschedule at 80% of the minted token's lifetime — see

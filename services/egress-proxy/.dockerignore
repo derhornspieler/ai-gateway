@@ -4,5 +4,16 @@
 !entrypoint.go
 !entrypoint_test.go
 !envoy.yaml
+!envoy.yaml.tmpl
+!cmd/
+!cmd/policygen/
+!cmd/policygen/*.go
+!internal/
+!internal/egresspolicy/
+!internal/egresspolicy/*.go
+!providers/
+!providers/catalog.json
+!providers/provenance/
+!providers/provenance/*.json
 !certs/
 !certs/*.pem

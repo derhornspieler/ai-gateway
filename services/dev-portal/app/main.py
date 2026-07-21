@@ -57,6 +57,10 @@ templates = Jinja2Templates(
 
 VENDOR_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
 VENDOR_RE = re.compile(VENDOR_PATTERN)
+# The portal must not turn an arbitrary syntactically valid name into a
+# provider-control URL. Keep this in sync with key-rotator's registered driver
+# map. Adding a provider requires the reviewed provider release workflow.
+REGISTERED_ROTATION_VENDORS = frozenset({"anthropic", "static-anthropic"})
 IDENTITY_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
 IDENTITY_ID_RE = re.compile(IDENTITY_ID_PATTERN)
 # aigw-chat is the dedicated Open WebUI chat capability; aigw-users is
@@ -131,6 +135,7 @@ class VaultSealedAuthorizationUnavailable(HTTPException):
 def _audit(action: str, outcome: str, user: dict[str, Any], **fields: Any) -> None:
     """Emit one-line JSON audit metadata without tokens, email, or log injection."""
     event: dict[str, Any] = {
+        "schema_version": 1,
         "event": "aigw.portal.audit",
         "action": action,
         "outcome": outcome,
@@ -139,7 +144,12 @@ def _audit(action: str, outcome: str, user: dict[str, Any], **fields: Any) -> No
     for key, value in fields.items():
         if value is not None:
             event[key] = str(value)[:255]
-    logger.info("%s", json.dumps(event, separators=(",", ":"), ensure_ascii=True))
+    # Alloy routes only this exact marker plus the reviewed event/action fields
+    # to the SOC feed. Ordinary portal logs remain local.
+    logger.info(
+        "AIGW_SECURITY_EVENT %s",
+        json.dumps(event, separators=(",", ":"), ensure_ascii=True),
+    )
 
 
 FORBIDDEN_HTML = """<!DOCTYPE html>
@@ -1720,7 +1730,11 @@ def _safe_rotator_status(raw: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         vendor = item.get("vendor")
-        if not isinstance(vendor, str) or VENDOR_RE.fullmatch(vendor) is None:
+        if (
+            not isinstance(vendor, str)
+            or VENDOR_RE.fullmatch(vendor) is None
+            or vendor not in REGISTERED_ROTATION_VENDORS
+        ):
             continue
         interval = item.get("interval_seconds")
         if isinstance(interval, bool) or not isinstance(interval, int) or interval < 0:
@@ -2041,6 +2055,8 @@ async def admin_page(
             if isinstance(vendor, dict)
             and isinstance(vendor.get("vendor") or vendor.get("name"), str)
             and VENDOR_RE.fullmatch(vendor.get("vendor") or vendor.get("name"))
+            and (vendor.get("vendor") or vendor.get("name"))
+            in REGISTERED_ROTATION_VENDORS
         ]
     except Exception:  # noqa: BLE001
         auth.flash(request, "Could not reach key-rotator for settings.", "error")
@@ -2150,6 +2166,8 @@ async def admin_save_settings(
     enabled: str | None = Form(None),
     csrf_token: str = Form(..., min_length=32, max_length=128),
 ):
+    if vendor not in REGISTERED_ROTATION_VENDORS:
+        raise HTTPException(status_code=404, detail="Provider is not registered.")
     if not auth.verify_csrf(request, csrf_token):
         auth.flash(request, "Your session expired — please try again.", "error")
         return RedirectResponse("/admin", status_code=303)
@@ -2177,6 +2195,8 @@ async def admin_rotate_now(
     user: dict[str, Any] = Depends(require_live_admin),
     csrf_token: str = Form(..., min_length=32, max_length=128),
 ):
+    if vendor not in REGISTERED_ROTATION_VENDORS:
+        raise HTTPException(status_code=404, detail="Provider is not registered.")
     if not auth.verify_csrf(request, csrf_token):
         auth.flash(request, "Your session expired — please try again.", "error")
         return RedirectResponse("/admin", status_code=303)
@@ -2334,33 +2354,6 @@ async def admin_delete_anthropic_provider(
 
 
 # --- admin / Keycloak identity control ------------------------------------
-
-
-@admin_app.post("/admin/identity/bootstrap")
-async def admin_identity_bootstrap(
-    request: Request,
-    user: dict[str, Any] = Depends(require_recent_live_admin),
-    confirmation: str = Form(..., min_length=1, max_length=32),
-    csrf_token: str = Form(..., min_length=32, max_length=128),
-):
-    if not auth.verify_csrf(request, csrf_token):
-        auth.flash(request, "Your session expired — please try again.", "error")
-        return RedirectResponse("/admin", status_code=303)
-    if not secrets.compare_digest(confirmation, "INITIALIZE"):
-        auth.flash(request, "Type INITIALIZE exactly to confirm setup.", "error")
-        return RedirectResponse("/admin", status_code=303)
-    try:
-        await _rotator_post("/identity/bootstrap", {"confirmation": confirmation})
-        # The one-use Keycloak bootstrap client is deleted only after all
-        # controller keys and state have been verified in Vault.
-        auth.flash(request, "Keycloak identity setup completed.", "success")
-    except Exception:  # noqa: BLE001
-        auth.flash(
-            request,
-            "Identity setup did not complete; no credential details were exposed.",
-            "error",
-        )
-    return RedirectResponse("/admin", status_code=303)
 
 
 @admin_app.post("/admin/identity/groups")

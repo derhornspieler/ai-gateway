@@ -241,7 +241,7 @@ if source_layout:
             f"realm template scope mapping drifted for {client_id}"
         )
 
-entrypoint = (ROOT / "services/samba-ad-lab/samba-ad-entrypoint").read_text()
+entrypoint = (ROOT / "services/samba-ad-preprod/samba-ad-entrypoint").read_text()
 for assignment in (
     "LOCKOUT_THRESHOLD=5",
     "LOCKOUT_DURATION_MINUTES=15",

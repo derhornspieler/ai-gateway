@@ -17,7 +17,7 @@ pinned image changes.
 ## Current executable topology
 
 The implemented Compose service is a single LiteLLM container running the image
-`ghcr.io/berriai/litellm:v1.92.0`, pinned by digest. LiteLLM is one of the
+`ghcr.io/berriai/litellm:v1.93.0`, pinned by digest. LiteLLM is one of the
 stack's three reviewed non-DHI application exceptions rather than a
 locally-built DHI derivative. It uses the default single Uvicorn worker within
 reviewed limits of 2 CPUs, 4 GiB memory, and 1024 PIDs, with a 600-second
@@ -103,14 +103,12 @@ formula.
 
 ## Required multi-replica architecture (design, not implemented)
 
-Nothing in this section exists in the repository today; it is the bounded
-design for a future throughput-oriented profile and must be read as such. The
-shared-state substrate it depends on — one PostgreSQL server carrying the
-`litellm` database and one Redis instance — is already present in the single-VM
-stack, so the outstanding work is not to introduce state services but to add
-stable replica identities, a socket-free load balancer, a controlled migration
-step, and drain discipline. The design must never grant any proxy access to
-`/var/run/docker.sock` or depend on Docker-label discovery.
+Nothing in this section exists today. It is a bounded design for a future
+high-throughput profile. The current stack already has one PostgreSQL server
+with the `litellm` database and one Redis instance. Future work would add
+stable replica identities, a load balancer that does not use the Docker
+socket, a controlled migration step, and safe connection draining. No proxy
+may access `/var/run/docker.sock` or depend on Docker-label discovery.
 
 1. Ansible renders named replica services, or an orchestrator renders stable
    replica endpoints. Every replica receives the same reviewed image, model
@@ -154,13 +152,12 @@ plane; see [high-availability.md](high-availability.md).
 
 All replicas must use the same stable `LITELLM_SALT_KEY`, because changing it
 can make stored credentials unreadable, and the same `LITELLM_MASTER_KEY`.
-PostgreSQL sizing must cover aggregate worker pools and migrations, while
-backup, restore, ACL reconciliation, and the upgrade gates in
-[operations.md](operations.md) remain single coordinated operations. Redis must
-be shared by every replica for coordinated router and cache state; if global
-rate-limit or other correctness controls are moved into Redis, the present
-tmpfs single-instance posture is insufficient and its persistence, replication,
-outage semantics, and fail-open/fail-closed behavior must be defined first.
+PostgreSQL sizing must cover all worker pools and migrations. Backup, restore,
+ACL repair, and the upgrade gates in [operations.md](operations.md) remain one
+coordinated operation. Every replica must share Redis for router and cache
+state. Before Redis owns global rate limits or other required controls, define
+its persistence, replication, outage behavior, and fail-open or fail-closed
+rules. The current single tmpfs instance is not enough for that role.
 
 Credential creation and rotation must become visible on every replica within a
 measured bound — test cache invalidation rather than assuming that a successful

@@ -25,9 +25,6 @@ ALL_VARS = (ROOT / "ansible/group_vars/all.yml").read_text(encoding="utf-8")
 GENERIC_VARS = (
     ROOT / "ansible/inventory/group_vars/generic_rocky9.yml"
 ).read_text(encoding="utf-8")
-LAB_VARS = (
-    ROOT / "ansible/inventory/host_vars/lab-aigw01.yml"
-).read_text(encoding="utf-8")
 OS_PREP = (ROOT / "ansible/os-prep.yml").read_text(encoding="utf-8")
 ENV_TEMPLATE = (
     ROOT / "ansible/roles/docker_stack/templates/env.j2"
@@ -36,7 +33,7 @@ TRAEFIK_ADM = (ROOT / "compose/traefik/dynamic-adm.yml").read_text(
     encoding="utf-8"
 )
 ADM_ZONE = (
-    ROOT / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.adm.j2"
+    ROOT / "ansible/roles/docker_stack/templates/db.aigw.internal.adm.j2"
 ).read_text(encoding="utf-8")
 COMPOSE_WRAPPER = (ROOT / "scripts/aigw-compose.sh").read_text(encoding="utf-8")
 VALIDATE_COMPOSE = (ROOT / "scripts/validate-compose.sh").read_text(encoding="utf-8")
@@ -48,10 +45,9 @@ def service_block(name: str, next_name: str) -> str:
 
 
 class VaultUIProxyContractTests(unittest.TestCase):
-    def test_ansible_flag_is_strictly_boolean_default_off_and_lab_on(self) -> None:
+    def test_ansible_flag_is_strictly_boolean_and_default_off(self) -> None:
         self.assertRegex(ALL_VARS, r"(?m)^aigw_vault_ui_enabled: false$")
         self.assertRegex(GENERIC_VARS, r"(?m)^aigw_vault_ui_enabled: false$")
-        self.assertRegex(LAB_VARS, r"(?m)^aigw_vault_ui_enabled: true$")
         self.assertIn("aigw_vault_ui_enabled is boolean", OS_PREP)
         self.assertIn("aigw_vault_ui_enabled is boolean", STACK_ONLY)
 
@@ -263,7 +259,7 @@ class VaultUIProxyContractTests(unittest.TestCase):
         # tasks keep an empty ambient profile set; every raw live-project
         # exec/query carries the reviewed joined profile set instead
         # (test_compose_profiles_exec_contract.py pins the full split).
-        self.assertEqual(STACK.count('COMPOSE_PROFILES: ""'), 13)
+        self.assertEqual(STACK.count('COMPOSE_PROFILES: ""'), 11)
         self.assertIn(
             "Prove disabled Vault browser-surface containers are absent, not stopped",
             VERIFY,
@@ -364,7 +360,7 @@ class VaultUIProxyContractTests(unittest.TestCase):
         )
         self.assertIn(
             "FROM dhi.io/vault:2.0.3@sha256:"
-            "743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6",
+            "2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e",
             dockerfile,
         )
         self.assertIn(
@@ -416,7 +412,7 @@ class VaultUIProxyContractTests(unittest.TestCase):
         vault = service_block("vault", "postgres")
         self.assertIn(
             "BASE_IMAGE: dhi.io/vault:2.0.3@sha256:"
-            "743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6",
+            "2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e",
             vault,
         )
         self.assertIn("vault_data:/vault/data", vault)

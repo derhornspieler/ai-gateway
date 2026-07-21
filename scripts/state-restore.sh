@@ -77,13 +77,10 @@ python3 "$STACK_DIR/scripts/restore_archive.py" \
   --volume-target "$docker_root"
 rm -f "$staging/outer.tar.gz"
 
-# PostgreSQL major-version guard. This restore replaces the physical pg_data
-# volume, and a data directory written by major N will not start under a
-# different major's server binaries. The deployed Compose file pins the
-# postgres image that will mount the restored volume next, so compare the
-# backup receipt's recorded server_version major against that pin and refuse a
-# cross-major restore before any destructive operation. (Audit 2026-07-16 risk
-# 2: restore had no version guard.) Same-major minor differences are allowed.
+# PostgreSQL major-version guard. This command restores the physical pg_data
+# archive, so source and target majors must match. A deliberate major move uses
+# postgres-major-migrate.py and the logical dumps in the same backup instead.
+# Same-major minor differences are allowed.
 backup_pg_major="$(python3 - "$staging/extracted/manifest.json" <<'PY'
 import json, re, sys
 v = str(json.load(open(sys.argv[1])).get("postgres_version", ""))
@@ -108,11 +105,27 @@ PY
 }
 [[ "$backup_pg_major" == "$target_pg_major" ]] || {
   echo "restore refused: backup PostgreSQL major $backup_pg_major != deployed" \
-       "major $target_pg_major — a cross-major logical restore is unsafe." \
-       "Deploy the matching postgres major first, or restore into a matching host." >&2
+       "major $target_pg_major — physical data directories cannot cross majors." \
+       "Use postgres-major-migrate.py for the reviewed logical migration." >&2
   exit 1
 }
 echo "PostgreSQL major $backup_pg_major matches the deployed pin." >&2
+
+# The PostgreSQL 18 Compose graph uses an explicit physical volume name so a
+# major migration can preserve the PostgreSQL 16 volume. Read the authenticated
+# restored .env as data; never source it as shell code.
+restored_pg_volume="$(python3 - "$staging/stack-config/.env" <<'PY'
+import re, sys
+values = [
+    line.split("=", 1)[1]
+    for line in open(sys.argv[1], encoding="utf-8").read().splitlines()
+    if line.startswith("PG_DATA_VOLUME_NAME=")
+]
+if len(values) != 1 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", values[0]) is None:
+    raise SystemExit("restored .env has no canonical PG_DATA_VOLUME_NAME")
+print(values[0])
+PY
+)"
 
 echo "Stopping the current stack for destructive restore..." >&2
 "${compose[@]}" stop -t 60 >/dev/null
@@ -131,6 +144,9 @@ for logical in "${volumes[@]}"; do
   ((${#matches[@]} <= 1)) || { echo "multiple target volumes for $logical" >&2; exit 1; }
   if ((${#matches[@]} == 0)); then
     volume_name="${PROJECT}_${logical}"
+    if [[ "$logical" == pg_data ]]; then
+      volume_name="$restored_pg_volume"
+    fi
     "${docker_cmd[@]}" volume create \
       --label "com.docker.compose.project=$PROJECT" \
       --label "com.docker.compose.volume=$logical" "$volume_name" >/dev/null
@@ -155,12 +171,12 @@ done
 # restoring onto a host that predates the Tempo removal must still clear the
 # stale tempo/ config root instead of leaving it beside the restored tree.
 config_roots=(
-  docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml docker-compose.lab.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana
+  docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana
   keycloak litellm loki postgres prometheus tempo traefik services scripts
   certs secrets
 )
 for root in "${config_roots[@]}"; do
-  rm -rf -- "$STACK_DIR/$root"
+  rm -rf -- "${STACK_DIR:?}/$root"
 done
 cp -a "$staging/stack-config/." "$STACK_DIR/"
 # `.state` is deliberately excluded from the authenticated configuration

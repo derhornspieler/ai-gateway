@@ -881,7 +881,7 @@ def test_admin_template_contains_injection_and_cache_defenses(
             return {
                 "vendors": [
                     {"vendor": malicious_vendor, "enabled": True},
-                    {"vendor": "openai", "enabled": True, "interval_seconds": 3600},
+                    {"vendor": "static-anthropic", "enabled": True, "interval_seconds": 3600},
                 ]
             }
         if path.startswith("/history"):
@@ -979,6 +979,43 @@ def test_invalid_vendor_path_never_reaches_rotator(
     )
 
     assert response.status_code == 422
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("path", "form"),
+    [
+        ("/admin/rotate/openai", {}),
+        (
+            "/admin/settings/openai",
+            {"enabled": "1", "interval_seconds": "3600", "grace_seconds": "300"},
+        ),
+    ],
+)
+def test_unregistered_openai_provider_never_reaches_rotator(
+    admin_client, set_admin_session, monkeypatch, path, form
+):
+    called = False
+
+    async def rotator_get(request_path):
+        assert request_path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def unexpected(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", unexpected)
+    monkeypatch.setattr(main, "_rotator_put", unexpected)
+    csrf = "c" * 43
+    set_admin_session(
+        {"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf}
+    )
+
+    response = admin_client.post(path, data={**form, "csrf_token": csrf})
+
+    assert response.status_code == 404
     assert called is False
 
 
@@ -1186,7 +1223,7 @@ def test_revoked_admin_cookie_cannot_change_rotation_controls(
     )
 
     response = admin_client.post(
-        "/admin/rotate/openai",
+        "/admin/rotate/anthropic",
         data={"csrf_token": csrf},
         follow_redirects=False,
     )
@@ -3142,7 +3179,7 @@ def test_rotation_tab_renders_status_table_without_raw_dump_or_internal_rows(
     settings_payload = [
         {"vendor": "anthropic", "enabled": True, "interval_seconds": 3000,
          "grace_seconds": 300},
-        {"vendor": "static-openai", "enabled": False, "interval_seconds": 3600,
+        {"vendor": "static-anthropic", "enabled": False, "interval_seconds": 3600,
          "grace_seconds": 300},
         {"vendor": "portal-key-reconciliation-state", "enabled": False,
          "interval_seconds": 0, "grace_seconds": 0},
@@ -3164,7 +3201,7 @@ def test_rotation_tab_renders_status_table_without_raw_dump_or_internal_rows(
     assert "portal-key-reconciliation-state" not in response.text
     # Static fallbacks live behind the advanced disclosure.
     assert "Static fallback keys (advanced)" in response.text
-    assert "static-openai" in response.text
+    assert "static-anthropic" in response.text
 
 
 def _identity_admin_rotator(monkeypatch, group):
@@ -3199,8 +3236,8 @@ def _identity_admin_rotator(monkeypatch, group):
             return [
                 {
                     "id": "user-1",
-                    "username": "lab-developer",
-                    "email": "lab-developer@example.test",
+                    "username": "directory-developer",
+                    "email": "directory-developer@example.test",
                     "enabled": True,
                 }
             ]
@@ -3208,8 +3245,8 @@ def _identity_admin_rotator(monkeypatch, group):
             return [
                 {
                     "id": "member-1",
-                    "username": "lab-developer",
-                    "email": "lab-developer@example.test",
+                    "username": "directory-developer",
+                    "email": "directory-developer@example.test",
                     "enabled": True,
                 }
             ]
@@ -3253,7 +3290,7 @@ def test_selected_group_renders_policy_form_and_members_inline(
         'action="/admin/identity/groups/group-1/members/member-1/remove"'
         in response.text
     )
-    assert "lab-developer@example.test" in response.text
+    assert "directory-developer@example.test" in response.text
 
 
 def test_selected_group_deconfigured_restriction_renders_the_widening_guard(

@@ -82,22 +82,22 @@ import re
 import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
-assert set(manifest) == {"base", "platform_dns", "lab_identity", "identity_ldap"}
+assert set(manifest) == {"base", "platform_dns", "identity_ldap"}
 service_pattern = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 segment_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 assert set(manifest["base"]).isdisjoint(manifest["platform_dns"])
-# Each identity overlay (lab Samba AD, external directory) mounts one extra CA
-# into Keycloak's truststore, so each REPLACES keycloak's base source list and
-# may re-state `keycloak`. Every OTHER service name stays disjoint from base.
-assert (set(manifest["base"]) & set(manifest["lab_identity"])) <= {"keycloak"}
+# The external directory overlay mounts one extra CA into Keycloak's truststore,
+# so it replaces Keycloak's base source list and may re-state `keycloak`.
 assert (set(manifest["base"]) & set(manifest["identity_ldap"])) <= {"keycloak"}
-assert set(manifest["platform_dns"]).isdisjoint(manifest["lab_identity"])
-# The two identity sources are mutually exclusive, so their key-rotator and
-# keycloak entries may collide with each other; nothing else may.
 assert set(manifest["identity_ldap"]).isdisjoint(manifest["platform_dns"])
-assert set(manifest["lab_identity"]).isdisjoint(manifest["platform_dns"])
 assert set(manifest["identity_ldap"]) == {"keycloak", "key-rotator"}
-assert set(manifest["lab_identity"]) == {"keycloak", "key-rotator", "samba-ad"}
+assert manifest["platform_dns"] == {
+    "platform-dns": [
+        "services/platform-dns/Corefile",
+        "services/platform-dns/db.aigw.internal",
+        "services/platform-dns/db.aigw.internal.adm",
+    ]
+}
 assert manifest["identity_ldap"]["keycloak"] == [
     "keycloak/identity-ldap-ca.pem",
     "keycloak/realms",
@@ -105,22 +105,7 @@ assert manifest["identity_ldap"]["keycloak"] == [
 assert manifest["identity_ldap"]["key-rotator"] == [
     "secrets/identity_ldap_bind_password"
 ]
-# The lab keycloak digest captures the shared Aegis CA chain (certs/ca.pem)
-# added to Keycloak's truststore, alongside the realm import it replaces.
-assert manifest["lab_identity"]["keycloak"] == ["certs/ca.pem", "keycloak/realms"]
-assert manifest["lab_identity"]["key-rotator"] == ["secrets/samba_ad_bind_password"]
-# The lab DC digest binds its LDAPS leaf+key so a re-issued certificate forces a
-# samba-ad recreation on the next converge.
-assert manifest["lab_identity"]["samba-ad"] == [
-    "secrets/samba_ad_admin_password",
-    "secrets/samba_ad_bind_password",
-    "secrets/samba_ad_tls_cert",
-    "secrets/samba_ad_tls_key",
-    "secrets/samba_user_lab-admin_password",
-    "secrets/samba_user_lab-developer_password",
-    "secrets/samba_user_lab-user_password",
-]
-for profile in ("base", "platform_dns", "lab_identity", "identity_ldap"):
+for profile in ("base", "platform_dns", "identity_ldap"):
     assert isinstance(manifest[profile], dict) and manifest[profile]
     for service, sources in manifest[profile].items():
         assert service_pattern.fullmatch(service), service
@@ -213,7 +198,6 @@ for required in (
 assert "operator unseal" not in text
 assert "VAULT_UNSEAL_KEY" not in text
 PY
-grep -Fq 'common_name="*.$DOMAIN" alt_names="$DOMAIN"' "$ROOT/scripts/vault-bootstrap.sh"
 grep -Fq 'common_name="*.$DOMAIN" alt_names="$DOMAIN"' "$ROOT/scripts/vault-pki-intermediate.sh"
 
 # ── Edge TLS / PKI contract ─────────────────────────────────────────────────
@@ -356,14 +340,14 @@ PY
 
 # Every broad operational start must exclude the successful volume initializer.
 bash -n "$ROOT/scripts/aigw-runtime-up.sh" \
-  "$ROOT/scripts/vault-bootstrap.sh" "$ROOT/scripts/state-restore.sh" \
+  "$ROOT/scripts/state-restore.sh" \
   "$ROOT/scripts/pre-upgrade-check.sh"
 python3 -I - "$ROOT/scripts/aigw-runtime-up.sh" \
-  "$ROOT/scripts/vault-bootstrap.sh" "$ROOT/scripts/state-restore.sh" <<'PY'
+  "$ROOT/scripts/state-restore.sh" <<'PY'
 from pathlib import Path
 import sys
 
-runtime, bootstrap, restore = (Path(path).read_text() for path in sys.argv[1:])
+runtime, restore = (Path(path).read_text() for path in sys.argv[1:])
 for required in (
     "config --services",
     "initializer_count",
@@ -371,8 +355,6 @@ for required in (
     "up --no-deps --no-build",
 ):
     assert required in runtime, required
-assert "aigw-runtime-up.sh" in bootstrap
-assert "up -d --no-deps --force-recreate" in bootstrap
 assert '"$STACK_DIR/scripts/aigw-runtime-up.sh" -d' not in restore
 assert '"${compose[@]}" stop -t 60' in restore
 assert restore.count("require_project_stopped") == 3
@@ -543,10 +525,10 @@ if ansible.is_file():
         "edge-tls.py",
         "load-offline-image-seed.py",
         "plan-compose-builds.py",
+        "postgres-major-migrate.py",
         "preserve-compose-rollbacks.py",
         "pre-upgrade-check.sh",
         "reconcile-openwebui-key.py",
-        "remove-lab-local-keycloak-users.py",
         "restore_archive.py",
         "rotate-vault-audit.sh",
         "state-backup.sh",
@@ -559,11 +541,9 @@ if ansible.is_file():
         "validate-compose.sh",
         "validate-identity-policy.py",
         "validate-vault-config.sh",
-        "vault-bootstrap.sh",
         "vault-oidc-setup.sh",
         "vault-pki-intermediate.sh",
         "vault-unseal.sh",
-        "verify-live-lab-identity.py",
     )
     manifest = re.search(
         r"(?ms)^    aigw_operational_scripts:\n"
@@ -699,10 +679,6 @@ if ansible.is_file():
         "'/certs'",
         "'/secrets/redis_password'",
         "'/secrets/redis_users.acl'",
-        "'/secrets/samba_ad_admin_password'",
-        "'/secrets/samba_ad_bind_password'",
-        "'/secrets/samba_ad_tls_cert'",
-        "'/secrets/samba_ad_tls_key'",
         "'/keycloak/identity-ldap-ca.pem'",
         "'/secrets/identity_ldap_bind_password'",
     ):
@@ -712,7 +688,7 @@ if ansible.is_file():
     )
     manifest_sources = {
         path
-        for profile in ("base", "platform_dns", "lab_identity", "identity_ldap")
+        for profile in ("base", "platform_dns", "identity_ldap")
         for paths in bind_manifest[profile].values()
         for path in paths
     }
@@ -822,13 +798,11 @@ if ansible.is_file():
     ):
         assert required in source, required
     # Plaintext LDAP must be refused at every layer that can still stop a
-    # converge, and the reserved lab provider name must stay unusable.
+    # converge.
     identity_ldap_contract = source.split(
         "- name: Validate the external directory federation inventory contract", 1
     )[1].split("- name: Validate per-gate oauth2-proxy cookie secret shapes", 1)[0]
     assert '"^ldaps://' in identity_ldap_contract
-    assert "not (samba_lab_enabled | bool)" in identity_ldap_contract
-    assert "identity_ldap_provider_name != 'lab-samba-ad'" in identity_ldap_contract
     identity_ldap_secret = source.split(
         "- name: Materialize the external directory bind credential outside command "
         "and environment metadata",
@@ -927,9 +901,7 @@ if ansible.is_file():
     wrapper = ansible.parents[3].parent / "scripts/aigw-compose.sh"
     wrapper_source = wrapper.read_text()
     assert "expected exactly one IDENTITY_LDAP_ENABLED selector" in wrapper_source
-    assert "external identity overlay conflicts with the lab profile" in wrapper_source
-
-    assert "not (identity_ldap_enabled | bool) or not (samba_lab_enabled | bool)" in os_prep_source
+    assert "external identity overlay is missing" in wrapper_source
     assert (
         "not (identity_ldap_enabled | bool) or identity_ldap_url is match('^ldaps://')"
         in os_prep_source
@@ -989,6 +961,7 @@ assert command.count("--no-access-log") == 1
 assert "COPY requirements.txt requirements.lock ./" in dockerfile
 builder = dockerfile.split("FROM ", 2)[1]
 assert "--require-hashes" in builder
+assert "--only-binary=:all:" in builder
 assert "-r requirements.lock" in builder
 assert "-r requirements.txt" not in builder
 
@@ -996,7 +969,7 @@ direct = Path(sys.argv[2]).read_text().splitlines()
 lock_text = Path(sys.argv[3]).read_text()
 assert lock_text.startswith(
     "# This file was autogenerated by uv via the following command:\n"
-    "#    uv pip compile requirements.txt --python-version 3.12 "
+    "#    uv pip compile requirements.txt --python-version 3.14 "
     "--python-platform linux --generate-hashes --output-file requirements.lock\n"
 )
 
@@ -1029,8 +1002,9 @@ PY
 env \
   COMPOSE_PROFILES=vault-ui \
   VAULT_UI_ENABLED=true \
-  DOMAIN=aigw.aegisgroup.ch \
+  DOMAIN=aigw.internal \
   DOCKER_DATA_ROOT="$docker_data_root" \
+  PG_DATA_VOLUME_NAME=ai-gateway_pg18_data \
   ETH1_IP=10.8.10.10 \
   ETH2_IP=10.20.0.10 \
   TRAEFIK_INT_CHAT_IP=172.28.3.2 \
@@ -1040,12 +1014,15 @@ env \
   TRAEFIK_ADM_GRAFANA_IP=172.28.6.2 \
   OAUTH2_PROXY_GRAFANA_IP=172.28.6.3 \
   ENVOY_EGRESS_IP=172.28.0.2 \
+  AIGW_EGRESS_SOURCE_DATE_EPOCH=0 \
+  AIGW_EGRESS_PROVIDERS=anthropic \
+  AIGW_EGRESS_POLICY_SHA256=46792952f978335aa2681638f295d2208ab1d9a0154879a0d6dc9ef02d3a7907 \
   ALLOY_INTERNAL_IP=172.28.2.2 \
   ALLOY_TELEMETRY_IP=172.28.13.2 \
   ALLOY_OBSERVABILITY_IP=172.28.15.2 \
   PROMETHEUS_OBSERVABILITY_IP=172.28.15.3 \
-  LAB_DNS_IP=172.28.18.2 \
-  LAB_DNS_ADM_CIDR=10.8.10.0/24 \
+  PLATFORM_DNS_IP=172.28.18.2 \
+  PLATFORM_DNS_ADM_CIDR=10.8.10.0/24 \
   AIGW_BIND_DIGEST_TRAEFIK_INT=0000000000000000000000000000000000000000000000000000000000000001 \
   AIGW_BIND_DIGEST_TRAEFIK_ADM=0000000000000000000000000000000000000000000000000000000000000002 \
   AIGW_BIND_DIGEST_LITELLM=0000000000000000000000000000000000000000000000000000000000000003 \
@@ -1059,9 +1036,7 @@ env \
   AIGW_BIND_DIGEST_LOKI=000000000000000000000000000000000000000000000000000000000000000b \
   AIGW_BIND_DIGEST_GRAFANA=000000000000000000000000000000000000000000000000000000000000000d \
   AIGW_BIND_DIGEST_CRIBL_MOCK=000000000000000000000000000000000000000000000000000000000000000e \
-  AIGW_BIND_DIGEST_LAB_DNS=000000000000000000000000000000000000000000000000000000000000000f \
-  AIGW_BIND_DIGEST_SAMBA_AD=0000000000000000000000000000000000000000000000000000000000000010 \
-  AIGW_BIND_DIGEST_KEY_ROTATOR_LAB=0000000000000000000000000000000000000000000000000000000000000011 \
+  AIGW_BIND_DIGEST_PLATFORM_DNS=000000000000000000000000000000000000000000000000000000000000000f \
   AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP=0000000000000000000000000000000000000000000000000000000000000012 \
   KEYCLOAK_INTERNAL_IP=172.28.2.3 \
   IDENTITY_LDAP_HOST=dc1.corp.example.com \
@@ -1160,7 +1135,7 @@ manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 project_root = Path(sys.argv[2])
 docker_data_root = Path(os.environ["DOCKER_DATA_ROOT"]).resolve(strict=False)
 services = json.load(sys.stdin)["services"]
-assert "lab-dns" not in services
+assert "platform-dns" not in services
 for name in (
     "oauth2-proxy", "oauth2-proxy-grafana",
     "oauth2-proxy-prometheus", "oauth2-proxy-vault",
@@ -1174,7 +1149,7 @@ for name in (
     assert env["OAUTH2_PROXY_OIDC_GROUPS_CLAIM"] == "roles", name
 litellm_admin_proxy = services["oauth2-proxy"]["environment"]
 assert litellm_admin_proxy["OAUTH2_PROXY_REDIRECT_URL"] == (
-    "https://litellm-admin.aigw.aegisgroup.ch/oauth2/callback"
+    "https://litellm-admin.aigw.internal/oauth2/callback"
 )
 assert litellm_admin_proxy["OAUTH2_PROXY_COOKIE_NAME"] == (
     "_aigw_litellm_admin_oauth"
@@ -1202,7 +1177,7 @@ assert config_mount["read_only"] is True
 # net-chat), and no other public name leaks onto that bridge.
 assert set(vault["networks"]) == {"net-vault"}
 assert services["traefik-adm"]["networks"]["net-vault"]["aliases"] == [
-    "auth.aigw.aegisgroup.ch"
+    "auth.aigw.internal"
 ]
 vault_ui_proxy = services["vault-ui-proxy"]
 assert vault_ui_proxy["image"] == "ai-gateway/dhi-vault-ui-proxy:2.0.3"
@@ -1221,6 +1196,12 @@ assert services["oauth2-proxy-vault"]["depends_on"] == {
     "vault-ui-proxy": {"condition": "service_healthy", "required": True}
 }
 assert services["envoy-egress"]["healthcheck"]["test"] == ["CMD", "/usr/local/bin/aigw-envoy-entrypoint", "health"]
+assert services["envoy-egress"]["image"] == "ai-gateway/envoy-egress:1"
+assert services["envoy-egress"]["build"]["args"] == {
+    "AIGW_EGRESS_POLICY_SHA256": "46792952f978335aa2681638f295d2208ab1d9a0154879a0d6dc9ef02d3a7907",
+    "AIGW_EGRESS_PROVIDERS": "anthropic",
+    "SOURCE_DATE_EPOCH": "0",
+}
 for edge in ("traefik-int", "traefik-adm"):
     assert services[edge]["user"] == "65532:65532"
     assert services[edge]["healthcheck"]["test"] == ["CMD", "traefik", "healthcheck"]
@@ -1488,8 +1469,8 @@ for name, service in services.items():
             raise AssertionError((name, source, "Docker runtime bind requested relabel"))
         assert relabel in {"z", "Z"}, (name, source, relabel)
 postgres = services["postgres"]
-assert postgres["image"].startswith("dhi.io/postgres:16.14@sha256:")
-assert any(v["target"] == "/var/lib/postgresql/16/data" for v in postgres["volumes"])
+assert postgres["image"] == "dhi.io/postgres:18.4@sha256:a807e832c1fc9ded731956abcb53dc98ed003fd82e27275eaef8dcf52fb90236"
+assert any(v["target"] == "/var/lib/postgresql/18/data" for v in postgres["volumes"])
 assert "cap_add" not in postgres
 volume_init = services["volume-init"]
 assert volume_init["network_mode"] == "none"
@@ -1520,7 +1501,7 @@ assert grafana["environment"]["GF_PLUGINS_PLUGIN_ADMIN_ENABLED"] == "false"
 assert grafana["environment"]["GF_PATHS_PLUGINS"] == "/usr/share/aigw/grafana-plugins"
 assert grafana["build"]["dockerfile"] == "Dockerfile.grafana"
 assert grafana["build"]["network"] == "none"
-assert grafana["image"] == "ai-gateway/dhi-grafana:12.4.5-aigw1"
+assert grafana["image"] == "ai-gateway/dhi-grafana:13.1.0-aigw1"
 # Owner-approved admin cost path: the read-only spend credential reaches the
 # provisioned datasource only through this exact environment variable.
 assert grafana["environment"]["AIGW_PG_GRAFANA_RO_PASSWORD"] == (
@@ -1554,8 +1535,8 @@ for path, expected_options in {
     # implicit writable mode. Accept only those two canonical renderings.
     assert grafana_tmpfs[path] in (expected_options, expected_options | {"rw"})
 assert services["oauth2-proxy-grafana"]["networks"]["net-grafana"]["ipv4_address"] == "172.28.6.3"
-assert services["key-rotator"]["environment"]["KEYCLOAK_PUBLIC_URL"] == "https://auth.aigw.aegisgroup.ch"
-assert services["key-rotator"]["environment"]["WIF_KEYCLOAK_PUBLIC_URL"] == "https://idp.wif-a.example.invalid"
+assert services["key-rotator"]["environment"]["KEYCLOAK_PUBLIC_URL"] == "https://auth.aigw.internal"
+assert services["key-rotator"]["environment"]["WIF_KEYCLOAK_PUBLIC_URL"] == "https://idp.wif.aigw.internal"
 # The vault OIDC relying-party secret reaches exactly two consumers: Keycloak
 # (realm-import ${VAR} substitution) and the rotator (reconcile + escrow).
 # Vault itself never receives it via environment — the root-token ceremony
@@ -1580,7 +1561,7 @@ assert set(portal["networks"]) == {"net-portal", "net-telemetry"}
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" config --format json |
       python3 -I "$1/scripts/validate-build-contract.py" "$1" base
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
-      -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad --profile vault-ui config --format json |
+      -f "$2/docker-compose.platform-dns.yml" --profile vault-ui config --format json |
       python3 -I -c '\''
 import json
 import os
@@ -1592,17 +1573,17 @@ project_root = Path(sys.argv[2])
 docker_data_root = Path(os.environ["DOCKER_DATA_ROOT"]).resolve(strict=False)
 config = json.load(sys.stdin)
 assert "secrets" not in config
-dns = config["services"]["lab-dns"]
+dns = config["services"]["platform-dns"]
 assert dns.get("privileged", False) is False
 assert dns["read_only"] is True
 assert dns["user"] == "65532:65532"
 assert dns["cap_drop"] == ["ALL"]
 assert dns["cap_add"] == ["NET_BIND_SERVICE"]
 assert dns["security_opt"] == ["no-new-privileges:true"]
-assert list(dns["networks"]) == ["net-lab-dns"]
+assert list(dns["networks"]) == ["net-platform-dns"]
 assert dns["build"]["network"] == "none"
 assert dns["healthcheck"]["test"] == ["CMD", "/dns-healthcheck"]
-assert dns["environment"] == {"LAB_DNS_ADM_CIDR": "10.8.10.0/24"}
+assert dns["environment"] == {"PLATFORM_DNS_ADM_CIDR": "10.8.10.0/24"}
 ports = {(p.get("host_ip"), int(p["published"]), p["protocol"], int(p["target"])) for p in dns["ports"]}
 assert ports == {
     ("10.8.10.10", 53, "tcp", 53),
@@ -1610,86 +1591,23 @@ assert ports == {
     ("10.20.0.10", 53, "tcp", 53),
     ("10.20.0.10", 53, "udp", 53),
 }
-assert config["networks"]["net-lab-dns"]["external"] is True
+assert config["networks"]["net-platform-dns"]["external"] is True
 assert all(v["read_only"] for v in dns["volumes"])
 adm_zone = next(
     mount for mount in dns["volumes"]
-    if mount["target"] == "/etc/coredns/zones/db.aigw.aegisgroup.ch.adm"
+    if mount["target"] == "/etc/coredns/zones/db.aigw.internal.adm"
 )
 assert adm_zone["type"] == "bind"
 assert adm_zone["read_only"] is True
 assert adm_zone["bind"]["selinux"] == "Z"
-assert Path(adm_zone["source"]).name == "db.aigw.aegisgroup.ch.adm"
-samba = config["services"]["samba-ad"]
-assert samba["healthcheck"]["test"] == ["CMD", "/usr/local/sbin/samba-ad-healthcheck"]
-assert samba.get("labels", {}).get(
-    "com.aigw.contract.selinux-generation"
-) == "1"
-samba_mounts = {mount["target"]: mount for mount in samba["volumes"]}
-expected_samba_relabels = {
-    "/run/secrets/samba_ad_admin_password": "Z",
-    "/run/secrets/samba_ad_bind_password": "z",
-    # The CA-issued LDAPS leaf + key are private to this DC (never shared with a
-    # peer), so a private-category Z relabel is correct. The key is delivered
-    # root:root 0600 on the host: the Samba CVE-2013-4476 guard rejects any
-    # group or other permission bit on the LDAPS private key.
-    "/run/secrets/samba_ad_tls_cert": "Z",
-    "/run/secrets/samba_ad_tls_key": "Z",
-    "/run/secrets/samba_user_lab-admin_password": "Z",
-    "/run/secrets/samba_user_lab-developer_password": "Z",
-    "/run/secrets/samba_user_lab-user_password": "Z",
-}
-for target, expected_relabel in expected_samba_relabels.items():
-    mount = samba_mounts[target]
-    assert mount["type"] == "bind", target
-    assert mount["read_only"] is True, target
-    assert mount["bind"]["selinux"] == expected_relabel, target
-# The DC serves LDAPS on the FQDN the CA-signed leaf bears, resolvable inside
-# net-identity via a Docker network alias. A bare-hostname endpoint is unusable
-# under the customer CA name constraints.
-assert samba["environment"]["SAMBA_LDAPS_FQDN"] == "samba-ad.aigw.aegisgroup.ch"
-assert "samba-ad.aigw.aegisgroup.ch" in samba["networks"]["net-identity"]["aliases"]
-
-# Keycloak trusts the REAL Aegis chain for LDAPS (production trust path). The
-# self-signed DC cert is kept ONLY as a comma-separated bootstrap-window anchor.
-keycloak_lab = config["services"]["keycloak"]
-assert keycloak_lab["environment"]["KC_TRUSTSTORE_PATHS"] == (
-    "/etc/aigw/aegis-ca.pem,/var/lib/samba-public/ca.pem"
-)
-assert keycloak_lab["environment"]["KC_TLS_HOSTNAME_VERIFIER"] == "DEFAULT"
-assert keycloak_lab["environment"]["KC_TLS_HOSTNAME_VERIFIER"] != "ANY"
-aegis_mount = next(
-    mount for mount in keycloak_lab["volumes"]
-    if mount["target"] == "/etc/aigw/aegis-ca.pem"
-)
-assert aegis_mount["type"] == "bind"
-assert aegis_mount["read_only"] is True
-# certs/ is SHARED with traefik-int/traefik-adm/open-webui/alloy: the shared
-# lowercase category `z` is mandatory. A private `Z` would steal the label.
-assert aegis_mount["bind"]["selinux"] == "z", aegis_mount["bind"]["selinux"]
-assert Path(aegis_mount["source"]).as_posix().endswith("/certs/ca.pem")
-
-rotator_lab = config["services"]["key-rotator"]
-assert rotator_lab["environment"]["LAB_SAMBA_LDAP_ENABLED"] == "true"
-assert rotator_lab["environment"]["LAB_SAMBA_LDAP_URL"] == (
-    "ldaps://samba-ad.aigw.aegisgroup.ch:636"
-)
-rotator_bind = next(
-    mount for mount in rotator_lab["volumes"]
-    if mount["target"] == "/run/secrets/samba_keycloak_bind_password"
-)
-assert rotator_bind["type"] == "bind"
-assert rotator_bind["read_only"] is True
-assert rotator_bind["bind"]["selinux"] == "z"
-
+assert Path(adm_zone["source"]).name == "db.aigw.internal.adm"
 bind_digest_services = {
     "traefik-int", "traefik-adm", "litellm", "open-webui", "keycloak",
     "vault", "postgres", "redis", "alloy", "prometheus", "loki",
-    "grafana", "cribl-mock", "lab-dns", "samba-ad", "key-rotator",
+    "grafana", "cribl-mock", "platform-dns",
 }
 expected_bind_sources = dict(manifest["base"])
 expected_bind_sources.update(manifest["platform_dns"])
-expected_bind_sources.update(manifest["lab_identity"])
 assert bind_digest_services == set(expected_bind_sources)
 bind_digest_environment = {
     "traefik-int": "AIGW_BIND_DIGEST_TRAEFIK_INT",
@@ -1705,9 +1623,7 @@ bind_digest_environment = {
     "loki": "AIGW_BIND_DIGEST_LOKI",
     "grafana": "AIGW_BIND_DIGEST_GRAFANA",
     "cribl-mock": "AIGW_BIND_DIGEST_CRIBL_MOCK",
-    "lab-dns": "AIGW_BIND_DIGEST_LAB_DNS",
-    "samba-ad": "AIGW_BIND_DIGEST_SAMBA_AD",
-    "key-rotator": "AIGW_BIND_DIGEST_KEY_ROTATOR_LAB",
+    "platform-dns": "AIGW_BIND_DIGEST_PLATFORM_DNS",
 }
 assert set(bind_digest_environment) == bind_digest_services
 
@@ -1806,8 +1722,8 @@ for name, service in config["services"].items():
     assert service["healthcheck"]["test"][0] == "CMD", name
 '\'' "$2/bind-source-digest-inputs.json" "$1"
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
-      -f "$2/docker-compose.platform-dns.yml" -f "$2/docker-compose.lab.yml" --profile lab-ad --profile vault-ui config --format json |
-      python3 -I "$1/scripts/validate-build-contract.py" "$1" lab
+      -f "$2/docker-compose.platform-dns.yml" --profile vault-ui config --format json |
+      python3 -I "$1/scripts/validate-build-contract.py" "$1" platform-dns
     docker --host "$AIGW_LOCAL_DOCKER_HOST" compose --project-directory "$1" -f "$2/docker-compose.yml" \
       -f "$2/docker-compose.identity-ldap.yml" config --format json |
       python3 -I -c '\''
@@ -1820,7 +1736,7 @@ manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 project_root = Path(sys.argv[2])
 config = json.load(sys.stdin)
 
-# The production directory overlay never brings the lab DC or Compose secrets.
+# The production directory overlay never creates Compose secrets.
 assert "samba-ad" not in config["services"]
 assert "secrets" not in config
 assert config["networks"]["net-internal"]["external"] is True
@@ -1875,7 +1791,7 @@ for name, value in {
 }.items():
     assert rotator_environment[name] == value, name
 # The credential itself is a file, never Compose environment metadata, and the
-# lab federation inputs are absent from a production render.
+# preprod-only directory inputs are absent from a production render.
 assert "IDENTITY_LDAP_BIND_PASSWORD" not in rotator_environment
 assert not any(name.startswith("LAB_SAMBA_") for name in rotator_environment)
 secret_mount = next(
@@ -1920,16 +1836,16 @@ assert rotator["labels"]["com.aigw.contract.bind-source-digest"] == os.environ[
 '\'' "$2/bind-source-digest-inputs.json" "$1"
   ' sh "$ROOT" "$COMPOSE_DIR"
 
-grep -Fq 'LAB_DNS_ADM_CIDR: ${LAB_DNS_ADM_CIDR:?LAB_DNS_ADM_CIDR must be set}' "$COMPOSE_DIR/docker-compose.platform-dns.yml"
-python3 -I - "$SERVICES_DIR/lab-dns/Corefile" <<'PY'
+grep -Fq 'PLATFORM_DNS_ADM_CIDR: ${PLATFORM_DNS_ADM_CIDR:?PLATFORM_DNS_ADM_CIDR must be set}' "$COMPOSE_DIR/docker-compose.platform-dns.yml"
+python3 -I - "$SERVICES_DIR/platform-dns/Corefile" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 corefile = Path(sys.argv[1]).read_text(encoding="utf-8")
 assert "view adm {" in corefile
-assert "expr incidr(client_ip(), '{$LAB_DNS_ADM_CIDR}')" in corefile
-assert "db.aigw.aegisgroup.ch.adm" in corefile
+assert "expr incidr(client_ip(), '{$PLATFORM_DNS_ADM_CIDR}')" in corefile
+assert "db.aigw.internal.adm" in corefile
 assert re.search(r"(?m)^\s*forward(?:\s|$)", corefile) is None
 PY
 
@@ -2099,15 +2015,15 @@ username_capture = re.compile(
     r'''(?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})['"]'''
 )
 for sample in (
-    "{'aigw_username': 'lab-developer'}",
+    "{'aigw_username': 'preprod-developer'}",
     '{"aigw_username": "j.doe@example"}',
 ):
     match = username_capture.search(sample)
-    assert match and match.group('username') in {'lab-developer', 'j.doe@example'}
+    assert match and match.group('username') in {'preprod-developer', 'j.doe@example'}
 for sample in (
     "{}",
     "{'aigw_username': ''}",
-    "{'aigw_username': ' lab-user'}",
+    "{'aigw_username': ' preprod-user'}",
     "{'aigw_username': 'safe<script>'}",
     "{'aigw_username': 'a" + "b" * 64 + "'}",
 ):
@@ -2274,4 +2190,4 @@ for forbidden in ("service_account_id", "key_type", "team_id"):
     assert forbidden not in source
 PY
 
-echo "Base and lab Compose configurations are valid (render-only; no containers started)."
+echo "Production Compose configurations are valid (render-only; no containers started)."

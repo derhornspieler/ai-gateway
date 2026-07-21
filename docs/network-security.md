@@ -3,10 +3,14 @@
 This document describes how AI Gateway's routing, host interfaces, firewalld
 zones, iptables (`DOCKER-USER`), and native nftables policy connect into one
 layered, fail-closed network design. It is a customer-facing reference for
-the implemented configuration in `ansible/roles/network_routing`,
+the production configuration in `ansible/roles/network_routing`,
 `ansible/roles/firewalld_zones`, and `ansible/roles/docker_networks`.
 Companion visuals are in [technical diagrams](architecture-diagrams.md);
 component detail is in the [solution map](solution-map.md).
+
+Local preprod uses Docker networks only. It does not claim to test the Rocky
+host firewall or routing rules described here. See
+[local preprod](preprod.md).
 
 ## Design principle
 
@@ -26,8 +30,8 @@ zone template is silently activated.
 | Zone | Interface | Target | Permitted inbound |
 |---|---|---|---|
 | `aigw-egress` | egress NIC | `DROP` | nothing — no listener exists on this leg |
-| `aigw-adm` | ADM NIC (`ETH1_IP`) | `REJECT` | source `vpn_client_cidr` only: management SSH port/tcp and 443/tcp (lab profile adds 53 tcp+udp) |
-| `aigw-internal` | internal NIC (`ETH2_IP`) | `REJECT` | source `internal_cidr` only: 443/tcp (lab profile adds 53 tcp+udp) |
+| `aigw-adm` | ADM NIC (`ETH1_IP`) | `REJECT` | source `vpn_client_cidr` only: management SSH port/tcp and 443/tcp; optional authoritative DNS on 53/tcp+udp |
+| `aigw-internal` | internal NIC (`ETH2_IP`) | `REJECT` | source `internal_cidr` only: 443/tcp; optional authoritative DNS on 53/tcp+udp |
 
 All permissions are IPv4 source-scoped rich rules; verification fails if any
 zone carries a plain port opening, an unexpected service, masquerade, or
@@ -69,24 +73,25 @@ before continuing.
 
 ## 3. Container network planes
 
-Ansible pre-creates 20 fixed bridges (`172.28.0.0/24` through
-`172.28.19.0/24`), each pinned to a stable, short Linux bridge name
+Ansible pre-creates 20 fixed bridges from `172.28.0.0/24` through
+`172.28.20.0/24`, with `172.28.16.0/24` kept retired and reserved. Each active
+network is pinned to a stable, short Linux bridge name
 (`br-egress`, `br-chat`, `br-vault`, …) so firewall rules can reference
-bridges as a stable ABI. IPv6 is disabled on every bridge. Fifteen planes are
-Docker-`internal` (no NAT path); the lower half of every subnet (`.0/25`) is
-reserved for fixed workload addresses so Compose cannot allocate a firewall-
-pinned address (such as Envoy's `172.28.0.2`) to an ordinary service.
+bridges as a stable ABI. IPv6 is disabled on every bridge. Fifteen planes use
+Docker's `internal` setting, so they have no NAT path. The lower half of every
+subnet (`.0/25`) is reserved for fixed workload addresses. This keeps Compose
+from giving a firewall-pinned address, such as Envoy's `172.28.0.2`, to an
+ordinary service.
 
 Two ordinary (non-internal) bridges exist solely so Docker will render
 published-port DNAT — Docker omits publication when every attached network is
 `internal` — and carry no application peers: `net-int-edge` (traefik-int)
-and the lab-only `net-lab-dns`. Their bridge-originated egress is still
+and the optional `net-platform-dns`. Their bridge-originated egress is still
 denied by both packet-filter planes.
 
-A read-only preflight audits the live daemon before any change: correct data
-root, no foreign containers or networks, no subnet overlap with the default
-bridge or address pools, and exact per-network contracts (driver, internal
-flag, bridge name, subnet, IP range).
+A read-only preflight checks the live Docker daemon before any change. It
+checks the data root, foreign containers and networks, subnet overlap, and
+every network's driver, internal flag, bridge name, subnet, and IP range.
 
 ## 4. Packet filtering — two independent planes
 
@@ -105,13 +110,15 @@ fail-open interval exists during updates. Rule groups, in order:
 4. Inbound publication is accepted only as an exact DNAT tuple: ADM-sourced
    (`vpn_client_cidr`) TCP/443 whose original destination is exactly
    `ETH1_IP:443`, and internal-sourced TCP/443 to exactly `ETH2_IP:443`
-   (plus lab DNS equivalents). All other physical-interface ingress into the
+   (plus the optional authoritative-DNS tuples). All other physical-interface ingress into the
    bridge fabric is dropped.
 5. Container egress is accepted only for Envoy's exact address
    (`172.28.0.2/32` on `br-egress`): DNS to the one approved resolver, and
    TCP/443 out the egress NIC. The subnet is deliberately not allowed —
-   only the pinned /32. An optional, exactly-tupled Alloy-to-Cribl export on
-   the internal NIC is the only other egress allowance.
+   only the pinned /32. An optional, exactly-tupled Alloy-to-Cribl SOC log
+   export on the internal NIC is the only other egress allowance. It permits
+   one packet path, not metrics, traces, alerts, or unreviewed logs; Alloy's
+   allow-list enforces the data boundary.
 6. Default deny: any bridge-to-non-bridge traffic is dropped.
 
 The IPv6 chain is the fail-closed subset — no allow rules at all.
@@ -141,20 +148,22 @@ additionally asserts that Docker's `FORWARD` chain actually jumps to
 
 ## 5. Container DNS enforcement
 
-DNS is split into two non-overlapping resolver planes, rendered by Ansible
-into a dedicated `docker-compose.dns.yml` overlay (the legacy shared
-`CONTAINER_DNS_SERVER` variable is gone): `internal_dns_servers` (the
-corporate/ADM resolver plane, reachable only via the ADM and internal legs)
-and `egress_dns_servers` (the Internet resolver plane, reachable only by
-Envoy over the egress leg). Explicit per-container resolvers matter on
-Docker 29: an inherited host resolver is dialed by `dockerd` from the host
-namespace and would bypass the forward path entirely, whereas explicit
-per-plane resolvers keep queries inside the container namespace where
-`DOCKER-USER` and `aigw_guard` enforce them. Loopback, link-local, and
+Ansible renders two separate DNS planes in `docker-compose.dns.yml`:
+
+- `internal_dns_servers` is the corporate DNS plane. It is reachable only
+  through the ADM and internal legs.
+- `egress_dns_servers` is the internet DNS plane. Only Envoy can reach it,
+  and only through the egress leg.
+
+The old shared `CONTAINER_DNS_SERVER` setting is gone. Each container has an
+explicit resolver because Docker 29 may send inherited DNS queries from the
+host namespace. That would bypass the container forward path. Explicit
+resolvers keep queries where `DOCKER-USER` and `aigw_guard` can enforce the
+rules. Loopback, link-local, and
 multicast values are rejected at preflight, the two lists may not overlap,
 and only Envoy's pinned address may reach an Internet resolver. When the
 platform runs its own authoritative DNS
-(`platform_authoritative_dns_enabled`, default on only for the lab profile),
+(`platform_authoritative_dns_enabled`, off by default in production),
 the `docker-compose.platform-dns.yml` overlay adds the CoreDNS service,
 which then publishes port 53 on the exact ADM and internal host addresses.
 The complete hostname inventory and per-audience resolution design are in the
@@ -172,11 +181,14 @@ egress-subnet source address still matches no allow rule.
 
 ## 7. What verification asserts
 
-The `verify` role re-derives the contract from the live host after every
-converge: exactly one default route on the egress NIC; both policy rules and
-their single-default tables; every zone's runtime, saved, and permanent
-interface ownership; the presence of the identity-pinned `DOCKER-USER` and
-`aigw_guard` rules (and the absence of any source/port-only physical
-accept); per-network driver, internal, bridge-name, subnet, and IP-range
-contracts; and published ports limited to exactly the two Traefik binds
-(plus lab DNS), never a wildcard or the egress address.
+After every converge, the `verify` role checks the live host again. It requires:
+
+- one default route on the egress NIC;
+- both policy rules and their single-default routing tables;
+- the saved, runtime, and permanent interface owner for every zone;
+- the identity-pinned `DOCKER-USER` and `aigw_guard` rules;
+- no physical accept rule based only on source and port;
+- the exact driver, internal flag, bridge name, subnet, and IP range for every
+  Docker network; and
+- only the two Traefik port bindings and optional authoritative DNS, with no
+  wildcard or egress binding.

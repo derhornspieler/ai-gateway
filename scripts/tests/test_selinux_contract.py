@@ -59,7 +59,7 @@ class VaultConfigValidationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("failed to fetch anonymous token: 401 Unauthorized", result.stderr)
         self.assertIn(
-            "dhi.io/vault:2.0.3@sha256:743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6",
+            "dhi.io/vault:2.0.3@sha256:2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e",
             result.stderr,
         )
         self.assertIn("image, registry, or Docker daemon problem", result.stderr)

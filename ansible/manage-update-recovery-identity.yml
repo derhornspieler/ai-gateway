@@ -1,0 +1,263 @@
+---
+# Temporarily place the controller-held age identity in root-only /run storage.
+# The update orchestrator calls state=absent from its Python finally path after
+# either acceptance or rollback. Secret-bearing tasks never log their values.
+- name: Manage the temporary image-update recovery identity
+  hosts: gateway:generic_rocky9
+  gather_facts: false
+  become: true
+  vars:
+    update_recovery_identity_fixed_path: /run/ai-gateway-image-update/rollback.agekey
+    update_recovery_identity_directory: /run/ai-gateway-image-update
+  pre_tasks:
+    - name: Validate temporary recovery identity controls
+      ansible.builtin.assert:
+        that:
+          - update_recovery_identity_state in ['present', 'absent']
+          - update_recovery_identity_remote_path == update_recovery_identity_fixed_path
+          - update_recovery_identity_controller_path is match('^/.+$')
+        quiet: true
+        fail_msg: Temporary recovery identity inputs are invalid.
+      no_log: true
+
+  tasks:
+    - name: Stage the temporary recovery identity
+      when: update_recovery_identity_state == 'present'
+      block:
+        - name: Inspect the controller-held recovery identity
+          ansible.builtin.stat:
+            path: "{{ update_recovery_identity_controller_path }}"
+            follow: false
+          become: false
+          delegate_to: localhost
+          register: update_recovery_identity_controller_file
+          no_log: true
+
+        - name: Require a private regular controller-held recovery identity
+          ansible.builtin.assert:
+            that:
+              - update_recovery_identity_controller_file.stat.isreg
+              - not (update_recovery_identity_controller_file.stat.islnk | default(false))
+              - update_recovery_identity_controller_file.stat.mode == '0600'
+              - update_recovery_identity_controller_file.stat.size | int > 0
+              - update_recovery_identity_controller_file.stat.size | int <= 16384
+            quiet: true
+          no_log: true
+
+        - name: Inspect the volatile recovery directory boundary
+          ansible.builtin.stat:
+            path: "{{ update_recovery_identity_directory }}"
+            follow: false
+          register: update_recovery_identity_directory_before
+          no_log: true
+
+        - name: Refuse an unsafe existing volatile recovery directory
+          ansible.builtin.assert:
+            that:
+              - not (update_recovery_identity_directory_before.stat.exists | default(false)) or
+                (update_recovery_identity_directory_before.stat.isdir | default(false))
+              - not (update_recovery_identity_directory_before.stat.islnk | default(false))
+              - not (update_recovery_identity_directory_before.stat.exists | default(false)) or
+                update_recovery_identity_directory_before.stat.uid == 0
+              - not (update_recovery_identity_directory_before.stat.exists | default(false)) or
+                update_recovery_identity_directory_before.stat.gid == 0
+              - not (update_recovery_identity_directory_before.stat.exists | default(false)) or
+                update_recovery_identity_directory_before.stat.mode == '0700'
+            quiet: true
+          no_log: true
+
+        - name: Create the root-only volatile recovery directory
+          ansible.builtin.file:
+            path: "{{ update_recovery_identity_directory }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+            follow: false
+          no_log: true
+
+        - name: Inspect a pre-existing temporary recovery identity
+          ansible.builtin.stat:
+            path: "{{ update_recovery_identity_fixed_path }}"
+            follow: false
+          register: update_recovery_identity_before
+          no_log: true
+
+        - name: Refuse to replace a pre-existing temporary recovery identity
+          ansible.builtin.assert:
+            that:
+              - not (update_recovery_identity_before.stat.exists | default(false))
+            quiet: true
+          no_log: true
+
+        - name: Stream the recovery identity into volatile root-only storage
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -I
+              - -c
+              - |
+                import os
+                import pathlib
+                import sys
+
+                path = pathlib.Path(sys.argv[1])
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                descriptor = os.open(path, flags, 0o600)
+                try:
+                    os.fchown(descriptor, 0, 0)
+                    os.fchmod(descriptor, 0o600)
+                    secret = sys.stdin.buffer.read(16385)
+                    if not 0 < len(secret) <= 16384:
+                        raise RuntimeError("invalid recovery identity size")
+                    with os.fdopen(descriptor, "wb", closefd=True) as target:
+                        descriptor = -1
+                        target.write(secret)
+                        target.flush()
+                        os.fsync(target.fileno())
+                except Exception:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                    path.unlink(missing_ok=True)
+                    raise
+              - "{{ update_recovery_identity_fixed_path }}"
+            stdin: "{{ lookup('ansible.builtin.file', update_recovery_identity_controller_path, rstrip=false) }}"
+            stdin_add_newline: false
+          changed_when: true
+          no_log: true
+
+        - name: Verify the temporary recovery identity boundary
+          ansible.builtin.stat:
+            path: "{{ update_recovery_identity_fixed_path }}"
+            follow: false
+          register: update_recovery_identity_after
+          no_log: true
+
+        - name: Require the exact temporary recovery identity boundary
+          ansible.builtin.assert:
+            that:
+              - update_recovery_identity_after.stat.isreg
+              - not (update_recovery_identity_after.stat.islnk | default(false))
+              - update_recovery_identity_after.stat.uid == 0
+              - update_recovery_identity_after.stat.gid == 0
+              - update_recovery_identity_after.stat.mode == '0600'
+              - (update_recovery_identity_after.stat.nlink | default(1) | int) == 1
+            quiet: true
+          no_log: true
+      rescue:
+        - name: Inspect only a newly created partial recovery identity
+          ansible.builtin.stat:
+            path: "{{ update_recovery_identity_fixed_path }}"
+            follow: false
+          register: update_recovery_identity_partial
+          when:
+            - update_recovery_identity_before is defined
+            - not (update_recovery_identity_before.stat.exists | default(false))
+          no_log: true
+
+        - name: Refuse to delete an unexpected partial recovery identity
+          ansible.builtin.assert:
+            that:
+              - not (update_recovery_identity_partial.stat.exists | default(false)) or
+                (update_recovery_identity_partial.stat.isreg | default(false))
+              - not (update_recovery_identity_partial.stat.islnk | default(false))
+              - not (update_recovery_identity_partial.stat.exists | default(false)) or
+                update_recovery_identity_partial.stat.uid == 0
+              - not (update_recovery_identity_partial.stat.exists | default(false)) or
+                update_recovery_identity_partial.stat.gid == 0
+              - not (update_recovery_identity_partial.stat.exists | default(false)) or
+                update_recovery_identity_partial.stat.mode == '0600'
+              - not (update_recovery_identity_partial.stat.exists | default(false)) or
+                (update_recovery_identity_partial.stat.nlink | default(1) | int) == 1
+            quiet: true
+          when:
+            - update_recovery_identity_before is defined
+            - not (update_recovery_identity_before.stat.exists | default(false))
+          no_log: true
+
+        - name: Remove only a newly created partial recovery identity
+          ansible.builtin.file:
+            path: "{{ update_recovery_identity_fixed_path }}"
+            state: absent
+            follow: false
+          when:
+            - update_recovery_identity_before is defined
+            - not (update_recovery_identity_before.stat.exists | default(false))
+            - update_recovery_identity_partial.stat.exists | default(false)
+          no_log: true
+
+        - name: Stop after temporary recovery identity staging failed
+          ansible.builtin.fail:
+            msg: Temporary recovery identity staging failed; no pre-existing identity was removed.
+          no_log: true
+
+    - name: Remove and prove removal of the temporary recovery identity
+      when: update_recovery_identity_state == 'absent'
+      block:
+        - name: Inspect volatile recovery directory before cleanup
+          ansible.builtin.stat:
+            path: "{{ update_recovery_identity_directory }}"
+            follow: false
+          register: update_recovery_cleanup_directory
+          no_log: true
+
+        - name: Require an exact volatile recovery directory before cleanup
+          ansible.builtin.assert:
+            that:
+              - not (update_recovery_cleanup_directory.stat.exists | default(false)) or
+                (update_recovery_cleanup_directory.stat.isdir | default(false))
+              - not (update_recovery_cleanup_directory.stat.islnk | default(false))
+              - not (update_recovery_cleanup_directory.stat.exists | default(false)) or
+                update_recovery_cleanup_directory.stat.uid == 0
+              - not (update_recovery_cleanup_directory.stat.exists | default(false)) or
+                update_recovery_cleanup_directory.stat.gid == 0
+              - not (update_recovery_cleanup_directory.stat.exists | default(false)) or
+                update_recovery_cleanup_directory.stat.mode == '0700'
+            quiet: true
+          no_log: true
+
+        - name: Inspect the temporary recovery identity before cleanup
+          ansible.builtin.stat:
+            path: "{{ update_recovery_identity_fixed_path }}"
+            follow: false
+          register: update_recovery_cleanup_identity
+          no_log: true
+
+        - name: Refuse to remove an unexpected recovery identity replacement
+          ansible.builtin.assert:
+            that:
+              - not (update_recovery_cleanup_identity.stat.exists | default(false)) or
+                (update_recovery_cleanup_identity.stat.isreg | default(false))
+              - not (update_recovery_cleanup_identity.stat.islnk | default(false))
+              - not (update_recovery_cleanup_identity.stat.exists | default(false)) or
+                update_recovery_cleanup_identity.stat.uid == 0
+              - not (update_recovery_cleanup_identity.stat.exists | default(false)) or
+                update_recovery_cleanup_identity.stat.gid == 0
+              - not (update_recovery_cleanup_identity.stat.exists | default(false)) or
+                update_recovery_cleanup_identity.stat.mode == '0600'
+              - not (update_recovery_cleanup_identity.stat.exists | default(false)) or
+                (update_recovery_cleanup_identity.stat.nlink | default(1) | int) == 1
+            quiet: true
+          no_log: true
+
+        - name: Remove only the fixed temporary recovery identity file
+          ansible.builtin.file:
+            path: "{{ update_recovery_identity_fixed_path }}"
+            state: absent
+            follow: false
+          when: update_recovery_cleanup_identity.stat.exists | default(false)
+          no_log: true
+      always:
+        - name: Inspect the temporary recovery identity after cleanup
+          ansible.builtin.stat:
+            path: "{{ update_recovery_identity_fixed_path }}"
+            follow: false
+          register: update_recovery_identity_removed
+          no_log: true
+
+        - name: Require temporary recovery identity removal
+          ansible.builtin.assert:
+            that:
+              - not (update_recovery_identity_removed.stat.exists | default(false))
+            quiet: true
+          no_log: true

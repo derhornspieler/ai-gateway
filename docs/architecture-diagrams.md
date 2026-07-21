@@ -4,7 +4,9 @@ This document is the visual companion to the
 [solution map](solution-map.md). Each diagram reflects the implemented
 configuration in `compose/`, `ansible/`, and `services/`; where a diagram
 simplifies, the solution map's tables remain authoritative. Diagrams render
-natively on GitHub/GitLab (Mermaid).
+natively on GitHub/GitLab (Mermaid). Provider catalog and CA review details
+are in [Provider onboarding](provider-onboarding.md) and the
+[Provider CA maintenance SOP](sop/provider-ca-maintenance.md).
 
 ## 1. Network topology and trust zones
 
@@ -33,7 +35,7 @@ flowchart TB
     TI[traefik-int :443]
   end
 
-  EV -->|pinned TLS, exact SANs,<br/>narrowed per-vendor CAs| NIC0 --> INET
+  EV -->|selected-provider TLS, exact SANs,<br/>reviewed CA bundles| NIC0 --> INET
   VPN -->|SSH + admin HTTPS| NIC1 --> TA
   USERS -->|user HTTPS| NIC2 --> TI
 ```
@@ -41,7 +43,57 @@ flowchart TB
 Reply traffic for the ADM and internal legs uses source-policy routing
 (tables 101/102) so responses leave through the interface they arrived on.
 
-## 2. Segmented container planes
+## 2. Local preprod topology
+
+Local preprod runs on one local Docker engine. It keeps the production service
+networks but replaces physical host interfaces with three labeled Docker
+planes. Only the two loopback HTTPS addresses are published. The exact
+production Envoy image starts from the offline seed and its policy is checked.
+The mock WIF request path stays separate, so test trust can never enter that
+production Envoy image.
+
+Docker Desktop requires one preprod-only Envoy TCP forwarder to own both IPv4
+port 443 publications. It passes TLS through unchanged to the separate
+Internal and ADM Traefik containers. This workaround is not in production.
+
+```mermaid
+flowchart LR
+  SEED[(Schema-v2 preprod<br/>offline seed)]
+  ANS[Ansible preprod<br/>pull never, no build]
+  CLIENT[Local browser and API tests]
+
+  subgraph engine [Local Docker engine — project aigw-preprod]
+    PNI[plane-internal<br/>127.0.2.1:443]
+    PNA[plane-adm<br/>127.0.3.1:443]
+    PNE[plane-egress<br/>no host bind]
+    TI[traefik-int]
+    TA[traefik-adm]
+    APPS[Portals, chat, LiteLLM,<br/>Vault, and telemetry]
+    KC[Keycloak]
+    AD[Samba AD<br/>hostname-verified LDAPS]
+    KR[key-rotator]
+    WEV[Separate test Envoy<br/>trusts preprod Root CA]
+    WIF[WIF provider mock<br/>TLS + JWT checks]
+    EV[Exact production Envoy image<br/>selected policy checked]
+    CA[Test Root CA<br/>generated locally]
+  end
+
+  SEED --> ANS --> APPS
+  CLIENT -->|user names| PNI --> TI --> APPS
+  CLIENT -->|admin names| PNA --> TA --> APPS
+  AD -->|LDAPS| KC --> APPS
+  KR --> WEV --> WIF
+  EV --- PNE
+  CA -.signs edge, LDAPS,<br/>and mock certificates.-> TI
+  CA -.-> TA
+  CA -.-> AD
+  CA -.-> WIF
+```
+
+See [Local preprod](preprod.md) for the exact names, addresses, static users,
+and bounded destroy command.
+
+## 3. Segmented container planes
 
 The stack pre-creates 20 Docker bridges and uses 18 in the base profile;
 services join only the planes they need, and both an atomic `DOCKER-USER`
@@ -76,12 +128,12 @@ flowchart LR
   D3 --- A1
 ```
 
-## 3. Software flow — user, developer, and administrator paths
+## 4. Software flow — user, developer, and administrator paths
 
 ```mermaid
 flowchart LR
   U[User browser] -->|chat.DOMAIN, ADM leg| TA
-  T[AI tool with gateway key] -->|api.DOMAIN /v1| TI
+  T[AI tool with gateway key] -->|api.DOMAIN /v1| TI[traefik-int]
   D[Developer browser] -->|portal.DOMAIN| TI
   A[Administrator browser] -->|admin hosts on ADM leg| TA[traefik-adm]
 
@@ -91,19 +143,19 @@ flowchart LR
   TI -->|aigw realm only| KC[Keycloak]
 
   TA --> AP[admin-portal]
-  TA --> O2[oauth2-proxy gates ×4] -->|aigw-admins| ADM_UIS[LiteLLM Admin / Grafana / Prometheus / Vault UIs]
+  TA --> O2[up to 4 oauth2-proxy gates] -->|aigw-admins| ADM_UIS[LiteLLM Admin / Grafana / Prometheus / optional Vault UIs]
   TA -->|auth.DOMAIN full console| KC
 
   DP -->|key lifecycle| KR[key-rotator]
   AP -->|identity + rotation control| KR
-  LL -->|vendor path| EV[Envoy egress] --> V[Anthropic / OpenAI]
+  LL -->|selected provider path| EV[Envoy egress] --> V[Selected provider APIs]
   KR --> EV
   LL & KC & KR --> PG[(Postgres)]
   LL --> RD[(Redis)]
   KR --> VT[(Vault)]
 ```
 
-## 4. Authentication flow — browser OIDC and admin gates
+## 5. Authentication flow — browser OIDC and admin gates
 
 All human access authenticates against Keycloak realm `aigw`, which emits
 the four realm roles (`aigw-chat`, `aigw-users` (deprecated for chat),
@@ -139,7 +191,7 @@ Keycloak step-up (`prompt=login`, `max_age=0`) within a five-minute window,
 and every page read re-checks the caller's live composite roles — a revoked
 administrator fails closed even with a valid session cookie.
 
-## 5. Logic flow — developer key lifecycle
+## 6. Logic flow — developer key lifecycle
 
 Group membership in Keycloak is the authorization source; LiteLLM virtual
 keys are always derived from it and revoked with it.
@@ -156,7 +208,7 @@ flowchart TD
   REM([Admin removes member from group]) --> KILL[key-rotator logs user out of Keycloak<br/>and deactivates that subject's project keys<br/>before and after the membership change]
 ```
 
-## 6. Security flow — provider credential rotation (Anthropic WIF)
+## 7. Security flow — provider credential rotation (Anthropic WIF)
 
 No long-lived vendor API key sits in application configuration. key-rotator
 brokers a short-lived Anthropic token through Keycloak's isolated
@@ -181,7 +233,7 @@ sequenceDiagram
   KR->>KR: install token as LiteLLM provider credential<br/>(anthropic-primary), schedule refresh
 ```
 
-## 7. Security design — layered enforcement
+## 8. Security design — layered enforcement
 
 Each layer fails closed independently; compromising one does not disable the
 others.
@@ -191,37 +243,41 @@ flowchart TB
   L1[Host ingress — firewalld zones:<br/>exact source CIDRs, SSH key-only on ADM,<br/>no egress-leg listener]
   L2[Packet policy — atomic DOCKER-USER +<br/>independent nftables aigw_guard:<br/>deny cross-plane, container-to-host,<br/>unapproved bridge egress]
   L3[Network segmentation — 18 per-function bridges;<br/>services join only required planes;<br/>fixed IPs for firewall-addressed workloads]
-  L4[Identity — Keycloak OIDC everywhere;<br/>three realm roles; per-UI oauth2-proxy gates;<br/>step-up + live-role re-checks for admin mutations]
+  L4[Identity — Keycloak OIDC everywhere;<br/>role-based access; per-UI oauth2-proxy gates;<br/>step-up + live-role re-checks for admin mutations]
   L5["Secrets — Vault-backed provider credentials;<br/>file-backed Docker secrets; no secret in argv/env;<br/>fail-closed blank-variable Compose contract"]
   L6[Runtime — SELinux enforcing with per-container MCS;<br/>non-root DHI images, digest-pinned;<br/>read-only binds with keyed HMAC digests;<br/>no Docker socket exposure]
-  L7[Egress — Envoy as the only external identity:<br/>exact routes, exact SANs, per-vendor CA bundles]
+  L7[Egress — Envoy as the only external identity:<br/>selected routes, exact SANs, reviewed CA bundles]
   L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
 ```
 
-## 8. Telemetry flow
+## 9. Telemetry and SOC log flow
 
-Prompts and completions are sensitive: they travel as span attributes to
-Cribl and land locally only in the dedicated Loki `aigw-requests` per-request
-stream, never in ordinary service log records. Retention and
-redaction rules are in
-[observability operations](observability-operations.md).
+Prompts and completions are sensitive. Alloy converts the reviewed
+`litellm_request` span into a log record. The raw span never leaves the gateway.
+The log stays locally in Loki and may enter the narrow Cribl SOC feed.
+
+Metrics, raw traces, ordinary service logs, and alert payloads never enter
+Cribl. Detailed routes and redaction rules are in
+[observability operations](observability-operations.md). The logging-team
+contract is in [Cribl SOC logging handoff](cribl-soc-handoff.md).
 
 ```mermaid
 flowchart LR
-  LL[LiteLLM<br/>full AI spans] -->|OTLP| AL[Alloy]
-  DP[Portals] -->|OTLP/logs| AL
-  KR[key-rotator] -->|OTLP/logs| AL
-  DL[Docker JSON logs<br/>uid-473 ACL tail] --> AL
-  VA[Vault audit device tail] --> AL
+  LL[LiteLLM<br/>AI spans and runtime logs] --> AL[Alloy]
+  KC[Keycloak<br/>auth events] --> AL
+  SE[Reviewed trust and<br/>security-control events] --> AL
+  DL[Other Docker JSON logs<br/>uid-473 ACL tail] --> AL
+  VA[Vault raw audit tail] --> AL
 
-  AL -->|logs + per-request stream| LK[(Loki — 7 d<br/>incl. prompt-bearing aigw-requests)]
-  AL -->|remote write + spanmetrics| PR[(Prometheus — 7 d)]
+  AL -->|local logs + request audit| LK[(Loki — 7 days)]
+  AL -->|local metrics + spanmetrics| PR[(Prometheus — 30 days)]
   NE[node-exporter] --> PR
-  AL -.optional OTLP over internal NIC.-> CR[Cribl export]
-  GF[Grafana — ADM leg,<br/>behind oauth2-proxy] --> TP & LK & PR
+  PR -.approved backlog.-> AM[Future Alertmanager<br/>local only]
+  AL -.curated OTLP logs over TLS only.-> CR[Cribl SOC — 24 hours]
+  GF[Grafana — ADM leg,<br/>behind oauth2-proxy] --> LK & PR
 ```
 
-## 9. Deployment logic — Ansible converge order
+## 10. Deployment logic — Ansible converge order
 
 The converge is a gated pipeline: each stage validates its contract and the
 run stops at the first failure, before later stages can mutate the host.
@@ -245,3 +301,115 @@ flowchart TD
   GATE -- no — first converge --> WAIT[Reduced wait + explicit Vault gate<br/>→ initialize Vault, re-run]
   GATE -- yes --> FULL[Full service-graph wait — done]
 ```
+
+## 11. Provider selection and immutable Envoy build
+
+Operators select reviewed names. They cannot pass a hostname or CA path. The
+same canonical policy is used to build the image and write both release
+projections.
+
+```mermaid
+flowchart LR
+  OP[Operator repeats<br/>--provider NAME] --> PLAN[Network-disabled policy planner]
+  CAT[Committed provider catalog] --> PLAN
+  CA[Reviewed CA bundles] --> PLAN
+  PROV[Reviewed provenance records] --> PLAN
+  PLAN --> CHECK{Names, routes, SNI, SANs,<br/>hashes, fingerprints, dates valid?}
+  CHECK -- no --> STOP[Stop: no image or release]
+  CHECK -- yes --> CANON[Canonical sorted provider list<br/>and egress-policy digest]
+  CANON --> BUILD[Network-disabled reproducible<br/>Envoy image build]
+  CAT --> BUILD
+  CA --> BUILD
+  PROV --> BUILD
+  BUILD --> ONLY[Final image contains only selected<br/>routes, policy, and CA bundles]
+  ONLY --> ID[Immutable Envoy image ID]
+  CANON --> MAN[Schema-v2 manifest egress policy]
+  ID --> MAN
+  MAN --> PROD[Production offline seed<br/>no preprod-only images]
+  MAN --> PRE[Preprod offline seed<br/>production plus Samba AD and WIF mock]
+```
+
+The catalog itself is not copied into the final image. The generated policy
+contains only the selected records. Changing the selection changes the policy
+and image identity.
+
+## 12. Runtime request path for selected providers
+
+The host firewall leaves Envoy as the only external workload identity. Envoy
+has no catch-all provider route and no system-trust fallback.
+
+```mermaid
+flowchart LR
+  LL[LiteLLM] -->|HTTP on net-vendor| EV[Envoy egress]
+  KR[key-rotator] -->|HTTP on net-vendor| EV
+  EV --> ROUTE{Path matches a selected<br/>provider prefix?}
+  ROUTE -- no --> DENY[Return 404<br/>no upstream request]
+  ROUTE -- yes --> TLS[Rewrite path and Host<br/>start TLS with reviewed SNI]
+  TLS --> VERIFY{Exact SAN and reviewed<br/>CA bundle valid?}
+  VERIFY -- no --> FAIL[Fail closed]
+  VERIFY -- yes --> API[Selected provider API]
+  LL -.direct TCP/443 blocked.-> FW[Host egress firewall]
+  KR -.direct TCP/443 blocked.-> FW
+  UNS[Unselected provider] -.no generated route.-> DENY
+```
+
+## 13. CA capture, review, rotation, and approval
+
+Live capture is evidence, not approval. The reviewed source and a new release
+must cross the release approval boundary before any CA reaches runtime.
+
+```mermaid
+flowchart LR
+  NOTICE[Provider or CA change notice] --> CAP
+  ENDPOINT[Approved provider endpoint] --> CAP
+  OFFICIAL[Official provider or CA repository] --> REVIEW
+
+  subgraph TRUST [Trusted release-maintenance boundary]
+    CAP[Capture candidate chain<br/>on trusted networked system] --> REVIEW[Independent review:<br/>source, chain, dates, CA use,<br/>hashes, provenance limits]
+    REVIEW --> DECIDE{All evidence approved?}
+    DECIDE -- no --> REJECT[Reject candidate]
+    DECIDE -- yes --> SOURCE[Update reviewed PEM,<br/>provenance, catalog, and tests]
+    SOURCE --> GATES[Unit, contract, deterministic,<br/>and selected-only tests]
+    GATES --> APPROVE{Release approval}
+  end
+
+  APPROVE -- no --> REJECT
+  APPROVE -- yes --> RELEASE[Build new immutable Envoy image<br/>and offline seeds]
+  RELEASE --> TRANSITION[Optional transition release<br/>contains approved old and new CAs]
+  TRANSITION --> CUTOVER[Provider chain cutover]
+  CUTOVER --> FINAL[New reviewed release<br/>removes retired CA]
+```
+
+Ansible does not enter this flow. It receives the already-built release and
+never downloads trust material.
+
+## 14. Offline-seed validation, deployment, and rollback
+
+The production and preprod files are separate projections from one build.
+Local preprod must pass using its exact seed before the production pair is
+transferred.
+
+```mermaid
+flowchart TD
+  BUILD[One reviewed release build] --> PRESEED[Preprod archive and manifest]
+  BUILD --> PRODSEED[Production archive and manifest]
+  PRESEED --> LLOAD[Local loader checks archive allow-list,<br/>source hashes, policy, labels, and image IDs]
+  LLOAD --> PE2E[Ansible local preprod<br/>pull never, no build]
+  PE2E --> PGATE{Full end-to-end test passed?}
+  PGATE -- no --> FIX[Reject release and fix source]
+  PGATE -- yes --> XFER[Transfer production pair<br/>and independent hashes]
+  PRODSEED --> XFER
+  XFER --> RLOAD[Remote loader checks production scope,<br/>policy, labels, and exact image IDs]
+  RLOAD --> BACKUP[Authenticate encrypted state backup]
+  BACKUP --> DEPLOY[Ansible deploys candidate<br/>Envoy image and policy as one unit]
+  DEPLOY --> VALIDATE{Readiness and external<br/>validation passed?}
+  VALIDATE -- yes --> ACCEPT[Accept candidate release]
+  VALIDATE -- no --> ROLLBACK[Restore prior state and use<br/>previous clean source plus seed]
+  ROLLBACK --> OLDTEST{Previous release validates?}
+  OLDTEST -- yes --> RESTORED[Rollback complete]
+  OLDTEST -- no --> CLOSED[Keep ingress closed<br/>manual recovery required]
+```
+
+See the [image update workflow](image-update-workflow.md) for commands and
+[offline image releases](offline-image-seed.md) for the manifest and loader
+contracts.

@@ -4,8 +4,8 @@ Owner decision: Open WebUI chat access is gated by the DEDICATED `aigw-chat`
 realm role, not by aigw-users/-developers/-admins membership. The capability
 spans the Compose gate, the realm template and its static dev default, the
 identity-policy parity validator, both services' assignable capability sets,
-the Open WebUI build-time OAuth verification harness, and the lab baseline /
-live-lab acceptance. These pins keep those surfaces in lockstep so no single
+the Open WebUI build-time OAuth verification harness, and local preprod
+acceptance. These pins keep those surfaces in lockstep so no single
 edit can silently re-widen chat access or brick it.
 """
 
@@ -162,22 +162,20 @@ class ChatCapabilityContractTest(unittest.TestCase):
         self.assertIn('{"roles": ["aigw-developers"]}', verifier)
         self.assertIn('{"roles": ["aigw-chat"]}', verifier)
 
-    def test_lab_baseline_and_acceptance_reflect_the_migration(self) -> None:
-        lab_vars = (ROOT / "ansible/inventory/host_vars/lab-aigw01.yml").read_text(
-            encoding="utf-8"
-        )
+    def test_preprod_baseline_and_acceptance_reflect_the_capability(self) -> None:
+        preprod = (ROOT / "scripts/preprod.py").read_text(encoding="utf-8")
         for line in (
-            "- { name: lab-admins, roles: [aigw-admins, aigw-chat] }",
-            "- { name: lab-developers, roles: [aigw-chat, aigw-developers] }",
-            "- { name: lab-users, roles: [aigw-chat, aigw-users] }",
+            '"preprod-admins": ("preprod-admin", ["aigw-admins", "aigw-chat"]),',
+            '"preprod-developers": ("preprod-developer", ["aigw-chat", "aigw-developers"]),',
+            '"preprod-users": ("preprod-user", ["aigw-chat"]),',
         ):
-            self.assertIn(line, lab_vars)
-        acceptance = (ROOT / "scripts/verify-live-lab-identity.py").read_text(
+            self.assertIn(line, preprod)
+        acceptance = (ROOT / "scripts/test-e2e-preprod.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('["aigw-admins", "aigw-chat"]', acceptance)
-        self.assertIn('["aigw-chat", "aigw-developers"]', acceptance)
-        self.assertIn('["aigw-chat", "aigw-users"]', acceptance)
+        self.assertIn('"preprod-admin"', acceptance)
+        self.assertIn('"preprod-developer"', acceptance)
+        self.assertIn('"preprod-user"', acceptance)
 
     def test_migration_procedure_is_documented(self) -> None:
         operations = (ROOT / "docs/identity-operations.md").read_text(
@@ -191,7 +189,7 @@ class ChatCapabilityContractTest(unittest.TestCase):
         verify = (ROOT / "ansible/roles/verify/tasks/main.yml").read_text(
             encoding="utf-8"
         )
-        # Runs on every converge, both profiles (no profile guard), gated only
+        # Runs on every production converge (no development-profile guard), gated only
         # on an initialized Vault so a genuinely fresh pre-bootstrap converge
         # is skipped.
         self.assertIn(

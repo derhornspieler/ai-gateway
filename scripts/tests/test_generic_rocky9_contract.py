@@ -20,9 +20,6 @@ PREFLIGHT = ROOT / "ansible" / "preflight-generic-rocky9.yml"
 ALL_VARS = ROOT / "ansible" / "group_vars" / "all.yml"
 GENERIC_GROUP_VARS = ROOT / "ansible" / "inventory" / "group_vars" / "generic_rocky9.yml"
 GENERIC_INVENTORY = ROOT / "ansible" / "inventory" / "hosts.yml"
-LAB_VARS = ROOT / "ansible" / "inventory" / "host_vars" / "lab-aigw01.yml"
-LAB_INVENTORY = ROOT / "ansible" / "inventory" / "lab.yml"
-LAB_VAULT = ROOT / "ansible" / "inventory" / "group_vars" / "gateway" / "vault.yml"
 STACK_ONLY = ROOT / "ansible" / "deploy-stack-only.yml"
 SITE = ROOT / "ansible" / "site.yml"
 OS_PREP = ROOT / "ansible" / "os-prep.yml"
@@ -102,120 +99,36 @@ class GenericRocky9ContractTests(unittest.TestCase):
                 self.assertIn(f"- {name}", source)
             else:
                 self.assertIn(f"name: {name}", source)
-        self.assertEqual(
-            self.contract["lab_only_secret_keys"],
-            [
-                "samba_ad_admin_password",
-                "samba_ad_bind_password",
-                "samba_user_lab_admin_password",
-                "samba_user_lab_developer_password",
-                "samba_user_lab_user_password",
-            ],
-        )
+        self.assertNotIn("lab_only_secret_keys", self.contract)
         # The external directory bind credential is operator-supplied, exactly
         # like vault_unseal_key: it cannot be randomly generated here.
         self.assertNotIn("identity_ldap_bind_password", names)
         self.assertIn("identity_ldap_enabled", self.contract["required_nonsecret_keys"])
 
-    def test_generic_and_lab_profiles_are_explicit_and_encryption_is_fail_closed(self) -> None:
+    def test_generic_compatibility_and_production_profiles_are_encrypted(self) -> None:
         inventory = GENERIC_INVENTORY.read_text(encoding="utf-8")
         generic = GENERIC_GROUP_VARS.read_text(encoding="utf-8")
-        lab = LAB_INVENTORY.read_text(encoding="utf-8")
-        lab_host_vars = LAB_VARS.read_text(encoding="utf-8")
         defaults = ALL_VARS.read_text(encoding="utf-8")
 
         self.assertIn("generic_rocky9:", inventory)
-        self.assertIn("gateway:\n      hosts: {}", inventory)
-        self.assertNotIn("gateway:\n      children:", inventory)
-        self.assertTrue(LAB_VAULT.is_file())
+        self.assertIn("production_rocky9:", inventory)
+        self.assertNotIn("gateway:\n      hosts: {}", inventory)
         for required in (
             "deployment_profile: generic-rocky9",
             "require_encrypted_state: true",
             "require_preupgrade_backup: true",
             "aigw_vault_ui_enabled: false",
-            "aigw_ssh_password_authentication: false",
-            "aigw_adm_socks_enabled: false",
         ):
             self.assertIn(required, generic)
-        self.assertIn("deployment_profile: rocky9-lab", lab)
-        self.assertIn("require_encrypted_state: false", lab)
-        self.assertNotIn("deployment_profile:", lab_host_vars)
-        self.assertNotIn("require_encrypted_state:", lab_host_vars)
-        self.assertIn("aigw_encrypted_state_preflight_required:", defaults)
-        self.assertIn("(deployment_profile | default('')) != 'rocky9-lab'", defaults)
-        self.assertIn("(require_encrypted_state | bool)", defaults)
+        self.assertIn(
+            'aigw_encrypted_state_preflight_required: "{{ require_encrypted_state | bool }}"',
+            defaults,
+        )
         for source in (STACK_ONLY, OS_PREP):
             self.assertIn(
                 "when: aigw_encrypted_state_preflight_required | bool",
                 source.read_text(encoding="utf-8"),
             )
-
-    def test_ansible_precedence_keeps_only_lab_false_unencrypted(self) -> None:
-        """Exercise the inline lab exception without a Vault or host_vars."""
-        ansible_playbook = shutil.which("ansible-playbook")
-        self.assertIsNotNone(ansible_playbook, "ansible-playbook is required")
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "group_vars").mkdir()
-            (root / "inventory" / "host_vars").mkdir(parents=True)
-            (root / "group_vars" / "all.yml").write_text(
-                """---
-require_encrypted_state: true
-aigw_encrypted_state_preflight_required: >-
-  {{ (deployment_profile | default('')) != 'rocky9-lab' or
-     (require_encrypted_state | bool) }}
-""",
-                encoding="utf-8",
-            )
-            (root / "inventory" / "hosts.yml").write_text(
-                """---
-all:
-  children:
-    gateway:
-      hosts:
-        lab-aigw01:
-          deployment_profile: rocky9-lab
-          require_encrypted_state: false
-          expected_encryption_preflight: false
-        customer-aigw01:
-""",
-                encoding="utf-8",
-            )
-            (root / "inventory" / "host_vars" / "customer-aigw01.yml").write_text(
-                """---
-deployment_profile: generic-rocky9
-require_encrypted_state: false
-expected_encryption_preflight: true
-""",
-                encoding="utf-8",
-            )
-            playbook = root / "precedence.yml"
-            playbook.write_text(
-                """---
-- hosts: gateway
-  gather_facts: false
-  tasks:
-    - ansible.builtin.assert:
-        that:
-          - (aigw_encrypted_state_preflight_required | bool) == expected_encryption_preflight
-""",
-                encoding="utf-8",
-            )
-            result = subprocess.run(
-                [
-                    str(ansible_playbook),
-                    "-i",
-                    str(root / "inventory" / "hosts.yml"),
-                    str(playbook),
-                ],
-                cwd=root,
-                env={"PATH": os.environ["PATH"], "ANSIBLE_NOCOLOR": "1"},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_bootstrap_creates_alias_matched_layout_and_ciphertext_only_vault(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -412,14 +325,12 @@ print("          0123456789abcdef")
         self.assertIn("'missing_secret': aigw_generic_missing_secret_keys", source)
         self.assertIn("'invalid_secret': aigw_generic_invalid_secret_keys", source)
         self.assertIn("'duplicate_secret_boundaries': aigw_generic_duplicate_secret_boundaries", source)
-        self.assertIn("'forbidden_lab_options': aigw_generic_forbidden_lab_options", source)
+        self.assertIn("'forbidden_options': aigw_generic_forbidden_options", source)
         self.assertIn("validate generic Vault values without emitting values", source)
         self.assertIn("canonical lowercase FQDN without emitting its value", source)
         self.assertIn("canonical_lowercase_fqdn", source)
         self.assertIn("no_log: true", source)
-        self.assertIn("samba_lab_enabled", source)
         self.assertIn("aigw_seed_test_users", source)
-        self.assertIn("aigw_prebootstrap_oidc_scope_reconciliation", source)
         self.assertNotIn("roles:", source)
         for mutation_entrypoint in (OS_PREP, STACK_ONLY):
             entrypoint_source = mutation_entrypoint.read_text(encoding="utf-8")
@@ -450,11 +361,9 @@ all:
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_generic_inventory_does_not_load_the_committed_lab_vault(self) -> None:
-        """No Vault ID is supplied; success proves generic selection skips it."""
+    def test_generic_inventory_loads_without_an_unrelated_vault_id(self) -> None:
         ansible_inventory = shutil.which("ansible-inventory")
         self.assertIsNotNone(ansible_inventory, "ansible-inventory is required")
-        self.assertTrue(LAB_VAULT.is_file())
         environment = os.environ.copy()
         environment.update(
             {
@@ -496,14 +405,9 @@ all:
 aigw_generic_inventory_alias: customer-aigw01
 deployment_profile: generic-rocky9
 require_encrypted_state: true
-samba_lab_enabled: false
 aigw_seed_test_users: false
-retain_bootstrap_admin_user: false
-aigw_prebootstrap_oidc_scope_reconciliation: false
-aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
 platform_authoritative_dns_enabled: false
 aigw_vault_ui_enabled: false
-aigw_lab_reset_handoff_drop_interfaces: []
 """,
                 encoding="utf-8",
             )
@@ -556,14 +460,9 @@ aigw_domain: """
                     + json.dumps(domain)
                     + """
 require_encrypted_state: true
-samba_lab_enabled: false
 aigw_seed_test_users: false
-retain_bootstrap_admin_user: false
-aigw_prebootstrap_oidc_scope_reconciliation: false
-aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
 platform_authoritative_dns_enabled: false
 aigw_vault_ui_enabled: false
-aigw_lab_reset_handoff_drop_interfaces: []
 """,
                     encoding="utf-8",
                 )

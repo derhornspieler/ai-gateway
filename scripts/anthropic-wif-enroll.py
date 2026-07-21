@@ -54,8 +54,9 @@ import urllib.parse
 import urllib.request
 
 API = "https://api.anthropic.com/v1/organizations"
-DEFAULT_ISSUER_URL = "https://idp.wif-a.example.invalid/realms/anthropic-wif"
+DEFAULT_ISSUER_URL = "https://idp.wif.aigw.example.internal/realms/anthropic-wif"
 DEFAULT_SUBJECT = "service-account-anthropic-token-broker"
+FEDERATION_TARGET_KIND = "service_account"
 
 # RFC 7517 appendix A.1 public RSA key: structurally valid, publicly known,
 # verifies nothing. Used only by self-test's throwaway issuer.
@@ -322,7 +323,10 @@ def mode_enroll(client: Client, args) -> int:
                 "name": args.name_prefix,
                 "issuer_id": issuer["id"],
                 "match": {"subject_prefix": args.subject},
-                "target": {"type": "service_account", "service_account_id": svac["id"]},
+                "target": {
+                    "type": FEDERATION_TARGET_KIND,
+                    "service_account_id": svac["id"],
+                },
                 "workspace_id": args.workspace_id,
                 "oauth_scope": "workspace:inference",
                 "token_lifetime_seconds": args.token_lifetime,
@@ -400,7 +404,10 @@ def mode_selftest(client: Client, args) -> int:
                 "name": name,
                 "issuer_id": issuer["id"],
                 "match": {"subject_prefix": fake_subject},
-                "target": {"type": "service_account", "service_account_id": svac["id"]},
+                "target": {
+                    "type": FEDERATION_TARGET_KIND,
+                    "service_account_id": svac["id"],
+                },
                 "workspace_id": args.workspace_id,
                 "oauth_scope": "workspace:inference",
                 "token_lifetime_seconds": 600,

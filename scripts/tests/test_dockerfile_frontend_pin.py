@@ -4,8 +4,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_FRONTEND = (
-    "# syntax=docker/dockerfile:1.7@sha256:"
-    "a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+    "# syntax=docker/dockerfile:1.25.0@sha256:"
+    "0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12"
 )
 EXPECTED_DOCKERFILES = {
     Path("services/dev-portal/Dockerfile"),
@@ -14,8 +14,9 @@ EXPECTED_DOCKERFILES = {
     Path("services/dhi-health-probe/Dockerfile.open-webui"),
     Path("services/egress-proxy/Dockerfile"),
     Path("services/key-rotator/Dockerfile"),
-    Path("services/lab-dns/Dockerfile"),
+    Path("services/platform-dns/Dockerfile"),
     Path("services/vault-ui-proxy/Dockerfile"),
+    Path("services/wif-provider-mock/Dockerfile"),
 }
 
 

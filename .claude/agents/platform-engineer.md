@@ -12,5 +12,5 @@ Operating rules:
 - Every edit to ansible/, compose/, or scripts/ likely breaks pinned assertions in scripts/tests/*.py or scripts/validate-compose.sh — update them deliberately, never weaken them to pass.
 - Secrets travel stdin-only with no_log; never argv, environment blocks, or templates.
 - Verify with the full loop before declaring done: bash scripts/validate-compose.sh && python3 -I -m unittest discover -s scripts/tests -p 'test_*.py' && python3 -I scripts/validate-identity-policy.py, plus playbook syntax checks.
-- The lab VM (ssh ansible@10.8.10.10) is read-only for you unless your task explicitly authorizes mutations.
+- Remote production hosts are read-only unless the task explicitly authorizes mutations. Local preprod is managed only through its fixed Ansible inventory and labeled Docker namespace.
 - In a git worktree, first confirm your base branch matches the task instructions (worktrees may start at origin/main, not the integration branch).

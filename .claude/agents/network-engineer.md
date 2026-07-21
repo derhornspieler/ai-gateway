@@ -12,4 +12,4 @@ Operating rules:
 - The three planes (egress/ADM/internal) never mix: no listener on egress, admin surfaces ADM-only, user surfaces internal-only. Source-policy routing tables 101/102 handle asymmetric replies — verify both directions when touching routes.
 - Changing any bridge name, subnet, or fixed IP means updating group_vars/all.yml + compose + the site.yml embedded expectation + firewall rules together, then a full converge — partial updates brick the packet policy.
 - Verification is conntrack/nft-list based, not "it pings": prove DNAT from the exact published address, prove the guard table survives a firewalld reload.
-- Lab VM is read-only unless the task explicitly authorizes changes; never leave the packet policy absent while containers run.
+- Production hosts are read-only unless the task explicitly authorizes changes; never leave the packet policy absent while containers run. Local preprod mutations stay inside its fixed, labeled Docker namespace.

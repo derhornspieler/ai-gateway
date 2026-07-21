@@ -6,8 +6,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from authlib.integrations.starlette_client import OAuth
-from authlib.jose import JsonWebKey, jwt
-from authlib.jose.errors import InvalidClaimError
+from joserfc import jwt
+from joserfc.errors import InvalidClaimError
+from joserfc.jwk import RSAKey
 
 from app import auth
 from app.config import settings
@@ -132,8 +133,10 @@ async def test_oauth_registration_preserves_issuer_for_authlib(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_authlib_rejects_a_signed_id_token_from_the_wrong_issuer():
-    key = JsonWebKey.generate_key(
-        "RSA", 2048, is_private=True, options={"kid": "issuer-regression-key"}
+    key = RSAKey.generate_key(
+        key_size=2048,
+        private=True,
+        parameters={"kid": "issuer-regression-key"},
     )
     oauth = OAuth()
     client = oauth.register(
@@ -141,7 +144,7 @@ async def test_authlib_rejects_a_signed_id_token_from_the_wrong_issuer():
         client_id="portal-client",
         client_secret="unused-for-rs256",
         issuer="https://idp.test/realms/aigw",
-        jwks={"keys": [key.as_dict(is_private=False)]},
+        jwks={"keys": [key.as_dict(private=False)]},
         id_token_signing_alg_values_supported=["RS256"],
     )
     now = int(time.time())
@@ -156,7 +159,7 @@ async def test_authlib_rejects_a_signed_id_token_from_the_wrong_issuer():
             "nonce": "expected-nonce",
         },
         key,
-    ).decode()
+    )
 
     with pytest.raises(InvalidClaimError, match="iss"):
         await client.parse_id_token({"id_token": encoded}, nonce="expected-nonce")

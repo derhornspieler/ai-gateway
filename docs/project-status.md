@@ -1,165 +1,114 @@
-# AI Gateway — Project Status
+# AI Gateway project status
 
-_As of 2026-07-14._
+_Updated 2026-07-21._
 
-This is the living implementation-status record for AI Gateway. For the
-authoritative, gate-by-gate destructive-recovery evidence, see the
-[lab rebuild and restore rehearsal register](archive/lab-dr-rehearsal.md). For
-architecture and trust boundaries, see the [solution map](solution-map.md).
+AI Gateway is a customer prototype under active hardening. It runs on one
+Docker host and is not highly available. A passing local test does not approve
+a production release.
 
-## Maturity
+For design details, read the [solution map](solution-map.md). For release
+steps, use the [acceptance runbook](test-runbook.md). Old Rocky lab and recovery
+records are kept only as historical evidence in
+[docs/archive](archive/lab-dr-rehearsal.md). They are not deployment
+instructions.
 
-AI Gateway is a **customer prototype under active hardening**, not a turnkey
-production appliance. It is **not highly available**: one Docker Compose project
-on one Rocky Linux 9 VM. Recovery and reboot acceptance do not confer high
-availability, and passing source tests does not make the current source
-accepted, highly available, or ready for access reopening.
+## Supported deployment paths
 
-## What is implemented
+There are two separate paths:
 
-The hardened control-plane drop (July 2026) added: a generated per-customer
-inventory flow (`scripts/bootstrap-rocky9-production.py` plus the controller-only
-`ansible/preflight-rocky9-production.yml` gate, with the `generic-rocky9` names
-kept as deprecated aliases), three new converge roles
-(`firewall_preflight`, `time_sync`, `host_finalize`), split internal/egress
-DNS resolver planes replacing the shared container resolver, four per-gate
-OAuth cookie secrets, an optional extracted-asset Vault browser UI
-(`vault-ui-proxy`), continuous portal-key reconciliation, a pre-Vault
-identity baseline bridge, an Anthropic WIF enrollment control plane,
-provisioned immutable Grafana dashboards with Alloy-side telemetry
-sanitization, and a snapshot-gated legacy lab reset playbook.
+| Environment | Purpose | Entry point |
+| --- | --- | --- |
+| Local preprod | Test the full stack on one local Docker engine | [Local preprod](preprod.md) |
+| Production | Deploy to an existing three-NIC Rocky Linux 9 VM | [Production runbook](deploy-runbook.md) |
 
+Local preprod uses the fixed domain `aigw.internal`. It creates its own test
+root CA, Samba AD over LDAPS, WIF provider mock, static users, and labeled
+Docker networks and volumes. It is localhost-only and does not run the Rocky
+host-hardening roles.
 
-The repository contains an implemented base Compose stack of 25 services — one
-`volume-init` one-shot DHI volume initializer plus 23 long-running services —
-using 18 of the 20 segmented Docker bridges that Ansible pre-creates. The
-lab overlay adds two long-running services: Samba AD on the isolated
-identity bridge and an authoritative, non-recursive CoreDNS service on a
-dedicated bridge. Samba publishes no AD port; lab DNS publishes TCP/UDP 53 only
-on the exact ADM and internal host addresses, never egress. Samba is lab-only
-and is never a customer directory.
+Production uses the domain, IP addresses, directory, certificates, and secret
+custody values from a generated inventory. Ansible validates the live host
+before it changes anything.
 
-An external customer Active Directory is supported for production over LDAPS
-only, driven entirely by inventory (`identity_ldap_*`) and off by default. It
-is mutually exclusive with the lab Samba overlay. Plaintext `ldap://` is
-refused by the controller preflight, `site.yml`, `docker_stack`, and the
-key-rotator's own settings. The bind credential is stored by the stdin-only
-`scripts/store-identity-ldap-bind-password.py` into a dedicated encrypted
-overlay and reaches the stack only as a root-owned file bind-mounted into
-key-rotator — never Compose environment, argv, logs, or `.env`. The
-inventory-supplied public CA bundle is validated (certificates-only) before it
-becomes Keycloak's LDAPS trust anchor, and hostname verification stays on. The
-provider is created READ_ONLY with `syncRegistrations=false` only after
-Keycloak proves the connection and the bind credential, so a wrong CA, a
-certificate that fails hostname verification, or wrong credentials leave no
-component behind. Reaching the directory over a physical NIC opens exactly one
-firewall allowance — Keycloak's fixed address to the directory's `/32` on
-tcp/636 — in both DOCKER-USER and the independent nftables `aigw_guard`;
-toggling `identity_ldap_enabled` therefore changes the firewall ABI and
-requires a full `site.yml`, not `deploy-stack-only.yml`. End-to-end behavior
-against a real directory (wrong CA, wrong hostname, wrong bind credentials,
-happy-path import) still requires validation on a directory-equipped
-environment; it is fixture- and unit-validated today. Those open claims are
-enumerated — never simulated — in `LIVE_VERIFICATION_REQUIRED` in
-`scripts/tests/test_identity_ldap_contract.py`, each with the exact live check
-that closes it.
+## Implemented in the current source
 
-Docker Hardened Images (DHI) are used directly or as the final build stage for
-every catalog-supported component that passed compatibility and security review;
-shellless DHI runtimes embed a static health-probe binary. Three non-DHI
-application exceptions remain — upstream LiteLLM 1.91.3, upstream Open WebUI
-0.10.2, and the lab-only Debian Samba build. Traefik is a reviewed DHI
-derivative that carries the upstream 3.7.7 security binary on the non-root DHI
-runtime. Every source is exact tag-and-digest pinned; the rationale and
-re-evaluation rules are in the [solution map](solution-map.md).
+- `scripts/bootstrap-rocky9-production.py` has a guided terminal setup and a
+  complete non-interactive example. Its older `generic-rocky9` names remain
+  compatibility aliases.
+- `ansible/preprod.yml` creates and verifies local preprod. The matching
+  destroy playbook removes only resources with the exact `aigw-preprod`
+  namespace and ownership labels.
+- Preprod models egress, ADM, and internal planes with separate Docker
+  networks. Public test traffic binds only to `127.0.2.1` and `127.0.3.1`.
+- Keycloak URLs, redirect URIs, web origins, logout URLs, and WIF issuer URLs
+  come from the selected deployment domain. Existing realms are reconciled;
+  changing a realm JSON file alone is not treated as an update.
+- When LDAPS is enabled, Ansible mounts the bind password from its protected
+  file and automatically configures and verifies federation, durable identity
+  control, OIDC clients, the break-glass account, and temporary-admin cleanup.
+  The admin portal has no user-run initialization step.
+- `scripts/update-images.py` joins the image release steps: fetch exact pins,
+  build custom images, create an offline seed, test that seed in local
+  preprod, stage it for a remote host, deploy with Ansible, validate, and roll
+  back on failure.
+- Offline seed mode verifies image IDs, removes Compose build sections, and
+  sets `pull_policy: never` before startup. The source-tag materialization
+  workaround is still available as
+  `--materialize-missing-source-tags`.
+- Production keeps its host firewall, routing, SELinux, encrypted-state,
+  backup, Vault, and segmented-network checks. Local preprod does not weaken
+  those production checks.
 
-The current source also enforces the SELinux fail-closed contract, bind-source
-HMAC recreation digests, per-service rollback retention, and least-privilege
-Alloy ACL reconciliation described in [operations](operations.md).
+## Verified so far
 
-## Verification completed
+The current workspace has source and contract coverage for Compose rendering,
+production and preprod Ansible syntax, identity policy, portal and key-rotator
+behavior, offline seed planning and loading, update rollback rules, the Go
+services, and shell scripts.
 
-The current security-audit workspace has passed local Compose render, Ansible
-syntax/configuration, runtime-start, service-unit, ARM64 Samba/Keycloak, and
-disposable age-encrypted backup/restore tests.
+Local safety checks have also proved that preprod network creation and removal
+leave unrelated Docker projects alone. The Samba image tests prove that its
+test passwords do not appear in process arguments and that the lockout policy
+survives a restart.
 
-The most recent full three-NIC lab converge passed clean
-(`failed=0`), with all long-running services healthy and `volume-init` exited
-zero. Live checks proved the key-only, no-forwarding SSH policy and fresh sudo
-path, the full PostgreSQL privilege matrix, the stable Open WebUI signing
-secret, and the exact scoped Open WebUI workload key — model/route scope,
-management denial, hash-only database storage, and absence from project logs. A
-forced Open WebUI recreate returned healthy; the admin, developer,
-ordinary-user, and removed-user identity flows passed; the portal one-time-key
-lifecycle (standard and concurrent) retained no plaintext; and a fresh encrypted
-backup passed receipt, hash, age, and the complete non-destructive
-hostile-archive parser.
+These checks are useful, but they are not the final release proof described in
+the [acceptance runbook](test-runbook.md).
 
-In the active destructive-recovery rehearsal, the predecessor lab VM was
-verified off-box and deliberately deleted, and a genuinely new vanilla Rocky 9.8
-VM passed gates G2 through G6: topology and access; the host boundary before any
-state (empty `public` zone, one default route, the exact policy rules, and Vault
-correctly uninitialized and sealed pre-restore); offline restore and old-share
-unseal; durable persistence, identity/OIDC/LDAPS, portal key lifecycle,
-infrastructure/observability, secret-scan, and negative network lanes; and a
-synthetic four-span Alloy/Tempo/Cribl telemetry correlation batch with zero
-drops. A controlled host reboot also passed: the boot firewall guard loaded
-before Docker, the exact container/image/volume/network inventory survived,
-`volume-init` did not re-run, and Vault returned sealed by design and accepted
-exactly one stdin-only lab unseal.
+## Open release gates
 
-See the [rehearsal register](archive/lab-dr-rehearsal.md) for exact per-gate figures.
+- **Seeded preprod:** the exact ARM64 schema-v2 release seed has been built.
+  Load its preprod archive into a clean local Docker engine and start preprod
+  from those exact image IDs. Run the full browser/OIDC, LDAPS, WIF, portal,
+  chat, admin-gate, validation, and local rollback checks. Do not create a
+  Rocky or Parallels test VM for this gate.
+- **Production upgrade:** promote only the production-scoped release after the
+  seeded local test passes. During the approved production maintenance window,
+  make a fresh backup, deploy through Ansible, validate the real host, and keep
+  the previous source, images, and state ready for rollback. Do not force a
+  failure on the production host merely to create test evidence.
+- **Production ceremonies:** customer TLS, external LDAPS, Vault
+  initialization and custody, Anthropic enrollment, backups, and final access
+  approval remain operator-owned work.
+- **Cribl SOC feed:** the source now has a log-only Alloy queue, a reviewed
+  Keycloak event list, request-audit conversion, and bounded structured-event
+  classifiers. The release still needs a seeded-preprod receipt test for every
+  approved class and proof that denied metrics, traces, alerts, malformed
+  records, and ordinary logs do not arrive. Any required event without a
+  structured producer remains open. See the
+  [logging-team handoff](cribl-soc-handoff.md).
+- **Security and version review:** the full source/container Trivy audit,
+  production-sized PostgreSQL 18 migration rehearsal, and complete
+  DHI/upstream version review are tracked in the
+  [repository task list](../TASKS.md).
+  PostgreSQL 18.4 is stable and operator-selected. Exact DHI 17.10 and 18.4
+  both passed the bounded application and restore comparison; seeded preprod
+  and production-sized evidence are still required.
+- **High availability:** there is no HA in the Docker Compose design. See the
+  [HA posture](high-availability.md).
+- **Repository history:** the active tree blocks prohibited customer and
+  personal identifiers. Removing old commit metadata or changing repository
+  ownership needs a separate owner-approved history plan.
 
-## Open items before production and access reopening
-
-The following are explicitly **not yet closed**:
-
-- **G7 and access reopening — PENDING.** Marker removal and access reopening
-  remain pending in the rehearsal register. The SELinux/MCS, bind-recreation,
-  rollback-retention, Vault-readiness, and ACL changes in the current source are
-  source-validated only and still require the final controlled converge and
-  runtime proof.
-- **Real Anthropic inference — PROVEN IN THE LAB (2026-07-16), production
-  enrollment still customer-owned.** The lab executed the real WIF exchange
-  and end-to-end LiteLLM inference against api.anthropic.com (both API
-  shapes, re-proven across a scheduled rotation and a token expiry;
-  `scripts/test-wif-inference.py`). A production deployment still requires
-  the customer's own Console enrollment; see
-  [Anthropic WIF bootstrap](anthropic-wif-bootstrap.md).
-- **Upgrade durability — audited, rehearsals pending.** A per-service audit
-  of what an image bump preserves versus destroys (ranked risks, restore
-  ordering, Blue/Green tiering) is recorded in the
-  [upgrade durability audit](research/upgrade-durability-audit-20260716.md);
-  items it marks [REHEARSE] rest on upstream behavior and need live
-  rehearsal before being relied on.
-- **Key-rotator sealed-start retry — PROVEN LIVE (2026-07-16).** A genuine VM
-  reboot produced a real sealed window: for its full duration the zero-interval
-  startup jobs deferred every 30 s ("Vault not ready; deferred without
-  driver/audit attempt") without being consumed, the 15 s presence-reconcile
-  failed non-terminally with operator ALERTs, the converge auto-unseal ended
-  the window, the vendor credential re-minted within one reconcile tick, and
-  end-to-end WIF inference passed in both API shapes immediately after.
-- **Alloy ACL and rollback-retention live gates — PENDING.** The parent/child
-  ACL reconciliation and the content-addressed rollback-retention helper pass
-  source tests but have not completed the controlled live deploy and the
-  Docker-daemon plus long-running-service restart gates. The garbage-collected
-  predecessor key-rotator image has been recovered under an immutable rollback
-  reference; this closes only the image-recovery prerequisite.
-- **Vault production hardening.** The lab/test bootstrap (1-of-1 unseal, file
-  backend, internal test root, plaintext listener on `net-vault`) must be
-  replaced with the controls in the [deployment](deploy-guide.md) and
-  [operations](operations.md) guides.
-- **First administrator provisioning.** A generic deployment requires one
-  pre-existing `aigw` realm user mapped to `aigw-admins` through a controlled
-  Keycloak or customer-IdP procedure. Only the lab seeds disposable
-  `testadmin`, which must be removed after the Samba `lab-admin` handoff is
-  proved.
-- **High availability.** There is no HA today, and HA is not pursued on
-  Docker Compose: the VM scales vertically, and horizontal scaling/HA would be
-  a separate Kubernetes design. A Blue/Green two-VM upgrade path behind an HA
-  proxy is recorded as a future planning exercise. See the
-  [scaling and HA posture](high-availability.md).
-
-These residuals are not waived by any local or recovery test. Rehearse stateful
-upgrades and restore, and run the full [acceptance test runbook](test-runbook.md)
-before production use.
+Do not reopen production access until every required section in the
+[acceptance runbook](test-runbook.md) has dated evidence and an owner has
+accepted every remaining risk.

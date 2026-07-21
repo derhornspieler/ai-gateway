@@ -11,14 +11,10 @@
 # This example just documents the canonical structure the generator emits.
 #
 # 'production_rocky9' is the canonical group; it is a child of the DEPRECATED
-# compatibility group 'generic_rocky9', so both the site.yml play pattern
-# (gateway:generic_rocky9) and the shared preflight (hosts: generic_rocky9)
-# select a production host with zero duplication. Do NOT make it a child of
-# 'gateway': that name selects the committed lab-only Vault overlay.
+# compatibility group 'generic_rocky9', so both site.yml and the shared
+# preflight select a production host with zero duplication.
 all:
   children:
-    gateway:
-      hosts: {}
     generic_rocky9:
       children:
         production_rocky9:

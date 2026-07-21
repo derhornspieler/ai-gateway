@@ -3,8 +3,8 @@
 > **IMPLEMENTED:** see `Dockerfile`, `requirements.txt`, and `app/` in this
 > directory for the running service (FastAPI + APScheduler + hvac + psycopg,
 > OTel-instrumented). Drivers: `app/drivers/anthropic_wif.py` (WIF from
-> Keycloak), `app/drivers/openai_svcacct.py` (blue/green service accounts),
-> `app/drivers/static_seed.py` (static-key bootstrap for local/dev testing).
+> Keycloak) and `app/drivers/static_seed.py` (Anthropic static-key bootstrap
+> for local/dev testing).
 > The design docs below remain the source of truth for *why*; the code
 > implements the v5 design from `docs/solution-map.md` §1.7 and
 > `docs/anthropic-wif-bootstrap.md`.
@@ -26,35 +26,30 @@
   `org:admin` token which the inference broker must not receive. After the
   human update, record the exact approved hash as
   `federation_jwks_sha256` in the `ai-gateway/anthropic-wif` Vault doc.
-- `OPENAI_ORPHAN_CLEANUP_INTERVAL_SECONDS` (default 3600): retries
-  delete/revocation-verification of service accounts orphaned by a
-  partially-failed rotation.
-
 The service also exposes the authenticated identity-administration controller
 used by the admin portal. It bootstraps a least-privilege Keycloak controller,
 manages the `aigw-managed` group tree, assigns existing Keycloak/federated
 users to capability groups, invalidates affected sessions, and protects the
-last managed administrator. In the explicit lab profile it also
-configures the bounded Samba AD LDAP provider; generic deployments leave that
-lab integration disabled.
+last managed administrator. When external LDAP is enabled, it also configures
+the bounded read-only directory provider; deployments with LDAP disabled leave
+that integration absent.
 
 ## Rotation cycle (per vendor, on schedule + on-demand)
 
 1. Authenticate through the configured implemented driver:
    - **Anthropic**: Keycloak `private_key_jwt` exchange for short-lived WIF
      tokens; JWKS drift is detected and requires explicit operator approval.
-   - **OpenAI**: project service-account blue/green rotation using the
-     organization admin credential stored in Vault, with durable recovery of
-     ambiguous/partial promotion and revocation state.
-   - **Static seed drivers**: explicit local/bootstrap path only.
+   - **Static Anthropic seed**: explicit local/bootstrap path only.
 2. Canary-verify new key **through envoy-egress** (pinned path).
 3. Update LiteLLM credential (credentials API / DB) — hot reload, no restart.
 4. Grace window, then revoke/deactivate old key.
-5. Emit OTel span + audit event per rotation (→ Cribl).
+5. Emit local OTel evidence plus a sanitized, structured rotation security
+   event. Only that reviewed event may enter the Cribl SOC log feed; the raw
+   span and ordinary service logs stay local.
 
 ## Non-goals
 
 The service does not rotate LiteLLM virtual keys (the developer portal owns
 that lifecycle), invent unsupported vendor APIs, or provide a generic
-SOPS/OpenBao adapter. Vault CE KV v2 and the implemented Anthropic, OpenAI,
-and static bootstrap drivers are the supported scope.
+SOPS/OpenBao adapter. Vault CE KV v2, Anthropic WIF, and the static Anthropic
+bootstrap driver are the supported scope. OpenAI is not a registered provider.

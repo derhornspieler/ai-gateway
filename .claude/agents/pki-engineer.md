@@ -11,6 +11,6 @@ Operating rules:
 - Never design a flow that requests, transports, or stores a customer's root signing key. Intermediate CSR ceremonies only.
 - Validate certificates with openssl primitives, not string matching: pubkey modulus comparison for key↔leaf match, `openssl verify` with an explicit untrusted chain for path validation, exact SAN set checks (wildcard + apex), EKU serverAuth, basicConstraints, notBefore/notAfter windows with clock-skew margin.
 - Private keys: 0600, root-owned, non-symlink, single hardlink, never in git, never in argv/env/logs. Validation happens BEFORE any mutation.
-- Production verification must reject placeholder/self-signed chains; the lab's test PKI (vault-bootstrap.sh) is explicitly lab-only.
+- Production verification must reject placeholder or self-signed chains. Local preprod uses only its generated, explicitly test-only root CA and never reuses that trust outside preprod.
 - Separate trust domains stay separate: the edge CA does not implicitly sign Cribl export or LDAPS trust — each gets its own pinned bundle.
 - Follow the repo's contract-test discipline for everything you add (see CLAUDE.md).

@@ -4,22 +4,6 @@
 # configuration and a host can retain nft/DOCKER-USER state after a previous
 # service; neither may be implicitly claimed by the AI Gateway converge.
 
-- name: Preflight — derive the exact fail-closed Rocky 9 lab reset handoff
-  ansible.builtin.set_fact:
-    aigw_lab_reset_handoff_drop_bindings: >-
-      {{
-        [
-          {'interface': nic_egress, 'zone': 'aigw-egress'},
-          {'interface': nic_internal, 'zone': 'aigw-internal'}
-        ]
-        if (
-          (deployment_profile | default('')) == 'rocky9-lab'
-          and (aigw_lab_reset_handoff_drop_interfaces | default([]) | length) == 2
-          and (aigw_lab_reset_handoff_drop_interfaces | default([]) | sort) == ([nic_egress, nic_internal] | sort)
-        )
-        else []
-      }}
-
 - name: Preflight — establish firewalld, NetworkManager, and packet-filter ownership before host mutation
   ansible.builtin.command:
     argv:
@@ -41,38 +25,12 @@
         has_marker = sys.argv[2] == "true"
         has_valid_pending_marker = sys.argv[3] == "true"
         firewall_adoption = sys.argv[4] == "true"
-        reset_drop_bindings = json.loads(sys.argv[5])
         managed_zones = {entry["zone"] for entry in zones}
         interfaces = {
             interface: entry["zone"]
             for entry in zones
             for interface in entry.get("interfaces", [])
         }
-        if (
-            not isinstance(reset_drop_bindings, list)
-            or any(
-                not isinstance(entry, dict)
-                or set(entry) != {"interface", "zone"}
-                or not isinstance(entry["interface"], str)
-                or not isinstance(entry["zone"], str)
-                for entry in reset_drop_bindings
-            )
-        ):
-            raise SystemExit("invalid lab reset drop-zone handoff contract")
-        allowed_reset_drop_bindings = {
-            (entry["interface"], entry["zone"])
-            for entry in reset_drop_bindings
-        }
-        expected_reset_drop_bindings = {
-            (interface, zone)
-            for interface, zone in interfaces.items()
-            if zone in {"aigw-egress", "aigw-internal"}
-        }
-        if allowed_reset_drop_bindings and (
-            allowed_reset_drop_bindings != expected_reset_drop_bindings
-            or len(allowed_reset_drop_bindings) != 2
-        ):
-            raise SystemExit("lab reset drop-zone handoff does not match reviewed interfaces")
         errors = []
 
         def run(command, allowed=(0,)):
@@ -650,11 +608,7 @@
                     ["nmcli", "--get-values", "connection.zone", "connection", "show", "uuid", uuid],
                 )
                 saved_zone = saved_zone.strip()
-                is_reset_drop_handoff = (
-                    saved_zone == "drop"
-                    and (interface, expected_zone) in allowed_reset_drop_bindings
-                )
-                if saved_zone not in {"", "public", expected_zone} and not is_reset_drop_handoff:
+                if saved_zone not in {"", "public", expected_zone}:
                     unowned(
                         f"{interface} persists unowned NetworkManager zone {saved_zone!r}"
                     )
@@ -664,11 +618,7 @@
                         allowed=(0, 1),
                     )
                     runtime_zone = runtime_zone.strip()
-                    is_reset_drop_handoff = (
-                        runtime_zone == "drop"
-                        and (interface, expected_zone) in allowed_reset_drop_bindings
-                    )
-                    if runtime_zone not in {"", "no zone", "public", expected_zone} and not is_reset_drop_handoff:
+                    if runtime_zone not in {"", "no zone", "public", expected_zone}:
                         unowned(
                             f"{interface} is assigned to unowned runtime zone {runtime_zone!r}"
                         )
@@ -699,7 +649,6 @@
       - "{{ 'true' if (aigw_host_marker_stat.exists | default(false)) else 'false' }}"
       - "{{ 'true' if (aigw_host_pending_marker_valid | default(false) | bool) else 'false' }}"
       - "{{ 'true' if (aigw_adopt_firewalld_state | bool) else 'false' }}"
-      - "{{ aigw_lab_reset_handoff_drop_bindings | to_json }}"
   environment:
     LC_ALL: C
   changed_when: false

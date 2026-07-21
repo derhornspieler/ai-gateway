@@ -104,10 +104,8 @@
     - name: Preflight — validate external directory inputs without emitting values
       ansible.builtin.assert:
         that:
-          - not (samba_lab_enabled | default(false) | bool)
           - 'identity_ldap_url is match("^ldaps://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+(?::636)?$")'
           - 'identity_ldap_provider_name is match("^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")'
-          - identity_ldap_provider_name != 'lab-samba-ad'
           - identity_ldap_users_dn | length <= 512
           - identity_ldap_bind_dn | length <= 512
           - 'identity_ldap_users_dn is match("(?i)^(CN|OU)=")'
@@ -323,26 +321,12 @@
           }}
       changed_when: false
 
-    - name: Preflight — reject lab-only feature paths from generic inventory
+    - name: Preflight — reject unsafe production feature options
       ansible.builtin.set_fact:
-        aigw_generic_forbidden_lab_options: >-
+        aigw_generic_forbidden_options: >-
           {{
-            ([] if not (samba_lab_enabled | default(false) | bool)
-             else ['samba_lab_enabled']) +
             ([] if not (aigw_seed_test_users | default(false) | bool)
              else ['aigw_seed_test_users']) +
-            ([] if not (retain_bootstrap_admin_user | default(false) | bool)
-             else ['retain_bootstrap_admin_user']) +
-            ([] if not (aigw_prebootstrap_oidc_scope_reconciliation | default(false) | bool)
-             else ['aigw_prebootstrap_oidc_scope_reconciliation']) +
-            ([] if not (aigw_prebootstrap_oidc_scope_reconciliation_ack | default('') | length > 0)
-             else ['aigw_prebootstrap_oidc_scope_reconciliation_ack']) +
-            ([] if not (aigw_ssh_password_authentication | default(false) | bool)
-             else ['aigw_ssh_password_authentication']) +
-            ([] if not (aigw_adm_socks_enabled | default(false) | bool)
-             else ['aigw_adm_socks_enabled']) +
-            ([] if (aigw_lab_reset_handoff_drop_interfaces | default([]) | length == 0)
-             else ['aigw_lab_reset_handoff_drop_interfaces']) +
             ([] if (require_encrypted_state | default(true) | bool)
              else ['require_encrypted_state=false'])
           }}
@@ -531,7 +515,7 @@
           - aigw_generic_missing_secret_keys | length == 0
           - aigw_generic_invalid_secret_keys | length == 0
           - aigw_generic_duplicate_secret_boundaries | length == 0
-          - aigw_generic_forbidden_lab_options | length == 0
+          - aigw_generic_forbidden_options | length == 0
           - aigw_generic_invalid_edge_tls | length == 0
           - aigw_generic_missing_identity_ldap | length == 0
           - aigw_generic_invalid_identity_ldap | length == 0
@@ -548,7 +532,7 @@
             'missing_secret': aigw_generic_missing_secret_keys,
             'invalid_secret': aigw_generic_invalid_secret_keys,
             'duplicate_secret_boundaries': aigw_generic_duplicate_secret_boundaries,
-            'forbidden_lab_options': aigw_generic_forbidden_lab_options,
+            'forbidden_options': aigw_generic_forbidden_options,
             'invalid_edge_tls': aigw_generic_invalid_edge_tls,
             'missing_identity_ldap': aigw_generic_missing_identity_ldap,
             'invalid_identity_ldap': aigw_generic_invalid_identity_ldap

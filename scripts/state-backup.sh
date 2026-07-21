@@ -35,7 +35,7 @@ for command in age age-inspect docker findmnt sha256sum tar python3; do
 done
 
 # A copy on the same block filesystem is not disaster recovery. The explicit
-# override exists only for disposable lab validation.
+# override exists only for a deliberate, non-production restore rehearsal.
 stack_device="$(findmnt -n -o MAJ:MIN -T "$STACK_DIR")"
 output_device="$(findmnt -n -o MAJ:MIN -T "$(dirname "$output")")"
 if [[ "$stack_device" == "$output_device" ]] &&
@@ -125,11 +125,20 @@ for database in litellm keycloak rotator; do
     < "$staging/postgres/${database}.dump" >/dev/null
 done
 pg_version="$("${compose[@]}" exec -T postgres psql -U postgres -d postgres -Atqc 'show server_version')"
+# This value does not reveal application data. The PostgreSQL 18 migration
+# compares it after stopping writers. A mismatch means the source changed
+# after this backup, so the migration refuses a stale logical snapshot.
+pg_next_xid="$("${compose[@]}" exec -T postgres psql -U postgres -d postgres -Atqc \
+  'SELECT next_xid FROM pg_control_checkpoint()')"
+[[ "$pg_next_xid" =~ ^[0-9]+:[0-9]+$ ]] || {
+  echo "PostgreSQL returned a malformed next_xid checkpoint value" >&2
+  exit 1
+}
 "${compose[@]}" stop -t 60 postgres >/dev/null
 
 allowed_volumes=(
   pg_data openwebui_data vault_data vault_audit alloy_data prom_data
-  loki_data grafana_data samba_ad_config samba_ad_state samba_ad_public
+  loki_data grafana_data
 )
 archived_volumes=()
 for logical in "${allowed_volumes[@]}"; do
@@ -161,7 +170,6 @@ done
   exit 1
 }
 config_items=(docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana keycloak litellm loki postgres prometheus traefik services scripts certs)
-[[ ! -f docker-compose.lab.yml ]] || config_items+=(docker-compose.lab.yml)
 [[ ! -d secrets ]] || config_items+=(secrets)
 tar --numeric-owner --exclude='.state' --exclude='.state-backup.*' \
   -czf "$staging/stack-config.tar.gz" "${config_items[@]}"
@@ -169,6 +177,7 @@ tar -tzf "$staging/stack-config.tar.gz" >/dev/null
 
 export AIGW_BACKUP_STAGING="$staging" AIGW_BACKUP_PROJECT="$PROJECT"
 export AIGW_BACKUP_PG_VERSION="$pg_version"
+export AIGW_BACKUP_PG_NEXT_XID="$pg_next_xid"
 AIGW_BACKUP_VOLUMES="$(printf '%s\n' "${archived_volumes[@]}")"
 export AIGW_BACKUP_VOLUMES
 export AIGW_BACKUP_DEPLOYMENT_PROFILE="$deployment_profile"
@@ -184,6 +193,7 @@ manifest = {
     "project": os.environ["AIGW_BACKUP_PROJECT"],
     "deployment_profile": os.environ["AIGW_BACKUP_DEPLOYMENT_PROFILE"],
     "postgres_version": os.environ["AIGW_BACKUP_PG_VERSION"],
+    "postgres_next_xid": os.environ["AIGW_BACKUP_PG_NEXT_XID"],
     "volumes": [v for v in os.environ.get("AIGW_BACKUP_VOLUMES", "").splitlines() if v],
     "running_services": (root / "running-services.txt").read_text().splitlines(),
     "images": subprocess.run(

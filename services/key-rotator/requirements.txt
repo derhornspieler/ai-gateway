@@ -1,7 +1,7 @@
 # Direct dependencies are exact-pinned. requirements.lock resolves and
 # hash-pins the complete transitive graph used by the container build.
 
-fastapi==0.139.0
+fastapi==0.139.2
 uvicorn[standard]==0.51.0
 httpx==0.28.1
 apscheduler==3.11.3
@@ -17,7 +17,7 @@ psycopg[binary]==3.3.4
 PyJWT[crypto]==2.13.0
 cryptography==49.0.0
 
-opentelemetry-api==1.43.0
-opentelemetry-sdk==1.43.0
-opentelemetry-exporter-otlp-proto-http==1.43.0
-opentelemetry-instrumentation-fastapi==0.64b0
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-instrumentation-fastapi==0.65b0

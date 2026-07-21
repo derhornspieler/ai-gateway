@@ -32,11 +32,10 @@ complete, up-front list of every secret this deployment needs, so nothing
 surprises you halfway through.
 
 The important message first: **almost every secret is generated for you.** The
-one command in [Part 3](#part-3--generate-your-deployment-folder-5-minutes)
-creates all 27 stack secrets — database passwords, signing keys, OIDC client
-secrets, and the rest — randomly, and writes them **already encrypted** into
-your inventory. You never invent, type, or paste any of them. Only a short,
-known list is yours to supply, and it is all laid out below.
+command in [Part 3](#part-3--generate-your-deployment-folder-5-minutes) creates
+all 27 stack secrets. This includes database passwords, signing keys, and OIDC
+client secrets. It writes them to your inventory in encrypted form. You never
+invent, type, or paste them. The short list you must supply appears below.
 
 > **A "secret" here means a value stored inside the encrypted inventory (the
 > vault overlay).** An *inline-encrypted overlay* is a small file where each
@@ -72,12 +71,12 @@ never see them, type them, or store them in plain text. Grouped by purpose:
 | Internal service tokens | `rotator_internal_token`, `portal_identity_token` | 2 |
 | Grafana break-glass password | `grafana_admin_password` | 1 |
 
-The complete, authoritative list is `required_secret_keys` in
+The complete list is `required_secret_keys` in
 `ansible/generic-rocky9-contract.json`. **Nothing in this table is an operator
-input.** If you ever need to *change* one later, edit the overlay in place (see
-the "You need to change a secret later" row under
-[Troubleshooting](#troubleshooting-quick-reference)) — you still never generate
-it by hand on the first deploy.
+input.** To change a value later, edit the overlay in place. See the "You need
+to change a secret later" row under
+[Troubleshooting](#troubleshooting-quick-reference). Do not generate these
+values by hand on the first deploy.
 
 > **Not a stack secret, but yours to keep:** the master **vault password** you
 > create in [Part 2](#part-2--prepare-the-controller-10-minutes)
@@ -92,13 +91,13 @@ Everything below is something the bootstrap does **not** generate.
 #### 2a. `vault_unseal_key` — always required (done in Part 7)
 
 This is the **only unconditional operator secret**. It comes from the one-time
-`vault operator init` ceremony, so it **cannot exist until after your first
-converge** — the automation deliberately lets the first `site.yml` run finish
-with Vault still uninitialized (that "waits only for core services" notice at
-the end of [Part 6](#part-6--run-the-converge-3090-minutes) is expected, not an
-error). You then initialize Vault and store its unseal key with the stdin-only
-helper into a **dedicated sibling overlay** — never `group_vars/all.yml`, which
-a contract test forbids.
+`vault operator init` ceremony, so it cannot exist before the first converge.
+The first `site.yml` run leaves Vault uninitialized on purpose. The "waits only
+for core services" notice at the end of
+[Part 6](#part-6--run-the-converge-3090-minutes) is expected. After you
+initialize Vault, use the stdin-only helper to store its unseal key in a
+**dedicated sibling overlay**. Never put it in `group_vars/all.yml`; a contract
+test forbids that location.
 
 - **Helper:** `scripts/store-vault-unseal-key.py` — reads the key from stdin
   only, refuses a terminal, and will not overwrite an existing key.
@@ -193,13 +192,13 @@ stored.
   with `scripts/anthropic-wif-enroll.py`. It needs a short-lived `org:admin`
   OAuth bearer piped on stdin, which it holds only in memory and never stores.
 
-#### Lab profile only
+#### 2e. Cribl SOC connection — optional
 
-The disposable `rocky9-lab` profile additionally seeds five throwaway Samba
-directory passwords (`samba_*`). **These do not apply to a production
-deployment** — the customer profile has no Samba directory.
-
----
+Do not point Alloy at a real Cribl worker until the logging and gateway teams
+complete the [Cribl SOC logging handoff](cribl-soc-handoff.md). You need the
+worker IP, TCP `4317`, TLS server name, dedicated CA bundle, exact destination
+`/32`, 24-hour Cribl retention proof, and receipt-test evidence. The feed is
+logs only. Raw traces, metrics, alerts, and ordinary service logs stay local.
 
 ## Part 1 — Check the target VM (10 minutes)
 
@@ -414,11 +413,14 @@ ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
   --vault-id mygateway@~/.aigw-vault-pass
 ```
 
-What happens, in order: safety checks on the host → clock verification →
-SELinux verification → network policy routing → firewall zones and packet
-rules → OS packages, Docker, and SSH hardening → 20 isolated container
-networks → configuration rendering, image builds, and container start →
-verification of everything it just did.
+The converge runs these stages in order:
+
+1. host safety, clock, and SELinux checks;
+2. network routes, firewall zones, and packet rules;
+3. OS packages, Docker, and SSH hardening;
+4. the 20 isolated container networks;
+5. configuration, image builds, and container startup; and
+6. final verification.
 
 ### The three playbooks — which one do I run?
 
@@ -466,36 +468,22 @@ Two rules keep this safe, and the playbooks enforce both for you:
 
 ## Part 7 — Initialize the secrets vault and hand its key to the controller (15 minutes)
 
-Vault (the built-in secrets safe) starts empty and sealed. You now do three
-things in order: (7a) initialize Vault once on the VM, (7b) give the
-controller an encrypted copy of Vault's unlock key, (7c) hand Vault your
-intermediate CA if your edge TLS mode needs it, and (7d) run the converge
-again so the automation can unlock Vault and finish.
+Vault (the built-in secrets safe) starts empty and sealed. Do these four steps
+in order:
 
-**Step 7a — Initialize Vault on the VM.** Log in to the VM (first time you
-actually need to) and run the bootstrap:
+1. initialize Vault once on the VM;
+2. give the controller an encrypted copy of Vault's unlock key;
+3. give Vault the intermediate CA when your edge TLS mode needs it; and
+4. run the converge again so the automation can unlock Vault and finish.
 
-```bash
-ssh <ansible_user>@<vm>
-cd /opt/ai-gateway
-sudo AIGW_ALLOW_INSECURE_VAULT_BOOTSTRAP=I_UNDERSTAND_THIS_IS_LAB_ONLY \
-  scripts/vault-bootstrap.sh
-```
-
-> **Important:** this is the built-in **lab/test** Vault ceremony — one
-> unseal key, no TLS on the internal listener. The acknowledgement variable is
-> required because this pilot uses the customer `rocky9-production` profile, and
-> the script refuses to run on that profile without it. It is acceptable for a
-> pilot; a production deployment replaces this whole step with the customer's
-> reviewed Vault ceremony (see [operations](operations.md)), driven by the
-> [`production-rocky9.first-init.sh.example`](../ansible/inventory/examples/production-rocky9.first-init.sh.example)
-> sequence.
-
-The script initializes Vault, sets up the credential-rotation policies, and
-then waits (up to 10 minutes) for the entire service graph to become
-healthy. It prints one **unseal key** (a 44-character string ending in `=`)
-and one **root token**. **Securely store both** — a password manager or paper,
-never a shared drive. Anyone with them controls the gateway's secrets.
+**Step 7a — Initialize Vault through the reviewed operator ceremony.** Follow
+the organization-approved production ceremony to initialize and unseal Vault,
+distribute recovery material to its custodians, and retain the unseal share that
+the controller will encrypt in Step 7b. Do not use an automated test initializer
+on a production target. The executable controller-side handoff is
+[`production-rocky9.first-init.sh.example`](../ansible/inventory/examples/production-rocky9.first-init.sh.example).
+Securely custody every recovery share and the initial root token according to
+that ceremony; anyone with them controls the gateway's secrets.
 
 **Step 7b — Give the controller an encrypted copy of the unseal key.** Back on
 the controller, store the unseal key in a dedicated encrypted file so the
@@ -586,20 +574,16 @@ ansible-playbook -i ansible/inventory/generated/mygateway/hosts.yml \
 > initialized Vault needs `vault_unseal_key` from the controller — it refuses
 > to finish a half-unlocked system. Do Step 7b, then rerun.
 
-The whole 7a → 7b → 7c → 7d sequence is also captured, ready to copy, in
-[`rocky9-lab.first-init.sh.example`](../ansible/inventory/examples/rocky9-lab.first-init.sh.example)
-(disposable lab, which pipes the share straight from the bootstrap without
-printing it) and
-[`production-rocky9.first-init.sh.example`](../ansible/inventory/examples/production-rocky9.first-init.sh.example)
-(reviewed production ceremony).
+The controller-side 7b → 7d handoff is captured in
+[`production-rocky9.first-init.sh.example`](../ansible/inventory/examples/production-rocky9.first-init.sh.example).
 
 ## Part 8 — First administrator and sign-off (15 minutes)
 
 1. Connect your directory and create the first administrator following
    [identity operations](identity-operations.md) — the short version: a
    Keycloak/directory procedure grants one named person the `aigw-admins`
-   role, and that person then presses **Initialize identity control** in the
-   admin portal at `https://admin.<domain>`.
+   role. Ansible has already configured and verified the LDAPS federation and
+   durable identity controller; there is no admin-portal initialization step.
 2. From an administrator machine (on the ADM network), open
    `https://admin.<domain>` and `https://grafana.<domain>` — both should
    redirect you to a login page and let the administrator in. In Grafana, the

@@ -3,8 +3,10 @@ from __future__ import annotations
 import http.cookiejar
 import importlib.util
 from pathlib import Path
+import socket
 import sys
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,7 +37,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
             observed,
             {
                 "litellm-admin": (
-                    "litellm-admin.aigw.aegisgroup.ch",
+                    "litellm-admin.aigw.internal",
                     "/oauth2/start",
                     "/oauth2/callback",
                     "/ui",
@@ -43,7 +45,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
                     "_aigw_litellm_admin_oauth",
                 ),
                 "grafana": (
-                    "grafana.aigw.aegisgroup.ch",
+                    "grafana.aigw.internal",
                     "/oauth2/start",
                     "/oauth2/callback",
                     "/",
@@ -51,7 +53,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
                     "_aigw_grafana_oauth",
                 ),
                 "prometheus": (
-                    "prometheus.aigw.aegisgroup.ch",
+                    "prometheus.aigw.internal",
                     "/oauth2/start",
                     "/oauth2/callback",
                     "/",
@@ -59,7 +61,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
                     "_aigw_prometheus_oauth",
                 ),
                 "vault": (
-                    "vault.aigw.aegisgroup.ch",
+                    "vault.aigw.internal",
                     "/oauth2/start",
                     "/oauth2/callback",
                     "/ui/",
@@ -67,7 +69,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
                     "_aigw_vault_oauth",
                 ),
                 "chat": (
-                    "chat.aigw.aegisgroup.ch",
+                    "chat.aigw.internal",
                     "/oauth/oidc/login",
                     "/oauth/oidc/callback",
                     "/auth",
@@ -78,11 +80,11 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             harness.start_url(harness.TARGET_BY_NAME["litellm-admin"]),
-            "https://litellm-admin.aigw.aegisgroup.ch/oauth2/start?rd=/ui",
+            "https://litellm-admin.aigw.internal/oauth2/start?rd=/ui",
         )
         self.assertEqual(
             harness.start_url(harness.TARGET_BY_NAME["chat"]),
-            "https://chat.aigw.aegisgroup.ch/oauth/oidc/login",
+            "https://chat.aigw.internal/oauth/oidc/login",
         )
         self.assertEqual(
             harness.TARGET_BY_NAME["litellm-admin"].denied_paths,
@@ -105,25 +107,25 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
         realm = REALM_TEMPLATE.read_text(encoding="utf-8")
         for target in harness.TARGETS:
             template_origin = target.origin.replace(
-                ".aigw.aegisgroup.ch", ".{{ aigw_domain }}"
+                ".aigw.internal", ".{{ aigw_domain }}"
             )
             self.assertIn(template_origin + target.callback_path, realm)
 
     def test_only_reviewed_https_origins_and_default_ports_are_accepted(self) -> None:
         target = harness.TARGET_BY_NAME["grafana"]
         valid = harness.reviewed_https_url(
-            "https://auth.aigw.aegisgroup.ch/realms/aigw/protocol/openid-connect/auth",
+            "https://auth.aigw.internal/realms/aigw/protocol/openid-connect/auth",
             target.allowed_hosts,
         )
         self.assertEqual(valid.hostname, harness.AUTH_HOST)
 
         for url in (
-            "http://auth.aigw.aegisgroup.ch/realms/aigw/protocol/openid-connect/auth",
+            "http://auth.aigw.internal/realms/aigw/protocol/openid-connect/auth",
             "https://evil.example/",
-            "https://auth.aigw.aegisgroup.ch:444/",
-            "https://user@auth.aigw.aegisgroup.ch/",
-            "https://auth.aigw.aegisgroup.ch@evil.example/",
-            "https://admin.aigw.aegisgroup.ch/",
+            "https://auth.aigw.internal:444/",
+            "https://user@auth.aigw.internal/",
+            "https://auth.aigw.internal@evil.example/",
+            "https://admin.aigw.internal/",
         ):
             with self.subTest(url=url):
                 with self.assertRaises(harness.AcceptanceError):
@@ -159,7 +161,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
 
         for redirects, final_url, html in (
             ([], target.origin + "/auth", "ok"),
-            ([(target.host, target.callback_path)], "https://auth.aigw.aegisgroup.ch/", "ok"),
+            ([(target.host, target.callback_path)], "https://auth.aigw.internal/", "ok"),
             ([(target.host, target.callback_path)], target.origin + "/auth?error=bad", "ok"),
             ([(target.host, target.callback_path)], target.origin + "/auth?code=leaked", "ok"),
             ([(target.host, target.callback_path)], target.origin + "/auth", "invalid_scope"),
@@ -177,21 +179,21 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
         }
         self.assertEqual(
             harness.reviewed_login_action(
-                "https://auth.aigw.aegisgroup.ch/realms/aigw/protocol/openid-connect/auth",
+                "https://auth.aigw.internal/realms/aigw/protocol/openid-connect/auth",
                 valid,
                 target,
             ),
-            "https://auth.aigw.aegisgroup.ch/realms/aigw/login-actions/authenticate?session_code=opaque",
+            "https://auth.aigw.internal/realms/aigw/login-actions/authenticate?session_code=opaque",
         )
         for action in (
-            "https://vault.aigw.aegisgroup.ch/login-actions/authenticate",
+            "https://vault.aigw.internal/login-actions/authenticate",
             "https://evil.example/realms/aigw/login-actions/authenticate",
-            "https://auth.aigw.aegisgroup.ch/realms/aigw/account/",
+            "https://auth.aigw.internal/realms/aigw/account/",
         ):
             with self.subTest(action=action):
                 with self.assertRaises(harness.AcceptanceError):
                     harness.reviewed_login_action(
-                        "https://auth.aigw.aegisgroup.ch/realms/aigw/protocol/openid-connect/auth",
+                        "https://auth.aigw.internal/realms/aigw/protocol/openid-connect/auth",
                         {"action": action, "method": "post", "inputs": {}},
                         target,
                     )
@@ -206,7 +208,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
                 value="not-inspected",
                 port=None,
                 port_specified=False,
-                domain="chat.aigw.aegisgroup.ch",
+                domain="chat.aigw.internal",
                 domain_specified=False,
                 domain_initial_dot=False,
                 path="/",
@@ -230,7 +232,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
                 value="not-inspected",
                 port=None,
                 port_specified=False,
-                domain="chat.aigw.aegisgroup.ch",
+                domain="chat.aigw.internal",
                 domain_specified=False,
                 domain_initial_dot=False,
                 path="/",
@@ -252,9 +254,40 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
         self.assertNotIn('add_argument("--host"', source)
         self.assertNotIn('add_argument("--origin"', source)
         self.assertNotIn('add_argument("--redirect', source)
-        self.assertIn("pipe the disposable lab password on stdin", source)
+        self.assertIn("pipe the static preprod password on stdin", source)
         self.assertIn("ProxyHandler({})", source)
         self.assertIn("OIDC_CALLBACK_FAIL target={target.name}", source)
+
+    def test_preprod_resolution_is_exact_and_preserves_each_tls_hostname(self) -> None:
+        self.assertEqual(
+            harness.ACCEPTANCE_USERNAMES,
+            {"preprod-admin", "preprod-developer", "preprod-user"},
+        )
+        self.assertEqual(
+            harness.PREPROD_HOST_ADDRESSES,
+            {
+                "admin.aigw.internal": "127.0.3.1",
+                "auth.aigw.internal": "127.0.3.1",
+                "chat.aigw.internal": "127.0.3.1",
+                "grafana.aigw.internal": "127.0.3.1",
+                "litellm-admin.aigw.internal": "127.0.3.1",
+                "prometheus.aigw.internal": "127.0.3.1",
+                "vault.aigw.internal": "127.0.3.1",
+            },
+        )
+        resolver = mock.Mock(return_value=[("resolved",)])
+        with mock.patch.object(harness, "_SYSTEM_GETADDRINFO", resolver):
+            self.assertEqual(
+                harness.preprod_getaddrinfo(
+                    "grafana.aigw.internal", 443, socket.AF_INET, socket.SOCK_STREAM
+                ),
+                [("resolved",)],
+            )
+        resolver.assert_called_once_with(
+            "127.0.3.1", 443, socket.AF_INET, socket.SOCK_STREAM, 0, 0
+        )
+        with self.assertRaises(socket.gaierror):
+            harness.preprod_getaddrinfo("unreviewed.aigw.internal", 443)
 
 
 if __name__ == "__main__":

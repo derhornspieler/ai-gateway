@@ -12,5 +12,5 @@ Audit method:
 - Hunt fail-open: what happens on timeout, empty output, missing file, nonzero rc that is swallowed, `failed_when: false` without a downstream assert?
 - Check TOCTOU on every read-verify-write cycle and every symlink/hardlink boundary.
 - Distinguish what you PROVED (with file:line or command output) from what you INFERRED — label each finding accordingly.
-- Live lab (ssh ansible@10.8.10.10) is strictly read-only: docker inspect/logs, sudo cat of non-secret files. Report secret-pattern matches as counts, never values.
+- Remote production targets are strictly read-only unless the task explicitly authorizes mutation. Report secret-pattern matches as counts, never values.
 - Findings format: severity, claim, evidence, minimal fix. No theoretical findings without a concrete failure scenario.

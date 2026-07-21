@@ -2,8 +2,8 @@
 """Prove non-admin identities are DENIED at every ADM-gated admin surface.
 
 Companion to test-oidc-callbacks.py, which proves the ALLOW path for an
-aigw-admins identity. This harness proves the converse: lab-user and
-lab-developer each authenticate with a real Samba-backed password through
+aigw-admins identity. This harness proves the converse: preprod-user and
+preprod-developer each authenticate with a real Samba-backed password through
 Keycloak -- so a genuine credential and a genuine Keycloak login are proven,
 never a broken-login false pass -- and are then rejected because neither
 carries aigw-admins:
@@ -20,7 +20,7 @@ This is a denial-only harness and deliberately accepts no admin fixture as
 --username: pointing it at an admin identity would prove nothing (or worse,
 mask a broken deny path behind an unrelated allow).
 
-The disposable lab password is accepted only on stdin and is never logged,
+The static preprod password is accepted only on stdin and is never logged,
 persisted, placed in argv, or included in an exception message.
 """
 
@@ -57,9 +57,9 @@ sys.modules[_FLOW_SPEC.name] = flow
 _FLOW_SPEC.loader.exec_module(flow)
 
 
-# Deliberately narrow: only the two non-admin lab fixtures. An admin fixture
+# Deliberately narrow: only the two non-admin preprod fixtures. An admin fixture
 # here would defeat the point of a denial harness.
-DENIED_USERNAMES = frozenset({"lab-user", "lab-developer"})
+DENIED_USERNAMES = frozenset({"preprod-user", "preprod-developer"})
 ADM_TARGET_NAMES = ("litellm-admin", "grafana", "prometheus", "vault")
 ALL_TARGET_NAMES = (*ADM_TARGET_NAMES, "admin-portal")
 
@@ -170,7 +170,7 @@ def admin_portal_denial(context: ssl.SSLContext, username: str, password: str) -
     if status != 403:
         raise DenialAssertionError(f"admin-portal denial returned unexpected status {status}")
     parsed = urllib.parse.urlsplit(final_url)
-    if parsed.hostname != "admin.aigw.aegisgroup.ch" or parsed.path != "/admin":
+    if parsed.hostname != "admin.aigw.internal" or parsed.path != "/admin":
         raise DenialAssertionError("admin-portal denial did not occur at /admin")
     if "403 Forbidden" not in body:
         raise DenialAssertionError("admin-portal denial body did not match the expected forbidden page")
@@ -187,16 +187,16 @@ def admin_portal_denial(context: ssl.SSLContext, username: str, password: str) -
 
 def read_password() -> str:
     if sys.stdin.isatty():
-        raise SystemExit("pipe the disposable lab password on stdin")
+        raise SystemExit("pipe the static preprod password on stdin")
     raw = sys.stdin.buffer.read(513)
     if not raw or len(raw) > 512:
-        raise SystemExit("invalid lab password length")
+        raise SystemExit("invalid preprod password length")
     try:
         password = raw.strip().decode("utf-8")
     except UnicodeDecodeError:
-        raise SystemExit("lab password is not UTF-8") from None
+        raise SystemExit("preprod password is not UTF-8") from None
     if not password:
-        raise SystemExit("invalid lab password")
+        raise SystemExit("invalid preprod password")
     return password
 
 
@@ -207,6 +207,7 @@ def main() -> int:
     parser.add_argument("--target", choices=("all", *ALL_TARGET_NAMES), default="all")
     args = parser.parse_args()
     password = read_password()
+    oidc.install_preprod_resolution()
     try:
         context = ssl.create_default_context(cafile=args.ca)
     except (OSError, ssl.SSLError) as exc:

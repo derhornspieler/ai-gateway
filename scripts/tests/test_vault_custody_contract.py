@@ -16,7 +16,6 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/store-vault-unseal-key.py"
-BOOTSTRAP = ROOT / "scripts/vault-bootstrap.sh"
 GENERATOR = ROOT / "scripts/bootstrap-generic-rocky9.py"
 CONTRACT = ROOT / "ansible/generic-rocky9-contract.json"
 EXAMPLES = ROOT / "ansible/inventory/examples"
@@ -199,33 +198,6 @@ class VaultCustodyContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("must not grant group or world access", result.stderr)
 
-    def test_bootstrap_reserves_captured_stdout_and_retains_recovery_copy(self) -> None:
-        source = BOOTSTRAP.read_text(encoding="utf-8")
-        subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=True)
-        for required in (
-            "--emit-unseal-key",
-            'if [[ -t 1 ]]',
-            "exec 3>&1",
-            "exec 1>&2",
-            'printf \'%s\\n\' "$UNSEAL_KEY" >&3',
-            "retaining secrets/vault-init.json",
-            "controller helper has",
-        ):
-            self.assertIn(required, source)
-        self.assertLess(
-            source.index('printf \'%s\\n\' "$UNSEAL_KEY" |'),
-            source.index('printf \'%s\\n\' "$UNSEAL_KEY" >&3'),
-        )
-        self.assertLess(
-            source.index('"$STACK_DIR/scripts/aigw-runtime-up.sh" -d'),
-            source.index('printf \'%s\\n\' "$UNSEAL_KEY" >&3'),
-        )
-        # The controller share is never accepted from argv or environment.
-        helper = HELPER.read_text(encoding="utf-8")
-        self.assertIn("sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)", helper)
-        self.assertNotIn("--unseal-key", helper)
-        self.assertNotRegex(helper, r"os\.environ\[[\"'].*UNSEAL")
-
     def test_contract_and_generator_never_randomly_create_unseal_key(self) -> None:
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
         generated = [entry["name"] for entry in contract["required_secret_keys"]]
@@ -251,42 +223,21 @@ class VaultCustodyContractTests(unittest.TestCase):
         )[0]
         self.assertNotIn("vault_unseal_key", random_region)
 
-    def test_safe_lab_and_production_templates_have_exact_secret_boundaries(self) -> None:
+    def test_safe_production_templates_have_exact_secret_boundaries(self) -> None:
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
         base = {entry["name"] for entry in contract["required_secret_keys"]}
-        lab = base | set(contract["lab_only_secret_keys"])
-        for name, expected in (
-            ("production-rocky9.vault.yml.example", base),
-            ("rocky9-lab.vault.yml.example", lab),
-        ):
-            source = (EXAMPLES / name).read_text(encoding="utf-8")
-            actual = set(re.findall(r"^([a-z0-9_]+):", source, re.MULTILINE))
-            self.assertEqual(actual, expected | {"vault_unseal_key"})
-            self.assertIn("<OPERATOR_INIT_OUTPUT;", source)
-            self.assertNotIn("$ANSIBLE_VAULT;", source)
+        source = (EXAMPLES / "production-rocky9.vault.yml.example").read_text(
+            encoding="utf-8"
+        )
+        actual = set(re.findall(r"^([a-z0-9_]+):", source, re.MULTILINE))
+        self.assertEqual(actual, base | {"vault_unseal_key"})
+        self.assertIn("<OPERATOR_INIT_OUTPUT;", source)
+        self.assertNotIn("$ANSIBLE_VAULT;", source)
         production_host = (
             EXAMPLES / "production-rocky9.host-vars.yml.example"
         ).read_text(encoding="utf-8")
         self.assertIn("deployment_profile: rocky9-production", production_host)
         self.assertIn("backwards-compatible", production_host)
-        lab_host = (EXAMPLES / "rocky9-lab.host-vars.yml.example").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("deployment_profile: rocky9-lab", lab_host)
-
-        lab_flow = (EXAMPLES / "rocky9-lab.first-init.sh.example").read_text(
-            encoding="utf-8"
-        )
-        first_converge = lab_flow.index("ansible-playbook")
-        bootstrap = lab_flow.index("vault-bootstrap.sh --emit-unseal-key")
-        custody = lab_flow.index("store-vault-unseal-key.py")
-        second_converge = lab_flow.index("ansible-playbook", first_converge + 1)
-        cleanup = lab_flow.index("securely delete")
-        self.assertLess(first_converge, bootstrap)
-        self.assertLess(bootstrap, custody)
-        self.assertLess(custody, second_converge)
-        self.assertLess(second_converge, cleanup)
-
         production_flow = (
             EXAMPLES / "production-rocky9.first-init.sh.example"
         ).read_text(encoding="utf-8")

@@ -10,7 +10,6 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ROOT / "compose" / "docker-compose.yml"
 DOCKER_STACK_TASKS = ROOT / "ansible" / "roles" / "docker_stack" / "tasks" / "main.yml"
-VAULT_BOOTSTRAP = ROOT / "scripts" / "vault-bootstrap.sh"
 
 
 class HealthcheckContractTests(unittest.TestCase):
@@ -34,7 +33,7 @@ class HealthcheckContractTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:4000/health/readiness", service)
         self.assertNotIn("http://127.0.0.1:4000/health/liveliness", service)
 
-    def test_first_vault_bootstrap_does_not_deadlock_admin_portal_startup(self) -> None:
+    def test_fresh_vault_does_not_deadlock_admin_portal_startup(self) -> None:
         compose = COMPOSE.read_text(encoding="utf-8")
         admin_portal = self._service_block(compose, "admin-portal", "envoy-egress")
 
@@ -83,40 +82,6 @@ class HealthcheckContractTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(task_timeouts), 2)
         self.assertTrue(all(value >= minimum_timeout for value in task_timeouts))
-        self.assertIn(
-            f"--wait-timeout {max(task_timeouts)}",
-            VAULT_BOOTSTRAP.read_text(encoding="utf-8"),
-        )
-
-    def test_vault_bootstrap_refuses_existing_state_and_commits_init_atomically(self) -> None:
-        source = VAULT_BOOTSTRAP.read_text(encoding="utf-8")
-
-        # Vault status returns exit code 2 for both sealed and uninitialized
-        # states. The lab bootstrap must parse the public JSON and allow only a
-        # genuinely fresh Vault, never accidentally initialize an existing one.
-        self.assertIn('vlt status -format=json', source)
-        self.assertIn('false:true)', source)
-        self.assertIn('true:*)', source)
-        self.assertIn('Vault is already initialized', source)
-        self.assertIn('scripts/vault-unseal.sh', source)
-
-        # A failed `operator init` must not leave a partial secret response at
-        # the durable path. Keep it private in the same directory, validate it,
-        # then use the same-filesystem rename as the sole durable commit.
-        self.assertIn('mktemp "secrets/.vault-init.json.XXXXXX"', source)
-        self.assertIn('trap cleanup_vault_init_tmp EXIT', source)
-        self.assertIn('trap abort_vault_init_tmp HUP INT TERM', source)
-        self.assertIn(
-            'vlt operator init -key-shares=1 -key-threshold=1 -format=json > "$vault_init_tmp"',
-            source,
-        )
-        self.assertIn('Vault init response was incomplete', source)
-        self.assertIn('mv -f -- "$vault_init_tmp" secrets/vault-init.json', source)
-        self.assertIn('vault_init_tmp=""', source)
-        self.assertNotIn(
-            'vlt operator init -key-shares=1 -key-threshold=1 -format=json > secrets/vault-init.json',
-            source,
-        )
 
 
 if __name__ == "__main__":

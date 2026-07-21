@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import urllib.parse
 
 import httpx
 import pytest
@@ -743,3 +744,37 @@ async def test_status_degrades_when_the_escrow_path_is_unreadable(
     result = await admin.status()
     assert result["break_glass_escrowed"] is False
     assert result["break_glass_escrow_readable"] is False
+
+
+@pytest.mark.asyncio
+async def test_deployment_repair_can_use_the_escrowed_break_glass_admin() -> None:
+    password = "escrowed-password-0123456789-ABCDEFGH"
+    vault = FakeVault(
+        {
+            BG_VAULT_PATH: {
+                "schema_version": 1,
+                "username": "break-glass-admin",
+                "password": password,
+            }
+        }
+    )
+
+    def token_endpoint(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/realms/master/protocol/openid-connect/token"
+        form = urllib.parse.parse_qs(request.content.decode("utf-8"))
+        assert form == {
+            "grant_type": ["password"],
+            "client_id": ["admin-cli"],
+            "username": ["break-glass-admin"],
+            "password": [password],
+        }
+        return httpx.Response(200, json={"access_token": "repair-token"})
+
+    admin = KeycloakAdmin(
+        settings(KC_BOOTSTRAP_ADMIN_CLIENT_SECRET=""),
+        vault,
+        FakeDB(),
+        transport=httpx.MockTransport(token_endpoint),
+    )
+
+    assert await admin._break_glass_admin_token() == "repair-token"

@@ -62,15 +62,15 @@ table inet aigw_guard {
 
 {% if platform_authoritative_dns_enabled | bool %}
 {% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
-    iifname "{{ net.bridge }}" oifname "br-lab-dns" ip daddr {{ lab_dns_ip }} udp dport 53 accept
-    iifname "{{ net.bridge }}" oifname "br-lab-dns" ip daddr {{ lab_dns_ip }} tcp dport 53 accept
+    iifname "{{ net.bridge }}" oifname "br-platform-dns" ip daddr {{ platform_dns_ip }} udp dport 53 accept
+    iifname "{{ net.bridge }}" oifname "br-platform-dns" ip daddr {{ platform_dns_ip }} tcp dport 53 accept
 {% endfor %}
     # The cross-bridge drop below is deliberately before the broad reply
     # allowance. Add only the reply half of the exact platform-DNS flow so a
     # DNS answer is usable without preserving unrelated stale connections.
 {% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
-    iifname "br-lab-dns" oifname "{{ net.bridge }}" ip saddr {{ lab_dns_ip }} udp sport 53 ct state established,related ct direction reply accept
-    iifname "br-lab-dns" oifname "{{ net.bridge }}" ip saddr {{ lab_dns_ip }} tcp sport 53 ct state established,related ct direction reply accept
+    iifname "br-platform-dns" oifname "{{ net.bridge }}" ip saddr {{ platform_dns_ip }} udp sport 53 ct state established,related ct direction reply accept
+    iifname "br-platform-dns" oifname "{{ net.bridge }}" ip saddr {{ platform_dns_ip }} tcp sport 53 ct state established,related ct direction reply accept
 {% endfor %}
 {% endif %}
     iifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } drop
@@ -84,12 +84,12 @@ table inet aigw_guard {
     # exact published host address and whose translated output is managed.
     iifname "{{ nic_adm }}" oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 443 tcp dport 443 accept
 {% if platform_authoritative_dns_enabled | bool %}
-    # Lab-only published authoritative DNS. These are FORWARD rules for the
+    # Optional published authoritative DNS. These are FORWARD rules for the
     # DNAT path; the host INPUT chain remains closed to container traffic.
-    iifname "{{ nic_adm }}" oifname "br-lab-dns" ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 53 udp dport 53 accept
-    iifname "{{ nic_adm }}" oifname "br-lab-dns" ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 53 tcp dport 53 accept
-    iifname "{{ nic_internal }}" oifname "br-lab-dns" ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 53 udp dport 53 accept
-    iifname "{{ nic_internal }}" oifname "br-lab-dns" ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 53 tcp dport 53 accept
+    iifname "{{ nic_adm }}" oifname "br-platform-dns" ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 53 udp dport 53 accept
+    iifname "{{ nic_adm }}" oifname "br-platform-dns" ip saddr {{ vpn_client_cidr }} ct status dnat ct original ip daddr {{ eth1_ip }} ct original proto-dst 53 tcp dport 53 accept
+    iifname "{{ nic_internal }}" oifname "br-platform-dns" ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 53 udp dport 53 accept
+    iifname "{{ nic_internal }}" oifname "br-platform-dns" ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 53 tcp dport 53 accept
 {% endif %}
     iifname "{{ nic_internal }}" oifname { {% for net in docker_networks %}"{{ net.bridge }}"{% if not loop.last %}, {% endif %}{% endfor %} } ip saddr {{ internal_cidr }} ct status dnat ct original ip daddr {{ eth2_ip }} ct original proto-dst 443 tcp dport 443 accept
     iifname { "{{ nic_egress }}", "{{ nic_adm }}", "{{ nic_internal }}" } drop

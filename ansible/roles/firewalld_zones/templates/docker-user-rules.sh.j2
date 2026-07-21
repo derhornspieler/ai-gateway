@@ -26,16 +26,16 @@ iptables-restore --wait 15 --noflush <<'AIGW_IPV4_RULES'
 # excluding net-vendor/net-metrics also prevents multi-homed Envoy from
 # reaching the internal resolver plane through one of its side networks.
 {% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
--A DOCKER-USER -i {{ net.bridge }} -o br-lab-dns -d {{ lab_dns_ip }}/32 -p udp --dport 53 -j RETURN
--A DOCKER-USER -i {{ net.bridge }} -o br-lab-dns -d {{ lab_dns_ip }}/32 -p tcp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ net.bridge }} -o br-platform-dns -d {{ platform_dns_ip }}/32 -p udp --dport 53 -j RETURN
+-A DOCKER-USER -i {{ net.bridge }} -o br-platform-dns -d {{ platform_dns_ip }}/32 -p tcp --dport 53 -j RETURN
 {% endfor %}
 # Cross-bridge default-deny below intentionally precedes the generic reply
 # allowance. Preserve that stale-flow protection while admitting only replies
 # to the exact DNS requests allowed above; otherwise the request reaches
-# CoreDNS but every answer is dropped on br-lab-dns -> application bridge.
+# CoreDNS but every answer is dropped on br-platform-dns -> application bridge.
 {% for net in docker_networks if net.name in ['net-adm', 'net-internal', 'net-int-edge'] %}
--A DOCKER-USER -i br-lab-dns -o {{ net.bridge }} -s {{ lab_dns_ip }}/32 -p udp --sport 53 -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
--A DOCKER-USER -i br-lab-dns -o {{ net.bridge }} -s {{ lab_dns_ip }}/32 -p tcp --sport 53 -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+-A DOCKER-USER -i br-platform-dns -o {{ net.bridge }} -s {{ platform_dns_ip }}/32 -p udp --sport 53 -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+-A DOCKER-USER -i br-platform-dns -o {{ net.bridge }} -s {{ platform_dns_ip }}/32 -p tcp --sport 53 -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
 {% endfor %}
 {% endif %}
 {% for net in docker_networks %}

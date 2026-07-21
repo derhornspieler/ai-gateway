@@ -1,23 +1,24 @@
 # AI Gateway
 
-[![Infrastructure validation](https://github.com/derhornspieler/ai-gateway/actions/workflows/infrastructure-ci.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/infrastructure-ci.yml)
-[![Python quality and security](https://github.com/derhornspieler/ai-gateway/actions/workflows/python-ci.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/python-ci.yml)
-[![Secret scanning](https://github.com/derhornspieler/ai-gateway/actions/workflows/secret-scanning.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/secret-scanning.yml)
-[![Filesystem and IaC security](https://github.com/derhornspieler/ai-gateway/actions/workflows/trivy.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/trivy.yml)
-[![GitHub Actions policy](https://github.com/derhornspieler/ai-gateway/actions/workflows/actions-security.yml/badge.svg?branch=main)](https://github.com/derhornspieler/ai-gateway/actions/workflows/actions-security.yml)
+Checks: [infrastructure](.github/workflows/infrastructure-ci.yml),
+[Python](.github/workflows/python-ci.yml),
+[secret scanning](.github/workflows/secret-scanning.yml),
+[filesystem and IaC](.github/workflows/trivy.yml), and
+[GitHub Actions policy](.github/workflows/actions-security.yml).
 
 AI Gateway is a security-focused, self-hosted AI access platform for an existing
 Rocky Linux 9 VM. It puts OpenAI- and Anthropic-compatible API front doors,
-browser chat, per-user gateway keys, Keycloak OIDC, pinned vendor egress,
-Vault-backed provider credentials, and local plus Cribl telemetry behind a
-single hardened Docker Compose stack.
+browser chat, per-user gateway keys, Keycloak OIDC, immutable provider-selected
+egress,
+Vault-backed provider credentials, local observability, and a narrow optional
+Cribl SOC log feed behind one hardened Docker Compose stack.
 
 Ansible configures the host and containers. It does **not** create the VM or a
 NetworkManager profile, readdress an interface, or change customer-owned routes,
 gateways, DNS, or static IP addressing. It owns exactly one bounded property on
 each supplied active physical profile — `connection.zone`, keyed by its live
 UUID — so a firewalld reload cannot move that interface back to the default
-zone. It neither cycles nor reactivates the connection. The committed lab inventory is an explicit lab profile, not a production default.
+zone. It neither cycles nor reactivates the connection.
 
 ## Architecture at a glance
 
@@ -50,7 +51,7 @@ flowchart LR
   KR --> VT
   LL --> EV
   KR --> EV
-  EV -->|pinned TLS, egress NIC only| VEND[Anthropic / OpenAI vendor APIs]
+  EV -->|reviewed TLS policy, egress NIC only| VEND[Selected provider APIs]
 ```
 
 The full component, network, and trust-boundary detail lives in the
@@ -65,14 +66,15 @@ The supported host has three customer-owned, already-addressed interfaces:
 - **egress** — the only default route; no gateway listener is published here.
 - **ADM** (`ETH1_IP`) — SSH and administrative HTTPS, restricted to the VPN
   source CIDR.
-- **internal** (`ETH2_IP`) — user HTTPS and an optional exact Cribl export,
+- **internal** (`ETH2_IP`) — user HTTPS and an optional exact Cribl SOC log export,
   restricted to the internal source CIDR.
 
 ## Status
 
 AI Gateway is a **customer prototype under active hardening** — one Compose
 project on one Rocky VM, not highly available and not a turnkey production
-appliance; Vault bootstrap is currently lab/test-grade. Implementation state,
+appliance. Production Vault initialization and custody remain reviewed operator
+ceremonies; local preprod uses only disposable test custody. Implementation state,
 verification evidence, and the open items gating production live in
 [project status](docs/project-status.md); the historical destructive
 rebuild-and-restore evidence is archived in
@@ -80,31 +82,50 @@ rebuild-and-restore evidence is archived in
 
 ## Documentation
 
-Read these in order for a deployment:
+Choose one operator path:
 
-1. [Architecture and trust boundaries](docs/solution-map.md)
-2. [Technical diagrams](docs/architecture-diagrams.md)
-3. [Network architecture and enforcement](docs/network-security.md)
-4. [Service FQDN inventory and DNS design](docs/fqdn-inventory.md)
-5. [Operating system security baseline](docs/os-security.md)
-6. [Container platform security](docs/docker-security.md)
-7. [Ansible deployment runbook](docs/deploy-runbook.md)
-8. [Generic Rocky 9 and lab deployment reference](docs/deploy-guide.md)
-9. [Offline external-image seed](docs/offline-image-seed.md)
-10. [Identity, Samba AD lab, and group administration](docs/identity-operations.md)
-11. [Anthropic WIF and `private_key_jwt`](docs/anthropic-wif-bootstrap.md)
-12. [Operations, recovery, upgrades, and troubleshooting](docs/operations.md)
-13. [Sensitive telemetry and retention](docs/observability-operations.md)
-14. [LiteLLM capacity and scaling design](docs/litellm-scaling.md)
-15. [Scaling and high-availability posture](docs/high-availability.md)
-16. [Acceptance test runbook](docs/test-runbook.md)
-17. [Project status and open items](docs/project-status.md)
+- **Local release test:** [Local Docker preprod](docs/preprod.md) →
+  [acceptance test runbook](docs/test-runbook.md).
+- **Production deployment:** [Production deployment runbook](docs/deploy-runbook.md)
+  → [operations and recovery](docs/operations.md) →
+  [Vault unseal after reboot](docs/sop/vault-unseal-after-reboot.md).
+- **Image release:** [Image update, local seeded test, production upgrade, and
+  rollback](docs/image-update-workflow.md).
+
+Use these pages when you need design detail:
+
+- [Architecture and trust boundaries](docs/solution-map.md) and
+  [technical diagrams](docs/architecture-diagrams.md)
+- [Network rules](docs/network-security.md),
+  [FQDN and DNS inventory](docs/fqdn-inventory.md),
+  [OS security](docs/os-security.md), and
+  [container security](docs/docker-security.md)
+- [Identity operations](docs/identity-operations.md),
+  [Keycloak realm design](docs/keycloak-realm-architecture.md), and
+  [Anthropic WIF](docs/anthropic-wif-bootstrap.md)
+- [Provider onboarding](docs/provider-onboarding.md),
+  [provider CA maintenance](docs/sop/provider-ca-maintenance.md), and
+  [offline seed internals](docs/offline-image-seed.md)
+- [Telemetry](docs/observability-operations.md),
+  [Cribl SOC logging handoff](docs/cribl-soc-handoff.md),
+  [LiteLLM scaling](docs/litellm-scaling.md), and
+  [high availability](docs/high-availability.md)
+
+Current state is in [project status](docs/project-status.md). Durable work is
+tracked in [TASKS.md](TASKS.md).
 
 The original
 [architecture skeleton](docs/archive/architecture-skeleton.md) is archived as
 historical input only. It is not an operational reference.
 
 ## Deployment entry points
+
+Choose the environment before running anything:
+
+- For a disposable local Docker environment, follow the
+  [local preprod runbook](docs/preprod.md).
+- For a customer-owned Rocky Linux host, follow the
+  [production deployment runbook](docs/deploy-runbook.md).
 
 For a real customer host, generate a dedicated inventory with an encrypted
 secret overlay, fill in the topology, pass the controller-only preflight, and
@@ -127,16 +148,18 @@ The older `bootstrap-generic-rocky9.py` / `preflight-generic-rocky9.yml` /
 `generic-rocky9` names still work as DEPRECATED compatibility aliases and print a
 one-line deprecation notice pointing here.
 
-For the explicit lab only:
+For disposable local preprod:
 
 ```bash
-ansible-playbook -i ansible/inventory/lab.yml ansible/site.yml \
-  --ask-vault-pass
+ansible-playbook -i ansible/inventory/preprod.yml ansible/preprod.yml
 ```
 
-Both commands intentionally fail before mutating the host if the supplied
-topology disagrees with live interface/default-route facts. See the
-[deployment guide](docs/deploy-guide.md) before running either command.
+On macOS, append `--ask-become-pass` so the play can create the two missing
+Docker Desktop loopback aliases. Linux skips that privileged step.
+
+Production intentionally fails before mutating the host if the supplied
+topology disagrees with live interface/default-route facts. Preprod refuses a
+remote Docker context and does not run any Rocky Linux host role.
 
 Safe local validation that starts no containers and needs no secret overlay:
 
@@ -153,37 +176,38 @@ ansible/
                            through docker_networks); starts no containers
   deploy-stack-only.yml    stack deploy + verify + marker promotion; refuses an
                            unprepared host or a stale firewall/network ABI
-  inventory/               generic entry point (hosts.yml) + lab (lab.yml)
+  inventory/               generated production inventories + local preprod
   group_vars/all.yml       20 segmented bridge definitions and host variables
   roles/                   host_preflight, firewall_preflight, time_sync,
                            selinux_baseline, network_routing, firewalld_zones,
                            os_baseline, docker_networks, docker_stack, verify,
                            host_finalize
 compose/
-  docker-compose.yml       base stack, 25 services (23 default; Vault UI pair
-                           profile-gated); images tag-and-digest pinned
-  docker-compose.lab.yml   lab overlay (Samba AD + authoritative DNS)
+  docker-compose.yml       base stack, 24 services (22 selected by default,
+                           including volume-init; Vault UI pair profile-gated);
+                           images tag-and-digest pinned
+  docker-compose.preprod.yml portable local overlay (Samba AD + WIF mock)
   .env.example             fail-closed variable contract templated by Ansible
   traefik/                 separate internal and ADM routing
   keycloak/ litellm/ postgres/ vault/
   alloy/ prometheus/ loki/ grafana/ cribl-mock/
 services/
-  egress-proxy/            Envoy TLS-originating, pinned per-vendor CA egress
+  egress-proxy/            immutable catalog-selected Envoy egress policy
   key-rotator/             rotation engine and Keycloak identity controller
   dev-portal/              portal app image (serves dev-portal and admin-portal)
-  traefik/                 patched DHI Traefik build (3.7.7 binary on DHI runtime)
-  samba-ad-lab/            disposable AD/LDAPS lab image for the lab profile
-  lab-dns/                 authoritative non-recursive CoreDNS lab image
+  traefik/                 patched DHI Traefik build (3.7.8 binary on DHI runtime)
+  samba-ad-preprod/        disposable AD/LDAPS image for local preproduction
+  platform-dns/            optional authoritative split-DNS image
   dhi-health-probe/        static health-probe binary embedded in DHI images
 scripts/
   aigw-compose.sh          profile-aware deployed Compose wrapper
   aigw-runtime-up.sh       start/wait the graph without re-running volume-init
   validate-compose.sh      render-only Compose validation
-  vault-bootstrap.sh       lab/test Vault bootstrap; run on the target VM
   vault-unseal.sh          submit one unseal share without exposing it
   state-backup.sh          quiesced, age-encrypted state backup
   state-restore.sh         authenticated offline restore; leaves graph stopped
   pre-upgrade-check.sh     recent-backup gate for stateful image changes
+  update-images.py         seed build/test and remote upgrade/validate/rollback
   plan-compose-builds.py / preserve-compose-rollbacks.py / *.py
                            build planning, rollback retention, and portal tests
 docs/                      current operator and architecture documentation
@@ -194,7 +218,9 @@ docs/                      current operator and architecture documentation
 - Only Traefik publishes container ports, bound to the exact ADM/internal host
   addresses; no container port is bound to the egress address or `0.0.0.0`.
 - Envoy at fixed `172.28.0.2` is the only workload allowed external DNS and
-  TCP/443. Vendor TLS uses exact SANs and narrowed per-vendor CA bundles.
+  TCP/443. The offline release bakes only selected provider routes, exact
+  SNI/SAN rules, and reviewed CA bundles into one immutable image and policy.
+  Ansible never downloads CA trust during deployment.
 - Atomic `DOCKER-USER` rules and an independent native nftables guard deny
   cross-plane, container-to-host, and unapproved bridge egress.
 - User/API, administrative, database, cache, Vault, telemetry, metrics,
@@ -212,13 +238,13 @@ docs/                      current operator and architecture documentation
   `targeted` policy already enforcing, requires per-container MCS labels, and
   asserts zero AVCs in the converge window. It does not convert a permissive or
   disabled host.
-- Full prompts/completions are sensitive span attributes exported to Cribl and
-  retained locally only in the dedicated Loki `aigw-requests` per-request
-  stream; they never appear in ordinary service log records. Open WebUI uses one
-  inference-only service key, so its audit attribution is `svc-open-webui`, not
-  the individual browser user.
+- Full prompts/completions are sensitive. Alloy converts the reviewed request
+  span into a sanitized audit log for local Loki and the optional Cribl SOC
+  feed. Raw traces, metrics, alerts, and ordinary service logs never enter
+  Cribl. Open WebUI uses one inference-only service key, so its enforced audit
+  identity is `svc-open-webui`.
 - Authenticated restore exits with zero running project containers under an exact
-  root-only marker; `vault-bootstrap.sh` is forbidden on the recovery path.
+  root-only marker; replacement initialization is forbidden on the recovery path.
 
 This remains a customer prototype, not a turnkey production appliance. Review the
 documented residual risks, rehearse stateful upgrades and restore, and run the

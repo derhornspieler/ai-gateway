@@ -222,11 +222,15 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "storage           = otelcol.storage.file.cribl_queue.handler",
             exporter,
         )
-        self.assertIn('max_elapsed_time = "0s"', exporter)
+        self.assertIn('max_elapsed_time = "24h"', exporter)
+        self.assertNotIn('max_elapsed_time = "0s"', exporter)
 
         # Tempo was removed: no second OTLP exporter, no tempo queue, and no
         # TEMPO_INGEST_IP contract may survive anywhere in the pipeline.
-        self.assertNotIn("tempo", self.alloy.lower())
+        self.assertNotRegex(
+            self.alloy,
+            r'(?m)^(?:otelcol|loki|prometheus)\.[^{\n]+\s+"tempo"',
+        )
         self.assertNotIn("TEMPO_INGEST_IP", self.compose)
 
         alloy_service = self.compose.split("  alloy:\n", 1)[1].split(
@@ -237,23 +241,27 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         self.assertIn("- --disable-reporting", alloy_service)
 
     def test_request_stream_is_filtered_allowlisted_and_labeled_for_drilldown(self) -> None:
-        # The Loki request stream must be fed from the SANITIZED trace path:
-        # batch fans out to Cribl, spanmetrics, and the request-span filter —
-        # nothing else, and no Tempo exporter.
+        # The Loki request stream must be fed from the SANITIZED trace path.
+        # Raw traces stay local to span-derived metrics and the exact request
+        # converter; the default batch must never reference Cribl.
         batch = self.alloy.split('otelcol.processor.batch "default"', 1)[1].split(
             "\n}\n", 1
         )[0]
-        self.assertIn("otelcol.exporter.otlp.cribl.input", batch)
+        self.assertNotIn("otelcol.exporter.otlp.cribl.input", batch)
         self.assertIn("otelcol.connector.spanmetrics.default.input", batch)
         self.assertIn("otelcol.processor.filter.aigw_request_spans.input", batch)
 
         # Only the exact litellm_request span may become a log line; sibling
-        # spans (raw vendor payload, proxy request) are dropped here while
-        # still reaching Cribl through the batch fan-out.
+        # spans (raw vendor payload, proxy request) and same-name spans from a
+        # different service are dropped before the external log queue.
         span_filter = self.alloy.split(
             'otelcol.processor.filter "aigw_request_spans"', 1
         )[1].split("\n}\n", 1)[0]
-        self.assertIn('`name != "litellm_request"`', span_filter)
+        self.assertIn(
+            '`resource.attributes["service.name"] != "litellm" or name != "litellm_request"`',
+            span_filter,
+        )
+        self.assertIn('error_mode = "propagate"', span_filter)
         self.assertIn(
             "traces = [otelcol.connector.spanlogs.aigw_requests.input]", span_filter
         )
@@ -309,6 +317,8 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         transform = self.alloy.split(
             'otelcol.processor.transform "aigw_request_stream"', 1
         )[1].split("\n}\n", 1)[0]
+        self.assertIn('error_mode = "propagate"', transform)
+        self.assertNotIn('error_mode = "ignore"', transform)
         self.assertIn(
             '`set(attributes["service.name"], "aigw-requests")`', transform
         )
@@ -325,7 +335,81 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         # attributes into aigw_user_name / aigw_project_id stream labels.
         self.assertIn('key    = "loki.attribute.labels"', labels)
         self.assertIn('value  = "aigw.user.name, aigw.project.id"', labels)
-        self.assertIn("logs = [otelcol.exporter.loki.local.input]", labels)
+        self.assertIn("otelcol.exporter.loki.local.input", labels)
+        self.assertIn(
+            "otelcol.processor.transform.cribl_security_contract.input", labels
+        )
+
+    def test_cribl_has_one_logs_only_fail_closed_queue_ingress(self) -> None:
+        self.assertEqual(
+            self.alloy.count("otelcol.exporter.otlp.cribl.input"), 1
+        )
+        security_batch = self.alloy.split(
+            'otelcol.processor.batch "cribl_security"', 1
+        )[1].split("\n}\n", 1)[0]
+        self.assertIn("logs = [otelcol.exporter.otlp.cribl.input]", security_batch)
+        self.assertNotIn("traces", security_batch)
+        self.assertNotIn("metrics", security_batch)
+        self.assertNotIn('otelcol.receiver.loki "file_logs"', self.alloy)
+        self.assertNotIn('otelcol.processor.batch "file_logs"', self.alloy)
+        contract = self.alloy.split(
+            'otelcol.processor.transform "cribl_security_contract"', 1
+        )[1].split("\n}\n", 1)[0]
+        self.assertIn('error_mode = "propagate"', contract)
+        self.assertIn(
+            '`set(attributes["aigw.security.schema_version"], 1)`', contract
+        )
+        self.assertIn("otelcol.processor.batch.cribl_security.input", contract)
+
+        default_batch = self.alloy.split(
+            'otelcol.processor.batch "default"', 1
+        )[1].split("\n}\n", 1)[0]
+        self.assertNotIn("cribl", default_batch.lower())
+
+        vault = self.alloy.split('loki.source.file "vault_audit"', 1)[1].split(
+            "\n}\n", 1
+        )[0]
+        self.assertIn("loki.write.local.receiver", vault)
+        self.assertNotIn("cribl", vault.lower())
+        self.assertNotIn("otelcol.receiver", vault)
+
+    def test_security_classifiers_are_exact_and_non_recursive(self) -> None:
+        keycloak = self.alloy.split(
+            'loki.process "cribl_keycloak_auth"', 1
+        )[1].split('\nloki.process "cribl_structured_security"', 1)[0]
+        for required in (
+            'project!~\\"ai-gateway|aigw-preprod\\"',
+            'service!=\\"keycloak\\"',
+            'keycloak_logger!=\\"org.keycloak.events\\"',
+            'keycloak_event=\\"\\"',
+            "USER_DISABLED_BY_PERMANENT_LOCKOUT",
+            "USER_DISABLED_BY_TEMPORARY_LOCKOUT",
+        ):
+            self.assertIn(required, keycloak)
+        self.assertIn(
+            "otelcol.receiver.loki.cribl_security_logs.receiver", keycloak
+        )
+
+        structured = self.alloy.split(
+            'loki.process "cribl_structured_security"', 1
+        )[1].split('loki.source.file "vault_audit"', 1)[0]
+        for event in (
+            "aigw.portal.audit",
+            "aigw.identity.audit",
+            "aigw.egress.trust",
+        ):
+            self.assertIn(event, structured)
+        self.assertIn("AIGW_SECURITY_EVENT", structured)
+        self.assertNotIn('service=~\\"alloy|cribl-mock\\"', structured)
+
+        # Alloy and the mock sink never enter either positive classifier, so
+        # exporter failure/debug logs cannot recurse into their own queue.
+        docker = self.alloy.split('loki.process "docker"', 1)[1].split(
+            'loki.process "cribl_keycloak_auth"', 1
+        )[0]
+        self.assertIn("loki.write.local.receiver", docker)
+        self.assertIn("loki.process.cribl_keycloak_auth.receiver", docker)
+        self.assertIn("loki.process.cribl_structured_security.receiver", docker)
 
 
 if __name__ == "__main__":

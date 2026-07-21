@@ -1,0 +1,24 @@
+---
+preprod_state: present
+preprod_repo_root: "{{ playbook_dir | dirname }}"
+preprod_project_name: aigw-preprod
+preprod_resource_prefix: aigw-preprod
+preprod_subnet_octet: 29
+preprod_image_mode: source
+preprod_pull_images: false
+preprod_build_images: true
+preprod_manage_hosts: false
+
+# Seed mode uses an archive and manifest already copied to the local controller.
+# All four values are required in that mode.
+preprod_seed_archive: ""
+preprod_seed_archive_sha256: ""
+preprod_seed_manifest: ""
+preprod_seed_manifest_sha256: ""
+preprod_seed_load_archive: false
+# Linux root loads private staged copies. Docker Desktop loads the caller-owned
+# originals as the recorded non-root operator. Seed activation always uses the
+# caller-owned archive and manifest above.
+preprod_seed_loader_archive: ""
+preprod_seed_loader_manifest: ""
+preprod_seed_marker_directory: "/var/tmp/ai-gateway-preprod-seeds/{{ preprod_seed_manifest_sha256[:16] }}/loader-marker"

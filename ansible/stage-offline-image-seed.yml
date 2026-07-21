@@ -1,0 +1,221 @@
+---
+# Copy one reviewed offline image release from the controller to an existing
+# gateway host. This playbook starts no containers and loads no images. The
+# normal docker_stack role performs the final manifest and archive checks.
+- name: Stage one offline image release on a gateway host
+  hosts: generic_rocky9
+  gather_facts: false
+  become: true
+  vars:
+    image_seed_stage_fixed_root: /var/lib/ai-gateway/image-seeds
+  pre_tasks:
+    - name: Validate the image release staging inputs
+      ansible.builtin.assert:
+        that:
+          - image_seed_stage_controller_archive is match('^/.*\.docker\.tar\.zst$')
+          - image_seed_stage_archive_sha256 is match('^[0-9a-f]{64}$')
+          - image_seed_stage_controller_manifest is match('^/.*\.manifest\.json$')
+          - image_seed_stage_manifest_sha256 is match('^[0-9a-f]{64}$')
+          - >-
+            image_seed_stage_remote_directory is match(
+              '^/var/lib/ai-gateway/image-seeds/(candidate|previous)-[0-9a-f]{16}$'
+            )
+          - >-
+            image_seed_stage_remote_archive is match(
+              '^/var/lib/ai-gateway/image-seeds/(candidate|previous)-[0-9a-f]{16}/'
+              ~
+              '[A-Za-z0-9._-]+\.docker\.tar\.zst$'
+            )
+          - >-
+            image_seed_stage_remote_manifest is match(
+              '^/var/lib/ai-gateway/image-seeds/(candidate|previous)-[0-9a-f]{16}/'
+              ~
+              '[A-Za-z0-9._-]+\.manifest\.json$'
+            )
+          - (image_seed_stage_remote_archive | dirname) == image_seed_stage_remote_directory
+          - (image_seed_stage_remote_manifest | dirname) == image_seed_stage_remote_directory
+        quiet: true
+        fail_msg: Offline image release staging inputs are incomplete or unsafe.
+
+    - name: Inspect the controller release files
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      become: false
+      delegate_to: localhost
+      loop:
+        - path: "{{ image_seed_stage_controller_archive }}"
+          sha256: "{{ image_seed_stage_archive_sha256 }}"
+        - path: "{{ image_seed_stage_controller_manifest }}"
+          sha256: "{{ image_seed_stage_manifest_sha256 }}"
+      register: image_seed_stage_controller_files
+
+    - name: Require private regular controller release files with exact hashes
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not (item.stat.islnk | default(false))
+          - item.stat.mode == '0600'
+          - item.stat.checksum == item.item.sha256
+        quiet: true
+        fail_msg: >-
+          A controller release file is missing, is not a private regular file,
+          or does not match its reviewed SHA-256.
+      loop: "{{ image_seed_stage_controller_files.results }}"
+
+    - name: Prove production release scope and archive allow-list before transfer
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - "{{ playbook_dir }}/../scripts/load-offline-image-seed.py"
+          - validate-production-release
+          - "{{ image_seed_stage_controller_archive }}"
+          - "{{ image_seed_stage_archive_sha256 }}"
+          - "{{ image_seed_stage_controller_manifest }}"
+          - "{{ image_seed_stage_manifest_sha256 }}"
+      become: false
+      delegate_to: localhost
+      register: image_seed_stage_production_validation
+      changed_when: false
+      failed_when: >-
+        image_seed_stage_production_validation.rc != 0
+        or image_seed_stage_production_validation.stdout
+           != 'VALIDATED_PRODUCTION_RELEASE '
+              ~ image_seed_stage_archive_sha256
+              ~ ' '
+              ~ image_seed_stage_manifest_sha256
+
+  tasks:
+    - name: Install the current reviewed schema-v2 offline release loader
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/load-offline-image-seed.py"
+        dest: /usr/local/sbin/aigw-load-offline-image-seed
+        owner: root
+        group: root
+        mode: "0750"
+        follow: false
+
+    - name: Inspect the fixed target image release root
+      ansible.builtin.stat:
+        path: "{{ image_seed_stage_fixed_root }}"
+        follow: false
+      register: image_seed_stage_root_before
+
+    - name: Refuse an unsafe existing target image release root
+      ansible.builtin.assert:
+        that:
+          - not (image_seed_stage_root_before.stat.exists | default(false)) or
+            (image_seed_stage_root_before.stat.isdir | default(false))
+          - not (image_seed_stage_root_before.stat.islnk | default(false))
+          - not (image_seed_stage_root_before.stat.exists | default(false)) or
+            image_seed_stage_root_before.stat.uid == 0
+          - not (image_seed_stage_root_before.stat.exists | default(false)) or
+            image_seed_stage_root_before.stat.gid == 0
+          - not (image_seed_stage_root_before.stat.exists | default(false)) or
+            image_seed_stage_root_before.stat.mode == '0700'
+        quiet: true
+        fail_msg: The fixed target image release root is not a root-owned 0700 directory.
+
+    - name: Create the fixed private target image release root
+      ansible.builtin.file:
+        path: "{{ image_seed_stage_fixed_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Inspect the target release directory
+      ansible.builtin.stat:
+        path: "{{ image_seed_stage_remote_directory }}"
+        follow: false
+      register: image_seed_stage_directory_before
+
+    - name: Refuse an unsafe existing target release directory
+      ansible.builtin.assert:
+        that:
+          - not (image_seed_stage_directory_before.stat.exists | default(false)) or
+            (image_seed_stage_directory_before.stat.isdir | default(false))
+          - not (image_seed_stage_directory_before.stat.islnk | default(false))
+          - not (image_seed_stage_directory_before.stat.exists | default(false)) or
+            image_seed_stage_directory_before.stat.uid == 0
+          - not (image_seed_stage_directory_before.stat.exists | default(false)) or
+            image_seed_stage_directory_before.stat.gid == 0
+          - not (image_seed_stage_directory_before.stat.exists | default(false)) or
+            image_seed_stage_directory_before.stat.mode == '0700'
+        quiet: true
+        fail_msg: The existing target release directory is not a root-owned 0700 directory.
+
+    - name: Create the private target release directory
+      ansible.builtin.file:
+        path: "{{ image_seed_stage_remote_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Inspect existing target release files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ image_seed_stage_remote_archive }}"
+        - "{{ image_seed_stage_remote_manifest }}"
+      register: image_seed_stage_targets_before
+
+    - name: Refuse unsafe existing target release files
+      ansible.builtin.assert:
+        that:
+          - not (item.stat.exists | default(false)) or item.stat.isreg
+          - not (item.stat.islnk | default(false))
+          - not (item.stat.exists | default(false)) or item.stat.uid == 0
+          - not (item.stat.exists | default(false)) or item.stat.gid == 0
+          - not (item.stat.exists | default(false)) or item.stat.mode == '0600'
+          - not (item.stat.exists | default(false)) or (item.stat.nlink | default(1) | int) == 1
+        quiet: true
+        fail_msg: An existing target release path is not a private single-link regular file.
+      loop: "{{ image_seed_stage_targets_before.results }}"
+
+    - name: Copy the reviewed archive and manifest to the target
+      ansible.builtin.copy:
+        src: "{{ item.source }}"
+        dest: "{{ item.destination }}"
+        owner: root
+        group: root
+        mode: "0600"
+        follow: false
+      loop:
+        - source: "{{ image_seed_stage_controller_archive }}"
+          destination: "{{ image_seed_stage_remote_archive }}"
+        - source: "{{ image_seed_stage_controller_manifest }}"
+          destination: "{{ image_seed_stage_remote_manifest }}"
+
+    - name: Verify the staged release files
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop:
+        - path: "{{ image_seed_stage_remote_archive }}"
+          sha256: "{{ image_seed_stage_archive_sha256 }}"
+        - path: "{{ image_seed_stage_remote_manifest }}"
+          sha256: "{{ image_seed_stage_manifest_sha256 }}"
+      register: image_seed_stage_target_files
+
+    - name: Require exact private target release files
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg
+          - not (item.stat.islnk | default(false))
+          - item.stat.uid == 0
+          - item.stat.gid == 0
+          - item.stat.mode == '0600'
+          - (item.stat.nlink | default(1) | int) == 1
+          - item.stat.checksum == item.item.sha256
+        quiet: true
+        fail_msg: A staged target release file failed its ownership, mode, or SHA-256 gate.
+      loop: "{{ image_seed_stage_target_files.results }}"

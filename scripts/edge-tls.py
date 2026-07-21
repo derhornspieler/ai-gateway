@@ -521,8 +521,8 @@ def check_intermediate_name_constraints(
     `*.DOMAIN` and the apex `DOMAIN`, and nothing else. A one-label probe host
     under the wildcard plus the apex together exercise the whole namespace the
     gateway ever certifies. It deliberately does NOT probe a specific service
-    host such as `samba-ad.DOMAIN`: that leaf is lab-only, is covered by the
-    wildcard when issued, and pinning it here would false-reject a production
+    host such as `samba-ad.DOMAIN`: that directory leaf is not issued by this
+    edge ceremony, and pinning it here would false-reject a production
     intermediate whose name constraints exclude that one host even though the
     gateway never issues it.
 

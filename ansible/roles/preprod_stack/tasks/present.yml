@@ -1,0 +1,419 @@
+---
+- name: Require every offline-seed input in seed mode
+  ansible.builtin.assert:
+    that:
+      - preprod_seed_archive | length > 0
+      - preprod_seed_archive_sha256 is match('^[0-9a-f]{64}$')
+      - preprod_seed_manifest | length > 0
+      - preprod_seed_manifest_sha256 is match('^[0-9a-f]{64}$')
+      - >-
+        not (preprod_seed_load_archive | bool) or
+        (
+          preprod_host_kernel.stdout | trim == 'Darwin' and
+          preprod_seed_loader_archive == preprod_seed_archive
+        ) or
+        preprod_seed_loader_archive is match('^/var/tmp/ai-gateway-preprod-seeds/[0-9a-f]{16}/[A-Za-z0-9._-]+\.docker\.tar\.zst$')
+      - >-
+        not (preprod_seed_load_archive | bool) or
+        (
+          preprod_host_kernel.stdout | trim == 'Darwin' and
+          preprod_seed_loader_manifest == preprod_seed_manifest
+        ) or
+        preprod_seed_loader_manifest is match('^/var/tmp/ai-gateway-preprod-seeds/[0-9a-f]{16}/[A-Za-z0-9._-]+\.manifest\.json$')
+    quiet: true
+    fail_msg: Seed mode requires the archive, archive SHA-256, manifest, and manifest SHA-256.
+  when: preprod_image_mode == 'seed'
+
+- name: Refuse a remote Docker context
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - check-context
+  changed_when: false
+
+- name: Generate persistent test PKI, static test credentials, and domain-rendered realms
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - prepare
+  register: preprod_prepare
+  changed_when: "'PREPROD_PREPARED' in preprod_prepare.stdout"
+
+- name: Prove the root loader uses the operator's exact Docker engine
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - seed
+      - check-root-seed-engine
+  changed_when: false
+  when:
+    - preprod_image_mode == 'seed'
+    - preprod_seed_load_archive | bool
+    - preprod_host_kernel.stdout | trim == 'Linux'
+
+- name: Load the exact offline image seed
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ preprod_repo_root }}/scripts/load-offline-image-seed.py"
+      - root-preprod-load
+      - "{{ preprod_seed_loader_archive }}"
+      - "{{ preprod_seed_archive_sha256 }}"
+      - "{{ preprod_seed_loader_manifest }}"
+      - "{{ preprod_seed_manifest_sha256 }}"
+      - "{{ preprod_seed_marker_directory }}"
+  become: true
+  register: preprod_seed_load
+  changed_when: "preprod_seed_load.stdout is search('^(LOADED|RELOADED) ')"
+  when:
+    - preprod_image_mode == 'seed'
+    - preprod_seed_load_archive | bool
+    - preprod_host_kernel.stdout | trim == 'Linux'
+
+- name: Load the exact offline image seed through the Docker Desktop operator
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - seed
+      - load-local-preprod-seed
+      - "{{ preprod_seed_loader_archive }}"
+      - "{{ preprod_seed_archive_sha256 }}"
+      - "{{ preprod_seed_loader_manifest }}"
+      - "{{ preprod_seed_manifest_sha256 }}"
+  become: false
+  register: preprod_local_seed_load
+  changed_when: "preprod_local_seed_load.stdout is search('PREPROD_LOCAL_SEED_(LOADED|RELOADED) ')"
+  when:
+    - preprod_image_mode == 'seed'
+    - preprod_seed_load_archive | bool
+    - preprod_host_kernel.stdout | trim == 'Darwin'
+
+- name: Bind preprod to immutable transfer image references
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - seed
+      - activate-seed
+      - "{{ preprod_seed_archive }}"
+      - "{{ preprod_seed_manifest }}"
+      - "{{ preprod_seed_manifest_sha256 }}"
+  become: false
+  register: preprod_seed_activate
+  changed_when: "'PREPROD_SEED_ACTIVATED' in preprod_seed_activate.stdout"
+  when: preprod_image_mode == 'seed'
+
+- name: Create only namespaced preprod Docker networks
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - create-networks
+  register: preprod_networks
+  changed_when: "'PREPROD_NETWORKS_READY' in preprod_networks.stdout"
+
+- name: Render and validate the complete preprod Compose model
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - compose-config
+  changed_when: false
+
+- name: Pull updated pinned base images for a requested source build
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - source
+      - pull
+  when:
+    - preprod_image_mode == 'source'
+    - preprod_pull_images | bool
+  changed_when: true
+
+- name: Build source-checkout candidate images
+  ansible.builtin.command:
+    argv: >-
+      {{
+        [
+          'python3', preprod_repo_root + '/scripts/preprod.py',
+          '--domain', aigw_domain,
+          '--project', preprod_project_name,
+          '--prefix', preprod_resource_prefix,
+          '--subnet-octet', preprod_subnet_octet | string,
+          '--image-mode', 'source',
+          'build'
+        ]
+        + (['--pull'] if preprod_pull_images | bool else [])
+      }}
+  when:
+    - preprod_image_mode == 'source'
+    - preprod_build_images | bool
+  changed_when: true
+
+- name: Create only missing macOS preprod loopback aliases
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - ensure-loopback-aliases
+  become: true
+  register: preprod_loopback_aliases
+  changed_when: >-
+    'PREPROD_LOOPBACK_ALIASES_CREATED' in preprod_loopback_aliases.stdout or
+    'PREPROD_LOOPBACK_ALIASES_MIGRATED' in preprod_loopback_aliases.stdout
+  when: preprod_host_kernel.stdout | trim == 'Darwin'
+
+- name: Start the isolated preprod project
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - start
+  changed_when: true
+
+- name: Initialize or unseal the local test Vault
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - bootstrap-vault
+  register: preprod_vault
+  changed_when: "'PREPROD_VAULT_READY' in preprod_vault.stdout"
+
+- name: Auto-initialize Keycloak identity control without the admin portal
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - auto-initialize-identity
+  register: preprod_identity_auto_init
+  changed_when: "'IDENTITY_AUTO_BOOTSTRAP_APPLIED' in preprod_identity_auto_init.stdout"
+  failed_when: >-
+    preprod_identity_auto_init.rc != 0 or
+    not (
+      preprod_identity_auto_init.stdout | trim in
+      ['IDENTITY_AUTO_BOOTSTRAP_APPLIED', 'IDENTITY_AUTO_BOOTSTRAP_VERIFIED']
+    )
+
+- name: Create and verify the three static preprod user assignments
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - configure-users
+  register: preprod_users
+  changed_when: "'PREPROD_USERS_CONFIGURED' in preprod_users.stdout"
+
+- name: Enroll and exercise the TLS WIF provider mock
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - configure-wif
+  register: preprod_wif
+  changed_when: "'PREPROD_WIF_CONFIGURED' in preprod_wif.stdout"
+
+- name: Verify LDAP, OIDC, identity controller, escrow, and WIF state
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - verify
+  changed_when: false
+
+- name: Run the full local preprod edge and identity acceptance gate
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - "{{ preprod_repo_root }}/scripts/test-e2e-preprod.py"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+  register: preprod_end_to_end_acceptance
+  changed_when: false
+  failed_when: >-
+    preprod_end_to_end_acceptance.rc != 0 or
+    'PREPROD_E2E_PASSED' not in preprod_end_to_end_acceptance.stdout
+
+- name: Report the full local preprod acceptance result
+  ansible.builtin.debug:
+    msg: PREPROD_E2E_PASSED
+
+- name: Show the optional bounded hosts fragment
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - hosts-fragment
+  register: preprod_hosts_fragment
+  changed_when: false
+  when: not (preprod_manage_hosts | bool)
+
+- name: Print the hosts fragment for manual review
+  ansible.builtin.debug:
+    msg: "{{ preprod_hosts_fragment.stdout_lines }}"
+  when: not (preprod_manage_hosts | bool)
+
+- name: Install only the marker-bounded preprod hosts fragment
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - install-hosts
+  become: true
+  register: preprod_hosts_install
+  changed_when: "'PREPROD_HOSTS_INSTALLED' in preprod_hosts_install.stdout"
+  when: preprod_manage_hosts | bool

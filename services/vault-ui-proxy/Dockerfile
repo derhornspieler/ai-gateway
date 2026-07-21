@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# syntax=docker/dockerfile:1.25.0@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
 
 # The source image is HashiCorp's official multi-architecture Vault 2.0.3
 # release, pinned to its manifest-list digest. Its /bin/vault is the exact
@@ -10,7 +10,7 @@ FROM hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5
 
 # Both build tools are stdlib-only and compile in the already-reviewed DHI Go
 # toolchain. GOTOOLCHAIN=local prevents an implicit toolchain download.
-FROM dhi.io/golang:1.25.12-alpine-dev@sha256:4411028e8461d5a111cdbf0aa172db17342557590f7727a4dd4649440bb411c2 AS builder
+FROM dhi.io/golang:1.26.5-alpine-dev@sha256:711ea0b8f09f549c50f2f550dc26859d3e6441ca11d5640caecf69c29a862f0c AS builder
 ARG TARGETARCH
 ENV GOTOOLCHAIN=local
 WORKDIR /src
@@ -59,7 +59,7 @@ RUN --network=none set -eu; \
 # intact but the direct proxy entrypoint and startup process assertion prove it
 # is dormant. The upstream extraction binary, extractor, source-image layers,
 # build shell, and package tools do not cross this stage.
-FROM dhi.io/vault:2.0.3@sha256:743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6
+FROM dhi.io/vault:2.0.3@sha256:2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e
 
 COPY --from=builder --chown=0:0 --chmod=0555 /out/vault-ui-proxy /usr/local/bin/vault-ui-proxy
 COPY --from=builder --chown=0:0 /vault-ui /opt/vault-ui

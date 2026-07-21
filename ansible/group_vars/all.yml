@@ -6,8 +6,7 @@
 # Empty lookups are deliberate: site.yml rejects them before the first role
 # can install packages, write firewall state, or add policy routes.
 # 'rocky9-production' is the canonical fail-closed customer profile;
-# 'generic-rocky9' remains a working DEPRECATED compatibility alias (all
-# fail-closed logic keys off the profile NOT being 'rocky9-lab').
+# 'generic-rocky9' remains a working DEPRECATED compatibility alias.
 deployment_profile: "{{ lookup('ansible.builtin.env', 'AIGW_DEPLOYMENT_PROFILE') | default('rocky9-production', true) }}"
 nic_egress: "{{ lookup('ansible.builtin.env', 'AIGW_NIC_EGRESS') }}"
 nic_adm: "{{ lookup('ansible.builtin.env', 'AIGW_NIC_ADM') }}"
@@ -61,27 +60,8 @@ aigw_adopt_firewalld_state: false
 # takeover independently of Docker/firewalld ownership.
 aigw_adopt_ssh_state: false
 
-# SSH stays reachable only through the ADM interface/CIDR firewalld rule.  The
-# generic/customer profile defaults to key-only. A lab inventory can enable
-# password authentication explicitly during greenfield access setup; root
-# login and all forwarding remain denied by default regardless of this setting.
-aigw_ssh_password_authentication: false
-
-# Dynamic SSH SOCKS forwarding is off by default.  Enabling it requires both
-# an approved local user and/or group and one or more source CIDRs contained
-# by vpn_client_cidr.  Group-based exceptions additionally name a real local
-# member for `sshd -T -C` verification; this prevents untested Match Group
-# policy from silently reaching production.
-aigw_adm_socks_enabled: false
-aigw_adm_socks_users: []
-aigw_adm_socks_groups: []
-aigw_adm_socks_source_cidrs: []
-aigw_adm_socks_group_test_users: {}
-# `PermitOpen any` is necessary for a true browser SOCKS proxy, but it lets a
-# named approved operator reach every destination routable by the host. Keep
-# the feature disabled unless the environment inventory explicitly records
-# this trusted-operator acknowledgement.
-aigw_adm_socks_trusted_operator_ack: ""
+# SSH stays reachable only through the ADM interface/CIDR firewalld rule.
+# Password authentication and all SSH forwarding are unconditionally denied.
 
 # Configure the Rocky SELinux desired state before Docker is installed or
 # restarted.  Enabling a disabled policy requires a reboot, which remains an
@@ -114,6 +94,18 @@ cribl_otlp_endpoint: "cribl-mock:4317"
 cribl_otlp_insecure: true
 cribl_otlp_ca_file: "/etc/ssl/certs/aigw-cribl-ca.pem"
 cribl_otlp_server_name: "cribl-mock"
+
+# Immutable Envoy egress build inputs. A schema-v2 offline release overrides
+# these from its validated policy receipt. These reviewed defaults keep the
+# older source-build path fail-closed: the Docker build independently
+# regenerates the policy and refuses a stale digest.
+aigw_egress_source_date_epoch: "0"
+aigw_egress_providers:
+  - anthropic
+aigw_egress_policy_sha256: "46792952f978335aa2681638f295d2208ab1d9a0154879a0d6dc9ef02d3a7907"
+# Set only from a loaded schema-v2 release. Source builds prove the same
+# policy labels but have no release-manifest image ID to compare.
+aigw_expected_envoy_image_id: ""
 # Controller-local PEM bundle for the REAL Cribl endpoint's CA. Required when
 # cribl_external_export_enabled is true; never the edge CA.
 cribl_otlp_ca_pem_file: ""
@@ -128,9 +120,6 @@ cribl_otlp_ca_pem_file: ""
 #
 # Exactly one mode must be selected; the selection is fail-closed in site.yml.
 #
-#   lab                -- self-signed TEST root minted by vault-bootstrap.sh.
-#                         Legal on rocky9-lab only, and only as the explicit
-#                         fallback for a disposable lab with no real CA.
 #   vault-intermediate -- Vault generates the intermediate key INTERNALLY and
 #                         emits a CSR; the customer CA signs it OFFLINE; the
 #                         signed cert + chain are imported back. The customer's
@@ -141,16 +130,15 @@ cribl_otlp_ca_pem_file: ""
 #                         certificate AND its private key plus the complete
 #                         chain. Vault imports that intermediate into pki_int,
 #                         promotes it to the default issuer, and issues every
-#                         leaf (edge wildcard + Samba LDAPS) under it. This is a
+#                         platform-managed leaf under it. This is a
 #                         higher-trust posture than vault-intermediate: the
 #                         gateway briefly holds the intermediate signing key,
 #                         which transits the no_log Ansible pipe, sits at
 #                         secrets/aigw-intermediate-import.key (0600 root) until
 #                         the import ceremony, is imported over stdin, and is
 #                         then shredded. The customer ROOT key is still never
-#                         supplied. One mode for lab and production; they differ
-#                         only in where the intermediate material comes from.
-aigw_edge_tls_mode: "{{ 'lab' if deployment_profile == 'rocky9-lab' else '' }}"
+#                         supplied.
+aigw_edge_tls_mode: ""
 # Mode customer-supplied only: controller-local PEM paths. Never committed,
 # never placed in the encrypted inventory overlay (a multi-line PEM in an inline
 # vault would create a second custody path); the key file must be 0600.
@@ -170,7 +158,7 @@ aigw_edge_tls_min_days_remaining: 30
 # An existing host's addressing and ordinary routing are customer-owned.
 # Source-policy routing is opt-in because it adds two defaults/rules; declare
 # both this flag and the exact tables in an environment inventory only when
-# asymmetric reply routing is actually required.  The lab profile opts in.
+# asymmetric reply routing is actually required.
 manage_networking: false
 pbr_tables: []
 
@@ -201,8 +189,8 @@ docker_networks:
   # Published ports do not traverse a Docker `internal: true` bridge. This
   # dedicated ordinary bridge has no application peers; DOCKER-USER and the
   # independent nft guard still deny every container-originated egress flow.
-  # It is used only by the explicit lab overlay.
-  - { name: net-lab-dns,       bridge: br-lab-dns, subnet: 172.28.18.0/24, internal: false }
+  # It is used only when authoritative platform DNS is enabled.
+  - { name: net-platform-dns,  bridge: br-platform-dns, subnet: 172.28.18.0/24, internal: false }
   # Docker 29 silently omits published-port DNAT when every attached bridge is
   # `internal: true`. This ordinary no-peer bridge exists only for traefik-int;
   # DOCKER-USER and the native nft guard deny every bridge-originated egress.
@@ -235,8 +223,7 @@ cribl_otlp_allowed_port: 4317
 
 # ── External production directory federation (LDAPS only) ───────────────
 # Optional customer Active Directory federation for generic/production
-# deployments. It is never combined with the lab Samba overlay: exactly one
-# identity source may own the Keycloak truststore and the federation
+# deployments. One identity source owns the Keycloak truststore and federation
 # reconciliation inputs. Every value is inventory-owned and fail-closed, and
 # the bind credential lives only in a dedicated encrypted overlay written by
 # scripts/store-identity-ldap-bind-password.py. Plaintext ldap:// is refused
@@ -276,7 +263,7 @@ oauth2_proxy_grafana_ip: 172.28.6.3
 alloy_telemetry_ip: 172.28.13.2
 alloy_observability_ip: 172.28.15.2
 prometheus_observability_ip: 172.28.15.3
-lab_dns_ip: 172.28.18.2
+platform_dns_ip: 172.28.18.2
 
 # ── firewalld ───────────────────────────────────────────────────────────
 # Zone names are prefixed (aigw-*) deliberately: firewalld ships built-in
@@ -306,19 +293,13 @@ firewalld_zones:
     rich_rules:
       - 'rule family="ipv4" source address="{{ internal_cidr }}" port port="443" protocol="tcp" accept'
 
-# A clean-reset handoff leaves the lab egress and internal NICs in firewalld's
-# built-in fail-closed ``drop`` zone until the next full converge. Generic and
-# customer profiles never inherit this exception; the roles additionally bind
-# it to this exact two-interface lab contract before accepting it.
-aigw_lab_reset_handoff_drop_interfaces: []
-
-# ── Feature flags (set false for a reduced local test VM) ──────────────
+# ── Feature flags ──────────────────────────────────────────────────────
 manage_firewalld: true       # zones + DOCKER-USER
 # Optional authoritative-only split DNS for the gateway zone. It never
-# forwards arbitrary names. The lab enables it; a generic deployment may opt
-# in explicitly when clients should point their ADM/internal interfaces at the
-# corresponding gateway address.
-platform_authoritative_dns_enabled: "{{ deployment_profile == 'rocky9-lab' }}"
+# forwards arbitrary names. A production deployment may opt in explicitly
+# when clients should point their ADM/internal interfaces at the corresponding
+# gateway address.
+platform_authoritative_dns_enabled: false
 # The Vault API remains an internal control-plane dependency regardless of
 # this flag. Only the browser-facing ADM UI and its OIDC proxy are optional;
 # generic/customer deployments keep that additional operator surface closed
@@ -363,43 +344,26 @@ offline_image_seed_marker_dir: "{{ docker_data_root }}/.aigw-image-seeds"
 # warn (but no longer fail) before mutation when either fails to resolve
 # through a dm-crypt/LUKS ancestor: LUKS is a build-time (disk-provisioning)
 # concern the converge does not manage, so the gap is surfaced loudly and the
-# converge continues. The explicit lab profile opts out of even the warning
-# because it is disposable local test.
+# converge continues.
 require_encrypted_state: true
-# This is deliberately stricter than the raw switch: an unencrypted-state
-# exception is valid only when the selected profile is the committed disposable
-# Rocky 9 lab *and* that lab explicitly sets require_encrypted_state=false.
-# Generic/customer profiles therefore remain fail-closed even if a stray
-# inventory override supplies false.
-aigw_encrypted_state_preflight_required: >-
-  {{ (deployment_profile | default('')) != 'rocky9-lab' or
-     (require_encrypted_state | bool) }}
+aigw_encrypted_state_preflight_required: "{{ require_encrypted_state | bool }}"
 require_preupgrade_backup: true
 encrypted_state_paths:
   - "{{ docker_data_root }}"
   - "{{ stack_dir }}"
 compose_project_name: ai-gateway
+# PostgreSQL major versions never share a physical data directory. Existing
+# PostgreSQL 16 hosts must run ansible/migrate-postgres18.yml before converge;
+# clean deployments create this PostgreSQL 18 volume directly.
+pg_data_volume_name: "{{ compose_project_name }}_pg18_data"
 aigw_domain: aigw.example.internal
-samba_lab_enabled: "{{ deployment_profile == 'rocky9-lab' }}"
-retain_bootstrap_admin_user: false
-# A narrowly scoped recovery bridge for a realm created before explicit OIDC
-# role scope mappings were imported. It is deliberately off for generic and
-# customer inventories: it uses Keycloak's temporary bootstrap authority but
-# refuses to run unless no durable identity controller is configured.
-aigw_prebootstrap_oidc_scope_reconciliation: false
-aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
 # Optional pre-Vault recovery bridge. Generic/customer inventories inherit no
 # users, groups, federation choice, or acknowledgement: enabling it without an
 # explicit inventory-owned mutation set fails before Keycloak is contacted.
 aigw_pre_vault_identity_baseline_reconciliation: false
 aigw_pre_vault_identity_baseline_reconciliation_ack: ""
-aigw_pre_vault_identity_ensure_lab_federation: false
 aigw_pre_vault_identity_baseline_groups: []
 aigw_pre_vault_identity_bootstrap_admin_identities: []
-samba_lab_seed_users:
-  - lab-admin
-  - lab-developer
-  - lab-user
 
 # ── Portal key-issuance guardrails (static backstop; default UNLIMITED) ─
 # Owner decision: a new self-service key carries NO budget, rate limit, or
@@ -437,8 +401,6 @@ aigw_seed_test_users: false
 # ── Stack secrets ───────────────────────────────────────────────────────
 # NO secret defaults ship in git. Every credential below is intentionally
 # UNDEFINED here and MUST be supplied by an Ansible-Vault/SOPS-encrypted
-# overlay. `inventory/group_vars/gateway/vault.yml` is selected only by the
-# committed lab inventory. Generic/customer operators must use the separate
 # layout generated by `scripts/bootstrap-generic-rocky9.py`, whose overlay is
 # `group_vars/generic_rocky9/vault.yml` beside that generated inventory.
 # env.j2 and the Keycloak realm templates wrap each of these in
@@ -467,10 +429,6 @@ aigw_seed_test_users: false
 #   portal_session_secret admin_portal_session_secret
 #   rotator_internal_token portal_identity_token grafana_admin_password
 #   kc_bootstrap_admin_client_secret
-# The rocky9-lab profile additionally requires:
-#   samba_ad_admin_password     samba_ad_bind_password
-#   samba_user_lab_admin_password samba_user_lab_developer_password
-#   samba_user_lab_user_password
 # A production deployment with identity_ldap_enabled additionally requires:
 #   identity_ldap_bind_password  <encrypted overlay only when identity_ldap_enabled>
 #
@@ -515,11 +473,6 @@ aigw_seed_test_users: false
 # portal_identity_token:      <vault overlay only; distinct from rotator token>
 # grafana_admin_password:     <vault overlay only>
 # kc_bootstrap_admin_client_secret: <vault overlay only>
-# samba_ad_admin_password:    <lab vault overlay only>
-# samba_ad_bind_password:     <lab vault overlay only>
-# samba_user_lab_admin_password: <lab vault overlay only>
-# samba_user_lab_developer_password: <lab vault overlay only>
-# samba_user_lab_user_password: <lab vault overlay only>
 # vault_unseal_key:           <vault overlay only>  # Operator-supplied output
 #     of HashiCorp Vault initialization. Never randomly generate this value.
 #     When defined, Ansible may use it via the stdin-only unseal helper.
@@ -527,8 +480,8 @@ aigw_seed_test_users: false
 #     read-only directory service-account credential. Never randomly generated;
 #     store it with scripts/store-identity-ldap-bind-password.py (stdin only).
 
-# Not an overlay secret: starts empty, written in place on the VM by
-# scripts/vault-bootstrap.sh after Vault init/unseal.
+# Not an overlay secret: starts empty and is written in place during the
+# documented Vault initialization ceremony.
 rotator_vault_token: ""
 
 # ── Anthropic WIF broker client authentication ──────────────────────────

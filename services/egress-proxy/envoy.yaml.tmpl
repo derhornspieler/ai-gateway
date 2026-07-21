@@ -1,0 +1,128 @@
+# Generated from the reviewed provider catalog. Do not edit the generated
+# /etc/envoy/envoy.yaml inside an image.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: egress_http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: egress
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        json_format:
+                          time: "%START_TIME%"
+                          method: "%REQ(:METHOD)%"
+                          upstream: "%UPSTREAM_CLUSTER%"
+                          status: "%RESPONSE_CODE%"
+                          flags: "%RESPONSE_FLAGS%"
+                          duration_ms: "%DURATION%"
+                          bytes_tx: "%BYTES_SENT%"
+                route_config:
+                  name: selected_providers
+                  virtual_hosts:
+                    - name: egress
+                      domains: ["*"]
+                      routes:
+{{ range .Providers }}                        - match: { prefix: "{{ .RoutePrefix }}" }
+                          name: {{ .Name }}-api
+                          route:
+                            cluster: {{ .Name }}
+                            prefix_rewrite: "/"
+                            host_rewrite_literal: {{ .APIHostname }}
+                            timeout: 600s
+{{ end }}                        # There is no default route. Unselected paths return 404.
+                http_filters:
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: ALLOW
+                        policies:
+                          net_vendor_only:
+                            permissions:
+                              - any: true
+                            principals:
+                              - direct_remote_ip:
+                                  address_prefix: 172.28.7.0
+                                  prefix_len: 24
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    # Prometheus gets one read-only stats path, not the Envoy admin API.
+    - name: read_only_metrics
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 9902 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: metrics_export
+                route_config:
+                  name: metrics
+                  virtual_hosts:
+                    - name: metrics
+                      domains: ["*"]
+                      routes:
+                        - name: prometheus-stats-only
+                          match:
+                            path: "/stats/prometheus"
+                            headers:
+                              - name: ":method"
+                                string_match: { exact: "GET" }
+                          route:
+                            cluster: local_admin
+                            timeout: 5s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: local_admin
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: local_admin
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+{{ range .Providers }}    - name: {{ .Name }}
+      type: LOGICAL_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 10s
+      load_assignment:
+        cluster_name: {{ .Name }}
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{ .APIHostname }}, port_value: 443 }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: {{ .SNI }}
+          common_tls_context:
+            validation_context:
+              trusted_ca: { filename: /etc/envoy/certs/{{ .CAFile }} }
+              match_typed_subject_alt_names:
+{{ range .ExactSANs }}                - san_type: DNS
+                  matcher: { exact: {{ . }} }
+{{ end }}
+{{ end }}

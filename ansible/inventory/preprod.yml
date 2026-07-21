@@ -1,0 +1,11 @@
+all:
+  children:
+    preprod:
+      hosts:
+        localhost:
+          ansible_connection: local
+      vars:
+        aigw_domain: aigw.internal
+        preprod_project_name: aigw-preprod
+        preprod_resource_prefix: aigw-preprod
+        preprod_subnet_octet: 29

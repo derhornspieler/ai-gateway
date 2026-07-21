@@ -44,7 +44,7 @@ ones stacked at the top ("custom pricing") tier.
 | Multi-provider routing, retries, fallbacks | OSS gateway | Free | LiteLLM proxy | Free (MIT) |
 | OpenAI/Anthropic-compatible API | OSS gateway | Free | LiteLLM (`/v1/chat/completions`, `/v1/messages`) | Free |
 | Provider-credential vaulting ("virtual keys") | Hosted platform | **Paid** (absent from OSS tier) | Vault + key-rotator; WIF-minted 600 s tokens, restart-safe reconcile | Free (Vault under BSL 1.1 — free to run, source-available, not OSI-open) |
-| Automated key rotation | Managed | Paid tiers | key-rotator drivers (anthropic-wif, openai-svcacct) | Free (built here) |
+| Automated key rotation | Managed | Paid tiers | Anthropic WIF; other provider drivers are dormant until reviewed and released | Free (built here) |
 | SSO / OIDC / SAML | Hosted platform | **Enterprise only** | Keycloak, first-class across every app | Free (Apache-2.0). **LiteLLM's own admin-UI SSO is an enterprise feature — routed around with oauth2-proxy + Keycloak** |
 | RBAC / teams / workspaces | Hosted | **Production tier and up**; org-granular at Enterprise | Keycloak realm roles (`aigw-admins/-developers/-chat`) + admin portal | Free |
 | Observability: logs, traces, metrics | Hosted; 10k logs/mo free, 100k at $49, 10M+ Enterprise; retention capped by tier | **Metered + paid** | Grafana/Prometheus/Loki/Tempo — unlimited, local, retention is a disk decision | Free (AGPL/Apache). Note: some LiteLLM telemetry callbacks are enterprise-gated upstream; our dashboards use self-owned pipelines |

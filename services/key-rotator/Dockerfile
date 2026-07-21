@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# syntax=docker/dockerfile:1.25.0@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
 # key-rotator — see README.md and docs/solution-map.md §1.7 for design.
 #
 # Runs only on segmented application/data networks (docs/solution-map.md §3),
@@ -8,7 +8,7 @@
 # that boundary is enforced by Docker network placement + firewalld/
 # DOCKER-USER rules at the compose/ansible layer, not here.
 
-FROM dhi.io/python:3.12.13-dev@sha256:a7dc6d4025e3e94ab67f7331729a582c3eda127afa64d15c855ab82b44e8a7ea AS python-builder
+FROM dhi.io/python:3.14.6-dev@sha256:9b72c38a520f44fafa1c4a3026e9b390eb3b4967c62d38be01400ecbb0232b65 AS python-builder
 WORKDIR /build
 COPY requirements.txt requirements.lock ./
 RUN python3 -m venv /opt/venv \
@@ -16,10 +16,11 @@ RUN python3 -m venv /opt/venv \
         --no-cache-dir \
         --no-compile \
         --disable-pip-version-check \
+        --only-binary=:all: \
         --require-hashes \
         -r requirements.lock
 
-FROM dhi.io/python:3.12.13@sha256:eb7705c04a8240fa06d1f3d6e8adb61f72e5f0b2b457411a2840297cb5f997f3
+FROM dhi.io/python:3.14.6@sha256:c82da5a1a30a6214f45c42def5b6f5b85981c7dc7a1802015a6ebf264675436d
 
 WORKDIR /app
 COPY --from=python-builder /opt/venv /opt/venv

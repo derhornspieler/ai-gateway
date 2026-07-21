@@ -10,7 +10,7 @@
 # networking, so it is safe in isolation.
 # Kept in the ansible/ project root so playbook-adjacent group_vars/all.yml loads.
 - name: AI Gateway — container stack only
-  hosts: gateway:generic_rocky9
+  hosts: generic_rocky9
   become: true
   pre_tasks:
     - name: Preflight — require a bounded canonical lowercase deployment domain
@@ -295,24 +295,24 @@
             (('ip daddr ' ~ item) in stack_only_host_input.stdout)
           - >-
             not (platform_authoritative_dns_enabled | bool) or
-            (('-i br-lab-dns' in stack_only_du.stdout) and
-             (('-s ' ~ lab_dns_ip ~ '/32') in stack_only_du.stdout) and
+            (('-i br-platform-dns' in stack_only_du.stdout) and
+             (('-s ' ~ platform_dns_ip ~ '/32') in stack_only_du.stdout) and
              ('--sport 53' in stack_only_du.stdout) and
              ('--ctdir REPLY' in stack_only_du.stdout))
           - >-
             not (platform_authoritative_dns_enabled | bool) or
-            (('iifname "br-lab-dns"' in stack_only_host_input.stdout) and
-             (('ip saddr ' ~ lab_dns_ip) in stack_only_host_input.stdout) and
+            (('iifname "br-platform-dns"' in stack_only_host_input.stdout) and
+             (('ip saddr ' ~ platform_dns_ip) in stack_only_host_input.stdout) and
              ('sport 53' in stack_only_host_input.stdout) and
              ('ct direction reply accept' in stack_only_host_input.stdout))
           - >-
             (platform_authoritative_dns_enabled | bool) or
-            not (('-i br-lab-dns' in stack_only_du.stdout) and
+            not (('-i br-platform-dns' in stack_only_du.stdout) and
                  ('--sport 53' in stack_only_du.stdout) and
                  ('--ctdir REPLY' in stack_only_du.stdout))
           - >-
             (platform_authoritative_dns_enabled | bool) or
-            not (('iifname "br-lab-dns"' in stack_only_host_input.stdout) and
+            not (('iifname "br-platform-dns"' in stack_only_host_input.stdout) and
                  ('sport 53' in stack_only_host_input.stdout) and
                  ('ct direction reply accept' in stack_only_host_input.stdout))
         fail_msg: >-

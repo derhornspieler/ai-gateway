@@ -267,12 +267,12 @@ async def test_in_memory_credential_names_parses_the_list() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
         assert request.url.path == "/credentials"
-        return _present(["anthropic-primary", "openai-primary"])
+        return _present(["anthropic-primary", "synthetic-primary"])
 
     client = LiteLLMClient(settings(), transport=httpx.MockTransport(handler))
     assert await client.in_memory_credential_names() == {
         "anthropic-primary",
-        "openai-primary",
+        "synthetic-primary",
     }
 
 

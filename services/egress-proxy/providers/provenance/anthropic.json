@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "provider": "anthropic",
+  "api_hostname": "api.anthropic.com",
+  "verification_status": "current-chain-verified",
+  "verified_at": "2026-07-21",
+  "verification_scope": "Committed bundle bytes, current endpoint chain, and official CA-repository fingerprints",
+  "source_bundle_sha256": "105d0a49dc2709a3c1ee9e28d4d12a592a2fdd07946052484d499123cd1ebb92",
+  "certificate_sha256_fingerprints": [
+    "1dfc1605fbad358d8bc844f76d15203fac9ca5c1a79fd4857ffaf2864fbebf96",
+    "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d"
+  ],
+  "verification": [
+    "The committed bundle parses as the WE1 intermediate followed by the self-signed GTS Root R4.",
+    "A live TLS check with SNI and system trust returned Verify return code 0 for api.anthropic.com on 2026-07-21 and presented a leaf issued by WE1.",
+    "The WE1 and GTS Root R4 fingerprints match the Google Trust Services repository at https://pki.goog/repository/."
+  ],
+  "limitations": [
+    "The live endpoint check is a point-in-time observation, not proof of future routing or endpoint geography.",
+    "A matching fingerprint proves certificate bytes match the reviewed certificate. It does not by itself prove the original capture path.",
+    "A certificate subject country does not prove endpoint geography, processing location, or data residency."
+  ]
+}

@@ -64,3 +64,33 @@
       ansible.builtin.debug:
         msg: "Offline image seed {{ offline_image_seed_result.stdout | lower }}"
       changed_when: false
+
+    - name: Read the loaded immutable Envoy policy receipt
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - /usr/local/sbin/aigw-load-offline-image-seed
+          - loaded-egress-policy-receipt
+          - "{{ offline_image_seed_remote_path }}"
+          - "{{ offline_image_seed_manifest_remote_path }}"
+          - "{{ offline_image_seed_manifest_sha256 }}"
+      register: offline_image_seed_egress_policy_raw
+      changed_when: false
+
+    - name: Record the loaded immutable Envoy policy
+      ansible.builtin.set_fact:
+        aigw_release_egress_policy: >-
+          {{ offline_image_seed_egress_policy_raw.stdout | from_json }}
+      no_log: true
+
+    - name: Use the loaded Envoy policy as the deployment build contract
+      ansible.builtin.set_fact:
+        aigw_egress_source_date_epoch: "0"
+        aigw_egress_providers: >-
+          {{ aigw_release_egress_policy.selected_providers }}
+        aigw_egress_policy_sha256: >-
+          {{ aigw_release_egress_policy.egress_policy_sha256 }}
+        aigw_expected_envoy_image_id: >-
+          {{ aigw_release_egress_policy.envoy_image_id }}
+      no_log: true

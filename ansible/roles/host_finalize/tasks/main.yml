@@ -31,5 +31,5 @@
       on the controller only when needed, e.g.
       ansible -i <your inventory> {{ inventory_hostname }} -m debug -a
       var=litellm_ui_breakglass_password --vault-id <label>@<password-file>
-      (lab inventories may use --ask-vault-pass). Never echo it into shell
+      (generated inventories use their named --vault-id). Never echo it into shell
       history or logs.

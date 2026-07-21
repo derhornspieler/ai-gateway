@@ -1,0 +1,265 @@
+---
+# Make root-owned copies for the root-only local seed loader. The controller
+# originals stay owned by the desktop user. State=absent removes only the
+# digest-scoped root staging directory and proves it is gone.
+- name: Stage one local preprod image release for the root loader
+  hosts: preprod
+  gather_facts: false
+  become: true
+  vars:
+    preprod_seed_stage_root: /var/tmp/ai-gateway-preprod-seeds
+  pre_tasks:
+    - name: Validate local preprod seed staging inputs
+      ansible.builtin.assert:
+        that:
+          - preprod_seed_stage_state in ['present', 'absent']
+          - preprod_seed_stage_controller_archive is match('^/.*\.docker\.tar\.zst$')
+          - preprod_seed_stage_archive_sha256 is match('^[0-9a-f]{64}$')
+          - preprod_seed_stage_controller_manifest is match('^/.*\.manifest\.json$')
+          - preprod_seed_stage_manifest_sha256 is match('^[0-9a-f]{64}$')
+          - preprod_seed_stage_directory is match('^/var/tmp/ai-gateway-preprod-seeds/[0-9a-f]{16}$')
+          - >-
+            preprod_seed_stage_archive is match(
+              '^/var/tmp/ai-gateway-preprod-seeds/[0-9a-f]{16}/'
+              ~
+              '[A-Za-z0-9._-]+\.docker\.tar\.zst$'
+            )
+          - >-
+            preprod_seed_stage_manifest is match(
+              '^/var/tmp/ai-gateway-preprod-seeds/[0-9a-f]{16}/'
+              ~
+              '[A-Za-z0-9._-]+\.manifest\.json$'
+            )
+          - (preprod_seed_stage_archive | dirname) == preprod_seed_stage_directory
+          - (preprod_seed_stage_manifest | dirname) == preprod_seed_stage_directory
+        quiet: true
+        fail_msg: Local preprod seed staging inputs are incomplete or unsafe.
+
+  tasks:
+    - name: Stage private root-owned local preprod release files
+      when: preprod_seed_stage_state == 'present'
+      block:
+        - name: Inspect local-user release files
+          ansible.builtin.stat:
+            path: "{{ item.path }}"
+            follow: false
+            get_checksum: true
+            checksum_algorithm: sha256
+          become: false
+          loop:
+            - path: "{{ preprod_seed_stage_controller_archive }}"
+              sha256: "{{ preprod_seed_stage_archive_sha256 }}"
+            - path: "{{ preprod_seed_stage_controller_manifest }}"
+              sha256: "{{ preprod_seed_stage_manifest_sha256 }}"
+          register: preprod_seed_stage_controller_files
+
+        - name: Require exact private local-user release files
+          ansible.builtin.assert:
+            that:
+              - item.stat.isreg
+              - not (item.stat.islnk | default(false))
+              - item.stat.mode == '0600'
+              - item.stat.checksum == item.item.sha256
+            quiet: true
+          loop: "{{ preprod_seed_stage_controller_files.results }}"
+
+        - name: Inspect the fixed root staging boundary
+          ansible.builtin.stat:
+            path: "{{ preprod_seed_stage_root }}"
+            follow: false
+          register: preprod_seed_stage_root_before
+
+        - name: Refuse an unsafe existing root staging boundary
+          ansible.builtin.assert:
+            that:
+              - not (preprod_seed_stage_root_before.stat.exists | default(false)) or
+                (preprod_seed_stage_root_before.stat.isdir | default(false))
+              - not (preprod_seed_stage_root_before.stat.islnk | default(false))
+              - not (preprod_seed_stage_root_before.stat.exists | default(false)) or
+                preprod_seed_stage_root_before.stat.uid == 0
+              - not (preprod_seed_stage_root_before.stat.exists | default(false)) or
+                preprod_seed_stage_root_before.stat.gid == 0
+              - not (preprod_seed_stage_root_before.stat.exists | default(false)) or
+                preprod_seed_stage_root_before.stat.mode == '0700'
+            quiet: true
+
+        - name: Inspect the digest-scoped local preprod staging directory
+          ansible.builtin.stat:
+            path: "{{ preprod_seed_stage_directory }}"
+            follow: false
+          register: preprod_seed_stage_directory_before
+
+        - name: Refuse an unsafe existing digest-scoped staging directory
+          ansible.builtin.assert:
+            that:
+              - not (preprod_seed_stage_directory_before.stat.exists | default(false)) or
+                (preprod_seed_stage_directory_before.stat.isdir | default(false))
+              - not (preprod_seed_stage_directory_before.stat.islnk | default(false))
+              - not (preprod_seed_stage_directory_before.stat.exists | default(false)) or
+                preprod_seed_stage_directory_before.stat.uid == 0
+              - not (preprod_seed_stage_directory_before.stat.exists | default(false)) or
+                preprod_seed_stage_directory_before.stat.gid == 0
+              - not (preprod_seed_stage_directory_before.stat.exists | default(false)) or
+                preprod_seed_stage_directory_before.stat.mode == '0700'
+            quiet: true
+
+        - name: Create root-only local preprod staging directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+            follow: false
+          loop:
+            - "{{ preprod_seed_stage_root }}"
+            - "{{ preprod_seed_stage_directory }}"
+
+        - name: Copy release files for the root-only local loader
+          ansible.builtin.copy:
+            src: "{{ item.source }}"
+            dest: "{{ item.destination }}"
+            owner: root
+            group: root
+            mode: "0600"
+            follow: false
+          loop:
+            - source: "{{ preprod_seed_stage_controller_archive }}"
+              destination: "{{ preprod_seed_stage_archive }}"
+            - source: "{{ preprod_seed_stage_controller_manifest }}"
+              destination: "{{ preprod_seed_stage_manifest }}"
+
+        - name: Verify the root-owned staged preprod release files
+          ansible.builtin.stat:
+            path: "{{ item.path }}"
+            follow: false
+            get_checksum: true
+            checksum_algorithm: sha256
+          loop:
+            - path: "{{ preprod_seed_stage_archive }}"
+              sha256: "{{ preprod_seed_stage_archive_sha256 }}"
+            - path: "{{ preprod_seed_stage_manifest }}"
+              sha256: "{{ preprod_seed_stage_manifest_sha256 }}"
+          register: preprod_seed_stage_root_files
+
+        - name: Require exact root-owned staged preprod release files
+          ansible.builtin.assert:
+            that:
+              - item.stat.isreg
+              - not (item.stat.islnk | default(false))
+              - item.stat.uid == 0
+              - item.stat.gid == 0
+              - item.stat.mode == '0600'
+              - (item.stat.nlink | default(1) | int) == 1
+              - item.stat.checksum == item.item.sha256
+            quiet: true
+          loop: "{{ preprod_seed_stage_root_files.results }}"
+      rescue:
+        - name: Inspect the fixed root staging boundary before partial cleanup
+          ansible.builtin.stat:
+            path: "{{ preprod_seed_stage_root }}"
+            follow: false
+          register: preprod_seed_stage_partial_root
+
+        - name: Refuse partial cleanup through an unsafe root staging boundary
+          ansible.builtin.assert:
+            that:
+              - not (preprod_seed_stage_partial_root.stat.exists | default(false)) or
+                (preprod_seed_stage_partial_root.stat.isdir | default(false))
+              - not (preprod_seed_stage_partial_root.stat.islnk | default(false))
+              - not (preprod_seed_stage_partial_root.stat.exists | default(false)) or
+                preprod_seed_stage_partial_root.stat.uid == 0
+              - not (preprod_seed_stage_partial_root.stat.exists | default(false)) or
+                preprod_seed_stage_partial_root.stat.gid == 0
+              - not (preprod_seed_stage_partial_root.stat.exists | default(false)) or
+                preprod_seed_stage_partial_root.stat.mode == '0700'
+            quiet: true
+
+        - name: Inspect partial local preprod staging before cleanup
+          ansible.builtin.stat:
+            path: "{{ preprod_seed_stage_directory }}"
+            follow: false
+          register: preprod_seed_stage_partial_directory
+
+        - name: Refuse to delete an unexpected partial staging replacement
+          ansible.builtin.assert:
+            that:
+              - not (preprod_seed_stage_partial_directory.stat.exists | default(false)) or
+                (preprod_seed_stage_partial_directory.stat.isdir | default(false))
+              - not (preprod_seed_stage_partial_directory.stat.islnk | default(false))
+              - not (preprod_seed_stage_partial_directory.stat.exists | default(false)) or
+                preprod_seed_stage_partial_directory.stat.uid == 0
+              - not (preprod_seed_stage_partial_directory.stat.exists | default(false)) or
+                preprod_seed_stage_partial_directory.stat.gid == 0
+              - not (preprod_seed_stage_partial_directory.stat.exists | default(false)) or
+                preprod_seed_stage_partial_directory.stat.mode == '0700'
+            quiet: true
+
+        - name: Remove partial root-owned local preprod staging
+          ansible.builtin.file:
+            path: "{{ preprod_seed_stage_directory }}"
+            state: absent
+
+        - name: Stop after local preprod seed staging failed
+          ansible.builtin.fail:
+            msg: Local preprod seed staging failed and was cleaned up.
+
+    - name: Remove and prove removal of root-owned local preprod staging
+      when: preprod_seed_stage_state == 'absent'
+      block:
+        - name: Inspect the fixed root staging boundary before cleanup
+          ansible.builtin.stat:
+            path: "{{ preprod_seed_stage_root }}"
+            follow: false
+          register: preprod_seed_stage_cleanup_root
+
+        - name: Refuse cleanup through an unsafe root staging boundary
+          ansible.builtin.assert:
+            that:
+              - not (preprod_seed_stage_cleanup_root.stat.exists | default(false)) or
+                (preprod_seed_stage_cleanup_root.stat.isdir | default(false))
+              - not (preprod_seed_stage_cleanup_root.stat.islnk | default(false))
+              - not (preprod_seed_stage_cleanup_root.stat.exists | default(false)) or
+                preprod_seed_stage_cleanup_root.stat.uid == 0
+              - not (preprod_seed_stage_cleanup_root.stat.exists | default(false)) or
+                preprod_seed_stage_cleanup_root.stat.gid == 0
+              - not (preprod_seed_stage_cleanup_root.stat.exists | default(false)) or
+                preprod_seed_stage_cleanup_root.stat.mode == '0700'
+            quiet: true
+
+        - name: Inspect digest-scoped local preprod staging before cleanup
+          ansible.builtin.stat:
+            path: "{{ preprod_seed_stage_directory }}"
+            follow: false
+          register: preprod_seed_stage_cleanup_directory
+
+        - name: Refuse to delete an unexpected digest-scoped staging replacement
+          ansible.builtin.assert:
+            that:
+              - not (preprod_seed_stage_cleanup_directory.stat.exists | default(false)) or
+                (preprod_seed_stage_cleanup_directory.stat.isdir | default(false))
+              - not (preprod_seed_stage_cleanup_directory.stat.islnk | default(false))
+              - not (preprod_seed_stage_cleanup_directory.stat.exists | default(false)) or
+                preprod_seed_stage_cleanup_directory.stat.uid == 0
+              - not (preprod_seed_stage_cleanup_directory.stat.exists | default(false)) or
+                preprod_seed_stage_cleanup_directory.stat.gid == 0
+              - not (preprod_seed_stage_cleanup_directory.stat.exists | default(false)) or
+                preprod_seed_stage_cleanup_directory.stat.mode == '0700'
+            quiet: true
+
+        - name: Remove only the digest-scoped local preprod staging directory
+          ansible.builtin.file:
+            path: "{{ preprod_seed_stage_directory }}"
+            state: absent
+      always:
+        - name: Inspect local preprod staging after cleanup
+          ansible.builtin.stat:
+            path: "{{ preprod_seed_stage_directory }}"
+            follow: false
+          register: preprod_seed_stage_removed
+
+        - name: Require local preprod staging removal
+          ansible.builtin.assert:
+            that:
+              - not (preprod_seed_stage_removed.stat.exists | default(false))
+            quiet: true

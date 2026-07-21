@@ -1,0 +1,61 @@
+---
+- name: Require the exact destroy confirmation at the removal boundary
+  ansible.builtin.assert:
+    that:
+      - preprod_destroy_confirmation | default('') == 'DESTROY_AIGW_PREPROD'
+    quiet: true
+    fail_msg: >-
+      Pass -e preprod_destroy_confirmation=DESTROY_AIGW_PREPROD through the
+      dedicated ansible/preprod-destroy.yml playbook.
+
+- name: Remove only the named preprod containers, volumes, and networks
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - destroy
+  changed_when: true
+
+- name: Remove only macOS loopback aliases owned by this preprod
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - remove-loopback-aliases
+  become: true
+  register: preprod_loopback_aliases_remove
+  changed_when: >-
+    'PREPROD_LOOPBACK_ALIASES_REMOVED' in
+    preprod_loopback_aliases_remove.stdout
+  when: preprod_host_kernel.stdout | trim == 'Darwin'
+
+- name: Remove only the exact marker-bounded preprod hosts fragment
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - remove-hosts
+  become: true
+  register: preprod_hosts_remove
+  changed_when: "'PREPROD_HOSTS_REMOVED' in preprod_hosts_remove.stdout"
+  when: preprod_manage_hosts | bool

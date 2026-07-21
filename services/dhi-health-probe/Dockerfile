@@ -1,10 +1,10 @@
-# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# syntax=docker/dockerfile:1.25.0@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
 
 ARG BASE_IMAGE
 
 # The dev image is build-only. The final stage is the exact service DHI passed
 # by BASE_IMAGE and retains that image's entrypoint, command, and non-root user.
-FROM dhi.io/golang:1.25.12-alpine-dev@sha256:4411028e8461d5a111cdbf0aa172db17342557590f7727a4dd4649440bb411c2 AS probe-builder
+FROM dhi.io/golang:1.26.5-alpine-dev@sha256:711ea0b8f09f549c50f2f550dc26859d3e6441ca11d5640caecf69c29a862f0c AS probe-builder
 WORKDIR /src
 COPY go.mod main.go main_test.go ./
 RUN --network=none go test ./... \

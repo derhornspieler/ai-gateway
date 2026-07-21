@@ -122,7 +122,7 @@ services:
       <<: *selinux-labels
       com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_TRAEFIK_INT:?AIGW_BIND_DIGEST_TRAEFIK_INT must be set}
     # Docker's Traefik DHI currently stops at vulnerable v3.7.6. Build a
-    # shellless/non-root DHI derivative containing the exact patched v3.7.7
+    # shellless/non-root DHI derivative containing the exact patched v3.7.8
     # binary instead of accepting either the vulnerable DHI or upstream base.
     build:
       context: ./services/traefik
@@ -130,7 +130,7 @@ services:
       args:
         BASE_IMAGE: dhi.io/traefik:3.7.6@sha256:790392e8d8dc7c572afacd6d598cabab103034c79ad04a4c3c84116dbc12f2f4
         PATCH_IMAGE: traefik:v3.7.8@sha256:4299bbed850421258fc5448c2e0e6ad350981d4d335a68de11b92448aedbefe5
-    image: ai-gateway/dhi-traefik:3.7.7-patched
+    image: ai-gateway/dhi-traefik:3.7.8-patched
     user: "65532:65532"
     cap_add: [NET_BIND_SERVICE]   # binds :443 in-container
     read_only: true
@@ -181,7 +181,7 @@ services:
       args:
         BASE_IMAGE: dhi.io/traefik:3.7.6@sha256:790392e8d8dc7c572afacd6d598cabab103034c79ad04a4c3c84116dbc12f2f4
         PATCH_IMAGE: traefik:v3.7.8@sha256:4299bbed850421258fc5448c2e0e6ad350981d4d335a68de11b92448aedbefe5
-    image: ai-gateway/dhi-traefik:3.7.7-patched
+    image: ai-gateway/dhi-traefik:3.7.8-patched
     user: "65532:65532"
     cap_add: [NET_BIND_SERVICE]   # binds :443 in-container
     read_only: true
@@ -268,7 +268,7 @@ services:
       OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRAEFIK_ADM_ADMIN_IP:?TRAEFIK_ADM_ADMIN_IP must be set}/32
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
-      # Lab AD accounts are not required to carry an email attribute. Use the
+      # Federated directory accounts are not required to carry an email attribute. Use the
       # stable OIDC username claim for identity while authorization remains
       # enforced independently by the exact `aigw-admins` role claim.
       OAUTH2_PROXY_OIDC_EMAIL_CLAIM: preferred_username
@@ -496,7 +496,7 @@ services:
     # v1.74.0 is affected by critical auth bypasses (including
     # GHSA-4xpc-pv4p-pm3w). This signed stable release was independently
     # resolved to the immutable multi-arch index below.
-    image: ghcr.io/berriai/litellm:v1.92.0@sha256:9ef6f45bc0104940571765e610c52a1d761b5ec85efcd193795281086ee61277
+    image: ghcr.io/berriai/litellm:v1.93.0@sha256:a1745e629abfb17d434426ff48b115f54f4f4c4a0f5af241de569e93c63c411e
     # read_only intentionally NOT set: the image runs prisma generate /
     # schema migrations and writes caches under /app and $HOME at startup;
     # the write set isn't stable across releases.
@@ -586,7 +586,7 @@ services:
       # its DB and IGNORES the env after the first boot — so a hardening env
       # like ENABLE_OLLAMA_API / ENABLE_EVALUATION_ARENA_MODELS would silently
       # no-op on any instance whose DB was initialized earlier (a redeploy that
-      # keeps openwebui_data, or a lab). Pinning this false makes every env
+      # keeps openwebui_data, including local preprod). Pinning this false makes every env
       # below enforce on each start and eliminates DB config drift; runtime
       # admin-UI config changes are intentionally not persisted.
       ENABLE_PERSISTENT_CONFIG: "false"
@@ -622,7 +622,7 @@ services:
       OAUTH_CLIENT_SECRET: ${WEBUI_OIDC_CLIENT_SECRET:?WEBUI_OIDC_CLIENT_SECRET must be set}
       OPENID_PROVIDER_URL: "https://auth.${DOMAIN:?DOMAIN must be set}/realms/aigw/.well-known/openid-configuration"
       OAUTH_PROVIDER_NAME: "AIGW SSO"
-      # Lab Samba identities deliberately do not require a mail attribute.
+      # Federated directory identities deliberately do not require a mail attribute.
       # Open WebUI otherwise rejects an otherwise-valid signed OIDC identity
       # before its role check. Use Keycloak's stable username claim for both
       # fields, matching the oauth2-proxy identity contract above.
@@ -710,7 +710,7 @@ services:
       network: none
       args:
         BASE_IMAGE: dhi.io/keycloak:26.7.0@sha256:bcddb378bfd5fe036346477855a01eac3633d31166be781e21d4dd37cb242b3e
-    image: ai-gateway/dhi-keycloak:26.6.4-probe
+    image: ai-gateway/dhi-keycloak:26.7.0-probe
     user: "65532:65532"
     # DHI Keycloak is a tested shellless uid-65532 runtime. The probe is the
     # only added binary; realm import and Samba LDAPS login were exercised.
@@ -735,6 +735,18 @@ services:
       - --http-enabled=true
       - --health-enabled=true
       - --metrics-enabled=true
+      # The jboss-logging event listener is the reviewed authentication-audit
+      # source. JSON makes Alloy's logger/type allow-list fail closed instead
+      # of guessing at general Keycloak stdout. Success events default to
+      # DEBUG upstream, so pin them to INFO; representations/admin events stay
+      # disabled to keep credentials and configuration bodies out of logs.
+      - --log-console-output=json
+      - --log-console-json-format=ecs
+      - --log-service-name=keycloak
+      - --spi-events-listener--jboss-logging--success-level=info
+      - --spi-events-listener--jboss-logging--error-level=warn
+      - --spi-events-listener--jboss-logging--sanitize=true
+      - --spi-events-listener--jboss-logging--include-representation=false
     environment:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
@@ -909,6 +921,11 @@ services:
     build:
       context: ./services/egress-proxy
       network: none
+      args:
+        SOURCE_DATE_EPOCH: "${AIGW_EGRESS_SOURCE_DATE_EPOCH:?AIGW_EGRESS_SOURCE_DATE_EPOCH must be set}"
+        AIGW_EGRESS_PROVIDERS: "${AIGW_EGRESS_PROVIDERS:?AIGW_EGRESS_PROVIDERS must be set}"
+        AIGW_EGRESS_POLICY_SHA256: "${AIGW_EGRESS_POLICY_SHA256:?AIGW_EGRESS_POLICY_SHA256 must be set}"
+    image: ai-gateway/envoy-egress:1
     read_only: true
     tmpfs: [/tmp]
     deploy:
@@ -949,7 +966,7 @@ services:
       DATABASE_URL: postgresql://rotator:${PG_ROTATOR_PASSWORD:?PG_ROTATOR_PASSWORD must be set}@postgres:5432/rotator
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_PUBLIC_URL: "https://auth.${DOMAIN:?DOMAIN must be set}"
-      WIF_KEYCLOAK_PUBLIC_URL: https://idp.wif-a.example.invalid
+      WIF_KEYCLOAK_PUBLIC_URL: "https://idp.wif.${DOMAIN:?DOMAIN must be set}"
       EGRESS_BASE: http://envoy-egress:8080
       ROTATOR_INTERNAL_TOKEN: ${ROTATOR_INTERNAL_TOKEN:?ROTATOR_INTERNAL_TOKEN must be set}
       PORTAL_IDENTITY_TOKEN: ${PORTAL_IDENTITY_TOKEN:?PORTAL_IDENTITY_TOKEN must be set}
@@ -973,7 +990,6 @@ services:
       # ceremony scripts/vault-oidc-setup.sh; Vault never reads Compose env.
       VAULT_OIDC_CLIENT_SECRET: ${VAULT_OIDC_CLIENT_SECRET:?VAULT_OIDC_CLIENT_SECRET must be set}
       VAULT_OIDC_RP_VAULT_PATH: ${VAULT_OIDC_RP_VAULT_PATH:-ai-gateway/keycloak/vault-oidc-rp}
-      RETAIN_BOOTSTRAP_ADMIN_USER: ${RETAIN_BOOTSTRAP_ADMIN_USER:-false}
       # Durable group-gated master-realm administration. No secret: the
       # rotator generates the break-glass password and escrows it in Vault.
       BREAK_GLASS_ADMIN_ENABLED: ${BREAK_GLASS_ADMIN_ENABLED:-true}
@@ -1050,7 +1066,7 @@ services:
       context: ./services/dhi-health-probe
       network: none
       args:
-        BASE_IMAGE: dhi.io/vault:2.0.3@sha256:743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6
+        BASE_IMAGE: dhi.io/vault:2.0.3@sha256:2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e
     image: ai-gateway/dhi-vault:2.0.3-probe
     cap_add: [IPC_LOCK]
     # CAP_IPC_LOCK alone is insufficient when Docker leaves RLIMIT_MEMLOCK at
@@ -1096,7 +1112,7 @@ services:
     labels:
       <<: *selinux-labels
       com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_POSTGRES:?AIGW_BIND_DIGEST_POSTGRES must be set}
-    image: dhi.io/postgres:16.14@sha256:5b1b603cbb414af8ee417d0f6b4c170be7fed0b7e433c137f1b9f2a63ba313cd
+    image: dhi.io/postgres:18.4@sha256:a807e832c1fc9ded731956abcb53dc98ed003fd82e27275eaef8dcf52fb90236
     read_only: true
     tmpfs: [/tmp, /run/postgresql]
     pids_limit: 1024   # one backend process per connection + workers
@@ -1113,7 +1129,7 @@ services:
       PG_GRAFANA_RO_PASSWORD: ${PG_GRAFANA_RO_PASSWORD:?PG_GRAFANA_RO_PASSWORD must be set}
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
     volumes:
-      - pg_data:/var/lib/postgresql/16/data
+      - pg_data:/var/lib/postgresql/18/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro,Z
     networks: [net-db-litellm, net-db-keycloak, net-db-rotator, net-db-grafana]
     healthcheck:
@@ -1134,8 +1150,8 @@ services:
       context: ./services/dhi-health-probe
       network: none
       args:
-        BASE_IMAGE: dhi.io/redis:7.4.9@sha256:4feb8a348f13e623392857774371cc9a2e1d8f8c6f897645410a527dfea83397
-    image: ai-gateway/dhi-redis:7.4.9-probe
+        BASE_IMAGE: dhi.io/redis:8.8.0@sha256:f1dda8014cea13246dd69a360c0508813230dbe1b9a1590f014533e45119e883
+    image: ai-gateway/dhi-redis:8.8.0-probe
     # Keep the image's shellless non-root identity explicit because both
     # root-rendered authentication files grant read access only to this GID.
     user: "65532:65532"
@@ -1277,7 +1293,7 @@ services:
       network: none
       args:
         BASE_IMAGE: dhi.io/prometheus:3.13.1@sha256:cb1c6077e4e0e31dcabf927a3017419b48262885d6fb61a827f063005f61a68e
-    image: ai-gateway/dhi-prometheus:3.5.5-probe
+    image: ai-gateway/dhi-prometheus:3.13.1-probe
     read_only: true
     tmpfs: [/tmp]
     deploy:
@@ -1291,9 +1307,9 @@ services:
       # inject remote-write series into its unauthenticated web API.
       - --web.listen-address=${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}:9090
       - --storage.tsdb.path=/var/prometheus
-      # 7d local metrics (owner decision, matched to Loki's 168h); long-term
-      # retention is the customer Cribl pipeline's job.
-      - --storage.tsdb.retention.time=7d
+      # Keep local metrics for up to 30 days. Prometheus enforces time and size
+      # together, so the 5 GB default may shorten that window under load.
+      - --storage.tsdb.retention.time=30d
       - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-5GB}
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
@@ -1329,7 +1345,7 @@ services:
       network: none
       args:
         BASE_IMAGE: dhi.io/node-exporter:1.12.1@sha256:6160f0b7f10c641dfad086394111a8f13685a01edd3a69c80c5b2451f59c6c9f
-    image: ai-gateway/dhi-node-exporter:1.11.1-probe
+    image: ai-gateway/dhi-node-exporter:1.12.1-probe
     # Docker explicitly warns never to apply `z`/`Z` to a system-directory
     # bind such as `/`. This final label-disable exception is bounded by an
     # explicit non-root UID, cap-drop ALL, a read-only rootfs/root mount, and
@@ -1419,8 +1435,8 @@ services:
       dockerfile: Dockerfile.grafana
       network: none
       args:
-        BASE_IMAGE: dhi.io/grafana:12.4.5@sha256:bf28b93e5f122d0d93574f865df15ba01ca630e91e9af1138c4bfd3461e8619e
-    image: ai-gateway/dhi-grafana:12.4.5-aigw1
+        BASE_IMAGE: dhi.io/grafana:13.1.0@sha256:0cdd92e5aac28a11796f48765cf96a13098db83b45e216b57013324182453441
+    image: ai-gateway/dhi-grafana:13.1.0-aigw1
     read_only: true
     # Grafana probes its plugin path even when installation is disabled. Keep
     # that path writable but ephemeral and non-executable: this deployment
@@ -1534,6 +1550,10 @@ services:
 
 volumes:
   pg_data:
+    # The physical name is release state, not a Compose default. A PostgreSQL
+    # major migration points this at a fresh volume and preserves the PG16
+    # volume for the bounded pre-cutover rollback window.
+    name: ${PG_DATA_VOLUME_NAME:?PG_DATA_VOLUME_NAME must be set}
   openwebui_data:
   vault_data:
   vault_audit:

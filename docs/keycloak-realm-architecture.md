@@ -34,7 +34,7 @@ vs *machine identities*.
 | Realm | Purpose | Who/what lives there |
 |---|---|---|
 | `master` | Keycloak administration | The `keycloak-admins` group, mapped to master's full `admin` composite role; the durable `break-glass-admin` user, password escrowed in Vault; optionally, admins federated from a designated AD admin group. Temporary bootstrap principals exist only between first start and the identity ceremony. |
-| `aigw` | People and applications | Human users (federated from AD over LDAPS — lab Samba or the customer directory); the app clients `open-webui`, `dev-portal`, `admin-portal`, `admin-ui`, `vault`; the realm roles `aigw-chat`, `aigw-users` (deprecated for chat), `aigw-developers`, `aigw-admins`; the managed group tree under `/aigw-managed`; the durable `aigw-identity-controller` service client. |
+| `aigw` | People and applications | Human users federated over LDAPS (the customer directory in production or Samba AD in local preprod); the app clients `open-webui`, `dev-portal`, `admin-portal`, `admin-ui`, `vault`; the realm roles `aigw-chat`, `aigw-users` (deprecated for chat), `aigw-developers`, `aigw-admins`; the managed group tree under `/aigw-managed`; the durable `aigw-identity-controller` service client. |
 | `anthropic-wif` | Machine / workload identity | The `anthropic-token-broker` service client used for the Anthropic workload-identity-federation token exchange. No human users, no roles. See [anthropic-wif-bootstrap.md](anthropic-wif-bootstrap.md). |
 
 `master` keeps its built-in name: in Keycloak, administering *other* realms
@@ -44,7 +44,7 @@ name; that is cosmetic and changes nothing functionally.
 
 ```mermaid
 flowchart LR
-  AD[Customer AD or lab Samba<br/>owns accounts and passwords]
+  AD[Selected LDAPS directory<br/>owns accounts and passwords]
   KR[key-rotator<br/>identity controller]
   V[(Vault)]
 
@@ -64,8 +64,8 @@ flowchart LR
 Authorization inside `aigw` is carried as a realm-**role** claim, not a group
 claim: each first-party client maps realm roles into a `roles` claim in the
 token. Users acquire `aigw-admins` by being placed in a managed group (a
-child of `/aigw-managed`) that maps to that role — see the
-[authorization model](identity-operations.md#authorization-model).
+child of `/aigw-managed`) that maps to that role — see
+[identity operations](identity-operations.md).
 
 Note that `aigw-admins` and `keycloak-admins` are **deliberately disjoint**:
 `aigw-admins` authorizes the AI Gateway admin surfaces (admin portal, LiteLLM
@@ -78,10 +78,11 @@ On its first start, Keycloak creates two temporary principals in the `master`
 realm: a password-backed bootstrap admin user (`admin` by default) and a
 bootstrap service client (`aigw-bootstrap-controller`). Keycloak marks both
 with an `is_temporary_admin` attribute. They exist so that the **identity
-bootstrap ceremony** (admin-portal → **Initialize identity control**, run
-once by the initial `aigw-admins` operator) can set up durable controls.
+bootstrap step** (run automatically by Ansible after LDAPS and Vault are
+ready) can set up durable controls. The admin portal has no initialization
+button.
 
-During that ceremony, the key-rotator service:
+During that deployment step, the key-rotator service:
 
 1. uses the temporary bootstrap client to obtain a short-lived master-realm
    admin token;
@@ -106,11 +107,12 @@ durable one is proven and escrowed.** A failure anywhere in step 3 leaves
 the temporary principals in place and the ceremony retryable — never a
 Keycloak with no administrator.
 
-Teardown remains guarded the way it always was: the rotator's cleanup
-(`_delete_bootstrap_principals` in `services/key-rotator/app/identity.py`)
-looks up the exact bootstrap username and hard-fails on any master-realm
-account that matches it without carrying the temporary marker, so it can
-never remove an operator-created admin. This is why the durable account is
+The rotator guards cleanup in
+`_delete_bootstrap_principals` in
+`services/key-rotator/app/identity.py`. It looks up the exact bootstrap
+username. If the matching master-realm account lacks the temporary marker,
+cleanup stops. This prevents removal of an administrator created by an
+operator. This is why the durable account is
 named `break-glass-admin` and must never be named `admin`. The three names
 are **contract pins** asserted by the test suite; renaming any of them is a
 contract change, not a cosmetic edit:
@@ -123,17 +125,10 @@ contract change, not a cosmetic edit:
 
 If the break-glass objects are ever deleted out-of-band, the durable `aigw`
 controller cannot recreate them — its lack of master-realm authority is a
-deliberate boundary, not an oversight. Recovery is the documented path:
-recreate the temporary bootstrap client (a realm re-seed into an empty
-database, see
-[identity-operations.md](identity-operations.md#domain-migration-on-an-existing-realm))
-and re-run the identity ceremony.
-
-`RETAIN_BOOTSTRAP_ADMIN_USER` (`retain_bootstrap_admin_user` in
-`services/key-rotator/app/config.py`, default false) is unchanged this
-cycle: it remains a disposable-lab-only convenience that converts the
-temporary user into a marked lab recovery operator, and is slated for
-deprecation now that every profile keeps a durable administrator.
+deliberate boundary, not an oversight. Recovery uses the reviewed Keycloak
+break-glass procedure and the normal Ansible identity reconciliation described
+in [identity operations](identity-operations.md); do not delete retained realm
+state just to force a JSON import.
 
 ## Who administers Keycloak, day to day and in a crisis
 
@@ -152,9 +147,8 @@ mandatory; the second is recommended wherever a customer directory exists:
   credentials and a per-person audit trail, with membership managed where
   the customer already manages it.
 
-Why both rather than either alone: **AD-only is circular** — a broken LDAP
-federation locks out exactly the people who need to fix it, and the lab's AD
-lives inside the same Compose stack it would be administering.
+Why both rather than either alone: **directory-only is circular** — a broken
+LDAP federation can lock out exactly the people who need to fix it.
 **Break-glass-only has a weak audit trail** — one shared account cannot tell
 you which person acted. The escrowed account is the instance-recovery
 principal; the federated group is the accountable everyday path.
@@ -202,26 +196,27 @@ defense-in-depth — three independent layers, each of which must pass:
 | `admin.<domain>` — admin portal | Portal's own Keycloak OIDC login (`aigw` realm) + live role re-check | Same login; mutations additionally require a fresh Keycloak step-up |
 | `auth.<domain>` — Keycloak admin console | None — served directly on the ADM edge, deliberately outside oauth2-proxy | Keycloak admin login: **`break-glass-admin`** (password via the on-VM Vault ceremony) or a **federated AD admin account** (optional overlay) |
 
-The Keycloak console stays outside oauth2-proxy on purpose: oauth2-proxy
-authenticates against the `aigw` realm, so putting it in front of Keycloak's
-own recovery surface would be circular — a broken Keycloak login would block
-the console needed to fix it — and would recouple `aigw-admins` with
-Keycloak administration, which the model keeps disjoint. The console's
-protections are the layer-1 network gate, its own brute-force-protected
-admin login, and admin-event logging.
+The Keycloak console stays outside oauth2-proxy on purpose. oauth2-proxy uses
+the `aigw` realm. If it protected the Keycloak recovery console, a broken
+Keycloak login could also block the console needed for repair. It would also
+join `aigw-admins` to Keycloak administration, even though they are separate
+roles. The console is protected by the network gate, its own brute-force
+controls, and admin-event logging.
 
-So a Grafana session costs two prompts (VPN, then Keycloak), a Vault session
-three (VPN, the Keycloak oauth2-proxy gate, then Vault's own OIDC sign-in —
-usually silent, since the Keycloak SSO session from the gate is still live),
-and the Keycloak console two (VPN, then a master-realm admin login) — with
-the console's inner credential either a per-person federated AD account or
-the escrowed break-glass password.
+Grafana has two login gates: VPN, then Keycloak. Vault has three: VPN, the
+Keycloak oauth2-proxy gate, then Vault's own OIDC sign-in. The last Vault step
+is often silent because the Keycloak SSO session is still active. The Keycloak
+console has two gates: VPN, then a master-realm administrator login. That login
+uses either a named federated AD account or the escrowed break-glass password.
 
-Routine identity work — creating groups, assigning users, key rotation —
-continues to flow through the admin portal and the narrow `aigw` controller,
-which never needed a Keycloak console login. The console, entered through
-`keycloak-admins`, is for what the controller deliberately cannot do: realm
-settings, clients, roles, and recovery. First-administrator provisioning for
-the **`aigw`** realm (one pre-existing user carrying `aigw-admins` so the
-portal can be entered at all) is a separate concern, tracked in
-[project-status.md](project-status.md).
+Routine identity work — creating groups, assigning users, and rotating keys —
+continues through the admin portal and the narrow `aigw` controller. The
+console, entered through `keycloak-admins`, is for realm settings, clients,
+roles, and recovery that the controller deliberately cannot change.
+
+The deployment owner still chooses which directory group or named person gets
+the first `aigw-admins` membership; automation must not guess that business
+decision. After the LDAPS settings and bind password are supplied, Ansible
+configures and verifies federation, durable control, OIDC clients, and
+bootstrap cleanup. There is no administrator-run initialization page in the
+admin portal.

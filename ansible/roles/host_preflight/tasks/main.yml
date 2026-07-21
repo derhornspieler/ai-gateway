@@ -1529,11 +1529,7 @@
         [
           'pg_data', 'openwebui_data', 'vault_data', 'vault_audit',
           'alloy_data', 'prom_data', 'loki_data', 'grafana_data'
-        ] +
-        (
-          ['samba_ad_config', 'samba_ad_state', 'samba_ad_public']
-          if (samba_lab_enabled | bool) else []
-        )
+        ]
       }}
 
 - name: Preflight — inventory an existing stack directory before accepting live containers

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -111,6 +112,54 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
         self.assertIn("AIGW_GENERIC_PREFLIGHT=", legacy_pf)
         self.assertIn("deliberately unrenamed", legacy_pf)
 
+    def test_no_argument_noninteractive_run_lists_every_required_flag(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-I", str(PROD_BOOTSTRAP)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        for flag in (
+            "--inventory-alias",
+            "--vault-id",
+            "--vault-password-file",
+        ):
+            self.assertIn(flag, result.stderr)
+        self.assertIn("guided setup", result.stderr)
+        self.assertIn("interactive example", result.stderr)
+        self.assertIn("mygateway.vault-password", result.stderr)
+
+    def test_guided_setup_creates_a_private_vault_password_file(self) -> None:
+        bootstrap = _load_bootstrap_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            password_file = Path(temporary) / "guided.vault-password"
+            answers = ["preprod-controller", "", str(password_file), ""]
+            with mock.patch("builtins.input", side_effect=answers):
+                arguments = bootstrap.guided_arguments(
+                    default_profile="rocky9-production"
+                )
+
+            self.assertEqual(
+                arguments,
+                [
+                    "--deployment-profile",
+                    "rocky9-production",
+                    "--inventory-alias",
+                    "preprod-controller",
+                    "--vault-id",
+                    "preprod-controller",
+                    "--vault-password-file",
+                    str(password_file),
+                ],
+            )
+            self.assertTrue(password_file.is_file())
+            self.assertEqual(stat.S_IMODE(password_file.stat().st_mode), 0o600)
+            self.assertGreaterEqual(len(password_file.read_text().strip()), 48)
+
     # ── generator output ────────────────────────────────────────────────
     def test_generated_webui_litellm_key_matches_its_real_consumer_contract(self) -> None:
         bootstrap = _load_bootstrap_module()
@@ -179,7 +228,7 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
             self.assertIn("children:", inventory)
             self.assertIn("production_rocky9:", inventory)
             self.assertIn("customer-prod01:", inventory)
-            self.assertIn("gateway:\n      hosts: {}", inventory)
+            self.assertNotIn("gateway:\n      hosts: {}", inventory)
 
             host_text = host_vars.read_text(encoding="utf-8")
             self.assertIn("deployment_profile: rocky9-production", host_text)
@@ -419,8 +468,8 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(dump.returncode, 0, dump.stderr)
-        # A production host never loads the committed lab Vault overlay: no
-        # Vault password was supplied, so any decryption attempt would fail.
+        # A production host never loads an unrelated encrypted group overlay:
+        # no Vault password was supplied, so any decryption attempt would fail.
         self.assertNotIn("Attempting to decrypt", dump.stderr)
         resolved = json.loads(dump.stdout)
         self.assertEqual(resolved["deployment_profile"], "rocky9-production")
@@ -593,14 +642,9 @@ def _minimal_host_vars(profile: str, alias: str = "prod-aigw01") -> str:
 aigw_generic_inventory_alias: {alias}
 deployment_profile: {profile}
 require_encrypted_state: true
-samba_lab_enabled: false
 aigw_seed_test_users: false
-retain_bootstrap_admin_user: false
-aigw_prebootstrap_oidc_scope_reconciliation: false
-aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
 platform_authoritative_dns_enabled: false
 aigw_vault_ui_enabled: false
-aigw_lab_reset_handoff_drop_interfaces: []
 """
 
 
@@ -633,14 +677,7 @@ def _full_valid_host_vars(contract: dict, profile: str) -> str:
         "require_preupgrade_backup: true",
         "platform_authoritative_dns_enabled: false",
         "aigw_vault_ui_enabled: false",
-        "samba_lab_enabled: false",
         "aigw_seed_test_users: false",
-        "retain_bootstrap_admin_user: false",
-        "aigw_prebootstrap_oidc_scope_reconciliation: false",
-        'aigw_prebootstrap_oidc_scope_reconciliation_ack: ""',
-        "aigw_ssh_password_authentication: false",
-        "aigw_adm_socks_enabled: false",
-        "aigw_lab_reset_handoff_drop_interfaces: []",
         # Edge TLS mode is a required production input. 'vault-intermediate'
         # is the mode that needs no operator-supplied file paths, so it keeps
         # this fixture to the contract's own required-key set.
@@ -649,7 +686,7 @@ def _full_valid_host_vars(contract: dict, profile: str) -> str:
     for index, entry in enumerate(contract["required_secret_keys"]):
         length = entry.get("exact_length") or entry["min_length"]
         if entry.get("prefix"):
-            # Match the committed lab token's shape: sk- plus 64 safe random
+            # Match the consumer token's shape: sk- plus 64 safe random
             # characters. The fixture contains no real secret.
             value = entry["prefix"] + (f"K{index:03d}" + filler)[: max(length, 64)]
         else:

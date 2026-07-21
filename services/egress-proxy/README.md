@@ -1,159 +1,144 @@
-# egress-proxy — CA-pinned originating TLS proxy (custom component)
+# egress-proxy
 
-Envoy on `net-egress`, the **only** container with a path out eth0 (enforced
-in DOCKER-USER). All LLM vendor API traffic leaves through it.
+`egress-proxy` is the only workload allowed to reach approved AI provider
+APIs. LiteLLM and key-rotator send plain HTTP to Envoy on `net-vendor`.
+Envoy then starts TLS to each selected provider.
 
-## Architecture
+The provider policy is immutable. It is generated while the offline release
+is built. It is not downloaded, mounted, or changed during deployment.
 
-This is **not** an `HTTPS_PROXY`/CONNECT forward proxy (an earlier design,
-now abandoned). With CONNECT, the client does TLS end-to-end and the proxy
-only sees an opaque tunnel — pinning would be unenforceable without MITM.
+## Select providers for a release
 
-Instead, Envoy is an **originating TLS reverse proxy**:
+Run the release command from the repository root. Repeat `--provider` for each
+provider that the release may reach:
 
-- Clients (LiteLLM, key-rotator) speak plain HTTP to Envoy on the backend
-  network: `http://envoy-egress:8080/<vendor>/...`
-  (e.g. `POST /anthropic/v1/messages`).
-- Path-prefix routing maps each vendor prefix to a dedicated upstream
-  cluster (`/anthropic/` → `anthropic`, `/openai/` → `openai`) with
-  `prefix_rewrite`, `host_rewrite_literal`, and per-cluster SNI.
-- Envoy **originates the vendor TLS itself**, so it validates and pins the
-  vendor's certificate. A compromised gateway container cannot bypass
-  pinning — it has no direct route out.
-- **No default route**: any path not on the vendor allow-list returns 404.
-  Adding a vendor requires both a route and a cluster in `envoy.yaml`.
-
-## Pinning posture
-
-Each upstream cluster's `validation_context` enforces, on top of normal TLS
-chain validation:
-
-- **CA pinning via a narrowed `trusted_ca`** — the PRIMARY enforcement.
-  `trusted_ca` is **not** the full public root bundle; it is a curated
-  per-vendor file (`certs/anthropic-ca.pem`, `certs/openai-ca.pem`) that holds
-  **only the issuing CA(s) that vendor actually uses** (its intermediate +
-  root). Envoy builds the chain against this store, so a technically-valid
-  public-CA certificate for the vendor hostname issued by *any other CA* is
-  rejected. This is the real, rotation-stable pin: roots/intermediates change
-  on a multi-year cadence.
-  - As of the last capture, both `api.anthropic.com` and `api.openai.com`
-    chain via **Google Trust Services** (intermediate `WE1` → root
-    `GTS Root R4`); narrowing `trusted_ca` to those constrains egress to that
-    CA. Re-verify with `generate-pins.sh` — do not trust this doc blindly.
-- **Optional leaf SPKI pinning** (`verify_certificate_spki`) — commented out by
-  default, defense-in-depth only. It is base64 SHA-256 of the DER
-  SubjectPublicKeyInfo and — per Envoy's implementation — matches the **LEAF
-  certificate ONLY** (it does **not** walk the chain; pinning an intermediate
-  here does nothing). It is strict but **rotation-fragile**: vendor CDN leaf
-  certs rotate roughly every **90 days**, so an active leaf pin must be
-  refreshed on that cadence or egress breaks. This is why leaf SPKI is *not*
-  the primary enforcement. If you enable it, keep 2 slots (current + incoming).
-- **Strict SAN matching** (`match_typed_subject_alt_names`, exact DNS per
-  vendor).
-
-> Earlier revisions of this component made leaf/chain SPKI the sole enforcement
-> and kept `trusted_ca` as the full system bundle. That was wrong:
-> `verify_certificate_spki` is leaf-only, so pinning an intermediate never took
-> effect, and leaf-only pins brick egress on every ~90-day vendor rotation. The
-> narrowed `trusted_ca` above is the fix.
-
-### Generating / rotating pins
-
-```sh
-# On a trusted networked host (verify from two vantage points if possible):
-./generate-pins.sh                    # defaults to the pinned vendors
-./generate-pins.sh api.anthropic.com  # or specific hosts
+```bash
+python3 -I scripts/update-images.py prepare \
+  --provider anthropic \
+  --platform linux/amd64 \
+  --archive /release/aigw.docker.tar.zst \
+  --manifest /release/aigw.manifest.json
 ```
 
-The script connects with `openssl s_client -showcerts -verify_return_error`,
-**refuses** any cert whose chain does not validate (Verify return code != 0),
-and then:
+Provider names come from [`providers/catalog.json`](providers/catalog.json).
+The command does not accept a hostname or CA file. Unknown names and an empty
+selection fail. Anthropic is the only provider approved today. Repeated names
+are removed, and the final list is sorted. Future providers require a reviewed
+catalog change before the command accepts them.
 
-- writes each vendor's **issuing-CA chain** (intermediate + root) to
-  `certs/<vendor>-ca.pem` — this is the trusted_ca bundle; and
-- prints the **leaf SPKI pin** for the optional `verify_certificate_spki`
-  layer.
+The build runs with networking disabled. It checks the catalog, CA files,
+certificate fingerprints, provenance records, route prefixes, SNI names, and
+exact SAN names. The final image contains only the selected routes, clusters,
+CA bundles, and policy files. A different provider selection produces a
+different policy digest and image ID.
 
-**Rotation runbook:**
+See [Provider onboarding](../../docs/provider-onboarding.md) for the full
+catalog contract and [Provider CA maintenance](../../docs/sop/provider-ca-maintenance.md)
+for CA review and rotation.
 
-- *CA bundle (primary, stable):* re-run only when a vendor changes issuing CA
-  (rare). To rotate without an outage, **append** the incoming CA cert to
-  `certs/<vendor>-ca.pem` (keep the old) *before* the vendor cuts over, deploy,
-  then prune the retired CA.
-- *Leaf SPKI (optional, ~90 days):* if enabled, add the incoming leaf pin to
-  the second slot before the vendor rotates, deploy, then drop the old pin.
+## Runtime request path
 
-## Fail-closed startup
+This component is an originating TLS reverse proxy. It is not an HTTPS
+`CONNECT` proxy.
 
-The compiled, static `aigw-envoy-entrypoint` (built from `entrypoint.go` and
-wired as the image ENTRYPOINT) asserts that the narrowed-CA enforcement is
-actually **present and populated** before starting Envoy. It keeps the final
-DHI image shellless and exits non-zero (fail closed) if, for any vendor TLS
-context:
+For a selected provider, the generated policy does all of the following:
 
-- a `trusted_ca` file is missing from the config (block deleted), or
-- `trusted_ca` points at a system/public root bundle (pinning voided), or
-- the referenced bundle is missing, empty, still a `REPLACE_WITH_*`
-  placeholder, or contains no certificate.
+- maps its reviewed route prefix, such as `/anthropic/`, to one cluster;
+- removes that prefix before sending the request;
+- writes the reviewed API hostname into the HTTP `Host` header;
+- uses the reviewed SNI name for TLS;
+- requires an exact reviewed DNS SAN; and
+- validates the chain with that provider's reviewed CA bundle.
 
-It also rejects any active (uncommented) `REPLACE_WITH_SPKI` placeholder. This
-closes the earlier gap where a config with the pin block simply **deleted**
-would start on public-PKI-only validation.
+There is no default provider route. An unselected or unknown route returns
+404. The host firewall also blocks every workload except Envoy from direct
+external DNS and TCP/443 access.
 
-### Entrypoint is a trust boundary
+## What enters the image
 
-The entrypoint also **refuses caller-supplied `--config-yaml` / `--config-path`
-/ `-c` flags**: it chooses the config path itself, and a compose
-`command: ["--config-yaml", ...]` would otherwise merge unvetted config *after*
-the gate validated the file. To point at a different config, set the
-`ENVOY_CONFIG` env var (still gated) rather than passing a flag.
+The policy generator creates these files for the selected providers:
 
-Note that **overriding the container `entrypoint:` in compose bypasses this
-gate entirely** — that is an inherent trust boundary. Do not override
-`entrypoint:` for `envoy-egress`; if you must, replicate the compiled launcher's
-checks and acceptance tests.
-
-## Admin interface
-
-The Envoy admin listener is bound to `127.0.0.1:9901` (it is unauthenticated
-and exposes `/quitquitquit`, `/runtime_modify`, etc.). It is not reachable
-from other containers. The healthcheck execs
-`/usr/local/bin/aigw-envoy-entrypoint health` inside the shellless container;
-the compiled probe disables proxies and redirects and requires a loopback HTTP
-200 response containing `LIVE`. A separate listener on `:9902` routes only an
-exact `GET /stats/prometheus` to loopback admin for Prometheus; there is no
-catch-all route, so mutation/shutdown endpoints remain unreachable.
-
-## Observability
-
-Structured JSON access logs to stdout (method, path, upstream cluster,
-status, response flags, duration, bytes) — every egress request is
-auditable.
-
-## Deployment (compose)
-
-The narrowed CA bundles must reach the container at the paths in `envoy.yaml`
-(`/etc/envoy/certs/<vendor>-ca.pem`). The image bakes in `certs/` as fail-closed
-placeholders; mount the real, verified bundles over them, e.g.:
-
-```yaml
-    volumes:
-      - ./services/egress-proxy/certs/anthropic-ca.pem:/etc/envoy/certs/anthropic-ca.pem:ro
-      - ./services/egress-proxy/certs/openai-ca.pem:/etc/envoy/certs/openai-ca.pem:ro
+```text
+/etc/envoy/envoy.yaml
+/etc/envoy/provider-policy.json
+/etc/envoy/provider-policy.sha256
+/etc/envoy/provider-policy-receipt.json
+/etc/envoy/certs/<selected-provider>-ca.pem
 ```
 
-Do not set a `command:` with `--config-yaml/--config-path/-c` (the entrypoint
-rejects them) and do not override `entrypoint:` (bypasses the gate).
+The final DHI Envoy stage receives no unselected CA file. The image labels
+record the policy schema, canonical provider list, and policy SHA-256 digest.
+The schema-v2 offline manifest binds that digest and provider evidence to the
+same immutable Envoy image ID.
 
-## Files
+Do not add a CA volume to `envoy-egress`. Do not set `ENVOY_CONFIG`, pass
+`-c` or another `--config-*` option, or override the image entrypoint. These
+changes would weaken the reviewed image boundary, so the startup gate rejects
+the config overrides.
 
-- `envoy.yaml` — listener, vendor routes/clusters, narrowed-CA validation
-  contexts (optional leaf SPKI commented out)
-- `certs/` — per-vendor narrowed `trusted_ca` bundles (issuing CA(s) only);
-  shipped as fail-closed placeholders
-- `generate-pins.sh` — issuing-CA bundle + leaf-SPKI generation/rotation helper
-- `entrypoint.go`, `entrypoint_test.go` — compiled fail-closed startup gate and
-  loopback readiness probe; the gate asserts CA pinning and refuses
-  config-override flags
-- `Dockerfile` — DHI Envoy runtime and DHI Go build source pinned by digest,
-  offline gate tests/build, and compiled entrypoint wiring
+## Fail-closed startup gate
+
+The static `aigw-envoy-entrypoint` validates the image before it starts Envoy.
+It exits nonzero when it finds any of these problems:
+
+- the policy digest does not match the digest compiled into the gate;
+- the policy JSON, Envoy config, or policy receipt is missing or changed;
+- a selected CA file is missing, empty, malformed, or not a regular file;
+- an unexpected CA file is present;
+- a CA bundle or certificate fingerprint differs from the catalog;
+- a CA certificate is expired, not active yet, or cannot act as a CA;
+- SNI is absent from the provider's exact SAN list; or
+- a caller tries to select another Envoy config.
+
+The gate does not fall back to the operating system trust store. The final
+container is shellless and runs as UID/GID 65532.
+
+The Envoy admin listener stays on `127.0.0.1:9901`. The health command checks
+that loopback listener without using proxy environment variables or redirects.
+Prometheus can reach only the exact read-only `/stats/prometheus` route on
+port 9902. Other admin paths are not routed.
+
+## CA capture is not CA approval
+
+[`generate-pins.sh`](generate-pins.sh) can capture a point-in-time TLS chain
+on a trusted, networked maintenance system. Its output is only a candidate.
+It must go through the separate CA review process before anyone changes the
+catalog or builds a release.
+
+A matching SHA-256 fingerprint proves that certificate bytes match. It does
+not prove who captured them or which network path was used. A certificate
+subject that includes `C=US` does not prove that the endpoint is in the United
+States or that provider data stays there. See the
+[CA maintenance SOP](../../docs/sop/provider-ca-maintenance.md) for these trust
+limits and the approval steps.
+
+## Test this component
+
+Run the unit and policy tests from this directory:
+
+```bash
+go test -race ./...
+go vet ./...
+```
+
+With DHI credentials, the Go security workflow also builds the fixed
+`anthropic` image twice, compares the complete Docker archive bytes,
+loads one archive, and checks its live receipt. If that CI step is skipped, it
+is not deterministic-build evidence.
+
+The release test is stronger than a local unit test. It builds the exact image,
+loads it through the offline seed, starts local preprod with `pull_policy:
+never`, and runs the end-to-end checks. Follow the
+[image update workflow](../../docs/image-update-workflow.md).
+
+## Important files
+
+- `providers/catalog.json` — reviewed provider names and trust requirements.
+- `providers/provenance/*.json` — reviewed CA evidence and its limits.
+- `certs/*.pem` — reviewed source CA bundles. Only selected bundles enter an
+  image.
+- `envoy.yaml.tmpl` — generated route and cluster template.
+- `internal/egresspolicy/` — catalog validation and deterministic generation.
+- `entrypoint.go` — runtime validation, launch, and health gate.
+- `Dockerfile` — network-disabled planner, generator, tests, and final image.
+- `generate-pins.sh` — candidate capture helper; it does not approve trust.

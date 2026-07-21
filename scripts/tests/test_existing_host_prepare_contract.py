@@ -12,7 +12,6 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 GROUP_VARS = ROOT / "ansible" / "group_vars" / "all.yml"
-LAB_VARS = ROOT / "ansible" / "inventory" / "host_vars" / "lab-aigw01.yml"
 SITE = ROOT / "ansible" / "site.yml"
 OS_PREP = ROOT / "ansible" / "os-prep.yml"
 HOST_PREFLIGHT = ROOT / "ansible" / "roles" / "host_preflight" / "tasks" / "main.yml"
@@ -30,7 +29,6 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.group = GROUP_VARS.read_text(encoding="utf-8")
-        cls.lab = LAB_VARS.read_text(encoding="utf-8")
         cls.site = SITE.read_text(encoding="utf-8")
         cls.os_prep = OS_PREP.read_text(encoding="utf-8")
         cls.host = HOST_PREFLIGHT.read_text(encoding="utf-8")
@@ -152,23 +150,6 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
                 vendor_zone_checker_start:vendor_zone_checker_end
             ]
         )
-        validator_start = cls.os_prep.index("            import ipaddress\n")
-        validator_end = cls.os_prep.index(
-            "          - \"{{ deployment_profile | default('') }}\"",
-            validator_start,
-        )
-        cls.socks_validator = textwrap.dedent(
-            cls.os_prep[validator_start:validator_end]
-        )
-
-    def run_socks_validator(self, *arguments: str) -> None:
-        original_argv = sys.argv
-        try:
-            sys.argv = ["validator", *arguments]
-            exec(self.socks_validator, {"__name__": "__validator__"})
-        finally:
-            sys.argv = original_argv
-
     def run_runtime_checker(self, process_inventory: str) -> None:
         """Execute the inline preflight scanner against a controlled ps view."""
         import shutil
@@ -386,91 +367,10 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             subprocess.run = original_run  # type: ignore[assignment]
             sys.argv = original_argv
 
-    def test_generic_ssh_and_socks_defaults_are_secure_while_lab_is_explicit(self) -> None:
+    def test_sshd_password_and_forwarding_denials_are_unconditional(self) -> None:
         for required in (
-            "aigw_ssh_password_authentication: false",
-            "aigw_adm_socks_enabled: false",
-            "aigw_adm_socks_users: []",
-            "aigw_adm_socks_groups: []",
-            "aigw_adm_socks_source_cidrs: []",
-            "aigw_adm_socks_trusted_operator_ack: \"\"",
-        ):
-            self.assertIn(required, self.group)
-        for required in (
-            "aigw_ssh_password_authentication: true",
-            "aigw_adm_socks_enabled: true",
-            "aigw_adm_socks_users: [ansible]",
-            "aigw_adm_socks_source_cidrs: [\"{{ vpn_client_cidr }}\"]",
-            "aigw_adm_socks_trusted_operator_ack: I_UNDERSTAND_SOCKS_REACHES_ALL_HOST_ROUTES",
-        ):
-            self.assertIn(required, self.lab)
-        self.assertIn(
-            "aigw_adm_socks_trusted_operator_ack is string", self.os_prep
-        )
-        self.assertIn(
-            "PermitOpen any reaches every host-routable destination", self.os_prep
-        )
-        self.assertIn("or trusted_operator_ack", self.os_prep)
-
-    def test_ssh_password_and_socks_exceptions_are_lab_profile_gated(self) -> None:
-        self.assertIn(
-            "Preflight — restrict SSH password and SOCKS exceptions to rocky9-lab",
-            self.os_prep,
-        )
-        self.assertIn(
-            "(deployment_profile | default('')) == 'rocky9-lab' or",
-            self.os_prep,
-        )
-        for required in (
-            "password SSH authentication is allowed only in deployment_profile=rocky9-lab",
-            "SSH SOCKS is allowed only in deployment_profile=rocky9-lab",
-            "- \"{{ deployment_profile | default('') }}\"",
-            "- \"{{ 'true' if (aigw_ssh_password_authentication | bool) else 'false' }}\"",
-        ):
-            self.assertIn(required, self.os_prep)
-        for required in (
-            "PasswordAuthentication {{ 'yes' if ((deployment_profile | default('')) == 'rocky9-lab' and (aigw_ssh_password_authentication | bool)) else 'no' }}",
-            "{% if ((deployment_profile | default('')) == 'rocky9-lab') and (aigw_adm_socks_enabled | bool) %}",
-            "('yes' if ((deployment_profile | default('')) == 'rocky9-lab' and (aigw_ssh_password_authentication | bool)) else 'no') ~ '$'",
-        ):
-            self.assertIn(required, self.os_baseline)
-
-    def test_embedded_ssh_exception_validator_rejects_generic_opt_in(self) -> None:
-        valid_lab_socks = (
-            "rocky9-lab",
-            "true",
-            "true",
-            '["ansible"]',
-            "[]",
-            '["10.23.0.0/24"]',
-            "{}",
-            "I_UNDERSTAND_SOCKS_REACHES_ALL_HOST_ROUTES",
-            "10.23.0.0/24",
-        )
-        self.run_socks_validator(*valid_lab_socks)
-
-        with self.assertRaises(SystemExit) as password_error:
-            self.run_socks_validator(
-                "generic-rocky9", "true", "false", "[]", "[]", "[]", "{}", "", "10.23.0.0/24"
-            )
-        self.assertIn("password SSH authentication is allowed only", str(password_error.exception))
-
-        with self.assertRaises(SystemExit) as socks_error:
-            self.run_socks_validator(
-                "generic-rocky9",
-                "false",
-                "true",
-                '["ansible"]',
-                "[]",
-                '["10.23.0.0/24"]',
-                "{}",
-                "I_UNDERSTAND_SOCKS_REACHES_ALL_HOST_ROUTES",
-                "10.23.0.0/24",
-            )
-        self.assertIn("SSH SOCKS is allowed only", str(socks_error.exception))
-
-    def test_sshd_default_deny_and_source_scoped_socks_contracts_are_rendered_and_tested(self) -> None:
-        for required in (
+            "PasswordAuthentication no",
+            "KbdInteractiveAuthentication no",
             "DisableForwarding yes",
             "AllowTcpForwarding no",
             "AllowStreamLocalForwarding no",
@@ -479,15 +379,11 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             "GatewayPorts no",
             "PermitOpen none",
             "PermitListen none",
-            "Match User {{ aigw_adm_socks_users | join(',') }} Address",
-            "Match Group {{ aigw_adm_socks_groups | join(',') }} Address",
-            "AllowTcpForwarding local",
-            "PermitOpen any",
-            "Match all",
             "- /usr/sbin/sshd\n      - -T\n      - -C",
-            "inventory acknowledgement",
         ):
             self.assertIn(required, self.os_baseline)
+        self.assertNotIn("PermitOpen any", self.os_baseline)
+        self.assertNotIn("AllowTcpForwarding local", self.os_baseline)
         self.assertIn("Preflight — require a safe sshd include and forwarding precedence boundary", self.os_baseline)
         for required in (
             "is_verified_late_redhat_fragment",
@@ -893,7 +789,7 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             self.assertNotIn("['/usr/bin/bash', '-c',", source)
             self.assertIn("OpenSSH joins", source)
 
-    def test_lab_dns_verifier_keeps_bridge_and_adm_views_distinct(self) -> None:
+    def test_platform_dns_verifier_keeps_bridge_and_adm_views_distinct(self) -> None:
         """A Docker-bridge source is restricted, not an ADM DNS client."""
         restricted = self.verify.split(
             "Query the restricted platform DNS view over UDP and TCP from the host bridge", 1
@@ -906,7 +802,7 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         # Owner decision: the internal view serves the dual-homed chat name.
         self.assertIn('"chat.{{ aigw_domain }}"', restricted)
         self.assertNotIn('"admin.{{ aigw_domain }}"', restricted)
-        self.assertIn("lab_dns_restricted_queries.stdout | trim != eth2_ip", restricted)
+        self.assertIn("platform_dns_restricted_queries.stdout | trim != eth2_ip", restricted)
 
         negative = self.verify.split(
             "Verify the restricted platform DNS view does not disclose ADM-only names", 1
@@ -1447,27 +1343,6 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
             'records = [line.split("\\\\t") for line in query.stdout.splitlines()]',
             self.firewall_preflight,
         )
-
-    def test_only_the_exact_rocky9_lab_reset_handoff_may_retain_drop(self) -> None:
-        self.assertIn("aigw_lab_reset_handoff_drop_interfaces: []", self.group)
-        self.assertIn(
-            'aigw_lab_reset_handoff_drop_interfaces: ["{{ nic_egress }}", "{{ nic_internal }}"]',
-            self.lab,
-        )
-        for source in (self.firewall_preflight, self.firewall):
-            self.assertIn(
-                "derive the exact fail-closed Rocky 9 lab reset handoff", source
-            )
-            self.assertIn("(deployment_profile | default('')) == 'rocky9-lab'", source)
-            self.assertIn("aigw_lab_reset_handoff_drop_interfaces", source)
-            self.assertIn("aigw_lab_reset_handoff_drop_bindings", source)
-            self.assertIn("{'interface': nic_egress, 'zone': 'aigw-egress'}", source)
-            self.assertIn("{'interface': nic_internal, 'zone': 'aigw-internal'}", source)
-        self.assertIn('saved_zone == "drop"', self.firewall_preflight)
-        self.assertIn('runtime_zone == "drop"', self.firewall_preflight)
-        self.assertGreaterEqual(self.firewall.count("(item.stdout | trim) == 'drop'"), 2)
-        self.assertIn("lab reset drop-zone handoff does not match reviewed interfaces", self.firewall_preflight)
-        self.assertNotIn("expected_zone, 'drop'", self.firewall_preflight)
 
     def test_native_guard_drops_internal_egress_both_directions_before_replies(self) -> None:
         forward = self.nft_guard.split("chain container_forward {", 1)[1]

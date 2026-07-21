@@ -9,7 +9,6 @@ STACK_DIR="${STACK_DIR:-/opt/ai-gateway}"
 PROJECT="${COMPOSE_PROJECT_NAME:-ai-gateway}"
 [[ "$PROJECT" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || { echo "unsafe Compose project name" >&2; exit 2; }
 [[ -f "$STACK_DIR/.env" && -f "$STACK_DIR/docker-compose.yml" && -f "$STACK_DIR/docker-compose.dns.yml" ]] || { echo "deployed Compose files are missing" >&2; exit 1; }
-profile="$(grep -E '^DEPLOYMENT_PROFILE=' "$STACK_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
 platform_dns="$(grep -E '^PLATFORM_AUTHORITATIVE_DNS_ENABLED=' "$STACK_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
 vault_ui_selector_count="$(grep -Ec '^VAULT_UI_ENABLED=' "$STACK_DIR/.env" || true)"
 [[ "$vault_ui_selector_count" == 1 ]] || { echo "expected exactly one VAULT_UI_ENABLED selector" >&2; exit 2; }
@@ -116,12 +115,7 @@ if [[ "$platform_dns" == true ]]; then
   [[ -f "$STACK_DIR/docker-compose.platform-dns.yml" ]] || { echo "platform DNS overlay is missing" >&2; exit 1; }
   compose+=(-f "$STACK_DIR/docker-compose.platform-dns.yml")
 fi
-if [[ "$profile" == rocky9-lab ]]; then
-  [[ -f "$STACK_DIR/docker-compose.lab.yml" ]] || { echo "lab identity overlay is missing" >&2; exit 1; }
-  compose+=(-f "$STACK_DIR/docker-compose.lab.yml" --profile lab-ad)
-fi
 if [[ "$identity_ldap" == true ]]; then
-  [[ "$profile" != rocky9-lab ]] || { echo "external identity overlay conflicts with the lab profile" >&2; exit 2; }
   [[ -f "$STACK_DIR/docker-compose.identity-ldap.yml" ]] || { echo "external identity overlay is missing" >&2; exit 1; }
   compose+=(-f "$STACK_DIR/docker-compose.identity-ldap.yml")
 fi

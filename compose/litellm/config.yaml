@@ -40,7 +40,7 @@ model_list:
       api_base: http://envoy-egress:8080/anthropic
       litellm_credential_name: anthropic-primary
       cache_control_injection_points: [{location: message, role: system}]
-  # Verified live on the lab's WIF workspace 2026-07-16 (all six return real
+  # Verified live against the original integration WIF workspace on 2026-07-16 (all six returned real
   # completions via scripts/test-wif-inference.py / probe). Access is NOT
   # limited here — every key may reach every model; the admin portal's
   # per-project runtime policy is the only model-access control.
@@ -89,7 +89,7 @@ general_settings:
   # ENABLE_FORWARD_USER_INFO_HEADERS) sends the authenticated identity in
   # X-OpenWebUI-User-* headers; the Email header carries the OIDC
   # preferred_username because this deployment maps OAUTH_EMAIL_CLAIM to
-  # preferred_username (lab identities have no mail attribute). LiteLLM
+  # preferred_username (directory identities may have no mail attribute). LiteLLM
   # records it as the request's end user, which reaches telemetry as
   # metadata.user_api_key_end_user_id and becomes aigw.user.name /
   # aigw.enduser.id in the audit stream.

@@ -7,7 +7,7 @@ unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH D
 docker_cmd=(docker --host unix:///run/docker.sock)
 
 STACK_DIR="${STACK_DIR:-/opt/ai-gateway}"
-IMAGE='dhi.io/vault:2.0.3@sha256:743791e1bf99025aae045b3155fecf0542e7fd1bde7bbfbaf76eb4b9ff2555a6'
+IMAGE='dhi.io/vault:2.0.3@sha256:2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e'
 source_config="$STACK_DIR/vault/config.hcl"
 if [ ! -f "$source_config" ] || [ -L "$source_config" ] ||
    [ "$(stat -c '%u:%g:%a:%h' -- "$source_config")" != "0:0:644:1" ]; then

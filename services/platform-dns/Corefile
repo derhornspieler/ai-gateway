@@ -1,0 +1,32 @@
+# Optional split-view authoritative platform DNS. Requests sourced from the reviewed ADM
+# client CIDR receive the administration view. Every other source fails safe
+# to the restricted internal view. There is deliberately no `forward` plugin:
+# this container cannot recurse or relay arbitrary DNS traffic.
+aigw.internal:53 {
+    view adm {
+        expr incidr(client_ip(), '{$PLATFORM_DNS_ADM_CIDR}')
+    }
+    errors
+    health 127.0.0.1:8080
+    file /etc/coredns/zones/db.aigw.internal.adm aigw.internal
+    cache 30
+}
+
+aigw.internal:53 {
+    view internal {
+        expr true
+    }
+    errors
+    file /etc/coredns/zones/db.aigw.internal aigw.internal
+    cache 30
+}
+
+# If a client sends a non-aigw.internal name directly to this server, answer
+# NXDOMAIN instead of recursing. macOS normally sends only aigw.internal here
+# because the service is installed as a scoped resolver.
+.:53 {
+    errors
+    template ANY ANY {
+        rcode NXDOMAIN
+    }
+}

@@ -81,8 +81,8 @@ def _scheduler(litellm, db, drivers) -> RotationScheduler:
 DRIVERS = {
     "anthropic": PrimaryDriver("anthropic", "anthropic-primary"),
     "static-anthropic": StaticDriver("static-anthropic", "anthropic-primary"),
-    "openai": PrimaryDriver("openai", "openai-primary"),
-    "static-openai": StaticDriver("static-openai", "openai-primary"),
+    "synthetic": PrimaryDriver("synthetic", "synthetic-primary"),
+    "static-synthetic": StaticDriver("static-synthetic", "synthetic-primary"),
 }
 
 
@@ -113,15 +113,15 @@ async def test_missing_primary_credential_is_minted_on_fresh_boot() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_credential_of_disabled_driver_is_not_minted() -> None:
-    """openai is a primary driver but disabled (no key) — its credential is
+    """A synthetic primary driver is disabled, so its credential is
     legitimately absent and must not be minted (no churn)."""
     sched = _scheduler(
         FakeLiteLLM([]),
-        FakeDb({"anthropic": True, "openai": False}),
+        FakeDb({"anthropic": True, "synthetic": False}),
         DRIVERS,
     )
     await sched._reconcile_litellm_credentials()
-    assert sched._reminted == ["anthropic"]  # openai skipped
+    assert sched._reminted == ["anthropic"]  # synthetic driver skipped
 
 
 @pytest.mark.asyncio

@@ -10,8 +10,8 @@ does not exist until ``vault operator init`` completes.
 
 This is the shared implementation for both the canonical ``rocky9-production``
 profile (Ansible group ``production_rocky9``) and the DEPRECATED compatibility
-``generic-rocky9`` profile (group ``generic_rocky9``); neither is a lab
-profile. The canonical entry point is ``scripts/bootstrap-rocky9-production.py``;
+``generic-rocky9`` profile (group ``generic_rocky9``). The canonical entry
+point is ``scripts/bootstrap-rocky9-production.py``;
 invoking this file directly keeps the legacy layout byte-identical but prints a
 one-line deprecation notice on stderr. Both entry points run this exact module
 — the profile only selects the Ansible group name and the generated
@@ -57,7 +57,13 @@ def parse_arguments(
         description=(
             "Create a new production Rocky 9 inventory and encrypted Ansible Vault "
             "without a plaintext secret file."
-        )
+        ),
+        epilog=(
+            "Run with no arguments in an interactive terminal for the guided setup. "
+            "Non-interactive example: %(prog)s --inventory-alias mygateway "
+            "--vault-id mygateway --vault-password-file ~/.config/ai-gateway/"
+            "mygateway.vault-password"
+        ),
     )
     parser.add_argument(
         "--deployment-profile",
@@ -97,7 +103,100 @@ def parse_arguments(
         default="ansible-vault",
         help="ansible-vault executable (default: ansible-vault from PATH)",
     )
-    return parser.parse_args(argv)
+    raw_arguments = list(sys.argv[1:] if argv is None else argv)
+    if not raw_arguments:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            raw_arguments = guided_arguments(default_profile=default_profile)
+        else:
+            parser.print_help(sys.stderr)
+            fail(
+                "no arguments supplied in a non-interactive session; provide "
+                "--inventory-alias, --vault-id, and --vault-password-file as "
+                "shown above"
+            )
+    return parser.parse_args(raw_arguments)
+
+
+def _guided_value(prompt: str, default: str) -> str:
+    value = input(f"{prompt} [{default}]: ").strip()
+    return value or default
+
+
+def _create_guided_vault_password_file(path: Path) -> None:
+    """Create the wizard's controller-only Vault password without exposing it."""
+
+    parent = path.parent
+    try:
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent_metadata = parent.lstat()
+    except OSError as exc:
+        fail(f"cannot create vault-password directory: {exc}")
+    if (
+        stat.S_ISLNK(parent_metadata.st_mode)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+    ):
+        fail("guided vault-password directory must be private and owned by the current user")
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="ascii", closefd=True) as destination:
+            descriptor = -1
+            destination.write(secrets.token_urlsafe(48) + "\n")
+            destination.flush()
+            os.fsync(destination.fileno())
+    except OSError as exc:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        fail(f"cannot create vault password file: {exc}")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def guided_arguments(*, default_profile: str) -> list[str]:
+    """Collect only non-secret names and create a private password file."""
+
+    print("AI Gateway production inventory guided setup")
+    print("No provider, application, or Vault secret will be displayed.")
+    alias = _guided_value("Inventory alias", "aigw")
+    if ALIAS_RE.fullmatch(alias) is None:
+        fail("inventory alias must match [A-Za-z][A-Za-z0-9_.-]{0,62}")
+    vault_id = _guided_value("Ansible Vault ID", alias)
+    if VAULT_ID_RE.fullmatch(vault_id) is None:
+        fail("vault ID must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+    default_password = Path.home() / ".config" / "ai-gateway" / f"{alias}.vault-password"
+    password_file = Path(
+        _guided_value("Vault password file", str(default_password))
+    ).expanduser()
+    if not password_file.is_absolute():
+        fail("guided vault password file must be an absolute path")
+    if not password_file.exists() and not password_file.is_symlink():
+        answer = input(
+            f"Create a new random mode-0600 Vault password at {password_file}? [Y/n]: "
+        ).strip().lower()
+        if answer not in {"", "y", "yes"}:
+            fail("guided setup stopped before creating the required Vault password file")
+        _create_guided_vault_password_file(password_file)
+        print(f"Created private Vault password file: {password_file}")
+    return [
+        "--deployment-profile",
+        default_profile,
+        "--inventory-alias",
+        alias,
+        "--vault-id",
+        vault_id,
+        "--vault-password-file",
+        str(password_file),
+    ]
 
 
 def load_contract() -> dict[str, Any]:
@@ -179,16 +278,11 @@ def write_text(path: Path, content: str, mode: int) -> None:
 
 def inventory_document(alias: str) -> str:
     return f"""---
-# Generated production Rocky 9 inventory. Keep this separate from the
-# committed lab inventory. The generic_rocky9 group name is retained as a
-# backwards-compatible automation selector. Host-specific non-secret values
-# live in host_vars/{alias}.yml.
+# Generated production Rocky 9 inventory. The generic_rocky9 group name is
+# retained as a backwards-compatible automation selector. Host-specific
+# non-secret values live in host_vars/{alias}.yml.
 all:
   children:
-    # Empty selector group: the generic host below is deliberately not a
-    # gateway member, so a lab-only Vault cannot be inherited.
-    gateway:
-      hosts: {{}}
     # Compatibility selector used by existing playbooks. New automation may
     # target production_rocky9; generic_rocky9 deliberately includes it.
     generic_rocky9:
@@ -205,7 +299,7 @@ def host_vars_document(alias: str) -> str:
 # Generated production Rocky 9 host contract. Fill every empty value before
 # the non-mutating preflight; the encrypted Vault is intentionally elsewhere.
 # deployment_profile=generic-rocky9 is the backwards-compatible production
-# runtime identifier and must not be changed to the lab-only rocky9-lab value.
+# runtime identifier.
 aigw_generic_inventory_alias: {alias}
 deployment_profile: generic-rocky9
 
@@ -315,22 +409,9 @@ pbr_tables: []
 #   - {{ name: internal, id: 102, priority: 10102, dev: "{{{{ nic_internal }}}}",
 #       gw: "{{{{ eth2_gateway }}}}", src: "{{{{ eth2_ip }}}}" }}
 
-# Generic/customer profiles stay outside all lab-only exceptions.
 require_encrypted_state: true
 require_preupgrade_backup: true
-aigw_ssh_password_authentication: false
-aigw_adm_socks_enabled: false
-aigw_adm_socks_users: []
-aigw_adm_socks_groups: []
-aigw_adm_socks_source_cidrs: []
-aigw_adm_socks_group_test_users: {{}}
-aigw_adm_socks_trusted_operator_ack: ""
-samba_lab_enabled: false
 aigw_seed_test_users: false
-retain_bootstrap_admin_user: false
-aigw_prebootstrap_oidc_scope_reconciliation: false
-aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
-aigw_lab_reset_handoff_drop_interfaces: []
 offline_image_seed_enabled: false
 offline_image_seed_remote_path: ""
 offline_image_seed_sha256: ""
@@ -364,15 +445,10 @@ identity_ldap_user_filter: ""
 
 def production_inventory_document(alias: str) -> str:
     return f"""---
-# Generated rocky9-production inventory (canonical profile). Keep this separate
-# from the committed lab inventory. Its host-specific non-secret values live in
-# host_vars/{alias}.yml.
+# Generated rocky9-production inventory (canonical profile). Its host-specific
+# non-secret values live in host_vars/{alias}.yml.
 all:
   children:
-    # Empty selector group: the production host below is deliberately not a
-    # gateway member, so a lab-only Vault cannot be inherited.
-    gateway:
-      hosts: {{}}
     # 'generic_rocky9' is the DEPRECATED compatibility parent group. The
     # canonical 'production_rocky9' child carries this host, so both the legacy
     # and canonical play host patterns (and the preflight) select it while the
@@ -453,22 +529,9 @@ pbr_tables: []
 #   - {{ name: internal, id: 102, priority: 10102, dev: "{{{{ nic_internal }}}}",
 #       gw: "{{{{ eth2_gateway }}}}", src: "{{{{ eth2_ip }}}}" }}
 
-# Production profiles stay outside all lab-only exceptions.
 require_encrypted_state: true
 require_preupgrade_backup: true
-aigw_ssh_password_authentication: false
-aigw_adm_socks_enabled: false
-aigw_adm_socks_users: []
-aigw_adm_socks_groups: []
-aigw_adm_socks_source_cidrs: []
-aigw_adm_socks_group_test_users: {{}}
-aigw_adm_socks_trusted_operator_ack: ""
-samba_lab_enabled: false
 aigw_seed_test_users: false
-retain_bootstrap_admin_user: false
-aigw_prebootstrap_oidc_scope_reconciliation: false
-aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
-aigw_lab_reset_handoff_drop_interfaces: []
 offline_image_seed_enabled: false
 offline_image_seed_remote_path: ""
 offline_image_seed_sha256: ""
@@ -786,8 +849,7 @@ def main(argv: list[str] | None = None, *, default_profile: str = "generic-rocky
     )
     print("2. Run the first converge. A fresh Vault remains uninitialized by design:")
     print(f"  {deploy_command}")
-    print("3. Complete the reviewed production Vault init/unseal ceremony. The bundled")
-    print("   vault-bootstrap.sh is lab-only and is intentionally NOT invoked here.")
+    print("3. Complete the reviewed production Vault init/unseal ceremony.")
     print("   On the controller, enter its generated 1-of-1 share without echo:")
     print("  read -rsp 'Vault unseal share: ' AIGW_UNSEAL_SHARE; printf '\\n'")
     print(

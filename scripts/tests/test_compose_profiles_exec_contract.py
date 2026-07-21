@@ -2,11 +2,8 @@
 
 Modern Docker Compose validates the complete project model even for `exec`
 and other live-project queries. A raw `docker compose exec` task resolves the
-project only from the deployed .env (whose COMPOSE_FILE includes the lab
-overlay on lab hosts) plus the process environment, so a task that empties
-COMPOSE_PROFILES excludes the profile-gated samba-ad service while the lab
-overlay's keycloak depends_on still references it, and Compose rejects the
-whole project: `service "keycloak" depends on undefined service "samba-ad"`.
+project only from the deployed .env plus the process environment, so its
+reviewed optional profiles must remain explicit and deterministic.
 
 Live-project exec/query tasks must therefore carry the reviewed joined
 profile set. An empty ambient COMPOSE_PROFILES stays legal only where the
@@ -69,15 +66,11 @@ STACK_EMPTY_PROFILE_TASKS = (
     "Build only missing or build-input-changed custom images",
     "Deploy stack without implicitly rebuilding custom images",
     "Wait for Keycloak before first pre-Vault identity recovery",
-    "Wait for Keycloak before applicable pre-bootstrap OIDC scope reconciliation",
-    "Wait for Keycloak before managed OIDC redirect-URI reconciliation",
     "Wait for the complete post-bootstrap stack",
     "Wait only for bootstrap-independent core on first converge",
 )
 
-VERIFY_EXEC_TASKS = (
-    "Samba lab directory database is internally consistent",
-)
+VERIFY_EXEC_TASKS = ()
 
 
 def split_tasks(source: str) -> dict[str, str]:
@@ -133,7 +126,7 @@ class ComposeProfilesExecContractTests(unittest.TestCase):
                 "module/argv profile selection",
             )
 
-    def test_verify_lab_exec_carries_the_reviewed_profile_set(self) -> None:
+    def test_verify_has_no_raw_compose_exec_outside_the_stack_contract(self) -> None:
         tasks = split_tasks(VERIFY)
         self.assertEqual(raw_compose_exec_tasks(tasks), set(VERIFY_EXEC_TASKS))
         for name in VERIFY_EXEC_TASKS:

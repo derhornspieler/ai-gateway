@@ -1,0 +1,23 @@
+---
+- name: Build and verify local AI Gateway preprod
+  hosts: preprod
+  gather_facts: false
+  become: false
+  pre_tasks:
+    - name: Refuse removal through the preprod converge playbook
+      ansible.builtin.assert:
+        that:
+          - preprod_state == 'present'
+        quiet: true
+        fail_msg: Use ansible/preprod-destroy.yml for a confirmed removal.
+  vars:
+    preprod_state: present
+    # Play vars outrank ansible/group_vars/all.yml, which contains production
+    # defaults. Keep the portable preprod identity exact and fail closed if an
+    # extra-var tries to replace one of these values.
+    aigw_domain: aigw.internal
+    preprod_project_name: aigw-preprod
+    preprod_resource_prefix: aigw-preprod
+    preprod_subnet_octet: 29
+  roles:
+    - preprod_stack

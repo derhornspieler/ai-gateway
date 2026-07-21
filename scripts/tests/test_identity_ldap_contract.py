@@ -11,7 +11,7 @@ The claims pinned here are the ones an operator's directory depends on:
   and hostname verification is never disabled;
 * exactly one Keycloak -> directory tcp/636 firewall allowance exists, in both
   independent backends, and none exists while the feature is off;
-* the lab federation keeps its exact ``lab-samba-ad`` provider identity.
+* the production selector adds the LDAP overlay only when explicitly enabled.
 """
 
 from __future__ import annotations
@@ -97,27 +97,15 @@ LIVE_VERIFICATION_REQUIRED: tuple[tuple[str, str, str], ...] = (
         "Converge twice: the provider keeps its id, users import READ_ONLY, an "
         "AD user completes an OIDC login, and the second converge is no-op.",
     ),
-    (
-        "The lab federation keeps its exact lab-samba-ad component id on converge",
-        "Pinned byte-for-byte by unit tests, but only a live lab converge "
-        "proves no reprovision occurs.",
-        "On the live lab: capture the lab-samba-ad component UUID before and "
-        "after a full converge — it must be unchanged.",
-    ),
 )
 
 VALID_HOST_VARS = """---
 aigw_generic_inventory_alias: customer-aigw01
 deployment_profile: generic-rocky9
 require_encrypted_state: true
-samba_lab_enabled: false
 aigw_seed_test_users: false
-retain_bootstrap_admin_user: false
-aigw_prebootstrap_oidc_scope_reconciliation: false
-aigw_prebootstrap_oidc_scope_reconciliation_ack: ""
 platform_authoritative_dns_enabled: false
 aigw_vault_ui_enabled: false
-aigw_lab_reset_handoff_drop_interfaces: []
 """
 
 
@@ -268,8 +256,7 @@ class IdentityLdapSecretBoundaryTests(unittest.TestCase):
         for task_name in (
             "Apply the first pre-Vault managed-identity recovery baseline",
             "Prove the pre-Vault managed-identity recovery is idempotent",
-            "Reconcile only applicable pre-bootstrap Keycloak OIDC role scopes",
-            "Reconcile managed OIDC client redirect URIs to the configured domain",
+            "Automatically configure Keycloak identity control from LDAPS",
         ):
             block = source.split(f"- name: {task_name}", 1)[1].split("\n- name:", 1)[0]
             self.assertIn("      - exec\n", block)
@@ -474,74 +461,17 @@ class IdentityLdapFirewallTests(unittest.TestCase):
         )
 
 
-class IdentityLdapMutualExclusionTests(unittest.TestCase):
-    def test_docker_stack_refuses_both_identity_sources(self) -> None:
-        block = STACK_TASKS.read_text(encoding="utf-8").split(
-            "- name: Validate the external directory federation inventory contract", 1
-        )[1].split("- name: Validate per-gate oauth2-proxy cookie secret shapes", 1)[0]
-        self.assertIn("not (samba_lab_enabled | bool)", block)
-        self.assertIn("identity_ldap_provider_name != 'lab-samba-ad'", block)
-
-    def test_site_refuses_both_identity_sources(self) -> None:
-        site = OS_PREP.read_text(encoding="utf-8")
-        self.assertIn(
-            "not (identity_ldap_enabled | bool) or not (samba_lab_enabled | bool)", site
-        )
-
-    def test_the_compose_wrapper_refuses_the_lab_profile_combination(self) -> None:
+class IdentityLdapOverlaySelectionTests(unittest.TestCase):
+    def test_the_compose_wrapper_requires_one_boolean_selector(self) -> None:
         wrapper = WRAPPER.read_text(encoding="utf-8")
         self.assertIn("expected exactly one IDENTITY_LDAP_ENABLED selector", wrapper)
-        self.assertIn("external identity overlay conflicts with the lab profile", wrapper)
+        self.assertIn("invalid external identity selector", wrapper)
+
+    def test_the_compose_wrapper_adds_only_the_requested_production_overlay(self) -> None:
+        wrapper = WRAPPER.read_text(encoding="utf-8")
+        self.assertIn('if [[ "$identity_ldap" == true ]]; then', wrapper)
+        self.assertIn("external identity overlay is missing", wrapper)
         self.assertIn("docker-compose.identity-ldap.yml", wrapper)
-
-    def test_the_key_rotator_refuses_both_identity_sources(self) -> None:
-        config = ROTATOR_CONFIG.read_text(encoding="utf-8")
-        self.assertIn("exactly one LDAP federation source may be enabled", config)
-        self.assertIn('LAB_LDAP_PROVIDER_NAME = "lab-samba-ad"', config)
-
-
-class IdentityLdapLabProviderIdentityTests(unittest.TestCase):
-    """A regression here would silently reprovision the live lab directory."""
-
-    def test_the_lab_provider_name_and_filter_are_unchanged(self) -> None:
-        identity = ROTATOR_IDENTITY.read_text(encoding="utf-8")
-        self.assertIn("LAB_LDAP_USER_FILTER", identity)
-        self.assertIn("(!(sAMAccountName=svc-keycloak-ldap)))", identity)
-        self.assertIn("provider_name=LAB_LDAP_PROVIDER_NAME", identity)
-        config = ROTATOR_CONFIG.read_text(encoding="utf-8")
-        self.assertIn('LAB_LDAP_PROVIDER_NAME = "lab-samba-ad"', config)
-
-    def test_the_lab_creation_path_gains_no_new_admin_call(self) -> None:
-        """The directory probe is a production-only gate.
-
-        The lab DC is an in-stack, healthcheck-gated dependency with a
-        published CA. Introducing a new Keycloak admin call into the lab's
-        provider-creation path could regress a fresh lab build for no benefit.
-        """
-        identity = ROTATOR_IDENTITY.read_text(encoding="utf-8")
-        self.assertIn("prove_directory_before_create: bool", identity)
-        self.assertIn("if spec.prove_directory_before_create:", identity)
-        lab_branch = identity.split("if settings.lab_samba_ldap_enabled:", 1)[1].split(
-            "if settings.identity_ldap_enabled:", 1
-        )[0]
-        self.assertIn("prove_directory_before_create=False", lab_branch)
-        generic_branch = identity.split("if settings.identity_ldap_enabled:", 1)[
-            1
-        ].split("return None", 1)[0]
-        self.assertIn("prove_directory_before_create=True", generic_branch)
-
-    def test_the_lab_overlay_is_untouched_by_the_production_feature(self) -> None:
-        lab = (ROOT / "compose" / "docker-compose.lab.yml").read_text(encoding="utf-8")
-        self.assertIn("LAB_SAMBA_LDAP_ENABLED", lab)
-        # The lab now trusts the REAL Aegis chain (certs/ca.pem) for LDAPS, with
-        # the self-signed DC certificate kept only as a bootstrap-window anchor.
-        # It still shares NONE of the production external-directory overlay's
-        # inventory-driven IDENTITY_LDAP surface.
-        self.assertIn(
-            "KC_TRUSTSTORE_PATHS: /etc/aigw/aegis-ca.pem,/var/lib/samba-public/ca.pem",
-            lab,
-        )
-        self.assertNotIn("IDENTITY_LDAP", lab)
 
 
 class IdentityLdapPreflightExecutionTests(unittest.TestCase):
@@ -773,9 +703,9 @@ class IdentityLdapLiveVerificationRequiredTests(unittest.TestCase):
 
     def test_the_operator_documentation_states_the_remaining_gap(self) -> None:
         status = (ROOT / "docs" / "project-status.md").read_text(encoding="utf-8")
-        self.assertIn("directory-equipped", status)
-        self.assertIn("fixture- and unit-validated today", status)
-        self.assertIn("LIVE_VERIFICATION_REQUIRED", status)
+        self.assertIn("Production ceremonies", status)
+        self.assertIn("external LDAPS", status)
+        self.assertIn("operator-owned work", status)
 
 
 if __name__ == "__main__":

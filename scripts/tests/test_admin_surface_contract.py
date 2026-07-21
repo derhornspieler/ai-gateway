@@ -25,10 +25,10 @@ class AdminSurfaceContractTests(unittest.TestCase):
         )
         cls.adm_zone = (
             ROOT
-            / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.adm.j2"
+            / "ansible/roles/docker_stack/templates/db.aigw.internal.adm.j2"
         ).read_text()
         cls.internal_zone = (
-            ROOT / "ansible/roles/docker_stack/templates/db.aigw.aegisgroup.ch.j2"
+            ROOT / "ansible/roles/docker_stack/templates/db.aigw.internal.j2"
         ).read_text()
         cls.verify = (ROOT / "ansible/roles/verify/tasks/main.yml").read_text()
 
@@ -265,7 +265,7 @@ class AdminSurfaceContractTests(unittest.TestCase):
         self.assertIn("subjectAltName=DNS:*.{{ aigw_domain }}", stack)
 
     def test_provider_enrollment_vault_policy_is_exact_path_only(self) -> None:
-        bootstrap = (ROOT / "scripts/vault-bootstrap.sh").read_text()
+        bootstrap = (ROOT / "scripts/preprod.py").read_text()
         self.assertIn(
             'path "kv/data/ai-gateway/anthropic-wif" { capabilities = '
             '["create", "read", "update", "delete"] }',

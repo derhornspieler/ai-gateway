@@ -70,13 +70,6 @@
       "generated_by_inventory_bootstrap": false
     }
   ],
-  "lab_only_secret_keys": [
-    "samba_ad_admin_password",
-    "samba_ad_bind_password",
-    "samba_user_lab_admin_password",
-    "samba_user_lab_developer_password",
-    "samba_user_lab_user_password"
-  ],
   "conditional_feature_keys": {
     "identity_ldap": {
       "enabled_by": "identity_ldap_enabled",
@@ -104,7 +97,7 @@
     },
     "edge_tls_customer_intermediate": {
       "enabled_by": "aigw_edge_tls_mode == 'customer-intermediate'",
-      "informational": "These three keys are edge-TLS-mode-conditional file paths, validated in the playbooks like the customer-supplied trio; they are intentionally NOT in required_nonsecret_keys so lab/vault-intermediate/customer-supplied inventories stay valid. The intermediate PRIVATE KEY is a controller-local file path, never an inventory secret and never an inline-encrypted overlay value.",
+      "informational": "These three keys are edge-TLS-mode-conditional file paths, validated in the playbooks like the customer-supplied trio; they are intentionally NOT in required_nonsecret_keys so vault-intermediate and customer-supplied inventories stay valid. The intermediate PRIVATE KEY is a controller-local file path, never an inventory secret and never an inline-encrypted overlay value.",
       "required_nonsecret_keys": [
         "aigw_edge_tls_intermediate_cert_file",
         "aigw_edge_tls_intermediate_key_file",

@@ -1,0 +1,33 @@
+---
+- name: Check the local preprod input contract
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname == 'localhost'
+      - (ansible_connection | default('')) == 'local'
+      - preprod_state in ['present', 'absent']
+      - aigw_domain == 'aigw.internal'
+      - preprod_project_name == 'aigw-preprod'
+      - preprod_resource_prefix == 'aigw-preprod'
+      - preprod_subnet_octet | int == 29
+      - preprod_image_mode in ['source', 'seed']
+    quiet: true
+    fail_msg: Local preprod input is invalid or could overlap the production project.
+
+- name: Detect the local preprod host kernel
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/uname
+      - -s
+  register: preprod_host_kernel
+  changed_when: false
+  failed_when: >-
+    preprod_host_kernel.rc != 0 or
+    preprod_host_kernel.stdout | trim not in ['Darwin', 'Linux']
+
+- name: Run the local preprod converge
+  ansible.builtin.include_tasks: present.yml
+  when: preprod_state == 'present'
+
+- name: Run the bounded local preprod removal
+  ansible.builtin.include_tasks: absent.yml
+  when: preprod_state == 'absent'

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Exercise completed browserless OIDC callbacks for reviewed ADM services.
+"""Exercise browserless OIDC callbacks against the local preprod edges.
 
-This is intentionally a lab acceptance harness rather than a general-purpose
-HTTP client.  It accepts the disposable directory password only on stdin and
+This is intentionally a preprod acceptance harness rather than a general-purpose
+HTTP client. It accepts the static test-directory password only on stdin and
 has no host, callback, redirect, or return-URL command-line options.  Every
 network transition is restricted to one hard-coded relying-party hostname and
-the Keycloak issuer over HTTPS.
+the Keycloak issuer over HTTPS. Those names resolve directly to the reviewed
+loopback listeners without relying on workstation DNS or /etc/hosts; their URL
+hostnames remain intact for TLS SNI, certificate validation, cookies, and Host
+routing.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 import argparse
 import http.cookiejar
 import importlib.util
+import socket
 import ssl
 import sys
 import urllib.error
@@ -30,10 +34,40 @@ flow = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(flow)
 
 
-AUTH_HOST = "auth.aigw.aegisgroup.ch"
+AUTH_HOST = "auth.aigw.internal"
 AUTH_LOGIN_ACTION_PREFIX = "/realms/aigw/login-actions/authenticate"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-ACCEPTANCE_USERNAMES = frozenset({"lab-admin", "testadmin"})
+ACCEPTANCE_USERNAMES = frozenset(
+    {"preprod-admin", "preprod-developer", "preprod-user"}
+)
+
+PREPROD_HOST_ADDRESSES = {
+    "admin.aigw.internal": "127.0.3.1",
+    "auth.aigw.internal": "127.0.3.1",
+    "chat.aigw.internal": "127.0.3.1",
+    "grafana.aigw.internal": "127.0.3.1",
+    "litellm-admin.aigw.internal": "127.0.3.1",
+    "prometheus.aigw.internal": "127.0.3.1",
+    "vault.aigw.internal": "127.0.3.1",
+}
+_SYSTEM_GETADDRINFO = socket.getaddrinfo
+
+
+def preprod_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if not isinstance(host, str) or host not in PREPROD_HOST_ADDRESSES:
+        raise socket.gaierror(
+            socket.EAI_NONAME,
+            "hostname is outside the reviewed preprod OIDC boundary",
+        )
+    return _SYSTEM_GETADDRINFO(
+        PREPROD_HOST_ADDRESSES[host], port, family, type, proto, flags
+    )
+
+
+def install_preprod_resolution() -> None:
+    if socket.getaddrinfo is not _SYSTEM_GETADDRINFO:
+        raise RuntimeError("socket name resolution was already replaced")
+    socket.getaddrinfo = preprod_getaddrinfo
 
 
 class AcceptanceError(RuntimeError):
@@ -69,7 +103,7 @@ class OidcTarget:
 TARGETS = (
     OidcTarget(
         name="litellm-admin",
-        host="litellm-admin.aigw.aegisgroup.ch",
+        host="litellm-admin.aigw.internal",
         start_path="/oauth2/start",
         callback_path="/oauth2/callback",
         requested_path="/ui",
@@ -88,7 +122,7 @@ TARGETS = (
     ),
     OidcTarget(
         name="grafana",
-        host="grafana.aigw.aegisgroup.ch",
+        host="grafana.aigw.internal",
         start_path="/oauth2/start",
         callback_path="/oauth2/callback",
         requested_path="/",
@@ -99,7 +133,7 @@ TARGETS = (
     ),
     OidcTarget(
         name="prometheus",
-        host="prometheus.aigw.aegisgroup.ch",
+        host="prometheus.aigw.internal",
         start_path="/oauth2/start",
         callback_path="/oauth2/callback",
         requested_path="/",
@@ -112,7 +146,7 @@ TARGETS = (
     ),
     OidcTarget(
         name="vault",
-        host="vault.aigw.aegisgroup.ch",
+        host="vault.aigw.internal",
         start_path="/oauth2/start",
         callback_path="/oauth2/callback",
         requested_path="/ui/",
@@ -123,7 +157,7 @@ TARGETS = (
     ),
     OidcTarget(
         name="chat",
-        host="chat.aigw.aegisgroup.ch",
+        host="chat.aigw.internal",
         start_path="/oauth/oidc/login",
         callback_path="/oauth/oidc/callback",
         requested_path="/auth",
@@ -395,16 +429,16 @@ def run_target(context: ssl.SSLContext, target: OidcTarget, username: str, passw
 
 def read_password() -> str:
     if sys.stdin.isatty():
-        raise SystemExit("pipe the disposable lab password on stdin")
+        raise SystemExit("pipe the static preprod password on stdin")
     raw = sys.stdin.buffer.read(513)
     if not raw or len(raw) > 512:
-        raise SystemExit("invalid lab password length")
+        raise SystemExit("invalid preprod password length")
     try:
         password = raw.strip().decode("utf-8")
     except UnicodeDecodeError:
-        raise SystemExit("lab password is not UTF-8") from None
+        raise SystemExit("preprod password is not UTF-8") from None
     if not password:
-        raise SystemExit("invalid lab password")
+        raise SystemExit("invalid preprod password")
     return password
 
 
@@ -420,14 +454,19 @@ def main() -> int:
     parser.add_argument(
         "--username",
         choices=tuple(sorted(ACCEPTANCE_USERNAMES)),
-        default="lab-admin",
+        default="preprod-admin",
     )
     args = parser.parse_args()
+    if args.username != "preprod-admin" and args.target != "chat":
+        raise SystemExit(
+            "non-admin preprod identities may exercise only the chat target here"
+        )
     password = read_password()
     try:
         context = ssl.create_default_context(cafile=args.ca)
     except (OSError, ssl.SSLError) as exc:
         raise SystemExit("could not load the reviewed CA file") from exc
+    install_preprod_resolution()
     selected = TARGETS if args.target == "all" else (TARGET_BY_NAME[args.target],)
     for target in selected:
         try:

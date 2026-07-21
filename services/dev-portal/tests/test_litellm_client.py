@@ -197,11 +197,11 @@ async def test_key_generate_stamps_a_bounded_readable_username(monkeypatch):
     _mock_client(monkeypatch, handler)
 
     await litellm_client.key_generate(
-        "owner-sub", "laptop", "ai-gateway", username="lab-developer"
+        "owner-sub", "laptop", "ai-gateway", username="directory-developer"
     )
-    assert body["metadata"]["aigw_username"] == "lab-developer"
+    assert body["metadata"]["aigw_username"] == "directory-developer"
 
-    for rejected in (None, "", " lab-user", "bad name", "<script>", "a" * 65, 7):
+    for rejected in (None, "", " invalid-user", "bad name", "<script>", "a" * 65, 7):
         await litellm_client.key_generate(
             "owner-sub", "laptop", "ai-gateway", username=rejected
         )

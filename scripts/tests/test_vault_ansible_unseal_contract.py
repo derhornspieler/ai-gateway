@@ -20,7 +20,6 @@ GROUP_VARS = ROOT / "ansible/group_vars/all.yml"
 ENV_TEMPLATE = ROOT / "ansible/roles/docker_stack/templates/env.j2"
 COMPOSE = ROOT / "compose/docker-compose.yml"
 SITE = ROOT / "ansible/site.yml"
-LAB_INVENTORY = ROOT / "ansible/inventory/lab.yml"
 GENERIC_INVENTORY = ROOT / "ansible/inventory/hosts.yml"
 REPO_ROOT_ANSIBLE_CFG = ROOT / "ansible.cfg"
 ANSIBLE_DIR_CFG = ROOT / "ansible" / "ansible.cfg"
@@ -280,26 +279,24 @@ class VaultAnsibleUnsealContractTests(unittest.TestCase):
         self.assertNotIn("vault-bootstrap.sh", automatic)
         self.assertIn("Report the fresh Vault bootstrap gate", self.stack)
 
-    def test_lab_and_generic_inventory_paths_share_the_same_role_contract(self) -> None:
+    def test_canonical_production_inventory_uses_the_shared_role_contract(self) -> None:
         site = SITE.read_text(encoding="utf-8")
         os_prep = (ROOT / "ansible/os-prep.yml").read_text(encoding="utf-8")
         stack_only = (ROOT / "ansible/deploy-stack-only.yml").read_text(
             encoding="utf-8"
         )
-        lab = LAB_INVENTORY.read_text(encoding="utf-8")
         generic = GENERIC_INVENTORY.read_text(encoding="utf-8")
         self.assertIn("- import_playbook: os-prep.yml", site)
         self.assertIn("- import_playbook: deploy-stack-only.yml", site)
-        self.assertIn("hosts: gateway:generic_rocky9", os_prep)
-        self.assertIn("hosts: gateway:generic_rocky9", stack_only)
+        self.assertIn("hosts: generic_rocky9", os_prep)
+        self.assertIn("hosts: generic_rocky9", stack_only)
         self.assertIn("- role: docker_stack", stack_only)
         self.assertIn("- role: verify", stack_only)
-        self.assertIn("gateway:", lab)
-        self.assertIn("deployment_profile: rocky9-lab", lab)
         self.assertIn("generic_rocky9:", generic)
+        self.assertIn("production_rocky9:", generic)
 
-        # The unseal decision is intentionally state-based, not tied to a lab,
-        # generic_rocky9, or future production group/profile name.
+        # The unseal decision is intentionally state-based, not tied to an
+        # inventory group or future production profile name.
         unseal_region = self.stack.split(
             "Read public Vault initialization and seal state before automatic unseal",
             1,

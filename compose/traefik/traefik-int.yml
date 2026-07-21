@@ -49,5 +49,5 @@ api:
   dashboard: false
 
 # ACME vs Vault PKI (certificatesResolvers) is the production path — for the
-# first VM test, certs are files issued by scripts/vault-bootstrap.sh (see
+# initial deployment, certs are files issued by the documented TLS ceremony (see
 # dynamic config tls section). ACME upgrade: docs/test-runbook.md "next steps".

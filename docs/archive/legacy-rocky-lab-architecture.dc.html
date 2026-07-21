@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<!-- ARCHIVED HISTORICAL DIAGRAM: describes the retired Rocky/Parallels lab and is not deployment guidance. -->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+    body { margin: 0; background: #e9edf2; color: #1b2130; font-family: "IBM Plex Sans", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+    a { color: #2f5e97; text-decoration: none; }
+    a:hover { color: #1f3f68; }
+    ::selection { background: #d6e2f0; }
+  </style>
+</helmet>
+
+<div style="max-width: 1240px; margin: 0 auto; padding: 0 28px 120px;">
+
+  <sc-if value="{{ showStickyNav }}" hint-placeholder-val="{{ true }}">
+  <div style="position: sticky; top: 0; z-index: 50; margin: 0 -28px 0; padding: 12px 28px; background: rgba(233,237,242,0.88); backdrop-filter: blur(8px); border-bottom: 1px solid #d3dae3; display: flex; align-items: center; gap: 18px; flex-wrap: wrap;">
+    <span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; letter-spacing: -0.01em; color: #1b2130;">AI Gateway</span>
+    <span style="width: 1px; height: 16px; background: #c4ccd7;"></span>
+    <nav style="display: flex; gap: 4px; flex-wrap: wrap; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;">
+      <a href="#network" style="padding: 5px 9px; border-radius: 7px;" style-hover="padding: 5px 9px; border-radius: 7px; background: #dbe3ec;">01 Network</a>
+      <a href="#software" style="padding: 5px 9px; border-radius: 7px;" style-hover="padding: 5px 9px; border-radius: 7px; background: #dbe3ec;">02 Software</a>
+      <a href="#security" style="padding: 5px 9px; border-radius: 7px;" style-hover="padding: 5px 9px; border-radius: 7px; background: #dbe3ec;">03 Security</a>
+      <a href="#telemetry" style="padding: 5px 9px; border-radius: 7px;" style-hover="padding: 5px 9px; border-radius: 7px; background: #dbe3ec;">04 Telemetry</a>
+      <a href="#keys" style="padding: 5px 9px; border-radius: 7px;" style-hover="padding: 5px 9px; border-radius: 7px; background: #dbe3ec;">05 Keys</a>
+      <a href="#rotation" style="padding: 5px 9px; border-radius: 7px;" style-hover="padding: 5px 9px; border-radius: 7px; background: #dbe3ec;">06 Rotation</a>
+      <a href="#planes" style="padding: 5px 9px; border-radius: 7px;" style-hover="padding: 5px 9px; border-radius: 7px; background: #dbe3ec;">07 Planes</a>
+      <a href="#converge" style="padding: 5px 9px; border-radius: 7px;" style-hover="padding: 5px 9px; border-radius: 7px; background: #dbe3ec;">08 Converge</a>
+    </nav>
+  </div>
+  </sc-if>
+
+  <header style="padding: 64px 0 40px;">
+    <div style="display: inline-flex; align-items: center; gap: 8px; padding: 6px 13px; border-radius: 999px; background: #dbe3ec; border: 1px solid #c4ccd7; font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: #4a5568; margin-bottom: 26px;">
+      <span style="width: 7px; height: 7px; border-radius: 50%; background: #b8472e;"></span>
+      Customer prototype · under active hardening
+    </div>
+    <h1 style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 58px; line-height: 1.02; letter-spacing: -0.025em; margin: 0 0 20px; color: #131824; max-width: 16ch;">Architecture &amp; Trust Boundaries</h1>
+    <p style="font-size: 18px; line-height: 1.55; color: #475264; max-width: 62ch; margin: 0 0 32px;">A security-focused, self-hosted AI access platform running as one hardened Docker Compose stack on a single Rocky Linux 9 VM. OpenAI- and Anthropic-compatible API front doors, browser chat, per-user gateway keys, Keycloak OIDC, pinned vendor egress, and Vault-backed provider credentials.</p>
+    <sc-if value="{{ showStats }}" hint-placeholder-val="{{ true }}">
+    <div style="display: flex; gap: 40px; flex-wrap: wrap; padding-top: 8px; border-top: 1px solid #d3dae3;">
+      <div style="padding-top: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; color: #131824;">3</div>
+        <div style="font-size: 13px; color: #647082; margin-top: 2px;">trust legs · one VM</div>
+      </div>
+      <div style="padding-top: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; color: #131824;">20</div>
+        <div style="font-size: 13px; color: #647082; margin-top: 2px;">segmented bridges</div>
+      </div>
+      <div style="padding-top: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; color: #131824;">23</div>
+        <div style="font-size: 13px; color: #647082; margin-top: 2px;">services (default profile)</div>
+      </div>
+      <div style="padding-top: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; color: #131824;">7</div>
+        <div style="font-size: 13px; color: #647082; margin-top: 2px;">fail-closed enforcement layers</div>
+      </div>
+    </div>
+    </sc-if>
+  </header>
+
+  <sc-if value="{{ showLegend }}" hint-placeholder-val="{{ true }}">
+  <div style="display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; padding: 18px 22px; background: #fbfcfd; border: 1px solid #dde3ea; border-radius: 14px; margin-bottom: 56px;">
+    <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #8a94a3; margin-right: 4px;">Plane legend</span>
+    <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: #3a4252;"><span style="width: 12px; height: 12px; border-radius: 4px; background: #e6edf6; border: 1px solid #aec6e2;"></span>User / internal</span>
+    <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: #3a4252;"><span style="width: 12px; height: 12px; border-radius: 4px; background: #f6edda; border: 1px solid #e3cd9c;"></span>Administrative</span>
+    <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: #3a4252;"><span style="width: 12px; height: 12px; border-radius: 4px; background: #f7e7e1; border: 1px solid #e6b8a8;"></span>Egress / vendor</span>
+    <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: #3a4252;"><span style="width: 12px; height: 12px; border-radius: 4px; background: #efe7f6; border: 1px solid #cbb4e2;"></span>Identity</span>
+    <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: #3a4252;"><span style="width: 12px; height: 12px; border-radius: 4px; background: #e2efe8; border: 1px solid #a8d0bd;"></span>Data / secrets</span>
+    <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: #3a4252;"><span style="width: 12px; height: 12px; border-radius: 4px; background: #e1eef0; border: 1px solid #a6cdd3;"></span>Telemetry</span>
+    <span style="width: 1px; height: 16px; background: #d3dae3;"></span>
+    <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: #3a4252;"><span style="width: 16px; height: 12px; border-radius: 4px; background: #fff; border: 1.5px dashed #b3bcc9;"></span>Off-host</span>
+  </div>
+  </sc-if>
+
+  <!-- ============ 01 NETWORK ============ -->
+  <section id="network" style="scroll-margin-top: 76px; margin-bottom: 30px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #b8472e;">01</span>
+      <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; color: #131824;">Network topology &amp; trust zones</h2>
+    </div>
+    <p style="font-size: 15.5px; line-height: 1.55; color: #566072; max-width: 76ch; margin: 0 0 28px;">Three customer-owned interfaces map to three firewalld zones, each with distinct inbound policy. Nothing publishes a listener on the egress leg; only the two Traefik edges publish container ports, each bound to its exact host address.</p>
+
+    <div style="background: #fbfcfd; border: 1px solid #dde3ea; border-radius: 20px; padding: 26px; box-shadow: 0 1px 3px rgba(20,30,50,0.04);">
+
+      <!-- Lane: internal -->
+      <div style="display: flex; align-items: stretch; gap: 16px; border-radius: 16px; background: #e9f0f8; border: 1px solid #cddcec; padding: 16px 18px; margin-bottom: 14px;">
+        <div style="flex: 0 0 128px; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-right: 1px solid #cddcec; padding-right: 14px;">
+          <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; color: #2f5e97;">Internal leg</div>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #6a8bb0;">zone aigw-internal</div>
+          <div style="font-size: 11px; color: #6b7688; line-height: 1.35;">internal CIDR only · TCP/443</div>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1.5px dashed #aec6e2; min-width: 132px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">Internal users &amp; tools</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7d8a9c; margin-top: 3px;">off-host · internal_cidr</div>
+          </div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;">
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #7d8a9c;">HTTPS</span>
+            <svg width="30" height="12" viewBox="0 0 30 12" fill="none"><path d="M0 6 H25 M20 1.5 L26 6 L20 10.5" stroke="#9db0c6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1px solid #aec6e2; min-width: 130px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">Internal NIC</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #2f5e97; margin-top: 3px;">ETH2_IP · :443</div>
+          </div>
+          <svg width="30" height="12" viewBox="0 0 30 12" fill="none"><path d="M0 6 H25 M20 1.5 L26 6 L20 10.5" stroke="#9db0c6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1px solid #aec6e2; min-width: 130px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">Internal edge</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #2f5e97; margin-top: 3px;">traefik-int</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Lane: admin -->
+      <div style="display: flex; align-items: stretch; gap: 16px; border-radius: 16px; background: #f7efdd; border: 1px solid #e7d3a4; padding: 16px 18px; margin-bottom: 14px;">
+        <div style="flex: 0 0 128px; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-right: 1px solid #e7d3a4; padding-right: 14px;">
+          <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; color: #96631a;">Admin leg</div>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #b08a3e;">zone aigw-adm</div>
+          <div style="font-size: 11px; color: #6b7688; line-height: 1.35;">VPN CIDR only · TCP/22 + 443</div>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1.5px dashed #e3cd9c; min-width: 132px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">VPN administrators</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7d8a9c; margin-top: 3px;">off-host · vpn_client_cidr</div>
+          </div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;">
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #7d8a9c;">SSH + HTTPS</span>
+            <svg width="30" height="12" viewBox="0 0 30 12" fill="none"><path d="M0 6 H25 M20 1.5 L26 6 L20 10.5" stroke="#c9ab6a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1px solid #e3cd9c; min-width: 130px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">ADM NIC</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #96631a; margin-top: 3px;">ETH1_IP · :443</div>
+          </div>
+          <svg width="30" height="12" viewBox="0 0 30 12" fill="none"><path d="M0 6 H25 M20 1.5 L26 6 L20 10.5" stroke="#c9ab6a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1px solid #e3cd9c; min-width: 130px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">Admin edge</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #96631a; margin-top: 3px;">traefik-adm</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Lane: egress -->
+      <div style="display: flex; align-items: stretch; gap: 16px; border-radius: 16px; background: #f9e9e2; border: 1px solid #ecc0af; padding: 16px 18px;">
+        <div style="flex: 0 0 128px; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-right: 1px solid #ecc0af; padding-right: 14px;">
+          <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; color: #b8472e;">Egress leg</div>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #cc6a4f;">zone aigw-egress</div>
+          <div style="font-size: 11px; color: #6b7688; line-height: 1.35;">target DROP · no listener</div>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1px solid #ecc0af; min-width: 150px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">Envoy egress</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #b8472e; margin-top: 3px;">172.28.0.2 · sole external identity</div>
+          </div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;">
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #7d8a9c;">pinned TLS · exact SAN</span>
+            <svg width="30" height="12" viewBox="0 0 30 12" fill="none"><path d="M0 6 H25 M20 1.5 L26 6 L20 10.5" stroke="#d38f77" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1px solid #ecc0af; min-width: 130px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">Egress NIC</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #b8472e; margin-top: 3px;">only default route</div>
+          </div>
+          <svg width="30" height="12" viewBox="0 0 30 12" fill="none"><path d="M0 6 H25 M20 1.5 L26 6 L20 10.5" stroke="#d38f77" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 11px 14px; border-radius: 11px; background: #fff; border: 1.5px dashed #ecc0af; min-width: 140px;">
+            <div style="font-weight: 600; font-size: 13px; color: #1b2130;">Vendor APIs</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #7d8a9c; margin-top: 3px;">off-host · Anthropic / OpenAI</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 10px; align-items: flex-start; margin-top: 18px; padding-top: 16px; border-top: 1px dashed #d3dae3;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #8a94a3; padding-top: 1px;">NOTE</span>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.5; color: #647082; max-width: 92ch;">Reply traffic for the ADM and internal legs uses source-policy routing (tables 101 / 102) so responses leave through the interface they arrived on. The main table keeps exactly one default route, through the egress NIC.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 02 SOFTWARE ============ -->
+  <section id="software" style="scroll-margin-top: 76px; margin: 72px 0 30px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #2f5e97;">02</span>
+      <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; color: #131824;">Software &amp; request flow</h2>
+    </div>
+    <p style="font-size: 15.5px; line-height: 1.55; color: #566072; max-width: 76ch; margin: 0 0 28px;">Four caller paths — browser chat, tool API, developer self-service, and administration — enter through the correct TLS edge and fan into shared platform services. Every human path authenticates against Keycloak; the API path carries a portal-minted gateway key.</p>
+
+    <div style="background: #fbfcfd; border: 1px solid #dde3ea; border-radius: 20px; padding: 26px; box-shadow: 0 1px 3px rgba(20,30,50,0.04);">
+
+      <!-- lane: chat -->
+      <div style="display: flex; align-items: stretch; gap: 16px; border-radius: 16px; background: #e9f0f8; border: 1px solid #cddcec; padding: 15px 18px; margin-bottom: 12px;">
+        <div style="flex: 0 0 130px; display: flex; flex-direction: column; justify-content: center; gap: 3px; border-right: 1px solid #cddcec; padding-right: 14px;">
+          <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13.5px; color: #2f5e97;">Browser chat</div>
+          <div style="font-size: 11px; color: #6b7688;">role aigw-users</div>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; gap: 9px; flex-wrap: wrap;">
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1.5px dashed #aec6e2;"><div style="font-weight: 600; font-size: 12.5px;">User browser</div></div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #7d8a9c;">chat.DOMAIN · ADM</span><svg width="28" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#9aa6b6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #aec6e2;"><div style="font-weight: 600; font-size: 12.5px;">Open WebUI</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">open-webui</div></div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #7d8a9c;">svc-open-webui key</span><svg width="28" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#9aa6b6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #eef3f8; border: 1px solid #aec6e2;"><div style="font-weight: 600; font-size: 12.5px;">LiteLLM gateway</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">litellm</div></div>
+        </div>
+      </div>
+
+      <!-- lane: api -->
+      <div style="display: flex; align-items: stretch; gap: 16px; border-radius: 16px; background: #e9f0f8; border: 1px solid #cddcec; padding: 15px 18px; margin-bottom: 12px;">
+        <div style="flex: 0 0 130px; display: flex; flex-direction: column; justify-content: center; gap: 3px; border-right: 1px solid #cddcec; padding-right: 14px;">
+          <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13.5px; color: #2f5e97;">Tool API</div>
+          <div style="font-size: 11px; color: #6b7688;">gateway virtual key</div>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; gap: 9px; flex-wrap: wrap;">
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1.5px dashed #aec6e2;"><div style="font-weight: 600; font-size: 12.5px;">AI tool + key</div></div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #7d8a9c;">api.DOMAIN /v1 · internal</span><svg width="28" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#9aa6b6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #aec6e2;"><div style="font-weight: 600; font-size: 12.5px;">Internal edge</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">traefik-int · inference allow-list</div></div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><svg width="28" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#9aa6b6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #eef3f8; border: 1px solid #aec6e2;"><div style="font-weight: 600; font-size: 12.5px;">LiteLLM gateway</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">any other path → 403</div></div>
+        </div>
+      </div>
+
+      <!-- lane: developer -->
+      <div style="display: flex; align-items: stretch; gap: 16px; border-radius: 16px; background: #e9f0f8; border: 1px solid #cddcec; padding: 15px 18px; margin-bottom: 12px;">
+        <div style="flex: 0 0 130px; display: flex; flex-direction: column; justify-content: center; gap: 3px; border-right: 1px solid #cddcec; padding-right: 14px;">
+          <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13.5px; color: #2f5e97;">Developer</div>
+          <div style="font-size: 11px; color: #6b7688;">role aigw-developers</div>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; gap: 9px; flex-wrap: wrap;">
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1.5px dashed #aec6e2;"><div style="font-weight: 600; font-size: 12.5px;">Developer browser</div></div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #7d8a9c;">portal.DOMAIN · internal</span><svg width="28" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#9aa6b6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #aec6e2;"><div style="font-weight: 600; font-size: 12.5px;">Dev portal</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">dev-portal</div></div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #7d8a9c;">key lifecycle</span><svg width="28" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#9aa6b6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #f2ecf8; border: 1px solid #cbb4e2;"><div style="font-weight: 600; font-size: 12.5px;">key-rotator</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #8a6fb0; margin-top: 2px;">mints scoped virtual key</div></div>
+        </div>
+      </div>
+
+      <!-- lane: admin -->
+      <div style="display: flex; align-items: stretch; gap: 16px; border-radius: 16px; background: #f7efdd; border: 1px solid #e7d3a4; padding: 15px 18px;">
+        <div style="flex: 0 0 130px; display: flex; flex-direction: column; justify-content: center; gap: 3px; border-right: 1px solid #e7d3a4; padding-right: 14px;">
+          <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13.5px; color: #96631a;">Administration</div>
+          <div style="font-size: 11px; color: #6b7688;">role aigw-admins</div>
+        </div>
+        <div style="flex: 1; display: flex; align-items: center; gap: 9px; flex-wrap: wrap;">
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1.5px dashed #e3cd9c;"><div style="font-weight: 600; font-size: 12.5px;">Admin browser</div></div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #7d8a9c;">admin hosts · ADM</span><svg width="28" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#c9ab6a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #e3cd9c;"><div style="font-weight: 600; font-size: 12.5px;">oauth2-proxy ×4 · admin-portal</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">step-up + live-role recheck</div></div>
+          <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><svg width="28" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#c9ab6a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fbf5e8; border: 1px solid #e3cd9c;"><div style="font-weight: 600; font-size: 12.5px;">LiteLLM Admin · Grafana · Prometheus · Vault</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">+ identity &amp; rotation control</div></div>
+        </div>
+      </div>
+
+      <!-- shared services band -->
+      <div style="margin-top: 18px; padding-top: 20px; border-top: 1px dashed #d3dae3;">
+        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #8a94a3; margin-bottom: 14px;">Shared platform services</div>
+        <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: stretch;">
+          <div style="flex: 1; min-width: 260px; display: flex; align-items: center; gap: 9px; padding: 14px; border-radius: 12px; background: #f9e9e2; border: 1px solid #ecc0af;">
+            <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #ecc0af;"><div style="font-weight: 600; font-size: 12.5px;">LiteLLM · key-rotator</div></div>
+            <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #7d8a9c;">vendor path</span><svg width="26" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#d38f77" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+            <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #ecc0af;"><div style="font-weight: 600; font-size: 12.5px;">Envoy</div></div>
+            <svg width="22" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#d38f77" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1.5px dashed #ecc0af;"><div style="font-weight: 600; font-size: 12.5px;">Vendors</div></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; padding: 14px; border-radius: 12px; background: #e6f0ea; border: 1px solid #b7d7c5;">
+            <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #b7d7c5;"><div style="font-weight: 600; font-size: 12.5px;">Postgres</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #7d8a9c; margin-top: 2px;">3 isolated DBs</div></div>
+            <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #b7d7c5;"><div style="font-weight: 600; font-size: 12.5px;">Redis</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #7d8a9c; margin-top: 2px;">cache</div></div>
+            <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #b7d7c5;"><div style="font-weight: 600; font-size: 12.5px;">Vault</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #7d8a9c; margin-top: 2px;">KV v2 · PKI</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 03 SECURITY ============ -->
+  <section id="security" style="scroll-margin-top: 76px; margin: 72px 0 30px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #b8472e;">03</span>
+      <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; color: #131824;">Layered security enforcement</h2>
+    </div>
+    <p style="font-size: 15.5px; line-height: 1.55; color: #566072; max-width: 76ch; margin: 0 0 28px;">Seven independent layers, ingress to egress. Each fails closed on its own — compromising one does not disable the others.</p>
+
+    <div style="background: #fbfcfd; border: 1px solid #dde3ea; border-radius: 20px; padding: 26px; box-shadow: 0 1px 3px rgba(20,30,50,0.04); display: flex; flex-direction: column; gap: 10px;">
+
+      <div style="display: flex; align-items: stretch; gap: 16px; padding: 16px 18px; border-radius: 13px; background: #fff; border: 1px solid #e3e8ee; border-left: 4px solid #96631a;">
+        <div style="flex: 0 0 34px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; color: #c9ab6a; display: flex; align-items: center;">L1</div>
+        <div style="flex: 0 0 190px; display: flex; flex-direction: column; justify-content: center;"><div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #131824;">Host ingress</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #96631a; margin-top: 2px;">firewalld zones</div></div>
+        <div style="flex: 1; display: flex; align-items: center; font-size: 13px; color: #566072; line-height: 1.5;">Exact source CIDRs per leg · SSH key-only on ADM · no listener on the egress leg.</div>
+      </div>
+
+      <div style="display: flex; justify-content: center;"><svg width="12" height="18" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="display: flex; align-items: stretch; gap: 16px; padding: 16px 18px; border-radius: 13px; background: #fff; border: 1px solid #e3e8ee; border-left: 4px solid #b8472e;">
+        <div style="flex: 0 0 34px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; color: #d38f77; display: flex; align-items: center;">L2</div>
+        <div style="flex: 0 0 190px; display: flex; flex-direction: column; justify-content: center;"><div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #131824;">Packet policy</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #b8472e; margin-top: 2px;">DOCKER-USER + aigw_guard</div></div>
+        <div style="flex: 1; display: flex; align-items: center; font-size: 13px; color: #566072; line-height: 1.5;">Atomic iptables chain plus an independent native nftables guard deny cross-plane, container-to-host, and unapproved bridge egress.</div>
+      </div>
+
+      <div style="display: flex; justify-content: center;"><svg width="12" height="18" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="display: flex; align-items: stretch; gap: 16px; padding: 16px 18px; border-radius: 13px; background: #fff; border: 1px solid #e3e8ee; border-left: 4px solid #2f5e97;">
+        <div style="flex: 0 0 34px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; color: #7fa0c6; display: flex; align-items: center;">L3</div>
+        <div style="flex: 0 0 190px; display: flex; flex-direction: column; justify-content: center;"><div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #131824;">Network segmentation</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #2f5e97; margin-top: 2px;">18 per-function bridges</div></div>
+        <div style="flex: 1; display: flex; align-items: center; font-size: 13px; color: #566072; line-height: 1.5;">Services join only the planes they need · fixed IPs for firewall-addressed workloads.</div>
+      </div>
+
+      <div style="display: flex; justify-content: center;"><svg width="12" height="18" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="display: flex; align-items: stretch; gap: 16px; padding: 16px 18px; border-radius: 13px; background: #fff; border: 1px solid #e3e8ee; border-left: 4px solid #6d4bd0;">
+        <div style="flex: 0 0 34px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; color: #a48fe0; display: flex; align-items: center;">L4</div>
+        <div style="flex: 0 0 190px; display: flex; flex-direction: column; justify-content: center;"><div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #131824;">Identity</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #6d4bd0; margin-top: 2px;">Keycloak OIDC</div></div>
+        <div style="flex: 1; display: flex; align-items: center; font-size: 13px; color: #566072; line-height: 1.5;">Three realm roles · per-UI oauth2-proxy gates · step-up and live-role rechecks for admin mutations.</div>
+      </div>
+
+      <div style="display: flex; justify-content: center;"><svg width="12" height="18" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="display: flex; align-items: stretch; gap: 16px; padding: 16px 18px; border-radius: 13px; background: #fff; border: 1px solid #e3e8ee; border-left: 4px solid #2c7350;">
+        <div style="flex: 0 0 34px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; color: #74ab8f; display: flex; align-items: center;">L5</div>
+        <div style="flex: 0 0 190px; display: flex; flex-direction: column; justify-content: center;"><div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #131824;">Secrets</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #2c7350; margin-top: 2px;">Vault-backed</div></div>
+        <div style="flex: 1; display: flex; align-items: center; font-size: 13px; color: #566072; line-height: 1.5;">Provider credentials in Vault · file-backed Docker secrets · no secret in argv/env · fail-closed blank-variable Compose contract.</div>
+      </div>
+
+      <div style="display: flex; justify-content: center;"><svg width="12" height="18" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="display: flex; align-items: stretch; gap: 16px; padding: 16px 18px; border-radius: 13px; background: #fff; border: 1px solid #e3e8ee; border-left: 4px solid #2a6f7a;">
+        <div style="flex: 0 0 34px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; color: #6fb0b9; display: flex; align-items: center;">L6</div>
+        <div style="flex: 0 0 190px; display: flex; flex-direction: column; justify-content: center;"><div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #131824;">Runtime</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #2a6f7a; margin-top: 2px;">SELinux + DHI images</div></div>
+        <div style="flex: 1; display: flex; align-items: center; font-size: 13px; color: #566072; line-height: 1.5;">SELinux enforcing with per-container MCS · non-root digest-pinned images · read-only binds · no Docker socket exposure.</div>
+      </div>
+
+      <div style="display: flex; justify-content: center;"><svg width="12" height="18" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="display: flex; align-items: stretch; gap: 16px; padding: 16px 18px; border-radius: 13px; background: #fff; border: 1px solid #e3e8ee; border-left: 4px solid #b8472e;">
+        <div style="flex: 0 0 34px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; color: #d38f77; display: flex; align-items: center;">L7</div>
+        <div style="flex: 0 0 190px; display: flex; flex-direction: column; justify-content: center;"><div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #131824;">Egress</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #b8472e; margin-top: 2px;">Envoy sole identity</div></div>
+        <div style="flex: 1; display: flex; align-items: center; font-size: 13px; color: #566072; line-height: 1.5;">Exact routes · exact SANs · per-vendor CA bundles narrower than the system trust store.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 04 TELEMETRY ============ -->
+  <section id="telemetry" style="scroll-margin-top: 76px; margin: 72px 0 30px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #2a6f7a;">04</span>
+      <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; color: #131824;">Telemetry &amp; logging flow</h2>
+    </div>
+    <p style="font-size: 15.5px; line-height: 1.55; color: #566072; max-width: 76ch; margin: 0 0 28px;">Every signal fans through Alloy to a purpose-specific store. Prompts and completions are sensitive: they travel as Tempo trace attributes, never as ordinary Loki log records.</p>
+
+    <div style="background: #fbfcfd; border: 1px solid #dde3ea; border-radius: 20px; padding: 26px; box-shadow: 0 1px 3px rgba(20,30,50,0.04);">
+      <div style="display: flex; gap: 18px; align-items: stretch; flex-wrap: wrap;">
+
+        <!-- sources -->
+        <div style="flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 8px;">
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #8a94a3; margin-bottom: 2px;">Sources</div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #e3e8ee;"><div style="font-weight: 600; font-size: 12.5px;">LiteLLM</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b8472e; margin-top: 2px;">full AI spans · OTLP</div></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #e3e8ee;"><div style="font-weight: 600; font-size: 12.5px;">Portals · key-rotator</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">OTLP / logs</div></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #e3e8ee;"><div style="font-weight: 600; font-size: 12.5px;">Docker JSON logs</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">uid-473 ACL tail</div></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #e3e8ee;"><div style="font-weight: 600; font-size: 12.5px;">Vault audit device</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">tail</div></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1px solid #e3e8ee;"><div style="font-weight: 600; font-size: 12.5px;">node-exporter</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">host metrics</div></div>
+        </div>
+
+        <!-- alloy -->
+        <div style="flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; align-self: center;">
+          <svg width="30" height="12" viewBox="0 0 30 12" fill="none"><path d="M0 6 H25 M20 1.5 L26 6 L20 10.5" stroke="#9aa6b6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 20px 18px; border-radius: 14px; background: #e1eef0; border: 1px solid #a6cdd3; text-align: center; min-width: 132px;">
+            <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 16px; color: #1b2130;">Alloy</div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2a6f7a; margin-top: 4px; line-height: 1.5;">OTLP receive<br>fan-out · spanmetrics</div>
+          </div>
+          <svg width="30" height="12" viewBox="0 0 30 12" fill="none"><path d="M0 6 H25 M20 1.5 L26 6 L20 10.5" stroke="#9aa6b6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+
+        <!-- sinks -->
+        <div style="flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 8px;">
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #8a94a3; margin-bottom: 2px;">Stores</div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #f9e9e2; border: 1px solid #ecc0af;"><div style="font-weight: 600; font-size: 12.5px;">Tempo</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b8472e; margin-top: 2px;">30 d · prompt-bearing spans</div></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #e6f0ea; border: 1px solid #b7d7c5;"><div style="font-weight: 600; font-size: 12.5px;">Loki</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350; margin-top: 2px;">30 d · operational + audit logs</div></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #e6f0ea; border: 1px solid #b7d7c5;"><div style="font-weight: 600; font-size: 12.5px;">Prometheus</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350; margin-top: 2px;">15 d · remote-write + spanmetrics</div></div>
+          <div style="padding: 10px 13px; border-radius: 10px; background: #fff; border: 1.5px dashed #a6cdd3;"><div style="font-weight: 600; font-size: 12.5px;">Cribl export</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #7d8a9c; margin-top: 2px;">optional · OTLP over internal NIC</div></div>
+        </div>
+      </div>
+
+      <!-- grafana + note -->
+      <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px;">
+        <div style="flex: 1; min-width: 240px; display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-radius: 12px; background: #f7efdd; border: 1px solid #e7d3a4;">
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #e3cd9c;"><div style="font-weight: 600; font-size: 12.5px;">Grafana</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #96631a; margin-top: 2px;">ADM leg · behind oauth2-proxy</div></div>
+          <svg width="26" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#c9ab6a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span style="font-size: 12px; color: #647082;">queries Tempo · Loki · Prometheus</span>
+        </div>
+        <div style="flex: 1; min-width: 240px; display: flex; gap: 10px; align-items: flex-start; padding: 14px 16px; border-radius: 12px; background: #f9e9e2; border: 1px solid #ecc0af;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b8472e; padding-top: 1px;">SENSITIVE</span>
+          <p style="margin: 0; font-size: 12px; line-height: 1.5; color: #6b5148;">Full prompts &amp; completions are Tempo trace attributes and may go to Cribl — never ordinary Loki records. Open WebUI is attributed to <span style="font-family: 'IBM Plex Mono', monospace;">svc-open-webui</span>, not the browser user.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 05 KEYS ============ -->
+  <section id="keys" style="scroll-margin-top: 76px; margin: 72px 0 30px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #6d4bd0;">05</span>
+      <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; color: #131824;">Developer key lifecycle</h2>
+    </div>
+    <p style="font-size: 15.5px; line-height: 1.55; color: #566072; max-width: 76ch; margin: 0 0 28px;">Keycloak group membership is the authorization source. LiteLLM virtual keys are always derived from it — and revoked with it.</p>
+
+    <div style="background: #fbfcfd; border: 1px solid #dde3ea; border-radius: 20px; padding: 26px; box-shadow: 0 1px 3px rgba(20,30,50,0.04); display: flex; flex-direction: column; gap: 10px; max-width: 720px;">
+
+      <div style="padding: 13px 16px; border-radius: 12px; background: #efe7f6; border: 1px solid #cbb4e2; font-weight: 600; font-size: 13.5px; color: #4b3a86;">Developer opens dev-portal</div>
+
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="flex: 1; display: flex; align-items: center; gap: 12px; padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #8a94a3;">CHECK</span>
+          <span style="font-size: 13px; color: #1b2130;">Token carries <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px;">aigw-developers</span>?</span>
+        </div>
+        <svg width="24" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#c99" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div style="padding: 9px 13px; border-radius: 10px; background: #f9e9e2; border: 1px solid #ecc0af; font-size: 12px; font-weight: 600; color: #b8472e; white-space: nowrap;">No → Denied</div>
+      </div>
+
+      <div style="display: flex; justify-content: flex-start; padding-left: 8px;"><svg width="12" height="16" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="flex: 1; display: flex; align-items: center; gap: 12px; padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #8a94a3;">CHECK</span>
+          <span style="font-size: 13px; color: #1b2130;">Live member of a managed project group? <span style="color: #8a94a3;">— verified via key-rotator</span></span>
+        </div>
+        <svg width="24" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#c99" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div style="padding: 9px 13px; border-radius: 10px; background: #f9e9e2; border: 1px solid #ecc0af; font-size: 12px; font-weight: 600; color: #b8472e; white-space: nowrap;">No → Denied</div>
+      </div>
+
+      <div style="display: flex; justify-content: flex-start; padding-left: 8px;"><svg width="12" height="16" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="padding: 13px 16px; border-radius: 12px; background: #f2ecf8; border: 1px solid #cbb4e2;"><div style="font-weight: 600; font-size: 13.5px; color: #4b3a86;">key-rotator mints scoped LiteLLM virtual key</div><div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #8a6fb0; margin-top: 3px;">project ID = group name, stored in key metadata</div></div>
+
+      <div style="display: flex; justify-content: flex-start; padding-left: 8px;"><svg width="12" height="16" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;"><div style="font-weight: 600; font-size: 13.5px; color: #131824;">One-time plaintext key shown once</div><div style="font-size: 12px; color: #647082; margin-top: 3px;">never stored, logged, or redisplayed — snippets carry only <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px;">YOUR_KEY</span></div></div>
+
+      <div style="display: flex; gap: 11px; align-items: flex-start; margin-top: 8px; padding: 14px 16px; border-radius: 12px; background: #f9e9e2; border: 1px dashed #ecc0af;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b8472e; padding-top: 2px;">REVOKE</span>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.5; color: #6b5148;">When an admin removes the member from the group, key-rotator logs the user out of Keycloak and deactivates that subject's project keys — both before and after the membership change, closing the mint/removal race.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 06 ROTATION ============ -->
+  <section id="rotation" style="scroll-margin-top: 76px; margin: 72px 0 30px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #b8472e;">06</span>
+      <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; color: #131824;">Provider credential rotation — Anthropic WIF</h2>
+    </div>
+    <p style="font-size: 15.5px; line-height: 1.55; color: #566072; max-width: 76ch; margin: 0 0 28px;">No long-lived vendor key sits in application config. key-rotator brokers a short-lived Anthropic token through Keycloak's isolated <span style="font-family: 'IBM Plex Mono', monospace; font-size: 14px;">anthropic-wif</span> realm using <span style="font-family: 'IBM Plex Mono', monospace; font-size: 14px;">private_key_jwt</span>; the private key exists only in Vault.</p>
+
+    <div style="background: #fbfcfd; border: 1px solid #dde3ea; border-radius: 20px; padding: 26px; box-shadow: 0 1px 3px rgba(20,30,50,0.04);">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px;">
+        <span style="padding: 6px 11px; border-radius: 8px; background: #f2ecf8; border: 1px solid #cbb4e2; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #4b3a86;">key-rotator</span>
+        <span style="padding: 6px 11px; border-radius: 8px; background: #e6f0ea; border: 1px solid #b7d7c5; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #2c7350;">Vault</span>
+        <span style="padding: 6px 11px; border-radius: 8px; background: #efe7f6; border: 1px solid #cbb4e2; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #6d4bd0;">Keycloak · anthropic-wif</span>
+        <span style="padding: 6px 11px; border-radius: 8px; background: #f9e9e2; border: 1px solid #ecc0af; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #b8472e;">Envoy</span>
+        <span style="padding: 6px 11px; border-radius: 8px; background: #fff; border: 1.5px dashed #c4ccd7; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #647082;">Anthropic API</span>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 9px;">
+        <div style="display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;"><span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #cbb4e2; flex: 0 0 22px;">1</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #4b3a86; flex: 0 0 190px;">key-rotator → Vault</span><span style="font-size: 13px; color: #566072;">read client private key <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #8a94a3;">(ai-gateway/anthropic-wif-client-key)</span></span></div>
+        <div style="display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;"><span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #cbb4e2; flex: 0 0 22px;">2</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #4b3a86; flex: 0 0 190px;">key-rotator → Keycloak</span><span style="font-size: 13px; color: #566072;">token request; client assertion <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px;">private_key_jwt</span> (RS256, 3072-bit)</span></div>
+        <div style="display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;"><span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #cbb4e2; flex: 0 0 22px;">3</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #6d4bd0; flex: 0 0 190px;">Keycloak → key-rotator</span><span style="font-size: 13px; color: #566072;">workload identity JWT · aud <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px;">api.anthropic.com</span> · 600 s lifespan</span></div>
+        <div style="display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;"><span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #cbb4e2; flex: 0 0 22px;">4</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #4b3a86; flex: 0 0 190px;">key-rotator → Envoy</span><span style="font-size: 13px; color: #566072;">POST <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px;">/v1/oauth/token</span> (WIF exchange)</span></div>
+        <div style="display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;"><span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #cbb4e2; flex: 0 0 22px;">5</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #b8472e; flex: 0 0 190px;">Envoy → Anthropic</span><span style="font-size: 13px; color: #566072;">pinned TLS · exact SAN · narrowed CA</span></div>
+        <div style="display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;"><span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #cbb4e2; flex: 0 0 22px;">6</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #647082; flex: 0 0 190px;">Anthropic → key-rotator</span><span style="font-size: 13px; color: #566072;">short-lived <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px;">sk-ant-oat01</span> access token</span></div>
+        <div style="display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 12px; background: #f2ecf8; border: 1px solid #cbb4e2;"><span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #8a6fb0; flex: 0 0 22px;">7</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #4b3a86; flex: 0 0 190px;">key-rotator</span><span style="font-size: 13px; color: #4b3a86;">install as LiteLLM provider credential <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px;">(anthropic-primary)</span> · schedule refresh</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 07 PLANES ============ -->
+  <section id="planes" style="scroll-margin-top: 76px; margin: 72px 0 30px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #2c7350;">07</span>
+      <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; color: #131824;">Segmented container planes</h2>
+    </div>
+    <p style="font-size: 15.5px; line-height: 1.55; color: #566072; max-width: 76ch; margin: 0 0 28px;">There is no flat backend network. The stack pre-creates 20 Docker bridges on <span style="font-family: 'IBM Plex Mono', monospace; font-size: 14px;">172.28.0.0/16</span> and uses 18 by default; every service joins only the planes it needs.</p>
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px;">
+
+      <div style="background: #f9e9e2; border: 1px solid #ecc0af; border-radius: 16px; padding: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; color: #b8472e; margin-bottom: 12px;">Physical &amp; edge</div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="background: #fff; border: 1px solid #ecc0af; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-egress</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b8472e;">.0.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">Envoy (172.28.0.2)</div></div>
+          <div style="background: #fff; border: 1px solid #ecc0af; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-adm</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b8472e;">.1.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">traefik-adm</div></div>
+          <div style="background: #fff; border: 1px solid #ecc0af; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-internal</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b8472e;">.2.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">Alloy (.2) · cribl-mock</div></div>
+          <div style="background: #fff; border: 1px solid #ecc0af; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-int-edge</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b8472e;">.19.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">traefik-int only · no peers</div></div>
+        </div>
+      </div>
+
+      <div style="background: #e9f0f8; border: 1px solid #cddcec; border-radius: 16px; padding: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; color: #2f5e97; margin-bottom: 12px;">Application</div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="background: #fff; border: 1px solid #cddcec; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-chat</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2f5e97;">.3.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">traefik-int · LiteLLM · Open WebUI · Keycloak</div></div>
+          <div style="background: #fff; border: 1px solid #cddcec; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-portal</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2f5e97;">.4.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">dev-portal · key-rotator · LiteLLM · Keycloak</div></div>
+          <div style="background: #fff; border: 1px solid #cddcec; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-admin-app</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2f5e97;">.5.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">traefik-adm · 4× oauth2-proxy · admin-portal</div></div>
+          <div style="background: #fff; border: 1px solid #cddcec; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-grafana</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2f5e97;">.6.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">traefik-adm · oauth2-proxy-grafana · Grafana</div></div>
+          <div style="background: #fff; border: 1px solid #cddcec; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-vendor</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2f5e97;">.7.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">LiteLLM · key-rotator → Envoy</div></div>
+        </div>
+      </div>
+
+      <div style="background: #e6f0ea; border: 1px solid #b7d7c5; border-radius: 16px; padding: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; color: #2c7350; margin-bottom: 12px;">Data &amp; secrets</div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="background: #fff; border: 1px solid #b7d7c5; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-vault</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350;">.8.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">Vault · key-rotator · Vault gate</div></div>
+          <div style="background: #fff; border: 1px solid #b7d7c5; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-db-litellm</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350;">.9.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">LiteLLM · Postgres</div></div>
+          <div style="background: #fff; border: 1px solid #b7d7c5; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-db-keycloak</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350;">.10.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">Keycloak · Postgres</div></div>
+          <div style="background: #fff; border: 1px solid #b7d7c5; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-db-rotator</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350;">.11.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">key-rotator · Postgres</div></div>
+          <div style="background: #fff; border: 1px solid #b7d7c5; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-cache</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350;">.12.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">LiteLLM · Redis</div></div>
+        </div>
+      </div>
+
+      <div style="background: #e1eef0; border: 1px solid #a6cdd3; border-radius: 16px; padding: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; color: #2a6f7a; margin-bottom: 12px;">Telemetry</div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="background: #fff; border: 1px solid #a6cdd3; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-telemetry</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2a6f7a;">.13.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">LiteLLM · portals · key-rotator · Alloy (.2)</div></div>
+          <div style="background: #fff; border: 1px solid #a6cdd3; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-metrics</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2a6f7a;">.14.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">both Traefik · Keycloak · Envoy · Prometheus · node-exporter</div></div>
+          <div style="background: #fff; border: 1px solid #a6cdd3; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-observability</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2a6f7a;">.15.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">Alloy · Prometheus · Loki · Tempo · Grafana</div></div>
+          <div style="background: #fff; border: 1px solid #a6cdd3; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-traces</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2a6f7a;">.16.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">Alloy · Tempo (.2)</div></div>
+        </div>
+      </div>
+
+      <div style="background: #f4f2ec; border: 1px dashed #cfc7b3; border-radius: 16px; padding: 18px;">
+        <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14px; color: #8a7c52; margin-bottom: 12px;">Lab overlay only</div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="background: #fff; border: 1px dashed #cfc7b3; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-identity</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #8a7c52;">.17.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">Keycloak · Samba AD (disposable lab directory)</div></div>
+          <div style="background: #fff; border: 1px dashed #cfc7b3; border-radius: 9px; padding: 9px 11px;"><div style="display: flex; justify-content: space-between; gap: 8px;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: #1b2130;">net-lab-dns</span><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #8a7c52;">.18.0/24</span></div><div style="font-size: 11px; color: #7d8a9c; margin-top: 3px;">authoritative DNS (.2) · no peers</div></div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ 08 CONVERGE ============ -->
+  <section id="converge" style="scroll-margin-top: 76px; margin: 72px 0 30px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #96631a;">08</span>
+      <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; color: #131824;">Ansible converge order</h2>
+    </div>
+    <p style="font-size: 15.5px; line-height: 1.55; color: #566072; max-width: 76ch; margin: 0 0 28px;">A gated pipeline: each stage validates its contract and the run stops at the first failure, before later stages can mutate the host. Host preparation and stack deploy are two composable playbooks.</p>
+
+    <div style="background: #fbfcfd; border: 1px solid #dde3ea; border-radius: 20px; padding: 26px; box-shadow: 0 1px 3px rgba(20,30,50,0.04);">
+
+      <div style="border-radius: 16px; background: #f2f5f9; border: 1px solid #dbe3ec; padding: 16px 18px; margin-bottom: 14px;">
+        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: #7d8a9c; margin-bottom: 12px;">Phase A — os-prep.yml · host preparation · starts no containers</div>
+        <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #d7dee7;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #96631a;">R1</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">host_preflight</div><div style="font-size: 10px; color: #7d8a9c;">topology · encrypted state</div></div>
+          <svg width="20" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#b6c0cd" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #d7dee7;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #96631a;">R1b–c</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">firewall_preflight · time_sync</div><div style="font-size: 10px; color: #7d8a9c;">audit · proven clock</div></div>
+          <svg width="20" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#b6c0cd" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #d7dee7;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #96631a;">R2</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">selinux_baseline</div><div style="font-size: 10px; color: #7d8a9c;">MCS · enforcing required</div></div>
+          <svg width="20" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#b6c0cd" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #d7dee7;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #96631a;">R3</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">network_routing</div><div style="font-size: 10px; color: #7d8a9c;">tables 101 / 102</div></div>
+          <svg width="20" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#b6c0cd" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #d7dee7;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #96631a;">R4</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">firewalld_zones</div><div style="font-size: 10px; color: #7d8a9c;">nftables + DOCKER-USER</div></div>
+          <svg width="20" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#b6c0cd" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #d7dee7;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #96631a;">R5</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">os_baseline</div><div style="font-size: 10px; color: #7d8a9c;">Docker CE · sshd hardening</div></div>
+          <svg width="20" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#b6c0cd" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #d7dee7;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #96631a;">R6</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">docker_networks</div><div style="font-size: 10px; color: #7d8a9c;">20 pinned bridges</div></div>
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: center; margin-bottom: 14px;"><svg width="12" height="18" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="border-radius: 16px; background: #eef4ef; border: 1px solid #c9ddd0; padding: 16px 18px; margin-bottom: 14px;">
+        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: #6f9280; margin-bottom: 12px;">Phase B — deploy-stack-only.yml · refuses an unprepared host or stale ABI</div>
+        <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #c9ddd0;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350;">R7</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">docker_stack</div><div style="font-size: 10px; color: #7d8a9c;">secrets · bind digests · volume-init · pinned builds · up</div></div>
+          <svg width="20" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#a9cbb6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #c9ddd0;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350;">R8</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">verify</div><div style="font-size: 10px; color: #7d8a9c;">routing · listeners · DNS · zero AVCs</div></div>
+          <svg width="20" height="12" viewBox="0 0 28 12" fill="none"><path d="M0 6 H23 M18 1.5 L24 6 L18 10.5" stroke="#a9cbb6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div style="padding: 9px 12px; border-radius: 10px; background: #fff; border: 1px solid #c9ddd0;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #2c7350;">R9</span><div style="font-weight: 600; font-size: 12px; margin-top: 2px;">host_finalize</div><div style="font-size: 10px; color: #7d8a9c;">promote dedicated-host marker</div></div>
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: center; margin-bottom: 14px;"><svg width="12" height="18" viewBox="0 0 12 20" fill="none"><path d="M6 0 V15 M2 11 L6 16 L10 11" stroke="#c4ccd7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+      <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: stretch;">
+        <div style="flex: 0 0 auto; display: flex; align-items: center; padding: 14px 18px; border-radius: 12px; background: #f7efdd; border: 1px solid #e7d3a4; font-weight: 700; font-size: 13.5px; color: #96631a;">Vault initialized &amp; unsealed?</div>
+        <div style="flex: 1; min-width: 200px; display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-radius: 12px; background: #fff; border: 1px solid #e3e8ee;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #b8472e;">NO</span><span style="font-size: 12.5px; color: #566072;">reduced wait + explicit Vault gate → initialize Vault, re-run</span></div>
+        <div style="flex: 1; min-width: 200px; display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-radius: 12px; background: #eef4ef; border: 1px solid #c9ddd0;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: #2c7350;">YES</span><span style="font-size: 12.5px; color: #566072;">full service-graph wait — done</span></div>
+      </div>
+    </div>
+  </section>
+
+  <footer style="margin-top: 80px; padding-top: 24px; border-top: 1px solid #d3dae3; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+    <span style="font-size: 12px; color: #8a94a3;">AI Gateway · one Compose project on one Rocky Linux 9 VM · customer prototype under active hardening</span>
+    <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #a3abb8;">friendly role labels · exact names as subtitles · balanced detail</span>
+  </footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{
+  &quot;showStickyNav&quot;: {&quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Display&quot;},
+  &quot;showLegend&quot;: {&quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Display&quot;},
+  &quot;showStats&quot;: {&quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;Display&quot;}
+}">
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      showStickyNav: this.props.showStickyNav ?? true,
+      showLegend: this.props.showLegend ?? true,
+      showStats: this.props.showStats ?? true,
+    };
+  }
+}
+</script>
+</body>
+</html>

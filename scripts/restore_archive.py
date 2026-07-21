@@ -31,9 +31,6 @@ BASE_VOLUMES = frozenset(
         "grafana_data",
     }
 )
-LAB_VOLUMES = frozenset(
-    {"samba_ad_config", "samba_ad_state", "samba_ad_public"}
-)
 POSTGRES_FILES = frozenset(
     {
         "postgres/globals.sql",
@@ -66,7 +63,7 @@ STACK_REQUIRED_ROOTS = frozenset(
 # configuration tree still passes the top-level root scan; its volume
 # manifest (tempo_data) still fails the exact-volume contract by design.
 STACK_OPTIONAL_ROOTS = frozenset(
-    {"docker-compose.lab.yml", "bind-source-digest-inputs.json", "secrets", "tempo"}
+    {"bind-source-digest-inputs.json", "secrets", "tempo"}
 )
 SAFE_SERVICE_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
 SAFE_PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
@@ -86,8 +83,6 @@ class ArchiveError(RuntimeError):
 
 
 def expected_volumes(profile: str) -> frozenset[str]:
-    if profile == "rocky9-lab":
-        return BASE_VOLUMES | LAB_VOLUMES
     return BASE_VOLUMES
 
 
@@ -387,8 +382,6 @@ def prepare_restore(
             if name
         }
         required_roots = set(STACK_REQUIRED_ROOTS)
-        if profile == "rocky9-lab":
-            required_roots.update({"docker-compose.lab.yml", "secrets"})
         if not required_roots.issubset(present_roots):
             raise ArchiveError(
                 "stack configuration archive lacks required top-level roots: "

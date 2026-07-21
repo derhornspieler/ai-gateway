@@ -8,7 +8,6 @@ import pytest
 from app.config import Settings
 from app.identity import (
     CAPABILITY_ROLES,
-    LAB_LDAP_PROVIDER_NAME,
     RELYING_PARTY_CLIENT_IDS,
     IdentityConflict,
     KeycloakAdmin,
@@ -23,6 +22,17 @@ def settings(**overrides) -> Settings:
         "LITELLM_MASTER_KEY": "litellm-master-key",
         "KC_BOOTSTRAP_ADMIN_CLIENT_SECRET": (
             "Bootstrap-Secret!0123456789-ABCDEFGHIJKLMN"
+        ),
+        "IDENTITY_LDAP_ENABLED": True,
+        "IDENTITY_LDAP_PROVIDER_NAME": "corp-ad",
+        "IDENTITY_LDAP_URL": "ldaps://dc1.corp.example.com:636",
+        "IDENTITY_LDAP_USERS_DN": "OU=Users,DC=corp,DC=example,DC=com",
+        "IDENTITY_LDAP_BIND_DN": (
+            "CN=svc-aigw-ldap,OU=Service Accounts,DC=corp,DC=example,DC=com"
+        ),
+        "IDENTITY_LDAP_USER_FILTER": (
+            "(&(objectCategory=person)(objectClass=user)"
+            "(!(sAMAccountName=svc-aigw-ldap)))"
         ),
     }
     values.update(overrides)
@@ -39,31 +49,32 @@ RP_SECRETS = {
 
 
 def baseline_spec() -> dict:
-    # Mirrors ansible/inventory/host_vars/lab-aigw01.yml exactly: the unit
-    # fixture drifting behind the shipped inventory is precisely how the
-    # aigw-chat fresh-converge regression stayed green in CI.
+    # A production directory administrator can be placed into a reviewed set of
+    # managed groups before Vault is available. The input is inventory-owned.
     return {
         "schema": 1,
-        "ensure_lab_federation": False,
         "groups": [
-            {"name": "lab-admins", "roles": ["aigw-admins", "aigw-chat"]},
-            {"name": "lab-developers", "roles": ["aigw-chat", "aigw-developers"]},
-            {"name": "lab-users", "roles": ["aigw-chat", "aigw-users"]},
+            {"name": "platform-admins", "roles": ["aigw-admins", "aigw-chat"]},
+            {
+                "name": "platform-developers",
+                "roles": ["aigw-chat", "aigw-developers"],
+            },
+            {"name": "platform-users", "roles": ["aigw-chat", "aigw-users"]},
         ],
         "bootstrap_admin_identities": [
             {
-                "username": "lab-admin",
-                "group": "lab-admins",
-                "federation_provider": LAB_LDAP_PROVIDER_NAME,
+                "username": "directory-admin",
+                "group": "platform-admins",
+                "federation_provider": "corp-ad",
             }
         ],
     }
 
 
-def lab_ldap_component(admin: KeycloakAdmin) -> dict:
+def ldap_component(admin: KeycloakAdmin) -> dict:
     return {
         "id": "ldap-uuid",
-        "name": LAB_LDAP_PROVIDER_NAME,
+        "name": "corp-ad",
         "providerId": "ldap",
         "providerType": "org.keycloak.storage.UserStorageProvider",
         "config": {
@@ -76,10 +87,10 @@ def lab_ldap_component(admin: KeycloakAdmin) -> dict:
             "rdnLDAPAttribute": ["cn"],
             "uuidLDAPAttribute": ["objectGUID"],
             "userObjectClasses": ["person, organizationalPerson, user"],
-            "connectionUrl": [admin.settings.lab_samba_ldap_url],
-            "usersDn": [admin.settings.lab_samba_users_dn],
+            "connectionUrl": [admin.settings.identity_ldap_url],
+            "usersDn": [admin.settings.identity_ldap_users_dn],
             "authType": ["simple"],
-            "bindDn": [admin.settings.lab_samba_bind_dn],
+            "bindDn": [admin.settings.identity_ldap_bind_dn],
             # Keycloak returns a masked value here. Its contents must never be
             # used as proof of the rest of the provider configuration.
             "bindCredential": ["**********"],
@@ -90,7 +101,7 @@ def lab_ldap_component(admin: KeycloakAdmin) -> dict:
             "useKerberosForPasswordAuthentication": ["false"],
             "customUserSearchFilter": [
                 "(&(objectCategory=person)(objectClass=user)"
-                "(!(sAMAccountName=svc-keycloak-ldap)))"
+                "(!(sAMAccountName=svc-aigw-ldap)))"
             ],
         },
     }
@@ -207,9 +218,9 @@ class FakePreVaultAdmin(KeycloakAdmin):
     async def _pre_vault_federated_user(
         self, username, federation_provider, admin_token
     ):
-        assert federation_provider == LAB_LDAP_PROVIDER_NAME
+        assert federation_provider == "corp-ad"
         return {
-            "id": "lab-admin-uuid",
+            "id": "directory-admin-uuid",
             "username": username,
             "enabled": True,
             "federationLink": "ldap-uuid",
@@ -344,10 +355,13 @@ async def test_pre_vault_baseline_is_narrow_idempotent_and_never_uses_vault() ->
     unrelated_before = copy.deepcopy(admin.groups["operator-project"])
 
     assert await admin.reconcile_pre_vault_identity_baseline(baseline_spec()) is True
-    assert admin.groups["lab-admins"]["roles"] == {"aigw-admins", "aigw-chat"}
-    assert admin.groups["lab-developers"]["roles"] == {"aigw-chat", "aigw-developers"}
-    assert admin.groups["lab-users"]["roles"] == {"aigw-chat", "aigw-users"}
-    assert admin.groups["lab-admins"]["members"] == {"lab-admin-uuid"}
+    assert admin.groups["platform-admins"]["roles"] == {"aigw-admins", "aigw-chat"}
+    assert admin.groups["platform-developers"]["roles"] == {
+        "aigw-chat",
+        "aigw-developers",
+    }
+    assert admin.groups["platform-users"]["roles"] == {"aigw-chat", "aigw-users"}
+    assert admin.groups["platform-admins"]["members"] == {"directory-admin-uuid"}
     assert admin.groups["operator-project"] == unrelated_before
     assert all(method != "DELETE" for method, _ in admin.mutations)
 
@@ -408,9 +422,9 @@ async def test_pre_vault_rp_reconciliation_refuses_unmanaged_mapper() -> None:
     assert admin.puts == []
 
 
-def test_lab_ldap_provider_is_bound_to_exact_nonsecret_inventory_config() -> None:
-    admin = KeycloakAdmin(settings(LAB_SAMBA_LDAP_ENABLED=True), None, None)
-    component = lab_ldap_component(admin)
+def test_ldap_provider_is_bound_to_exact_nonsecret_inventory_config() -> None:
+    admin = KeycloakAdmin(settings(), None, None)
+    component = ldap_component(admin)
 
     assert admin._verify_ldap_component(component) == "ldap-uuid"
 
@@ -427,9 +441,9 @@ def test_lab_ldap_provider_is_bound_to_exact_nonsecret_inventory_config() -> Non
         ("name", "operator-ldap"),
     ],
 )
-def test_lab_ldap_provider_refuses_wrong_component_identity(field, value) -> None:
-    admin = KeycloakAdmin(settings(LAB_SAMBA_LDAP_ENABLED=True), None, None)
-    component = lab_ldap_component(admin)
+def test_ldap_provider_refuses_wrong_component_identity(field, value) -> None:
+    admin = KeycloakAdmin(settings(), None, None)
+    component = ldap_component(admin)
     component[field] = value
 
     with pytest.raises(IdentityConflict, match="inventory-bound"):
@@ -452,10 +466,10 @@ async def test_pre_vault_baseline_refuses_undeclared_group_role_without_deleting
     None
 ):
     admin = FakePreVaultAdmin()
-    admin.groups["lab-admins"] = {
-        "id": "lab-admins-uuid",
-        "name": "lab-admins",
-        "path": "/aigw-managed/lab-admins",
+    admin.groups["platform-admins"] = {
+        "id": "platform-admins-uuid",
+        "name": "platform-admins",
+        "path": "/aigw-managed/platform-admins",
         "roles": {"aigw-admins", "manage-realm"},
         "members": set(),
         "children": [],
@@ -463,16 +477,16 @@ async def test_pre_vault_baseline_refuses_undeclared_group_role_without_deleting
     with pytest.raises(IdentityConflict, match="undeclared"):
         await admin.reconcile_pre_vault_identity_baseline(baseline_spec())
     assert all(method != "DELETE" for method, _ in admin.mutations)
-    assert "manage-realm" in admin.groups["lab-admins"]["roles"]
+    assert "manage-realm" in admin.groups["platform-admins"]["roles"]
 
 
 @pytest.mark.asyncio
 async def test_pre_vault_baseline_refuses_undeclared_admin_without_deleting() -> None:
     admin = FakePreVaultAdmin()
-    admin.groups["lab-admins"] = {
-        "id": "lab-admins-uuid",
-        "name": "lab-admins",
-        "path": "/aigw-managed/lab-admins",
+    admin.groups["platform-admins"] = {
+        "id": "platform-admins-uuid",
+        "name": "platform-admins",
+        "path": "/aigw-managed/platform-admins",
         "roles": {"aigw-admins"},
         "members": {"undeclared-admin-uuid"},
         "children": [],
@@ -481,17 +495,17 @@ async def test_pre_vault_baseline_refuses_undeclared_admin_without_deleting() ->
     with pytest.raises(IdentityConflict, match="undeclared members"):
         await admin.reconcile_pre_vault_identity_baseline(baseline_spec())
 
-    assert admin.groups["lab-admins"]["members"] == {"undeclared-admin-uuid"}
+    assert admin.groups["platform-admins"]["members"] == {"undeclared-admin-uuid"}
     assert all(method != "DELETE" for method, _ in admin.mutations)
 
 
 @pytest.mark.asyncio
 async def test_pre_vault_baseline_does_not_grant_roles_to_undeclared_members() -> None:
     admin = FakePreVaultAdmin()
-    admin.groups["lab-developers"] = {
-        "id": "lab-developers-uuid",
-        "name": "lab-developers",
-        "path": "/aigw-managed/lab-developers",
+    admin.groups["platform-developers"] = {
+        "id": "platform-developers-uuid",
+        "name": "platform-developers",
+        "path": "/aigw-managed/platform-developers",
         "roles": set(),
         "members": {"undeclared-developer-uuid"},
         "children": [],
@@ -500,38 +514,30 @@ async def test_pre_vault_baseline_does_not_grant_roles_to_undeclared_members() -
     with pytest.raises(IdentityConflict, match="undeclared members"):
         await admin.reconcile_pre_vault_identity_baseline(baseline_spec())
 
-    assert admin.groups["lab-developers"]["roles"] == set()
-    assert admin.groups["lab-developers"]["members"] == {"undeclared-developer-uuid"}
+    assert admin.groups["platform-developers"]["roles"] == set()
+    assert admin.groups["platform-developers"]["members"] == {
+        "undeclared-developer-uuid"
+    }
     assert all(method != "DELETE" for method, _ in admin.mutations)
 
 
-def test_pre_vault_spec_accepts_the_shipped_lab_inventory_admin_group() -> None:
-    """Regression guard for the aigw-chat fresh-converge failure.
-
-    b5bcb96 moved the lab inventory's bootstrap-admin group to
-    ``[aigw-admins, aigw-chat]`` but the validator still pinned exactly
-    ``{aigw-admins}``, so every fresh lab converge raised IdentityConflict
-    during pure spec validation — before any Keycloak request — and the
-    one-shot printed only PRE_VAULT_IDENTITY_BASELINE_RECONCILIATION_FAILED.
-    """
-
-    groups, identities, ensure_lab_federation = (
-        KeycloakAdmin._validate_pre_vault_identity_spec(baseline_spec())
+def test_pre_vault_spec_accepts_inventory_admin_group() -> None:
+    groups, identities = KeycloakAdmin._validate_pre_vault_identity_spec(
+        baseline_spec()
     )
     assert [group["name"] for group in groups] == [
-        "lab-admins",
-        "lab-developers",
-        "lab-users",
+        "platform-admins",
+        "platform-developers",
+        "platform-users",
     ]
     assert groups[0]["roles"] == ["aigw-admins", "aigw-chat"]
     assert identities == [
         {
-            "username": "lab-admin",
-            "group": "lab-admins",
-            "federation_provider": LAB_LDAP_PROVIDER_NAME,
+            "username": "directory-admin",
+            "group": "platform-admins",
+            "federation_provider": "corp-ad",
         }
     ]
-    assert ensure_lab_federation is False
 
 
 @pytest.mark.parametrize(
@@ -566,22 +572,13 @@ def test_pre_vault_bootstrap_admin_group_must_stay_a_pure_admin_gate(
             {"roles": ["aigw-admins", "aigw-developers"]}
         ),
         lambda value: value["bootstrap_admin_identities"][0].update(
-            {"group": "lab-users"}
+            {"group": "platform-users"}
         ),
         lambda value: value["bootstrap_admin_identities"].append(
             copy.deepcopy(value["bootstrap_admin_identities"][0])
         ),
-        lambda value: value.update(
-            {
-                "ensure_lab_federation": True,
-                "bootstrap_admin_identities": [
-                    {
-                        "username": "lab-admin",
-                        "group": "lab-admins",
-                        "federation_provider": "operator-provider",
-                    }
-                ],
-            }
+        lambda value: value["bootstrap_admin_identities"][0].update(
+            {"federation_provider": "../operator-provider"}
         ),
     ],
 )

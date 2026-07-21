@@ -51,16 +51,19 @@ CREATE TABLE IF NOT EXISTS rotation_history (
 """
 
 # (vendor, enabled, interval_seconds, grace_seconds, config)
-# anthropic / openai start disabled until Vault bootstrap material exists
-# (docs/anthropic-wif-bootstrap.md Phase 0; solution-map.md §1.7 OpenAI
-# admin-key setup). The static-* rows seed LiteLLM creds once at boot
+# Anthropic starts disabled until Vault bootstrap material exists. The
+# static-anthropic row seeds the LiteLLM credential once at boot
 # (interval_seconds == 0 => run-once) for local/dev testing.
 DEFAULT_SETTINGS: list[tuple[str, bool, int, int, dict[str, Any]]] = [
     ("anthropic", False, 3000, 300, {}),
-    ("openai", False, 30 * 86400, 300, {}),
     ("static-anthropic", True, 0, 0, {}),
-    ("static-openai", True, 0, 0, {}),
 ]
+
+# Old deployments may still contain these settings rows. Keep their history
+# and configuration for audit/recovery, but force them disabled at every
+# schema initialization. They are not returned by the API because no driver is
+# registered. This is intentionally non-destructive.
+RETIRED_SETTINGS_VENDORS = ("openai", "static-openai")
 
 
 class Database:
@@ -190,6 +193,7 @@ class Database:
             await cur.execute(CREATE_SETTINGS_SQL)
             await cur.execute(CREATE_HISTORY_SQL)
         await self._seed_defaults()
+        await self._disable_retired_settings()
 
     async def _seed_defaults(self) -> None:
         if self._conn is None:
@@ -205,6 +209,20 @@ class Database:
                     """,
                     (vendor, enabled, interval, grace, json.dumps(config)),
                 )
+
+    async def _disable_retired_settings(self) -> None:
+        """Disable removed providers without deleting their audit evidence."""
+        if self._conn is None:
+            raise RuntimeError("database connection was not initialized")
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE rotator_settings
+                SET enabled = false, updated_at = now()
+                WHERE vendor = ANY(%s) AND enabled = true
+                """,
+                (list(RETIRED_SETTINGS_VENDORS),),
+            )
 
     async def list_settings(self) -> list[dict[str, Any]]:
         try:
