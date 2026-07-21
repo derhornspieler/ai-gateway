@@ -67,22 +67,46 @@ model. It does not start containers.
 
 ### Python services
 
-Use each service's pinned development tools. Run inside each service folder:
+Use Python 3.14.6, which is the exact version used by GitHub CI. Build a clean,
+temporary environment for each service. This avoids passing a test because an
+old package happens to be installed on the workstation.
+
+Run this block from the repository root. It installs both the direct
+application requirements and the development tools. It then applies the
+hash-locked production graph before it runs the checks.
 
 ```bash
-cd services/dev-portal
-PYTHONPATH=. pytest -q
-ruff check app tests
-bandit -q -r app --severity-level medium --confidence-level medium
+set -euo pipefail
+python_test_root="$(mktemp -d "${TMPDIR:-/tmp}/aigw-python-tests.XXXXXX")"
+trap 'rm -rf -- "$python_test_root"' EXIT
 
-cd ../key-rotator
-PYTHONPATH=. pytest -q
-ruff check app tests
-bandit -q -r app --severity-level medium --confidence-level medium
-cd ../..
+for service in dev-portal key-rotator; do
+  service_dir="$PWD/services/$service"
+  test_env="$python_test_root/$service"
+
+  uv venv --python 3.14.6 "$test_env"
+  uv pip install --python "$test_env/bin/python" \
+    -r "$service_dir/requirements.txt" \
+    -r "$service_dir/requirements-dev.txt"
+  uv pip install --python "$test_env/bin/python" --require-hashes \
+    -r "$service_dir/requirements.lock"
+  uv pip check --python "$test_env/bin/python"
+
+  (
+    cd "$service_dir"
+    PYTHONPATH=. "$test_env/bin/python" -m pytest -q
+    "$test_env/bin/ruff" check app tests
+    "$test_env/bin/bandit" -q -r app \
+      --severity-level medium --confidence-level medium
+    "$test_env/bin/pip-audit" --disable-pip -r requirements.lock
+  )
+done
 ```
 
-Do not run bare `pytest` from the repository root.
+The `trap` removes only the new temporary directory when the shell exits. Do
+not run bare `pytest` from the repository root. If Python 3.14.6 is not
+available to `uv`, stop and install that version; do not substitute another
+Python version for release evidence.
 
 ### Go services
 
@@ -128,10 +152,26 @@ Limit that environment to protected `main`. Missing secrets are a failure, not
 a skip. A pull, build, scan, SBOM, provenance, or upload error also fails the
 job.
 
-The scan blocks `HIGH` and `CRITICAL` findings unless a reviewed waiver covers
-the exact issue. Repository waivers live in `.trivyignore.yaml`. Image waivers
-live in `.github/trivyignore-images.yaml`. Each waiver needs an owner, reason,
-exact package version, and end date.
+For release images, Trivy saves the raw `HIGH` and `CRITICAL` JSON without VEX
+filtering. Docker Scout 1.23.1 is the blocking, VEX-aware check. Repository
+waivers live in `.trivyignore.yaml`. Image waivers live in
+`.github/trivyignore-images.yaml`. Each waiver needs an owner, reason, exact
+package version, and end date.
+
+For an exact DHI base, CI fetches Docker's VEX statement for that tag and
+digest. It verifies the statement with the committed Docker public key and
+uses it only for the matching final image. Docker's current statements have no
+public transparency-log entry, so CI uses `--verify --skip-tlog`: the key
+signature is checked, but public-log inclusion is not. The evidence record
+must state that limit. If an exact base has no VEX statement, it gets no DHI
+VEX suppression.
+
+Open WebUI is not a DHI image. Its exact `0.10.2-aigw2` derivative has one
+committed OpenVEX review for `CVE-2026-45829`. The review is unsigned,
+Git-reviewed, tied to exact build inputs, and expires on 2026-10-19. A reviewed
+local comparison found one raw Scout finding and zero findings after that VEX
+statement was applied. This is local evidence only. It does not mean the
+credential-protected GitHub release scan passed.
 
 Do not replace this job with an unrecorded local scan. The GitHub runner rebuilds
 from the commit. It does not inspect the local archive, so the seeded test below
@@ -175,8 +215,12 @@ aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
 aigw-2026-07-21-linux-amd64.preprod.manifest.json
 ```
 
-The production archive has no Samba AD or WIF mock image. The preprod archive
-has the production images plus those two test images.
+For the current `r11` candidate, production has 23 external and 17 custom
+image references, for 40 total. Preprod has 24 external and 19 custom image
+references, for 43 total. The two preprod-only custom services are Samba AD
+and the WIF provider mock. Their Debian 13.6-slim base is the third extra
+preprod image reference. None of those three references belongs in the
+production archive.
 
 Record all four SHA-256 values:
 
@@ -356,4 +400,6 @@ Record:
 
 Accept the release only when every required step passed for the same source
 and files. If access, disk, registry login, or another input is missing, mark
-the release `BLOCKED`.
+the release `BLOCKED`. A browser result from an older release does not approve
+a newer release. In particular, keep the accepted `r10` browser record as
+historical evidence until the browser test is run again for `r11`.

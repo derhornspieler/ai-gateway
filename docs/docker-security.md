@@ -57,10 +57,54 @@ Three reviewed upstream exceptions remain:
 | Image | Reason |
 | --- | --- |
 | LiteLLM `v1.93.0` | The reviewed upstream image was safer and compatible |
-| Open WebUI `0.10.2` | No matching application DHI image was available |
+| Open WebUI `0.10.2-aigw2` | No matching application DHI image was available |
 | Samba AD test image | Local preprod only; never a production directory |
 
 An exception does not allow a floating tag or skipped scan.
+
+### Open WebUI chat-only image
+
+The `0.10.2-aigw2` derivative is smaller than the upstream general-purpose
+image and has fewer runtime paths:
+
+- Its root filesystem is read-only.
+- Its named data volume holds required application state.
+- A bounded `/tmp` `tmpfs` holds temporary files and generated static files.
+- The build removes unused local ML packages and document-conversion tools.
+- `BYPASS_EMBEDDING_AND_RETRIEVAL=true` stops local vector indexing, and
+  `RAG_EMBEDDING_MODEL` is empty.
+- An exact source patch removes remote Chroma settings and the `HttpClient`
+  path. Only the embedded `PersistentClient` code remains, and retrieval is
+  bypassed for this chat-only deployment.
+
+The offline build also installs reviewed wheels for cryptography 48.0.1,
+Pillow 12.3.0, MCP 1.28.1, and python-multipart 0.0.30. Compiled wheels are
+committed for both AMD64 and ARM64. Their hashes are checked before install,
+and the Docker build has no network.
+
+Open WebUI has no DHI VEX statement. The repository therefore carries one
+local OpenVEX review for `CVE-2026-45829`. It is tied to the exact `aigw2`
+build inputs and expires on 2026-10-19. The document is unsigned and reviewed
+through Git. It must not be described as Docker-signed evidence. A reviewed
+local Scout comparison found one raw finding and zero VEX-aware findings.
+The protected GitHub release scan still needs to run before release approval.
+
+### Release image scan evidence
+
+GitHub saves raw Trivy `HIGH` and `CRITICAL` JSON for each release image. That
+record is not VEX-filtered. Docker Scout 1.23.1 applies the blocking VEX-aware
+gate.
+
+For DHI bases, CI fetches VEX only for the exact tag and digest. It verifies
+the signature with the committed Docker public key, then selects the statement
+only when that exact DHI base is part of the final image. A missing DHI VEX
+statement means no DHI suppression.
+
+Docker's current DHI statements have no public transparency-log entries. The
+fetch therefore uses `--verify --skip-tlog`. The pinned-key signature is still
+checked, and the evidence receipt records that public-log inclusion was not
+proved. This limitation is different from Open WebUI's unsigned, Git-reviewed
+local VEX statement.
 
 The optional Vault UI proxy extracts static UI files from the pinned official
 Vault image. It does not run the upstream Vault binary. A provenance file lists
@@ -137,8 +181,8 @@ The local Samba test container has a separate reviewed capability set. It is
 not part of production.
 
 Most root filesystems are read-only, with small `tmpfs` paths for writes.
-LiteLLM, Open WebUI, and Keycloak keep documented writable-root exceptions
-because their upstream images need them.
+LiteLLM and Keycloak keep documented writable-root exceptions because their
+upstream images need them. Open WebUI no longer has that exception.
 
 Health checks use a static project probe or the service's own command. They do
 not depend on a shell or download a tool at runtime.

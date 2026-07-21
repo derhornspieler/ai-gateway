@@ -208,7 +208,8 @@ The [acceptance test runbook](test-runbook.md) lists every release gate.
 
 Seed mode uses the exact image IDs in the manifest. It removes Compose build
 sections and sets `pull_policy: never`. It refuses a production-only manifest
-because that release does not include the Samba AD and WIF test images.
+because that release does not include the Samba AD and WIF test images or
+their extra Debian build base.
 
 For a final release test, load the copied preprod pair. Use one sudo option if
 your workstation needs it:

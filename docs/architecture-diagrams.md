@@ -352,7 +352,7 @@ flowchart LR
   CANON --> MAN[Matching schema-v2 manifest<br/>egress-policy receipts]
   ID --> MAN
   MAN --> PROD[Production offline seed<br/>no preprod-only images]
-  MAN --> PRE[Preprod offline seed<br/>production plus Samba AD and WIF mock]
+  MAN --> PRE[Preprod offline seed<br/>production plus Samba AD, WIF mock,<br/>and their extra Debian base]
 ```
 
 The catalog is not copied into the image. Only selected records enter the

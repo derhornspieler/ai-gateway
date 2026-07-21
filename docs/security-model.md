@@ -59,6 +59,14 @@ does not prove production firewall, SELinux, disk encryption, or Cribl rules.
 
 See the [layered security diagram](architecture-diagrams.md#8-security-design--layered-enforcement).
 
+Open WebUI is a chat-only service in this design. Its `aigw2` image has a
+read-only root filesystem, no remote Chroma client path, and no local embedding
+or retrieval work. Unused local ML and document-conversion packages are
+removed. Required state stays in its named data volume, and temporary files
+stay in a bounded `tmpfs`. See
+[container security](docker-security.md#open-webui-chat-only-image) for the
+exact image and vulnerability-review rules.
+
 ## Provider egress is selected at release time
 
 LiteLLM and key-rotator cannot call a provider directly. They call Envoy over

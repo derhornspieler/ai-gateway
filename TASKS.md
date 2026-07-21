@@ -2,6 +2,24 @@
 
 ## Active
 
+- [ ] **Finish `r11` visual browser acceptance** - Candidate `r11` was built
+  from pushed commit `5c43a83`. Its exact preprod pair passed clean-room purge,
+  fresh archive loading, one Ansible seed-mode deploy, and the full integration
+  and end-to-end gate. The receipt removed 26 containers, 19 networks, 11
+  volumes, 62 aliases, and all 43 target image IDs while preserving 148
+  unrelated IDs. Pulls and source builds stayed off. Redis first start, Vault,
+  automatic Keycloak and LDAPS identity, all three users, WIF, OIDC roles and
+  logout, edge inference, and Cribl queue recovery passed with
+  `SEEDED_PREPROD_E2E_PASSED`. After a Vault restart, a second identical
+  converge auto-unsealed Vault and passed end to end again. The visual browser
+  replay could not run because the current test runtime exposed no browser.
+  Run that replay when a browser is available. Keep the `r10` Chrome result as
+  historical evidence; do not use it as `r11` proof.
+
+  - The exact Open WebUI runtime image is
+    `sha256:c6608e76ef495925ff6724edcc48c3ace4fb8450e614cb56fcfe62f3e9248725`.
+    It was healthy, the hardened-path check passed, raw Scout reported the one
+    reviewed Chroma finding, and the VEX-aware result was zero.
 - [ ] **Send only approved SOC security events to Cribl** - Keep raw metrics,
   raw traces, and ordinary operational container logs local for Prometheus,
   Loki, Grafana, and alert evaluation. Export a curated, versioned security-log
@@ -52,8 +70,9 @@
 ## Waiting On
 
 - [ ] **Add approved DHI credentials to GitHub release scans** - The ordinary
-  `main` checks are green. The final DHI image build and Trivy jobs stop at the
-  required credential gate because the protected
+  `main` checks are green. The release image jobs stop at the required
+  credential gate before their raw Trivy records and blocking VEX-aware Scout
+  checks can finish because the protected
   `release-container-security` environment has no `DHI_USERNAME` or
   `DHI_PASSWORD` secret. A repository administrator must add approved
   credentials and rerun the failed jobs. Do not copy a developer's local login
@@ -76,9 +95,11 @@
   network-disabled image build, baked CA bundles, startup gate, schema-v2
   release record, loader contracts, documentation, diagrams, and exact seeded
   local preprod proof are complete. Release `r10` selected only `anthropic` and
-  reproduced the same Envoy image ID twice. Keep the full design below so a
-  future developer can finish the remaining protected GitHub image scan and
-  approved remote promote/validate/rollback proof without this conversation.
+  reproduced the same Envoy image ID twice. Candidate `r11` used the same
+  single provider and passed the exact seeded local preprod gate. Its visual
+  browser replay is still active above. Keep the full design below so a future
+  developer can finish the remaining protected GitHub image scan and approved
+  remote promote/validate/rollback proof without this conversation.
   - **Operator interface:** Accept repeated provider selections while preparing
     the offline seed. The intended command shape is:
 
@@ -223,10 +244,11 @@
   beyond that as an inference.
 - [ ] **Finish protected scans for the newest supported image release** - The
   authoritative upstream and DHI catalog review, exact version-and-digest pins,
-  compatibility fixes, software/toolchain review, network-disabled custom
-  builds, schema-v2 seeds, and two full seeded local preprod passes are
-  complete. The release cannot pass until GitHub builds and scans every final
-  DHI-derived image with its protected credentials and records any fixes,
+  compatibility fixes, software/toolchain review, network-disabled `r11`
+  builds, and exact seeded local preprod checks are complete. The visual `r11`
+  browser replay is still active above. The release cannot pass until that
+  replay is complete and GitHub builds and scans every final image with
+  protected credentials. Save raw Trivy JSON, VEX-aware Scout results,
   waivers, SBOMs, provenance, and remaining risk.
   - Update the image-update SOP and operator runbook with the complete engineer
     workflow: identify whether the exact pin belongs in Compose, a Dockerfile,
@@ -272,10 +294,11 @@
   - Application and Keycloak identity cookies were secure and host-bounded.
     Logout cleared both application and Keycloak sessions, and Back plus
     Refresh did not reopen the protected developer page.
-- [x] ~~Run the final current-source schema-v2 seed rehearsal~~ (2026-07-21)
+- [x] ~~Run the `r10` schema-v2 seed rehearsal~~ (2026-07-21)
   - Release r10 built a 40-image ARM64 production archive and a 43-image
     preprod archive with Anthropic as the only selected provider. The
-    production manifest excludes the two preprod-only images.
+    production manifest excludes the two preprod-only custom service images
+    and their extra Debian 13.6-slim base reference.
   - The clean-room play removed 26 owned containers, 19 owned networks, 11
     owned volumes, and 43 old release image IDs. It preserved 129 unrelated
     image IDs. The fresh load and one Ansible seed-mode deploy ended with
@@ -321,11 +344,22 @@
     rollback fail closed. Contract tests cover source-tag materialization,
     exact transfer IDs, preprod-byte rejection, validation, and rollback.
 
-- [x] ~~Authenticate to DHI and build the exact schema-v2 release seed~~
+- [x] ~~Build and hash-check the `r11` schema-v2 release candidate~~
   (2026-07-21)
-  - The ARM64 seed contains 24 exact external images and 19 repository-built
-    images. Its archive and manifest checksums pass the schema-v2 local release
-    receipt. Loading and full live preprod validation remain active above.
+  - The candidate was built from pushed commit `5c43a83`. Production contains
+    23 exact external and 17 repository-built references. Preprod contains 24
+    exact external and 19 repository-built references. Its four file hashes
+    pass the schema-v2 local release receipt. The exact preprod pair later
+    passed fresh loading, seeded validation, and a second converge after a
+    Vault restart. Visual browser acceptance remains active above.
+  - Production archive SHA-256:
+    `fd38eec7d7769c102ab6ad018342f52236877727159db638258a74b3d87b52ad`.
+    Production manifest SHA-256:
+    `3f5db8d7b8b7548f84975015182cb134132075c748a30984d9bf1b419d34f9b7`.
+    Preprod archive SHA-256:
+    `df65120821a48f99741493cdfaf31d5a8e9ad569db975d338d2c81898f2b06fa`.
+    Preprod manifest SHA-256:
+    `891601332abb46c58afa3359d73125f73f8e264252f849a31d029378eab967fd`.
 - [x] ~~Replace the old lab with local Docker preprod~~ (2026-07-21)
   - Ansible now owns the fixed `aigw-preprod` project, `aigw.internal`, three
     host planes, isolated service networks, persistent test Root CA, Samba AD

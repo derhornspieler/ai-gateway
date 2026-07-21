@@ -11,6 +11,12 @@ One build makes two file pairs:
 
 Never send the preprod pair to production.
 
+For the current `r11` candidate, production has 23 external and 17 custom
+image references, for 40 total. Preprod has 24 external and 19 custom
+references, for 43 total. Only two custom services are preprod-only: Samba AD
+and the WIF provider mock. Their Debian 13.6-slim build base is the third extra
+preprod reference.
+
 ## The normal engineer flow
 
 Use this order for each image change:
@@ -73,7 +79,8 @@ preprod paths.
 4. Builds Envoy with no build network.
 5. Adds only the selected provider route and CA data to Envoy.
 6. Builds the other production custom images.
-7. Builds the two preprod-only images.
+7. Builds the two preprod-only custom services. Their Debian 13.6-slim base is
+   also included only in the preprod release.
 8. Writes both schema-v2 pairs with mode `0600`.
 9. Checks image IDs, source hashes, labels, provider data, and policy hashes.
 
@@ -97,11 +104,46 @@ DHI_PASSWORD
 Limit that environment to protected `main`. Missing secrets fail the job. The
 job also fails for a pull, build, scan, SBOM, provenance, or upload error.
 
-The job blocks `HIGH` and `CRITICAL` findings unless an exact reviewed waiver
-applies. Keep waivers owned, dated, and tied to an exact package version.
+Trivy saves the raw `HIGH` and `CRITICAL` JSON without VEX filtering. Docker
+Scout 1.23.1 is the blocking VEX-aware gate. For an exact DHI base, CI fetches
+the matching Docker VEX statement, verifies it with the committed Docker
+public key, and selects it only for that final image. A missing statement gives
+no DHI VEX suppression.
+
+Docker's current DHI VEX statements have no public transparency-log entries.
+CI uses `--verify --skip-tlog`, so the pinned-key signature is checked but
+public-log inclusion is not. The receipt records that limit. Open WebUI is not
+a DHI image; its one local OpenVEX statement is unsigned, Git-reviewed, tied to
+the exact `0.10.2-aigw2` inputs, and expires on 2026-10-19.
+
+Keep waivers owned, dated, and tied to an exact package version. Do not treat a
+local scan or VEX review as proof that the protected GitHub job passed.
 
 Hosted CI rebuilds from the commit. It does not receive the local archive.
 For that reason, CI does not replace the seeded preprod test.
+
+### Review software inside each image
+
+An image update also reviews the software inside the image. For the Python
+services, use Python 3.14.6, validate the direct pins, rebuild the hash-locked
+dependency graph for Python 3.14, and run the clean temporary-environment steps
+in the [test runbook](test-runbook.md#python-services). CI currently pins
+ansible-core 2.21.2 and yamllint 1.38.0.
+
+The newest upstream application tag is not always present in DHI. These are
+the current reviewed holds:
+
+| Component | Reviewed choice | Why |
+| --- | --- | --- |
+| Traefik | Upstream 3.7.8 binary on DHI 3.7.6 | DHI 3.7.7 and 3.7.8 were not available |
+| Alloy | DHI 1.17.1 | DHI 1.17.2 and upstream 1.18.0 were not available in DHI |
+| Grafana | DHI 13.1.0 | Upstream 13.1.1 was not available in DHI |
+| OpenTelemetry Collector | DHI 0.156.0-contrib | Upstream 0.157.0 was not available in DHI |
+
+Recheck these facts for every release. Record a new reason if a component
+stays below a compatible stable version. If a new image changes its startup,
+filesystem, user, health, or configuration contract, update the source and
+tests before building a seed.
 
 ## 2. Test the exact preprod seed
 
