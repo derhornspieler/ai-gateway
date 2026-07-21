@@ -1,5 +1,8 @@
 # Portkey vs. AI Gateway — an apples-to-oranges comparison
 
+> **Archived:** This dated research is not an operator guide or a current
+> product statement.
+
 Research note, 2026-07-16. Sources: github.com/Portkey-AI (org + gateway README),
 portkey.ai/pricing (fetched today). Owner request: compare the two designs and
 flag, feature by feature, what sits behind a paywall — in Portkey *and* in the

@@ -1,5 +1,8 @@
 # Commercial consolidation study — what paid tiers could absorb, per component
 
+> **Archived:** This dated research is not an operator guide or a current
+> product statement.
+
 Date: 2026-07-17. Owner question: "How much could we collapse into LiteLLM if we
 paid for it? Is LiteLLM Kubernetes capable?" — expanded to the whole stack, with
 an Envoy AI Gateway comparison for a Kubernetes-shaped future and license-cost

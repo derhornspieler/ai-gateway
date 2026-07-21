@@ -1,5 +1,8 @@
 # Upgrade Durability Audit — 2026-07-16
 
+> **Archived:** This audit describes an older commit and the retired lab. Use
+> the current image update, backup, restore, and migration guides.
+
 Point-in-time audit of what every service's state surfaces are and what an
 image bump preserves versus destroys. Produced by a mapped-then-adversarially-
 verified multi-agent review of the working tree at commit `f6e6210` (each
