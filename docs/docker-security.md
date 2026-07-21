@@ -1,29 +1,21 @@
-# Container Platform Security
+# Container security
 
-This document describes how AI Gateway hardens the Docker platform itself:
-daemon configuration, the image supply chain, per-container runtime
-restrictions, secrets handling, volume and bind-mount integrity, and port
-publication. Host-level controls are in
-[OS security](os-security.md); packet-level controls in
-[network security](network-security.md).
+This page explains how AI Gateway locks down Docker, images, containers,
+mounts, and ports. See [host security](os-security.md) and
+[network security](network-security.md) for the other layers.
 
-For the shorter, system-wide view, start with the
-[security model](security-model.md).
+The main rules are:
 
-In plain language:
+- Every image has a reviewed tag and digest.
+- Normal services run as non-root with small permissions.
+- No container gets the Docker socket.
+- Config mounts are read-only and tied to content digests.
+- Only the two Traefik edges publish application ports.
+- Provider routes and CA files are built into one immutable Envoy image.
 
-- images are pinned, reviewed, and loaded as one release;
-- services run with small permissions and no Docker socket;
-- configuration mounts are read-only and force recreation when bytes change;
-- only the two Traefik edges publish application ports; and
-- provider routes and provider CA bundles are built into the selected Envoy
-  image, not added to a running container.
+## Docker daemon
 
-## 1. Daemon configuration
-
-`/etc/docker/daemon.json` is an exact, validated contract — six keys, no
-more — checked with `dockerd --validate` before installation and re-checked
-by preflight on every run:
+Ansible owns one exact `/etc/docker/daemon.json` file:
 
 ```json
 {
@@ -36,177 +28,191 @@ by preflight on every run:
 }
 ```
 
-`firewall-backend: iptables` is deliberate: Docker 29's experimental
-nftables backend removes the `DOCKER-USER` chain this design enforces
-against. SELinux integration is mandatory — the daemon must report
-`name=selinux` — and the daemon is never started until the host packet
-policy is live. A drifted `daemon.json` on a provisioned host is a refused
-condition, not an auto-repair.
+There are six keys. Ansible checks the file with `dockerd --validate` and
+reads it again on later deploys. Drift on a marked production host stops the
+deploy instead of changing a live daemon without review.
 
-## 2. Image supply chain
+The iptables backend is required. Docker's nftables backend does not provide
+the `DOCKER-USER` chain used by this design. SELinux must also be active in the
+daemon.
 
-**Every image is pinned by tag and immutable digest.** No floating tags, no
-`latest`, and Compose runs with implicit builds disabled — an unchanged
-converge can never rebuild or retag an image.
+Docker starts only after the host packet rules are ready.
 
-**Docker Hardened Images (DHI) by default.** Postgres 18.4 and BusyBox run
-directly from `dhi.io`. Reviewed single-layer images add only a static health
-probe to shellless DHI runtimes. This group includes Keycloak 26.7.0, Vault
-2.0.3, Redis 8.8.0, the four OAuth2 Proxy 7.15.3 gates, Alloy 1.17.1,
-Prometheus 3.13.1, Loki 3.7.3, Grafana 13.1.0, node-exporter 1.12.1, and the
-OTel collector 0.156.0-contrib. Traefik is a reviewed two-stage build that
-places the patched 3.7.8 binary on the non-root DHI runtime. The portals,
-key-rotator, and Envoy entrypoint build from DHI Python/Go bases with
-`--network=none`.
+## Image supply chain
 
-**Documented exceptions.** Three upstream images remain, each pinned and
-reviewed: LiteLLM v1.93.0, Open WebUI 0.10.2, and the Debian-based Samba AD
-image used only by local preprod. The Samba image is never deployed as a
-production customer directory.
+Every source image uses both a tag and an OCI digest. The project does not use
+`latest`. Normal Compose starts disable hidden builds and pulls.
 
-**Extracted, never executed.** The optional Vault browser UI
-(`vault-ui-proxy`) is a Go proxy that uses only the standard library. Its UI
-assets are extracted from the official `hashicorp/vault:2.0.3` image as data;
-the upstream binary never runs. `upstream-provenance.json` pins the exact
-embedded files. The image disables analytics, applies a strict no-external
-content security policy, and proves at startup that the proxy is the only
-process and runs as PID 1.
+DHI is the first choice when it is current, compatible, and at least as secure
+as the reviewed option. Some DHI runtimes are shellless, so local builds add a
+small static health probe.
 
-**Deterministic builds and rollback.** A build planner digests each
-service's effective build definition and complete build context
-(length-framed, collision-resistant) into a root-only manifest
-(`.state/compose-build-inputs.json`); only changed or missing images are
-built. Before any tag moves, the exact running image is preserved under a
-content-addressed rollback reference. The portal image installs its complete
-transitive dependency set from a SHA-256-hashed lock file with pip
-`--require-hashes`; installing from an unhashed requirements list is
-forbidden.
+Current DHI-based services include PostgreSQL 18.4, BusyBox, Keycloak, Vault,
+Redis, OAuth2 Proxy, Alloy, Prometheus, Loki, Grafana, node-exporter, the OTel
+collector, Envoy, portals, key-rotator, and optional platform DNS. Traefik uses
+a reviewed patched binary on a DHI runtime.
 
-### Immutable provider egress policy
+Three reviewed upstream exceptions remain:
 
-The Envoy image is built for an explicit set of reviewed provider names. The
-release command accepts no provider hostname or CA path. A network-disabled
-planner resolves each name through the committed provider catalog and checks:
+| Image | Reason |
+| --- | --- |
+| LiteLLM `v1.93.0` | The reviewed upstream image was safer and compatible |
+| Open WebUI `0.10.2` | No matching application DHI image was available |
+| Samba AD test image | Local preprod only; never a production directory |
 
-- the exact API hostname, route prefix, SNI, and SAN list;
-- complete CA-bundle hashes and ordered certificate fingerprints;
-- CA validity dates, CA constraints, and certificate-signing use; and
-- the reviewed provenance file and its hash.
+An exception does not allow a floating tag or skipped scan.
 
-The network-disabled image build copies only the selected routes, CA bundles,
-and generated policy into the final shellless image. An unselected provider
-has no route or CA file. Changing the selection changes the policy digest and
-immutable image ID.
+The optional Vault UI proxy extracts static UI files from the pinned official
+Vault image. It does not run the upstream Vault binary. A provenance file lists
+the exact embedded files. The proxy blocks analytics and outside web content.
 
-The schema-v2 release manifest records that evidence and binds it to the final
-Envoy image ID. The offline loader checks the matching image labels before
-activation. Ansible never discovers or downloads CA trust. It deploys the
-already-reviewed image and policy as one release unit.
+Custom Dockerfiles build with networking disabled. Python production images
+install a full hash-locked dependency file. Go images test during their
+network-disabled build.
 
-At startup, the compiled gate rejects changed policy or config bytes; missing,
-extra, malformed, expired, or fingerprint-mismatched CA files; invalid SNI or
-SAN rules; the `ENVOY_CONFIG` variable; and caller-supplied config flags. It
-does not fall back to the system trust store. Do not add a CA bind mount or
-override the image entrypoint.
+Before a tag moves, the release flow saves the exact current image under a
+content-based rollback name. Stateful image changes also need a recent,
+verified backup.
 
-See [Provider onboarding](provider-onboarding.md), the
-[Provider CA maintenance SOP](sop/provider-ca-maintenance.md), and
+## Immutable Envoy provider policy
+
+The release operator selects provider names from a committed catalog. The CLI
+does not accept arbitrary hostnames or CA paths.
+
+For each selected provider, the build checks:
+
+- API hostname and route prefix;
+- SNI and exact SAN names;
+- reviewed CA bundle and certificate fingerprints;
+- CA dates and signing rules; and
+- provenance evidence and hashes.
+
+The final shellless image contains only the selected routes and CA files.
+Changing the provider set or CA evidence changes the policy digest and image
+ID.
+
+The schema-v2 seed manifest records the provider evidence, policy digest, and
+final Envoy image ID. The offline loader checks the matching image labels.
+Ansible never finds or downloads CA trust during a deploy.
+
+At startup, the compiled gate rejects:
+
+- changed policy or config bytes;
+- missing, extra, broken, expired, or wrong-fingerprint CA files;
+- unsafe SNI or SAN rules;
+- `ENVOY_CONFIG`; and
+- caller-supplied config flags.
+
+There is no system trust fallback. Do not mount CA files over the image or
+replace its entrypoint.
+
+See [provider onboarding](provider-onboarding.md), the
+[CA maintenance SOP](sop/provider-ca-maintenance.md), and
 [offline image releases](offline-image-seed.md#envoy-image-and-policy-binding).
 
-## 3. Runtime hardening
+## Runtime limits
 
-A shared hardening anchor applies to every long-running service:
-`no-new-privileges`, `cap_drop: ALL`, explicit per-plane container resolvers
-(rendered into `docker-compose.dns.yml`; only Envoy receives Internet DNS),
-bounded JSON logging (20 MiB × 5), a PID limit, and `restart:
-unless-stopped`. On top of that baseline:
+Every long-running service gets this base policy:
 
-- **Non-root everywhere.** Application services run as uid 65532 (or a
-  service-specific non-root uid such as Vault's 1000 and Alloy's 473). The
-  only root container is the one-shot volume initializer — networkless,
-  read-only, PID-limited, and exiting before any stateful service starts.
-- **Minimal capabilities.** Almost every service runs with zero
-  capabilities. The production exceptions are explicit and narrow:
-  `NET_BIND_SERVICE` for the two Traefik edges and optional platform DNS,
-  `IPC_LOCK` for Vault (with unlimited memlock so key material never swaps),
-  and `CHOWN/FOWNER/FSETID` for the volume initializer. Local preprod Samba
-  has its own reviewed capability set because it must act as an AD domain
-  controller; that set is not part of production.
-- **Read-only root filesystems** with per-purpose `tmpfs` mounts, except
-  three documented writable-rootfs exceptions whose upstreams require it
-  (LiteLLM, Open WebUI, Keycloak) — each justified inline in the Compose
-  file.
-- **Resource ceilings** on every service (memory, CPU, PIDs), from 64 MiB
-  for platform DNS to 4 GiB for LiteLLM.
-- **Shellless health checks.** DHI runtimes carry no shell, so health checks
-  use a static, purpose-built probe binary (`aigw-health-probe`) or the
-  component's own native health command — never `curl | sh` patterns.
-- **SELinux confinement** with per-container MCS categories on process and
-  mount labels. Exactly two services run `label=disable`, each bounded and
-  justified: Alloy (must read Docker's runtime-owned logs, which must never
-  be relabeled) and node-exporter (read-only host-root metrics view). Both
-  remain non-root, capability-dropped, read-only, and unpublished.
-- **No privileged containers** anywhere, including local preprod.
+- `no-new-privileges`;
+- all Linux capabilities dropped first;
+- an explicit DNS path;
+- bounded JSON logs;
+- CPU, memory, and PID limits; and
+- a reviewed restart policy.
 
-## 4. Secrets handling
+Application services run as UID 65532 or their own non-root UID. The one-shot
+volume initializer is the only production root container. It has no network,
+a read-only root, a small PID limit, and exits before stateful services start.
 
-- **Fail-closed variable contract.** Every required Compose variable uses
-  `${VAR:?}`; a missing secret stops the stack rather than starting it
-  half-configured. Secret values are validated for length and character
-  class before rendering, and related secrets are asserted mutually
-  distinct.
-- **No secret in a command line or environment where a file will do.**
-  Redis receives only a SHA-256 ACL verifier via file; its health probe
-  reads a separate password file; neither value appears in the container's
-  command or environment metadata. Preprod Samba passwords are file-backed
-  test secrets read with `O_NOFOLLOW` and driven through the Samba API — never
-  a child-process argument.
-- **Verified absence.** The converge proves the Open WebUI workload key's
-  plaintext appears in no project container log, and stores only its hash in
-  the gateway database. Provider credentials live in Vault and are brokered
-  at runtime ([WIF flow](anthropic-wif-bootstrap.md)); no long-lived vendor
-  key sits in configuration.
+Most services keep zero capabilities. The approved additions are:
 
-## 5. Volume and bind-mount integrity
+| Service | Capability | Reason |
+| --- | --- | --- |
+| Traefik and optional platform DNS | `NET_BIND_SERVICE` | Bind low ports |
+| Vault | `IPC_LOCK` | Keep key material out of swap |
+| Volume initializer | `CHOWN`, `FOWNER`, `FSETID` | Set state-volume owners and modes |
 
-- **State-volume ownership contracts.** The versioned one-shot initializer
-  owns exactly eight volume-root contracts (owner, group, mode — including
-  the SGID audit volume) and re-runs only when absent, failed, redefined, or
-  drifted; Ansible verifies the exact metadata afterward.
-- **Read-only, relabeled binds.** Every configuration bind is read-only with
-  exactly one SELinux relabel flag: private (`Z`) for per-service files,
-  shared (`z`) only where two reviewed consumers share a source. Docker's
-  own runtime tree is never relabeled.
-- **Keyed content digests force safe recreation.** Bind mounts pin the file
-  inode at container creation, so an atomically replaced config could
-  otherwise leave a running service reading stale bytes. A per-service
-  HMAC-SHA256 digest over each service's complete bind-source inventory
-  (path, type, owner, mode, size, content — links and special files
-  rejected) is stamped into service metadata; a source change recreates
-  exactly the affected consumers. The 32-byte key is root-only, single-link,
-  accepted on stdin only, and excluded from backups.
+The local Samba test container has a separate reviewed capability set. It is
+not part of production.
 
-## 6. No Docker socket exposure
+Most root filesystems are read-only, with small `tmpfs` paths for writes.
+LiteLLM, Open WebUI, and Keycloak keep documented writable-root exceptions
+because their upstream images need them.
 
-No container mounts the Docker socket. Traefik uses a reviewed file provider
-— not Docker-label discovery — with its dashboard disabled. The log
-collector reads container logs through a read-only filesystem bind bounded
-by host ACLs (uid 473, current project only), not through the API. The only
-socket consumers are the host-side automation itself and a sandboxed
-systemd ACL reconciler with a read-only socket bind.
+Health checks use a static project probe or the service's own command. They do
+not depend on a shell or download a tool at runtime.
 
-## 7. Port publication
+Normal containers use SELinux MCS separation. Alloy and node-exporter are the
+only `label=disable` cases. They remain non-root, capability-dropped,
+read-only, and unpublished.
 
-Exactly two services publish host ports in the base stack. `traefik-int`
-binds only to `ETH2_IP:443`. `traefik-adm` binds only to `ETH1_IP:443`. The
-optional platform-DNS overlay also binds port 53 to those two addresses.
+No production or preprod container is privileged.
 
-The converge checks the live publication set. It rejects `0.0.0.0`, `::`, and
-the egress address, and it checks the matching NAT rules. Envoy's admin
-endpoint and every telemetry listener stay unpublished on fixed internal
-bridge addresses.
+## Secrets
 
-Alloy may open one outbound OTLP/TLS connection to the approved Cribl `/32`.
-Only the curated security-log allow-list can use it. Metrics, raw traces,
-alerts, and ordinary service logs stay local. See the
-[Cribl SOC logging handoff](cribl-soc-handoff.md).
+Required Compose values use `${VAR:?}` so a missing value stops rendering.
+Ansible checks secret length, allowed characters, and required differences
+before it writes runtime files.
+
+Use a mounted file when command or environment metadata would expose a secret.
+Examples:
+
+- Redis reads a SHA-256 password verifier file.
+- Redis clients read a separate password file.
+- The production LDAPS bind password is a root-owned file.
+- Preprod Samba reads test passwords from protected files.
+
+Provider credentials live in Vault and reach LiteLLM through the reviewed
+broker path. No long-lived provider key is stored in normal config.
+
+Verification checks that the Open WebUI workload key does not appear in any
+project container log. The database stores its hash, not its plaintext.
+
+## Volumes and config mounts
+
+The one-shot initializer owns eight state-volume root contracts. It runs only
+when it is missing, failed, changed, or the required owner or mode drifted.
+Ansible checks the state again after it exits.
+
+Every config bind is read-only. Private files use `Z`; files shared by reviewed
+containers use `z`. Docker's own runtime tree is never relabeled.
+
+Docker binds an inode when it creates a container. An atomic file replacement
+could leave a running service on old bytes. The project prevents that with a
+per-service HMAC-SHA256 bind-source digest.
+
+The digest covers path, type, owner, mode, size, and content. Unsafe links,
+special files, and read races fail. A changed digest recreates only the service
+that uses those files. The digest key is root-only, arrives on stdin, and is
+not backed up.
+
+## No Docker socket in containers
+
+No container mounts `/var/run/docker.sock`.
+
+Traefik reads Ansible-made files instead of Docker labels. Alloy reads only
+approved Docker JSON log files through a read-only host path and narrow ACLs.
+It does not call the Docker API.
+
+Only host automation and the locked log-ACL systemd job use the socket. The
+systemd job receives a read-only socket bind and a small file-permission set.
+
+## Published ports
+
+The base production stack publishes application traffic through two services:
+
+| Service | Bind |
+| --- | --- |
+| `traefik-int` | `ETH2_IP:443` |
+| `traefik-adm` | `ETH1_IP:443` |
+
+Optional platform DNS also binds TCP and UDP 53 on those two exact addresses.
+
+Verification rejects `0.0.0.0`, `::`, and the egress address. It also checks
+the matching NAT rules. Envoy admin, databases, cache, Vault, and telemetry
+listeners stay on private Docker networks.
+
+Alloy may make one outbound TLS connection to the approved Cribl address and
+port. Only the curated SOC log set can use it. Metrics, alerts, raw traces, and
+normal service logs stay local. See the [Cribl handoff](cribl-soc-handoff.md).
