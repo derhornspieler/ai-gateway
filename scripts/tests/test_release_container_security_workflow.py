@@ -146,6 +146,38 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("--username", fetch)
         self.assertNotIn("--password", fetch)
+        self.assertEqual(
+            WORKFLOW.count("dockerhub-user: ${{ secrets.DHI_USERNAME }}"), 2
+        )
+        self.assertEqual(
+            WORKFLOW.count("dockerhub-password: ${{ secrets.DHI_PASSWORD }}"), 2
+        )
+        self.assertEqual(
+            WORKFLOW.count("registry-user: ${{ secrets.DHI_USERNAME }}"), 2
+        )
+        self.assertEqual(
+            WORKFLOW.count("registry-password: ${{ secrets.DHI_PASSWORD }}"), 2
+        )
+
+    def test_custom_builds_pin_the_production_compose_and_buildkit(self) -> None:
+        custom = WORKFLOW.split("  custom-images:", 1)[1]
+        self.assertIn(
+            "uses: docker/setup-compose-action@"
+            "4eb059ff7f16592f9c84d5ca339c53cb7c5064e2 # v2.3.0",
+            custom,
+        )
+        self.assertIn("version: v5.3.1", custom)
+        self.assertIn(
+            "uses: docker/setup-buildx-action@"
+            "bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0",
+            custom,
+        )
+        self.assertIn("driver: docker-container", custom)
+        self.assertIn(
+            "image=moby/buildkit:v0.31.2@sha256:"
+            "2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec",
+            custom,
+        )
 
     def test_plan_uses_the_authoritative_full_seed_union(self) -> None:
         scopes = SEED.collect_project_image_reference_scopes(ROOT)
