@@ -47,6 +47,7 @@ from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
 from aigw_openwebui_identity import (
+    OPENWEBUI_IDENTITY_GATE_FIELD,
     OPENWEBUI_KEY_ALIAS,
     OPENWEBUI_KEY_METADATA,
     OPENWEBUI_KEY_OWNER,
@@ -104,13 +105,18 @@ def _enforce_openwebui_identity(
 ) -> None:
     """Deny an unauditable Open WebUI inference before model dispatch."""
 
+    proxy_request = (
+        data.get("proxy_server_request") if isinstance(data, dict) else None
+    )
+    if isinstance(proxy_request, dict):
+        # This object is shared with LiteLLM's pre-created failure logger.
+        # Clear caller/stale state first, then mark only a request that passes
+        # both normalized and raw-header checks below.
+        proxy_request.pop(OPENWEBUI_IDENTITY_GATE_FIELD, None)
     if not _has_openwebui_service_marker(user_api_key_dict):
         return
     if not _is_exact_openwebui_service_key(user_api_key_dict):
         raise _deny("Open WebUI service key markers do not match")
-    proxy_request = (
-        data.get("proxy_server_request") if isinstance(data, dict) else None
-    )
     headers = proxy_request.get("headers") if isinstance(proxy_request, dict) else None
     token = openwebui_jwt_from_headers(headers)
     secret_fields = data.get("secret_fields") if isinstance(data, dict) else None
@@ -125,6 +131,7 @@ def _enforce_openwebui_identity(
         or verified_openwebui_username(token, secret) is None
     ):
         raise _deny("Open WebUI requires one valid signed user assertion")
+    proxy_request[OPENWEBUI_IDENTITY_GATE_FIELD] = True
 
 
 def resolve_request_model(

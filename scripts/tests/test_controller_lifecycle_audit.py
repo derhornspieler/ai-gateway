@@ -19,6 +19,7 @@ WRITER_PATH = ROOT / "scripts/controller-lifecycle-audit.py"
 PLAYBOOK_PATH = ROOT / "ansible/record-controller-lifecycle.yml"
 ROLE_PATH = ROOT / "ansible/roles/docker_stack/tasks/main.yml"
 PREPROD_PATH = ROOT / "scripts/preprod.py"
+PREPROD_CRIBL_PATH = ROOT / "scripts/test-preprod-cribl-security.py"
 
 
 def load_writer():
@@ -38,6 +39,16 @@ WRITER = load_writer()
 def load_preprod():
     spec = importlib.util.spec_from_file_location(
         "aigw_controller_audit_preprod", PREPROD_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_preprod_cribl():
+    spec = importlib.util.spec_from_file_location(
+        "aigw_controller_audit_preprod_cribl", PREPROD_CRIBL_PATH
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -481,8 +492,14 @@ class ControllerLifecycleAuditTest(unittest.TestCase):
             'fail("generated preprod controller audit state remains after removal")',
             source,
         )
+        destroy = source.split("def _destroy_project_resources(", 1)[1].split(
+            "\ndef destroy(", 1
+        )[0]
+        self.assertLess(destroy.index('"down",'), destroy.index(
+            "remove_controller_audit_fixture()"
+        ))
 
-    def test_preprod_fixture_securely_truncates_rotates_and_cleans(self) -> None:
+    def test_preprod_fixture_repeated_prepare_preserves_both_inodes(self) -> None:
         preprod = load_preprod()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -501,19 +518,64 @@ class ControllerLifecycleAuditTest(unittest.TestCase):
                 mock.patch.object(preprod, "VAULT_INIT_FILE", root / "missing-vault"),
             ):
                 preprod.prepare_controller_audit_fixture()
-                self.assertEqual(current.read_bytes(), b"")
-                self.assertEqual(current.stat().st_mode & 0o777, 0o644)
+                identities = {
+                    path: (path.stat().st_dev, path.stat().st_ino)
+                    for path in (current, rotated)
+                }
+                for path in (current, rotated):
+                    self.assertEqual(path.read_bytes(), b"")
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o644)
                 current.write_text("stale current\n", encoding="utf-8")
                 rotated.write_text("stale rotated\n", encoding="utf-8")
-                rotated.chmod(0o644)
 
                 preprod.prepare_controller_audit_fixture()
-                self.assertEqual(current.read_bytes(), b"")
-                self.assertFalse(rotated.exists())
-                self.assertEqual(preprod._validate_clean_room_generated_state(), 1)
+                for path in (current, rotated):
+                    self.assertEqual(path.read_bytes(), b"")
+                    self.assertEqual(
+                        (path.stat().st_dev, path.stat().st_ino), identities[path]
+                    )
+                self.assertEqual(preprod._validate_clean_room_generated_state(), 2)
 
                 preprod.remove_controller_audit_fixture()
                 self.assertFalse(audit_directory.exists())
+
+    def test_preprod_acceptance_writes_both_files_in_place(self) -> None:
+        preprod = load_preprod()
+        receipt = load_preprod_cribl()
+        with tempfile.TemporaryDirectory() as temporary:
+            audit_directory = Path(temporary) / "controller"
+            current = audit_directory / "lifecycle.jsonl"
+            rotated = audit_directory / "lifecycle.jsonl.1"
+            with (
+                mock.patch.object(
+                    preprod, "PREPROD_CONTROLLER_AUDIT_DIR", audit_directory
+                ),
+                mock.patch.object(
+                    preprod, "PREPROD_CONTROLLER_AUDIT_FILES", (current, rotated)
+                ),
+                mock.patch.object(receipt, "CONTROLLER_AUDIT_DIR", audit_directory),
+                mock.patch.object(receipt, "CONTROLLER_AUDIT_CURRENT", current),
+                mock.patch.object(receipt, "CONTROLLER_AUDIT_ROTATED", rotated),
+            ):
+                preprod.prepare_controller_audit_fixture()
+                identities = {
+                    path: (path.stat().st_dev, path.stat().st_ino)
+                    for path in (current, rotated)
+                }
+                receipt.write_controller_lifecycle_fixtures("0123456789abcdef")
+
+                for path in (current, rotated):
+                    self.assertGreater(path.stat().st_size, 0)
+                    self.assertEqual(
+                        (path.stat().st_dev, path.stat().st_ino), identities[path]
+                    )
+
+                receipt.empty_controller_lifecycle_fixtures()
+                for path in (current, rotated):
+                    self.assertEqual(path.read_bytes(), b"")
+                    self.assertEqual(
+                        (path.stat().st_dev, path.stat().st_ino), identities[path]
+                    )
 
     def test_preprod_fixture_refuses_a_symlinked_rotation(self) -> None:
         preprod = load_preprod()

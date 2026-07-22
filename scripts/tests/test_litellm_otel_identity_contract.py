@@ -165,7 +165,11 @@ def request_kwargs(
     auth_metadata: object = None,
     headers: object = None,
     end_user: object = "caller-controlled",
+    identity_verified: bool = False,
 ) -> dict:
+    proxy_request = {"headers": headers or {}}
+    if identity_verified:
+        proxy_request["aigw_openwebui_identity_gate_v1"] = True
     return {
         "standard_logging_object": {
             "metadata": {
@@ -176,7 +180,7 @@ def request_kwargs(
             }
         },
         "litellm_params": {
-            "proxy_server_request": {"headers": headers or {}},
+            "proxy_server_request": proxy_request,
             "metadata": {},
         },
     }
@@ -332,6 +336,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                 "aigw_project_id": "open-webui",
             },
             headers={"X-OpenWebUI-User-Jwt": token},
+            identity_verified=True,
         )
         self.assertEqual(
             resolver(exact, SECRET, now=now),
@@ -341,6 +346,17 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                 "open_webui_signed_oidc",
             ),
         )
+        ungated = request_kwargs(
+            owner="svc-open-webui",
+            alias="aigw-open-webui-service",
+            auth_metadata={
+                "aigw_key_kind": "service",
+                "aigw_service": "open-webui",
+                "aigw_project_id": "open-webui",
+            },
+            headers={"X-OpenWebUI-User-Jwt": token},
+        )
+        self.assertIsNone(resolver(ungated, SECRET, now=now))
 
         fabricated_metadata_path = request_kwargs(
             owner="svc-open-webui",
@@ -350,6 +366,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                 "aigw_service": "open-webui",
                 "aigw_project_id": "open-webui",
             },
+            identity_verified=True,
         )
         fabricated_metadata_path["litellm_params"]["metadata"] = {
             "headers": {"X-OpenWebUI-User-Jwt": token}
@@ -370,6 +387,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                     "aigw_project_id": "open-webui",
                 },
                 headers={"X-OpenWebUI-User-Jwt": token},
+                identity_verified=True,
             ),
             request_kwargs(
                 owner="svc-open-webui",
@@ -379,6 +397,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                     "aigw_service": "open-webui",
                 },
                 headers={"X-OpenWebUI-User-Jwt": token},
+                identity_verified=True,
             ),
         ):
             with self.subTest(changed=changed):
@@ -439,6 +458,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                         "aigw_project_id": "open-webui",
                     },
                     headers={"X-OpenWebUI-User-Jwt": token},
+                    identity_verified=True,
                 )
                 self.assertIsNone(resolver(kwargs, SECRET, now=now))
 
@@ -452,6 +472,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                 "aigw_project_id": "open-webui",
             },
             headers={"X-OpenWebUI-User-Jwt": signed_token(unicode_name)},
+            identity_verified=True,
         )
         self.assertEqual(
             resolver(unicode_kwargs, SECRET, now=now),
@@ -482,6 +503,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                     "X-OpenWebUI-User-Email": "spoofed-header-user",
                 },
                 end_user="spoofed-body-user",
+                identity_verified=True,
             )
             kwargs["optional_params"] = {"user": "spoofed-body-user"}
             resolved.append(resolver(kwargs, SECRET, now=now))
@@ -522,6 +544,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                 "X-OpenWebUI-User-Email": "plain-header-user",
             },
             end_user="plain-end-user",
+            identity_verified=True,
         )
         self.assertIsNone(resolver(service, SECRET, now=now))
         self.assertEqual(
@@ -577,6 +600,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
                     "aigw_project_id": "open-webui",
                 },
                 headers={"X-OpenWebUI-User-Jwt": token},
+                identity_verified=True,
             ),
             None,
         )

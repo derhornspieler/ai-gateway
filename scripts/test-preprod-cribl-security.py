@@ -1104,6 +1104,11 @@ def fixture_lines(token: str) -> str:
         '"action":"deployment_converge","outcome":"success","changed":true,'
         f'"project":"receipt-{token}"}}'
     )
+    identity_unchanged = (
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
+        '"action":"deployment_converge","outcome":"success","changed":false,'
+        f'"project":"unchanged-{token}"}}'
+    )
     identity_failure = (
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
         '"action":"deployment_converge","outcome":"failed",'
@@ -1368,6 +1373,27 @@ def fixture_lines(token: str) -> str:
         ),
         (
             "key-rotator",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
+            '"action":"managed_identity_change_planned","outcome":"success",'
+            '"changed":"true","change_kind":"planned_change",'
+            '"operation_id":"123e4567-e89b-42d3-a456-426614174030"}',
+        ),
+        (
+            "key-rotator",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
+            '"action":"managed_identity_change_planned","outcome":"success",'
+            '"changed":null,"change_kind":"planned_change",'
+            '"operation_id":"123e4567-e89b-42d3-a456-426614174031"}',
+        ),
+        (
+            "key-rotator",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
+            '"action":"managed_identity_change_planned","outcome":"success",'
+            '"changed":1,"change_kind":"planned_change",'
+            '"operation_id":"123e4567-e89b-42d3-a456-426614174032"}',
+        ),
+        (
+            "key-rotator",
             'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.vault.state",'
             '"action":"state_observed","outcome":"failure","state":"tampered",'
             f'"marker":"DENIED_VAULT_STATE_{token}"}}',
@@ -1390,6 +1416,7 @@ def fixture_lines(token: str) -> str:
         docker_log_line("dev-portal", portal, timestamp),
         docker_log_line("admin-portal", admin_portal, timestamp),
         docker_log_line("key-rotator", identity, timestamp),
+        docker_log_line("key-rotator", identity_unchanged, timestamp),
         docker_log_line("key-rotator", identity_failure, timestamp),
         docker_log_line("key-rotator", break_glass, timestamp),
         docker_log_line("key-rotator", vault_state, timestamp),
@@ -1422,8 +1449,8 @@ def fixture_lines(token: str) -> str:
     return "\n".join(records) + "\n"
 
 
-def write_controller_lifecycle_fixtures(token: str) -> None:
-    """Write reviewed current/rotated controller records plus denied shapes."""
+def controller_lifecycle_file_identities() -> dict[Path, tuple[int, int]]:
+    """Validate both stable fixture paths and return their exact identities."""
 
     try:
         directory = CONTROLLER_AUDIT_DIR.lstat()
@@ -1437,6 +1464,89 @@ def write_controller_lifecycle_fixtures(token: str) -> None:
         or stat.S_IMODE(directory.st_mode) != 0o755
     ):
         fail("the generated preprod controller audit directory is unsafe")
+
+    expected_files: dict[Path, tuple[int, int]] = {}
+    for path in (CONTROLLER_AUDIT_CURRENT, CONTROLLER_AUDIT_ROTATED):
+        try:
+            metadata = path.lstat()
+        except OSError:
+            fail("a generated preprod controller audit file is unavailable")
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != os.getegid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o644
+        ):
+            fail("a generated preprod controller audit file is unsafe")
+        expected_files[path] = (metadata.st_dev, metadata.st_ino)
+    return expected_files
+
+
+def mutate_controller_lifecycle_fixtures(
+    content_by_path: dict[Path, bytes],
+) -> None:
+    """Truncate both validated fixture files in place and optionally refill them."""
+
+    paths = (CONTROLLER_AUDIT_CURRENT, CONTROLLER_AUDIT_ROTATED)
+    if set(content_by_path) != set(paths):
+        fail("the controller audit fixture mutation is incomplete")
+    if any(len(content_by_path[path]) > 16 * 1024 for path in paths):
+        fail("the controller audit fixture exceeded its fixed bound")
+
+    expected_files = controller_lifecycle_file_identities()
+    descriptors: dict[Path, int] = {}
+    try:
+        # Open and validate both paths before mutating either one. This keeps a
+        # failed boundary check from partially changing Alloy's two sources.
+        for path in paths:
+            flags = os.O_WRONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(path, flags)
+            except OSError:
+                fail("a generated preprod controller audit file is unavailable")
+            descriptors[path] = descriptor
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != expected_files[path]
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_gid != os.getegid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o644
+            ):
+                fail("a generated preprod controller audit file is unsafe")
+
+        for path in paths:
+            descriptor = descriptors[path]
+            content = content_by_path[path]
+            os.ftruncate(descriptor, 0)
+            if content:
+                written = os.write(descriptor, content)
+                if written != len(content):
+                    fail("the controller audit fixture write was incomplete")
+            os.fsync(descriptor)
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+def empty_controller_lifecycle_fixtures() -> None:
+    """Empty both Alloy sources without replacing or unlinking either path."""
+
+    mutate_controller_lifecycle_fixtures(
+        {
+            CONTROLLER_AUDIT_CURRENT: b"",
+            CONTROLLER_AUDIT_ROTATED: b"",
+        }
+    )
+
+
+def write_controller_lifecycle_fixtures(token: str) -> None:
+    """Write reviewed current/rotated controller records plus denied shapes."""
 
     timestamp = datetime.now(timezone.utc).isoformat(
         timespec="milliseconds"
@@ -1476,39 +1586,20 @@ def write_controller_lifecycle_fixtures(token: str) -> None:
     del missing_digest["egress_policy_sha256"]
     missing_digest["unexpected"] = f"DENIED_CONTROLLER_MISSING_{token}"
 
-    def write_records(path: Path, records: tuple[dict[str, object], ...]) -> None:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(path, flags, 0o644)
-        except OSError:
-            fail("a generated preprod controller audit file is unavailable")
-        try:
-            metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or metadata.st_gid != os.getegid()
-                or metadata.st_nlink != 1
-                or stat.S_IMODE(metadata.st_mode) != 0o644
-            ):
-                fail("a generated preprod controller audit file is unsafe")
-            content = "".join(
-                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-                for record in records
-            ).encode("ascii")
-            if len(content) > 16 * 1024:
-                fail("the controller audit fixture exceeded its fixed bound")
-            written = os.write(descriptor, content)
-            if written != len(content):
-                fail("the controller audit fixture write was incomplete")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    def encode(records: tuple[dict[str, object], ...]) -> bytes:
+        return "".join(
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+            for record in records
+        ).encode("ascii")
 
-    write_records(CONTROLLER_AUDIT_CURRENT, (upgrade, extra, unknown_action))
-    write_records(CONTROLLER_AUDIT_ROTATED, (rollback, quoted_schema, missing_digest))
+    mutate_controller_lifecycle_fixtures(
+        {
+            CONTROLLER_AUDIT_CURRENT: encode((upgrade, extra, unknown_action)),
+            CONTROLLER_AUDIT_ROTATED: encode(
+                (rollback, quoted_schema, missing_digest)
+            ),
+        }
+    )
 
 
 def write_log_fixtures(preprod: Preprod, model: dict[str, Any], token: str) -> None:
@@ -2130,6 +2221,7 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"event=aigw.portal.audit action=key.deactivate outcome=denied-membership subject=deactivate-membership-{token} project=aigw-users",
         f"event=aigw.portal.audit action=key.deactivate outcome=denied-ownership subject=deactivate-ownership-{token} project=aigw-users",
         f"event=aigw.identity.audit action=deployment_converge outcome=success project=receipt-{token} changed=true",
+        f"event=aigw.identity.audit action=deployment_converge outcome=success project=unchanged-{token} changed=false",
         f"event=aigw.identity.audit action=deployment_converge outcome=failed project=failed-{token} error_type=ReceiptFailure",
         "event=aigw.identity.audit action=break_glass_use outcome=success purpose=deployment_converge",
         "event=aigw.identity.audit action=bootstrap_cleanup outcome=success changed=true",
@@ -2259,6 +2351,10 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"DENIED_ZERO_TIMESTAMP_{token}",
         f"DENIED_STALE_TIMESTAMP_{token}",
         f"DENIED_FUTURE_TIMESTAMP_{token}",
+        "aigw.security.source_time_unix_nano",
+        "123e4567-e89b-42d3-a456-426614174030",
+        "123e4567-e89b-42d3-a456-426614174031",
+        "123e4567-e89b-42d3-a456-426614174032",
         f"untrusted-call-{token}",
         f"DENIED_KEYCLOAK_MISSING_USER_{token}",
         f"denied_raw_metric_{token}",
@@ -2514,54 +2610,60 @@ def main() -> int:
         fail("the live Vault audit receipt could not be generated")
     exercise_natural_keycloak_auth(preprod, model)
     write_log_fixtures(preprod, model, token)
-    write_controller_lifecycle_fixtures(token)
-    send_otlp_fixtures(preprod, OTLP_FIXTURE_HELPER, token, "OTLP_FIXTURES_ACCEPTED")
-    send_otlp_fixtures(
-        preprod,
-        OTLP_SPOOF_HELPER,
-        token,
-        "OTLP_SPOOF_REJECTED",
-        service="key-rotator",
-    )
-    send_real_litellm_request(preprod, token)
-    send_openwebui_header_runtime_request(preprod, token)
-    logs = wait_for_receipts(
-        preprod,
-        (
-            f"allowed-ai-input-{token}",
-            f"real-ai-input-{token}",
-            f"runtime-openwebui-ai-input-{token}",
-            f"aigw.user.name: Str(natural-portal-{token})",
-            f"aigw.user.name: Str(natural.openwebui.{token})",
-            "aigw.user.name_source: Str(open_webui_signed_oidc)",
-            f"nested-call-{token}",
-            f"ALLOWED_RECENT_PAST_TIMESTAMP_{token}",
-            f"ALLOWED_CLOCK_SKEW_TIMESTAMP_{token}",
-            f"event_type=LOGIN realm_id=aigw client_id=portal user_id=receipt-{token}",
-            f"event=aigw.portal.audit action=rotation.trigger outcome=success subject=receipt-{token}",
-            f"event=aigw.portal.audit action=authorization.role.denied outcome=failure subject=role-denied-{token}",
-            f"event=aigw.portal.audit action=key.deactivate outcome=denied-ownership subject=deactivate-ownership-{token}",
-            f"event=aigw.identity.audit action=deployment_converge outcome=success project=receipt-{token}",
-            "event=aigw.identity.audit action=ldap_recovery outcome=success operation_id=123e4567-e89b-42d3-a456-426614174026 ldap_provider=corp-ad",
-            "event=aigw.identity.audit action=managed_identity_change_applied outcome=success changed=true change_kind=planned_change operation_id=123e4567-e89b-42d3-a456-426614174025",
-            "event=aigw.provider.rotation action=start outcome=success vendor=anthropic",
-            "event=aigw.provider.rotation action=attempt outcome=failure vendor=anthropic",
-            "event=aigw.provider.rotation action=rotate outcome=success vendor=anthropic",
-            "event=aigw.provider.rotation action=recovery outcome=success vendor=anthropic",
-            "event=aigw.vault.state action=state_observed outcome=success state=unsealed",
-            "event=aigw.vault.audit",
-            "event=aigw.controller.lifecycle action=upgrade outcome=success",
-            "event=aigw.controller.lifecycle action=rollback outcome=failed",
-            f"event=aigw.egress.trust action=startup_gate outcome=success policy_sha256={token * 4}",
-            "event=aigw.egress.trust action=upstream_tls_failure",
-        ),
-        receipt_since,
-    )
-    # One extra file-source interval proves denied records did not merely lag.
-    time.sleep(12)
-    assert_initial_receipts(cribl_logs(preprod, receipt_since), token)
-    exercise_tls_server_name_failure(preprod, model, tls_token)
-    exercise_outage_recovery(preprod, model, outage_token)
+    try:
+        write_controller_lifecycle_fixtures(token)
+        send_otlp_fixtures(
+            preprod, OTLP_FIXTURE_HELPER, token, "OTLP_FIXTURES_ACCEPTED"
+        )
+        send_otlp_fixtures(
+            preprod,
+            OTLP_SPOOF_HELPER,
+            token,
+            "OTLP_SPOOF_REJECTED",
+            service="key-rotator",
+        )
+        send_real_litellm_request(preprod, token)
+        send_openwebui_header_runtime_request(preprod, token)
+        logs = wait_for_receipts(
+            preprod,
+            (
+                f"allowed-ai-input-{token}",
+                f"real-ai-input-{token}",
+                f"runtime-openwebui-ai-input-{token}",
+                f"aigw.user.name: Str(natural-portal-{token})",
+                f"aigw.user.name: Str(natural.openwebui.{token})",
+                "aigw.user.name_source: Str(open_webui_signed_oidc)",
+                f"nested-call-{token}",
+                f"ALLOWED_RECENT_PAST_TIMESTAMP_{token}",
+                f"ALLOWED_CLOCK_SKEW_TIMESTAMP_{token}",
+                f"event_type=LOGIN realm_id=aigw client_id=portal user_id=receipt-{token}",
+                f"event=aigw.portal.audit action=rotation.trigger outcome=success subject=receipt-{token}",
+                f"event=aigw.portal.audit action=authorization.role.denied outcome=failure subject=role-denied-{token}",
+                f"event=aigw.portal.audit action=key.deactivate outcome=denied-ownership subject=deactivate-ownership-{token}",
+                f"event=aigw.identity.audit action=deployment_converge outcome=success project=receipt-{token}",
+                f"event=aigw.identity.audit action=deployment_converge outcome=success project=unchanged-{token} changed=false",
+                "event=aigw.identity.audit action=ldap_recovery outcome=success operation_id=123e4567-e89b-42d3-a456-426614174026 ldap_provider=corp-ad",
+                "event=aigw.identity.audit action=managed_identity_change_applied outcome=success changed=true change_kind=planned_change operation_id=123e4567-e89b-42d3-a456-426614174025",
+                "event=aigw.provider.rotation action=start outcome=success vendor=anthropic",
+                "event=aigw.provider.rotation action=attempt outcome=failure vendor=anthropic",
+                "event=aigw.provider.rotation action=rotate outcome=success vendor=anthropic",
+                "event=aigw.provider.rotation action=recovery outcome=success vendor=anthropic",
+                "event=aigw.vault.state action=state_observed outcome=success state=unsealed",
+                "event=aigw.vault.audit",
+                "event=aigw.controller.lifecycle action=upgrade outcome=success",
+                "event=aigw.controller.lifecycle action=rollback outcome=failed",
+                f"event=aigw.egress.trust action=startup_gate outcome=success policy_sha256={token * 4}",
+                "event=aigw.egress.trust action=upstream_tls_failure",
+            ),
+            receipt_since,
+        )
+        # One extra file-source interval proves denied records did not merely lag.
+        time.sleep(12)
+        assert_initial_receipts(cribl_logs(preprod, receipt_since), token)
+        exercise_tls_server_name_failure(preprod, model, tls_token)
+        exercise_outage_recovery(preprod, model, outage_token)
+    finally:
+        empty_controller_lifecycle_fixtures()
 
     print("PREPROD_CRIBL_SECURITY_FEED_PASSED")
     return 0

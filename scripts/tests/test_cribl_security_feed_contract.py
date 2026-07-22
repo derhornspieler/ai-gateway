@@ -365,6 +365,18 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             PREPROD_TASKS,
         )
         self.assertIn("scripts/test-preprod-cribl-security.py", PREPROD_TASKS)
+        main = PREPROD_RECEIPT.split("def main() -> int:", 1)[1]
+        self.assertIn(
+            "finally:\n        empty_controller_lifecycle_fixtures()", main
+        )
+        self.assertLess(
+            main.index("write_controller_lifecycle_fixtures(token)"),
+            main.index("finally:\n        empty_controller_lifecycle_fixtures()"),
+        )
+        self.assertLess(
+            main.index("finally:\n        empty_controller_lifecycle_fixtures()"),
+            main.index('print("PREPROD_CRIBL_SECURITY_FEED_PASSED")'),
+        )
 
     def test_keycloak_projection_requires_complete_attribution(self) -> None:
         keycloak = ALLOY.split('loki.process "cribl_keycloak_auth"', 1)[1].split(
@@ -398,9 +410,25 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         )
         self.assertNotIn('stage.output { source = "aigw_security_json" }', structured)
         self.assertIn(
-            'template = `{{ if eq .Value true }}true{{ else if eq .Value false }}false{{ end }}`',
+            'security_changed_type            = "type(changed)"',
             structured,
         )
+        self.assertIn(
+            'template = `{{ if and (eq .security_changed_type "boolean") '
+            '(eq .Value "true") }}true{{ else if and '
+            '(eq .security_changed_type "boolean") (eq .Value "false") '
+            '}}false{{ end }}`',
+            structured,
+        )
+        self.assertNotIn("eq .Value true", structured)
+        self.assertNotIn("eq .Value false", structured)
+        for raw_value, expected in (("true", True), ("false", False)):
+            document = json.loads('{"changed":' + raw_value + "}")
+            self.assertIs(type(document["changed"]), bool)
+            self.assertIs(document["changed"], expected)
+        for raw_value in ('"true"', '"false"', "null", "0", "1"):
+            document = json.loads('{"changed":' + raw_value + "}")
+            self.assertIsNot(type(document["changed"]), bool, raw_value)
         for field in (
             "security_subject",
             "security_project",
@@ -434,15 +462,28 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         structured = ALLOY.split(
             'loki.process "cribl_structured_security"', 1
         )[1].split('loki.source.file "controller_lifecycle"', 1)[0]
+        attempt_pattern = (
+            r'^(?:\{"action":"(?:attempt|recovery|rotate)",|'
+            r'\{"schema_version":1,"event":"aigw\.provider\.rotation",'
+            r'"action":"(?:attempt|recovery|rotate)",'
+            r'"outcome":"(?:success|failure|failed)",'
+            r'"vendor":"(?:anthropic|static-anthropic)",'
+            r'"rotation_id":"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-'
+            r'[89ab][0-9a-f]{3}-[0-9a-f]{12}",)'
+            r'"attempt":(?P<security_attempt>[1-9][0-9]{0,2})(?:,|\})'
+        )
         for required in (
-            'security_attempt                 = "attempt"',
+            'security_attempt_present         = "contains(keys(@), \'attempt\')"',
             'security_rotation_id             = "rotation_id"',
-            'template = `{{ if kindIs "float64" .Value }}{{ .Value }}{{ end }}`',
+            'template = `{{ if eq .Value "true" }}present{{ end }}`',
+            'source     = "aigw_security_json"',
+            f'expression = `{attempt_pattern}`',
             'security_action!~\\"start|attempt|rotate|recovery\\"',
             'security_rotation_status!~\\"started|success|failed|skipped|disabled|recovered\\"',
             'security_rotation_id!~\\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\"',
             'security_action=~\\"attempt|rotate|recovery\\",security_attempt!~\\"[1-9][0-9]{0,2}\\"',
-            'security_action=\\"start\\",security_attempt!=\\"\\"',
+            'security_action=\\"start\\",security_attempt_present!=\\"\\"',
+            'security_event!=\\"aigw.provider.rotation\\",security_attempt_present!=\\"\\"',
             'security_action=\\"start\\",security_rotation_status=\\"started\\",security_outcome!=\\"success\\"',
             'security_action=\\"recovery\\",security_rotation_status=\\"recovered\\",security_outcome!=\\"success\\"',
             'security_action=~\\"attempt|rotate\\",security_rotation_status=\\"success\\",security_outcome!=\\"success\\"',
@@ -451,7 +492,49 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             'attempt={{ .security_attempt }}',
         ):
             self.assertIn(required, structured)
+        self.assertNotIn('kindIs "float64"', structured)
         self.assertNotIn("rollback", structured)
+
+        valid_attempts = (
+            '{"action":"attempt","attempt":1,"event":"aigw.provider.rotation"}',
+            '{"schema_version":1,"event":"aigw.provider.rotation",'
+            '"action":"rotate","outcome":"success","vendor":"anthropic",'
+            '"rotation_id":"123e4567-e89b-42d3-a456-426614174000",'
+            '"attempt":999,"rotation_status":"success"}',
+        )
+        for document in valid_attempts:
+            match = re.match(attempt_pattern, document)
+            self.assertIsNotNone(match, document)
+            self.assertRegex(match.group("security_attempt"), r"^[1-9][0-9]{0,2}$")
+
+        rejected_attempts = (
+            '{"action":"attempt","attempt":"1","event":"aigw.provider.rotation"}',
+            '{"action":"attempt","attempt":1.5,"event":"aigw.provider.rotation"}',
+            '{"action":"attempt","attempt":0,"event":"aigw.provider.rotation"}',
+            '{"action":"attempt","attempt":1000,"event":"aigw.provider.rotation"}',
+            '{"action":"attempt","attempt":false,"event":"aigw.provider.rotation"}',
+            '{"action":"attempt","attempt":"","event":"aigw.provider.rotation"}',
+            '{"action":"attempt","attempt":null,"event":"aigw.provider.rotation"}',
+            '{"action":"attempt","event":"aigw.provider.rotation"}',
+            '{"action":"attempt","detail":{"attempt":1},'
+            '"event":"aigw.provider.rotation"}',
+            '{"action":"start","attempt":1,"event":"aigw.provider.rotation"}',
+        )
+        for document in rejected_attempts:
+            self.assertIsNone(re.match(attempt_pattern, document), document)
+
+        for value in ("0", "false", '""', "null", '"1"', "1.5"):
+            document = json.loads(
+                '{"action":"start","attempt":'
+                + value
+                + ',"event":"aigw.provider.rotation"}'
+            )
+            self.assertIn("attempt", document, value)
+        nested_only = json.loads(
+            '{"action":"start","detail":{"attempt":1},'
+            '"event":"aigw.provider.rotation"}'
+        )
+        self.assertNotIn("attempt", nested_only)
 
         for marker in (
             '"action":"start"',
@@ -560,16 +643,47 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         span_attributes = spanlogs.split("  span_attributes = [", 1)[1].split(
             "  ]", 1
         )[0]
+        self.assertIn('"aigw.user.name_source",', labels)
         self.assertIn('"aigw.security.source_time_unix_nano",', labels)
-        self.assertNotIn('"aigw.security.source_time_unix_nano",', span_attributes)
-        self.assertIn(
-            'set(time_unix_nano, attributes["aigw.security.source_time_unix_nano"])',
-            request_stream,
+        self.assertIn('"aigw.security.source_time_unix_nano",', span_attributes)
+        self.assertTrue(
+            span_attributes.lstrip().startswith(
+                '"aigw.security.source_time_unix_nano",'
+            )
         )
-        self.assertIn(
-            'delete_key(attributes, "aigw.security.source_time_unix_nano")',
-            request_stream,
+        restore = (
+            'set(time_unix_nano, '
+            'attributes["aigw.security.source_time_unix_nano"])'
         )
+        scrub = (
+            r'replace_pattern(body, "^(span=litellm_request dur=[0-9]+ns'
+            r'(?: status=[^[:space:]]+)?) aigw\\.security\\.'
+            r'source_time_unix_nano=[0-9]+", "$1") where IsString(body)'
+        )
+        delete = 'delete_key(attributes, "aigw.security.source_time_unix_nano")'
+        for statement in (restore, scrub, delete):
+            self.assertIn(statement, request_stream)
+        self.assertLess(request_stream.index(restore), request_stream.index(scrub))
+        self.assertLess(request_stream.index(scrub), request_stream.index(delete))
+        scrub_pattern = re.compile(
+            r"^(span=litellm_request dur=[0-9]+ns(?: status=\S+)?) "
+            r"aigw\.security\.source_time_unix_nano=[0-9]+"
+        )
+        generated = (
+            "span=litellm_request dur=42ns "
+            "aigw.security.source_time_unix_nano=1000 "
+            'gen_ai.input.messages="hello"'
+        )
+        self.assertEqual(
+            scrub_pattern.sub(r"\1", generated),
+            'span=litellm_request dur=42ns gen_ai.input.messages="hello"',
+        )
+        prompt_evidence = (
+            "span=litellm_request dur=42ns aigw.user.id=user-1 "
+            'gen_ai.input.messages="say '
+            'aigw.security.source_time_unix_nano=1000"'
+        )
+        self.assertEqual(scrub_pattern.sub(r"\1", prompt_evidence), prompt_evidence)
 
     def test_common_record_fields_are_server_owned_before_the_only_batch(self) -> None:
         alloy = COMPOSE.split("  alloy:\n", 1)[1].split("\n  prometheus:", 1)[0]

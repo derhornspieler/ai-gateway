@@ -18,6 +18,7 @@ import tempfile
 import time
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -235,6 +236,8 @@ INTERNAL_HTTP_HELPER = r"""
 import http.client, json, os, sys
 request = json.load(sys.stdin)
 headers = {"X-Internal-Auth": os.environ["ROTATOR_INTERNAL_TOKEN"]}
+if "operation_id" in request:
+    headers["X-AIGW-Operation-ID"] = request["operation_id"]
 body = None
 if "body" in request:
     body = json.dumps(request["body"], separators=(",", ":"))
@@ -1048,8 +1051,49 @@ def write_file(path: Path, content: str, mode: int, *, replace: bool = True) -> 
     temporary.replace(path)
 
 
+def _empty_controller_audit_file(path: Path, *, create: bool) -> None:
+    """Create or truncate one fixture without replacing its directory entry."""
+
+    expected_identity: tuple[int, int] | None = None
+    if not create:
+        try:
+            before = path.lstat()
+        except OSError:
+            fail("the preprod controller audit fixture changed during reset")
+        expected_identity = (before.st_dev, before.st_ino)
+
+    flags = os.O_WRONLY
+    if create:
+        flags |= os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o644)
+    except OSError:
+        fail("the preprod controller audit fixture changed during reset")
+    try:
+        if create:
+            os.fchmod(descriptor, 0o644)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid) != (os.geteuid(), os.getegid())
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o644
+            or (
+                expected_identity is not None
+                and (metadata.st_dev, metadata.st_ino) != expected_identity
+            )
+        ):
+            fail("refusing an unsafe preprod controller audit fixture file")
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def prepare_controller_audit_fixture() -> None:
-    """Create one empty, portable preprod source for controller audit tests."""
+    """Keep two empty, stable files for the controller audit tailer."""
 
     try:
         PREPROD_CONTROLLER_AUDIT_DIR.lstat()
@@ -1062,10 +1106,11 @@ def prepare_controller_audit_fixture() -> None:
         # A bad rotation or unknown entry must not destroy the current receipt.
         existing = _validate_controller_audit_fixture() or ()
 
-    current, rotated = PREPROD_CONTROLLER_AUDIT_FILES
-    write_file(current, "", 0o644)
-    if rotated in existing:
-        rotated.unlink()
+    for path in PREPROD_CONTROLLER_AUDIT_FILES:
+        _empty_controller_audit_file(path, create=path not in existing)
+    reset = _validate_controller_audit_fixture()
+    if reset is None or set(reset) != set(PREPROD_CONTROLLER_AUDIT_FILES):
+        fail("the preprod controller audit fixture changed during reset")
 
 
 def _validate_controller_audit_fixture() -> tuple[Path, ...] | None:
@@ -3367,6 +3412,11 @@ def internal_call(
     body: Any | None = None,
 ) -> tuple[int, Any]:
     request: dict[str, Any] = {"method": method, "path": path}
+    if (
+        path.startswith("/identity/")
+        and method in {"DELETE", "PATCH", "POST", "PUT"}
+    ):
+        request["operation_id"] = str(uuid4())
     if body is not None:
         request["body"] = body
     result = compose(

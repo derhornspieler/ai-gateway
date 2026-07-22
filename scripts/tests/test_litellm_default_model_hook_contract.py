@@ -77,6 +77,9 @@ def _load_hook_module():
     callback_stub = types.ModuleType("aigw_openwebui_identity")
     callback_stub.OPENWEBUI_KEY_OWNER = "svc-open-webui"
     callback_stub.OPENWEBUI_KEY_ALIAS = "aigw-open-webui-service"
+    callback_stub.OPENWEBUI_IDENTITY_GATE_FIELD = (
+        "aigw_openwebui_identity_gate_v1"
+    )
     callback_stub.OPENWEBUI_KEY_METADATA = {
         "aigw_key_kind": "service",
         "aigw_service": "open-webui",
@@ -400,7 +403,8 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
         request = {
             "model": "claude-sonnet",
             "proxy_server_request": {
-                "headers": {"X-OpenWebUI-User-Jwt": "valid.jwt.token"}
+                "headers": {"X-OpenWebUI-User-Jwt": "valid.jwt.token"},
+                "aigw_openwebui_identity_gate_v1": "caller-forged",
             },
             "secret_fields": {
                 "raw_headers": {"X-OpenWebUI-User-Jwt": "valid.jwt.token"}
@@ -413,6 +417,10 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
             key_alias="aigw-open-webui-service",
         )
         self.assertIs(result, request)
+        self.assertIs(
+            request["proxy_server_request"]["aigw_openwebui_identity_gate_v1"],
+            True,
+        )
 
     def test_openwebui_missing_invalid_expired_and_conflicting_assertions_deny(
         self,
@@ -441,20 +449,26 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
             with self.subTest(
                 cleaned_headers=cleaned_headers, raw_headers=raw_headers
             ):
+                request = {
+                    "model": "claude-sonnet",
+                    "proxy_server_request": {
+                        "headers": cleaned_headers,
+                        "aigw_openwebui_identity_gate_v1": True,
+                    },
+                    "secret_fields": {"raw_headers": raw_headers},
+                }
                 with self.assertRaises(_StubHTTPException) as denied:
                     self._run_hook(
-                        {
-                            "model": "claude-sonnet",
-                            "proxy_server_request": {
-                                "headers": cleaned_headers
-                            },
-                            "secret_fields": {"raw_headers": raw_headers},
-                        },
+                        request,
                         metadata=metadata,
                         user_id="svc-open-webui",
                         key_alias="aigw-open-webui-service",
                     )
                 self.assertEqual(denied.exception.status_code, 400)
+                self.assertNotIn(
+                    "aigw_openwebui_identity_gate_v1",
+                    request["proxy_server_request"],
+                )
 
     def test_any_partial_openwebui_key_marker_denies(self) -> None:
         exact_metadata = {

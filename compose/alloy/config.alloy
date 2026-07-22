@@ -404,12 +404,18 @@ otelcol.connector.spanlogs "aigw_requests" {
   spans  = true
   labels = [
     "aigw.user.name",
+    // Preserve the reviewed identity source as an OTLP log attribute for the
+    // SOC feed. It is not included in loki.attribute.labels below, so it does
+    // not change Loki stream cardinality.
+    "aigw.user.name_source",
     "aigw.project.id",
-    // span_attributes are body fields only. Carry the source timestamp as a
-    // temporary log attribute so the next transform can restore it.
+    // spanlogs copies a label only when the same key is in span_attributes.
+    // Carry the timestamp in both lists, restore it, then scrub the temporary
+    // body field before this record can leave Alloy.
     "aigw.security.source_time_unix_nano",
   ]
   span_attributes = [
+    "aigw.security.source_time_unix_nano",
     "aigw.user.id",
     "aigw.user.name",
     "aigw.user.name_source",
@@ -429,6 +435,8 @@ otelcol.connector.spanlogs "aigw_requests" {
     "litellm.call_id",
     "gen_ai.input.messages",
     "gen_ai.output.messages",
+    "gen_ai.prompt.0.content",
+    "gen_ai.completion.0.content",
   ]
   output {
     logs = [otelcol.processor.transform.aigw_request_stream.input]
@@ -453,6 +461,7 @@ otelcol.processor.transform "aigw_request_stream" {
     context = "log"
     statements = [
       `set(time_unix_nano, attributes["aigw.security.source_time_unix_nano"])`,
+      `replace_pattern(body, "^(span=litellm_request dur=[0-9]+ns(?: status=[^[:space:]]+)?) aigw\\.security\\.source_time_unix_nano=[0-9]+", "$1") where IsString(body)`,
       `delete_key(attributes, "aigw.security.source_time_unix_nano")`,
       `set(attributes["aigw.security.event_class"], "ai_request_audit")`,
       `set(attributes["aigw.security.schema_version"], 1)`,
@@ -894,9 +903,10 @@ loki.process "cribl_structured_security" {
     source = "aigw_security_json"
     expressions = {
       security_action                  = "action",
-      security_attempt                 = "attempt",
+      security_attempt_present         = "contains(keys(@), 'attempt')",
       security_ca_fingerprints         = "ca_sha256_fingerprints",
       security_changed                 = "changed",
+      security_changed_type            = "type(changed)",
       security_change_kind             = "change_kind",
       security_error_type              = "error_type",
       security_event                   = "event",
@@ -929,14 +939,20 @@ loki.process "cribl_structured_security" {
   }
   stage.template {
     source   = "security_changed"
-    template = `{{ if eq .Value true }}true{{ else if eq .Value false }}false{{ end }}`
+    template = `{{ if and (eq .security_changed_type "boolean") (eq .Value "true") }}true{{ else if and (eq .security_changed_type "boolean") (eq .Value "false") }}false{{ end }}`
   }
-  // JSON numbers arrive as float64. Keep only that source type here; a quoted
-  // look-alike becomes empty, and the exact integer regex below rejects a
-  // fraction, zero, a negative value, or anything above 999.
+  // Alloy stringifies extracted template values, so templates cannot tell a
+  // JSON number from a quoted look-alike. JMESPath checks only root object keys,
+  // including null, false, zero, and empty values, then emits a bounded marker.
+  // Capture the value separately from either reviewed producer JSON shape.
+  // Anchoring at byte zero prevents a nested or prefixed field from matching.
   stage.template {
-    source   = "security_attempt"
-    template = `{{ if kindIs "float64" .Value }}{{ .Value }}{{ end }}`
+    source   = "security_attempt_present"
+    template = `{{ if eq .Value "true" }}present{{ end }}`
+  }
+  stage.regex {
+    source     = "aigw_security_json"
+    expression = `^(?:\{"action":"(?:attempt|recovery|rotate)",|\{"schema_version":1,"event":"aigw\.provider\.rotation","action":"(?:attempt|recovery|rotate)","outcome":"(?:success|failure|failed)","vendor":"(?:anthropic|static-anthropic)","rotation_id":"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",)"attempt":(?P<security_attempt>[1-9][0-9]{0,2})(?:,|\})`
   }
   // These internal flags let the event-specific gates reject a field that its
   // producer never emits. They are removed before export.
@@ -1009,6 +1025,7 @@ loki.process "cribl_structured_security" {
       aigw_security_schema      = "security_schema",
       security_action           = "",
       security_attempt          = "",
+      security_attempt_present  = "",
       security_ca_fingerprints  = "",
       security_changed          = "",
       security_change_kind      = "",
@@ -1425,7 +1442,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "malformed_rotation_attempt"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.provider.rotation\",security_action=\"start\",security_attempt!=\"\"}"
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=\"start\",security_attempt_present!=\"\"}"
     action              = "drop"
     drop_counter_reason = "unexpected_rotation_attempt"
   }
@@ -1630,7 +1647,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "unexpected_rotation_id"
   }
   stage.match {
-    selector            = "{security_event!=\"aigw.provider.rotation\",security_attempt!=\"\"}"
+    selector            = "{security_event!=\"aigw.provider.rotation\",security_attempt_present!=\"\"}"
     action              = "drop"
     drop_counter_reason = "unexpected_rotation_attempt"
   }
@@ -1678,6 +1695,7 @@ loki.process "cribl_structured_security" {
     values = [
       "security_action",
       "security_attempt",
+      "security_attempt_present",
       "security_ca_fingerprints",
       "security_changed",
       "security_change_kind",

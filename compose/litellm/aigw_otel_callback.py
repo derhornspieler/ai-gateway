@@ -13,6 +13,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from aigw_openwebui_identity import (
     KEY_OWNER_PATTERN,
     OPENWEBUI_KEY_ALIAS,
+    OPENWEBUI_IDENTITY_GATE_FIELD,
     OPENWEBUI_KEY_METADATA,
     OPENWEBUI_KEY_OWNER,
     PORTAL_USERNAME_PATTERN,
@@ -71,6 +72,8 @@ def _request_jwt_header(kwargs) -> str | None:
 
     proxy_request = litellm_params.get("proxy_server_request")
     if isinstance(proxy_request, dict):
+        if proxy_request.get(OPENWEBUI_IDENTITY_GATE_FIELD) is not True:
+            return None
         proxy_headers = proxy_request.get("headers")
         return openwebui_jwt_from_headers(proxy_headers)
     return None

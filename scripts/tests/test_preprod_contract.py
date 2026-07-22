@@ -13,6 +13,7 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from uuid import UUID
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1392,6 +1393,7 @@ class PreprodContractTests(unittest.TestCase):
                 mock.patch.object(module, "validate_local_docker_context"),
                 mock.patch.object(module, "check_context"),
                 mock.patch.object(module, "remove_seed_output_files"),
+                mock.patch.object(module, "remove_controller_audit_fixture"),
                 mock.patch.object(module, "docker", side_effect=docker_result) as docker,
                 mock.patch("sys.stdout", new_callable=io.StringIO),
             ):
@@ -2548,6 +2550,51 @@ class PreprodContractTests(unittest.TestCase):
             "- name: Auto-initialize Keycloak identity control without the admin portal", 1
         )[1].split("- name: Create and verify", 1)[0]
         self.assertNotIn("admin-portal", auto_task)
+
+    def test_internal_identity_mutations_receive_unique_operation_ids(self) -> None:
+        module = load_preprod_module()
+        response = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"status":204,"body":{}}',
+            stderr="",
+        )
+        with mock.patch.object(module, "compose", return_value=response) as compose:
+            module.internal_call(mock.Mock(), "GET", "/identity/groups")
+            module.internal_call(
+                mock.Mock(),
+                "POST",
+                "/identity/groups",
+                {"name": "preprod-admins", "capabilities": ["aigw-admins"]},
+            )
+            module.internal_call(
+                mock.Mock(),
+                "PUT",
+                "/identity/groups/group-1/members/user-1",
+            )
+            module.internal_call(
+                mock.Mock(),
+                "PUT",
+                "/providers/anthropic",
+                {"enrollment_confirmation": "ENROLLED"},
+            )
+
+        requests = [
+            json.loads(call.kwargs["input_text"])
+            for call in compose.call_args_list
+        ]
+        self.assertNotIn("operation_id", requests[0])
+        operation_ids = [requests[1]["operation_id"], requests[2]["operation_id"]]
+        self.assertEqual(len(set(operation_ids)), 2)
+        for operation_id in operation_ids:
+            parsed = UUID(operation_id)
+            self.assertEqual(parsed.version, 4)
+            self.assertEqual(str(parsed), operation_id)
+        self.assertNotIn("operation_id", requests[3])
+        self.assertIn(
+            'headers["X-AIGW-Operation-ID"] = request["operation_id"]',
+            module.INTERNAL_HTTP_HELPER,
+        )
 
     def test_verify_checks_every_rendered_service_and_completed_volume_init(self) -> None:
         module = load_preprod_module()

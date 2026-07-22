@@ -350,6 +350,7 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         # unbounded/high-churn and must never become labels.
         for label in (
             "aigw.user.name",
+            "aigw.user.name_source",
             "aigw.project.id",
             "aigw.security.source_time_unix_nano",
         ):
@@ -360,6 +361,7 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
                 spanlogs.split("labels = [", 1)[1].split("]", 1)[0],
             )
         for attribute in (
+            "aigw.security.source_time_unix_nano",
             "aigw.user.id",
             "aigw.user.name",
             "aigw.user.name_source",
@@ -379,6 +381,8 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "litellm.call_id",
             "gen_ai.input.messages",
             "gen_ai.output.messages",
+            "gen_ai.prompt.0.content",
+            "gen_ai.completion.0.content",
         ):
             self.assertIn(f'"{attribute}",', spanlogs)
         # Allow-list only: never a raw credential/identity source.
@@ -399,6 +403,20 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         self.assertIn(
             '`set(attributes["service.name"], "aigw-requests")`', transform
         )
+        restore = (
+            'set(time_unix_nano, '
+            'attributes["aigw.security.source_time_unix_nano"])'
+        )
+        scrub = (
+            r'replace_pattern(body, "^(span=litellm_request dur=[0-9]+ns'
+            r'(?: status=[^[:space:]]+)?) aigw\\.security\\.'
+            r'source_time_unix_nano=[0-9]+", "$1") where IsString(body)'
+        )
+        delete = 'delete_key(attributes, "aigw.security.source_time_unix_nano")'
+        for statement in (restore, scrub, delete):
+            self.assertIn(statement, transform)
+        self.assertLess(transform.index(restore), transform.index(scrub))
+        self.assertLess(transform.index(scrub), transform.index(delete))
         self.assertIn(
             "logs = [otelcol.processor.attributes.aigw_request_stream_labels.input]",
             transform,
