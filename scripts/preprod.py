@@ -30,6 +30,10 @@ EDGE_CERTS_DIR = SECRETS_DIR / "preprod-edge-certs"
 VAULT_INIT_FILE = SECRETS_DIR / "preprod-vault-init.json"
 SEED_RECEIPT = SECRETS_DIR / "preprod-seed-receipt.json"
 SEED_OVERLAY = SECRETS_DIR / "preprod-seed-images.yml"
+POSTGRES18_REHEARSAL_RECEIPT = (
+    SECRETS_DIR / "preprod-postgres18-rehearsal-receipt.json"
+)
+POSTGRES18_REHEARSAL_FORMAT = "aigw-preprod-postgres18-rehearsal-v1"
 POSTGRES16_OVERLAY = COMPOSE_DIR / "docker-compose.preprod-postgres16.yml"
 PREPROD_ROOT_CA_FILE = SECRETS_DIR / "preprod-root-ca.pem"
 PREPROD_CONTROLLER_AUDIT_DIR = SECRETS_DIR / "preprod-controller-lifecycle"
@@ -267,6 +271,51 @@ def validate_name(value: str, label: str) -> str:
     return value
 
 
+def refuse_postgres16_after_writes_opened(args: argparse.Namespace) -> None:
+    """Refuse the real PG16 command before it can inspect or change Docker."""
+
+    try:
+        metadata = POSTGRES18_REHEARSAL_RECEIPT.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid not in {ROOT_UID, os.geteuid()}
+        or stat.S_IMODE(metadata.st_mode) != 0o644
+        or metadata.st_size < 2
+        or metadata.st_size > 64 * 1024
+    ):
+        fail("the PostgreSQL rehearsal phase receipt is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(POSTGRES18_REHEARSAL_RECEIPT, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            fail("the PostgreSQL rehearsal phase receipt changed during validation")
+        raw = os.read(descriptor, 64 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 64 * 1024:
+        fail("the PostgreSQL rehearsal phase receipt is too large")
+    try:
+        document = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("ERROR: the PostgreSQL rehearsal phase receipt is malformed") from exc
+    if (
+        not isinstance(document, dict)
+        or document.get("format") != POSTGRES18_REHEARSAL_FORMAT
+        or document.get("project") != args.project
+    ):
+        fail("the PostgreSQL rehearsal phase receipt is malformed")
+    status = document.get("status")
+    phase = document.get("phase")
+    if status == "passed" or (status == "running" and phase == "writes_opened"):
+        fail("PostgreSQL 16 downgrade refused after PostgreSQL 18 writes opened")
+    fail("the PostgreSQL rehearsal phase receipt has an unknown state")
+
+
 def validate_inputs(args: argparse.Namespace) -> None:
     if args.domain != ALLOWED_DOMAIN:
         fail(f"local preprod uses the fixed test domain {ALLOWED_DOMAIN}")
@@ -284,6 +333,7 @@ def validate_inputs(args: argparse.Namespace) -> None:
                 "PostgreSQL 16 is allowed only in seed mode with the fixed "
                 "migration-rehearsal confirmation"
             )
+        refuse_postgres16_after_writes_opened(args)
     elif rehearsal_confirmed:
         fail("the PostgreSQL 16 rehearsal confirmation requires --postgres-major 16")
 
@@ -2568,8 +2618,8 @@ def recorded_preprod_owner() -> tuple[int, int]:
     return uid, gid
 
 
-def seed_output_files() -> tuple[Path, Path]:
-    return SEED_RECEIPT, SEED_OVERLAY
+def seed_output_files() -> tuple[Path, Path, Path]:
+    return SEED_RECEIPT, SEED_OVERLAY, POSTGRES18_REHEARSAL_RECEIPT
 
 
 def activate_seed(args: argparse.Namespace) -> None:
@@ -3647,7 +3697,49 @@ def replace_hosts_block(install: bool) -> None:
 def _clean_room_source_args(args: argparse.Namespace) -> argparse.Namespace:
     values = vars(args).copy()
     values["image_mode"] = "source"
+    if ENV_FILE.exists():
+        selected_volume = preprod_env_value("PG_DATA_VOLUME_NAME")
+        expected = {
+            f"{args.project}_pg16_data": "16",
+            f"{args.project}_pg18_data": "18",
+        }
+        postgres_major = expected.get(selected_volume)
+        if postgres_major is not None:
+            values["postgres_major"] = postgres_major
+            values["confirm_postgres16_rehearsal"] = postgres_major == "16"
     return argparse.Namespace(**values)
+
+
+def postgres_rehearsal_volume_names(args: argparse.Namespace) -> tuple[str, str]:
+    """Return the only two database volumes used by the local rehearsal."""
+
+    return f"{args.project}_pg16_data", f"{args.project}_pg18_data"
+
+
+def remove_postgres_rehearsal_volumes(args: argparse.Namespace) -> None:
+    """Remove only fixed, owned database volumes left after Compose cleanup."""
+
+    names = docker(
+        "volume", "ls", "--format", "{{.Name}}", capture=True
+    ).stdout.splitlines()
+    for name in postgres_rehearsal_volume_names(args):
+        if name not in names:
+            continue
+        documents = json.loads(docker("volume", "inspect", name, capture=True).stdout)
+        if not isinstance(documents, list) or len(documents) != 1:
+            fail("Docker returned an invalid PostgreSQL rehearsal volume")
+        document = documents[0]
+        labels = document.get("Labels") or {}
+        if (
+            not isinstance(labels, dict)
+            or labels.get("com.aigw.preprod.project") != args.project
+            or labels.get("com.docker.compose.project") != args.project
+            or labels.get("com.docker.compose.volume") != "pg_data"
+            or document.get("Driver") != "local"
+            or document.get("Scope") != "local"
+        ):
+            fail("refusing to remove an unowned PostgreSQL rehearsal volume")
+        docker("volume", "rm", name)
 
 
 def _validate_clean_room_generated_state() -> int:
@@ -3659,6 +3751,7 @@ def _validate_clean_room_generated_state() -> int:
     for path, expected_mode in (
         (SEED_RECEIPT, 0o644),
         (SEED_OVERLAY, 0o644),
+        (POSTGRES18_REHEARSAL_RECEIPT, 0o644),
         (VAULT_INIT_FILE, 0o600),
         (PREPROD_CONTROLLER_AUDIT_FILES[0], 0o644),
         (PREPROD_CONTROLLER_AUDIT_FILES[1], 0o644),
@@ -3718,6 +3811,7 @@ def preflight_clean_room_resources(
         owned_container_ids.add(container_id)
 
     owned_volumes: set[str] = set()
+    rehearsal_database_volumes = set(postgres_rehearsal_volume_names(args))
     for volume_name in _clean_room_list("volume", "--format", "{{.Name}}"):
         document = _clean_room_inspect_required("volume", volume_name)
         if document.get("Name") != volume_name:
@@ -3735,9 +3829,15 @@ def preflight_clean_room_resources(
         )
         if not belongs:
             continue
+        is_rehearsal_database_volume = (
+            volume_name in rehearsal_database_volumes
+            and labels.get("com.docker.compose.volume") == "pg_data"
+        )
         if (
             volume_name not in expected_volumes
-            or compose_project != args.project
+            and not is_rehearsal_database_volume
+        ) or (
+            compose_project != args.project
             or owner != args.project
             or document.get("Driver") != "local"
             or document.get("Scope") != "local"
@@ -3831,7 +3931,12 @@ def prove_clean_room_resource_absence(args: argparse.Namespace) -> None:
             )
         ) or value.startswith(args.project + "-"):
             fail("a preprod network remains after clean-room resource removal")
-    for path in (SEED_RECEIPT, SEED_OVERLAY, VAULT_INIT_FILE):
+    for path in (
+        SEED_RECEIPT,
+        SEED_OVERLAY,
+        POSTGRES18_REHEARSAL_RECEIPT,
+        VAULT_INIT_FILE,
+    ):
         try:
             path.lstat()
         except FileNotFoundError:
@@ -3920,6 +4025,7 @@ def _destroy_project_resources(
             "30",
             capture=quiet,
         )
+    remove_postgres_rehearsal_volumes(args)
     existing_names = set(
         docker("network", "ls", "--format", "{{.Name}}", capture=True).stdout.splitlines()
     )

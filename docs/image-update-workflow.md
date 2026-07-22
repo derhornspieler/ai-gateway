@@ -349,7 +349,9 @@ An old release may stop working after a provider CA cutover. Plan CA rotation
 with an overlap window. See the
 [Provider CA SOP](sop/provider-ca-maintenance.md#rotation-with-an-overlap-window).
 
-The normal image workflow refuses a PostgreSQL major change. Use the
+The normal remote image workflow refuses a PostgreSQL major change. First run
+the fixed [local PostgreSQL 16 to 18 rehearsal](preprod.md#rehearse-the-postgresql-move)
+from the exact preprod seed. Production still uses the separate
 [PostgreSQL 18 migration SOP](sop/postgresql-18-migration.md).
 
 ## Related pages

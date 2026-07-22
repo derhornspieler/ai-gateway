@@ -313,6 +313,33 @@ The run must prove:
 
 See [Local preprod](preprod.md) for the users and network model.
 
+### Step 3 — Rehearse PostgreSQL 16 to 18
+
+Run this step for a release that adds or changes the PostgreSQL major-version
+move. It uses local Docker only. It does not create a Rocky or Parallels VM.
+
+```bash
+python3 -I scripts/update-images.py test-postgres18-preprod \
+  --archive /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
+  --manifest /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  --become-password-file "$HOME/.ssh/become"
+```
+
+This command always does another exact clean-room load. It must prove the
+PostgreSQL 16 application graph, fixed fixtures of at least 384 MiB, fixture
+hashes, pre-cutover rollback, and logical restore to the exact PostgreSQL 18
+image. It must also prove post-write downgrade refusal with no mutation, then
+complete a same-major physical backup and restore. It runs the full PreProd
+acceptance gate again after the restore.
+
+Save these two markers and the JSON receipt named in
+[Local preprod](preprod.md#rehearse-the-postgresql-move):
+
+```text
+POSTGRES18_PREPROD_REHEARSAL_PASSED ...
+SEEDED_PREPROD_POSTGRES18_REHEARSAL_PASSED
+```
+
 ## 3. Prove Vault restart recovery
 
 Keep the exact seeded preprod deployment running. This test proves the normal

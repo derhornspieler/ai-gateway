@@ -1,0 +1,183 @@
+---
+- name: Rehearse PostgreSQL 16 to 18 in exact-seed local PreProd
+  hosts: preprod
+  gather_facts: false
+  become: false
+  vars:
+    aigw_domain: aigw.internal
+    preprod_project_name: aigw-preprod
+    preprod_resource_prefix: aigw-preprod
+    preprod_subnet_octet: 29
+    preprod_seed_marker_directory: >-
+      /var/tmp/ai-gateway-preprod-seeds/{{ preprod_seed_manifest_sha256[:16] }}/loader-marker
+  pre_tasks:
+    - name: Require the fixed schema-v2 PostgreSQL rehearsal inputs
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname == 'localhost'
+          - (ansible_connection | default('')) == 'local'
+          - preprod_seed_archive | length > 0
+          - preprod_seed_archive_sha256 is match('^[0-9a-f]{64}$')
+          - preprod_seed_manifest | length > 0
+          - preprod_seed_manifest_sha256 is match('^[0-9a-f]{64}$')
+          - preprod_seed_load_archive | bool
+          - preprod_seed_require_fresh_load | bool
+        quiet: true
+        fail_msg: >-
+          Use scripts/update-images.py test-postgres18-preprod with one exact
+          schema-v2 PreProd archive and manifest.
+
+    - name: Detect the local PostgreSQL rehearsal host kernel
+      ansible.builtin.command:
+        argv: [/usr/bin/uname, -s]
+      register: preprod_postgres_host_kernel
+      changed_when: false
+      failed_when: >-
+        preprod_postgres_host_kernel.rc != 0 or
+        preprod_postgres_host_kernel.stdout | trim not in ['Darwin', 'Linux']
+
+    - name: Prepare fixed local files for PostgreSQL 16 seed activation
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir | dirname }}/scripts/preprod.py"
+          - --domain
+          - aigw.internal
+          - --project
+          - aigw-preprod
+          - --prefix
+          - aigw-preprod
+          - --subnet-octet
+          - '29'
+          - --image-mode
+          - seed
+          - --postgres-major
+          - '16'
+          - --confirm-postgres16-rehearsal
+          - prepare
+      register: preprod_postgres_prepare
+      changed_when: "'PREPROD_PREPARED' in preprod_postgres_prepare.stdout"
+
+    - name: Prove the root loader uses the operator Docker engine on Linux
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir | dirname }}/scripts/preprod.py"
+          - --image-mode
+          - seed
+          - --postgres-major
+          - '16'
+          - --confirm-postgres16-rehearsal
+          - check-root-seed-engine
+      changed_when: false
+      when: preprod_postgres_host_kernel.stdout | trim == 'Linux'
+
+    - name: Load the exact rehearsal seed as root on Linux
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - "{{ playbook_dir | dirname }}/scripts/load-offline-image-seed.py"
+          - root-preprod-load
+          - "{{ preprod_seed_loader_archive }}"
+          - "{{ preprod_seed_archive_sha256 }}"
+          - "{{ preprod_seed_loader_manifest }}"
+          - "{{ preprod_seed_manifest_sha256 }}"
+          - "{{ preprod_seed_marker_directory }}"
+      become: true
+      register: preprod_postgres_linux_seed_load
+      changed_when: >-
+        preprod_postgres_linux_seed_load.stdout is search('^(LOADED|RELOADED) ')
+      failed_when: >-
+        preprod_postgres_linux_seed_load.rc != 0 or
+        preprod_postgres_linux_seed_load.stdout | trim !=
+        'LOADED ' ~ preprod_seed_archive_sha256
+      when: preprod_postgres_host_kernel.stdout | trim == 'Linux'
+
+    - name: Load the exact rehearsal seed as the Docker Desktop operator
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir | dirname }}/scripts/preprod.py"
+          - --image-mode
+          - seed
+          - --postgres-major
+          - '16'
+          - --confirm-postgres16-rehearsal
+          - load-local-preprod-seed
+          - "{{ preprod_seed_loader_archive }}"
+          - "{{ preprod_seed_archive_sha256 }}"
+          - "{{ preprod_seed_loader_manifest }}"
+          - "{{ preprod_seed_manifest_sha256 }}"
+      register: preprod_postgres_macos_seed_load
+      changed_when: >-
+        'PREPROD_LOCAL_SEED_LOADED' in preprod_postgres_macos_seed_load.stdout
+      failed_when: >-
+        preprod_postgres_macos_seed_load.rc != 0 or
+        preprod_postgres_macos_seed_load.stdout | trim !=
+        'PREPROD_LOCAL_SEED_LOADED ' ~ preprod_seed_archive_sha256
+      when: preprod_postgres_host_kernel.stdout | trim == 'Darwin'
+
+    - name: Bind the rehearsal to exact transfer image IDs
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir | dirname }}/scripts/preprod.py"
+          - --image-mode
+          - seed
+          - --postgres-major
+          - '16'
+          - --confirm-postgres16-rehearsal
+          - activate-seed
+          - "{{ preprod_seed_archive }}"
+          - "{{ preprod_seed_manifest }}"
+          - "{{ preprod_seed_manifest_sha256 }}"
+      register: preprod_postgres_seed_activation
+      changed_when: >-
+        'PREPROD_SEED_ACTIVATED' in preprod_postgres_seed_activation.stdout
+
+    - name: Create only missing macOS rehearsal loopback aliases
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir | dirname }}/scripts/preprod.py"
+          - --image-mode
+          - seed
+          - --postgres-major
+          - '16'
+          - --confirm-postgres16-rehearsal
+          - ensure-loopback-aliases
+      become: true
+      register: preprod_postgres_loopback_aliases
+      changed_when: >-
+        'PREPROD_LOOPBACK_ALIASES_CREATED' in preprod_postgres_loopback_aliases.stdout or
+        'PREPROD_LOOPBACK_ALIASES_MIGRATED' in preprod_postgres_loopback_aliases.stdout
+      when: preprod_postgres_host_kernel.stdout | trim == 'Darwin'
+
+  tasks:
+    - name: Run the fixed PostgreSQL migration and recovery rehearsal
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - "{{ playbook_dir | dirname }}/scripts/preprod-postgres18-rehearsal.py"
+      register: preprod_postgres_rehearsal
+      changed_when: true
+      failed_when: >-
+        preprod_postgres_rehearsal.rc != 0 or
+        'POSTGRES18_PREPROD_REHEARSAL_PASSED' not in
+        preprod_postgres_rehearsal.stdout
+
+    - name: Install only the marker-bounded local hostnames
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir | dirname }}/scripts/preprod.py"
+          - install-hosts
+      become: true
+      register: preprod_postgres_hosts
+      changed_when: "'PREPROD_HOSTS_INSTALLED' in preprod_postgres_hosts.stdout"
+
+    - name: Report the exact-seed PostgreSQL rehearsal result
+      ansible.builtin.debug:
+        msg: SEEDED_PREPROD_POSTGRES18_REHEARSAL_PASSED

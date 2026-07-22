@@ -22,6 +22,7 @@ the Rocky Linux host roles. It does not change a production project.
 | --- | --- |
 | Quick source check | [Start from source](#start-from-source) |
 | Final release test | [Test an offline seed](#test-an-offline-seed) |
+| PostgreSQL 16 to 18 test | [Rehearse the PostgreSQL move](#rehearse-the-postgresql-move) |
 | Manual browser test | [Local names](#local-names), then the [browser checks](test-runbook.md#4-run-the-real-browser-check) |
 | Final release teardown | [Finish with exact-manifest teardown](#finish-with-exact-manifest-teardown) |
 | Quick development cleanup | [Remove a development stack](#remove-a-development-stack) |
@@ -274,6 +275,54 @@ SEEDED_PREPROD_E2E_PASSED
 
 Follow the clean build, destroy, load, deploy, and browser order in the
 [acceptance test runbook](test-runbook.md#required-rehearsal-order).
+
+## Rehearse the PostgreSQL move
+
+Use this test only with the preprod archive. It does not connect to a VM or a
+production host. It always starts with a clean-room load of the exact archive.
+
+```bash
+python3 -I scripts/update-images.py test-postgres18-preprod \
+  --archive /absolute/private/path/aigw-YYYY-MM-DD.preprod.docker.tar.zst \
+  --manifest /absolute/private/path/aigw-YYYY-MM-DD.preprod.manifest.json \
+  --become-password-file "$HOME/.ssh/become"
+```
+
+You may use `--ask-become-pass` instead. There is no quick or no-load form of
+this command.
+
+The command checks this full path:
+
+1. Validate the schema-v2 manifest and both exact PostgreSQL image IDs.
+2. Remove the old local release and load the archive again.
+3. Run the whole application on PostgreSQL 16.
+4. Create 512,000 fixed test rows in each of the LiteLLM, Keycloak, and rotator
+   databases. Require at least 128 MiB per database, or 384 MiB total. Record a
+   row count, byte size, and content SHA-256 for each.
+5. Force a failure before cutover. Remove the unused PostgreSQL 18 volume,
+   restart PostgreSQL 16, and prove every test row is unchanged.
+6. Make logical dumps and restore them into the exact PostgreSQL 18 image.
+7. Run the full Ansible PreProd checks on PostgreSQL 18.
+8. Open writes, try a downgrade, and prove the refusal changed no container,
+   volume, or test row.
+9. Make a physical PostgreSQL 18 backup, restore it to a clean volume, and run
+   all checks again.
+
+A pass prints:
+
+```text
+POSTGRES18_PREPROD_REHEARSAL_PASSED ...
+SEEDED_PREPROD_POSTGRES18_REHEARSAL_PASSED
+```
+
+The machine-readable receipt is
+`compose/secrets/preprod-postgres18-rehearsal-receipt.json`. It has no
+passwords. Save it with the release evidence before teardown. The exact
+clean-room teardown removes this generated receipt with the other PreProd
+state.
+
+This local test does not replace the production change plan. Production uses
+the separate [PostgreSQL 18 migration SOP](sop/postgresql-18-migration.md).
 
 ## Finish with exact-manifest teardown
 

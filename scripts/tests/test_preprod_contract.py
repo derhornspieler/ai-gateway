@@ -118,6 +118,243 @@ class PreprodContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "PostgreSQL 16|requires"):
                     module.validate_inputs(refused)
 
+    def test_postgres16_real_command_refuses_after_writes_before_docker(self) -> None:
+        module = load_preprod_module()
+        phase = {
+            "format": module.POSTGRES18_REHEARSAL_FORMAT,
+            "project": "aigw-preprod",
+            "status": "running",
+            "phase": "writes_opened",
+        }
+        arguments = [
+            "preprod.py",
+            "--image-mode",
+            "seed",
+            "--postgres-major",
+            "16",
+            "--confirm-postgres16-rehearsal",
+            "compose-config",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "postgres18-rehearsal.json"
+            receipt.write_text(json.dumps(phase) + "\n", encoding="utf-8")
+            receipt.chmod(0o644)
+            with (
+                mock.patch.object(module, "POSTGRES18_REHEARSAL_RECEIPT", receipt),
+                mock.patch.object(module.sys, "argv", arguments),
+                mock.patch.object(module, "docker") as docker,
+                mock.patch.object(module, "check_context") as check_context,
+                mock.patch.object(module, "compose_config") as compose_config,
+            ):
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "downgrade refused after PostgreSQL 18 writes opened",
+                ):
+                    module.main()
+        docker.assert_not_called()
+        check_context.assert_not_called()
+        compose_config.assert_not_called()
+
+    def test_postgres16_rehearsal_receipt_unknown_state_fails_closed(self) -> None:
+        module = load_preprod_module()
+        parser = module.parser()
+        arguments = parser.parse_args(
+            [
+                "--image-mode",
+                "seed",
+                "--postgres-major",
+                "16",
+                "--confirm-postgres16-rehearsal",
+                "compose-config",
+            ]
+        )
+        phase = {
+            "format": module.POSTGRES18_REHEARSAL_FORMAT,
+            "project": "aigw-preprod",
+            "status": "running",
+            "phase": "unexpected",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "postgres18-rehearsal.json"
+            receipt.write_text(json.dumps(phase) + "\n", encoding="utf-8")
+            receipt.chmod(0o644)
+            with mock.patch.object(
+                module, "POSTGRES18_REHEARSAL_RECEIPT", receipt
+            ):
+                with self.assertRaisesRegex(SystemExit, "unknown state"):
+                    module.validate_inputs(arguments)
+
+    def test_clean_room_uses_the_recorded_postgres_major(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(
+            project="aigw-preprod",
+            image_mode="seed",
+            postgres_major="18",
+            confirm_postgres16_rehearsal=False,
+        )
+        with (
+            mock.patch.object(
+                module, "ENV_FILE", mock.Mock(exists=mock.Mock(return_value=True))
+            ),
+            mock.patch.object(
+                module,
+                "preprod_env_value",
+                return_value="aigw-preprod_pg16_data",
+            ),
+        ):
+            cleaned = module._clean_room_source_args(args)
+        self.assertEqual(cleaned.image_mode, "source")
+        self.assertEqual(cleaned.postgres_major, "16")
+        self.assertTrue(cleaned.confirm_postgres16_rehearsal)
+
+    def test_failed_rehearsal_volume_cleanup_requires_exact_labels(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(project="aigw-preprod")
+        listed = types.SimpleNamespace(
+            stdout="aigw-preprod_pg16_data\naigw-preprod_pg18_data\n"
+        )
+        owned = types.SimpleNamespace(
+            stdout=json.dumps(
+                [
+                    {
+                        "Driver": "local",
+                        "Scope": "local",
+                        "Labels": {
+                            "com.aigw.preprod.project": "aigw-preprod",
+                            "com.docker.compose.project": "aigw-preprod",
+                            "com.docker.compose.volume": "pg_data",
+                        }
+                    }
+                ]
+            )
+        )
+        removed = types.SimpleNamespace(stdout="")
+        with mock.patch.object(
+            module,
+            "docker",
+            side_effect=[listed, owned, removed, owned, removed],
+        ) as docker:
+            module.remove_postgres_rehearsal_volumes(args)
+        self.assertEqual(
+            [
+                call.args
+                for call in docker.call_args_list
+                if call.args[:2] == ("volume", "rm")
+            ],
+            [
+                ("volume", "rm", "aigw-preprod_pg16_data"),
+                ("volume", "rm", "aigw-preprod_pg18_data"),
+            ],
+        )
+
+        foreign = types.SimpleNamespace(stdout='[{"Labels":{}}]')
+        with mock.patch.object(module, "docker", side_effect=[listed, foreign]):
+            with self.assertRaisesRegex(SystemExit, "unowned PostgreSQL"):
+                module.remove_postgres_rehearsal_volumes(args)
+
+    def test_clean_room_accepts_only_the_exact_postgres_rehearsal_volumes(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(
+            project="aigw-preprod",
+            prefix="aigw-preprod",
+            subnet_octet=29,
+        )
+        expected = "aigw-preprod_pg18_data"
+        retained = "aigw-preprod_pg16_data"
+
+        def volume(name: str, *, compose_volume: str = "pg_data") -> dict:
+            return {
+                "Name": name,
+                "Driver": "local",
+                "Scope": "local",
+                "Labels": {
+                    "com.aigw.preprod.project": "aigw-preprod",
+                    "com.docker.compose.project": "aigw-preprod",
+                    "com.docker.compose.volume": compose_volume,
+                },
+            }
+
+        documents = {expected: volume(expected), retained: volume(retained)}
+        inventory = {"containers": {}}
+        with (
+            mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
+            mock.patch.object(module, "_clean_room_source_args", return_value=args),
+            mock.patch.object(module, "rendered_compose_model", return_value={}),
+            mock.patch.object(
+                module,
+                "verify_rendered_resource_ownership",
+                return_value={expected},
+            ),
+            mock.patch.object(module, "verify_existing_project_boundary"),
+            mock.patch.object(
+                module,
+                "_clean_room_list",
+                return_value=[expected, retained],
+            ),
+            mock.patch.object(
+                module,
+                "_clean_room_inspect_required",
+                side_effect=lambda _kind, name: documents[name],
+            ),
+            mock.patch.object(module, "desired_networks", return_value={}),
+            mock.patch.object(module, "_clean_room_network_inventory", return_value=[]),
+            mock.patch.object(
+                module, "_validate_clean_room_generated_state", return_value=0
+            ),
+        ):
+            resources = module.preflight_clean_room_resources(args, inventory)
+        self.assertEqual(resources["volumes"], {expected, retained})
+
+        with (
+            mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
+            mock.patch.object(module, "_clean_room_source_args", return_value=args),
+            mock.patch.object(module, "rendered_compose_model", return_value={}),
+            mock.patch.object(
+                module,
+                "verify_rendered_resource_ownership",
+                return_value={retained},
+            ),
+            mock.patch.object(module, "verify_existing_project_boundary"),
+            mock.patch.object(
+                module,
+                "_clean_room_list",
+                return_value=[retained, expected],
+            ),
+            mock.patch.object(
+                module,
+                "_clean_room_inspect_required",
+                side_effect=lambda _kind, name: documents[name],
+            ),
+            mock.patch.object(module, "desired_networks", return_value={}),
+            mock.patch.object(module, "_clean_room_network_inventory", return_value=[]),
+            mock.patch.object(
+                module, "_validate_clean_room_generated_state", return_value=0
+            ),
+        ):
+            resources = module.preflight_clean_room_resources(args, inventory)
+        self.assertEqual(resources["volumes"], {expected, retained})
+
+        documents[retained] = volume(retained, compose_volume="not-pg-data")
+        with (
+            mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
+            mock.patch.object(module, "_clean_room_source_args", return_value=args),
+            mock.patch.object(module, "rendered_compose_model", return_value={}),
+            mock.patch.object(
+                module,
+                "verify_rendered_resource_ownership",
+                return_value={expected},
+            ),
+            mock.patch.object(module, "verify_existing_project_boundary"),
+            mock.patch.object(module, "_clean_room_list", return_value=[retained]),
+            mock.patch.object(
+                module,
+                "_clean_room_inspect_required",
+                side_effect=lambda _kind, name: documents[name],
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "outside the exact clean-room"):
+                module.preflight_clean_room_resources(args, inventory)
+
     def test_postgres16_overlay_is_added_last_and_is_exactly_pinned(self) -> None:
         module = load_preprod_module()
         overlay = module.POSTGRES16_OVERLAY.read_text(encoding="utf-8")

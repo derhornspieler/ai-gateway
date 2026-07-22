@@ -94,21 +94,27 @@ def curl_json(hostname: str, address: str, path: str, *, body: dict | None = Non
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-mode", choices=("source", "seed"), default="source")
+    parser.add_argument("--postgres-major", choices=("16", "18"), default="18")
+    parser.add_argument("--confirm-postgres16-rehearsal", action="store_true")
     args = parser.parse_args()
+    if (args.postgres_major == "16") != args.confirm_postgres16_rehearsal:
+        fail("PostgreSQL 16 acceptance requires its fixed rehearsal confirmation")
     if shutil.which("curl") is None:
         fail("curl is required for the edge TLS checks")
     if not CA_FILE.is_file():
         fail("the persistent preprod test CA is missing")
 
-    verification = run(
-        [
-            sys.executable,
-            str(ROOT / "scripts/preprod.py"),
-            "--image-mode",
-            args.image_mode,
-            "verify",
-        ]
-    )
+    preprod_arguments = [
+        sys.executable,
+        str(ROOT / "scripts/preprod.py"),
+        "--image-mode",
+        args.image_mode,
+        "--postgres-major",
+        args.postgres_major,
+    ]
+    if args.postgres_major == "16":
+        preprod_arguments.append("--confirm-postgres16-rehearsal")
+    verification = run([*preprod_arguments, "verify"])
     if "PREPROD_VERIFIED" not in verification:
         fail("the complete preprod service graph was not verified")
 
