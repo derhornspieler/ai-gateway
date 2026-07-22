@@ -5,29 +5,55 @@
 <a id="complete-current-candidate-release-acceptance"></a>
 
 - [ ] **Complete the current source candidate release acceptance** - The
-  current worktree has changes that are newer than every saved release receipt.
-  Old `r10` through `r14` results are history. They do not approve this source.
+  runtime source is committed at `71c044b`; `7fcd027` adds only the reviewed
+  Vault restart runbook. The schema-v2 reader accepted the same release against
+  `7fcd027`, so the documentation commit changed no tracked runtime input.
 
-  - Commit the final source locally. Build a new Anthropic-only production pair
-    and matching preprod pair from that exact commit. Push that same commit only
-    after the local release gate passes.
-  - Use the preprod pair for the only release rehearsal. Run the exact-manifest
-    clean-room purge, require a fresh archive `LOADED` result, and deploy once
-    with `ansible/preprod.yml`. Do not create a Rocky or Parallels test VM.
-  - Run the full integration, end-to-end, identity, telemetry, Cribl,
-    upgrade/rollback contract, Vault restart, and browser gates against those
-    exact image IDs. A browser result from an older seed is not proof.
-  - Save the commit, four file hashes, provider policy digest, Envoy image ID,
-    container health, test markers, and GitHub job results. These values are
-    pending until the new seed run finishes.
-  - End with `ansible/preprod-clean-room.yml` and the exact tested manifest.
-    Prove all owned containers, images, volumes, networks, generated state,
-    hosts entries, and loopback aliases are absent. Also prove unrelated image
-    IDs are unchanged. The ordinary destroy play is only development cleanup.
+  - The Anthropic-only ARM64 production release contains 23 external and 17
+    custom images. Its archive SHA-256 is
+    `52ac5ed7136e038b5884ff3b98241fce408fb9c6778d692e9fb4d90e1ca3943a`.
+    Its manifest SHA-256 is
+    `835a07f2c8ab7e0464fb6a66928ea8603894a8e64f5c8431b60923ff20741a6e`.
+  - The matching preprod release contains 24 external and 19 custom images.
+    Its archive SHA-256 is
+    `0cdb573370dad8507683eadbea7e5522a599ca3336b8130861b155381dbec62f`.
+    Its manifest SHA-256 is
+    `c19b82a39c5d07342361d431e8bad0d978ef71c314f530c1c0d9aa4689a5eea7`.
+  - The provider-policy digest is
+    `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
+    The exact Envoy image ID is
+    `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
+  - The release-grade run removed the old owned deployment, preserved 222
+    unrelated image IDs, freshly loaded all 43 exact preprod image IDs, kept
+    pulls and builds disabled, and passed `PREPROD_CLEAN_ROOM_OK`,
+    `PREPROD_E2E_PASSED`, and `SEEDED_PREPROD_E2E_PASSED`. All 25 long-running
+    containers were healthy on the exact seed IDs.
+  - A Vault restart retained `initialized=true`, returned `sealed=true` and
+    HTTP 503, then the documented no-load Ansible run restored `sealed=false`,
+    HTTP 200, and both end-to-end markers. The 842 infrastructure contracts,
+    532 Python service tests, four Go race/vet suites, Compose, identity,
+    ShellCheck, yamllint, Bandit, Ruff, dependency audit, documentation links,
+    and Ansible syntax checks passed.
+  - Final exact-manifest teardown removed 26 containers, 19 networks, 11
+    volumes, all 43 release image IDs, 43 owned loopback aliases, and five
+    generated state files while preserving 222 unrelated image IDs. Separate
+    read-only checks found no owned container, image, volume, network, hosts
+    entry, loopback alias, or temporary test environment.
+  - Eight of ten GitHub workflows passed on `7fcd027`. The repository Trivy
+    scan passed. The two red workflows stopped only at the protected DHI
+    credential gates, so final image, VEX, SBOM, and container scans remain
+    blocked until a repository administrator adds both required secrets.
+  - Real-browser acceptance remains `BLOCKED/NOT RUN`: this session exposed no
+    browser backend. The browserless OIDC, cookie-scope, role, logout, and
+    callback tests passed, but they do not replace the manual browser checklist.
+    Do not create a Rocky or Parallels test VM for either remaining gate.
 
-- [ ] **Finish the current-candidate Cribl release receipt** - The in-stack
-  security-feed contract is implemented, but the final receipt must come from
-  the exact new preprod seed above.
+- [x] ~~Finish the current-candidate Cribl release receipt~~ (2026-07-22) -
+  The exact new preprod seed produced the final receipt. Manifest
+  `c19b82a39c5d07342361d431e8bad0d978ef71c314f530c1c0d9aa4689a5eea7`
+  passed the natural Keycloak, authenticated LiteLLM, malformed-field,
+  redaction, TLS, bounded backpressure, outage, and recovery checks twice,
+  including after the Vault restart.
 
   - Alloy applies one common-record gate with a server-owned schema,
     environment, producer, matching service name, and recent UTC time.
@@ -45,9 +71,8 @@
     One durable UUID follows retries through the pending Vault state. LDAP
     provider rename fails closed unless a legacy blank-name record points to
     the same live provider ID.
-  - A source-mode preprod test has received natural quoted `LOGIN`,
-    `LOGIN_ERROR`, and `LOGOUT` records. Treat that as implementation evidence,
-    not final release proof. Repeat it through the exact seeded run.
+  - The exact seeded preprod test received natural quoted `LOGIN`,
+    `LOGIN_ERROR`, and `LOGOUT` records through the TLS Cribl mock.
 
 ## Waiting On
 
