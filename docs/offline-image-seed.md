@@ -10,17 +10,18 @@ Schema v2 makes two file pairs from one build:
 | Scope | Contents | Use |
 | --- | --- | --- |
 | `production` | All production image references | A production VM |
-| `preprod` | Production plus Samba AD, the WIF mock, and their extra base | Local preprod |
+| `preprod` | Production plus test services, their base, and the PostgreSQL 16 migration source | Local preprod |
 
 The production archive has no preprod-only image bytes. Do not send the
 preprod pair to a production host.
 
-At this source revision, production has 23 external and 17 custom
-references, for 40 total. Preprod has 24 external and 19 custom references,
-for 43 total. Samba AD and the WIF provider mock are the two preprod-only
-custom services. Their Debian 13.6-slim base is the third extra preprod
-reference. This is why two extra services produce a three-reference
-difference.
+At this source revision, production has 23 external and 17 custom references,
+for 40 total. Preprod has 25 external and 19 custom references, for 44 total.
+Samba AD and the WIF provider mock are the two preprod-only custom services.
+Their Debian 13.6-slim base is also preprod-only. The last extra reference is
+the archive-only PostgreSQL 16 source used to rehearse the PostgreSQL 18
+migration. Ordinary PreProd deployment does not start it. None of these four
+extra references enters the production archive.
 
 Schema v1 is still accepted for old external-only seeds. Use schema v2 for all
 new releases.

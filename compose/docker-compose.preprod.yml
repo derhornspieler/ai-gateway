@@ -11,6 +11,13 @@ x-preprod-labels: &preprod-labels
 x-preprod-build-labels: &preprod-build-labels
   com.aigw.preprod.image-owner: "${PREPROD_PROJECT:?PREPROD_PROJECT must be set}"
 
+# Archive-only migration input. The seed builder reads this reviewed literal
+# pin into the PreProd archive, but Compose never starts or deploys it. The
+# production archive excludes this overlay, so PostgreSQL 16 cannot reach a
+# production image transfer by accident.
+x-preprod-archive-only-images:
+  postgres-16-migration-source: "dhi.io/postgres:16.14@sha256:47a12e559e8c418ed54e27da521efcbf4c00fc1c26e86eb58d82845afd7c57c7"
+
 networks:
   net-egress:       { name: "${PREPROD_PREFIX}-plane-egress", external: true }
   net-adm:          { name: "${PREPROD_PREFIX}-plane-adm", external: true }

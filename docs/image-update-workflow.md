@@ -11,11 +11,13 @@ One build makes two file pairs:
 
 Never send the preprod pair to production.
 
-At this source revision, production has 23 external and 17 custom
-image references, for 40 total. Preprod has 24 external and 19 custom
-references, for 43 total. Only two custom services are preprod-only: Samba AD
-and the WIF provider mock. Their Debian 13.6-slim build base is the third extra
-preprod reference.
+At this source revision, production has 23 external and 17 custom image
+references, for 40 total. Preprod has 25 external and 19 custom references,
+for 44 total. Two custom services are preprod-only: Samba AD and the WIF
+provider mock. Their Debian 13.6-slim build base is also preprod-only. The
+fourth extra reference is the archive-only PostgreSQL 16 source used to test
+the PostgreSQL 18 migration. Compose never starts that source image during an
+ordinary PreProd deploy.
 
 ## The normal engineer flow
 

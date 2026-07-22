@@ -28,6 +28,10 @@ PINNED_FRONTEND = (
     "docker/dockerfile:1.25.0@sha256:"
     "0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12"
 )
+PINNED_PREPROD_POSTGRES16 = (
+    "dhi.io/postgres:16.14@sha256:"
+    "47a12e559e8c418ed54e27da521efcbf4c00fc1c26e86eb58d82845afd7c57c7"
+)
 
 
 def inspection(image_id: str, digest: str) -> subprocess.CompletedProcess[str]:
@@ -1145,9 +1149,10 @@ class OfflineImageSeedBuilderTests(unittest.TestCase):
         scopes = builder.collect_project_image_reference_scopes(project_root)
         references = scopes["preprod"]
 
-        self.assertEqual(len(references), 24)
+        self.assertEqual(len(references), 25)
         self.assertIn(PINNED_DEBIAN, references)
         self.assertIn(PINNED_FRONTEND, references)
+        self.assertIn(PINNED_PREPROD_POSTGRES16, references)
         self.assertIn(
             "dhi.io/golang:1.26.5-alpine-dev@sha256:"
             "711ea0b8f09f549c50f2f550dc26859d3e6441ca11d5640caecf69c29a862f0c",
@@ -1155,6 +1160,8 @@ class OfflineImageSeedBuilderTests(unittest.TestCase):
         )
         self.assertNotIn(PINNED_DEBIAN, scopes["production"])
         self.assertIn(PINNED_DEBIAN, scopes["preprod"])
+        self.assertNotIn(PINNED_PREPROD_POSTGRES16, scopes["production"])
+        self.assertIn(PINNED_PREPROD_POSTGRES16, scopes["preprod"])
         self.assertIn(
             "dhi.io/golang:1.26.5-alpine-dev@sha256:"
             "711ea0b8f09f549c50f2f550dc26859d3e6441ca11d5640caecf69c29a862f0c",

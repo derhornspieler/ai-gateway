@@ -218,12 +218,12 @@ aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
 aigw-2026-07-21-linux-amd64.preprod.manifest.json
 ```
 
-At this source revision, production has 23 external and 17 custom
-image references, for 40 total. Preprod has 24 external and 19 custom image
-references, for 43 total. The two preprod-only custom services are Samba AD
-and the WIF provider mock. Their Debian 13.6-slim base is the third extra
-preprod image reference. None of those three references belongs in the
-production archive.
+At this source revision, production has 23 external and 17 custom image
+references, for 40 total. Preprod has 25 external and 19 custom image
+references, for 44 total. The two preprod-only custom services are Samba AD
+and the WIF provider mock. Their Debian 13.6-slim base and the archive-only
+PostgreSQL 16 migration source are the two extra external references. None of
+these four PreProd-only references belongs in the production archive.
 
 Record all four SHA-256 values:
 
