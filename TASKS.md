@@ -43,7 +43,7 @@
     Ansible contracts passed. The real commands remain an approved maintenance-
     window gate on the existing production Linux host. No rehearsal VM will be
     created, and the local receipt does not claim those commands ran.
-  - The 874 infrastructure contracts, 532 Python service tests, four Go
+  - The 875 infrastructure contracts, 532 Python service tests, four Go
     race/vet suites, Compose, identity, ShellCheck, yamllint, Bandit, Ruff,
     dependency audit, documentation links, and Ansible syntax checks passed.
   - Final exact-manifest teardown removed 26 containers, 19 networks, 11
