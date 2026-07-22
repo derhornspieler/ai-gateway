@@ -34,14 +34,14 @@ class OpenWebUiSecurityWheelTests(unittest.TestCase):
         for platform in ("amd64", "arm64"):
             names = {path.name.lower() for path in (WHEELS / platform).glob("*.whl")}
             self.assertEqual(len(names), 2)
-            self.assertTrue(any(name.startswith("cryptography-48.0.1-") for name in names))
+            self.assertTrue(any(name.startswith("cryptography-49.0.0-") for name in names))
             self.assertTrue(any(name.startswith("pillow-12.3.0-") for name in names))
         universal = {path.name.lower() for path in (WHEELS / "any").glob("*.whl")}
         self.assertEqual(
             universal,
             {
                 "mcp-1.28.1-py3-none-any.whl",
-                "python_multipart-0.0.30-py3-none-any.whl",
+                "python_multipart-0.0.32-py3-none-any.whl",
             },
         )
 

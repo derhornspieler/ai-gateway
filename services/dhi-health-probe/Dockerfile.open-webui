@@ -42,7 +42,7 @@ RUN --network=none \
     && rm -f /usr/local/bin/uv /usr/local/bin/uvx \
     && python3 -I -m pip check \
     && python3 -I -c \
-      "import cryptography,importlib.metadata,mcp,multipart,PIL; assert cryptography.__version__ == '48.0.1'; assert importlib.metadata.version('mcp') == '1.28.1'; assert multipart.__version__ == '0.0.30'; assert PIL.__version__ == '12.3.0'"
+      "import cryptography,importlib.metadata,mcp,multipart,PIL; assert cryptography.__version__ == '49.0.0'; assert importlib.metadata.version('mcp') == '1.28.1'; assert multipart.__version__ == '0.0.32'; assert PIL.__version__ == '12.3.0'"
 # The immutable upstream image contains Python and this exact module. The
 # patcher verifies both complete source hashes and both narrow promotion
 # snippets before changing bytes; the verifier executes the patched role method

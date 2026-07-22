@@ -77,8 +77,8 @@ image and has fewer runtime paths:
   path. Only the embedded `PersistentClient` code remains, and retrieval is
   bypassed for this chat-only deployment.
 
-The offline build also installs reviewed wheels for cryptography 48.0.1,
-Pillow 12.3.0, MCP 1.28.1, and python-multipart 0.0.30. Compiled wheels are
+The offline build also installs reviewed wheels for cryptography 49.0.0,
+Pillow 12.3.0, MCP 1.28.1, and python-multipart 0.0.32. Compiled wheels are
 committed for both AMD64 and ARM64. Their hashes are checked before install,
 and the Docker build has no network.
 
