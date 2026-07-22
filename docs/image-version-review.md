@@ -77,7 +77,7 @@ version and both digests.
 | --- | --- | --- |
 | Debian build base | `13.6-slim` | Current Debian stable point release |
 | Dockerfile frontend | `1.25.0` | Current published frontend tag |
-| LiteLLM base | `v1.93.0` | Current upstream release; final image is the reviewed `1.93.0-aigw1` derivative |
+| LiteLLM base | `v1.93.0` | Current upstream release; final image is the reviewed `1.93.0-aigw2` derivative |
 | Open WebUI base | `v0.10.2` | Current upstream release; final image is the reviewed `0.10.2-aigw2` derivative |
 | Traefik binary source | `v3.7.8` | Current upstream release |
 | Vault UI binary source | `2.0.3` | Matches the current reviewed Vault release |
@@ -106,10 +106,11 @@ change must regenerate the matching lock file and rebuild the release.
 
 The LiteLLM derivative keeps the exact `v1.93.0` application base. Its
 network-disabled build replaces `pyasn1` `0.6.3` with the reviewed `0.6.4`
-wheel. It also applies one exact missing-usage logging patch. That patch lets
-the prompt-free accounting callback record unknown usage when Anthropic omits
-the `usage` field. The build stops if the pinned LiteLLM version or reviewed
-source fragment changes. The Open WebUI derivative installs reviewed
+wheel. It also applies one exact usage-validation patch. That patch lets the
+prompt-free accounting callback record unknown usage when Anthropic omits or
+malforms token counts in normal or streaming responses. The build stops if the
+pinned LiteLLM version, reviewed source fragment, or patched Python syntax
+changes. The Open WebUI derivative installs reviewed
 `pyasn1` `0.6.4` and `GitPython` `3.1.54` wheels along with its existing
 runtime updates. The repository stores each wheel and its SHA-256 hash. Both
 AMD64 and ARM64 builds passed read-only package checks. The current exact-seed

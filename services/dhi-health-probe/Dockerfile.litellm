@@ -22,15 +22,15 @@ RUN --network=none \
     && /app/.venv/bin/python -I -c \
       "import importlib.metadata,pyasn1; assert importlib.metadata.version('pyasn1') == '0.6.4'; assert pyasn1.__version__ == '0.6.4'"
 
-# LiteLLM 1.93.0 accepts an Anthropic response without usage, then its logging
-# worker raises KeyError before custom callbacks run. Patch only that reviewed
-# source fragment so the callback can preserve missing usage as unknown.
+# LiteLLM 1.93.0 can normalize missing or malformed Anthropic usage to false
+# zeroes, or stop before custom callbacks run. Patch only the reviewed parser
+# and stream accumulator fragments so the callback preserves it as unknown.
 RUN --network=none \
     --mount=type=bind,source=patch_litellm_anthropic_usage.py,target=/tmp/patch_litellm_anthropic_usage.py,readonly \
     /app/.venv/bin/python -I -c \
       "import importlib.metadata; assert importlib.metadata.version('litellm') == '1.93.0'" \
     && /app/.venv/bin/python -I /tmp/patch_litellm_anthropic_usage.py \
-      /app/.venv/lib/python3.13/site-packages/litellm/llms/anthropic/chat/transformation.py
+      /app/.venv/lib/python3.13/site-packages/litellm
 
 # Production Compose already runs this identity. Pin it in the image too so a
 # direct run cannot silently fall back to the upstream root user.

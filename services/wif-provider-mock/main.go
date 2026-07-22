@@ -274,19 +274,7 @@ func (cfg config) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	usage := map[string]any{
-		"input_tokens":                10,
-		"cache_creation_input_tokens": 50,
-		"cache_read_input_tokens":     40,
-		"output_tokens":               50,
-		"cache_creation": map[string]int{
-			"ephemeral_5m_input_tokens": 20,
-			"ephemeral_1h_input_tokens": 30,
-		},
-	}
-	if strings.Contains(messageDocument, "AIGW_PREPROD_NO_USAGE_") {
-		usage = nil
-	}
+	usage := providerUsage(messageDocument)
 
 	var stream bool
 	_ = json.Unmarshal(request["stream"], &stream)
@@ -307,6 +295,26 @@ func (cfg config) messages(w http.ResponseWriter, r *http.Request) {
 		response["usage"] = usage
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func providerUsage(messageDocument string) map[string]any {
+	usage := map[string]any{
+		"input_tokens":                10,
+		"cache_creation_input_tokens": 50,
+		"cache_read_input_tokens":     40,
+		"output_tokens":               50,
+		"cache_creation": map[string]int{
+			"ephemeral_5m_input_tokens": 20,
+			"ephemeral_1h_input_tokens": 30,
+		},
+	}
+	if strings.Contains(messageDocument, "AIGW_PREPROD_NO_USAGE_") {
+		return nil
+	}
+	if strings.Contains(messageDocument, "AIGW_PREPROD_INVALID_USAGE_") {
+		usage["input_tokens"] = "not-a-token-count"
+	}
+	return usage
 }
 
 func (state *messageTestState) firstAttempt(model string) bool {
@@ -330,7 +338,6 @@ func writeMessageStream(w http.ResponseWriter, model string, usage map[string]an
 				"id": "msg_preprod_stream_001", "type": "message",
 				"role": "assistant", "model": model, "content": []any{},
 				"stop_reason": nil, "stop_sequence": nil,
-				"usage": map[string]int{"input_tokens": 10, "output_tokens": 0},
 			},
 		},
 		{"type": "content_block_start", "index": 0, "content_block": map[string]string{"type": "text", "text": ""}},

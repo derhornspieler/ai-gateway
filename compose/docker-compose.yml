@@ -500,15 +500,15 @@ services:
       com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_LITELLM:?AIGW_BIND_DIGEST_LITELLM must be set}
     # v1.74.0 is affected by critical auth bypasses (including
     # GHSA-4xpc-pv4p-pm3w). The small offline derivative keeps the exact
-    # v1.93.0 release, replaces vulnerable pyasn1 0.6.3, and preserves an
-    # Anthropic response with missing usage as unknown accounting evidence.
+    # v1.93.0 release, replaces vulnerable pyasn1 0.6.3, and preserves missing
+    # or malformed Anthropic usage as unknown accounting evidence.
     build:
       context: ./services/dhi-health-probe
       dockerfile: Dockerfile.litellm
       network: none
       args:
         BASE_IMAGE: ghcr.io/berriai/litellm:v1.93.0@sha256:a1745e629abfb17d434426ff48b115f54f4f4c4a0f5af241de569e93c63c411e
-    image: ai-gateway/litellm:1.93.0-aigw1
+    image: ai-gateway/litellm:1.93.0-aigw2
     # read_only intentionally NOT set: the image runs prisma generate /
     # schema migrations and writes caches under /app and $HOME at startup;
     # the write set isn't stable across releases.

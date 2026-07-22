@@ -171,18 +171,18 @@ def _provider_cost(payload: dict) -> str | None:
     return _decimal_text(headers.get("llm_provider-x-litellm-response-cost"))
 
 
-def _provider_usage_missing(payload: dict) -> bool:
-    """Read only the signal written by the reviewed LiteLLM image patch."""
+def _provider_usage_unusable(payload: dict) -> bool:
+    """Read only the receipt written after raw provider validation."""
 
-    hidden = _mapping(payload.get("hidden_params"))
-    headers = _mapping(hidden.get("additional_headers"))
-    return headers.get("aigw-provider-usage-missing") == "true"
+    metadata = _mapping(payload.get("metadata"))
+    usage = _mapping(metadata.get("usage_object"))
+    return usage.get("aigw_provider_usage_unusable") is True
 
 
 def _usage_counts(payload: dict, status: str) -> tuple[dict[str, int | None], str]:
     if status == "failure":
         return ({field: None for field in TOKEN_FIELDS}, "not_applicable")
-    if _provider_usage_missing(payload):
+    if _provider_usage_unusable(payload):
         return ({field: None for field in TOKEN_FIELDS}, "unknown")
 
     metadata = _mapping(payload.get("metadata"))
@@ -307,7 +307,7 @@ def build_usage_event(
 
     counts, completeness = _usage_counts(payload, status)
     litellm_cost = None
-    if status == "success" and not _provider_usage_missing(payload):
+    if status == "success" and not _provider_usage_unusable(payload):
         litellm_cost = _decimal_text(payload.get("response_cost"))
     provider_cost = _provider_cost(payload) if status == "success" else None
 

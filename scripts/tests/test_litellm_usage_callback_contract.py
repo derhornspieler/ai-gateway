@@ -283,12 +283,10 @@ class LiteLLMUsageCallbackContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(event["cache_creation_1h_tokens"])
         self.assertEqual(event["usage_completeness"], "partial")
 
-    def test_patched_missing_provider_usage_stays_unknown(self) -> None:
+    def test_patched_unusable_provider_usage_stays_unknown(self) -> None:
         kwargs = copy.deepcopy(self.fixture["kwargs"])
-        payload = kwargs["standard_logging_object"]
-        payload["hidden_params"]["additional_headers"][
-            "aigw-provider-usage-missing"
-        ] = "true"
+        usage = kwargs["standard_logging_object"]["metadata"]["usage_object"]
+        usage["aigw_provider_usage_unusable"] = True
 
         event = self._event(kwargs)
 
@@ -298,12 +296,12 @@ class LiteLLMUsageCallbackContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(event["litellm_cost_usd"])
 
-    def test_provider_cannot_spoof_the_internal_missing_usage_signal(self) -> None:
+    def test_provider_header_cannot_spoof_the_internal_usage_receipt(self) -> None:
         kwargs = copy.deepcopy(self.fixture["kwargs"])
         headers = kwargs["standard_logging_object"]["hidden_params"][
             "additional_headers"
         ]
-        headers["llm_provider-aigw-provider-usage-missing"] = "true"
+        headers["llm_provider-aigw-provider-usage-unusable"] = "true"
 
         event = self._event(kwargs)
 

@@ -306,6 +306,10 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
             "PREPROD_USAGE_REAL_REQUEST_PASSED",
             "PREPROD_USAGE_STREAM_PASSED",
             "PREPROD_USAGE_RETRY_PASSED",
+            "PREPROD_USAGE_MISSING_PASSED",
+            "PREPROD_USAGE_MISSING_STREAM_PASSED",
+            "PREPROD_USAGE_MALFORMED_PASSED",
+            "PREPROD_USAGE_MALFORMED_STREAM_PASSED",
             "PREPROD_USAGE_FAILURE_PASSED",
             "PREPROD_USAGE_ACCOUNTING_CORE_PASSED",
             "PREPROD_USAGE_AUDIT_EXPORT_PASSED",
@@ -323,6 +327,7 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         self.assertIn("AIGW_PREPROD_RETRY_ONCE_", usage)
         self.assertIn("AIGW_PREPROD_FAIL_ALWAYS_", usage)
         self.assertIn("AIGW_PREPROD_NO_USAGE_", usage)
+        self.assertIn("AIGW_PREPROD_INVALID_USAGE_", usage)
         self.assertIn("usage_component_reporting", usage)
         self.assertIn("usage_reporting", usage)
         self.assertIn('user="grafana_ro"', usage)
@@ -331,13 +336,8 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         self.assertIn("len(grafana_password) != 48", usage)
         self.assertIn("def wait_for_new_real_rows(", usage)
         self.assertIn('if row["request_id"] not in known_request_ids', usage)
-        self.assertEqual(
-            usage.count(
-                'known_request_ids = {row["request_id"] for row in '
-                "real_rows(connection)}"
-            ),
-            5,
-        )
+        self.assertIn("def require_unknown_provider_usage(", usage)
+        self.assertEqual(usage.count("require_unknown_provider_usage("), 5)
         self.assertIn('"CONFIRM BACKDATED PRICE"', usage)
         self.assertIn("output_preview[\"affected_rows\"]", usage)
         self.assertIn("a changed usage replay did not fail closed", usage)

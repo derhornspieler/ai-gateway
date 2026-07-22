@@ -56,7 +56,7 @@ Three reviewed upstream exceptions remain:
 
 | Image | Reason |
 | --- | --- |
-| LiteLLM `1.93.0-aigw1` | Exact upstream `v1.93.0` base with one offline security-wheel replacement and one missing-usage logging fix |
+| LiteLLM `1.93.0-aigw2` | Exact upstream `v1.93.0` base with one offline security-wheel replacement and one usage-validation fix |
 | Open WebUI `0.10.2-aigw2` | No matching application DHI image was available |
 | Samba AD test image | Local preprod only; never a production directory |
 
@@ -64,14 +64,15 @@ An exception does not allow a floating tag or skipped scan.
 
 ### LiteLLM security derivative
 
-The `1.93.0-aigw1` image keeps the exact upstream LiteLLM `v1.93.0` base. Its
+The `1.93.0-aigw2` image keeps the exact upstream LiteLLM `v1.93.0` base. Its
 network-disabled build removes `pyasn1` `0.6.3` and installs the reviewed
-`0.6.4` wheel. It also fixes one LiteLLM logging error. Without that fix, an
-Anthropic success response with no `usage` field skips the gateway accounting
-callback. The fix marks that response as unknown usage. It does not read the
-prompt or reply. The wheel, its SHA-256 hash, and the small source patch are
-committed. The build stops if the base package layout, LiteLLM version, or
-reviewed source fragment changes. It also pins the runtime user to
+`0.6.4` wheel. It also fixes one LiteLLM logging error. Without that fix,
+missing or malformed Anthropic usage can skip the accounting callback or turn
+into false zeroes. The fix checks raw token counts before LiteLLM changes them.
+It marks bad normal and streaming usage as unknown. It does not read the prompt
+or reply. The wheel, its SHA-256 hash, and the small source patch are committed.
+The build stops if the base package layout, LiteLLM version, reviewed source
+fragment, or patched Python syntax changes. It also pins the runtime user to
 `65532:65532`.
 
 Read-only package checks passed for AMD64 and ARM64. The exact offline-seed

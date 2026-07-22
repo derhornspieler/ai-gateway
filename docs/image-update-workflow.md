@@ -144,9 +144,10 @@ Build that derivative from the exact reviewed base. Store each replacement
 wheel and SHA-256 hash in the repository, keep the Docker build offline, and
 fail if the old package layout has changed. The current LiteLLM derivative
 replaces `pyasn1` `0.6.3` with `0.6.4`. It also applies one exact source patch
-so a missing Anthropic `usage` field reaches accounting as unknown instead of
-stopping LiteLLM's logging worker. The patch runs with no network and stops if
-the reviewed LiteLLM source changes. The Open WebUI derivative installs
+so missing or malformed Anthropic usage reaches accounting as unknown instead
+of becoming false zeroes or stopping LiteLLM's logging worker. It covers normal
+and streaming responses. The patch runs with no network and stops if the
+reviewed LiteLLM source or patched Python syntax changes. The Open WebUI derivative installs
 reviewed `pyasn1` `0.6.4` and `GitPython` `3.1.54` wheels with its other runtime
 updates. Test both supported platforms and then test the exact seed.
 

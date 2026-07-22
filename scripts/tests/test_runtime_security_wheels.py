@@ -50,9 +50,14 @@ class RuntimeSecurityWheelTests(unittest.TestCase):
         self.assertIn("--mount=type=bind,source=patch_litellm_anthropic_usage.py", dockerfile)
         self.assertIn("importlib.metadata.version('litellm') == '1.93.0'", dockerfile)
         self.assertIn("RUN --network=none", dockerfile)
-        self.assertIn('source.count(BEFORE) != 1', patch)
-        self.assertIn('aigw-provider-usage-missing', patch)
-        self.assertIn('usage_object=provider_usage', patch)
+        self.assertIn("aigw_usage_is_valid", patch)
+        self.assertIn("aigw_provider_usage_unusable", patch)
+        self.assertIn("required_fields=(\"output_tokens\",)", patch)
+        self.assertIn("streaming_chunk_builder_utils.py", patch)
+        self.assertIn("provider_usage_unusable = False", patch)
+        self.assertIn("def safe_count(value: object) -> int:", patch)
+        self.assertIn('compile(updated, str(path), "exec")', patch)
+        self.assertIn("usage_object=provider_usage", patch)
 
     def test_build_context_includes_the_security_wheels(self) -> None:
         source = DOCKERIGNORE.read_text(encoding="utf-8")

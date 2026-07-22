@@ -64,12 +64,14 @@ it accepts either the provider usage-report names or LiteLLM's standard prompt
 token details.
 
 LiteLLM `v1.93.0` has a logging bug when an Anthropic success response leaves
-out the whole `usage` field. Its logging worker stops before custom callbacks
-run. The gateway's immutable LiteLLM image applies one small, offline patch to
-the exact reviewed source. The patch adds an internal missing-usage marker and
-lets logging continue. The callback turns that marker into null token counts,
-unknown completeness, and no LiteLLM cost. A provider response header cannot
-set this marker. The image build stops if the pinned LiteLLM source changes.
+out or malforms token usage. Its logging worker can stop or turn bad values
+into zeroes before custom callbacks run. The gateway's immutable LiteLLM image
+applies one small, offline patch to the exact reviewed source. The patch checks
+raw normal and streaming token counts, adds an internal unusable-usage receipt,
+and lets logging continue. The callback turns that receipt into null token
+counts, unknown completeness, and no LiteLLM cost. Provider response fields or
+headers cannot set this receipt. The image build stops if the pinned LiteLLM
+source changes or the patched Python does not compile.
 
 | Cost part | Accepted exact field |
 | --- | --- |

@@ -144,6 +144,20 @@ func TestRetryMarkerFailsOnlyTheFirstAttemptForEachModel(t *testing.T) {
 	}
 }
 
+func TestProviderUsageKeepsMissingAndMalformedCasesDistinct(t *testing.T) {
+	if providerUsage("AIGW_PREPROD_NO_USAGE_") != nil {
+		t.Fatal("the missing-usage case emitted a usage object")
+	}
+	malformed := providerUsage("AIGW_PREPROD_INVALID_USAGE_")
+	if malformed["input_tokens"] != "not-a-token-count" || malformed["output_tokens"] != 50 {
+		t.Fatal("the malformed-usage case lost its exact invalid shape")
+	}
+	normal := providerUsage("normal request")
+	if normal["input_tokens"] != 10 || normal["output_tokens"] != 50 {
+		t.Fatal("the normal usage case changed")
+	}
+}
+
 func TestMessageStreamHasBoundedAnthropicFramesAndFinalUsage(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	usage := map[string]any{
@@ -172,5 +186,19 @@ func TestMessageStreamHasBoundedAnthropicFramesAndFinalUsage(t *testing.T) {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("stream omitted %q", marker)
 		}
+	}
+}
+
+func TestMessageStreamOmitsMissingUsageInsteadOfInventingZero(t *testing.T) {
+	recorder := httptest.NewRecorder()
+
+	writeMessageStream(recorder, "claude-preprod", nil)
+
+	body := recorder.Body.String()
+	if strings.Contains(body, `"input_tokens"`) {
+		t.Fatal("the missing-usage stream invented input tokens")
+	}
+	if !strings.Contains(body, `"output_tokens":50`) {
+		t.Fatal("the final provider usage delta was lost")
 	}
 }

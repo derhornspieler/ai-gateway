@@ -681,6 +681,34 @@ try:
             token=test_key,
         )
 
+    def require_unknown_provider_usage(marker, *, stream=False):
+        known_request_ids = {
+            row["request_id"] for row in real_rows(connection)
+        }
+        status, answer = call(marker, stream=stream)
+        if status != 200:
+            raise SystemExit("the unusable-usage provider response failed")
+        if stream and "pong" not in str(answer):
+            raise SystemExit("the unusable-usage provider stream was incomplete")
+        if not stream and not isinstance(answer, dict):
+            raise SystemExit("the unusable-usage provider response was invalid")
+        rows = wait_for_new_real_rows(
+            connection,
+            known_request_ids,
+            lambda row: row["status"] == "success"
+            and row["stream"] is stream
+            and row["usage_completeness"] == "unknown"
+            and row["configured_cost_status"] == "unknown",
+        )
+        if not any(
+            row["status"] == "success"
+            and row["stream"] is stream
+            and row["usage_completeness"] == "unknown"
+            and row["configured_cost_status"] == "unknown"
+            for row in rows
+        ):
+            raise SystemExit("unusable provider usage was not preserved as unknown")
+
     known_request_ids = {row["request_id"] for row in real_rows(connection)}
     status, answer = call("AIGW_PREPROD_NORMAL_")
     content = answer.get("content") if isinstance(answer, dict) else None
@@ -754,24 +782,16 @@ try:
         raise SystemExit("the internal provider retry count was not recorded")
     print("PREPROD_USAGE_RETRY_PASSED")
 
-    known_request_ids = {row["request_id"] for row in real_rows(connection)}
-    status, no_usage_answer = call("AIGW_PREPROD_NO_USAGE_")
-    if status != 200 or not isinstance(no_usage_answer, dict):
-        raise SystemExit("the no-usage provider response failed")
-    no_usage_rows = wait_for_new_real_rows(
-        connection,
-        known_request_ids,
-        lambda row: row["status"] == "success"
-        and row["usage_completeness"] == "unknown"
-        and row["configured_cost_status"] == "unknown",
+    require_unknown_provider_usage("AIGW_PREPROD_NO_USAGE_")
+    print("PREPROD_USAGE_MISSING_PASSED")
+    require_unknown_provider_usage("AIGW_PREPROD_NO_USAGE_", stream=True)
+    print("PREPROD_USAGE_MISSING_STREAM_PASSED")
+    require_unknown_provider_usage("AIGW_PREPROD_INVALID_USAGE_")
+    print("PREPROD_USAGE_MALFORMED_PASSED")
+    require_unknown_provider_usage(
+        "AIGW_PREPROD_INVALID_USAGE_", stream=True
     )
-    if not any(
-        row["status"] == "success"
-        and row["usage_completeness"] == "unknown"
-        and row["configured_cost_status"] == "unknown"
-        for row in no_usage_rows
-    ):
-        raise SystemExit("missing provider usage was not preserved as unknown")
+    print("PREPROD_USAGE_MALFORMED_STREAM_PASSED")
 
     known_request_ids = {row["request_id"] for row in real_rows(connection)}
     status, _ = call("AIGW_PREPROD_FAIL_ALWAYS_")
@@ -1618,6 +1638,10 @@ def main() -> int:
         "PREPROD_USAGE_REAL_REQUEST_PASSED",
         "PREPROD_USAGE_STREAM_PASSED",
         "PREPROD_USAGE_RETRY_PASSED",
+        "PREPROD_USAGE_MISSING_PASSED",
+        "PREPROD_USAGE_MISSING_STREAM_PASSED",
+        "PREPROD_USAGE_MALFORMED_PASSED",
+        "PREPROD_USAGE_MALFORMED_STREAM_PASSED",
         "PREPROD_USAGE_FAILURE_PASSED",
         "PREPROD_USAGE_ACCOUNTING_CORE_PASSED",
     )
