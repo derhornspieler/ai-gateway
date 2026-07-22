@@ -246,6 +246,9 @@ class PreprodContractTests(unittest.TestCase):
                 ("volume", "rm", "aigw-preprod_pg18_data"),
             ],
         )
+        for call in docker.call_args_list:
+            if call.args[:2] == ("volume", "rm"):
+                self.assertTrue(call.kwargs["capture"])
 
         foreign = types.SimpleNamespace(stdout='[{"Labels":{}}]')
         with mock.patch.object(module, "docker", side_effect=[listed, foreign]):

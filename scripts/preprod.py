@@ -3739,7 +3739,9 @@ def remove_postgres_rehearsal_volumes(args: argparse.Namespace) -> None:
             or document.get("Scope") != "local"
         ):
             fail("refusing to remove an unowned PostgreSQL rehearsal volume")
-        docker("volume", "rm", name)
+        # Docker prints a removed volume name on stdout. Keep clean-room
+        # stdout reserved for its one machine-readable receipt.
+        docker("volume", "rm", name, capture=True)
 
 
 def _validate_clean_room_generated_state() -> int:
