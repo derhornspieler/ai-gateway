@@ -67,7 +67,7 @@ if not database_url.startswith("postgresql://rotator:"):
     raise SystemExit("the rotator database connection is unavailable")
 if (
     not isinstance(grafana_password, str)
-    or len(grafana_password) != 64
+    or len(grafana_password) != 48
     or any(character not in "0123456789abcdef" for character in grafana_password)
 ):
     raise SystemExit("the Grafana reporting credential is unavailable")
@@ -256,23 +256,31 @@ def confirm_price(preview, operation_id=None, confirmation="CONFIRM BACKDATED PR
     return confirm_id, status, document
 
 
-def wait_for_real_rows(connection, expected, timeout=60):
+def real_rows(connection):
+    return fetchall(
+        connection,
+        """
+        SELECT event_id, request_id, status, stream, retry_count,
+               usage_completeness, configured_cost_status,
+               normal_input_tokens, cache_creation_5m_tokens,
+               cache_creation_1h_tokens, cache_read_tokens, output_tokens
+        FROM aigw_governance.usage_events
+        WHERE requested_model = %s AND stable_user_id = %s
+        ORDER BY received_at, event_id
+        """,
+        (model, real_user),
+    )
+
+
+def wait_for_new_real_rows(connection, known_request_ids, matches, timeout=60):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        rows = fetchall(
-            connection,
-            """
-            SELECT event_id, status, stream, retry_count, usage_completeness,
-                   configured_cost_status, normal_input_tokens,
-                   cache_creation_5m_tokens, cache_creation_1h_tokens,
-                   cache_read_tokens, output_tokens
-            FROM aigw_governance.usage_events
-            WHERE requested_model = %s AND stable_user_id = %s
-            ORDER BY received_at, event_id
-            """,
-            (model, real_user),
-        )
-        if len(rows) >= expected:
+        rows = [
+            row
+            for row in real_rows(connection)
+            if row["request_id"] not in known_request_ids
+        ]
+        if any(matches(row) for row in rows):
             return rows
         time.sleep(0.5)
     raise SystemExit("the LiteLLM usage callback did not reach PostgreSQL")
@@ -673,14 +681,27 @@ try:
             token=test_key,
         )
 
+    known_request_ids = {row["request_id"] for row in real_rows(connection)}
     status, answer = call("AIGW_PREPROD_NORMAL_")
     content = answer.get("content") if isinstance(answer, dict) else None
     if status != 200 or not isinstance(content, list) or not any(
         isinstance(item, dict) and item.get("text") == "pong" for item in content
     ):
         raise SystemExit("the real usage request failed")
-    normal_rows = wait_for_real_rows(connection, 1)
-    normal = normal_rows[-1]
+    normal_rows = wait_for_new_real_rows(
+        connection,
+        known_request_ids,
+        lambda row: row["status"] == "success"
+        and row["stream"] is False
+        and row["usage_completeness"] == "complete",
+    )
+    normal = next(
+        row
+        for row in normal_rows
+        if row["status"] == "success"
+        and row["stream"] is False
+        and row["usage_completeness"] == "complete"
+    )
     if (
         normal["status"] != "success"
         or normal["stream"] is not False
@@ -696,10 +717,15 @@ try:
         raise SystemExit("the real callback lost the five provider token classes")
     print("PREPROD_USAGE_REAL_REQUEST_PASSED")
 
+    known_request_ids = {row["request_id"] for row in real_rows(connection)}
     status, stream_answer = call("AIGW_PREPROD_STREAM_", stream=True)
     if status != 200 or "pong" not in str(stream_answer):
         raise SystemExit("the real streaming usage request failed")
-    stream_rows = wait_for_real_rows(connection, 2)
+    stream_rows = wait_for_new_real_rows(
+        connection,
+        known_request_ids,
+        lambda row: row["status"] == "success" and row["stream"] is True,
+    )
     if not any(
         row["status"] == "success" and row["stream"] is True
         for row in stream_rows
@@ -707,13 +733,20 @@ try:
         raise SystemExit("the streaming callback was not recorded as a stream")
     print("PREPROD_USAGE_STREAM_PASSED")
 
+    known_request_ids = {row["request_id"] for row in real_rows(connection)}
     status, retry_answer = call("AIGW_PREPROD_RETRY_ONCE_")
     retry_content = (
         retry_answer.get("content") if isinstance(retry_answer, dict) else None
     )
     if status != 200 or not isinstance(retry_content, list):
         raise SystemExit("the planned provider retry did not recover")
-    retry_rows = wait_for_real_rows(connection, 3)
+    retry_rows = wait_for_new_real_rows(
+        connection,
+        known_request_ids,
+        lambda row: row["status"] == "success"
+        and isinstance(row["retry_count"], int)
+        and row["retry_count"] >= 1,
+    )
     if not any(
         isinstance(row["retry_count"], int) and row["retry_count"] >= 1
         for row in retry_rows
@@ -721,10 +754,17 @@ try:
         raise SystemExit("the internal provider retry count was not recorded")
     print("PREPROD_USAGE_RETRY_PASSED")
 
+    known_request_ids = {row["request_id"] for row in real_rows(connection)}
     status, no_usage_answer = call("AIGW_PREPROD_NO_USAGE_")
     if status != 200 or not isinstance(no_usage_answer, dict):
         raise SystemExit("the no-usage provider response failed")
-    no_usage_rows = wait_for_real_rows(connection, 4)
+    no_usage_rows = wait_for_new_real_rows(
+        connection,
+        known_request_ids,
+        lambda row: row["status"] == "success"
+        and row["usage_completeness"] == "unknown"
+        and row["configured_cost_status"] == "unknown",
+    )
     if not any(
         row["status"] == "success"
         and row["usage_completeness"] == "unknown"
@@ -733,10 +773,16 @@ try:
     ):
         raise SystemExit("missing provider usage was not preserved as unknown")
 
+    known_request_ids = {row["request_id"] for row in real_rows(connection)}
     status, _ = call("AIGW_PREPROD_FAIL_ALWAYS_")
     if status < 400:
         raise SystemExit("the planned provider failure unexpectedly succeeded")
-    failure_rows = wait_for_real_rows(connection, 5)
+    failure_rows = wait_for_new_real_rows(
+        connection,
+        known_request_ids,
+        lambda row: row["status"] == "failure"
+        and row["usage_completeness"] == "not_applicable",
+    )
     if not any(
         row["status"] == "failure"
         and row["usage_completeness"] == "not_applicable"
@@ -1605,7 +1651,7 @@ def main() -> int:
 
     key_rotator_id = preprod.container_id("key-rotator")
     gap_started_at = int(time.time()) - 2
-    stopped, _ = preprod.docker("stop", "--time", "10", key_rotator_id)
+    stopped, _ = preprod.docker("stop", "-t", "10", key_rotator_id)
     if stopped.strip() != key_rotator_id:
         fail("Docker did not stop the exact key-rotator container")
     gap_output = ""

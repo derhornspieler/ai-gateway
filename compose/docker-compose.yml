@@ -500,7 +500,8 @@ services:
       com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_LITELLM:?AIGW_BIND_DIGEST_LITELLM must be set}
     # v1.74.0 is affected by critical auth bypasses (including
     # GHSA-4xpc-pv4p-pm3w). The small offline derivative keeps the exact
-    # v1.93.0 release and replaces only vulnerable pyasn1 0.6.3.
+    # v1.93.0 release, replaces vulnerable pyasn1 0.6.3, and preserves an
+    # Anthropic response with missing usage as unknown accounting evidence.
     build:
       context: ./services/dhi-health-probe
       dockerfile: Dockerfile.litellm

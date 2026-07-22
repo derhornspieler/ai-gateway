@@ -122,15 +122,37 @@ def _decimal_text(value) -> str | None:
     return text or "0"
 
 
-def _retry_count(payload: dict) -> int | None:
-    hidden = _mapping(payload.get("hidden_params"))
-    headers = _mapping(hidden.get("additional_headers"))
-    value = headers.get("x-litellm-attempted-retries")
+def _bounded_retry_count(value) -> int | None:
+    """Return one reviewed retry count without coercing other value types."""
+
     if isinstance(value, str) and value.isascii() and value.isdigit():
         value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if 0 <= value <= 100 else None
+
+
+def _retry_count(payload: dict, kwargs: dict) -> int | None:
+    """Read LiteLLM's router-owned retry count, then its response receipt.
+
+    LiteLLM updates ``litellm_metadata`` before it makes a retry. Custom
+    success callbacks run before the router adds retry headers to the final
+    response, so that internal metadata is the live source of truth. The
+    response header remains a compatibility fallback for direct callbacks.
+    Caller metadata is never accepted as retry evidence.
+    """
+
+    litellm_params = _mapping(kwargs.get("litellm_params"))
+    router_metadata = _mapping(litellm_params.get("litellm_metadata"))
+    router_count = _bounded_retry_count(
+        router_metadata.get("attempted_retries")
+    )
+    if router_count is not None:
+        return router_count
+
+    hidden = _mapping(payload.get("hidden_params"))
+    headers = _mapping(hidden.get("additional_headers"))
+    return _bounded_retry_count(headers.get("x-litellm-attempted-retries"))
 
 
 def _provider_cost(payload: dict) -> str | None:
@@ -149,9 +171,19 @@ def _provider_cost(payload: dict) -> str | None:
     return _decimal_text(headers.get("llm_provider-x-litellm-response-cost"))
 
 
+def _provider_usage_missing(payload: dict) -> bool:
+    """Read only the signal written by the reviewed LiteLLM image patch."""
+
+    hidden = _mapping(payload.get("hidden_params"))
+    headers = _mapping(hidden.get("additional_headers"))
+    return headers.get("aigw-provider-usage-missing") == "true"
+
+
 def _usage_counts(payload: dict, status: str) -> tuple[dict[str, int | None], str]:
     if status == "failure":
         return ({field: None for field in TOKEN_FIELDS}, "not_applicable")
+    if _provider_usage_missing(payload):
+        return ({field: None for field in TOKEN_FIELDS}, "unknown")
 
     metadata = _mapping(payload.get("metadata"))
     usage = _mapping(metadata.get("usage_object"))
@@ -274,9 +306,9 @@ def build_usage_event(
         raise UsageEventError("standard payload has no bounded provider")
 
     counts, completeness = _usage_counts(payload, status)
-    litellm_cost = (
-        _decimal_text(payload.get("response_cost")) if status == "success" else None
-    )
+    litellm_cost = None
+    if status == "success" and not _provider_usage_missing(payload):
+        litellm_cost = _decimal_text(payload.get("response_cost"))
     provider_cost = _provider_cost(payload) if status == "success" else None
 
     stream_value = payload.get("stream")
@@ -296,7 +328,7 @@ def build_usage_event(
         "project_id": project_id,
         "status": status,
         "stream": stream,
-        "retry_count": _retry_count(payload),
+        "retry_count": _retry_count(payload, kwargs),
         "occurred_at": _occurred_at(payload, end_time),
         **counts,
         "usage_completeness": completeness,

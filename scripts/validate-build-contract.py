@@ -149,6 +149,7 @@ def main() -> None:
             "!verify_openwebui_oauth.py",
             "!patch_openwebui_chroma.py",
             "!verify_openwebui_chroma.py",
+            "!patch_litellm_anthropic_usage.py",
             "!openwebui-wheels/",
             "!openwebui-wheels/SHA256SUMS",
             "!openwebui-wheels/README.md",

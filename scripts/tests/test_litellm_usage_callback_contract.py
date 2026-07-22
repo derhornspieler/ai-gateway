@@ -283,6 +283,32 @@ class LiteLLMUsageCallbackContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(event["cache_creation_1h_tokens"])
         self.assertEqual(event["usage_completeness"], "partial")
 
+    def test_patched_missing_provider_usage_stays_unknown(self) -> None:
+        kwargs = copy.deepcopy(self.fixture["kwargs"])
+        payload = kwargs["standard_logging_object"]
+        payload["hidden_params"]["additional_headers"][
+            "aigw-provider-usage-missing"
+        ] = "true"
+
+        event = self._event(kwargs)
+
+        self.assertEqual(event["usage_completeness"], "unknown")
+        self.assertTrue(
+            all(event[field] is None for field in self.callback.TOKEN_FIELDS)
+        )
+        self.assertIsNone(event["litellm_cost_usd"])
+
+    def test_provider_cannot_spoof_the_internal_missing_usage_signal(self) -> None:
+        kwargs = copy.deepcopy(self.fixture["kwargs"])
+        headers = kwargs["standard_logging_object"]["hidden_params"][
+            "additional_headers"
+        ]
+        headers["llm_provider-aigw-provider-usage-missing"] = "true"
+
+        event = self._event(kwargs)
+
+        self.assertEqual(event["usage_completeness"], "complete")
+
     def test_streaming_and_retry_values_are_recorded_without_labels(self) -> None:
         kwargs = copy.deepcopy(self.fixture["kwargs"])
         kwargs["stream"] = True
@@ -293,6 +319,30 @@ class LiteLLMUsageCallbackContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event["stream"])
         self.assertEqual(event["retry_count"], 2)
         self.assertNotIn("prometheus_labels", event)
+
+    def test_router_owned_retry_metadata_precedes_the_response_header(self) -> None:
+        kwargs = copy.deepcopy(self.fixture["kwargs"])
+        kwargs["litellm_params"] = {
+            "litellm_metadata": {"attempted_retries": 1},
+            "metadata": {"attempted_retries": 99},
+        }
+
+        event = self._event(kwargs)
+
+        self.assertEqual(event["retry_count"], 1)
+
+    def test_caller_retry_metadata_is_not_usage_evidence(self) -> None:
+        kwargs = copy.deepcopy(self.fixture["kwargs"])
+        kwargs["standard_logging_object"]["hidden_params"][
+            "additional_headers"
+        ].pop("x-litellm-attempted-retries")
+        kwargs["litellm_params"] = {
+            "metadata": {"attempted_retries": 99},
+        }
+
+        event = self._event(kwargs)
+
+        self.assertIsNone(event["retry_count"])
 
     def test_missing_or_malformed_stream_state_stays_unknown(self) -> None:
         kwargs = copy.deepcopy(self.fixture["kwargs"])

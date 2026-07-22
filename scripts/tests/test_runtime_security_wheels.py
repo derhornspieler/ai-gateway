@@ -10,6 +10,9 @@ WHEELS = ROOT / "services/dhi-health-probe/runtime-security-wheels"
 DOCKERIGNORE = ROOT / "services/dhi-health-probe/.dockerignore"
 DOCKER_STACK = ROOT / "ansible/roles/docker_stack/tasks/main.yml"
 LITELLM_DOCKERFILE = ROOT / "services/dhi-health-probe/Dockerfile.litellm"
+LITELLM_USAGE_PATCH = (
+    ROOT / "services/dhi-health-probe/patch_litellm_anthropic_usage.py"
+)
 OPENWEBUI_DOCKERFILE = ROOT / "services/dhi-health-probe/Dockerfile.open-webui"
 
 
@@ -41,11 +44,22 @@ class RuntimeSecurityWheelTests(unittest.TestCase):
         self.assertIn("USER 65532:65532", source)
         self.assertNotIn("pip install", source)
 
+    def test_litellm_missing_usage_patch_is_offline_and_fail_closed(self) -> None:
+        dockerfile = LITELLM_DOCKERFILE.read_text(encoding="utf-8")
+        patch = LITELLM_USAGE_PATCH.read_text(encoding="utf-8")
+        self.assertIn("--mount=type=bind,source=patch_litellm_anthropic_usage.py", dockerfile)
+        self.assertIn("importlib.metadata.version('litellm') == '1.93.0'", dockerfile)
+        self.assertIn("RUN --network=none", dockerfile)
+        self.assertIn('source.count(BEFORE) != 1', patch)
+        self.assertIn('aigw-provider-usage-missing', patch)
+        self.assertIn('usage_object=provider_usage', patch)
+
     def test_build_context_includes_the_security_wheels(self) -> None:
         source = DOCKERIGNORE.read_text(encoding="utf-8")
         self.assertIn("!Dockerfile.litellm", source)
         self.assertIn("!runtime-security-wheels/*.whl", source)
         self.assertIn("!runtime-security-wheels/SHA256SUMS", source)
+        self.assertIn("!patch_litellm_anthropic_usage.py", source)
 
     def test_ansible_stages_the_litellm_dockerfile(self) -> None:
         source = DOCKER_STACK.read_text(encoding="utf-8")

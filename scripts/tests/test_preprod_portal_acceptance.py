@@ -328,6 +328,16 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         self.assertIn('user="grafana_ro"', usage)
         self.assertIn("psycopg.errors.InsufficientPrivilege", usage)
         self.assertIn('"grafana_password": preprod.values.get(', usage)
+        self.assertIn("len(grafana_password) != 48", usage)
+        self.assertIn("def wait_for_new_real_rows(", usage)
+        self.assertIn('if row["request_id"] not in known_request_ids', usage)
+        self.assertEqual(
+            usage.count(
+                'known_request_ids = {row["request_id"] for row in '
+                "real_rows(connection)}"
+            ),
+            5,
+        )
         self.assertIn('"CONFIRM BACKDATED PRICE"', usage)
         self.assertIn("output_preview[\"affected_rows\"]", usage)
         self.assertIn("a changed usage replay did not fail closed", usage)
@@ -340,7 +350,7 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         # source; it never mounts the local Docker log root.
         self.assertIn('labels.get(OWNER_LABEL) != PROJECT', usage)
         self.assertIn(
-            'preprod.docker("stop", "--time", "10", key_rotator_id)', usage
+            'preprod.docker("stop", "-t", "10", key_rotator_id)', usage
         )
         self.assertIn("finally:\n        started, _ = preprod.docker", usage)
         self.assertIn('"litellm",\n        gap_started_at', usage)

@@ -63,6 +63,14 @@ The callback uses the exact field shapes in LiteLLM `v1.93.0`. For Anthropic,
 it accepts either the provider usage-report names or LiteLLM's standard prompt
 token details.
 
+LiteLLM `v1.93.0` has a logging bug when an Anthropic success response leaves
+out the whole `usage` field. Its logging worker stops before custom callbacks
+run. The gateway's immutable LiteLLM image applies one small, offline patch to
+the exact reviewed source. The patch adds an internal missing-usage marker and
+lets logging continue. The callback turns that marker into null token counts,
+unknown completeness, and no LiteLLM cost. A provider response header cannot
+set this marker. The image build stops if the pinned LiteLLM source changes.
+
 | Cost part | Accepted exact field |
 | --- | --- |
 | Normal input | `uncached_input_tokens` or standard `text_tokens` |

@@ -56,7 +56,7 @@ Three reviewed upstream exceptions remain:
 
 | Image | Reason |
 | --- | --- |
-| LiteLLM `1.93.0-aigw1` | Exact upstream `v1.93.0` base with one reviewed, offline security-wheel replacement |
+| LiteLLM `1.93.0-aigw1` | Exact upstream `v1.93.0` base with one offline security-wheel replacement and one missing-usage logging fix |
 | Open WebUI `0.10.2-aigw2` | No matching application DHI image was available |
 | Samba AD test image | Local preprod only; never a production directory |
 
@@ -65,10 +65,14 @@ An exception does not allow a floating tag or skipped scan.
 ### LiteLLM security derivative
 
 The `1.93.0-aigw1` image keeps the exact upstream LiteLLM `v1.93.0` base. Its
-network-disabled build removes only `pyasn1` `0.6.3` and installs the reviewed
-`0.6.4` wheel. The wheel and its SHA-256 hash are committed. The build fails if
-the base package layout or installed version changes. It also pins the runtime
-user to `65532:65532`.
+network-disabled build removes `pyasn1` `0.6.3` and installs the reviewed
+`0.6.4` wheel. It also fixes one LiteLLM logging error. Without that fix, an
+Anthropic success response with no `usage` field skips the gateway accounting
+callback. The fix marks that response as unknown usage. It does not read the
+prompt or reply. The wheel, its SHA-256 hash, and the small source patch are
+committed. The build stops if the base package layout, LiteLLM version, or
+reviewed source fragment changes. It also pins the runtime user to
+`65532:65532`.
 
 Read-only package checks passed for AMD64 and ARM64. The exact offline-seed
 PreProd test and protected GitHub image scans still must pass before release.

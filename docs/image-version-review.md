@@ -105,12 +105,15 @@ The hash-locked transitive packages passed `pip-audit`. A future direct pin
 change must regenerate the matching lock file and rebuild the release.
 
 The LiteLLM derivative keeps the exact `v1.93.0` application base. Its
-network-disabled build replaces only `pyasn1` `0.6.3` with the reviewed
-`0.6.4` wheel. The Open WebUI derivative installs reviewed `pyasn1` `0.6.4`
-and `GitPython` `3.1.54` wheels along with its existing runtime updates. The
-repository stores each wheel and its SHA-256 hash. Both AMD64 and ARM64 builds
-passed read-only package checks. The current exact-seed and GitHub scan gates
-still must pass before release.
+network-disabled build replaces `pyasn1` `0.6.3` with the reviewed `0.6.4`
+wheel. It also applies one exact missing-usage logging patch. That patch lets
+the prompt-free accounting callback record unknown usage when Anthropic omits
+the `usage` field. The build stops if the pinned LiteLLM version or reviewed
+source fragment changes. The Open WebUI derivative installs reviewed
+`pyasn1` `0.6.4` and `GitPython` `3.1.54` wheels along with its existing
+runtime updates. The repository stores each wheel and its SHA-256 hash. Both
+AMD64 and ARM64 builds passed read-only package checks. The current exact-seed
+and GitHub scan gates still must pass before release.
 
 ## Production host tools
 
