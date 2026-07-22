@@ -176,6 +176,31 @@ KEYCLOAK_SECURITY_EVENT_TYPES = (
     "USER_DISABLED_BY_TEMPORARY_LOCKOUT",
     "USER_DISABLED_BY_TEMPORARY_LOCKOUT_ERROR",
 )
+
+# Security events leave the local logging boundary for the SOC feed. Keep the
+# producer schema fixed here; callers cannot add a new action or outcome by
+# passing an arbitrary string.
+IDENTITY_AUDIT_ACTIONS = frozenset(
+    {
+        "bootstrap",
+        "bootstrap_cleanup",
+        "break_glass_activate",
+        "break_glass_disable",
+        "break_glass_use",
+        "deployment_converge",
+        "group_create",
+        "group_delete",
+        "group_member_add",
+        "group_member_remove",
+        "group_policy_update",
+        "ldap_check",
+        "ldap_drift_detected",
+        "ldap_recovery",
+        "managed_identity_drift_detected",
+        "managed_identity_recovery",
+    }
+)
+IDENTITY_AUDIT_OUTCOMES = frozenset({"success", "failed"})
 KEYCLOAK_SECURITY_EVENT_REALMS = ("master", "aigw", "anthropic-wif")
 BROKER_SUBJECT_MAPPER_NAME = "anthropic-stable-subject"
 @dataclass(frozen=True)
@@ -3066,17 +3091,44 @@ class KeycloakAdmin:
 
     async def _set_break_glass_enabled(
         self, user: dict[str, Any], enabled: bool, admin_token: str
-    ) -> None:
+    ) -> bool:
         user_id = path_segment(user.get("id"), label="break-glass user UUID")
         representation = dict(user)
         representation["enabled"] = enabled
-        await self._request(
-            "PUT",
-            f"/admin/realms/master/users/{user_id}",
-            token=admin_token,
-            json_body=representation,
-            expected=(204,),
-        )
+        action = "break_glass_activate" if enabled else "break_glass_disable"
+        was_enabled = user.get("enabled") is True
+        try:
+            await self._request(
+                "PUT",
+                f"/admin/realms/master/users/{user_id}",
+                token=admin_token,
+                json_body=representation,
+                expected=(204,),
+            )
+            refreshed = await self._master_user_by_username(
+                str(user.get("username") or ""), admin_token
+            )
+            attributes = refreshed.get("attributes") if refreshed else None
+            if (
+                not isinstance(refreshed, dict)
+                or refreshed.get("id") != user_id
+                or refreshed.get("enabled") is not enabled
+                or not isinstance(attributes, dict)
+                or attributes.get(BREAK_GLASS_ATTRIBUTE) not in (["true"], "true")
+            ):
+                raise IdentityError(
+                    "Keycloak did not verify the break-glass account state"
+                )
+        except Exception as exc:
+            await self._audit(action, "failed", {"error_type": type(exc).__name__})
+            raise
+
+        user.clear()
+        user.update(refreshed)
+        changed = was_enabled != enabled
+        if changed:
+            await self._audit(action, "success", {})
+        return changed
 
     async def _ensure_master_profile_marker(self, admin_token: str) -> None:
         """Declare the break-glass marker in master's user profile.
@@ -3320,7 +3372,11 @@ class KeycloakAdmin:
             # Never leave a password-backed master administrator enabled
             # without a proven Vault escrow. Best-effort disable, then fail.
             try:
-                await self._set_break_glass_enabled(user, False, admin_token)
+                changed = await self._set_break_glass_enabled(
+                    user, False, admin_token
+                )
+                if not changed:
+                    await self._audit("break_glass_disable", "success", {})
             except Exception:  # noqa: BLE001 - the original failure wins
                 pass
             raise
@@ -3462,6 +3518,8 @@ class KeycloakAdmin:
             raise IdentityError(
                 "Keycloak did not retire the temporary bootstrap administrator"
             )
+        if changed:
+            await self._audit("bootstrap_cleanup", "success", {"changed": True})
         return changed
 
     def _vault_oidc_rp_escrow_doc(self) -> dict[str, Any] | None:
@@ -3529,6 +3587,9 @@ class KeycloakAdmin:
         return str(escrow["created_at"])
 
     async def _audit(self, action: str, status: str, detail: dict[str, Any]) -> None:
+        if action not in IDENTITY_AUDIT_ACTIONS or status not in IDENTITY_AUDIT_OUTCOMES:
+            logger.error("identity security event rejected an internal schema value")
+            return
         try:
             await self.db.record_history(
                 "identity",
@@ -3550,9 +3611,11 @@ class KeycloakAdmin:
                 "changed",
                 "error_type",
                 "federation_configured",
+                "group",
                 "ldap_provider",
                 "purpose",
                 "project",
+                "target_subject",
                 "temporary_bootstrap_service_deleted",
                 "break_glass_admin_ensured",
                 "vault_oidc_rp_escrowed",
@@ -3650,7 +3713,15 @@ class KeycloakAdmin:
                     "vault_oidc_rp_escrowed": True,
                 },
             )
-            return await self.status()
+            result = await self.status()
+            if (
+                result.get("bootstrap_available") is False
+                and result.get("bootstrap_cleanup_required") is False
+            ):
+                await self._audit(
+                    "bootstrap_cleanup", "success", {"changed": True}
+                )
+            return result
         except Exception as exc:
             await self._audit(
                 "bootstrap", "failed", {"error_type": type(exc).__name__}
@@ -3821,7 +3892,8 @@ class KeycloakAdmin:
         async with self._bootstrap_lock:
             changed = False
             before = await self.status()
-            if not self._deployment_status_verified(before):
+            deployment_was_verified = self._deployment_status_verified(before)
+            if not deployment_was_verified:
                 await self._bootstrap_locked()
                 changed = True
 
@@ -3860,11 +3932,31 @@ class KeycloakAdmin:
                     for name, value in desired_config.items()
                 )
             )
-            federation_id = await self._ensure_ldap_federation(
-                admin_token, bind_password
-            )
-            if not isinstance(federation_id, str) or not federation_id:
-                raise IdentityError("Keycloak did not return an LDAPS provider ID")
+            ldap_drift = deployment_was_verified and ldap_changed
+            if ldap_drift:
+                await self._audit(
+                    "ldap_drift_detected",
+                    "failed",
+                    {"ldap_provider": spec.provider_name},
+                )
+            try:
+                federation_id = await self._ensure_ldap_federation(
+                    admin_token, bind_password
+                )
+                if not isinstance(federation_id, str) or not federation_id:
+                    raise IdentityError(
+                        "Keycloak did not return an LDAPS provider ID"
+                    )
+            except Exception as exc:
+                await self._audit(
+                    "ldap_check",
+                    "failed",
+                    {
+                        "error_type": type(exc).__name__,
+                        "ldap_provider": spec.provider_name,
+                    },
+                )
+                raise
             changed = ldap_changed or changed
             changed = (
                 self._update_deployment_federation_state(
@@ -3890,6 +3982,23 @@ class KeycloakAdmin:
                 or state_doc.get("federation_provider_name") != spec.provider_name
             ):
                 raise IdentityError("durable identity state does not match live LDAPS")
+            if ldap_drift:
+                await self._audit(
+                    "ldap_recovery",
+                    "success",
+                    {"ldap_provider": spec.provider_name},
+                )
+            if deployment_was_verified and changed:
+                await self._audit(
+                    "managed_identity_drift_detected",
+                    "failed",
+                    {"changed": True},
+                )
+                await self._audit(
+                    "managed_identity_recovery",
+                    "success",
+                    {"changed": True},
+                )
             await self._audit(
                 "deployment_converge",
                 "success",
@@ -4628,7 +4737,11 @@ class KeycloakAdmin:
         await self._audit(
             "group_create",
             "success",
-            {"group_id": group_id, "capabilities": sorted(capability_set)},
+            {
+                "group_id": group_id,
+                "group": clean_name,
+                "capabilities": sorted(capability_set),
+            },
         )
         return {
             "id": group_id,
@@ -4655,7 +4768,11 @@ class KeycloakAdmin:
             token=token,
             expected=(204,),
         )
-        await self._audit("group_delete", "success", {"group_id": safe_group})
+        await self._audit(
+            "group_delete",
+            "success",
+            {"group_id": safe_group, "group": safe_group},
+        )
 
     async def add_member(self, group_id: str, user_id: str) -> None:
         async with self._group_topology_lock:
@@ -4682,7 +4799,12 @@ class KeycloakAdmin:
         await self._audit(
             "group_member_add",
             "success",
-            {"group_id": safe_group, "user_id": safe_user},
+            {
+                "group_id": safe_group,
+                "user_id": safe_user,
+                "group": safe_group,
+                "target_subject": safe_user,
+            },
         )
 
     async def _managed_admin_user_ids(
@@ -4873,5 +4995,11 @@ class KeycloakAdmin:
         await self._audit(
             "group_member_remove",
             "success",
-            {"group_id": safe_group, "user_id": safe_user, "project": project_id},
+            {
+                "group_id": safe_group,
+                "user_id": safe_user,
+                "group": safe_group,
+                "target_subject": safe_user,
+                "project": project_id,
+            },
         )

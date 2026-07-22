@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 import httpx
 import pytest
@@ -691,25 +693,48 @@ def test_provider_rotation_security_event_is_bounded(caplog) -> None:
         scheduler._audit_rotation_result(
             "anthropic",
             RotationResult(status="success", detail="secret provider response"),
+            rotation_id=scheduler._new_rotation_id(),
+            attempt=1,
         )
         scheduler._audit_rotation_result(
             "unreviewed-vendor",
             RotationResult(status="unexpected", detail="another secret"),
+            rotation_id=scheduler._new_rotation_id(),
+            attempt=1,
         )
 
-    security_lines = [
-        record.message
+    security_events = [
+        json.loads(record.message.removeprefix("AIGW_SECURITY_EVENT "))
         for record in caplog.records
         if record.message.startswith("AIGW_SECURITY_EVENT ")
     ]
-    assert security_lines == [
-        'AIGW_SECURITY_EVENT {"action":"rotate","event":"aigw.provider.rotation",'
-        '"outcome":"success","rotation_status":"success","schema_version":1,'
-        '"vendor":"anthropic"}',
-        'AIGW_SECURITY_EVENT {"action":"rotate","event":"aigw.provider.rotation",'
-        '"outcome":"failure","rotation_status":"failed","schema_version":1,'
-        '"vendor":"unknown"}',
+    assert [
+        {key: value for key, value in event.items() if key != "rotation_id"}
+        for event in security_events
+    ] == [
+        {
+            "action": "rotate",
+            "attempt": 1,
+            "event": "aigw.provider.rotation",
+            "outcome": "success",
+            "rotation_status": "success",
+            "schema_version": 1,
+            "vendor": "anthropic",
+        },
+        {
+            "action": "rotate",
+            "attempt": 1,
+            "event": "aigw.provider.rotation",
+            "outcome": "failure",
+            "rotation_status": "failed",
+            "schema_version": 1,
+            "vendor": "unknown",
+        },
     ]
+    for event in security_events:
+        rotation_id = event["rotation_id"]
+        assert UUID(rotation_id).version == 4
+        assert str(UUID(rotation_id)) == rotation_id
     assert "provider response" not in caplog.text
     assert "another secret" not in caplog.text
     assert "unreviewed-vendor" not in caplog.text
@@ -1371,9 +1396,15 @@ async def test_anthropic_failure_keeps_retry_deadline_when_state_db_is_down() ->
     )
 
     result = await AnthropicWifDriver()._handle_failure(
-        ctx, dict(ctx.vendor_settings["config"]), RuntimeError("exchange failed")
+        ctx,
+        dict(ctx.vendor_settings["config"]),
+        RuntimeError("exchange failed"),
+        stage="token_exchange",
     )
 
     assert result.status == "failed"
+    assert result.detail == (
+        "rotation failed: stage=token_exchange reason=internal_failure"
+    )
     assert result.next_run_seconds is not None
     assert 0 < result.next_run_seconds <= 1800

@@ -77,8 +77,11 @@ class FakeVault:
 
 
 class FakeDB:
+    def __init__(self) -> None:
+        self.history: list[tuple] = []
+
     async def record_history(self, *args):
-        pass
+        self.history.append(args)
 
 
 class FakeMasterRealm:
@@ -339,12 +342,16 @@ class FakeMasterRealm:
 
 
 def admin_with(
-    master: FakeMasterRealm, vault: FakeVault, **setting_overrides
+    master: FakeMasterRealm,
+    vault: FakeVault,
+    *,
+    db: FakeDB | None = None,
+    **setting_overrides,
 ) -> KeycloakAdmin:
     return KeycloakAdmin(
         settings(**setting_overrides),
         vault,
-        FakeDB(),
+        db or FakeDB(),
         transport=httpx.MockTransport(master),
     )
 
@@ -374,14 +381,16 @@ VALID_ESCROW = {
 
 
 @pytest.mark.asyncio
-async def test_fresh_provision_orders_policy_profile_credential_and_enable() -> None:
+async def test_fresh_provision_orders_policy_profile_credential_and_enable(caplog) -> None:
     events: list[tuple[str, str]] = []
     master = FakeMasterRealm(events=events)
     vault = FakeVault(events=events)
+    db = FakeDB()
 
-    result = await admin_with(master, vault)._ensure_break_glass_admin(
-        "master-token"
-    )
+    with caplog.at_level("INFO", logger="key_rotator.identity"):
+        result = await admin_with(master, vault, db=db)._ensure_break_glass_admin(
+            "master-token"
+        )
 
     assert result == {
         "username": "break-glass-admin",
@@ -419,6 +428,10 @@ async def test_fresh_provision_orders_policy_profile_credential_and_enable() -> 
     ]
     assert order == sorted(order), events
     assert ("keycloak", "user_disabled") not in events
+    assert db.history == [
+        ("identity", "break_glass_activate", "success", "{}")
+    ]
+    assert escrow["password"] not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -534,14 +547,19 @@ async def test_enabled_unescrowed_user_is_disabled_before_membership() -> None:
         password="operator-set-password-0123456789",
     )
     vault = FakeVault(events=events)  # no escrow at all
+    db = FakeDB()
 
-    await admin_with(master, vault)._ensure_break_glass_admin("master-token")
+    await admin_with(master, vault, db=db)._ensure_break_glass_admin("master-token")
 
     disabled = events.index(("keycloak", "user_disabled"))
     membership = events.index(("keycloak", "membership_put"))
     assert disabled < membership
     assert master.users["break-glass-admin"]["enabled"] is True
     assert BG_VAULT_PATH in vault.docs
+    assert [entry[1:3] for entry in db.history] == [
+        ("break_glass_disable", "success"),
+        ("break_glass_activate", "success"),
+    ]
 
 
 @pytest.mark.asyncio

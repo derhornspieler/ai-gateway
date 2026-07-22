@@ -276,6 +276,38 @@ async def test_managed_ldap_drift_is_repaired_and_reported() -> None:
     assert await admin.converge_deployment_identity() == "applied"
     assert admin.ensure_calls == 1
     assert admin.proof_calls == 1
+    assert admin.audit_calls == [
+        (
+            "break_glass_use",
+            "success",
+            {"purpose": "deployment_converge"},
+        ),
+        (
+            "ldap_drift_detected",
+            "failed",
+            {"ldap_provider": "corp-ad"},
+        ),
+        (
+            "ldap_recovery",
+            "success",
+            {"ldap_provider": "corp-ad"},
+        ),
+        (
+            "managed_identity_drift_detected",
+            "failed",
+            {"changed": True},
+        ),
+        (
+            "managed_identity_recovery",
+            "success",
+            {"changed": True},
+        ),
+        (
+            "deployment_converge",
+            "success",
+            {"changed": True, "ldap_provider": "corp-ad"},
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -284,6 +316,11 @@ async def test_wif_frontend_domain_drift_is_repaired_and_reported() -> None:
 
     assert await admin.converge_deployment_identity() == "applied"
     assert admin.wif_calls == 1
+    assert (
+        "managed_identity_recovery",
+        "success",
+        {"changed": True},
+    ) in admin.audit_calls
 
 
 @pytest.mark.asyncio
@@ -405,7 +442,12 @@ async def test_bad_bind_stops_before_callbacks_cleanup_or_success_audit() -> Non
             "break_glass_use",
             "success",
             {"purpose": "deployment_converge"},
-        )
+        ),
+        (
+            "ldap_check",
+            "failed",
+            {"error_type": "IdentityConflict", "ldap_provider": "corp-ad"},
+        ),
     ]
 
 
@@ -469,12 +511,56 @@ async def test_final_status_must_still_be_strictly_complete(monkeypatch) -> None
     ]
 
 
+@pytest.mark.asyncio
+async def test_ldap_recovery_waits_for_the_final_deployment_gate(monkeypatch) -> None:
+    admin = DeploymentHarness(component="drifted")
+    calls = 0
+
+    async def status():
+        nonlocal calls
+        calls += 1
+        return complete_status() if calls == 1 else incomplete_status()
+
+    monkeypatch.setattr(admin, "status", status)
+
+    with pytest.raises(IdentityError, match="did not verify"):
+        await admin.converge_deployment_identity()
+
+    actions = [action for action, _status, _detail in admin.audit_calls]
+    assert "ldap_drift_detected" in actions
+    assert "ldap_recovery" not in actions
+    assert "managed_identity_recovery" not in actions
+
+
+@pytest.mark.asyncio
+async def test_ldap_recovery_waits_for_durable_state_verification(monkeypatch) -> None:
+    admin = DeploymentHarness(component="drifted")
+
+    monkeypatch.setattr(
+        admin,
+        "_identity_state",
+        lambda: {
+            "federation_provider_id": "wrong-provider",
+            "federation_provider_name": "corp-ad",
+        },
+    )
+
+    with pytest.raises(IdentityError, match="durable identity state"):
+        await admin.converge_deployment_identity()
+
+    actions = [action for action, _status, _detail in admin.audit_calls]
+    assert "ldap_drift_detected" in actions
+    assert "ldap_recovery" not in actions
+    assert "managed_identity_recovery" not in actions
+
+
 class CleanupHarness(KeycloakAdmin):
     def __init__(self, attributes: dict[str, object]) -> None:
         super().__init__(settings(), object(), object())
         self.attributes = attributes
         self.client_present = True
         self.deleted = False
+        self.audit_calls: list[tuple[str, str, dict]] = []
 
     async def _bootstrap_admin_users(self, admin_token):
         assert admin_token == "break-glass-token"
@@ -495,6 +581,9 @@ class CleanupHarness(KeycloakAdmin):
         self.client_present = False
         return httpx.Response(204)
 
+    async def _audit(self, action, status, detail):
+        self.audit_calls.append((action, status, detail))
+
 
 @pytest.mark.asyncio
 async def test_cleanup_deletes_only_the_exact_marked_temporary_client() -> None:
@@ -504,6 +593,9 @@ async def test_cleanup_deletes_only_the_exact_marked_temporary_client() -> None:
         "break-glass-token"
     )
     assert admin.deleted is True
+    assert admin.audit_calls == [
+        ("bootstrap_cleanup", "success", {"changed": True})
+    ]
 
 
 @pytest.mark.asyncio

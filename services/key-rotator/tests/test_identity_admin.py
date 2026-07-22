@@ -76,6 +76,73 @@ class FakeDB:
         self.history.append(args)
 
 
+@pytest.mark.asyncio
+async def test_identity_soc_audit_projects_group_and_target_subject(caplog) -> None:
+    admin = KeycloakAdmin(settings(), FakeVault(), FakeDB())
+
+    with caplog.at_level("INFO", logger="key_rotator.identity"):
+        for action, detail in (
+            ("group_create", {"group": "project-1"}),
+            ("group_delete", {"group": "group-1"}),
+            (
+                "group_member_add",
+                {"group": "group-1", "target_subject": "user-1"},
+            ),
+            (
+                "group_member_remove",
+                {"group": "group-1", "target_subject": "user-1"},
+            ),
+        ):
+            await admin._audit(
+                action,
+                "success",
+                {
+                    **detail,
+                    "ignored_secret": "must-not-leave-local-history",
+                },
+            )
+
+    exported = [
+        json.loads(record.message.removeprefix("AIGW_SECURITY_EVENT "))
+        for record in caplog.records
+        if record.name == "key_rotator.identity"
+        and record.message.startswith("AIGW_SECURITY_EVENT ")
+    ]
+    assert exported == [
+        {
+            "schema_version": 1,
+            "event": "aigw.identity.audit",
+            "action": "group_create",
+            "outcome": "success",
+            "group": "project-1",
+        },
+        {
+            "schema_version": 1,
+            "event": "aigw.identity.audit",
+            "action": "group_delete",
+            "outcome": "success",
+            "group": "group-1",
+        },
+        {
+            "schema_version": 1,
+            "event": "aigw.identity.audit",
+            "action": "group_member_add",
+            "outcome": "success",
+            "group": "group-1",
+            "target_subject": "user-1",
+        },
+        {
+            "schema_version": 1,
+            "event": "aigw.identity.audit",
+            "action": "group_member_remove",
+            "outcome": "success",
+            "group": "group-1",
+            "target_subject": "user-1",
+        },
+    ]
+    assert "must-not-leave-local-history" not in caplog.text
+
+
 async def no_op_portal_key_revoker(user_id: str, project_id: str) -> None:
     """Test double for successful, already-verified LiteLLM revocation."""
 
@@ -501,6 +568,7 @@ async def test_status_returns_fingerprints_never_private_key_material(monkeypatc
 async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> None:
     events: list[tuple[str, str]] = []
     vault = FakeVault(events=events)
+    db = FakeDB()
 
     class OrderedAdmin(KeycloakAdmin):
         async def _bootstrap_token(self):
@@ -538,10 +606,18 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
             events.append(("keycloak", "bootstrap_deleted"))
 
         async def status(self):
-            return {"configured": True}
+            return {
+                "configured": True,
+                "bootstrap_available": False,
+                "bootstrap_cleanup_required": False,
+            }
 
-    result = await OrderedAdmin(settings(**RP_SECRETS), vault, FakeDB()).bootstrap()
-    assert result == {"configured": True}
+    result = await OrderedAdmin(settings(**RP_SECRETS), vault, db).bootstrap()
+    assert result == {
+        "configured": True,
+        "bootstrap_available": False,
+        "bootstrap_cleanup_required": False,
+    }
     break_glass = events.index(("keycloak", "break_glass_ensured"))
     vault_rp_escrow = events.index(
         ("vault_write", "ai-gateway/keycloak/vault-oidc-rp")
@@ -558,6 +634,7 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
     assert escrow["schema_version"] == 1
     assert escrow["client_id"] == "vault"
     assert escrow["client_secret"] == RP_SECRETS["VAULT_OIDC_CLIENT_SECRET"]
+    assert [entry[1] for entry in db.history].count("bootstrap_cleanup") == 1
 
 
 @pytest.mark.asyncio

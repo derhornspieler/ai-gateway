@@ -47,13 +47,14 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from app import health
 from app.drivers.base import BaseDriver, DriverContext, RotationResult
+from app.litellm_client import LiteLLMError
 from app.provider_state import (
     CREDENTIAL_ISSUED,
     CREDENTIAL_LIFECYCLE_FIELD,
     CREDENTIAL_PROMOTION_PENDING,
 )
 from app.security import validate_wif_token_claims
-from app.vault_client import VaultError, mask_secret
+from app.vault_client import VaultError
 
 logger = logging.getLogger("key_rotator.drivers.anthropic_wif")
 
@@ -68,9 +69,46 @@ REQUIRED_BOOTSTRAP_FIELDS = [
 MIN_BACKOFF_SECONDS = 15.0
 MAX_BACKOFF_SECONDS = 1800.0
 
+FAILURE_STAGES = frozenset(
+    {
+        "vault_read",
+        "token_exchange",
+        "credential_promotion",
+        "failure_state",
+        "internal",
+    }
+)
+
 # Lifetime of the private_key_jwt client assertion we present to Keycloak.
 # Short by design (RFC 7523 §3: exp is the only required time claim).
 CLIENT_ASSERTION_LIFETIME_SECONDS = 60
+
+
+def _failure_reason(exc: Exception) -> str:
+    """Map an exception to a fixed, non-secret diagnostic."""
+    if isinstance(exc, VaultError):
+        return "vault_unavailable"
+    if isinstance(exc, httpx.TimeoutException):
+        return "request_timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if 400 <= status < 500:
+            return "request_rejected"
+        if 500 <= status < 600:
+            return "upstream_unavailable"
+        return "http_failure"
+    if isinstance(exc, httpx.RequestError):
+        return "transport_failure"
+    if isinstance(exc, LiteLLMError):
+        return "gateway_credential_failure"
+    if isinstance(exc, (pyjwt.PyJWTError, KeyError, TypeError, ValueError)):
+        return "invalid_material"
+    return "internal_failure"
+
+
+def _failure_detail(stage: str, exc: Exception) -> str:
+    safe_stage = stage if stage in FAILURE_STAGES else "internal"
+    return f"rotation failed: stage={safe_stage} reason={_failure_reason(exc)}"
 
 
 def _assertion_alg_for_key(key: Any) -> str:
@@ -99,10 +137,12 @@ class AnthropicWifDriver(BaseDriver):
         except VaultError as exc:
             # A vault read error is NOT "not bootstrapped" — do not claim
             # disabled and silently stop refreshing a live token.
-            detail = f"vault read error reading anthropic-wif bootstrap ({exc}); not rotating"
-            logger.error("anthropic_wif: %s", detail)
-            health.set_alert("anthropic.token_exchange", detail)
-            return await self._handle_failure(ctx, dict(ctx.vendor_settings.get("config") or {}), exc)
+            return await self._handle_failure(
+                ctx,
+                dict(ctx.vendor_settings.get("config") or {}),
+                exc,
+                stage="vault_read",
+            )
         if not bootstrap or any(f not in bootstrap for f in REQUIRED_BOOTSTRAP_FIELDS):
             detail = "anthropic-wif bootstrap config missing/incomplete in vault (Phase 0 not yet done)"
             logger.info("anthropic_wif: %s", detail)
@@ -114,7 +154,9 @@ class AnthropicWifDriver(BaseDriver):
             assertion = await self._get_keycloak_jwt(ctx, bootstrap)
             access_token, expires_in = await self._exchange_anthropic_token(ctx, bootstrap, assertion)
         except Exception as exc:  # noqa: BLE001
-            return await self._handle_failure(ctx, state, exc)
+            return await self._handle_failure(
+                ctx, state, exc, stage="token_exchange"
+            )
 
         try:
             # Persist an indeterminate marker before handing a newly minted
@@ -137,28 +179,36 @@ class AnthropicWifDriver(BaseDriver):
             # the gateway actually holds the token and its refresh deadline
             # is durable. Previously this flag went green before promotion,
             # hiding a LiteLLM failure while the active token expired.
-            health.set_alert(
-                "anthropic.token_exchange",
-                f"token minted but gateway promotion/state persistence failed: {exc}",
+            return await self._handle_failure(
+                ctx,
+                state,
+                exc,
+                stage="credential_promotion",
             )
-            return await self._handle_failure(ctx, state, exc)
 
         health.set_ok("anthropic.token_exchange")
 
         next_run = max(30.0, expires_in * 0.8)
         detail = (
-            f"rotated anthropic-primary, new token={mask_secret(access_token)}, "
-            f"expires_in={expires_in}s, next refresh in {next_run:.0f}s"
+            f"rotated anthropic-primary; expires_in={expires_in}s; "
+            f"next refresh in {next_run:.0f}s"
         )
         logger.info("anthropic_wif: %s", detail)
         return RotationResult(status="success", detail=detail, next_run_seconds=next_run)
 
     async def _handle_failure(
-        self, ctx: DriverContext, state: dict[str, Any], exc: Exception
+        self,
+        ctx: DriverContext,
+        state: dict[str, Any],
+        exc: Exception,
+        *,
+        stage: str,
     ) -> RotationResult:
-        detail = f"rotation failed: {exc}"
+        detail = _failure_detail(stage, exc)
         logger.error("anthropic_wif: %s", detail)
-        await ctx.db.record_history(self.name, "rotate", "failed", detail)
+        health.set_alert("anthropic.token_exchange", detail)
+        # Return the failure to RotationScheduler. It owns the single
+        # rotation_history row for every driver attempt.
 
         # Anthropic returns opaque 400 invalid_grant for ALL exchange
         # failures — including signature verification against a stale
@@ -201,14 +251,9 @@ class AnthropicWifDriver(BaseDriver):
             # State persistence being down must not discard the calculated
             # retry deadline. The scheduler can still retry before the active
             # token expires even while Postgres is degraded.
-            logger.error(
-                "anthropic_wif: could not persist failure state: %s",
-                persist_exc,
-            )
-            health.set_alert(
-                "anthropic.token_exchange",
-                f"rotation failed and retry state could not be persisted: {persist_exc}",
-            )
+            persist_detail = _failure_detail("failure_state", persist_exc)
+            logger.error("anthropic_wif: %s", persist_detail)
+            health.set_alert("anthropic.token_exchange", persist_detail)
 
         # Bound the failure backoff so persistent failure does NOT push the
         # next attempt out past the normal refresh cadence — otherwise the
@@ -307,6 +352,7 @@ class AnthropicWifDriver(BaseDriver):
             data["client_assertion_type"] = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
             data["client_assertion"] = self._build_client_assertion(ctx, bootstrap)
         except Exception as exc:  # noqa: BLE001
+            reason = _failure_reason(exc)
             if not (
                 ctx.settings.anthropic_wif_allow_insecure_client_secret
                 and bootstrap.get("kc_client_secret")
@@ -320,20 +366,21 @@ class AnthropicWifDriver(BaseDriver):
                 health.set_alert(
                     "anthropic.token_exchange",
                     "private_key_jwt client assertion unavailable "
-                    f"({exc}) and insecure static-secret fallback is disabled — "
+                    f"(reason={reason}) and insecure static-secret fallback is disabled — "
                     "cannot authenticate to Keycloak. Provision the signing key: set "
-                    "KC_CLIENT_ASSERTION_KEY_FILE or write private_key_pem to vault path "
-                    f"'{ctx.settings.kc_client_assertion_key_vault_path}', and set the "
+                    "KC_CLIENT_ASSERTION_KEY_FILE or write private_key_pem to the reviewed "
+                    "Vault path, and set the "
                     "Keycloak client's clientAuthenticatorType to 'client-jwt'.",
                 )
                 raise
             logger.error(
-                "anthropic_wif: INSECURE — private_key_jwt client assertion unavailable (%s) "
+                "anthropic_wif: INSECURE — private_key_jwt client assertion unavailable "
+                "(reason=%s) "
                 "and ANTHROPIC_WIF_ALLOW_INSECURE_CLIENT_SECRET=true: falling back to the "
                 "static kc_client_secret. This violates the WIF design "
                 "(docs/anthropic-wif-bootstrap.md Phase 0 step 2) and must NEVER be enabled "
                 "in production.",
-                exc,
+                reason,
             )
             data.pop("client_assertion_type", None)
             data.pop("client_assertion", None)

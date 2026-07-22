@@ -76,6 +76,14 @@ PORTAL_KEY_RECONCILE_DIGEST_SEED = hashlib.sha256(
 ONESHOT_READINESS_RETRY_SECONDS = 30.0
 MIN_DYNAMIC_DELAY_SECONDS = 5.0
 MAX_DYNAMIC_DELAY_SECONDS = 365.0 * 86400.0
+MAX_ROTATION_ATTEMPTS = 999
+
+ROTATION_EVENT = "aigw.provider.rotation"
+ROTATION_ACTIONS = frozenset({"start", "attempt", "rotate", "recovery"})
+ROTATION_RESULT_STATUSES = frozenset({"success", "failed", "skipped", "disabled"})
+ROTATION_STATUSES = frozenset(
+    {"started", "success", "failed", "skipped", "disabled", "recovered"}
+)
 
 
 @dataclass(frozen=True)
@@ -100,6 +108,14 @@ class _PortalKeyReconcileCursor:
             "reference_digest": self.reference_digest,
             "had_access_error": self.had_access_error,
         }
+
+
+@dataclass
+class _RotationLifecycle:
+    """One provider rotation, including any driver-requested retries."""
+
+    rotation_id: str
+    attempt: int = 0
 
 
 class _NullSpan:
@@ -143,6 +159,12 @@ class RotationScheduler:
         # set after a terminal outcome and is cleared on disable or when the
         # row leaves zero-interval mode, allowing a genuine later re-entry.
         self._oneshot_scheduled: set[str] = set()
+        # A failed attempt can request a bounded retry. Keep its ID and attempt
+        # number until that lifecycle reaches a terminal result. The durable
+        # Anthropic failure counter also lets a new process report recovery
+        # after a restart.
+        self._rotation_lifecycles: dict[str, _RotationLifecycle] = {}
+        self._rotation_degraded: set[str] = set()
         self._jwks_watcher: Optional[AnthropicJwksWatcher] = None
         if "anthropic" in drivers:
             self._jwks_watcher = AnthropicJwksWatcher(
@@ -268,7 +290,9 @@ class RotationScheduler:
         )
 
     @staticmethod
-    def _security_event(event: str, action: str, outcome: str, **fields: str) -> None:
+    def _security_event(
+        event: str, action: str, outcome: str, **fields: str | int
+    ) -> None:
         document = {
             "schema_version": 1,
             "event": event,
@@ -305,20 +329,137 @@ class RotationScheduler:
             state=state,
         )
 
-    def _audit_rotation_result(self, vendor: str, result: RotationResult) -> None:
-        safe_vendor = vendor if vendor in self._drivers else "unknown"
+    @staticmethod
+    def _new_rotation_id() -> str:
+        """Return the only rotation correlation-ID form emitted externally."""
+        return str(uuid.uuid4())
+
+    def _rotation_event(
+        self,
+        *,
+        action: str,
+        vendor: str,
+        rotation_id: str,
+        rotation_status: str,
+        attempt: int | None = None,
+    ) -> None:
+        """Emit one bounded provider-rotation event.
+
+        All values come from fixed scheduler state. Driver detail, exception
+        text, credentials, and provider responses never enter this record.
+        """
+        if action not in ROTATION_ACTIONS:
+            logger.error("rotation security event rejected an internal action")
+            return
+
+        try:
+            parsed_id = uuid.UUID(rotation_id)
+        except (AttributeError, TypeError, ValueError):
+            logger.error("rotation security event rejected an internal rotation ID")
+            return
+        if parsed_id.version != 4 or str(parsed_id) != rotation_id:
+            logger.error("rotation security event rejected a non-canonical rotation ID")
+            return
+
         safe_status = (
-            result.status
-            if result.status in {"success", "failed", "skipped", "disabled"}
-            else "failed"
+            rotation_status if rotation_status in ROTATION_STATUSES else "failed"
         )
+        fields: dict[str, str | int] = {
+            "vendor": vendor if vendor in self._drivers else "unknown",
+            "rotation_id": rotation_id,
+            "rotation_status": safe_status,
+        }
+        if action == "start" and attempt is not None:
+            logger.error("rotation start event rejected an unexpected attempt")
+            return
+        if action != "start" and attempt is None:
+            logger.error("rotation security event rejected a missing attempt")
+            return
+        if attempt is not None:
+            if (
+                not isinstance(attempt, int)
+                or isinstance(attempt, bool)
+                or not 1 <= attempt <= MAX_ROTATION_ATTEMPTS
+            ):
+                logger.error("rotation security event rejected an internal attempt")
+                return
+            fields["attempt"] = attempt
+
         self._security_event(
-            "aigw.provider.rotation",
-            "rotate",
-            "success" if safe_status == "success" else "failure",
-            vendor=safe_vendor,
-            rotation_status=safe_status,
+            ROTATION_EVENT,
+            action,
+            (
+                "success"
+                if safe_status in {"started", "success", "recovered"}
+                else "failure"
+            ),
+            **fields,
         )
+
+    def _start_rotation_lifecycle(
+        self, vendor: str, *, keep_for_retry: bool
+    ) -> _RotationLifecycle:
+        lifecycle = _RotationLifecycle(rotation_id=self._new_rotation_id())
+        if keep_for_retry:
+            self._rotation_lifecycles[vendor] = lifecycle
+        self._rotation_event(
+            action="start",
+            vendor=vendor,
+            rotation_id=lifecycle.rotation_id,
+            rotation_status="started",
+        )
+        return lifecycle
+
+    def _audit_rotation_result(
+        self,
+        vendor: str,
+        result: RotationResult,
+        *,
+        rotation_id: str,
+        attempt: int,
+    ) -> None:
+        self._rotation_event(
+            action="rotate",
+            vendor=vendor,
+            rotation_id=rotation_id,
+            rotation_status=result.status,
+            attempt=attempt,
+        )
+
+    def _finish_rotation_lifecycle(
+        self,
+        vendor: str,
+        lifecycle: _RotationLifecycle,
+        result: RotationResult,
+        *,
+        had_prior_failure: bool,
+    ) -> None:
+        safe_status = (
+            result.status if result.status in ROTATION_RESULT_STATUSES else "failed"
+        )
+        self._audit_rotation_result(
+            vendor,
+            result,
+            rotation_id=lifecycle.rotation_id,
+            attempt=lifecycle.attempt,
+        )
+
+        if safe_status == "failed":
+            self._rotation_degraded.add(vendor)
+        elif safe_status == "success" and (
+            had_prior_failure or vendor in self._rotation_degraded
+        ):
+            self._rotation_event(
+                action="recovery",
+                vendor=vendor,
+                rotation_id=lifecycle.rotation_id,
+                rotation_status="recovered",
+                attempt=lifecycle.attempt,
+            )
+            self._rotation_degraded.discard(vendor)
+
+        if self._rotation_lifecycles.get(vendor) is lifecycle:
+            self._rotation_lifecycles.pop(vendor, None)
 
     async def _recover_schedule(self) -> None:
         """Retry an empty boot schedule without perturbing healthy jobs.
@@ -930,16 +1071,21 @@ class RotationScheduler:
         return await self.run_rotation(vendor)
 
     async def run_rotation(self, vendor: str) -> RotationResult:
-        """Execute one rotation for `vendor`: build a DriverContext, run
-        the driver inside an OTel span ("rotation.{vendor}"), persist a
-        rotation_history row regardless of outcome, and honor any
-        driver-requested dynamic reschedule.
+        """Execute one rotation attempt for ``vendor``.
+
+        A failed attempt with a scheduled dynamic retry keeps the same
+        lifecycle ID. Success, a non-retry failure, disabled, and skipped are
+        terminal. The scheduler owns the one history row for each attempt.
         """
         driver = self._drivers.get(vendor)
         if driver is None:
             logger.warning("run_rotation: no driver registered for vendor=%s", vendor)
+            lifecycle = self._start_rotation_lifecycle(vendor, keep_for_retry=False)
+            lifecycle.attempt = 1
             result = RotationResult(status="failed", detail="no driver registered")
-            self._audit_rotation_result(vendor, result)
+            self._finish_rotation_lifecycle(
+                vendor, lifecycle, result, had_prior_failure=False
+            )
             return result
 
         # Per-vendor mutual exclusion (manual vs scheduled): a second
@@ -948,29 +1094,80 @@ class RotationScheduler:
         # the first run just created.
         lock = self._lock_for(vendor)
         if lock.locked():
+            lifecycle = self._start_rotation_lifecycle(vendor, keep_for_retry=False)
+            lifecycle.attempt = 1
             detail = (
                 "rotation already in progress for this vendor; concurrent run skipped"
             )
             logger.warning("run_rotation: vendor=%s %s", vendor, detail)
             await self._db.record_history(vendor, "rotate", "skipped", detail)
             result = RotationResult(status="skipped", detail=detail)
-            self._audit_rotation_result(vendor, result)
+            self._finish_rotation_lifecycle(
+                vendor, lifecycle, result, had_prior_failure=False
+            )
             return result
 
         async with lock:
             async with self._db.rotation_lock(self._lock_domain(vendor)) as acquired:
                 if not acquired:
+                    lifecycle = self._start_rotation_lifecycle(
+                        vendor, keep_for_retry=False
+                    )
+                    lifecycle.attempt = 1
                     detail = (
                         "another key-rotator instance holds the distributed vendor lock"
                     )
                     logger.warning("run_rotation: vendor=%s %s", vendor, detail)
                     await self._db.record_history(vendor, "rotate", "skipped", detail)
                     result = RotationResult(status="skipped", detail=detail)
-                    self._audit_rotation_result(vendor, result)
+                    self._finish_rotation_lifecycle(
+                        vendor, lifecycle, result, had_prior_failure=False
+                    )
                     return result
-                result = await self._run_rotation_locked(vendor, driver)
+
+                lifecycle = self._rotation_lifecycles.get(vendor)
+                if lifecycle is None:
+                    lifecycle = self._start_rotation_lifecycle(
+                        vendor, keep_for_retry=True
+                    )
+                lifecycle.attempt += 1
+                result, retry_scheduled, had_prior_failure = (
+                    await self._run_rotation_locked(vendor, driver)
+                )
+
+                safe_status = (
+                    result.status
+                    if result.status in ROTATION_RESULT_STATUSES
+                    else "failed"
+                )
+                self._rotation_event(
+                    action="attempt",
+                    vendor=vendor,
+                    rotation_id=lifecycle.rotation_id,
+                    rotation_status=safe_status,
+                    attempt=lifecycle.attempt,
+                )
+                if safe_status == "failed":
+                    self._rotation_degraded.add(vendor)
+
+                retry_continues = (
+                    safe_status == "failed"
+                    and retry_scheduled
+                    and lifecycle.attempt < MAX_ROTATION_ATTEMPTS
+                )
+                # _run_rotation_locked schedules the operational retry first.
+                # At the event-field limit, close this correlation ID but keep
+                # that safety retry. Its next attempt starts a new lifecycle at
+                # attempt 1, so telemetry stays bounded without stopping token
+                # refresh.
+                if not retry_continues:
+                    self._finish_rotation_lifecycle(
+                        vendor,
+                        lifecycle,
+                        result,
+                        had_prior_failure=had_prior_failure,
+                    )
         await self._reconcile_oneshot_lifecycle(vendor, result)
-        self._audit_rotation_result(vendor, result)
         return result
 
     async def _reconcile_oneshot_lifecycle(
@@ -1030,8 +1227,17 @@ class RotationScheduler:
         ):
             self._oneshot_scheduled.discard(vendor)
 
-    async def _run_rotation_locked(self, vendor: str, driver: Any) -> RotationResult:
+    async def _run_rotation_locked(
+        self, vendor: str, driver: Any
+    ) -> tuple[RotationResult, bool, bool]:
         row = await self._db.get_settings(vendor) or {}
+        config = row.get("config")
+        prior_fail_count = config.get("_fail_count", 0) if isinstance(config, dict) else 0
+        had_prior_failure = (
+            isinstance(prior_fail_count, int)
+            and not isinstance(prior_fail_count, bool)
+            and prior_fail_count > 0
+        )
         # Anthropic WIF uses an explicit confirmed disable lifecycle. A manual
         # DateTrigger accepted just before disable can survive scheduler.reload;
         # re-check the authoritative row under the distributed lock so that
@@ -1044,7 +1250,7 @@ class RotationScheduler:
             await self._db.record_history(
                 vendor, "rotate", result.status, result.detail
             )
-            return result
+            return result, False, had_prior_failure
         ctx = DriverContext(
             settings=self._settings,
             vault=self._vault,
@@ -1066,16 +1272,19 @@ class RotationScheduler:
             else _NullSpan()
         )
         with span_cm as span:
-            caught_exc: Exception | None = None
+            unhandled_driver_failure = False
             try:
                 result = await driver.rotate(ctx)
-            except Exception as exc:  # noqa: BLE001
-                caught_exc = exc
-                logger.exception(
-                    "run_rotation: unhandled exception for vendor=%s", vendor
+            except Exception:  # noqa: BLE001
+                unhandled_driver_failure = True
+                # Exception strings can contain provider bodies or credentials.
+                # Keep the local log, history, and span on a fixed diagnostic.
+                logger.error(
+                    "run_rotation: unhandled driver failure for vendor=%s", vendor
                 )
                 result = RotationResult(
-                    status="failed", detail=f"unhandled exception: {exc}"
+                    status="failed",
+                    detail="rotation failed: stage=driver reason=unhandled_failure",
                 )
 
             if span is not None:
@@ -1084,17 +1293,22 @@ class RotationScheduler:
                     span.set_attribute("rotation.status", result.status)
                     if result.status not in {"success", "skipped"}:
                         span.set_status(Status(StatusCode.ERROR, "rotation failed"))
-                    if caught_exc is not None:
-                        span.record_exception(caught_exc)
+                    if unhandled_driver_failure:
+                        span.set_attribute(
+                            "rotation.failure_reason", "unhandled_failure"
+                        )
                 except Exception:  # noqa: BLE001
                     pass
 
         await self._db.record_history(vendor, "rotate", result.status, result.detail)
 
+        retry_scheduled = False
         if result.next_run_seconds is not None:
-            await self._reschedule_dynamic(vendor, result.next_run_seconds)
+            retry_scheduled = await self._reschedule_dynamic(
+                vendor, result.next_run_seconds
+            )
 
-        return result
+        return result, retry_scheduled, had_prior_failure
 
     async def _reschedule_dynamic(self, vendor: str, seconds: float) -> bool:
         """Driver-requested dynamic next-run override (e.g. Anthropic's

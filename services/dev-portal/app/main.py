@@ -80,6 +80,38 @@ PROVIDER_STATES = frozenset(
         "unavailable",
     }
 )
+PORTAL_AUDIT_ACTIONS = frozenset(
+    {
+        "admin.key.block",
+        "admin.key.limits",
+        "admin.key.unblock",
+        "authorization.role.denied",
+        "authorization.step_up.required",
+        "egress.trust.verify",
+        "identity.group.create",
+        "identity.group.delete",
+        "identity.group.policy",
+        "identity.member.add",
+        "identity.member.remove",
+        "key.deactivate",
+        "key.generate",
+        "provider.anthropic.configure",
+        "provider.anthropic.delete",
+        "provider.anthropic.disable",
+        "rotation.settings.update",
+        "rotation.trigger",
+    }
+)
+PORTAL_AUDIT_OUTCOMES = frozenset(
+    {
+        "success",
+        "failure",
+        "mismatch",
+        "denied-active-key",
+        "denied-membership",
+        "denied-ownership",
+    }
+)
 PROJECT_LOCK_STRIPES = 64
 AMBIGUOUS_GENERATE_CLEANUP_LIMIT = 8
 
@@ -134,6 +166,9 @@ class VaultSealedAuthorizationUnavailable(HTTPException):
 
 def _audit(action: str, outcome: str, user: dict[str, Any], **fields: Any) -> None:
     """Emit one-line JSON audit metadata without tokens, email, or log injection."""
+    if action not in PORTAL_AUDIT_ACTIONS or outcome not in PORTAL_AUDIT_OUTCOMES:
+        logger.error("portal security event rejected an internal schema value")
+        return
     event: dict[str, Any] = {
         "schema_version": 1,
         "event": "aigw.portal.audit",
@@ -150,6 +185,18 @@ def _audit(action: str, outcome: str, user: dict[str, Any], **fields: Any) -> No
         "AIGW_SECURITY_EVENT %s",
         json.dumps(event, separators=(",", ":"), ensure_ascii=True),
     )
+
+
+def _audit_signed_session_denial(request: Request, action: str) -> None:
+    """Audit a denial only when the signed session names a user."""
+
+    user = request.session.get("user")
+    if not isinstance(user, dict):
+        return
+    subject = user.get("sub")
+    if not isinstance(subject, str) or not subject:
+        return
+    _audit(action, "failure", user)
 
 
 FORBIDDEN_HTML = """<!DOCTYPE html>
@@ -266,6 +313,7 @@ async def handle_not_authenticated(
 async def handle_not_authorized(
     request: Request, exc: auth.NotAuthorized
 ) -> HTMLResponse:
+    _audit_signed_session_denial(request, "authorization.role.denied")
     return HTMLResponse(FORBIDDEN_HTML, status_code=403)
 
 
@@ -273,6 +321,7 @@ async def handle_not_authorized(
 async def handle_reauthentication_required(
     request: Request, exc: auth.ReauthenticationRequired
 ) -> RedirectResponse:
+    _audit_signed_session_denial(request, "authorization.step_up.required")
     auth.flash(
         request,
         "Please sign in to Keycloak again before changing identity access.",
@@ -949,6 +998,12 @@ async def create_key(
     clean_alias = (alias.strip() or f"{user['name'] or user['sub']}-key")[:128]
     clean_project = project_id.strip()
     if clean_project not in project_ids:
+        _audit(
+            "key.generate",
+            "denied-membership",
+            user,
+            project=clean_project,
+        )
         raise HTTPException(
             status_code=403, detail="Project membership is missing or was revoked."
         )
@@ -1061,6 +1116,12 @@ async def deactivate_key(
     project_ids = await _live_project_ids(request, user)
     clean_project = project_id.strip()
     if clean_project not in project_ids:
+        _audit(
+            "key.deactivate",
+            "denied-membership",
+            user,
+            project=clean_project,
+        )
         raise HTTPException(
             status_code=403, detail="Project membership is missing or was revoked."
         )
@@ -1074,6 +1135,12 @@ async def deactivate_key(
             )
             concrete_id = _resolve_owned_project_key(before, token, clean_project)
             if not concrete_id:
+                _audit(
+                    "key.deactivate",
+                    "denied-ownership",
+                    user,
+                    project=clean_project,
+                )
                 raise HTTPException(
                     status_code=403,
                     detail="You can only deactivate a key in your own project.",
@@ -1405,6 +1472,7 @@ async def require_live_admin(
             ) from exc
         return user
     if not isinstance(decision, dict) or decision.get("admin") is not True:
+        _audit("authorization.role.denied", "failure", user)
         request.session.clear()
         raise auth.NotAuthorized()
     return user
@@ -2384,8 +2452,10 @@ async def admin_identity_create_group(
             "/identity/groups",
             {"name": clean_name, "capabilities": sorted(capability_set)},
         )
+        _audit("identity.group.create", "success", user, group=clean_name)
         auth.flash(request, "Authorization group created.", "success")
     except Exception:  # noqa: BLE001
+        _audit("identity.group.create", "failure", user, group=clean_name)
         auth.flash(request, "Could not create that authorization group.", "error")
     return RedirectResponse("/admin", status_code=303)
 
@@ -2402,8 +2472,10 @@ async def admin_identity_delete_group(
         return RedirectResponse("/admin", status_code=303)
     try:
         await _rotator_delete(f"/identity/groups/{group_id}")
+        _audit("identity.group.delete", "success", user, group=group_id)
         auth.flash(request, "Authorization group deleted.", "success")
     except Exception:  # noqa: BLE001
+        _audit("identity.group.delete", "failure", user, group=group_id)
         auth.flash(
             request,
             "Could not delete that group. Remove all members first.",
@@ -2425,8 +2497,22 @@ async def admin_identity_add_member(
         return RedirectResponse("/admin", status_code=303)
     try:
         await _rotator_put(f"/identity/groups/{group_id}/members/{user_id}", {})
+        _audit(
+            "identity.member.add",
+            "success",
+            user,
+            group=group_id,
+            target_subject=user_id,
+        )
         auth.flash(request, "User assigned to the group.", "success")
     except Exception:  # noqa: BLE001
+        _audit(
+            "identity.member.add",
+            "failure",
+            user,
+            group=group_id,
+            target_subject=user_id,
+        )
         auth.flash(request, "Could not assign that directory user.", "error")
     return RedirectResponse(
         "/admin?" + urlencode({"group_id": group_id}), status_code=303
@@ -2456,6 +2542,7 @@ async def admin_identity_remove_member(
             "identity.member.remove",
             "success",
             user,
+            group=group_id,
             project=project_id,
             target_subject=user_id,
         )
@@ -2471,6 +2558,7 @@ async def admin_identity_remove_member(
             "identity.member.remove",
             "failure",
             user,
+            group=group_id,
             target_subject=user_id,
         )
         auth.flash(

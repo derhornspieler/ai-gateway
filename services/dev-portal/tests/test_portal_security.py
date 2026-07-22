@@ -24,6 +24,17 @@ from conftest import portal_user, session_cookie
 LIVE_PROJECT_IDS = main._live_project_ids
 
 
+def security_events(caplog) -> list[dict]:
+    """Return only the structured security records emitted by the portal."""
+
+    marker = "AIGW_SECURITY_EVENT "
+    return [
+        json.loads(message.split(marker, 1)[1])
+        for record in caplog.records
+        if marker in (message := record.getMessage())
+    ]
+
+
 def portal_key(
     *,
     owner: str,
@@ -179,6 +190,52 @@ def test_key_creation_uses_immutable_subject_and_rejects_bad_csrf(
     assert "no-store" in good.headers["cache-control"]
     assert good.headers["referrer-policy"] == "no-referrer"
     assert "default-src 'none'" in good.headers["content-security-policy"]
+
+
+@pytest.mark.parametrize(
+    ("path", "form", "action"),
+    [
+        (
+            "/keys",
+            {"alias": "laptop", "project_id": "unassigned-project"},
+            "key.generate",
+        ),
+        (
+            "/keys/deactivate",
+            {"token": "opaque-key-reference", "project_id": "unassigned-project"},
+            "key.deactivate",
+        ),
+    ],
+)
+def test_key_mutation_membership_denials_are_audited(
+    client, set_session, monkeypatch, caplog, path, form, action
+):
+    async def live_projects(_request, _user):
+        return ("ai-gateway",)
+
+    monkeypatch.setattr(main, "_live_project_ids", live_projects)
+    csrf = "c" * 43
+    set_session({"user": portal_user(subject="member-sub"), "csrf_token": csrf})
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = client.post(
+            path,
+            data={**form, "csrf_token": csrf},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 403
+    assert security_events(caplog) == [
+        {
+            "schema_version": 1,
+            "event": "aigw.portal.audit",
+            "action": action,
+            "outcome": "denied-membership",
+            "subject": "member-sub",
+            "project": "unassigned-project",
+        }
+    ]
+    assert "opaque-key-reference" not in caplog.text
 
 
 def test_post_generation_membership_failure_revokes_without_disclosure(
@@ -809,7 +866,7 @@ def test_post_generate_duplicate_is_cleaned_up_without_disclosure(monkeypatch):
 
 
 def test_portal_inventory_never_exposes_or_deactivates_operator_key(
-    client, set_session, monkeypatch
+    client, set_session, monkeypatch, caplog
 ):
     owner = "owner-sub"
     deactivated: list[str] = []
@@ -841,18 +898,30 @@ def test_portal_inventory_never_exposes_or_deactivates_operator_key(
     csrf = "c" * 43
     set_session({"user": portal_user(subject=owner), "csrf_token": csrf})
 
-    response = client.post(
-        "/keys/deactivate",
-        data={
-            "token": "operator-controlled-hash",
-            "project_id": "ai-gateway",
-            "csrf_token": csrf,
-        },
-        follow_redirects=False,
-    )
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = client.post(
+            "/keys/deactivate",
+            data={
+                "token": "operator-controlled-hash",
+                "project_id": "ai-gateway",
+                "csrf_token": csrf,
+            },
+            follow_redirects=False,
+        )
 
     assert response.status_code == 403
     assert deactivated == []
+    assert security_events(caplog) == [
+        {
+            "schema_version": 1,
+            "event": "aigw.portal.audit",
+            "action": "key.deactivate",
+            "outcome": "denied-ownership",
+            "subject": owner,
+            "project": "ai-gateway",
+        }
+    ]
+    assert "operator-controlled-hash" not in caplog.text
 
 
 def test_malformed_portal_metadata_fails_closed_for_key_lifecycle():
@@ -1068,7 +1137,7 @@ def test_rotator_client_does_not_inherit_proxy_or_follow_redirects(monkeypatch):
 
 
 def test_identity_mutation_requires_fresh_keycloak_step_up(
-    admin_client, set_admin_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch, caplog
 ):
     called = False
 
@@ -1088,23 +1157,33 @@ def test_identity_mutation_requires_fresh_keycloak_step_up(
         {"user": portal_user(roles=[settings.admin_role]), "csrf_token": csrf}
     )
 
-    response = admin_client.post(
-        "/admin/identity/groups",
-        data={
-            "name": "platform-team",
-            "capabilities": "aigw-developers",
-            "csrf_token": csrf,
-        },
-        follow_redirects=False,
-    )
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/identity/groups",
+            data={
+                "name": "platform-team",
+                "capabilities": "aigw-developers",
+                "csrf_token": csrf,
+            },
+            follow_redirects=False,
+        )
 
     assert response.status_code == 303
     assert response.headers["location"] == "/admin/reauth"
     assert called is False
+    assert security_events(caplog) == [
+        {
+            "schema_version": 1,
+            "event": "aigw.portal.audit",
+            "action": "authorization.step_up.required",
+            "outcome": "failure",
+            "subject": "subject-123",
+        }
+    ]
 
 
 def test_recent_step_up_allows_only_allowlisted_group_capabilities(
-    admin_client, set_admin_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch, caplog
 ):
     calls = []
 
@@ -1141,15 +1220,16 @@ def test_recent_step_up_allows_only_allowlisted_group_capabilities(
     # The first response re-signed the session with a flash; restore a clean,
     # fresh marker and submit an allowlisted capability.
     set_admin_session(base_session)
-    accepted = admin_client.post(
-        "/admin/identity/groups",
-        data={
-            "name": "platform-team",
-            "capabilities": ["aigw-developers", "aigw-users"],
-            "csrf_token": csrf,
-        },
-        follow_redirects=False,
-    )
+    with caplog.at_level("INFO", logger="dev-portal"):
+        accepted = admin_client.post(
+            "/admin/identity/groups",
+            data={
+                "name": "platform-team",
+                "capabilities": ["aigw-developers", "aigw-users"],
+                "csrf_token": csrf,
+            },
+            follow_redirects=False,
+        )
     assert accepted.status_code == 303
     assert calls == [
         (
@@ -1160,10 +1240,160 @@ def test_recent_step_up_allows_only_allowlisted_group_capabilities(
             },
         )
     ]
+    assert security_events(caplog) == [
+        {
+            "schema_version": 1,
+            "event": "aigw.portal.audit",
+            "action": "identity.group.create",
+            "outcome": "success",
+            "subject": "subject-123",
+            "group": "platform-team",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "rotator_name", "form", "action"),
+    [
+        (
+            "/admin/identity/groups",
+            "_rotator_post",
+            {"name": "platform-team", "capabilities": "aigw-developers"},
+            "identity.group.create",
+        ),
+        (
+            "/admin/identity/groups/group-1/delete",
+            "_rotator_delete",
+            {},
+            "identity.group.delete",
+        ),
+        (
+            "/admin/identity/groups/group-1/members",
+            "_rotator_put",
+            {"user_id": "user-1"},
+            "identity.member.add",
+        ),
+    ],
+)
+@pytest.mark.parametrize("fails", [False, True])
+def test_identity_group_mutations_emit_actor_audit_events(
+    admin_client,
+    set_admin_session,
+    monkeypatch,
+    caplog,
+    path,
+    rotator_name,
+    form,
+    action,
+    fails,
+):
+    async def rotator_get(request_path):
+        assert request_path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def mutate(*_args, **_kwargs):
+        if fails:
+            raise RuntimeError("upstream detail must stay local")
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, rotator_name, mutate)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            path,
+            data={**form, "csrf_token": csrf},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    expected = {
+        "schema_version": 1,
+        "event": "aigw.portal.audit",
+        "action": action,
+        "outcome": "failure" if fails else "success",
+        "subject": "subject-123",
+        "group": form.get("name", "group-1"),
+    }
+    if "user_id" in form:
+        expected["target_subject"] = form["user_id"]
+    assert security_events(caplog) == [expected]
+    assert "upstream detail must stay local" not in caplog.text
+
+
+def test_identity_member_remove_audit_names_group_and_target(
+    admin_client, set_admin_session, monkeypatch, caplog
+):
+    calls = []
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def managed_project(group_id):
+        assert group_id == "group-1"
+        return "project-1"
+
+    async def deactivate(user_id, project_id):
+        calls.append(("deactivate", user_id, project_id))
+
+    async def rotator_delete(path, payload=None):
+        calls.append(("delete", path, payload))
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_managed_project_for_group", managed_project)
+    monkeypatch.setattr(main, "_deactivate_subject_project_keys", deactivate)
+    monkeypatch.setattr(main, "_rotator_delete", rotator_delete)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/identity/groups/group-1/members/user-1/remove",
+            data={"csrf_token": csrf},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert calls == [
+        ("deactivate", "user-1", "project-1"),
+        (
+            "delete",
+            "/identity/groups/group-1/members/user-1",
+            None,
+        ),
+        ("deactivate", "user-1", "project-1"),
+    ]
+    assert security_events(caplog) == [
+        {
+            "schema_version": 1,
+            "event": "aigw.portal.audit",
+            "action": "identity.member.remove",
+            "outcome": "success",
+            "subject": "subject-123",
+            "group": "group-1",
+            "project": "project-1",
+            "target_subject": "user-1",
+        }
+    ]
 
 
 def test_revoked_admin_cookie_cannot_mutate_or_restore_membership(
-    admin_client, set_admin_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch, caplog
 ):
     called = False
 
@@ -1187,15 +1417,25 @@ def test_revoked_admin_cookie_cannot_mutate_or_restore_membership(
         }
     )
 
-    response = admin_client.post(
-        "/admin/identity/groups/admins/members",
-        data={"user_id": "revoked-admin", "csrf_token": csrf},
-        follow_redirects=False,
-    )
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/identity/groups/admins/members",
+            data={"user_id": "revoked-admin", "csrf_token": csrf},
+            follow_redirects=False,
+        )
 
     assert response.status_code == 403
     assert called is False
     assert "aigw_admin_session=" in response.headers.get("set-cookie", "")
+    assert security_events(caplog) == [
+        {
+            "schema_version": 1,
+            "event": "aigw.portal.audit",
+            "action": "authorization.role.denied",
+            "outcome": "failure",
+            "subject": "revoked-admin",
+        }
+    ]
 
 
 def test_revoked_admin_cookie_cannot_change_rotation_controls(
