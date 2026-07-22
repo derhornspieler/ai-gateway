@@ -164,6 +164,11 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
   trace_statements {
     context = "span"
     statements = [
+      // LiteLLM records the caller's optional request `user` in these raw
+      // fields. They are prompt input, never identity authority. Keep the
+      // server-owned aigw.user.* fields and remove these look-alikes.
+      `delete_key(attributes, "llm.user")`,
+      `delete_key(attributes, "llm.anthropic.metadata")`,
       `replace_pattern(attributes["gen_ai.input.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n\\\"]{0,3}\\\"(?:\\\\.|[^\\\"\\\\\\r\\n])+(?:\\\\)?\\\"", "<redacted-credential>") where IsString(attributes["gen_ai.input.messages"])`,
       `replace_pattern(attributes["gen_ai.input.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n']{0,3}'(?:\\\\.|[^'\\\\\\r\\n])+(?:\\\\)?'", "<redacted-credential>") where IsString(attributes["gen_ai.input.messages"])`,
       `replace_pattern(attributes["gen_ai.input.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.input.messages"])`,

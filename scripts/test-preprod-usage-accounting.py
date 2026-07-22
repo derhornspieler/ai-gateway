@@ -30,6 +30,7 @@ CONFIG_LABEL = "com.aigw.preprod.config-digest"
 FIXTURE_VOLUME = "preprod_empty_docker_logs"
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_FIXTURE_BYTES = 64 * 1024
+CRIBL_LOG_TAIL = 50_000
 
 
 ACCOUNTING_HELPER = r'''
@@ -1033,9 +1034,16 @@ class Preprod:
             time.sleep(1)
         fail(f"preprod service {service} did not become healthy")
 
-    def logs_since(self, service: str, since: int) -> str:
+    def logs_since(
+        self, service: str, since: int, *, tail: int | None = None
+    ) -> str:
         identifier = self.container_id(service)
-        stdout, stderr = self.docker("logs", "--since", str(since), identifier)
+        arguments = ["logs", "--since", str(since)]
+        if tail is not None:
+            if type(tail) is not int or not 1 <= tail <= CRIBL_LOG_TAIL:
+                fail("the Docker log tail is invalid")
+            arguments.extend(("--tail", str(tail)))
+        stdout, stderr = self.docker(*arguments, identifier)
         return stdout + stderr
 
     def timestamped_logs_since(
@@ -1067,12 +1075,13 @@ def wait_for_log_receipt(
     required: tuple[str, ...],
     *,
     timeout: int = 60,
-) -> None:
+) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        document = preprod.logs_since(service, since)
+        tail = CRIBL_LOG_TAIL if service == "cribl-mock" else None
+        document = preprod.logs_since(service, since, tail=tail)
         if all(value in document for value in required):
-            return
+            return document
         time.sleep(1)
     fail(f"{service} did not receive the bounded usage audit receipt")
 
@@ -1413,7 +1422,7 @@ def bridge_and_wait(
     service: str,
     since: int,
     required: tuple[str, ...],
-) -> None:
+) -> str:
     """Expose validated real lines to Alloy, wait for Cribl, then remove them."""
 
     token = secrets.token_hex(8)
@@ -1422,10 +1431,11 @@ def bridge_and_wait(
     try:
         set_security_fixture(preprod, model, token, content)
         created = True
-        wait_for_log_receipt(preprod, "cribl-mock", since, required)
+        receipt = wait_for_log_receipt(preprod, "cribl-mock", since, required)
     finally:
         if created:
             set_security_fixture(preprod, model, token, None)
+    return receipt
 
 
 def main() -> int:
@@ -1516,7 +1526,7 @@ def main() -> int:
         if actual_values != expected_price_values[event["action"]]:
             fail("a backend price audit did not match its committed values")
     print("PREPROD_PRICE_AUDIT_SOURCE_PASSED")
-    bridge_and_wait(
+    price_export = bridge_and_wait(
         preprod,
         compose_model,
         price_records,
@@ -1530,10 +1540,7 @@ def main() -> int:
             "review_note_sha256=",
         ),
     )
-    if any(
-        review_note in preprod.logs_since("cribl-mock", portal_started_at)
-        for review_note in review_notes
-    ):
+    if any(review_note in price_export for review_note in review_notes):
         fail("a free-form price review note entered the Cribl export")
     print("PREPROD_PRICE_AUDIT_EXPORT_PASSED")
 

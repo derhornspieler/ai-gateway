@@ -393,6 +393,31 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             main.index('print("PREPROD_CRIBL_TELEMETRY_PASSED")'),
         )
 
+    def test_rejected_requests_remain_visible_without_raw_identity_authority(self) -> None:
+        assertion = PREPROD_RECEIPT.split(
+            "def assert_initial_receipts", 1
+        )[1].split("def read_alloy_metrics", 1)[0]
+        allowed, forbidden = assertion.split("forbidden =", 1)
+        for marker in (
+            "REJECTED_OPENWEBUI_MISSING_JWT_",
+            "REJECTED_OPENWEBUI_INVALID_JWT_",
+            "REJECTED_OPENWEBUI_EXPIRED_JWT_",
+            "REJECTED_OPENWEBUI_CONFLICTING_JWT_",
+            "REJECTED_OPENWEBUI_PARTIAL_MARKER_",
+        ):
+            self.assertIn(marker, allowed)
+            self.assertNotIn(marker, forbidden)
+
+        sensitive = ALLOY.split(
+            "// BEGIN AIGW MANAGED SENSITIVE ATTRIBUTE FILTER", 1
+        )[1].split("// END AIGW MANAGED SENSITIVE ATTRIBUTE FILTER", 1)[0]
+        self.assertIn('delete_key(attributes, "llm.user")', sensitive)
+        self.assertIn(
+            'delete_key(attributes, "llm.anthropic.metadata")', sensitive
+        )
+        self.assertIn("FORGED_BODY_USER_", forbidden)
+        self.assertIn("FORGED_OPENWEBUI_BODY_USER_", forbidden)
+
     def test_keycloak_projection_requires_complete_attribution(self) -> None:
         keycloak = ALLOY.split('loki.process "cribl_keycloak_auth"', 1)[1].split(
             'loki.process "cribl_envoy_tls"', 1

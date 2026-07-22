@@ -352,6 +352,34 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         self.assertIn("finally:\n        if created:", usage)
         self.assertNotIn("type=bind,src=/var/lib/docker", usage)
 
+    def test_usage_cribl_receipt_poll_is_bounded_and_retained(self) -> None:
+        module = load_usage_accounting_e2e_module()
+
+        class FakePreprod:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, int, int | None]] = []
+
+            def logs_since(
+                self, service: str, since: int, *, tail: int | None = None
+            ) -> str:
+                self.calls.append((service, since, tail))
+                return "price receipt marker"
+
+        preprod = FakePreprod()
+        receipt = module.wait_for_log_receipt(
+            preprod,
+            "cribl-mock",
+            123,
+            ("price receipt", "marker"),
+            timeout=1,
+        )
+        self.assertEqual(receipt, "price receipt marker")
+        self.assertEqual(
+            preprod.calls,
+            [("cribl-mock", 123, module.CRIBL_LOG_TAIL)],
+        )
+        self.assertEqual(module.CRIBL_LOG_TAIL, 50_000)
+
     def test_usage_audit_bridge_preserves_the_validated_docker_envelope(self) -> None:
         module = load_usage_accounting_e2e_module()
         timestamp = "2026-07-22T12:34:56.123456Z"
