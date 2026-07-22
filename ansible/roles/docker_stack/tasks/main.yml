@@ -1259,7 +1259,10 @@
       - not (litellm_otel_token_before.stat.islnk | default(false))
       - litellm_otel_token_before.stat.isreg | default(false)
       - litellm_otel_token_before.stat.uid == 0
-      - litellm_otel_token_before.stat.gid == 473
+      # A restore extracts secret files as root:root. Accept that one safe
+      # transition state; the content is checked before the reader group is
+      # restored below. No other owner or group is accepted.
+      - litellm_otel_token_before.stat.gid in [0, 473]
       - litellm_otel_token_before.stat.mode == '0440'
       - (litellm_otel_token_before.stat.nlink | int) == 1
       - (litellm_otel_token_before.stat.size | int) == 64
@@ -1320,6 +1323,16 @@
             raise SystemExit("malformed LiteLLM telemetry token")
       - "{{ stack_dir }}/secrets/litellm_otel_token"
   changed_when: false
+  no_log: true
+
+- name: Normalize the validated LiteLLM telemetry token boundary
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/secrets/litellm_otel_token"
+    state: file
+    owner: root
+    group: "473"
+    mode: "0440"
+    follow: false
   no_log: true
 
 - name: Require the exact stable LiteLLM telemetry token boundary

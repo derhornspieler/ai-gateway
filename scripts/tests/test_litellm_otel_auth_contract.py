@@ -19,6 +19,8 @@ STACK = (
     ROOT / "ansible/roles/docker_stack/tasks/main.yml"
 ).read_text(encoding="utf-8")
 PREPROD_SCRIPT = (ROOT / "scripts/preprod.py").read_text(encoding="utf-8")
+STATE_RESTORE = (ROOT / "scripts/state-restore.sh").read_text(encoding="utf-8")
+RESTORE_ARCHIVE = (ROOT / "scripts/restore_archive.py").read_text(encoding="utf-8")
 MANIFEST = json.loads(
     (ROOT / "compose/bind-source-digest-inputs.json").read_text(encoding="utf-8")
 )
@@ -172,6 +174,29 @@ class LiteLLMOtelAuthenticationContractTests(unittest.TestCase):
         ):
             self.assertIn(required, section)
         self.assertNotIn("{{ litellm_otel", section)
+
+    def test_restored_token_is_validated_before_group_normalization(self) -> None:
+        section = STACK.split(
+            "- name: Inspect the stable LiteLLM telemetry token", 1
+        )[1].split(
+            "- name: Materialize Redis authentication files", 1
+        )[0]
+        validate = "- name: Validate the stable LiteLLM telemetry token content"
+        normalize = "- name: Normalize the validated LiteLLM telemetry token boundary"
+        final_stat = "- name: Require the exact stable LiteLLM telemetry token boundary"
+
+        self.assertIn("litellm_otel_token_before.stat.gid in [0, 473]", section)
+        self.assertIn('group: "473"', section)
+        self.assertIn('mode: "0440"', section)
+        self.assertIn("follow: false", section)
+        self.assertLess(section.index(validate), section.index(normalize))
+        self.assertLess(section.index(normalize), section.index(final_stat))
+
+        # Restore deliberately extracts regular files as root-owned and then
+        # requires a current-source converge. The role must therefore repair
+        # only this reviewed ownership transition after checking the secret.
+        self.assertIn("preserve_modes=True", RESTORE_ARCHIVE)
+        self.assertIn("current-source Ansible converge", STATE_RESTORE)
 
     def test_preprod_uses_a_static_local_token_and_both_mounts(self) -> None:
         self.assertIn(
