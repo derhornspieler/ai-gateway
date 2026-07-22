@@ -40,7 +40,7 @@ func buildZip(t *testing.T, entries map[string]string) string {
 	return path
 }
 
-const manifest = `{"id": "grafana-lokiexplore-app", "info": {"version": "2.2.1"}}`
+const manifest = `{"id": "grafana-lokiexplore-app", "info": {"version": "2.4.0"}}`
 
 func TestExtractValidArchive(t *testing.T) {
 	archive := buildZip(t, map[string]string{
@@ -49,11 +49,11 @@ func TestExtractValidArchive(t *testing.T) {
 		"grafana-lokiexplore-app/module.js":   "export {}\n",
 	})
 	destination := t.TempDir()
-	summary, err := extract(archive, destination, "grafana-lokiexplore-app", "2.2.1")
+	summary, err := extract(archive, destination, "grafana-lokiexplore-app", "2.4.0")
 	if err != nil {
 		t.Fatalf("extract failed: %v", err)
 	}
-	expected := "plugin=grafana-lokiexplore-app\nversion=2.2.1\nentries=3\nfiles=2\ndirectories=1\nbytes=" +
+	expected := "plugin=grafana-lokiexplore-app\nversion=2.4.0\nentries=3\nfiles=2\ndirectories=1\nbytes=" +
 		"73\n"
 	if summary != expected {
 		t.Fatalf("summary %q, expected %q", summary, expected)
@@ -79,7 +79,7 @@ func TestExtractRejectsTraversalEntries(t *testing.T) {
 			"grafana-lokiexplore-app/plugin.json": manifest,
 			name:                                  "hostile",
 		})
-		if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.2.1"); err == nil {
+		if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.4.0"); err == nil {
 			t.Fatalf("hostile entry %q was accepted", name)
 		}
 	}
@@ -90,7 +90,7 @@ func TestExtractRejectsForeignRoot(t *testing.T) {
 		"grafana-lokiexplore-app/plugin.json": manifest,
 		"other-plugin/module.js":              "foreign",
 	})
-	if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.2.1"); err == nil {
+	if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.4.0"); err == nil {
 		t.Fatal("foreign top-level root was accepted")
 	}
 }
@@ -103,9 +103,9 @@ func TestExtractRejectsIdentityDrift(t *testing.T) {
 		t.Fatal("version drift was accepted")
 	}
 	archive = buildZip(t, map[string]string{
-		"grafana-lokiexplore-app/plugin.json": `{"id": "someone-else", "info": {"version": "2.2.1"}}`,
+		"grafana-lokiexplore-app/plugin.json": `{"id": "someone-else", "info": {"version": "2.4.0"}}`,
 	})
-	if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.2.1"); err == nil {
+	if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.4.0"); err == nil {
 		t.Fatal("plugin id drift was accepted")
 	}
 }
@@ -114,7 +114,7 @@ func TestExtractRejectsMissingManifest(t *testing.T) {
 	archive := buildZip(t, map[string]string{
 		"grafana-lokiexplore-app/module.js": "export {}\n",
 	})
-	if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.2.1"); err == nil {
+	if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.4.0"); err == nil {
 		t.Fatal("archive without plugin.json was accepted")
 	}
 }
@@ -145,7 +145,7 @@ func TestExtractRejectsSymlinkEntries(t *testing.T) {
 	if err := os.WriteFile(archive, buffer.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.2.1"); err == nil {
+	if _, err := extract(archive, t.TempDir(), "grafana-lokiexplore-app", "2.4.0"); err == nil {
 		t.Fatal("symlink entry was accepted")
 	}
 }

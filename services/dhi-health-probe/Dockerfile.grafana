@@ -22,20 +22,20 @@ RUN --network=none go test ./... \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/aigw-health-probe . \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/aigw-extract-plugin ./cmd/extract-plugin
 
-ADD --checksum=sha256:fce6beb37d0fb2fef9b24d307a8ed9d9d1dca9309ba1f7b2370f16041eb23f4a \
-    https://grafana.com/api/plugins/grafana-lokiexplore-app/versions/2.2.1/download \
-    /aigw/grafana-lokiexplore-app-2.2.1.zip
+ADD --checksum=sha256:c7e2f1a640cdfa2296f50043120ea80d4456b8b5183400b750358399fa18718a \
+    https://grafana.com/api/plugins/grafana-lokiexplore-app/versions/2.4.0/download \
+    /aigw/grafana-lokiexplore-app-2.4.0.zip
 
 RUN --network=none set -eu; \
-    echo 'fce6beb37d0fb2fef9b24d307a8ed9d9d1dca9309ba1f7b2370f16041eb23f4a  /aigw/grafana-lokiexplore-app-2.2.1.zip' | sha256sum -c -; \
-    result="$(/out/aigw-extract-plugin /aigw/grafana-lokiexplore-app-2.2.1.zip /out/grafana-plugins grafana-lokiexplore-app 2.2.1)"; \
+    echo 'c7e2f1a640cdfa2296f50043120ea80d4456b8b5183400b750358399fa18718a  /aigw/grafana-lokiexplore-app-2.4.0.zip' | sha256sum -c -; \
+    result="$(/out/aigw-extract-plugin /aigw/grafana-lokiexplore-app-2.4.0.zip /out/grafana-plugins grafana-lokiexplore-app 2.4.0)"; \
     expected="$(printf '%s\n' \
       'plugin=grafana-lokiexplore-app' \
-      'version=2.2.1' \
+      'version=2.4.0' \
       'entries=193' \
       'files=171' \
       'directories=22' \
-      'bytes=18091195')"; \
+      'bytes=18097140')"; \
     test "$result" = "$expected"; \
     find /out/grafana-plugins -type d -exec chmod 0755 {} + ; \
     find /out/grafana-plugins -type f -exec chmod 0644 {} +

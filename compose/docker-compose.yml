@@ -1472,7 +1472,7 @@ services:
       <<: *selinux-labels
       com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_GRAFANA:?AIGW_BIND_DIGEST_GRAFANA must be set}
     # Dockerfile.grafana layers the health probe AND the vendored, pinned
-    # Grafana Loki drilldown app (grafana-lokiexplore-app 2.2.1, fetched by
+    # Grafana Loki drilldown app (grafana-lokiexplore-app 2.4.0, fetched by
     # BuildKit's daemon-side HTTP source with a mandatory sha256 checksum and
     # re-verified plus safely extracted by a stdlib-only Go tool under
     # --network=none) onto the immutable read-only rootfs. Grafana never

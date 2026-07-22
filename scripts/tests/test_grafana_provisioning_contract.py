@@ -386,16 +386,16 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         ).read_text()
         for required in (
             "ADD --checksum=sha256:"
-            "fce6beb37d0fb2fef9b24d307a8ed9d9d1dca9309ba1f7b2370f16041eb23f4a",
-            "https://grafana.com/api/plugins/grafana-lokiexplore-app/versions/2.2.1/download",
+            "c7e2f1a640cdfa2296f50043120ea80d4456b8b5183400b750358399fa18718a",
+            "https://grafana.com/api/plugins/grafana-lokiexplore-app/versions/2.4.0/download",
             "sha256sum -c -",
-            "/out/aigw-extract-plugin /aigw/grafana-lokiexplore-app-2.2.1.zip",
+            "/out/aigw-extract-plugin /aigw/grafana-lokiexplore-app-2.4.0.zip",
             "'plugin=grafana-lokiexplore-app'",
-            "'version=2.2.1'",
+            "'version=2.4.0'",
             "'entries=193'",
             "'files=171'",
             "'directories=22'",
-            "'bytes=18091195'",
+            "'bytes=18097140'",
             'test "$result" = "$expected"',
             "RUN --network=none",
         ):
