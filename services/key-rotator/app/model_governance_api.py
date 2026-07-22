@@ -34,6 +34,7 @@ from app.model_catalog import (
     resolve_model_draft,
 )
 from app.model_lifecycle import ModelLifecycleAction
+from app.pricing import canonical_decimal
 
 
 logger = logging.getLogger("key_rotator.model_governance")
@@ -132,7 +133,7 @@ def governance_response(row: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in row.items():
         if isinstance(value, Decimal):
-            result[key] = format(value, "f")
+            result[key] = canonical_decimal(value)
         elif isinstance(value, datetime):
             result[key] = value.astimezone(timezone.utc).isoformat().replace(
                 "+00:00", "Z"

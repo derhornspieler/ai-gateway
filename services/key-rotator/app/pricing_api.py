@@ -30,7 +30,7 @@ from app.model_governance_api import (
     governance_write_identity,
     trusted_provider_policy,
 )
-from app.pricing import PriceVersion, UsageClass
+from app.pricing import PriceVersion, UsageClass, canonical_decimal
 
 
 router = APIRouter()
@@ -124,7 +124,7 @@ def _backdate_response(value: Any) -> Any:
     if isinstance(value, list):
         return [_backdate_response(item) for item in value]
     if isinstance(value, Decimal):
-        return format(value, "f")
+        return canonical_decimal(value)
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     if isinstance(value, uuid.UUID):
@@ -154,7 +154,7 @@ def _emit_price_audit(
     old_policy_sha256 = row.get("baseline_price_policy_sha256")
     candidate_sha256 = row.get("candidate_sha256", row.get("document_sha256"))
     if isinstance(amount, Decimal):
-        amount_text = format(amount, "f")
+        amount_text = canonical_decimal(amount)
     else:
         amount_text = amount
     if (

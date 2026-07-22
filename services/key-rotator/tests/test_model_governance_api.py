@@ -19,6 +19,7 @@ from app.db import (
 from app import main as main_module
 from app.main import _configured_provider_policy, app, state
 from app.model_catalog import parse_provider_policy_receipt
+from app.model_governance_api import governance_response
 from app.model_lifecycle import (
     GovernedModelState,
     ModelLifecycleError,
@@ -73,7 +74,7 @@ def test_trusted_price_audit_hashes_the_free_form_review_note(caplog) -> None:
         "model": "claude-sonnet-4-5",
         "provider": "anthropic",
         "usage_class": "normal_input",
-        "amount_usd": "30.000000000000",
+        "amount_usd": "30",
         "token_unit": "1000000",
         "effective_at": "2026-08-01T00:00:00Z",
         "source_reference": "anthropic-price-review-2026-08-01",
@@ -81,6 +82,16 @@ def test_trusted_price_audit_hashes_the_free_form_review_note(caplog) -> None:
         "old_policy_sha256": "a" * 64,
         "candidate_sha256": "b" * 64,
     }
+
+
+def test_governance_response_canonicalizes_database_decimals() -> None:
+    assert governance_response(
+        {
+            "price": Decimal("30.000000000000"),
+            "cost": Decimal("0.300000000000"),
+            "zero": Decimal("-0.000000000000"),
+        }
+    ) == {"price": "30", "cost": "0.3", "zero": "0"}
 
 
 def _settings() -> Settings:

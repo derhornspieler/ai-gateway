@@ -15,6 +15,7 @@ MODEL_LIMIT_E2E = ROOT / "scripts/test-preprod-model-limits.py"
 MODEL_LIFECYCLE_E2E = ROOT / "scripts/test-preprod-model-lifecycle.py"
 USAGE_ACCOUNTING_E2E = ROOT / "scripts/test-preprod-usage-accounting.py"
 PORTAL_PRICE_E2E = ROOT / "scripts/test-portal-price-backdate.py"
+PORTAL_IDENTITY_FLOW = ROOT / "scripts/test-portal-identity-flow.py"
 
 
 def load_login_module():
@@ -63,7 +64,46 @@ def load_usage_accounting_e2e_module():
     return module
 
 
+def load_portal_identity_flow_module():
+    spec = importlib.util.spec_from_file_location(
+        "aigw_preprod_portal_identity_flow", PORTAL_IDENTITY_FLOW
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class PreprodPortalAcceptanceTests(unittest.TestCase):
+    def test_form_parser_matches_browser_checkbox_and_radio_submission(self) -> None:
+        module = load_portal_identity_flow_module()
+        forms = module.parse_forms(
+            """
+            <form action="/save" method="post">
+              <input type="hidden" name="csrf_token" value="token">
+              <input type="checkbox" name="unchecked" value="1">
+              <input type="checkbox" name="checked" value="1" checked>
+              <input type="radio" name="choice" value="no">
+              <input type="radio" name="choice" value="yes" checked>
+              <input type="text" name="disabled_value" value="no" disabled>
+            </form>
+            """
+        )
+        self.assertEqual(
+            forms,
+            [
+                {
+                    "action": "/save",
+                    "method": "post",
+                    "inputs": {
+                        "csrf_token": "token",
+                        "checked": "1",
+                        "choice": "yes",
+                    },
+                }
+            ],
+        )
+
     def test_resolution_is_exact_and_preserves_the_tls_hostname_boundary(self) -> None:
         module = load_login_module()
         resolver = mock.Mock(return_value=[("resolved",)])
@@ -203,6 +243,7 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
             "PREPROD_MODEL_DISCOVERY_PASSED",
             "PREPROD_MODEL_ASSIGNMENT_GATE_PASSED",
             "PREPROD_MODEL_RETIREMENT_PASSED",
+            "PREPROD_MODEL_POLICY_CHUNKS_PASSED",
             "PREPROD_MODEL_LIFECYCLE_PASSED",
         ):
             self.assertIn(marker, source)

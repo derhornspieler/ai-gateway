@@ -69,7 +69,9 @@ def _decimal_places(value: Decimal) -> int:
     return max(-exponent, 0)
 
 
-def _canonical_decimal(value: Decimal) -> str:
+def canonical_decimal(value: Decimal) -> str:
+    """Return one plain, deterministic decimal without meaningless zeros."""
+
     text = format(value, "f")
     if "." in text:
         text = text.rstrip("0").rstrip(".")
@@ -303,7 +305,7 @@ class CostAdjustment:
 
 def _price_document(price: PriceVersion) -> dict[str, object]:
     return {
-        "amount": _canonical_decimal(price.amount),
+        "amount": canonical_decimal(price.amount),
         "currency": price.currency,
         "effective_at": _canonical_time(price.effective_at),
         "explicit_free": price.explicit_free,
@@ -634,12 +636,12 @@ def _adjustment_document(
 ) -> dict[str, object]:
     return {
         "confirmation_operation_id": confirmation_operation_id,
-        "new_cost": _canonical_decimal(new_cost),
+        "new_cost": canonical_decimal(new_cost),
         "new_price_digest": new_price_digest,
         "new_price_version_id": new_price_version_id,
         "preview_id": preview_id,
         "previous_cost": (
-            None if previous_cost is None else _canonical_decimal(previous_cost)
+            None if previous_cost is None else canonical_decimal(previous_cost)
         ),
         "previous_price_version_id": previous_price_version_id,
         "supersedes_adjustment_id": supersedes_adjustment_id,
@@ -811,22 +813,22 @@ def canonical_reprice_preview_digest(
         rows.append(
             {
                 "new_component_cost": (
-                    None if new.cost is None else _canonical_decimal(new.cost)
+                    None if new.cost is None else canonical_decimal(new.cost)
                 ),
                 "new_price_version_id": new.price_version_id,
                 "new_total": (
                     None
                     if change.proposed.total is None
-                    else _canonical_decimal(change.proposed.total)
+                    else canonical_decimal(change.proposed.total)
                 ),
                 "old_component_cost": (
-                    None if old.cost is None else _canonical_decimal(old.cost)
+                    None if old.cost is None else canonical_decimal(old.cost)
                 ),
                 "old_price_version_id": old.price_version_id,
                 "old_total": (
                     None
                     if change.original.total is None
-                    else _canonical_decimal(change.original.total)
+                    else canonical_decimal(change.original.total)
                 ),
                 "occurred_at": _canonical_time(change.original.occurred_at),
                 "supersedes_adjustment_id": old.adjustment_id,

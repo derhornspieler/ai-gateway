@@ -372,6 +372,7 @@ def main() -> int:
             "PREPROD_MODEL_DISCOVERY_PASSED",
             "PREPROD_MODEL_ASSIGNMENT_GATE_PASSED",
             "PREPROD_MODEL_RETIREMENT_PASSED",
+            "PREPROD_MODEL_POLICY_CHUNKS_PASSED",
             "PREPROD_MODEL_LIFECYCLE_PASSED",
         ):
             if marker not in lifecycle_acceptance:

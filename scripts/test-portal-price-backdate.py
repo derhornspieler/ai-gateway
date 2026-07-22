@@ -152,7 +152,15 @@ def main() -> int:
         allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
     )
     if "Future USD price version created." not in html:
-        raise RuntimeError("the portal did not append the future price")
+        safe_failures = (
+            "Your session expired — please try again.",
+            "The price was not saved. Use a future UTC time, an exact amount, and a reviewed source reference.",
+            "The price version was not created. Existing prices were not changed.",
+        )
+        reason = next((message for message in safe_failures if message in html), None)
+        if reason is None:
+            reason = "no reviewed portal status was rendered"
+        raise RuntimeError(f"the portal did not append the future price: {reason}")
 
     preview_form = exact_form(
         html, "/admin/model-governance/prices/backdate/preview"
@@ -178,17 +186,23 @@ def main() -> int:
         },
         allowed_hosts=flow.ADMIN_PORTAL_ALLOWED_HOSTS,
     )
-    required_preview = (
-        "Review the backdated price",
-        model,
-        "9.75 USD per 1000000 tokens",
-        source_reference,
-        review_note,
-        "CONFIRM BACKDATED PRICE",
-        "Affected usage rows</th><td class=\"tnum\">0</td>",
-    )
-    if any(value not in preview_html for value in required_preview):
-        raise RuntimeError("the portal did not render the exact stored preview")
+    required_preview = {
+        "heading": "Review the backdated price",
+        "model": model,
+        "price": "9.75 USD per 1000000 tokens",
+        "source": source_reference,
+        "review note": review_note,
+        "confirmation phrase": "CONFIRM BACKDATED PRICE",
+        "affected rows": "Affected usage rows</th><td class=\"tnum\">0</td>",
+    }
+    missing_preview = [
+        name for name, value in required_preview.items() if value not in preview_html
+    ]
+    if missing_preview:
+        raise RuntimeError(
+            "the portal did not render the exact stored preview: "
+            + ", ".join(missing_preview)
+        )
     confirmation_form = exact_form(
         preview_html, "/admin/model-governance/prices/backdate/confirm"
     )

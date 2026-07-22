@@ -84,7 +84,13 @@ class FormParser(HTMLParser):
             self.forms.append(self._form)
         elif tag == "input" and self._form is not None:
             name = values.get("name")
-            if name:
+            input_type = str(values.get("type", "text")).lower()
+            checked_control = input_type in {"checkbox", "radio"}
+            if (
+                name
+                and "disabled" not in values
+                and (not checked_control or "checked" in values)
+            ):
                 self._form["inputs"][name] = values.get("value", "")
 
     def handle_endtag(self, tag: str) -> None:
