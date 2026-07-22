@@ -152,6 +152,9 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         self.assertIn('"models": [MODEL]', limits)
         self.assertIn('"created_via": "dev-portal"', limits)
         self.assertIn('"aigw_model_limits_v1": policy', limits)
+        self.assertNotIn('"key": virtual_key', limits)
+        self.assertIn('generated_key = response.get("key")', limits)
+        self.assertIn('generated_key == preprod.master_key', limits)
         self.assertIn('sort_keys=True,\n        separators=(",", ":")', limits)
         # Two real calls run in parallel. Exactly one may reach the provider.
         self.assertIn("ThreadPoolExecutor(max_workers=2)", limits)
@@ -161,8 +164,11 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         # and the finally block always starts it before deleting the test key.
         self.assertIn('labels.get("com.docker.compose.service") != service', limits)
         self.assertIn(
-            'stopped = preprod.docker("stop", "--time", "10", redis_id)', limits
+            'redis_stopped = True\n        preprod.docker("stop", "--time", "10", redis_id)',
+            limits,
         )
+        self.assertIn('redis_state.get("Status") != "exited"', limits)
+        self.assertNotIn('stopped = preprod.docker("stop"', limits)
         self.assertIn("finally:\n        if redis_stopped:", limits)
         self.assertIn('preprod.wait_healthy("redis")', limits)
 

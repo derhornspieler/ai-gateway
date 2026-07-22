@@ -283,7 +283,7 @@ def main() -> int:
 
     preprod = Preprod(args.image_mode, args.postgres_major)
     marker = secrets.token_hex(8)
-    virtual_key = "sk-" + secrets.token_hex(24)
+    virtual_key: str | None = None
     project = "preprod-limit-" + marker
     policy = json.dumps(
         {
@@ -305,7 +305,6 @@ def main() -> int:
             "/key/generate",
             preprod.master_key,
             {
-                "key": virtual_key,
                 "key_alias": "preprod-model-limit-" + marker,
                 "user_id": "preprod-model-limit-" + marker,
                 "models": [MODEL],
@@ -319,12 +318,16 @@ def main() -> int:
                 "blocked": False,
             },
         )
+        generated_key = response.get("key") if isinstance(response, dict) else None
         if (
             status != 200
-            or not isinstance(response, dict)
-            or response.get("key") != virtual_key
+            or not isinstance(generated_key, str)
+            or not generated_key.startswith("sk-")
+            or not 24 <= len(generated_key) <= 2048
+            or generated_key == preprod.master_key
         ):
-            fail("LiteLLM did not create the exact temporary limit-test key")
+            fail("LiteLLM did not create a valid temporary limit-test key")
+        virtual_key = generated_key
         key_created = True
 
         before = provider_count(preprod)
@@ -362,7 +365,10 @@ def main() -> int:
             results = [call.result() for call in calls]
         statuses = sorted(status for status, _body in results)
         if statuses != [200, 429]:
-            fail("parallel output reservations did not allow one request and deny one")
+            fail(
+                "parallel output reservations did not allow one request and "
+                f"deny one; safe HTTP statuses: {statuses}"
+            )
         denied_parallel = next(body for status, body in results if status == 429)
         if (
             "this project's model output limit is reached"
@@ -377,10 +383,17 @@ def main() -> int:
             fail("parallel reservation denial crossed the provider boundary")
         print("PREPROD_MODEL_MINUTE_RESERVATION_PASSED")
 
-        stopped = preprod.docker("stop", "--time", "10", redis_id).strip()
-        if stopped != redis_id:
-            fail("Docker did not stop the exact preprod Redis container")
+        # Mark recovery before the mutation. If Docker reports an ambiguous
+        # failure after stopping the container, the finally block still starts
+        # this exact, ownership-checked ID.
         redis_stopped = True
+        preprod.docker("stop", "--time", "10", redis_id)
+        try:
+            redis_state = json.loads(preprod.docker("inspect", redis_id))[0]["State"]
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+            fail("Docker returned invalid stopped state for Redis")
+        if redis_state.get("Status") != "exited":
+            fail("Docker did not stop the exact preprod Redis container")
         unavailable_before = provider_count(preprod)
         unavailable_status, unavailable_body = litellm_request(
             preprod, "/v1/chat/completions", virtual_key, chat_body(1)
@@ -395,9 +408,7 @@ def main() -> int:
             fail("the Redis-unavailable request reached the provider")
         print("PREPROD_MODEL_REDIS_FAILURE_PASSED")
 
-        started = preprod.docker("start", redis_id).strip()
-        if started != redis_id:
-            fail("Docker did not restart the exact preprod Redis container")
+        preprod.docker("start", redis_id)
         preprod.wait_healthy("redis")
         redis_stopped = False
 
@@ -425,11 +436,9 @@ def main() -> int:
         print("PREPROD_MODEL_REDIS_RECOVERY_PASSED")
     finally:
         if redis_stopped:
-            started = preprod.docker("start", redis_id).strip()
-            if started != redis_id:
-                fail("Docker did not restart the exact preprod Redis container")
+            preprod.docker("start", redis_id)
             preprod.wait_healthy("redis")
-        if key_created:
+        if key_created and virtual_key is not None:
             status, _ = litellm_request(
                 preprod,
                 "/key/delete",
