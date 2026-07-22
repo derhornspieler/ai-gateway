@@ -238,8 +238,10 @@ Prometheus is the only alert evaluator. It returns only `ALERTS` and
 `ALERTS_FOR_STATE` to Alloy over dedicated mutual TLS. The client and server
 use a target-local CA that signs no other identity. Exact metric-name,
 alert-name, and label allow-lists run before Cribl export. This branch never
-returns to local Prometheus, so it cannot form a telemetry loop. Alertmanager
-does not connect to Cribl.
+returns to local Prometheus, so it cannot form a telemetry loop. If a generated
+alert has no target, Prometheus adds fixed `job` and `instance` labels only for
+this export. It does not replace labels from a real target. Alertmanager does
+not connect to Cribl.
 
 The local disk queue is capped at 2 GiB. A failed batch retries for up to 24
 hours after dequeue. Alloy does not give each waiting record a hard 24-hour

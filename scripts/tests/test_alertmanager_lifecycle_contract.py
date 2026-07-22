@@ -295,6 +295,7 @@ class AlertmanagerLifecycleContractTests(unittest.TestCase):
             "PREPROD_ALERT_CRIBL_EXPORT_PASS",
             "PREPROD_ALERT_LIVE_RESOLVED_PASS",
             '"fixture-state"',
+            'f"last check: {last_reason}"',
             "verify_alerting_graph(args)",
         ):
             self.assertIn(required, self.preprod)

@@ -127,7 +127,10 @@ certificate, and target-local CA. The server name is `alloy-alert-state`, and
 both sides require TLS 1.3. Prometheus keeps an exact approved alert-name list
 and a short label list. Alloy checks the same lists again, adds the deployment
 and `alert-state` labels, and sends the result only to the normal Cribl metric
-batch. Alloy never writes this branch to Prometheus. This prevents a loop.
+batch. Some generated alerts have no scrape target. For those alerts only,
+Prometheus sets `job` to `prometheus-alert-state` and `instance` to
+`prometheus-observability:9090`. Real target labels are kept. Alloy never
+writes this branch to Prometheus. This prevents a loop.
 
 Alertmanager sends nothing to Cribl. It continues to group, inhibit,
 deduplicate, and resolve alerts locally.

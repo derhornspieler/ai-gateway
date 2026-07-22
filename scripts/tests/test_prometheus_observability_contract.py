@@ -253,8 +253,15 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "min_version: TLS13",
             "regex: ALERTS|ALERTS_FOR_STATE",
             "action: labelkeep",
+            "source_labels: [job]",
+            "target_label: job",
+            "replacement: prometheus-alert-state",
+            "source_labels: [instance]",
+            "target_label: instance",
+            "replacement: prometheus-observability:9090",
         ):
             self.assertIn(required, self.prometheus)
+        self.assertEqual(self.prometheus.count("regex: ^$"), 2)
 
         branch = self.alloy.split(
             'prometheus.receive_http "alert_state"', 1
@@ -269,6 +276,8 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             'regex  = "__name__|alertname|alertstate|severity|owner|alert_class|instance|job|device|mountpoint|service|component_id|remote_name"',
             'replacement  = "alert-state"',
             "max_cache_size = 128",
+            'limit          = "384MiB"',
+            'spike_limit    = "64MiB"',
             "metrics = [otelcol.processor.batch.cribl_metrics.input]",
         ):
             self.assertIn(required, branch)

@@ -259,6 +259,8 @@ The only Alertmanager receiver is a local null receiver. Operators use Grafana
 for the lifecycle. Prometheus sends only `ALERTS` and `ALERTS_FOR_STATE` back
 to Alloy over a dedicated mTLS listener on the private observability network.
 Both sides keep an exact alert-name allow-list and a short label allow-list.
+Generated alerts without a scrape target get fixed `prometheus-alert-state`
+and `prometheus-observability:9090` labels. Existing target labels stay as-is.
 Alloy adds the deployment and `alert-state` labels, then sends the samples to
 Cribl only. It never writes this branch back to Prometheus. This fail-closed
 split prevents a telemetry loop. There is no direct Alertmanager-to-Cribl path.

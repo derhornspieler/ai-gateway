@@ -756,8 +756,10 @@ otelcol.receiver.prometheus "alert_state" {
 
 otelcol.processor.memory_limiter "alert_state" {
   check_interval = "1s"
-  limit          = "32MiB"
-  spike_limit    = "8MiB"
+  // Memory limiters observe the whole Alloy process, not one branch. Keep
+  // this narrow branch at the same bounded thresholds as the main pipeline.
+  limit          = "384MiB"
+  spike_limit    = "64MiB"
   output {
     metrics = [otelcol.processor.batch.cribl_metrics.input]
   }

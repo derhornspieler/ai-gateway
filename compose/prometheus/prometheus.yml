@@ -44,5 +44,18 @@ remote_write:
         action: keep
       - regex: __name__|alertname|alertstate|severity|owner|alert_class|instance|job|device|mountpoint|service|component_id|remote_name
         action: labelkeep
+      # Generated alerts such as the watchdog have no scrape target. Alloy's
+      # remote-write receiver requires both labels. Fill only missing values;
+      # alerts raised from a real target keep their original job and instance.
+      - source_labels: [job]
+        regex: ^$
+        target_label: job
+        replacement: prometheus-alert-state
+        action: replace
+      - source_labels: [instance]
+        regex: ^$
+        target_label: instance
+        replacement: prometheus-observability:9090
+        action: replace
 
 scrape_configs: []

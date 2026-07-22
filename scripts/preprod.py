@@ -3887,6 +3887,16 @@ else:
             "--entrypoint", "/opt/venv/bin/python", portal_image,
             "-I", "-c", lifecycle_program, phase,
         )
+        safe_reasons = {
+            "private observability API returned non-success",
+            "Prometheus query failed",
+            "Grafana alert dashboard is missing",
+            "Grafana alert panel query drifted",
+            "PreProd acceptance rule is missing or unhealthy",
+            "the live PreProd alert did not reach every firing path",
+            "the live PreProd alert did not reach every resolved path",
+        }
+        last_reason = "lifecycle checker did not return a recognized result"
         lifecycle_deadline = time.monotonic() + 120
         while time.monotonic() < lifecycle_deadline:
             lifecycle_result = clean_room_docker(*lifecycle_command)
@@ -3896,8 +3906,18 @@ else:
             ):
                 print(marker)
                 return
+            details = {
+                lifecycle_result.stdout.strip(),
+                lifecycle_result.stderr.strip(),
+            }
+            recognized = details.intersection(safe_reasons)
+            if recognized:
+                last_reason = sorted(recognized)[0]
             time.sleep(5)
-        fail(f"the live PreProd alert never reached the {phase} state")
+        fail(
+            f"the live PreProd alert never reached the {phase} state; "
+            f"last check: {last_reason}"
+        )
 
     def wait_for_cribl_alert(since: str) -> None:
         deadline = time.monotonic() + 90
