@@ -493,6 +493,7 @@ class PreprodContractTests(unittest.TestCase):
 
     def test_preprod_reconciles_the_openwebui_key_before_acceptance(self) -> None:
         start = self.tasks.index("Start the isolated preprod project")
+        vault = self.tasks.index("Initialize or unseal the local test Vault")
         reconcile = self.tasks.index(
             "Reconcile and verify the dedicated Open WebUI LiteLLM key"
         )
@@ -500,6 +501,7 @@ class PreprodContractTests(unittest.TestCase):
             "Run the full local preprod edge and identity acceptance gate"
         )
         self.assertLess(start, reconcile)
+        self.assertLess(vault, reconcile)
         self.assertLess(reconcile, acceptance)
         self.assertIn("reconcile-openwebui-key", self.tasks)
         self.assertIn("preprod_openwebui_key.stdout | trim is match(", self.tasks)

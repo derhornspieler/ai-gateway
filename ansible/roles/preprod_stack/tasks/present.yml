@@ -305,6 +305,25 @@
       - start
   changed_when: true
 
+- name: Initialize or unseal the local test Vault
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - bootstrap-vault
+  register: preprod_vault
+  changed_when: "'PREPROD_VAULT_READY' in preprod_vault.stdout"
+
 - name: Reconcile and verify the dedicated Open WebUI LiteLLM key
   ansible.builtin.command:
     argv:
@@ -329,25 +348,6 @@
       '^PREPROD_OPENWEBUI_KEY_RECONCILED created=(?:true|false) models=[1-9][0-9]*$'
     ))
   no_log: true
-
-- name: Initialize or unseal the local test Vault
-  ansible.builtin.command:
-    argv:
-      - python3
-      - "{{ preprod_repo_root }}/scripts/preprod.py"
-      - --domain
-      - "{{ aigw_domain }}"
-      - --project
-      - "{{ preprod_project_name }}"
-      - --prefix
-      - "{{ preprod_resource_prefix }}"
-      - --subnet-octet
-      - "{{ preprod_subnet_octet | string }}"
-      - --image-mode
-      - "{{ preprod_image_mode }}"
-      - bootstrap-vault
-  register: preprod_vault
-  changed_when: "'PREPROD_VAULT_READY' in preprod_vault.stdout"
 
 - name: Auto-initialize Keycloak identity control without the admin portal
   ansible.builtin.command:

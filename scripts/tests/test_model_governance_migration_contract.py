@@ -91,6 +91,12 @@ class ModelGovernanceMigrationContractTests(unittest.TestCase):
             "GOVERNANCE_TRIGGER_COUNT = len(GOVERNANCE_TABLES) * 2",
             self.schema_source,
         )
+        self.assertEqual(
+            self.schema_source.count(
+                "object.relname IN ({_sql_strings(GOVERNANCE_TABLES)})"
+            ),
+            2,
+        )
 
     def test_schema_version_and_provider_policy_binding_fail_closed(self) -> None:
         self.assertIn("CHECK (version = 1)", self.migration)

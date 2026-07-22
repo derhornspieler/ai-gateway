@@ -515,6 +515,16 @@ class ControllerLifecycleAuditTest(unittest.TestCase):
                 ),
                 mock.patch.object(preprod, "SEED_RECEIPT", root / "missing-receipt"),
                 mock.patch.object(preprod, "SEED_OVERLAY", root / "missing-overlay"),
+                mock.patch.object(
+                    preprod,
+                    "PROVIDER_POLICY_RECEIPT",
+                    root / "missing-provider-policy",
+                ),
+                mock.patch.object(
+                    preprod,
+                    "POSTGRES18_REHEARSAL_RECEIPT",
+                    root / "missing-postgres-rehearsal",
+                ),
                 mock.patch.object(preprod, "VAULT_INIT_FILE", root / "missing-vault"),
             ):
                 preprod.prepare_controller_audit_fixture()

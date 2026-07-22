@@ -46,6 +46,7 @@ SELECT
         JOIN pg_class object ON object.oid = installed_trigger.tgrelid
         JOIN pg_namespace namespace ON namespace.oid = object.relnamespace
         WHERE namespace.nspname = 'aigw_governance'
+          AND object.relname IN ({_sql_strings(GOVERNANCE_TABLES)})
           AND installed_trigger.tgname LIKE 'aigw_append_only_%'
           AND installed_trigger.tgenabled = 'O'
           AND NOT installed_trigger.tgisinternal
