@@ -27,19 +27,38 @@ class ChatCapabilityContractTest(unittest.TestCase):
         # The pre-aigw-chat gate must not silently return.
         self.assertNotIn('OAUTH_ALLOWED_ROLES: "aigw-users', compose)
 
-    def test_chat_identity_forwarding_is_attribution_only(self) -> None:
-        """Open WebUI forwards the authenticated chat identity to LiteLLM
-        (X-OpenWebUI-User-* headers) and LiteLLM records the Email header —
-        which carries preferred_username under OAUTH_EMAIL_CLAIM — as the
-        request's end user, so per-request telemetry attributes chat traffic
-        to the person instead of the shared workload key. Both halves are
-        pinned together: dropping either silently reverts every chat request
-        to the anonymous service identity. The header is attribution-only
-        (spend/telemetry); it must never gate authorization."""
+    def test_chat_identity_forwarding_is_an_audit_admission_gate(self) -> None:
+        """Open WebUI signs a short-lived chat identity assertion.
+
+        The exact Open WebUI service key must carry a valid signed assertion
+        before LiteLLM dispatches a model request. Plain headers are never SOC
+        name authority. Roles and model authorization remain separate gates.
+        """
         compose = (ROOT / "compose/docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn('ENABLE_FORWARD_USER_INFO_HEADERS: "true"', compose)
+        self.assertIn(
+            "FORWARD_USER_INFO_HEADER_JWT_SECRET: "
+            "${OPENWEBUI_FORWARD_JWT_SECRET:?OPENWEBUI_FORWARD_JWT_SECRET must be set}",
+            compose,
+        )
+        self.assertIn(
+            "OPENWEBUI_FORWARD_JWT_SECRET: "
+            "${OPENWEBUI_FORWARD_JWT_SECRET:?OPENWEBUI_FORWARD_JWT_SECRET must be set}",
+            compose,
+        )
+        self.assertIn(
+            "FORWARD_USER_INFO_HEADER_JWT: X-OpenWebUI-User-Jwt", compose
+        )
+        self.assertIn('FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS: "120"', compose)
         litellm = (ROOT / "compose/litellm/config.yaml").read_text(encoding="utf-8")
         self.assertIn("user_header_name: X-OpenWebUI-User-Email", litellm)
+        hook = (ROOT / "compose/litellm/aigw_default_model_hook.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("_enforce_openwebui_identity(", hook)
+        self.assertIn(
+            "Open WebUI requires one valid signed user assertion", hook
+        )
 
     def test_compose_bypasses_openwebui_internal_model_acl(self) -> None:
         """Model authorization is the gateway's job (scoped workload key +

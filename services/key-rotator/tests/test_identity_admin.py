@@ -225,7 +225,14 @@ async def test_relying_party_reconciliation_verifies_logout_redirect_allowlist()
             ]
 
         async def _reconcile_client_realm_role_scope_mappings(
-            self, realm, client, desired_roles, admin_token
+            self,
+            realm,
+            client,
+            desired_roles,
+            admin_token,
+            *,
+            remove_extras=True,
+            before_change=None,
         ):
             return None
 
@@ -608,15 +615,27 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
         async def status(self):
             return {
                 "configured": True,
+                "controller_usable": True,
                 "bootstrap_available": False,
                 "bootstrap_cleanup_required": False,
+                "ldap_configured": False,
+                "break_glass_escrow_readable": True,
+                "break_glass_escrowed": True,
+                "vault_oidc_rp_escrow_readable": True,
+                "vault_oidc_rp_escrowed": True,
             }
 
     result = await OrderedAdmin(settings(**RP_SECRETS), vault, db).bootstrap()
     assert result == {
         "configured": True,
+        "controller_usable": True,
         "bootstrap_available": False,
         "bootstrap_cleanup_required": False,
+        "ldap_configured": False,
+        "break_glass_escrow_readable": True,
+        "break_glass_escrowed": True,
+        "vault_oidc_rp_escrow_readable": True,
+        "vault_oidc_rp_escrowed": True,
     }
     break_glass = events.index(("keycloak", "break_glass_ensured"))
     vault_rp_escrow = events.index(
@@ -635,6 +654,63 @@ async def test_bootstrap_deletes_temporary_admin_only_after_verified_state() -> 
     assert escrow["client_id"] == "vault"
     assert escrow["client_secret"] == RP_SECRETS["VAULT_OIDC_CLIENT_SECRET"]
     assert [entry[1] for entry in db.history].count("bootstrap_cleanup") == 1
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_status_failure_never_emits_success_or_cleanup() -> None:
+    db = FakeDB()
+
+    class UnverifiedAdmin(KeycloakAdmin):
+        async def _bootstrap_token(self):
+            return "master-token"
+
+        async def _ensure_relying_parties(self, admin_token):
+            return None
+
+        async def _ensure_controller(self, admin_token):
+            return {"certificate_sha256": "a" * 64}
+
+        async def _client_credentials_with_key(self, realm, client_id, key_doc):
+            return "controller-token"
+
+        async def _root_group(self, admin_token, *, create):
+            return {"id": "managed-root"}
+
+        async def _ensure_ldap_federation(self, admin_token, bind_password):
+            return None
+
+        async def _ensure_broker(self, admin_token):
+            return {"certificate_sha256": "b" * 64}
+
+        async def _ensure_break_glass_admin(self, admin_token):
+            return {
+                "username": "break-glass-admin",
+                "escrowed_at": "2026-01-01T00:00:00+00:00",
+            }
+
+        async def _delete_bootstrap_principals(self, admin_token):
+            return None
+
+        async def status(self):
+            return {
+                "configured": False,
+                "controller_usable": False,
+                "bootstrap_available": False,
+                "bootstrap_cleanup_required": False,
+                "ldap_configured": False,
+                "break_glass_escrow_readable": True,
+                "break_glass_escrowed": True,
+                "vault_oidc_rp_escrow_readable": True,
+                "vault_oidc_rp_escrowed": True,
+            }
+
+    admin = UnverifiedAdmin(settings(**RP_SECRETS), FakeVault(), db)
+    with pytest.raises(IdentityError, match="bootstrap did not verify"):
+        await admin.bootstrap()
+
+    bootstrap_entries = [entry for entry in db.history if entry[1] == "bootstrap"]
+    assert [entry[2] for entry in bootstrap_entries] == ["failed"]
+    assert not any(entry[1] == "bootstrap_cleanup" for entry in db.history)
 
 
 @pytest.mark.asyncio
@@ -1457,7 +1533,10 @@ async def test_broker_reconciles_supported_hardcoded_subject_mapper() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=([{**created, "id": "mapper-uuid"}] if created else []),
+            )
         created.update(json.loads(request.content))
         return httpx.Response(201)
 
@@ -1641,7 +1720,7 @@ class BrokerProofHarness(KeycloakAdmin):
         }
         self.enabled_writes: list[bool] = []
 
-    async def _reconcile_wif_frontend_url(self, admin_token):
+    async def _reconcile_wif_frontend_url(self, admin_token, before_change=None):
         return False
 
     async def _find_client(self, realm, client_id, admin_token):
@@ -1650,11 +1729,15 @@ class BrokerProofHarness(KeycloakAdmin):
     async def _get_client(self, realm, client, admin_token):
         return copy.deepcopy(self.broker)
 
-    async def _ensure_broker_scope_boundary(self, broker, admin_token):
+    async def _ensure_broker_scope_boundary(
+        self, broker, admin_token, before_change=None
+    ):
         self.broker["enabled"] = False
         return copy.deepcopy(self.broker), True
 
-    async def _ensure_broker_subject_mapper(self, broker, admin_token):
+    async def _ensure_broker_subject_mapper(
+        self, broker, admin_token, before_change=None
+    ):
         return broker, False
 
     async def _put_client(self, realm, client, admin_token):

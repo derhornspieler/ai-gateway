@@ -1,7 +1,7 @@
 {
   "author": "AI Gateway platform security <security@aigw.internal>",
   "build_files": {
-    "compose/docker-compose.yml": "9dedf20c440cbe94a081b3f0342f23183c0525f0840a5b853b605fe42164b62f",
+    "compose/docker-compose.yml": "de24e1a2944c103e2d6837ac7e8e20d8954da4f1e4fe1a1194d50ca2e9de6b65",
     "services/dhi-health-probe/Dockerfile.open-webui": "e33a12b21129e72d7c2ed428939d703b7723902f44620671956340a4f7b1806c",
     "services/dhi-health-probe/patch_openwebui_chroma.py": "6d75b29814e78ec990af891b7cd48b4c5afae2ce82401d10d7fc7c1b04102638",
     "services/dhi-health-probe/verify_openwebui_chroma.py": "782f7140dcc349bd099810a5593c1049dbb04519ddf9551b228d2cbc6c11e003"

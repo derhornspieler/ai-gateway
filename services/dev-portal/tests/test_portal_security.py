@@ -7,6 +7,7 @@ import time
 from base64 import b64decode
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import UUID
 
 import httpx
 import pytest
@@ -33,6 +34,58 @@ def security_events(caplog) -> list[dict]:
         for record in caplog.records
         if marker in (message := record.getMessage())
     ]
+
+
+def _status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://key-rotator/internal")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        "fixed test status", request=request, response=response
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (_status_error(400), "failure"),
+        (_status_error(409), "failure"),
+        (_status_error(500), "indeterminate"),
+        (_status_error(418), "indeterminate"),
+        (RuntimeError("unknown"), "indeterminate"),
+        (ValueError("malformed"), "indeterminate"),
+        (
+            httpx.ReadTimeout(
+                "lost response",
+                request=httpx.Request("POST", "http://key-rotator/internal"),
+            ),
+            "indeterminate",
+        ),
+    ],
+)
+def test_identity_mutation_result_is_fail_closed(
+    error: Exception, expected: str
+) -> None:
+    assert main._identity_mutation_result(error) == expected
+
+
+def test_rotator_response_rejects_malformed_and_oversized_documents() -> None:
+    for response in (
+        httpx.Response(200, content=b"{"),
+        httpx.Response(200, content=b"x" * (main.ROTATOR_RESPONSE_MAX_BYTES + 1)),
+    ):
+        with pytest.raises(ValueError) as caught:
+            main._rotator_response(response)
+        assert main._identity_mutation_result(caught.value) == "indeterminate"
+
+
+def test_operation_id_requires_canonical_rfc4122_uuid4() -> None:
+    operation_id = "123e4567-e89b-42d3-a456-426614174000"
+    assert main._canonical_operation_id(operation_id)
+    assert not main._canonical_operation_id("123E4567-E89B-42D3-A456-426614174000")
+    assert not main._canonical_operation_id("00000000-0000-4000-0000-000000000000")
+    assert main._rotator_headers(operation_id)["X-AIGW-Operation-ID"] == operation_id
+    with pytest.raises(ValueError, match="invalid identity mutation operation ID"):
+        main._rotator_headers("not-a-uuid")
 
 
 def portal_key(
@@ -1141,7 +1194,7 @@ def test_identity_mutation_requires_fresh_keycloak_step_up(
 ):
     called = False
 
-    async def rotator_post(path, payload=None):
+    async def rotator_post(path, payload=None, *, operation_id=None):
         nonlocal called
         called = True
         return {}
@@ -1187,7 +1240,7 @@ def test_recent_step_up_allows_only_allowlisted_group_capabilities(
 ):
     calls = []
 
-    async def rotator_post(path, payload=None):
+    async def rotator_post(path, payload=None, *, operation_id=None):
         calls.append((path, payload))
         return {}
 
@@ -1240,15 +1293,20 @@ def test_recent_step_up_allows_only_allowlisted_group_capabilities(
             },
         )
     ]
-    assert security_events(caplog) == [
+    events = security_events(caplog)
+    operation_id = events[0]["operation_id"]
+    assert str(UUID(operation_id)) == operation_id
+    assert events == [
         {
             "schema_version": 1,
             "event": "aigw.portal.audit",
             "action": "identity.group.create",
-            "outcome": "success",
+            "outcome": outcome,
             "subject": "subject-123",
             "group": "platform-team",
+            "operation_id": operation_id,
         }
+        for outcome in ("intent", "success")
     ]
 
 
@@ -1275,8 +1333,8 @@ def test_recent_step_up_allows_only_allowlisted_group_capabilities(
         ),
     ],
 )
-@pytest.mark.parametrize("fails", [False, True])
-def test_identity_group_mutations_emit_actor_audit_events(
+@pytest.mark.parametrize("result_outcome", ["success", "failure", "indeterminate"])
+def test_identity_group_mutations_emit_correlated_actor_audit_events(
     admin_client,
     set_admin_session,
     monkeypatch,
@@ -1285,15 +1343,29 @@ def test_identity_group_mutations_emit_actor_audit_events(
     rotator_name,
     form,
     action,
-    fails,
+    result_outcome,
 ):
+    forwarded_operation_ids = []
+
     async def rotator_get(request_path):
         assert request_path == "/identity/authorization/subject-123"
         return {"admin": True}
 
     async def mutate(*_args, **_kwargs):
-        if fails:
-            raise RuntimeError("upstream detail must stay local")
+        forwarded_operation_ids.append(_kwargs.get("operation_id"))
+        if result_outcome == "failure":
+            request = httpx.Request("POST", "http://key-rotator/internal")
+            response = httpx.Response(409, request=request)
+            raise httpx.HTTPStatusError(
+                "upstream detail must stay local",
+                request=request,
+                response=response,
+            )
+        if result_outcome == "indeterminate":
+            raise httpx.ReadTimeout(
+                "token=transport-secret",
+                request=httpx.Request("POST", "http://key-rotator/internal"),
+            )
         return {}
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
@@ -1319,14 +1391,21 @@ def test_identity_group_mutations_emit_actor_audit_events(
         "schema_version": 1,
         "event": "aigw.portal.audit",
         "action": action,
-        "outcome": "failure" if fails else "success",
+        "outcome": result_outcome,
         "subject": "subject-123",
         "group": form.get("name", "group-1"),
     }
     if "user_id" in form:
         expected["target_subject"] = form["user_id"]
-    assert security_events(caplog) == [expected]
+    events = security_events(caplog)
+    operation_id = events[0]["operation_id"]
+    assert str(UUID(operation_id)) == operation_id
+    assert forwarded_operation_ids == [operation_id]
+    expected["operation_id"] = operation_id
+    intent = dict(expected, outcome="intent")
+    assert events == [intent, expected]
     assert "upstream detail must stay local" not in caplog.text
+    assert "transport-secret" not in caplog.text
 
 
 def test_identity_member_remove_audit_names_group_and_target(
@@ -1345,7 +1424,7 @@ def test_identity_member_remove_audit_names_group_and_target(
     async def deactivate(user_id, project_id):
         calls.append(("deactivate", user_id, project_id))
 
-    async def rotator_delete(path, payload=None):
+    async def rotator_delete(path, payload=None, *, operation_id=None):
         calls.append(("delete", path, payload))
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
@@ -1378,7 +1457,20 @@ def test_identity_member_remove_audit_names_group_and_target(
         ),
         ("deactivate", "user-1", "project-1"),
     ]
-    assert security_events(caplog) == [
+    events = security_events(caplog)
+    operation_id = events[0]["operation_id"]
+    assert str(UUID(operation_id)) == operation_id
+    assert events == [
+        {
+            "schema_version": 1,
+            "event": "aigw.portal.audit",
+            "action": "identity.member.remove",
+            "outcome": "intent",
+            "subject": "subject-123",
+            "group": "group-1",
+            "target_subject": "user-1",
+            "operation_id": operation_id,
+        },
         {
             "schema_version": 1,
             "event": "aigw.portal.audit",
@@ -1388,8 +1480,64 @@ def test_identity_member_remove_audit_names_group_and_target(
             "group": "group-1",
             "project": "project-1",
             "target_subject": "user-1",
-        }
+            "operation_id": operation_id,
+        },
     ]
+
+
+def test_identity_member_remove_post_revoke_failure_is_indeterminate(
+    admin_client, set_admin_session, monkeypatch, caplog
+):
+    deactivate_calls = 0
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def managed_project(group_id):
+        assert group_id == "group-1"
+        return "project-1"
+
+    async def deactivate(user_id, project_id):
+        nonlocal deactivate_calls
+        assert (user_id, project_id) == ("user-1", "project-1")
+        deactivate_calls += 1
+        if deactivate_calls == 2:
+            raise litellm_client.LiteLLMError(
+                "api_key=do-not-export-post-revoke-secret"
+            )
+
+    async def rotator_delete(path, payload=None, *, operation_id=None):
+        assert path == "/identity/groups/group-1/members/user-1"
+        assert operation_id is not None
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_managed_project_for_group", managed_project)
+    monkeypatch.setattr(main, "_deactivate_subject_project_keys", deactivate)
+    monkeypatch.setattr(main, "_rotator_delete", rotator_delete)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/identity/groups/group-1/members/user-1/remove",
+            data={"csrf_token": csrf},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert deactivate_calls == 2
+    events = security_events(caplog)
+    assert [event["outcome"] for event in events] == ["intent", "indeterminate"]
+    assert len({event["operation_id"] for event in events}) == 1
+    assert not any(event["outcome"] == "success" for event in events)
+    assert "do-not-export-post-revoke-secret" not in caplog.text
 
 
 def test_revoked_admin_cookie_cannot_mutate_or_restore_membership(
@@ -1401,7 +1549,7 @@ def test_revoked_admin_cookie_cannot_mutate_or_restore_membership(
         assert path == "/identity/authorization/revoked-admin"
         return {"admin": False}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         nonlocal called
         called = True
         return None
@@ -1447,7 +1595,7 @@ def test_revoked_admin_cookie_cannot_change_rotation_controls(
         assert path == "/identity/authorization/revoked-admin"
         return {"admin": False}
 
-    async def rotator_post(path, payload=None):
+    async def rotator_post(path, payload=None, *, operation_id=None):
         nonlocal called
         called = True
         return None
@@ -1790,7 +1938,7 @@ def test_provider_configure_is_step_up_csrf_and_schema_bounded(
         assert path == "/identity/authorization/subject-123"
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         calls.append((path, payload))
         return {"changed": True}
 
@@ -2777,7 +2925,7 @@ def test_project_policy_route_requires_step_up_and_csrf(
     async def rotator_get(path):
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         nonlocal called
         called = True
         return {}
@@ -2852,7 +3000,7 @@ def test_project_policy_save_retunes_existing_project_keys(
             ]
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         puts.append((path, payload))
         return {
             "id": "group-1",
@@ -2956,7 +3104,7 @@ def test_project_policy_deny_all_models_scopes_keys_to_the_sentinel(
             }]
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         puts.append((path, payload))
         return {"id": "group-1", "name": "ai-gateway",
                 "policy": {"tpm_limit": None, "rpm_limit": None,
@@ -3012,7 +3160,7 @@ def test_project_policy_all_and_none_are_mutually_exclusive(
                                 "allowed_models": None, "default_model": None}}]
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         raise AssertionError("must not persist an ambiguous all+none policy")
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
@@ -3072,7 +3220,7 @@ def test_key_mint_is_not_disclosed_when_the_default_model_stamp_is_missing(
 
 
 def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
-    admin_client, set_admin_session, monkeypatch
+    admin_client, set_admin_session, monkeypatch, caplog
 ):
     """A re-tune whose default stamp does not land verifies closed, not silent."""
 
@@ -3092,7 +3240,7 @@ def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
             return [_unlimited_group()]
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         return {
             "id": "group-1",
             "name": "ai-gateway",
@@ -3131,19 +3279,35 @@ def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
         }
     )
 
-    response = admin_client.post(
-        "/admin/identity/groups/group-1/policy",
-        data={
-            "tpm_limit": "50000",
-            "rpm_limit": "30",
-            "allowed_models": "claude-haiku",
-            "default_model": "claude-haiku",
-            "csrf_token": csrf,
-        },
-        follow_redirects=True,
-    )
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/identity/groups/group-1/policy",
+            data={
+                "tpm_limit": "50000",
+                "rpm_limit": "30",
+                "allowed_models": "claude-haiku",
+                "default_model": "claude-haiku",
+                "csrf_token": csrf,
+            },
+            follow_redirects=True,
+        )
 
     assert "1 could not be verified" in response.text
+    events = security_events(caplog)
+    operation_id = events[0]["operation_id"]
+    assert events == [
+        {
+            "schema_version": 1,
+            "event": "aigw.portal.audit",
+            "action": "identity.group.policy",
+            "outcome": outcome,
+            "subject": "subject-123",
+            "group": "group-1",
+            "operation_id": operation_id,
+            **({"project": "ai-gateway"} if outcome == "indeterminate" else {}),
+        }
+        for outcome in ("intent", "indeterminate")
+    ]
 
 
 def _unlimited_group(group_id="group-1", name="ai-gateway", **policy_overrides):
@@ -3163,6 +3327,66 @@ def _unlimited_group(group_id="group-1", name="ai-gateway", **policy_overrides):
     }
 
 
+@pytest.mark.parametrize(
+    "retune_failure",
+    [
+        litellm_client.LiteLLMError(
+            "api_key=do-not-export-post-policy-secret"
+        ),
+        RuntimeError("token=do-not-export-post-policy-secret"),
+    ],
+)
+def test_project_policy_retune_exception_is_correlated_indeterminate(
+    admin_client, set_admin_session, monkeypatch, caplog, retune_failure
+):
+    async def rotator_get(path):
+        if path == "/identity/groups":
+            return [_unlimited_group()]
+        return {"admin": True}
+
+    async def rotator_put(path, payload, *, operation_id=None):
+        return {
+            "id": "group-1",
+            "name": "ai-gateway",
+            "policy": {
+                "tpm_limit": 1000,
+                "rpm_limit": None,
+                "allowed_models": None,
+                "default_model": None,
+            },
+        }
+
+    async def fail_retune(_project_id, _policy):
+        raise retune_failure
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_retune_project_keys", fail_retune)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/identity/groups/group-1/policy",
+            data={"tpm_limit": "1000", "csrf_token": csrf},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    events = security_events(caplog)
+    operation_id = events[0]["operation_id"]
+    assert [event["outcome"] for event in events] == ["intent", "indeterminate"]
+    assert {event["operation_id"] for event in events} == {operation_id}
+    assert events[-1]["project"] == "ai-gateway"
+    assert "do-not-export-post-policy-secret" not in caplog.text
+
+
 def test_project_policy_rejects_unconfigured_models_before_the_controller(
     admin_client, set_admin_session, monkeypatch
 ):
@@ -3173,7 +3397,7 @@ def test_project_policy_rejects_unconfigured_models_before_the_controller(
             return [_unlimited_group()]
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         nonlocal called
         called = True
         return {}
@@ -3229,7 +3453,7 @@ def test_project_policy_refuses_silent_widening_of_deconfigured_restriction(
             ]
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         nonlocal put_called
         put_called = True
         return {}
@@ -3693,7 +3917,7 @@ def test_project_policy_widens_deconfigured_restriction_only_with_explicit_optou
             ]
         return {"admin": True}
 
-    async def rotator_put(path, payload):
+    async def rotator_put(path, payload, *, operation_id=None):
         puts.append(payload)
         return {
             "id": "group-1",

@@ -50,7 +50,7 @@ ruff check app tests                              # lint
 bandit -q -r app --severity-level medium --confidence-level medium  # security gate (CI variant; the runbook's --severity-level high is a looser release-flow supplement)
 ```
 
-Toolchain is pinned in each service's `requirements-dev.txt` (ruff 0.15.22, pytest 9.1.1, bandit 1.9.4); install with `pip install -r requirements-dev.txt` or use the clean-venv flow in `docs/test-runbook.md` §1. CI pins Python 3.14.6.
+Toolchain is pinned in each service's `requirements-dev.txt` (ruff 0.15.22, pytest 9.1.1, bandit 1.9.4); install with `pip install -r requirements-dev.txt` or use the clean-venv flow in `docs/test-runbook.md#python-services`. CI pins Python 3.14.6.
 
 ### Go modules (services/{dhi-health-probe,egress-proxy,vault-ui-proxy,wif-provider-mock} — stdlib-only, no go.sum)
 
@@ -95,11 +95,14 @@ Local preprod is a separate localhost-only flow. It does not run the Rocky host
 roles:
 
 ```bash
-ansible-playbook -i ansible/inventory/preprod.yml ansible/preprod.yml
+ansible-playbook -i ansible/inventory/preprod.yml ansible/preprod.yml --ask-become-pass
 python3 -I scripts/test-e2e-preprod.py
 ```
 
-See `docs/preprod.md` for seed mode, local names, and safe removal.
+You may pass the private `--become-password-file` described in
+`docs/preprod.md` instead of the prompt. Sudo is used only for the bounded
+hosts block and macOS loopback aliases. See that guide for seed mode, local
+names, and safe removal.
 
 **Run converges from the repo root with pipelining ON — it is a confidentiality control.** The automatic Vault-unseal task and the LDAP bind task pass their decrypted secret on the command module's `stdin` under `no_log`. `no_log` only suppresses Ansible's own logging; with pipelining **off** Ansible still base64-embeds that stdin in the AnsiballZ module payload it writes to `~/.ansible/tmp` on the **target**. Pipelining streams the module over the SSH session so the secret never lands on remote disk. Ansible only auto-loads `./ansible.cfg` from the current directory, so the committed **repo-root `ansible.cfg`** (a mirror of `ansible/ansible.cfg`, both set `pipelining = True` in `[defaults]`) is what makes `ansible-playbook … ansible/site.yml` from the repo root safe. Verify before a converge: `ansible-config dump | grep PIPELINING` must show `= True`, never `(default) = False`. Invoking from another directory requires `ANSIBLE_PIPELINING=True` (or `ANSIBLE_CONFIG=$PWD/ansible/ansible.cfg`). The two `ansible.cfg` files are pinned in sync by `scripts/tests/test_vault_ansible_unseal_contract.py`.
 
@@ -128,7 +131,11 @@ they do not depend on a literal `rw` token.
 
 ## Architecture
 
-**Two-machine model.** A controller workstation (macOS/Linux, ansible-core) runs everything against the target VM over SSH. Ansible configures an existing host only — it never provisions VMs, NICs, addresses, routes, or DNS, and `site.yml` refuses to run if declared topology disagrees with live facts (no override switches; fix inventory or the host).
+**Production controller model.** A controller workstation (macOS/Linux,
+ansible-core) runs production Ansible against the target VM over SSH. Ansible
+configures an existing host only. It never creates VMs, NICs, addresses,
+routes, or DNS. `site.yml` refuses to run if the declared topology disagrees
+with the live host. Local preprod is the separate localhost-only flow above.
 
 **Ansible converge.** `ansible/site.yml` runs `os-prep.yml` and then
 `deploy-stack-only.yml`. Its role order is:
@@ -148,7 +155,7 @@ bootstrap, controller preflight, and host-variables template. Adding a secret
 or topology key means updating every consumer. `vault_unseal_key` cannot exist
 until `vault operator init` and belongs in its dedicated encrypted overlay.
 
-**Compose stack** (`compose/docker-compose.yml`, project `ai-gateway`, deployed to `/opt/ai-gateway`) defines 24 services — one-shot `volume-init` plus 23 long-running, of which `vault-ui-proxy`/`oauth2-proxy-vault` are gated behind the `vault-ui` profile (22 run by default). Ansible may add the optional `platform-dns` overlay. **Never run `docker compose up` by hand** on a deployed host; use `scripts/aigw-compose.sh`, which derives files and profiles from `.env`. Local preprod uses `compose/docker-compose.preprod.yml` and `scripts/preprod.py`. Two shared anchors: `x-hardening` (cap_drop ALL, no-new-privileges, bounded logging) merges into every long-running service; `volume-init` deliberately does not inherit it.
+**Compose stack** (`compose/docker-compose.yml`, project `ai-gateway`, deployed to `/opt/ai-gateway`) defines 24 services — one-shot `volume-init` plus 23 long-running, of which `vault-ui-proxy`/`oauth2-proxy-vault` are gated behind the `vault-ui` profile (22 run by default, including the one-shot). Ansible may add the optional `platform-dns` overlay. **Never run `docker compose up` by hand** on a deployed host; use `scripts/aigw-compose.sh`, which derives files and profiles from `.env`. Local preprod uses `compose/docker-compose.preprod.yml` and `scripts/preprod.py`. Two shared anchors: `x-hardening` (cap_drop ALL, no-new-privileges, bounded logging) merges into every long-running service; `volume-init` deliberately does not inherit it.
 
 **Networks are a firewall ABI.** All 20 bridges (172.28.0.0/24 … 172.28.20.0/24; 172.28.16.0/24 is retired/reserved) are pre-created by Ansible as `external: true` (base stack attaches 18); bridge names, subnets, and fixed `ipv4_address` values (e.g. Envoy at 172.28.0.2) feed DOCKER-USER allowlists, trusted-proxy lists, and `site.yml`'s embedded topology check. Changing one requires updating `ansible/group_vars/all.yml`, the compose file, and the firewall expectations together. Only Traefik publishes ports, bound to exact NIC IPs (`${ETH1_IP}`/`${ETH2_IP}`), never 0.0.0.0.
 

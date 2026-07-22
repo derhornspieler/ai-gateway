@@ -18,6 +18,7 @@ import hmac
 import json
 import logging
 import re
+import uuid
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -126,9 +127,34 @@ def _identity_http_error(exc: IdentityError) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, IdentityConflict):
         return HTTPException(status_code=409, detail=str(exc))
-    # IdentityError messages are deliberately redacted at their Keycloak and
-    # Vault boundaries. Treat upstream/control-plane failures as Bad Gateway.
-    return HTTPException(status_code=502, detail=str(exc))
+    # Treat upstream/control-plane failures as Bad Gateway. Keep the response
+    # fixed as a second boundary in case a future IdentityError accidentally
+    # wraps a raw LDAP, Vault, or Keycloak diagnostic.
+    return HTTPException(status_code=502, detail="identity operation failed")
+
+
+def _identity_operation_id(request: Request) -> str:
+    values = request.headers.getlist("X-AIGW-Operation-ID")
+    if len(values) != 1:
+        raise HTTPException(
+            status_code=400, detail="missing or invalid identity operation ID"
+        )
+    value = values[0]
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail="missing or invalid identity operation ID"
+        ) from exc
+    if (
+        parsed.variant != uuid.RFC_4122
+        or parsed.version != 4
+        or str(parsed) != value
+    ):
+        raise HTTPException(
+            status_code=400, detail="missing or invalid identity operation ID"
+        )
+    return value
 
 
 def _provider_http_error(exc: ProviderError) -> HTTPException:
@@ -649,17 +675,30 @@ async def identity_chat_capability_health() -> dict[str, Any]:
 
 
 @app.post("/identity/groups", status_code=201)
-async def identity_create_group(body: IdentityGroupCreate) -> dict[str, Any]:
+async def identity_create_group(
+    body: IdentityGroupCreate, request: Request
+) -> dict[str, Any]:
     identity: KeycloakAdmin = state["identity"]
+    operation_id = _identity_operation_id(request)
     try:
-        return await identity.create_group(body.name, body.capabilities)
+        return await identity.create_group(
+            body.name, body.capabilities, operation_id
+        )
     except IdentityError as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_create", operation_id, exc
+        )
         raise _identity_http_error(exc) from exc
+    except Exception as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_create", operation_id, exc
+        )
+        raise
 
 
 @app.put("/identity/groups/{group_id}/policy")
 async def identity_set_group_policy(
-    group_id: str, body: IdentityGroupPolicyUpdate
+    group_id: str, body: IdentityGroupPolicyUpdate, request: Request
 ) -> dict[str, Any]:
     """Write one managed group's issuance policy (admin token only).
 
@@ -667,19 +706,39 @@ async def identity_set_group_policy(
     only the full internal token — i.e. the admin portal — can mutate policy.
     """
     identity: KeycloakAdmin = state["identity"]
+    operation_id = _identity_operation_id(request)
     try:
-        return await identity.set_group_policy(group_id, body.model_dump())
+        return await identity.set_group_policy(
+            group_id, body.model_dump(), operation_id
+        )
     except IdentityError as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_policy_update", operation_id, exc
+        )
         raise _identity_http_error(exc) from exc
+    except Exception as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_policy_update", operation_id, exc
+        )
+        raise
 
 
 @app.delete("/identity/groups/{group_id}", status_code=204)
-async def identity_delete_group(group_id: str) -> None:
+async def identity_delete_group(group_id: str, request: Request) -> None:
     identity: KeycloakAdmin = state["identity"]
+    operation_id = _identity_operation_id(request)
     try:
-        await identity.delete_group(group_id)
+        await identity.delete_group(group_id, operation_id)
     except IdentityError as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_delete", operation_id, exc
+        )
         raise _identity_http_error(exc) from exc
+    except Exception as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_delete", operation_id, exc
+        )
+        raise
 
 
 @app.get("/identity/groups/{group_id}/members")
@@ -692,21 +751,43 @@ async def identity_group_members(group_id: str) -> list[dict[str, Any]]:
 
 
 @app.put("/identity/groups/{group_id}/members/{user_id}", status_code=204)
-async def identity_add_group_member(group_id: str, user_id: str) -> None:
+async def identity_add_group_member(
+    group_id: str, user_id: str, request: Request
+) -> None:
     identity: KeycloakAdmin = state["identity"]
+    operation_id = _identity_operation_id(request)
     try:
-        await identity.add_member(group_id, user_id)
+        await identity.add_member(group_id, user_id, operation_id)
     except IdentityError as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_member_add", operation_id, exc
+        )
         raise _identity_http_error(exc) from exc
+    except Exception as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_member_add", operation_id, exc
+        )
+        raise
 
 
 @app.delete("/identity/groups/{group_id}/members/{user_id}", status_code=204)
-async def identity_remove_group_member(group_id: str, user_id: str) -> None:
+async def identity_remove_group_member(
+    group_id: str, user_id: str, request: Request
+) -> None:
     identity: KeycloakAdmin = state["identity"]
+    operation_id = _identity_operation_id(request)
     try:
-        await identity.remove_member(group_id, user_id)
+        await identity.remove_member(group_id, user_id, operation_id)
     except IdentityError as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_member_remove", operation_id, exc
+        )
         raise _identity_http_error(exc) from exc
+    except Exception as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_member_remove", operation_id, exc
+        )
+        raise
 
 
 @app.get("/identity/users")

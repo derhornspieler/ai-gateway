@@ -84,6 +84,12 @@ ROTATION_RESULT_STATUSES = frozenset({"success", "failed", "skipped", "disabled"
 ROTATION_STATUSES = frozenset(
     {"started", "success", "failed", "skipped", "disabled", "recovered"}
 )
+ROTATION_HISTORY_DETAILS = {
+    "success": "provider rotation completed",
+    "failed": "provider rotation failed",
+    "skipped": "provider rotation skipped",
+    "disabled": "provider rotation disabled",
+}
 
 
 @dataclass(frozen=True)
@@ -126,6 +132,14 @@ class _NullSpan:
 
     def __exit__(self, *exc: Any) -> bool:
         return False
+
+
+class _RotationHistoryFailure(RuntimeError):
+    """Internal fixed marker for an unavailable rotation-history store."""
+
+
+class _RotationControlFailure(RuntimeError):
+    """Internal fixed marker for a failed scheduler control step."""
 
 
 class RotationScheduler:
@@ -357,7 +371,11 @@ class RotationScheduler:
         except (AttributeError, TypeError, ValueError):
             logger.error("rotation security event rejected an internal rotation ID")
             return
-        if parsed_id.version != 4 or str(parsed_id) != rotation_id:
+        if (
+            parsed_id.variant != uuid.RFC_4122
+            or parsed_id.version != 4
+            or str(parsed_id) != rotation_id
+        ):
             logger.error("rotation security event rejected a non-canonical rotation ID")
             return
 
@@ -1100,15 +1118,41 @@ class RotationScheduler:
                 "rotation already in progress for this vendor; concurrent run skipped"
             )
             logger.warning("run_rotation: vendor=%s %s", vendor, detail)
-            await self._db.record_history(vendor, "rotate", "skipped", detail)
             result = RotationResult(status="skipped", detail=detail)
+            history_persisted = await self._record_rotation_history(vendor, result)
             self._finish_rotation_lifecycle(
                 vendor, lifecycle, result, had_prior_failure=False
             )
+            if not history_persisted:
+                raise RuntimeError("rotation history persistence failed") from None
             return result
 
         async with lock:
-            async with self._db.rotation_lock(self._lock_domain(vendor)) as acquired:
+            result = await self._run_rotation_serialized(vendor, driver)
+        try:
+            await self._reconcile_oneshot_lifecycle(vendor, result)
+        except Exception:  # noqa: BLE001 - dependency text can contain secrets
+            # The provider attempt already has its truthful terminal event.
+            # This is a later scheduler-control failure, so do not rewrite the
+            # provider result or emit a contradictory rotation outcome.
+            logger.error("provider rotation lifecycle reconciliation failed")
+            raise RuntimeError(
+                "provider rotation lifecycle reconciliation failed"
+            ) from None
+        return result
+
+    async def _run_rotation_serialized(
+        self, vendor: str, driver: Any
+    ) -> RotationResult:
+        """Run below both locks and close any lifecycle opened before failure."""
+
+        lifecycle: _RotationLifecycle | None = None
+        attempt_emitted = False
+        lifecycle_closed = False
+        try:
+            async with self._db.rotation_lock(
+                self._lock_domain(vendor)
+            ) as acquired:
                 if not acquired:
                     lifecycle = self._start_rotation_lifecycle(
                         vendor, keep_for_retry=False
@@ -1118,11 +1162,16 @@ class RotationScheduler:
                         "another key-rotator instance holds the distributed vendor lock"
                     )
                     logger.warning("run_rotation: vendor=%s %s", vendor, detail)
-                    await self._db.record_history(vendor, "rotate", "skipped", detail)
                     result = RotationResult(status="skipped", detail=detail)
+                    history_persisted = await self._record_rotation_history(
+                        vendor, result
+                    )
                     self._finish_rotation_lifecycle(
                         vendor, lifecycle, result, had_prior_failure=False
                     )
+                    lifecycle_closed = True
+                    if not history_persisted:
+                        raise _RotationHistoryFailure
                     return result
 
                 lifecycle = self._rotation_lifecycles.get(vendor)
@@ -1131,9 +1180,13 @@ class RotationScheduler:
                         vendor, keep_for_retry=True
                     )
                 lifecycle.attempt += 1
-                result, retry_scheduled, had_prior_failure = (
-                    await self._run_rotation_locked(vendor, driver)
-                )
+                (
+                    result,
+                    retry_scheduled,
+                    had_prior_failure,
+                    history_persisted,
+                    controls_succeeded,
+                ) = await self._run_rotation_locked(vendor, driver)
 
                 safe_status = (
                     result.status
@@ -1147,19 +1200,17 @@ class RotationScheduler:
                     rotation_status=safe_status,
                     attempt=lifecycle.attempt,
                 )
+                attempt_emitted = True
                 if safe_status == "failed":
                     self._rotation_degraded.add(vendor)
 
                 retry_continues = (
                     safe_status == "failed"
                     and retry_scheduled
+                    and history_persisted
+                    and controls_succeeded
                     and lifecycle.attempt < MAX_ROTATION_ATTEMPTS
                 )
-                # _run_rotation_locked schedules the operational retry first.
-                # At the event-field limit, close this correlation ID but keep
-                # that safety retry. Its next attempt starts a new lifecycle at
-                # attempt 1, so telemetry stays bounded without stopping token
-                # refresh.
                 if not retry_continues:
                     self._finish_rotation_lifecycle(
                         vendor,
@@ -1167,8 +1218,64 @@ class RotationScheduler:
                         result,
                         had_prior_failure=had_prior_failure,
                     )
-        await self._reconcile_oneshot_lifecycle(vendor, result)
-        return result
+                    lifecycle_closed = True
+                if not history_persisted:
+                    raise _RotationHistoryFailure
+                if not controls_succeeded:
+                    raise _RotationControlFailure
+                return result
+        except _RotationHistoryFailure:
+            raise RuntimeError("rotation history persistence failed") from None
+        except _RotationControlFailure:
+            raise RuntimeError("provider rotation control failed") from None
+        except Exception:  # noqa: BLE001 - exception text can contain secrets
+            logger.error("provider rotation control failed for vendor=%s", vendor)
+            if lifecycle is not None and not lifecycle_closed:
+                if lifecycle.attempt < 1:
+                    lifecycle.attempt = 1
+                failure = RotationResult(
+                    status="failed",
+                    detail="provider rotation control failed",
+                )
+                if not attempt_emitted:
+                    self._rotation_event(
+                        action="attempt",
+                        vendor=vendor,
+                        rotation_id=lifecycle.rotation_id,
+                        rotation_status="failed",
+                        attempt=lifecycle.attempt,
+                    )
+                await self._record_rotation_history(vendor, failure)
+                self._finish_rotation_lifecycle(
+                    vendor, lifecycle, failure, had_prior_failure=False
+                )
+            raise RuntimeError("provider rotation control failed") from None
+
+    async def _record_rotation_history(
+        self, vendor: str, result: RotationResult
+    ) -> bool:
+        """Persist local history without losing the independent SOC receipt.
+
+        A provider can finish after PostgreSQL becomes unavailable. The caller
+        still emits the provider result, then raises one fixed exception so a
+        database error cannot leak credentials or leave an open audit lifecycle.
+        """
+        try:
+            safe_status = (
+                result.status
+                if result.status in ROTATION_RESULT_STATUSES
+                else "failed"
+            )
+            await self._db.record_history(
+                vendor,
+                "rotate",
+                safe_status,
+                ROTATION_HISTORY_DETAILS[safe_status],
+            )
+        except Exception:  # noqa: BLE001 - exception text may contain secrets
+            logger.error("rotation history persistence failed for vendor=%s", vendor)
+            return False
+        return True
 
     async def _reconcile_oneshot_lifecycle(
         self, vendor: str, result: RotationResult
@@ -1229,7 +1336,7 @@ class RotationScheduler:
 
     async def _run_rotation_locked(
         self, vendor: str, driver: Any
-    ) -> tuple[RotationResult, bool, bool]:
+    ) -> tuple[RotationResult, bool, bool, bool, bool]:
         row = await self._db.get_settings(vendor) or {}
         config = row.get("config")
         prior_fail_count = config.get("_fail_count", 0) if isinstance(config, dict) else 0
@@ -1247,10 +1354,8 @@ class RotationScheduler:
                 status="skipped",
                 detail="Anthropic WIF refresh is disabled; rotation skipped",
             )
-            await self._db.record_history(
-                vendor, "rotate", result.status, result.detail
-            )
-            return result, False, had_prior_failure
+            history_persisted = await self._record_rotation_history(vendor, result)
+            return result, False, had_prior_failure, history_persisted, True
         ctx = DriverContext(
             settings=self._settings,
             vault=self._vault,
@@ -1300,15 +1405,25 @@ class RotationScheduler:
                 except Exception:  # noqa: BLE001
                     pass
 
-        await self._db.record_history(vendor, "rotate", result.status, result.detail)
-
         retry_scheduled = False
+        controls_succeeded = True
         if result.next_run_seconds is not None:
-            retry_scheduled = await self._reschedule_dynamic(
-                vendor, result.next_run_seconds
-            )
+            try:
+                retry_scheduled = await self._reschedule_dynamic(
+                    vendor, result.next_run_seconds
+                )
+            except Exception:  # noqa: BLE001 - upstream text may contain secrets
+                logger.error("provider rotation reschedule failed for vendor=%s", vendor)
+                controls_succeeded = False
 
-        return result, retry_scheduled, had_prior_failure
+        history_persisted = await self._record_rotation_history(vendor, result)
+        return (
+            result,
+            retry_scheduled,
+            had_prior_failure,
+            history_persisted,
+            controls_succeeded,
+        )
 
     async def _reschedule_dynamic(self, vendor: str, seconds: float) -> bool:
         """Driver-requested dynamic next-run override (e.g. Anthropic's

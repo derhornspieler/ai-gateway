@@ -566,6 +566,31 @@ class UpdateImagesContractTest(unittest.TestCase):
         self.assertIn("automatic upgrades refuse PostgreSQL major changes", source)
         self.assertNotIn("skip-backup-check", source)
 
+    def test_lifecycle_audit_uses_only_immutable_release_identifiers(self) -> None:
+        release = mock.Mock(
+            manifest_sha256="a" * 64,
+            document={
+                "egress_policy": {
+                    "envoy_image_id": "sha256:" + "b" * 64,
+                    "egress_policy_sha256": "c" * 64,
+                    "selected_providers": ["anthropic"],
+                },
+                "untrusted_extra": "must-not-be-forwarded",
+            },
+        )
+        self.assertEqual(
+            TOOL.lifecycle_release_fields(release, "d" * 40),
+            {
+                "controller_lifecycle_manifest_sha256": "a" * 64,
+                "controller_lifecycle_release_commit": "d" * 40,
+                "controller_lifecycle_envoy_image_id": "sha256:" + "b" * 64,
+                "controller_lifecycle_egress_policy_sha256": "c" * 64,
+            },
+        )
+        release.manifest_sha256 = "A" * 64
+        with self.assertRaisesRegex(TOOL.WorkflowError, "manifest digest"):
+            TOOL.lifecycle_release_fields(release, "d" * 40)
+
     def test_unexpected_candidate_exception_still_runs_automatic_rollback(self) -> None:
         args = mock.Mock(
             archive=Path("/candidate.tar.zst"),
@@ -617,6 +642,7 @@ class UpdateImagesContractTest(unittest.TestCase):
                 TOOL, "deploy_candidate", side_effect=ValueError("parser bug")
             ),
             mock.patch.object(TOOL, "run_external_validation"),
+            mock.patch.object(TOOL, "record_remote_lifecycle") as lifecycle,
             mock.patch.object(TOOL, "automatic_rollback") as rollback,
         ):
             with self.assertRaisesRegex(
@@ -625,6 +651,172 @@ class UpdateImagesContractTest(unittest.TestCase):
             ):
                 TOOL.cmd_upgrade(args)
         rollback.assert_called_once()
+        self.assertEqual(
+            [
+                (call.kwargs["action"], call.kwargs["outcome"])
+                for call in lifecycle.call_args_list
+            ],
+            [
+                ("upgrade", "started"),
+                ("upgrade", "failed"),
+                ("rollback", "started"),
+                ("rollback", "success"),
+            ],
+        )
+        operation_ids = {
+            call.kwargs["operation_id"] for call in lifecycle.call_args_list
+        }
+        self.assertEqual(len(operation_ids), 1)
+        self.assertEqual(
+            [call.kwargs["state"] for call in identity.call_args_list],
+            ["present", "absent"],
+        )
+
+    def test_candidate_cleanup_failure_never_records_upgrade_success(self) -> None:
+        args = mock.Mock(
+            archive=Path("/candidate.tar.zst"),
+            manifest=Path("/candidate.json"),
+            previous_archive=Path("/previous.tar.zst"),
+            previous_manifest=Path("/previous.json"),
+            ssh_target="deployer@gateway.example.internal",
+            ssh_port=2222,
+            remote_backup_root="/mnt/ai-gateway-backups",
+            remote_backup_path="/mnt/ai-gateway-backups/update.age",
+            backup_recipient="age1" + "a" * 58,
+            limit="gateway01",
+        )
+        candidate = mock.Mock(platform="linux/amd64", manifest_sha256="a" * 64)
+        previous = mock.Mock(platform="linux/amd64", manifest_sha256="b" * 64)
+        backup = TOOL.BackupReceipt(
+            path="/mnt/ai-gateway-backups/update.age",
+            sha256="c" * 64,
+            created_at="2026-07-21T00:00:00Z",
+        )
+        cleanup_failure = TOOL.WorkflowError(
+            "temporary recovery identity remains on the target"
+        )
+        with (
+            mock.patch.object(
+                TOOL,
+                "validate_upgrade_inputs",
+                return_value=(
+                    Path("/inventory.yml"),
+                    "gateway01@/vault-password",
+                    Path("/previous-source"),
+                    Path("/rollback.agekey"),
+                    "candidate-commit",
+                    "previous-commit",
+                ),
+            ),
+            mock.patch.object(TOOL, "read_release", side_effect=[candidate, previous]),
+            mock.patch.object(TOOL, "validate_release_source_pins"),
+            mock.patch.object(
+                TOOL, "remote_paths", side_effect=[mock.Mock(), mock.Mock()]
+            ),
+            mock.patch.object(TOOL, "validate_remote_backup_boundary"),
+            mock.patch.object(TOOL, "stage_release"),
+            mock.patch.object(TOOL, "preload_previous_release"),
+            mock.patch.object(
+                TOOL,
+                "manage_remote_recovery_identity",
+                side_effect=[None, cleanup_failure, None],
+            ) as identity,
+            mock.patch.object(TOOL, "take_backup", return_value=backup),
+            mock.patch.object(TOOL, "deploy_candidate"),
+            mock.patch.object(TOOL, "run_external_validation"),
+            mock.patch.object(TOOL, "record_remote_lifecycle") as lifecycle,
+            mock.patch.object(TOOL, "automatic_rollback") as rollback,
+        ):
+            with self.assertRaisesRegex(
+                TOOL.WorkflowError,
+                "temporary recovery identity remains on the target",
+            ):
+                TOOL.cmd_upgrade(args)
+
+        rollback.assert_called_once()
+        self.assertEqual(
+            [
+                (call.kwargs["action"], call.kwargs["outcome"])
+                for call in lifecycle.call_args_list
+            ],
+            [
+                ("upgrade", "started"),
+                ("upgrade", "failed"),
+                ("rollback", "started"),
+                ("rollback", "success"),
+            ],
+        )
+        self.assertEqual(
+            [call.kwargs["state"] for call in identity.call_args_list],
+            ["present", "absent", "absent"],
+        )
+
+    def test_success_audit_failure_leaves_validated_candidate_running(self) -> None:
+        args = mock.Mock(
+            archive=Path("/candidate.tar.zst"),
+            manifest=Path("/candidate.json"),
+            previous_archive=Path("/previous.tar.zst"),
+            previous_manifest=Path("/previous.json"),
+            ssh_target="deployer@gateway.example.internal",
+            ssh_port=2222,
+            remote_backup_root="/mnt/ai-gateway-backups",
+            remote_backup_path="/mnt/ai-gateway-backups/update.age",
+            backup_recipient="age1" + "a" * 58,
+            limit="gateway01",
+        )
+        candidate = mock.Mock(platform="linux/amd64", manifest_sha256="a" * 64)
+        previous = mock.Mock(platform="linux/amd64", manifest_sha256="b" * 64)
+        backup = TOOL.BackupReceipt(
+            path="/mnt/ai-gateway-backups/update.age",
+            sha256="c" * 64,
+            created_at="2026-07-21T00:00:00Z",
+        )
+        with (
+            mock.patch.object(
+                TOOL,
+                "validate_upgrade_inputs",
+                return_value=(
+                    Path("/inventory.yml"),
+                    "gateway01@/vault-password",
+                    Path("/previous-source"),
+                    Path("/rollback.agekey"),
+                    "candidate-commit",
+                    "previous-commit",
+                ),
+            ),
+            mock.patch.object(TOOL, "read_release", side_effect=[candidate, previous]),
+            mock.patch.object(TOOL, "validate_release_source_pins"),
+            mock.patch.object(
+                TOOL, "remote_paths", side_effect=[mock.Mock(), mock.Mock()]
+            ),
+            mock.patch.object(TOOL, "validate_remote_backup_boundary"),
+            mock.patch.object(TOOL, "stage_release"),
+            mock.patch.object(TOOL, "preload_previous_release"),
+            mock.patch.object(TOOL, "manage_remote_recovery_identity") as identity,
+            mock.patch.object(TOOL, "take_backup", return_value=backup),
+            mock.patch.object(TOOL, "deploy_candidate"),
+            mock.patch.object(TOOL, "run_external_validation"),
+            mock.patch.object(
+                TOOL,
+                "record_remote_lifecycle",
+                side_effect=[None, TOOL.WorkflowError("audit append unavailable")],
+            ) as lifecycle,
+            mock.patch.object(TOOL, "automatic_rollback") as rollback,
+        ):
+            with self.assertRaisesRegex(
+                TOOL.WorkflowError,
+                "leave the validated candidate running and repair the audit path",
+            ):
+                TOOL.cmd_upgrade(args)
+
+        rollback.assert_not_called()
+        self.assertEqual(
+            [
+                (call.kwargs["action"], call.kwargs["outcome"])
+                for call in lifecycle.call_args_list
+            ],
+            [("upgrade", "started"), ("upgrade", "success")],
+        )
         self.assertEqual(
             [call.kwargs["state"] for call in identity.call_args_list],
             ["present", "absent"],

@@ -27,6 +27,43 @@ The admin portal no longer has an identity initialization step. Its identity
 pages are for normal access work after deployment. They are not a deployment
 gate.
 
+## Managed identity change and recovery
+
+The controller records a private digest of the full managed identity policy in
+Vault. The digest covers the managed OIDC clients, broker, event settings,
+LDAP settings, and reviewed secret state. Raw secrets do not enter the digest
+record or audit log.
+
+Before the controller changes live identity state, it writes a pending record
+to Vault. That record has one UUIDv4 and one change type:
+
+- `planned_change` means the reviewed inventory or secret input changed; or
+- `security_drift` means live Keycloak or LDAP state moved away from the last
+  verified policy.
+
+Planned work emits `managed_identity_change_planned`, then
+`managed_identity_change_applied`. Drift emits
+`managed_identity_drift_detected`, then `managed_identity_recovery`. A failed
+repair keeps the pending record. The next run reuses the same UUID. The
+controller clears it only after live checks, durable Vault state, and the
+terminal audit event all pass.
+
+If a run reports a malformed pending record or says the policy changed while
+recovery is pending:
+
+1. Keep the identity change stopped.
+2. Do not delete or edit the Vault state by hand.
+3. Restore the exact reviewed inventory and secret set that began the pending
+   operation, then run the normal converge again.
+4. If those inputs are not available, keep access in maintenance and open an
+   identity incident. Use the UUID to join the start, failure, retry, and
+   terminal audit records.
+
+Changing `identity_ldap_provider_name` is not a normal rename. It fails before
+live mutation and needs a reviewed migration. One old state shape may have a
+blank provider name. The controller adopts the desired name only when the
+stored provider ID is the same live provider ID. A different ID fails closed.
+
 ## Domain-based Keycloak URLs
 
 Set the base domain once with `aigw_domain`. Ansible uses it for every managed

@@ -1,5 +1,11 @@
 # Lab Destructive Rebuild and Restore Rehearsal
 
+> **Archived record — do not use.** This page describes a retired Rocky and
+> Parallels lab. It is historical evidence, not an active runbook. Release
+> rehearsal now uses the exact offline seed in local Docker preprod through
+> Ansible. Production Ansible configures only an existing customer-owned Rocky
+> Linux 9 host; it never creates a VM.
+
 This runbook recreates the disposable Rocky Linux 9 lab VM from vanilla
 media and restores the `rocky9-lab` AI Gateway state. It is a
 destructive recovery exercise, not the ordinary lab deployment procedure.

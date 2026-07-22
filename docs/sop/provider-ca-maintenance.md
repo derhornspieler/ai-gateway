@@ -175,11 +175,13 @@ python3 -I scripts/update-images.py prepare \
   --platform linux/amd64 \
   --archive /release/aigw-ca-rotation.docker.tar.zst \
   --manifest /release/aigw-ca-rotation.manifest.json \
-  --test-preprod
+  --test-preprod \
+  --ask-become-pass
 ```
 
-Use the real approved provider list and target platform. On macOS, add
-`--ask-become-pass`.
+Use the real approved provider list and target platform. You may replace
+`--ask-become-pass` with a private `--become-password-file`. Sudo changes only
+the bounded hosts block and, on macOS, the owned loopback aliases.
 
 The command also creates the sibling preprod release. Local preprod loads that
 archive and starts the exact Envoy image with `pull_policy: never`. Do not use

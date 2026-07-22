@@ -169,6 +169,7 @@ services/
   dev-portal/              portal app image (serves dev-portal and admin-portal)
   traefik/                 patched DHI Traefik build (3.7.8 binary on DHI runtime)
   samba-ad-preprod/        disposable AD/LDAPS image for local preproduction
+  wif-provider-mock/       local provider-control-plane mock for preprod WIF
   platform-dns/            optional authoritative split-DNS image
   dhi-health-probe/        static health-probe binary embedded in DHI images
 scripts/

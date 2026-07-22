@@ -551,6 +551,7 @@ if ansible.is_file():
         "aigw-compose.sh",
         "aigw-runtime-up.sh",
         "compute-bind-source-digests.py",
+        "controller-lifecycle-audit.py",
         "edge-tls.py",
         "load-offline-image-seed.py",
         "plan-compose-builds.py",
@@ -1099,6 +1100,7 @@ env \
   REDIS_PASSWORD=ValidationRedisPassword_0123456789ABC \
   WEBUI_LITELLM_KEY=sk-ValidationVirtualKey_0123456789 \
   WEBUI_SECRET_KEY=ValidationStableWebuiSecret_0123456789ABC \
+  OPENWEBUI_FORWARD_JWT_SECRET=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   WEBUI_OIDC_CLIENT_SECRET=ValidationWebuiOIDCSecret0123456789ABC \
   PORTAL_OIDC_CLIENT_SECRET=ValidationPortalOIDCSecret0123456789AB \
   ADMIN_PORTAL_OIDC_CLIENT_SECRET=ValidationAdminPortalOIDC0123456789AB \
@@ -1284,6 +1286,10 @@ assert services["open-webui"]["build"]["args"]["BASE_IMAGE"] == (
     "9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4"
 )
 assert services["open-webui"]["environment"]["WEBUI_SECRET_KEY"] == "ValidationStableWebuiSecret_0123456789ABC"
+assert services["litellm"]["environment"]["OPENWEBUI_FORWARD_JWT_SECRET"] == "a" * 64
+assert services["open-webui"]["environment"]["FORWARD_USER_INFO_HEADER_JWT_SECRET"] == "a" * 64
+assert services["open-webui"]["environment"]["FORWARD_USER_INFO_HEADER_JWT"] == "X-OpenWebUI-User-Jwt"
+assert services["open-webui"]["environment"]["FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS"] == "120"
 assert services["open-webui"]["environment"]["SSL_CERT_FILE"] == "/etc/ssl/certs/aigw-ca.pem"
 assert services["open-webui"]["environment"]["WEBUI_SESSION_COOKIE_SECURE"] == "true"
 assert services["open-webui"]["environment"]["WEBUI_AUTH_COOKIE_SECURE"] == "true"
@@ -1968,11 +1974,40 @@ for required in (
     'DEFAULT_MODEL_SENTINEL = "aigw-default"',
     "raise _deny(",
     "HTTPException(status_code=400",
+    "_enforce_openwebui_identity(",
+    "Open WebUI requires one valid signed user assertion",
     'MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")',
 ):
     assert required in hook_source, required
 for forbidden in ("subprocess", "socket", "urllib", "requests", "http.client"):
     assert f"import {forbidden}" not in hook_source, forbidden
+
+# The pre-call gate and telemetry callback share one pure JWT verifier. It has
+# no exporter or LiteLLM import side effect, so request admission cannot depend
+# on telemetry initialization order.
+identity = Path(sys.argv[1]).parent / "aigw_openwebui_identity.py"
+identity_source = identity.read_text()
+compile(identity_source, str(identity), "exec")
+for required in (
+    "def read_openwebui_forward_jwt_secret() -> str:",
+    "def openwebui_jwt_from_headers(headers) -> str | None:",
+    "def verified_openwebui_username(",
+    'OPENWEBUI_KEY_OWNER = "svc-open-webui"',
+    'OPENWEBUI_KEY_ALIAS = "aigw-open-webui-service"',
+    'OPENWEBUI_FORWARD_JWT_HEADER = "X-OpenWebUI-User-Jwt"',
+    'algorithms=["HS256"]',
+):
+    assert required in identity_source, required
+for forbidden in (
+    "subprocess",
+    "socket",
+    "urllib",
+    "requests",
+    "http.client",
+    "opentelemetry",
+    "litellm",
+):
+    assert f"import {forbidden}" not in identity_source, forbidden
 
 # LiteLLM's dedicated OTLP callback keeps the source-authentication token out
 # of Compose environment metadata and LiteLLM's printable OTEL header setting.
@@ -2016,8 +2051,20 @@ for required in (
     'otelcol.processor.attributes "authenticated_litellm"',
     'value  = "litellm_bearer_v1"',
     '`attributes["aigw.security.source_authenticated"] != "litellm_bearer_v1"`',
+    'otelcol.processor.transform "cribl_security_contract"',
+    'set(attributes["aigw.security.event_class"], attributes["aigw_security_event_class"])',
+    r'delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.producer|aigw_security_event_class)$")',
+    'set(attributes["aigw.security.schema_version"], 1)',
+    'set(resource.attributes["deployment.environment"], "` + sys.env("AIGW_DEPLOYMENT_ENVIRONMENT") + `")',
+    'otelcol.processor.filter "cribl_common_record"',
+    'time_unix_nano == 0',
+    'time_unix_nano < UnixNano(Now()) - 86400000000000',
+    'time_unix_nano > UnixNano(Now()) + 60000000000',
 ):
     assert required in text, required
+assert text.count('otelcol.processor.batch "cribl_security"') == 1
+assert text.count('logs = [otelcol.processor.batch.cribl_security.input]') == 1
+assert text.count('logs = [otelcol.exporter.otlp.cribl.input]') == 1
 begin = "// BEGIN AIGW MANAGED CRIBL TLS"
 end = "// END AIGW MANAGED CRIBL TLS"
 assert text.count(begin) == text.count(end) == 1
@@ -2038,7 +2085,8 @@ correlation_end = "// END AIGW MANAGED TRACE CORRELATION"
 assert text.count(correlation_begin) == text.count(correlation_end) == 1
 correlation = text.split(correlation_begin, 1)[1].split(correlation_end, 1)[0]
 assert 'otelcol.processor.transform "aigw_correlation"' in correlation
-assert 'error_mode = "ignore"' in correlation
+assert 'error_mode = "propagate"' in correlation
+assert 'error_mode = "ignore"' not in correlation
 assert 'context = "span"' in correlation
 assert text.count(
     'traces  = [otelcol.processor.transform.aigw_correlation.input]'
@@ -2049,24 +2097,35 @@ for canonical, source in (
     ('aigw.api_key.id', 'metadata.user_api_key_hash'),
     ('aigw.request.id', 'litellm.call_id'),
     ('aigw.project.id', 'metadata.user_api_key_project_id'),
-    ('aigw.enduser.id', 'metadata.user_api_key_end_user_id'),
-    ('aigw.user.name', 'metadata.user_api_key_alias'),
+    ('aigw.user.name', 'aigw.server.user.name'),
+    ('aigw.user.name_source', 'aigw.server.user.name_source'),
 ):
     assert canonical in correlation
     assert source in correlation
-assert correlation.count('resource.attributes["service.name"] == "litellm"') == 10
-assert correlation.count('name == "litellm_request"') == 10
+assert correlation.count('resource.attributes["service.name"] == "litellm"') == 7
+assert correlation.count('name == "litellm_request"') == 7
 assert '^[0-9a-f]{64}$' in correlation
 assert 'aigw.api_key.alias' not in correlation
 assert 'metadata.user_api_key_auth_metadata' in correlation
 assert 'attributes["aigw.project.id"] == nil' in correlation
 assert '(?P<project>[a-z0-9][a-z0-9_.-]{0,63})' in correlation
-# Readable identity: nil-guarded priority chain (end user -> portal
-# aigw_username -> key alias -> opaque user id), every source bounded.
-assert correlation.count('attributes["aigw.user.name"] == nil') == 3
-assert correlation.count('^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$') == 3
-assert '(?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})' in correlation
-for forbidden in ('gen_ai.request.id', 'llm.user', 'authorization', 'access_token'):
+# Readable identity comes only from the callback's server-stamped fields. Caller
+# end-user, alias, and auth-metadata names are never name authority.
+assert 'delete_key(attributes, "aigw.user.name")' in correlation
+assert 'delete_key(attributes, "aigw.user.name_source")' in correlation
+assert correlation.count('^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$') == 4
+assert correlation.count('== "portal_key_metadata"') == 1
+assert correlation.count('== "open_webui_signed_oidc"') == 2
+assert correlation.count('== "key_subject"') == 1
+for forbidden in (
+    'gen_ai.request.id',
+    'llm.user',
+    'authorization',
+    'access_token',
+    'metadata.user_api_key_end_user_id',
+    'metadata.user_api_key_alias',
+    'aigw_username',
+):
     assert forbidden not in correlation
 
 # Mirror the bounded RE2 project capture with representative Python-repr and
@@ -2092,27 +2151,12 @@ for sample in (
 ):
     assert project_capture.search(sample) is None
 
-# Mirror the bounded aigw_username capture (portal-stamped readable identity)
-# the same way: malformed or oversized values must fail closed rather than
-# emit a misleading first-class user-name label.
-username_capture = re.compile(
-    r'''['"]aigw_username['"][ ]*:[ ]*['"]'''
-    r'''(?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})['"]'''
-)
-for sample in (
-    "{'aigw_username': 'preprod-developer'}",
-    '{"aigw_username": "j.doe@example"}',
-):
-    match = username_capture.search(sample)
-    assert match and match.group('username') in {'preprod-developer', 'j.doe@example'}
-for sample in (
-    "{}",
-    "{'aigw_username': ''}",
-    "{'aigw_username': ' preprod-user'}",
-    "{'aigw_username': 'safe<script>'}",
-    "{'aigw_username': 'a" + "b" * 64 + "'}",
-):
-    assert username_capture.search(sample) is None
+# Mirror the exact callback/Alloy user-name union.
+server_name = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$')
+for sample in ('preprod-developer', 'j.doe@example', 'subject:123'):
+    assert server_name.fullmatch(sample)
+for sample in ('', ' preprod-user', 'name with spaces', 'safe<script>', 'a' * 129):
+    assert server_name.fullmatch(sample) is None
 PY
 
 # The volume initializer needs only ownership/mode capabilities. FSETID is

@@ -62,6 +62,7 @@ services:
     volumes: !override
       - ./secrets/preprod-litellm-config.yaml:/app/config.yaml:ro,Z
       - ./litellm/aigw_default_model_hook.py:/app/aigw_default_model_hook.py:ro,Z
+      - ./litellm/aigw_openwebui_identity.py:/app/aigw_openwebui_identity.py:ro,Z
       - ./litellm/aigw_otel_callback.py:/app/aigw_otel_callback.py:ro,Z
       - ./secrets/litellm_otel_token:/run/secrets/litellm_otel_token:ro,z
     depends_on:
@@ -274,6 +275,8 @@ services:
     labels: *preprod-labels
     build: { context: ../services/dhi-health-probe, network: none, labels: *preprod-build-labels }
     image: "${PREPROD_PROJECT}/alloy:local"
+    environment:
+      AIGW_DEPLOYMENT_ENVIRONMENT: preprod
     security_opt: !override [no-new-privileges:true]
     # Local preprod must never read another local project's Docker logs.
     # This owned volume starts empty. The acceptance test writes only reviewed
@@ -285,6 +288,8 @@ services:
       - alloy_data:/var/lib/alloy
       - preprod_empty_docker_logs:/var/lib/docker/containers:ro
       - vault_audit:/var/log/aigw/vault:ro
+      # Portable, non-secret fixture for the exact controller file-source path.
+      - ./secrets/preprod-controller-lifecycle:/var/log/aigw/controller:ro,Z
 
   prometheus:
     labels: *preprod-labels

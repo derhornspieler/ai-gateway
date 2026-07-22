@@ -10,7 +10,7 @@ The main rules are:
 - admins enter through ADM from the approved VPN range;
 - users enter through the internal connection from the approved source range;
 - services can talk only when they share an approved Docker network;
-- only Envoy can use internet DNS and provider TCP port 443; and
+- only Envoy can use internet DNS and provider TCP port 443;
 - Keycloak gets one exact path to the customer LDAPS server; and
 - Alloy gets one optional path to the Cribl endpoint.
 

@@ -24,6 +24,7 @@ GitHub renders these Mermaid diagrams. Provider details are in
   [provider runtime](#12-runtime-request-path-for-selected-providers),
   [CA review and rotation](#13-ca-capture-review-rotation-and-approval), and
   [seed validation and rollback](#14-offline-seed-validation-deployment-and-rollback).
+- Identity control: [managed change and drift recovery](#15-managed-identity-change-and-recovery).
 
 ## 1. Network topology and trust zones
 
@@ -152,7 +153,7 @@ flowchart LR
   D[Developer browser] -->|portal.DOMAIN| TI
   A[Administrator browser] -->|admin hosts on ADM leg| TA[traefik-adm]
 
-  TA --> OW[Open WebUI] --> LL[LiteLLM]
+  TA --> OW[Open WebUI] -->|scoped service key +<br/>signed subject and name| LL[LiteLLM]
   TI --> OW
   TI -->|inference allow-list| LL
   TI --> DP[dev-portal]
@@ -217,6 +218,13 @@ sequenceDiagram
 Admin portal writes also need a CSRF token and a fresh Keycloak login. The
 step-up uses `prompt=login` and `max_age=0` and lasts five minutes. Each page
 checks the live admin role again.
+
+For chat, Open WebUI signs a short-lived assertion for the logged-in directory
+user. LiteLLM checks that assertion and the exact Open WebUI workload-key
+markers before provider dispatch. Missing, duplicate, changed, or expired
+assertions stop the request. The signed subject is the stable per-user audit
+ID. The signed username or e-mail is the readable audit name and may contain
+`@`. The Keycloak role and shared workload key remain the access checks.
 
 ## 6. Logic flow — developer key lifecycle
 
@@ -296,6 +304,7 @@ flowchart LR
   OT[Other internal telemetry] -->|ordinary OTLP<br/>ports 4317 and 4318| AL
   KC[Keycloak<br/>auth events] --> AL
   SE[Reviewed trust and<br/>security-control events] --> AL
+  CT[/Target lifecycle files<br/>upgrade and rollback/] -->|read-only| AL
   DL[Other Docker JSON logs<br/>uid-473 ACL tail] --> AL
   VA[Vault raw audit tail] --> AL
 
@@ -303,13 +312,20 @@ flowchart LR
   AL -->|local metrics + spanmetrics| PR[(Prometheus<br/>30 days or 5 GB, first limit wins)]
   NE[node-exporter] --> PR
   PR -.approved backlog.-> AM[Future Alertmanager<br/>local only]
-  AL -.curated OTLP logs over TLS only.-> CR[Cribl SOC destination<br/>24-hour retention]
+  AL -->|approved security candidates only| RED[Fixed fields + reviewed<br/>prompt secret redaction]
+  RED --> COMMON[Common gate:<br/>schema, environment, producer,<br/>service match, recent UTC time]
+  COMMON -.curated OTLP logs over TLS only.-> CR[Cribl SOC destination<br/>must enforce 24-hour retention]
   GF[Grafana — ADM leg,<br/>behind oauth2-proxy] --> LK & PR
 ```
 
 Alloy adds the trusted LiteLLM source marker only after port 4319 checks the
 private token. The ordinary OTLP path removes a caller-supplied marker and
 rejects a caller that claims to be LiteLLM.
+
+Open WebUI chat records get a stable user ID and readable name only from the
+valid signed assertion. LiteLLM denies the exact Open WebUI service key when
+the assertion is missing or bad, so an unaudited chat request cannot reach a
+provider. The shared key remains service authorization evidence.
 
 ## 10. Deployment logic — Ansible converge order
 
@@ -428,21 +444,59 @@ flowchart TD
   BUILD --> PRODSEED[Production archive and manifest]
   PRESEED --> LLOAD[Local loader checks archive allow-list,<br/>source hashes, policy, labels, and image IDs]
   LLOAD --> PE2E[Ansible local preprod<br/>pull never, no build]
-  PE2E --> PGATE{Full end-to-end test passed?}
-  PGATE -- no --> FIX[Reject release and fix source]
-  PGATE -- yes --> XFER[Transfer production pair<br/>and independent hashes]
+  PE2E --> PGATE{Full end-to-end and<br/>browser tests passed?}
+  PGATE --> CLEAN[Run exact-manifest clean-room teardown]
+  CLEAN --> ABSENT{Owned resources and images absent?<br/>Unrelated images preserved?}
+  ABSENT -- no --> FIX[Reject release and fix source]
+  ABSENT -- yes --> RESULT{All release tests passed?}
+  RESULT -- no --> FIX
+  RESULT -- yes --> XFER[Transfer production pair<br/>and independent hashes]
   PRODSEED --> XFER
   XFER --> RLOAD[Remote loader checks production scope,<br/>policy, labels, and exact image IDs]
   RLOAD --> BACKUP[Authenticate encrypted state backup]
-  BACKUP --> DEPLOY[Ansible deploys candidate<br/>Envoy image and policy as one unit]
+  BACKUP --> USTART[Target audit:<br/>upgrade started]
+  USTART --> DEPLOY[Ansible deploys candidate<br/>Envoy image and policy as one unit]
   DEPLOY --> VALIDATE{Readiness and external<br/>validation passed?}
-  VALIDATE -- yes --> ACCEPT[Accept candidate release]
-  VALIDATE -- no --> ROLLBACK[Restore prior state and use<br/>previous clean source plus seed]
+  VALIDATE -- yes --> USUCCESS[Target audit:<br/>upgrade success] --> ACCEPT[Accept candidate release]
+  VALIDATE -- no --> UFAIL[Target audit:<br/>upgrade failed + rollback started]
+  UFAIL --> ROLLBACK[Restore prior state and use<br/>previous clean source plus seed]
   ROLLBACK --> OLDTEST{Previous release validates?}
-  OLDTEST -- yes --> RESTORED[Rollback complete]
-  OLDTEST -- no --> CLOSED[Keep ingress closed<br/>manual recovery required]
+  OLDTEST -- yes --> RSUCCESS[Target audit:<br/>rollback success] --> RESTORED[Rollback complete]
+  OLDTEST -- no --> RFAIL[Target audit:<br/>rollback failed] --> CLOSED[Keep ingress closed<br/>manual recovery required]
 ```
 
 See the [image update workflow](image-update-workflow.md) for commands and
 [offline image releases](offline-image-seed.md) for the manifest and loader
 contracts.
+
+The target lifecycle source is not Ansible stdout. A fixed root-only writer
+uses only `lifecycle.jsonl` and `lifecycle.jsonl.1`. Alloy reads those files
+through a read-only mount and sends only the fixed fields through the common
+Cribl gate. One operation UUID joins the upgrade and any rollback.
+
+## 15. Managed identity change and recovery
+
+The controller records the lifecycle before it changes live Keycloak or LDAP
+state. The pending Vault record survives a failed run.
+
+```mermaid
+flowchart TD
+  START[Ansible asks key-rotator<br/>to converge identity] --> READ[Read verified Vault policy<br/>and pending state]
+  READ --> SAFE{Pending record valid and<br/>desired digest unchanged?}
+  SAFE -- no --> STOP[Stop before live mutation]
+  SAFE -- yes --> KIND{Why is change needed?}
+  KIND -- reviewed input changed --> PLAN[Write pending UUID<br/>planned_change]
+  KIND -- unexpected live drift --> DRIFT[Write pending UUID<br/>security_drift]
+  PLAN --> PEVENT[Audit change planned]
+  DRIFT --> DEVENT[Audit drift detected]
+  PEVENT --> REPAIR[Repair managed clients, broker,<br/>events, LDAP, and escrow]
+  DEVENT --> REPAIR
+  REPAIR --> VERIFY{Live and durable state pass?}
+  VERIFY -- no --> FAIL[Audit terminal failure<br/>keep same pending UUID]
+  FAIL --> START
+  VERIFY -- yes --> TERMINAL[Audit applied or recovery success]
+  TERMINAL --> CLEAR[Clear pending record only<br/>after terminal audit passes]
+```
+
+A managed LDAP provider rename needs a reviewed migration. A legacy blank name
+is adopted only when its saved provider ID matches the same live provider.

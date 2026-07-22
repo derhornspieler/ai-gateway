@@ -160,9 +160,16 @@ Open WebUI API keys are disabled. The developer portal creates LiteLLM virtual
 keys for approved users and projects. A new key is shown once. Later pages
 show `YOUR_KEY`, not the secret.
 
-Open WebUI uses one limited workload key. That key identifies the service and
-project, not the human in the browser. Portal-issued keys remain the trusted
-per-person API identity.
+Ansible creates or repairs one Open WebUI workload key on every deploy. The
+key can list models and send chat requests, but it cannot use LiteLLM
+management routes. The key proves which service made the request. Open WebUI
+also signs a short-lived assertion with the logged-in directory identity.
+LiteLLM rejects an Open WebUI request before provider dispatch when that
+assertion is missing, changed, expired, or does not match the exact workload
+key. The signed subject becomes the stable per-user audit ID. The signed
+username or e-mail becomes the readable name and may contain `@`. This is a
+reviewed audit exception, not an authorization rule. Portal-issued keys remain
+the trusted per-person API identity for tools.
 
 The admin portal has no manual setup button. Each admin page checks the live
 Keycloak role. A write also needs CSRF protection and a fresh Keycloak login.
@@ -172,6 +179,14 @@ admins only after the lasting controls pass.
 When production LDAPS is enabled, Keycloak trusts only the supplied CA bundle
 and checks the directory hostname. The bind password is a root-owned file. It
 is never a command argument, Compose environment value, or log field.
+
+The identity controller stores a policy digest and any pending repair in
+Vault. A planned inventory change emits planned/applied events. Unexpected
+live drift emits security-drift/recovery events. One UUID follows a retry until
+the terminal event is written and the pending record is cleared. A managed
+LDAP provider rename needs a reviewed migration. The only automatic legacy
+case is a blank saved name whose saved provider ID matches the same live
+provider.
 
 ## Docker network boundaries
 
@@ -289,10 +304,13 @@ prompt and response content, so it is high-sensitivity data.
 
 The Cribl path sends only the approved SOC log set over verified TLS. It
 includes request audit data, login and access events, provider trust failures,
-and other reviewed security events. It does not send metrics, alerts, raw
-traces, or all service logs. The local queue has back-pressure controls and a
-24-hour retry window, but it does not yet enforce a hard per-record 24-hour
-age limit. The Cribl destination must enforce its own 24-hour retention.
+managed identity changes, and controller upgrade or rollback results. Alloy
+rebuilds each record from approved fields and applies one common schema,
+environment, producer, service-name, and time gate. It does not send metrics,
+alerts, raw traces, or all service logs. The local queue has back-pressure
+controls and a 24-hour retry window, but it does not yet enforce a hard
+per-record 24-hour age limit. The Cribl destination must enforce its own
+24-hour retention.
 
 See [observability operations](observability-operations.md) and the
 [Cribl handoff](cribl-soc-handoff.md).
@@ -316,6 +334,7 @@ review source pins
   -> load the seed
   -> deploy with Ansible
   -> run full local checks
+  -> exact-manifest teardown and absence proof
   -> transfer the same production seed
   -> guarded remote upgrade, validation, and rollback
 ```
@@ -327,11 +346,12 @@ Envoy image and provider policy as one release unit.
 
 - This is one VM, not a highly available system.
 - LiteLLM and both portal apps use reviewed single-worker limits.
-- The dated system-Chrome login, role, redirect, cookie, and logout check is in
-  [project status](project-status.md#final-local-release-evidence).
+- The current source has no final browser or exact-seed receipt. See
+  [project status](project-status.md#current-source-candidate).
 - Production LDAPS, TLS, Vault custody, Anthropic enrollment, Cribl, backup,
   and change-window steps need customer operators.
-- A full production-sized PostgreSQL 16-to-18 rehearsal is still open.
+- A full production-sized PostgreSQL 16-to-18 local seeded-preprod rehearsal
+  is still open. It does not need another host or VM.
 - GitHub DHI image builds and Trivy scans need approved DHI credentials in the
   protected GitHub environment.
 - The protected container scan and capacity alert expansion are tracked in

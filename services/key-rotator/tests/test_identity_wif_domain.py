@@ -124,7 +124,9 @@ async def test_broker_setup_reconciles_the_wif_realm_before_client_lookup() -> N
     events: list[str] = []
 
     class OrderedAdmin(KeycloakAdmin):
-        async def _reconcile_wif_frontend_url(self, admin_token):
+        async def _reconcile_wif_frontend_url(
+            self, admin_token, before_change=None
+        ):
             events.append("realm")
             return False
 

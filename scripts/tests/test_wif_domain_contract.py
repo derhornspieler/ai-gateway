@@ -52,8 +52,10 @@ class WifDomainContractTests(unittest.TestCase):
             identity.index("async def converge_deployment_identity(") :
             identity.index("def _identity_state(")
         ]
-        self.assertIn("await self._reconcile_wif_frontend_url(admin_token)", broker)
-        self.assertIn("await self._reconcile_broker(admin_token)", converge)
+        self.assertIn("await self._reconcile_wif_frontend_url(", broker)
+        self.assertIn("admin_token, before_change", broker)
+        self.assertIn("await self._reconcile_broker(", converge)
+        self.assertIn("admin_token, mark_live_change", converge)
 
     def test_every_fresh_broker_starts_without_inherited_scopes(self) -> None:
         sources = (

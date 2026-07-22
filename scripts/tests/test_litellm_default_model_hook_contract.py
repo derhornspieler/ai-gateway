@@ -43,6 +43,7 @@ MODEL_NAME_GRAMMAR = "[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}"
 METADATA_KEY_LITERAL = '"aigw_default_model"'
 
 _STUBBED_MODULES = (
+    "aigw_openwebui_identity",
     "fastapi",
     "litellm",
     "litellm.integrations",
@@ -73,6 +74,40 @@ def _load_hook_module():
     litellm_stub = types.ModuleType("litellm")
     integrations_stub = types.ModuleType("litellm.integrations")
     custom_logger_stub = types.ModuleType("litellm.integrations.custom_logger")
+    callback_stub = types.ModuleType("aigw_openwebui_identity")
+    callback_stub.OPENWEBUI_KEY_OWNER = "svc-open-webui"
+    callback_stub.OPENWEBUI_KEY_ALIAS = "aigw-open-webui-service"
+    callback_stub.OPENWEBUI_KEY_METADATA = {
+        "aigw_key_kind": "service",
+        "aigw_service": "open-webui",
+        "aigw_project_id": "open-webui",
+    }
+
+    def read_secret():
+        return "a" * 64
+
+    def assertion_from_headers(headers):
+        if not isinstance(headers, dict):
+            return None
+        matches = [
+            value
+            for name, value in headers.items()
+            if isinstance(name, str)
+            and name.lower() == "x-openwebui-user-jwt"
+            and isinstance(value, str)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def verified_username(token, secret):
+        return (
+            "directory.user"
+            if token == "valid.jwt.token" and secret == "a" * 64
+            else None
+        )
+
+    callback_stub.read_openwebui_forward_jwt_secret = read_secret
+    callback_stub.openwebui_jwt_from_headers = assertion_from_headers
+    callback_stub.verified_openwebui_username = verified_username
 
     class CustomLogger:  # minimal stand-in for the proxy base class
         pass
@@ -81,6 +116,7 @@ def _load_hook_module():
     litellm_stub.integrations = integrations_stub
     integrations_stub.custom_logger = custom_logger_stub
 
+    sys.modules["aigw_openwebui_identity"] = callback_stub
     sys.modules["fastapi"] = fastapi_stub
     sys.modules["litellm"] = litellm_stub
     sys.modules["litellm.integrations"] = integrations_stub
@@ -102,9 +138,13 @@ def _load_hook_module():
 
 
 class _KeyStub:
-    def __init__(self, metadata=None, models=None):
+    def __init__(
+        self, metadata=None, models=None, *, user_id=None, key_alias=None
+    ):
         self.metadata = metadata
         self.models = models
+        self.user_id = user_id
+        self.key_alias = key_alias
 
 
 class DefaultModelHookWiringContract(unittest.TestCase):
@@ -115,6 +155,11 @@ class DefaultModelHookWiringContract(unittest.TestCase):
         self.assertIn(
             "- ./litellm/aigw_default_model_hook.py:"
             "/app/aigw_default_model_hook.py:ro,Z",
+            compose,
+        )
+        self.assertIn(
+            "- ./litellm/aigw_openwebui_identity.py:"
+            "/app/aigw_openwebui_identity.py:ro,Z",
             compose,
         )
         # The hook must sit next to the config it is resolved relative to.
@@ -141,6 +186,7 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             [
                 "litellm/config.yaml",
                 "litellm/aigw_default_model_hook.py",
+                "litellm/aigw_openwebui_identity.py",
                 "litellm/aigw_otel_callback.py",
                 "secrets/litellm_otel_token",
             ],
@@ -152,12 +198,18 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             "- name: Sync allow-listed compose configuration files", 1
         )[1].split("- name: Render plane-specific container resolver lists", 1)[0]
         self.assertIn("- litellm/aigw_default_model_hook.py", sync)
+        self.assertIn("- litellm/aigw_openwebui_identity.py", sync)
         self.assertIn("- litellm/aigw_otel_callback.py", sync)
         boundary = source.split(
             "- name: Define the exact SELinux read-only bind-source boundary", 1
         )[1]
         self.assertIn(
             "{'path': stack_dir ~ '/litellm/aigw_default_model_hook.py', "
+            "'recursive': false},",
+            boundary,
+        )
+        self.assertIn(
+            "{'path': stack_dir ~ '/litellm/aigw_openwebui_identity.py', "
             "'recursive': false},",
             boundary,
         )
@@ -239,8 +291,21 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.hook = _load_hook_module()
 
-    def _run_hook(self, data, metadata=None, models=None):
-        key = _KeyStub(metadata=metadata, models=models)
+    def _run_hook(
+        self,
+        data,
+        metadata=None,
+        models=None,
+        *,
+        user_id=None,
+        key_alias=None,
+    ):
+        key = _KeyStub(
+            metadata=metadata,
+            models=models,
+            user_id=user_id,
+            key_alias=key_alias,
+        )
         return asyncio.run(
             self.hook.aigw_default_model_enforcer.async_pre_call_hook(
                 key, None, data, "completion"
@@ -325,6 +390,126 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
     def test_non_dict_payloads_pass_through_unchanged(self) -> None:
         payload = ["not", "a", "dict"]
         self.assertIs(self._run_hook(payload, metadata={}), payload)
+
+    def test_exact_openwebui_key_requires_one_valid_signed_assertion(self) -> None:
+        metadata = {
+            "aigw_key_kind": "service",
+            "aigw_service": "open-webui",
+            "aigw_project_id": "open-webui",
+        }
+        request = {
+            "model": "claude-sonnet",
+            "proxy_server_request": {
+                "headers": {"X-OpenWebUI-User-Jwt": "valid.jwt.token"}
+            },
+            "secret_fields": {
+                "raw_headers": {"X-OpenWebUI-User-Jwt": "valid.jwt.token"}
+            },
+        }
+        result = self._run_hook(
+            request,
+            metadata=metadata,
+            user_id="svc-open-webui",
+            key_alias="aigw-open-webui-service",
+        )
+        self.assertIs(result, request)
+
+    def test_openwebui_missing_invalid_expired_and_conflicting_assertions_deny(
+        self,
+    ) -> None:
+        metadata = {
+            "aigw_key_kind": "service",
+            "aigw_service": "open-webui",
+            "aigw_project_id": "open-webui",
+        }
+        cases = (
+            ({}, {}),
+            (
+                {"X-OpenWebUI-User-Jwt": "invalid.jwt.token"},
+                {"X-OpenWebUI-User-Jwt": "invalid.jwt.token"},
+            ),
+            (
+                {"X-OpenWebUI-User-Jwt": "expired.jwt.token"},
+                {"X-OpenWebUI-User-Jwt": "expired.jwt.token"},
+            ),
+            (
+                {"X-OpenWebUI-User-Jwt": "other.jwt.token"},
+                {"X-OpenWebUI-User-Jwt": "valid.jwt.token"},
+            ),
+        )
+        for cleaned_headers, raw_headers in cases:
+            with self.subTest(
+                cleaned_headers=cleaned_headers, raw_headers=raw_headers
+            ):
+                with self.assertRaises(_StubHTTPException) as denied:
+                    self._run_hook(
+                        {
+                            "model": "claude-sonnet",
+                            "proxy_server_request": {
+                                "headers": cleaned_headers
+                            },
+                            "secret_fields": {"raw_headers": raw_headers},
+                        },
+                        metadata=metadata,
+                        user_id="svc-open-webui",
+                        key_alias="aigw-open-webui-service",
+                    )
+                self.assertEqual(denied.exception.status_code, 400)
+
+    def test_any_partial_openwebui_key_marker_denies(self) -> None:
+        exact_metadata = {
+            "aigw_key_kind": "service",
+            "aigw_service": "open-webui",
+            "aigw_project_id": "open-webui",
+        }
+        keys = (
+            {
+                "metadata": {},
+                "user_id": "svc-open-webui",
+                "key_alias": "other",
+            },
+            {
+                "metadata": {},
+                "user_id": "other",
+                "key_alias": "aigw-open-webui-service",
+            },
+            {
+                "metadata": {"aigw_service": "open-webui"},
+                "user_id": "other",
+                "key_alias": "other",
+            },
+            {
+                "metadata": {"aigw_project_id": "open-webui"},
+                "user_id": "other",
+                "key_alias": "other",
+            },
+            {
+                "metadata": {**exact_metadata, "unexpected": "drift"},
+                "user_id": "svc-open-webui",
+                "key_alias": "aigw-open-webui-service",
+            },
+        )
+        for key in keys:
+            with self.subTest(key=key):
+                with self.assertRaises(_StubHTTPException) as denied:
+                    self._run_hook({"model": "claude-sonnet"}, **key)
+                self.assertEqual(denied.exception.status_code, 400)
+
+    def test_openwebui_gate_does_not_apply_to_portal_or_operator_keys(self) -> None:
+        for key in (
+            {
+                "metadata": {
+                    "created_via": "dev-portal",
+                    "aigw_username": "directory.user",
+                },
+                "user_id": "directory.user",
+                "key_alias": "portal-key",
+            },
+            {"metadata": {}, "user_id": "operator", "key_alias": "operator"},
+        ):
+            request = {"model": "claude-sonnet"}
+            result = self._run_hook(request, **key)
+            self.assertIs(result, request)
 
 
 if __name__ == "__main__":

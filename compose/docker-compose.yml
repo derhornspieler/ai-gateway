@@ -520,6 +520,10 @@ services:
       # sends only traces to Alloy's authenticated receiver. The token never
       # enters Docker Config.Env or LiteLLM's printable OTEL header setting.
       AIGW_DEPLOYMENT_ENVIRONMENT: ${AIGW_DEPLOYMENT_ENVIRONMENT:-production}
+      # Verify Open WebUI's short-lived user assertion. Ansible derives this
+      # key from the stable WebUI secret with a fixed domain label. It is not
+      # the session key and it never enters an audit span.
+      OPENWEBUI_FORWARD_JWT_SECRET: ${OPENWEBUI_FORWARD_JWT_SECRET:?OPENWEBUI_FORWARD_JWT_SECRET must be set}
       DEBUG_OTEL: "false"
       # LiteLLM 1.81+ no longer emits the request-level span by default. The
       # reviewed Alloy allow-list, dashboards, and Cribl audit feed all key on
@@ -538,6 +542,7 @@ services:
       # Per-project default-model pre-call hook, registered in config.yaml's
       # litellm_settings.callbacks and resolved relative to /app/config.yaml.
       - ./litellm/aigw_default_model_hook.py:/app/aigw_default_model_hook.py:ro,Z
+      - ./litellm/aigw_openwebui_identity.py:/app/aigw_openwebui_identity.py:ro,Z
       - ./litellm/aigw_otel_callback.py:/app/aigw_otel_callback.py:ro,Z
       # Shared with Alloy only. `z` is required because two containers read
       # the same host inode; `Z` would let the last container steal its label.
@@ -703,13 +708,13 @@ services:
       # instead of the chat login. The value must byte-match the open-webui
       # client's post.logout.redirect.uris (reconciled by key-rotator).
       WEBUI_AUTH_SIGNOUT_REDIRECT_URL: "https://chat.${DOMAIN:?DOMAIN must be set}/"
-      # Forward the authenticated chat identity to LiteLLM as
-      # X-OpenWebUI-User-{Name,Id,Email,Role} headers so per-request telemetry
-      # attributes chat traffic to the person, not the shared workload key.
-      # LiteLLM reads the Email header (which carries preferred_username under
-      # OAUTH_EMAIL_CLAIM above) via general_settings.user_header_name; the
-      # header is attribution-only and grants no authorization there.
+      # Send one short-lived signed identity assertion to LiteLLM. The custom
+      # OTel callback accepts it only with the exact Open WebUI service key.
+      # Plain user headers and request-body fields are never name authority.
       ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+      FORWARD_USER_INFO_HEADER_JWT_SECRET: ${OPENWEBUI_FORWARD_JWT_SECRET:?OPENWEBUI_FORWARD_JWT_SECRET must be set}
+      FORWARD_USER_INFO_HEADER_JWT: X-OpenWebUI-User-Jwt
+      FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS: "120"
       # Model authorization lives at the gateway: the scoped workload key and
       # the per-project runtime policy decide which models chat may reach.
       # Open WebUI's own model access control is redundant on this path, and
@@ -1273,6 +1278,9 @@ services:
       - --disable-reporting
       - --server.http.listen-addr=${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}:12345
     environment:
+      # Common Cribl records use this literal server-owned value. The preprod
+      # overlay replaces it with its own literal; shell input cannot choose it.
+      AIGW_DEPLOYMENT_ENVIRONMENT: production
       ALLOY_TELEMETRY_IP: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}
       CRIBL_OTLP_ENDPOINT: ${CRIBL_OTLP_ENDPOINT:?CRIBL_OTLP_ENDPOINT must be set}
       CRIBL_OTLP_INSECURE: ${CRIBL_OTLP_INSECURE:-false}
@@ -1292,6 +1300,8 @@ services:
       # Read-only Docker json-file ingestion; never mount /var/run/docker.sock.
       - ${DOCKER_DATA_ROOT:?DOCKER_DATA_ROOT must be set}/containers:/var/lib/docker/containers:ro
       - vault_audit:/var/log/aigw/vault:ro
+      # Root-owned records written by the fixed controller lifecycle writer.
+      - /var/log/ai-gateway-controller:/var/log/aigw/controller:ro
     networks:
       net-telemetry:
         ipv4_address: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}

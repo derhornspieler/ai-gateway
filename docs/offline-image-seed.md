@@ -15,7 +15,7 @@ Schema v2 makes two file pairs from one build:
 The production archive has no preprod-only image bytes. Do not send the
 preprod pair to a production host.
 
-For the current `r14` candidate, production has 23 external and 17 custom
+At this source revision, production has 23 external and 17 custom
 references, for 40 total. Preprod has 24 external and 19 custom references,
 for 43 total. Samba AD and the WIF provider mock are the two preprod-only
 custom services. Their Debian 13.6-slim base is the third extra preprod
@@ -229,6 +229,13 @@ Desktop uses the caller-owned files. The loader must return exactly
 The updater then runs `ansible/preprod.yml` once for seed activation, deploy,
 and acceptance. Seed mode has no pull or build sections. The play installs the
 bounded preprod hosts block for browser tests.
+
+After all release tests, run `ansible/preprod-clean-room.yml` again with these
+same four exact file and hash values. That final receipt must prove every owned
+resource and every manifest-listed image is absent. It must also prove that
+unrelated image IDs are unchanged. The ordinary destroy play does not provide
+this release proof. See
+[final release teardown](preprod.md#finish-with-exact-manifest-teardown).
 
 The become password file, when used, must be an absolute, caller-owned,
 mode-`0600` regular file with one hard link and no symbolic link. The updater

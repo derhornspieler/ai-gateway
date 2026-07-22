@@ -45,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +60,7 @@ PREPROD_PLAYBOOK = ROOT / "ansible/preprod.yml"
 PREPROD_CLEAN_ROOM_PLAYBOOK = ROOT / "ansible/preprod-clean-room.yml"
 STAGE_PLAYBOOK = ROOT / "ansible/stage-offline-image-seed.yml"
 RECOVERY_IDENTITY_PLAYBOOK = ROOT / "ansible/manage-update-recovery-identity.yml"
+LIFECYCLE_AUDIT_PLAYBOOK = ROOT / "ansible/record-controller-lifecycle.yml"
 PREPROD_SEED_STAGE_PLAYBOOK = ROOT / "ansible/stage-preprod-image-seed.yml"
 DEPLOY_PLAYBOOK = ROOT / "ansible/deploy-stack-only.yml"
 EXTERNAL_E2E = ROOT / "scripts/e2e-fresh-vm-check.sh"
@@ -1386,6 +1388,61 @@ def seed_extra_vars(release: RemoteRelease, *, skip_backup_gate: bool = False) -
     return values
 
 
+def lifecycle_release_fields(release: Release, commit: str) -> dict[str, str]:
+    """Return only immutable, non-secret identifiers allowed in target audit."""
+
+    if HEX64.fullmatch(release.manifest_sha256) is None:
+        fail("release manifest digest is not lowercase SHA-256")
+    egress = release.document.get("egress_policy")
+    if not isinstance(egress, dict):
+        fail("release manifest lacks its egress policy receipt")
+    image_id = egress.get("envoy_image_id")
+    policy_digest = egress.get("egress_policy_sha256")
+    if not isinstance(image_id, str) or IMAGE_ID.fullmatch(image_id) is None:
+        fail("release manifest has an invalid Envoy image ID")
+    if not isinstance(policy_digest, str) or HEX64.fullmatch(policy_digest) is None:
+        fail("release manifest has an invalid egress policy digest")
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None:
+        fail("release source commit is not a lowercase Git object ID")
+    return {
+        "controller_lifecycle_manifest_sha256": release.manifest_sha256,
+        "controller_lifecycle_release_commit": commit,
+        "controller_lifecycle_envoy_image_id": image_id,
+        "controller_lifecycle_egress_policy_sha256": policy_digest,
+    }
+
+
+def record_remote_lifecycle(
+    *,
+    action: str,
+    outcome: str,
+    operation_id: str,
+    release: Release,
+    commit: str,
+    inventory: Path,
+    limit: str,
+    vault_id: str,
+) -> None:
+    """Ask Ansible to append one fixed-schema record on the target."""
+
+    values: dict[str, object] = lifecycle_release_fields(release, commit)
+    values.update(
+        {
+            "controller_lifecycle_action": action,
+            "controller_lifecycle_outcome": outcome,
+            "controller_lifecycle_operation_id": operation_id,
+        }
+    )
+    ansible_command(
+        root=ROOT,
+        inventory=inventory,
+        playbook=LIFECYCLE_AUDIT_PLAYBOOK,
+        limit=limit,
+        vault_id=vault_id,
+        extra_vars=values,
+    )
+
+
 def deploy_candidate(
     release: RemoteRelease,
     *,
@@ -1516,6 +1573,7 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     validate_release_source_pins(previous, previous_root)
     if candidate.platform != previous.platform:
         fail("candidate and previous offline releases target different platforms")
+    operation_id = str(uuid.uuid4())
 
     candidate_remote = remote_paths(candidate, REMOTE_SEED_ROOT, "candidate")
     previous_remote = remote_paths(previous, REMOTE_SEED_ROOT, "previous")
@@ -1559,6 +1617,16 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
             args.remote_backup_path,
         )
 
+        record_remote_lifecycle(
+            action="upgrade",
+            outcome="started",
+            operation_id=operation_id,
+            release=candidate,
+            commit=current_commit,
+            inventory=inventory,
+            limit=args.limit,
+            vault_id=vault_id,
+        )
         try:
             deploy_candidate(
                 candidate_remote,
@@ -1567,8 +1635,47 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
                 vault_id=vault_id,
             )
             run_external_validation(args)
+            manage_remote_recovery_identity(
+                state="absent",
+                controller_identity=age_identity,
+                inventory=inventory,
+                limit=args.limit,
+                vault_id=vault_id,
+            )
+            identity_staged = False
         except (Exception, KeyboardInterrupt) as candidate_error:
             candidate_failure = failure_summary(candidate_error)
+            audit_failures: list[str] = []
+            try:
+                record_remote_lifecycle(
+                    action="upgrade",
+                    outcome="failed",
+                    operation_id=operation_id,
+                    release=candidate,
+                    commit=current_commit,
+                    inventory=inventory,
+                    limit=args.limit,
+                    vault_id=vault_id,
+                )
+            except (Exception, KeyboardInterrupt) as audit_error:
+                audit_failures.append(
+                    "upgrade failure record: " + failure_summary(audit_error)
+                )
+            try:
+                record_remote_lifecycle(
+                    action="rollback",
+                    outcome="started",
+                    operation_id=operation_id,
+                    release=previous,
+                    commit=previous_commit,
+                    inventory=inventory,
+                    limit=args.limit,
+                    vault_id=vault_id,
+                )
+            except (Exception, KeyboardInterrupt) as audit_error:
+                audit_failures.append(
+                    "rollback start record: " + failure_summary(audit_error)
+                )
             try:
                 automatic_rollback(
                     args,
@@ -1578,20 +1685,88 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
                     previous_release=previous_remote,
                     backup=backup,
                 )
+                manage_remote_recovery_identity(
+                    state="absent",
+                    controller_identity=age_identity,
+                    inventory=inventory,
+                    limit=args.limit,
+                    vault_id=vault_id,
+                )
+                identity_staged = False
             except (Exception, KeyboardInterrupt) as rollback_error:
                 rollback_failure = failure_summary(rollback_error)
+                try:
+                    record_remote_lifecycle(
+                        action="rollback",
+                        outcome="failed",
+                        operation_id=operation_id,
+                        release=previous,
+                        commit=previous_commit,
+                        inventory=inventory,
+                        limit=args.limit,
+                        vault_id=vault_id,
+                    )
+                except (Exception, KeyboardInterrupt) as audit_error:
+                    audit_failures.append(
+                        "rollback failure record: " + failure_summary(audit_error)
+                    )
+                audit_suffix = (
+                    ". Lifecycle audit was incomplete: " + "; ".join(audit_failures)
+                    if audit_failures
+                    else ""
+                )
                 raise WorkflowError(
                     "AUTOMATIC ROLLBACK FAILED. Keep ingress closed and preserve the "
                     f"backup. Candidate failure: {candidate_failure}. Rollback failure: "
-                    f"{rollback_failure}"
+                    f"{rollback_failure}{audit_suffix}"
                 ) from rollback_error
+            try:
+                record_remote_lifecycle(
+                    action="rollback",
+                    outcome="success",
+                    operation_id=operation_id,
+                    release=previous,
+                    commit=previous_commit,
+                    inventory=inventory,
+                    limit=args.limit,
+                    vault_id=vault_id,
+                )
+            except (Exception, KeyboardInterrupt) as audit_error:
+                audit_failures.append(
+                    "rollback success record: " + failure_summary(audit_error)
+                )
+            audit_suffix = (
+                ". Lifecycle audit was incomplete: " + "; ".join(audit_failures)
+                if audit_failures
+                else ""
+            )
             raise WorkflowError(
                 "candidate release failed validation and was rolled back: "
-                f"{candidate_failure}"
+                f"{candidate_failure}{audit_suffix}"
             ) from candidate_error
+
+        try:
+            record_remote_lifecycle(
+                action="upgrade",
+                outcome="success",
+                operation_id=operation_id,
+                release=candidate,
+                commit=current_commit,
+                inventory=inventory,
+                limit=args.limit,
+                vault_id=vault_id,
+            )
+        except (Exception, KeyboardInterrupt) as audit_error:
+            raise WorkflowError(
+                "candidate release passed validation and the temporary recovery "
+                "identity was removed, but the terminal lifecycle record failed; "
+                "leave the validated candidate running and repair the audit path: "
+                f"{failure_summary(audit_error)}"
+            ) from audit_error
 
         output = {
             "status": "REMOTE_IMAGE_UPGRADE_PASSED",
+            "operation_id": operation_id,
             "candidate_commit": current_commit,
             "previous_commit": previous_commit,
             "candidate_manifest_sha256": candidate.manifest_sha256,
@@ -1609,6 +1784,7 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
                     limit=args.limit,
                     vault_id=vault_id,
                 )
+                identity_staged = False
             except WorkflowError as cleanup_error:
                 if original is None:
                     raise WorkflowError(

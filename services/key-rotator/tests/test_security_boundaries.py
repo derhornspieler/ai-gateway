@@ -507,6 +507,141 @@ async def test_identity_deployment_route_is_admin_only_confirmed_and_redacted() 
 
 
 @pytest.mark.asyncio
+async def test_identity_mutation_requires_one_canonical_operation_id() -> None:
+    old_state = dict(state)
+    operation_id = "123e4567-e89b-42d3-a456-426614174000"
+
+    class Identity:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, list[str], str]] = []
+
+        async def create_group(self, name, capabilities, received_operation_id):
+            self.calls.append((name, capabilities, received_operation_id))
+            return {"id": "group-1", "name": name}
+
+    identity = Identity()
+    try:
+        cfg = settings()
+        state.clear()
+        state.update({"settings": cfg, "identity": identity})
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rotator"
+        ) as client:
+            body = {"name": "platform-team", "capabilities": ["aigw-users"]}
+            auth_header = ("X-Internal-Auth", cfg.rotator_internal_token)
+            invalid_headers = [
+                [auth_header],
+                [auth_header, ("X-AIGW-Operation-ID", "not-a-uuid")],
+                [
+                    auth_header,
+                    (
+                        "X-AIGW-Operation-ID",
+                        operation_id.upper(),
+                    ),
+                ],
+                [
+                    auth_header,
+                    ("X-AIGW-Operation-ID", operation_id),
+                    ("X-AIGW-Operation-ID", operation_id),
+                ],
+                [
+                    auth_header,
+                    ("X-AIGW-Operation-ID", operation_id),
+                    (
+                        "X-AIGW-Operation-ID",
+                        "550e8400-e29b-41d4-a716-446655440000",
+                    ),
+                ],
+            ]
+            for headers in invalid_headers:
+                response = await client.post(
+                    "/identity/groups", headers=headers, json=body
+                )
+                assert response.status_code == 400
+                assert response.json() == {
+                    "detail": "missing or invalid identity operation ID"
+                }
+
+            accepted = await client.post(
+                "/identity/groups",
+                headers=[
+                    auth_header,
+                    ("X-AIGW-Operation-ID", operation_id),
+                ],
+                json=body,
+            )
+
+        assert accepted.status_code == 201
+        assert identity.calls == [
+            ("platform-team", ["aigw-users"], operation_id)
+        ]
+    finally:
+        state.clear()
+        state.update(old_state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_type"),
+    [
+        (IdentityError("password=upstream-identity-secret"), 502, "IdentityError"),
+        (RuntimeError("token=unexpected-internal-secret"), 500, "RuntimeError"),
+    ],
+)
+async def test_identity_mutation_failure_keeps_operation_id_and_fixed_audit(
+    failure, expected_status, expected_type
+) -> None:
+    old_state = dict(state)
+    operation_id = "123e4567-e89b-42d3-a456-426614174000"
+
+    class Identity:
+        def __init__(self) -> None:
+            self.failures: list[tuple[str, str, str]] = []
+
+        async def create_group(self, _name, _capabilities, _operation_id):
+            raise failure
+
+        async def audit_identity_mutation_failure(
+            self, action, received_operation_id, error
+        ):
+            self.failures.append(
+                (action, received_operation_id, type(error).__name__)
+            )
+
+    identity = Identity()
+    try:
+        cfg = settings()
+        state.clear()
+        state.update({"settings": cfg, "identity": identity})
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://rotator"
+        ) as client:
+            response = await client.post(
+                "/identity/groups",
+                headers={
+                    "X-Internal-Auth": cfg.rotator_internal_token,
+                    "X-AIGW-Operation-ID": operation_id,
+                },
+                json={
+                    "name": "platform-team",
+                    "capabilities": ["aigw-users"],
+                },
+            )
+
+        assert response.status_code == expected_status
+        assert identity.failures == [
+            ("group_create", operation_id, expected_type)
+        ]
+        assert "upstream-identity-secret" not in response.text
+        assert "unexpected-internal-secret" not in response.text
+    finally:
+        state.clear()
+        state.update(old_state)
+
+
+@pytest.mark.asyncio
 async def test_openai_provider_is_hidden_and_rejected_for_brownfield_rows() -> None:
     class BrownfieldDB:
         async def list_settings(self):
@@ -669,7 +804,7 @@ async def test_queued_anthropic_manual_rotation_rechecks_confirmed_disable() -> 
             vendor,
             "rotate",
             "skipped",
-            "Anthropic WIF refresh is disabled; rotation skipped",
+            "provider rotation skipped",
         )
     ]
 
@@ -1155,7 +1290,7 @@ async def test_zero_interval_dynamic_result_cannot_undo_inflight_disable() -> No
 async def test_static_seed_marks_only_vault_error_for_bounded_retry() -> None:
     class SealedVault:
         def read(self, path: str):
-            raise VaultError("sealed")
+            raise VaultError("token=do-not-export-vault-error")
 
     db = SchedulerDB(zero_interval_row("static-anthropic"))
     ctx = DriverContext(
@@ -1168,6 +1303,8 @@ async def test_static_seed_marks_only_vault_error_for_bounded_retry() -> None:
     result = await StaticSeedDriver("anthropic").rotate(ctx)
 
     assert result.status == "failed"
+    assert result.detail == "vault read failed while seeding anthropic"
+    assert "do-not-export-vault-error" not in result.detail
     assert result.next_run_seconds == VAULT_RETRY_SECONDS
     assert result.settings_self_disabled is False
 
@@ -1194,6 +1331,10 @@ async def test_static_seed_success_explicitly_reports_self_disable() -> None:
     result = await StaticSeedDriver("anthropic").rotate(ctx)
 
     assert result.status == "success"
+    assert result.detail == (
+        "seeded LiteLLM credential=anthropic-primary from reviewed Vault path"
+    )
+    assert "static-test-key" not in result.detail
     assert result.settings_self_disabled is True
     assert db.rows["static-anthropic"]["enabled"] is False
 

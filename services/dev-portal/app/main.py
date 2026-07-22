@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import secrets
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -106,6 +107,8 @@ PORTAL_AUDIT_OUTCOMES = frozenset(
     {
         "success",
         "failure",
+        "indeterminate",
+        "intent",
         "mismatch",
         "denied-active-key",
         "denied-membership",
@@ -114,6 +117,10 @@ PORTAL_AUDIT_OUTCOMES = frozenset(
 )
 PROJECT_LOCK_STRIPES = 64
 AMBIGUOUS_GENERATE_CLEANUP_LIMIT = 8
+ROTATOR_RESPONSE_MAX_BYTES = 1024 * 1024
+DEFINITIVE_IDENTITY_MUTATION_STATUS_CODES = frozenset(
+    {400, 401, 403, 404, 409, 422}
+)
 
 # --- egress trust pin (Anthropic) -------------------------------------------
 #
@@ -169,6 +176,10 @@ def _audit(action: str, outcome: str, user: dict[str, Any], **fields: Any) -> No
     if action not in PORTAL_AUDIT_ACTIONS or outcome not in PORTAL_AUDIT_OUTCOMES:
         logger.error("portal security event rejected an internal schema value")
         return
+    operation_id = fields.get("operation_id")
+    if operation_id is not None and not _canonical_operation_id(operation_id):
+        logger.error("portal security event rejected an operation ID")
+        return
     event: dict[str, Any] = {
         "schema_version": 1,
         "event": "aigw.portal.audit",
@@ -185,6 +196,27 @@ def _audit(action: str, outcome: str, user: dict[str, Any], **fields: Any) -> No
         "AIGW_SECURITY_EVENT %s",
         json.dumps(event, separators=(",", ":"), ensure_ascii=True),
     )
+
+
+def _canonical_operation_id(value: Any) -> bool:
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        parsed.variant == uuid.RFC_4122
+        and parsed.version == 4
+        and str(parsed) == value
+    )
+
+
+def _identity_mutation_result(error: Exception) -> str:
+    """Return failure only when a reviewed 4xx proves no mutation."""
+
+    if isinstance(error, httpx.HTTPStatusError):
+        if error.response.status_code in DEFINITIVE_IDENTITY_MUTATION_STATUS_CODES:
+            return "failure"
+    return "indeterminate"
 
 
 def _audit_signed_session_denial(request: Request, action: str) -> None:
@@ -1217,11 +1249,23 @@ async def snippets_page(
 # --- admin / rotation control ---
 
 
-def _rotator_headers() -> dict[str, str]:
+def _rotator_headers(operation_id: str | None = None) -> dict[str, str]:
     headers: dict[str, str] = {}
     if settings.rotator_internal_token:
         headers["X-Internal-Auth"] = settings.rotator_internal_token
+    if operation_id is not None:
+        if not _canonical_operation_id(operation_id):
+            raise ValueError("invalid identity mutation operation ID")
+        headers["X-AIGW-Operation-ID"] = operation_id
     return headers
+
+
+def _rotator_response(resp: httpx.Response) -> Any:
+    if not resp.content:
+        return None
+    if len(resp.content) > ROTATOR_RESPONSE_MAX_BYTES:
+        raise ValueError("rotator response exceeded the fixed size limit")
+    return resp.json()
 
 
 async def _rotator_get(path: str) -> Any:
@@ -1386,40 +1430,57 @@ async def _deactivate_subject_project_keys(user_id: str, project_id: str) -> Non
         )
 
 
-async def _rotator_put(path: str, payload: dict[str, Any]) -> Any:
+async def _rotator_put(
+    path: str,
+    payload: dict[str, Any],
+    *,
+    operation_id: str | None = None,
+) -> Any:
     url = settings.rotator_url.rstrip("/") + path
     async with httpx.AsyncClient(
         timeout=10, trust_env=False, follow_redirects=False
     ) as client:
-        resp = await client.put(url, headers=_rotator_headers(), json=payload)
+        resp = await client.put(
+            url, headers=_rotator_headers(operation_id), json=payload
+        )
     resp.raise_for_status()
-    return resp.json() if resp.content else None
+    return _rotator_response(resp)
 
 
-async def _rotator_post(path: str, payload: dict[str, Any] | None = None) -> Any:
+async def _rotator_post(
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    operation_id: str | None = None,
+) -> Any:
     url = settings.rotator_url.rstrip("/") + path
     async with httpx.AsyncClient(
         timeout=10, trust_env=False, follow_redirects=False
     ) as client:
-        kwargs: dict[str, Any] = {"headers": _rotator_headers()}
+        kwargs: dict[str, Any] = {"headers": _rotator_headers(operation_id)}
         if payload is not None:
             kwargs["json"] = payload
         resp = await client.post(url, **kwargs)
     resp.raise_for_status()
-    return resp.json() if resp.content else None
+    return _rotator_response(resp)
 
 
-async def _rotator_delete(path: str, payload: dict[str, Any] | None = None) -> Any:
+async def _rotator_delete(
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    operation_id: str | None = None,
+) -> Any:
     url = settings.rotator_url.rstrip("/") + path
     async with httpx.AsyncClient(
         timeout=10, trust_env=False, follow_redirects=False
     ) as client:
-        kwargs: dict[str, Any] = {"headers": _rotator_headers()}
+        kwargs: dict[str, Any] = {"headers": _rotator_headers(operation_id)}
         if payload is not None:
             kwargs["json"] = payload
         resp = await client.delete(url, **kwargs)
     resp.raise_for_status()
-    return resp.json() if resp.content else None
+    return _rotator_response(resp)
 
 
 async def require_live_admin(
@@ -2447,15 +2508,36 @@ async def admin_identity_create_group(
     if not capability_set or not capability_set <= IDENTITY_CAPABILITIES:
         auth.flash(request, "Choose at least one valid capability.", "error")
         return RedirectResponse("/admin", status_code=303)
+    operation_id = str(uuid.uuid4())
+    _audit(
+        "identity.group.create",
+        "intent",
+        user,
+        group=clean_name,
+        operation_id=operation_id,
+    )
     try:
         await _rotator_post(
             "/identity/groups",
             {"name": clean_name, "capabilities": sorted(capability_set)},
+            operation_id=operation_id,
         )
-        _audit("identity.group.create", "success", user, group=clean_name)
+        _audit(
+            "identity.group.create",
+            "success",
+            user,
+            group=clean_name,
+            operation_id=operation_id,
+        )
         auth.flash(request, "Authorization group created.", "success")
-    except Exception:  # noqa: BLE001
-        _audit("identity.group.create", "failure", user, group=clean_name)
+    except Exception as exc:  # noqa: BLE001
+        _audit(
+            "identity.group.create",
+            _identity_mutation_result(exc),
+            user,
+            group=clean_name,
+            operation_id=operation_id,
+        )
         auth.flash(request, "Could not create that authorization group.", "error")
     return RedirectResponse("/admin", status_code=303)
 
@@ -2470,12 +2552,34 @@ async def admin_identity_delete_group(
     if not auth.verify_csrf(request, csrf_token):
         auth.flash(request, "Your session expired — please try again.", "error")
         return RedirectResponse("/admin", status_code=303)
+    operation_id = str(uuid.uuid4())
+    _audit(
+        "identity.group.delete",
+        "intent",
+        user,
+        group=group_id,
+        operation_id=operation_id,
+    )
     try:
-        await _rotator_delete(f"/identity/groups/{group_id}")
-        _audit("identity.group.delete", "success", user, group=group_id)
+        await _rotator_delete(
+            f"/identity/groups/{group_id}", operation_id=operation_id
+        )
+        _audit(
+            "identity.group.delete",
+            "success",
+            user,
+            group=group_id,
+            operation_id=operation_id,
+        )
         auth.flash(request, "Authorization group deleted.", "success")
-    except Exception:  # noqa: BLE001
-        _audit("identity.group.delete", "failure", user, group=group_id)
+    except Exception as exc:  # noqa: BLE001
+        _audit(
+            "identity.group.delete",
+            _identity_mutation_result(exc),
+            user,
+            group=group_id,
+            operation_id=operation_id,
+        )
         auth.flash(
             request,
             "Could not delete that group. Remove all members first.",
@@ -2495,23 +2599,38 @@ async def admin_identity_add_member(
     if not auth.verify_csrf(request, csrf_token):
         auth.flash(request, "Your session expired — please try again.", "error")
         return RedirectResponse("/admin", status_code=303)
+    operation_id = str(uuid.uuid4())
+    _audit(
+        "identity.member.add",
+        "intent",
+        user,
+        group=group_id,
+        target_subject=user_id,
+        operation_id=operation_id,
+    )
     try:
-        await _rotator_put(f"/identity/groups/{group_id}/members/{user_id}", {})
+        await _rotator_put(
+            f"/identity/groups/{group_id}/members/{user_id}",
+            {},
+            operation_id=operation_id,
+        )
         _audit(
             "identity.member.add",
             "success",
             user,
             group=group_id,
             target_subject=user_id,
+            operation_id=operation_id,
         )
         auth.flash(request, "User assigned to the group.", "success")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         _audit(
             "identity.member.add",
-            "failure",
+            _identity_mutation_result(exc),
             user,
             group=group_id,
             target_subject=user_id,
+            operation_id=operation_id,
         )
         auth.flash(request, "Could not assign that directory user.", "error")
     return RedirectResponse(
@@ -2530,13 +2649,26 @@ async def admin_identity_remove_member(
     if not auth.verify_csrf(request, csrf_token):
         auth.flash(request, "Your session expired — please try again.", "error")
         return RedirectResponse("/admin", status_code=303)
+    operation_id = str(uuid.uuid4())
+    _audit(
+        "identity.member.remove",
+        "intent",
+        user,
+        group=group_id,
+        target_subject=user_id,
+        operation_id=operation_id,
+    )
+    mutation_confirmed = False
     try:
         project_id = await _managed_project_for_group(group_id)
         # Pre-pass prevents knowingly leaving an existing key active. The
         # post-pass closes a concurrent generation window around the Keycloak
         # membership mutation. Any ambiguity or LiteLLM failure fails closed.
         await _deactivate_subject_project_keys(user_id, project_id)
-        await _rotator_delete(f"/identity/groups/{group_id}/members/{user_id}")
+        await _rotator_delete(
+            f"/identity/groups/{group_id}/members/{user_id}",
+            operation_id=operation_id,
+        )
         await _deactivate_subject_project_keys(user_id, project_id)
         _audit(
             "identity.member.remove",
@@ -2545,7 +2677,9 @@ async def admin_identity_remove_member(
             group=group_id,
             project=project_id,
             target_subject=user_id,
+            operation_id=operation_id,
         )
+        mutation_confirmed = True
         if user_id == user.get("sub"):
             # Membership changes can revoke this administrator's own access.
             # Force a full login so a stale role-bearing cookie cannot keep
@@ -2553,19 +2687,26 @@ async def admin_identity_remove_member(
             request.session.clear()
             return RedirectResponse("/login", status_code=303)
         auth.flash(request, "User removed from the group.", "success")
-    except Exception:  # noqa: BLE001
-        _audit(
-            "identity.member.remove",
-            "failure",
-            user,
-            group=group_id,
-            target_subject=user_id,
-        )
-        auth.flash(
-            request,
-            "Could not remove that user; the last administrator is protected.",
-            "error",
-        )
+    except Exception as exc:  # noqa: BLE001
+        if not mutation_confirmed:
+            _audit(
+                "identity.member.remove",
+                _identity_mutation_result(exc),
+                user,
+                group=group_id,
+                target_subject=user_id,
+                operation_id=operation_id,
+            )
+            message = (
+                "Could not confirm that user removal; check the live group before "
+                "retrying."
+            )
+        else:
+            message = (
+                "The user was removed, but project key revocation could not be "
+                "verified. Check the key inventory now."
+            )
+        auth.flash(request, message, "error")
     return RedirectResponse(
         "/admin?" + urlencode({"group_id": group_id}), status_code=303
     )
@@ -3218,10 +3359,28 @@ async def admin_identity_set_group_policy(
         "allowed_models": selected or None,
         "default_model": clean_default,
     }
+    operation_id = str(uuid.uuid4())
+    _audit(
+        "identity.group.policy",
+        "intent",
+        user,
+        group=group_id,
+        operation_id=operation_id,
+    )
     try:
-        result = await _rotator_put(f"/identity/groups/{group_id}/policy", payload)
-    except Exception:  # noqa: BLE001 - upstream detail stays server-side
-        _audit("identity.group.policy", "failure", user)
+        result = await _rotator_put(
+            f"/identity/groups/{group_id}/policy",
+            payload,
+            operation_id=operation_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - upstream detail stays server-side
+        _audit(
+            "identity.group.policy",
+            _identity_mutation_result(exc),
+            user,
+            group=group_id,
+            operation_id=operation_id,
+        )
         auth.flash(request, "Could not save the project policy.", "error")
         return redirect
 
@@ -3236,7 +3395,13 @@ async def admin_identity_set_group_policy(
     if applied is None or not isinstance(project_id, str) or (
         litellm_client.PROJECT_ID_RE.fullmatch(project_id) is None
     ):
-        _audit("identity.group.policy", "failure", user)
+        _audit(
+            "identity.group.policy",
+            "indeterminate",
+            user,
+            group=group_id,
+            operation_id=operation_id,
+        )
         auth.flash(
             request,
             "The controller did not confirm the saved policy; existing keys "
@@ -3244,11 +3409,17 @@ async def admin_identity_set_group_policy(
             "error",
         )
         return redirect
-    _audit("identity.group.policy", "success", user, project=project_id)
-
     try:
         retuned, failed = await _retune_project_keys(project_id, applied)
-    except litellm_client.LiteLLMError:
+    except Exception:  # noqa: BLE001 - terminal audit must close on every failure
+        _audit(
+            "identity.group.policy",
+            "indeterminate",
+            user,
+            group=group_id,
+            project=project_id,
+            operation_id=operation_id,
+        )
         auth.flash(
             request,
             "Policy saved, but existing project keys could not all be "
@@ -3257,6 +3428,14 @@ async def admin_identity_set_group_policy(
         )
         return redirect
     if failed:
+        _audit(
+            "identity.group.policy",
+            "indeterminate",
+            user,
+            group=group_id,
+            project=project_id,
+            operation_id=operation_id,
+        )
         auth.flash(
             request,
             f"Policy saved; {retuned} existing keys re-tuned, {failed} could "
@@ -3264,6 +3443,14 @@ async def admin_identity_set_group_policy(
             "error",
         )
     else:
+        _audit(
+            "identity.group.policy",
+            "success",
+            user,
+            group=group_id,
+            project=project_id,
+            operation_id=operation_id,
+        )
         auth.flash(
             request,
             f"Project policy saved; {retuned} existing keys re-tuned.",

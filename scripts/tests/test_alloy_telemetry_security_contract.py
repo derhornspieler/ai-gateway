@@ -45,12 +45,16 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "aigw.api_key.id": "metadata.user_api_key_hash",
             "aigw.request.id": "litellm.call_id",
             "aigw.project.id": "metadata.user_api_key_project_id",
-            "aigw.enduser.id": "metadata.user_api_key_end_user_id",
-            "aigw.user.name": "metadata.user_api_key_alias",
+            "aigw.user.name": "aigw.server.user.name",
+            "aigw.user.name_source": "aigw.server.user.name_source",
         }
         for canonical, source in expected.items():
             self.assertIn(f'attributes["{canonical}"]', self.correlation)
             self.assertIn(f'attributes["{source}"]', self.correlation)
+        self.assertIn(
+            'set(attributes["aigw.user.id"], attributes["aigw.server.user.id"])',
+            self.correlation,
+        )
 
         # LiteLLM OSS 1.91.3 cannot create native projects. Portal keys carry
         # the project in server-issued auth metadata, so that narrow fallback
@@ -61,36 +65,32 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         self.assertIn("^[0-9a-f]{64}$", self.correlation)
         self.assertNotIn("aigw.api_key.alias", self.correlation)
         self.assertNotIn("llm.user", self.correlation)
+        self.assertNotIn("metadata.user_api_key_end_user_id", self.correlation)
+        self.assertNotIn("metadata.user_api_key_alias", self.correlation)
+        self.assertNotIn("aigw_username", self.correlation)
 
-    def test_readable_identity_is_prioritized_bounded_and_always_present(self) -> None:
-        """aigw.user.name resolution order (first match wins): the header-
-        forwarded chat end user, the portal-stamped aigw_username, the key
-        alias, then the opaque aigw.user.id so the field (and its Loki label)
-        never goes missing. Every source is regex-bounded because these become
-        log fields and a stream label."""
+    def test_readable_identity_requires_one_reviewed_server_source(self) -> None:
         statements = self.correlation.split("statements = [", 1)[1]
-        order = [
-            'set(attributes["aigw.enduser.id"], attributes["metadata.user_api_key_end_user_id"])',
-            'set(attributes["aigw.user.name"], attributes["aigw.enduser.id"])',
+        self.assertIn('error_mode = "propagate"', self.correlation)
+        self.assertNotIn('error_mode = "ignore"', self.correlation)
+        self.assertIn('delete_key(attributes, "aigw.user.name")', statements)
+        self.assertIn('delete_key(attributes, "aigw.user.name_source")', statements)
+        self.assertEqual(
+            statements.count(
+                'set(attributes["aigw.user.name"], attributes["aigw.server.user.name"])'
+            ),
+            1,
+        )
+        self.assertIn("^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$", statements)
+        self.assertEqual(statements.count('== "portal_key_metadata"'), 1)
+        self.assertEqual(statements.count('== "key_subject"'), 1)
+        self.assertEqual(statements.count('== "open_webui_signed_oidc"'), 2)
+        for caller_controlled in (
+            "metadata.user_api_key_end_user_id",
+            "metadata.user_api_key_alias",
             "aigw_username",
-            'set(attributes["aigw.user.name"], attributes["metadata.user_api_key_alias"])',
-            'set(attributes["aigw.user.name"], attributes["aigw.user.id"])',
-        ]
-        positions = [statements.index(fragment) for fragment in order]
-        self.assertEqual(positions, sorted(positions))
-        # Every fallback except the seed rule is nil-guarded so a higher-
-        # priority identity is never overwritten.
-        self.assertEqual(
-            statements.count('attributes["aigw.user.name"] == nil'), 3
-        )
-        # Bounded charsets: the end-user/alias rule and the portal-username
-        # extraction (kept textually identical to the dev-portal stamper).
-        self.assertEqual(
-            statements.count("^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$"), 3
-        )
-        self.assertIn(
-            "(?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})", statements
-        )
+        ):
+            self.assertNotIn(caller_controlled, statements)
 
     def test_every_otlp_signal_is_sanitized_before_batch_and_export(self) -> None:
         memory = self.alloy.split(
@@ -142,6 +142,8 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "metadata.user_api_key_user_email",
             "metadata.requester_ip_address",
             "metadata.requester_metadata",
+            "metadata.headers",
+            "metadata.request_headers",
             "requester_metadata",
             "http.request.header.authorization",
             "http.request.header.x-forwarded-for",
@@ -162,7 +164,6 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         retained = (
             "aigw.user.id",
             "aigw.user.name",
-            "aigw.enduser.id",
             "aigw.project.id",
             "aigw.api_key.id",
             "aigw.request.id",
@@ -175,6 +176,11 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
                 any(pattern.search(key) for pattern in self.patterns),
                 f"required attribute would be removed: {key}",
             )
+        self.assertIn('delete_key(attributes, "aigw.enduser.id")', self.sanitizer)
+        self.assertIn(
+            r'delete_matching_keys(attributes, "^aigw\\.server\\.user\\.(?:id|name|name_source)$")',
+            self.sanitizer,
+        )
 
         for body_contract in (
             'delete_matching_keys(body,',
@@ -182,6 +188,9 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             '<redacted-credential>',
             '<redacted-authorization>',
             '<redacted-vendor-key>',
+            '<redacted-jwt>',
+            '<redacted-vault-token>',
+            '<redacted-private-key>',
             'where IsMap(body)',
             'where IsString(body)',
         ):
@@ -200,13 +209,13 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
                 span_sanitizer.count(
                     f'replace_pattern(attributes["{prompt_attribute}"]'
                 ),
-                3,
+                8,
             )
             self.assertEqual(
                 span_sanitizer.count(
                     f'where IsString(attributes["{prompt_attribute}"])'
                 ),
-                3,
+                8,
             )
             escaped_attribute = prompt_attribute.replace(".", "\\\\.")
             self.assertEqual(
@@ -220,6 +229,25 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
                 f'IsString(attributes["{prompt_attribute}"])',
                 span_sanitizer,
             )
+
+        for narrow_rule in (
+            "session[ _-]?(?:id|token|secret|key|cookie)",
+            "vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))",
+            "client[ _-]?assertion",
+        ):
+            self.assertEqual(span_sanitizer.count(narrow_rule), 12)
+        for narrow_rule in (
+            "\\\\beyJ[A-Za-z0-9_-]{5,}\\\\.[A-Za-z0-9_-]{8,}\\\\.[A-Za-z0-9_-]{8,}\\\\b",
+            "\\\\b(?:hvs|hvb|hvr|s|b)\\\\.[A-Za-z0-9_-]{16,}\\\\b",
+            "-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----",
+        ):
+            self.assertEqual(span_sanitizer.count(narrow_rule), 4)
+        self.assertEqual(span_sanitizer.count(r"(?:\\\\.|"), 8)
+        self.assertNotIn("{1,1000}", span_sanitizer)
+        self.assertNotIn("{1,2048}", span_sanitizer)
+        for line in span_sanitizer.splitlines():
+            if "replace_pattern" in line and "[A-Za-z0-9_-]{16,}" in line:
+                self.assertTrue("sk-" in line or "hvs|hvb|hvr|s|b" in line)
 
         docker_logs = self.alloy.split('loki.process "docker"', 1)[1].split(
             'loki.process "external_file_logs"', 1
@@ -309,7 +337,8 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             )
         self.assertIn('error_mode = "propagate"', span_filter)
         self.assertIn(
-            "traces = [otelcol.connector.spanlogs.aigw_requests.input]", span_filter
+            "traces = [otelcol.processor.transform.aigw_request_event_time.input]",
+            span_filter,
         )
 
         spanlogs = self.alloy.split(
@@ -319,10 +348,12 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         # Bounded-cardinality attribution labels only: user/project populations
         # are small and this is one dedicated stream. Request-id and key-id are
         # unbounded/high-churn and must never become labels.
-        self.assertIn(
-            'labels = [\n    "aigw.user.name",\n    "aigw.project.id",\n  ]',
-            spanlogs,
-        )
+        for label in (
+            "aigw.user.name",
+            "aigw.project.id",
+            "aigw.security.source_time_unix_nano",
+        ):
+            self.assertIn(f'"{label}",', spanlogs)
         for forbidden_label in ("aigw.request.id", "aigw.api_key.id"):
             self.assertNotIn(
                 forbidden_label,
@@ -331,7 +362,7 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         for attribute in (
             "aigw.user.id",
             "aigw.user.name",
-            "aigw.enduser.id",
+            "aigw.user.name_source",
             "aigw.api_key.id",
             "aigw.project.id",
             "aigw.request.id",
@@ -405,7 +436,7 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         self.assertIn(
             '`set(attributes["aigw.security.schema_version"], 1)`', contract
         )
-        self.assertIn("otelcol.processor.batch.cribl_security.input", contract)
+        self.assertIn("otelcol.processor.filter.cribl_common_record.input", contract)
 
         default_batch = self.alloy.split(
             'otelcol.processor.batch "default"', 1

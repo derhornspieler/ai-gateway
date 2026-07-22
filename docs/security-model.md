@@ -40,7 +40,9 @@ does not prove production firewall, SELinux, disk encryption, or Cribl rules.
 | Gateway to provider | Selected requests through Envoy only | Fixed Envoy IP, exact route, SNI, SAN, and CA bundle |
 | Gateway to Cribl | Approved SOC log records only | Alloy filter, redaction, one address and port, verified TLS |
 | LiteLLM to Alloy | AI request audit spans only | Private port 4319, file-backed bearer token, and Alloy-owned source marker |
+| Open WebUI to LiteLLM | Chat with a trusted audit name | Exact workload-key markers and one short-lived signed user assertion |
 | Controller to VM | Ansible work and protected input | Key-only SSH, ADM source rule, pipelining, and secrets on stdin |
+| Target lifecycle files to Alloy | Upgrade and rollback audit only | Root-owned two-file boundary, fixed writer, read-only mount, and common Cribl gate |
 
 ## Layers of defense
 
@@ -67,6 +69,15 @@ removed. Required state stays in its named data volume, and temporary files
 stay in a bounded `tmpfs`. See
 [container security](docker-security.md#open-webui-chat-only-image) for the
 exact image and vulnerability-review rules.
+
+Ansible also reconciles the exact Open WebUI workload key. Open WebUI signs a
+short-lived assertion for the logged-in directory user. LiteLLM checks the
+signature and the full service-key marker set before it sends a model request.
+The signed subject becomes the stable per-user audit ID. The signed username or
+e-mail becomes the readable audit name and may contain `@`. The shared key
+proves service authorization only. A missing, duplicate, malformed, changed,
+or expired assertion stops the request. Plain caller headers are not trusted
+audit identity.
 
 ## Provider egress is selected at release time
 
@@ -142,14 +153,17 @@ Local operations and the SOC feed have different purposes.
 | AI request audit | Loki, 7 days | Yes, after filter and redaction |
 | Keycloak auth and access events | Loki | Yes, reviewed fields only |
 | Provider trust and policy failures | Loki | Yes, reviewed fields only |
+| Controller upgrade and rollback | Target audit files, then Loki | Yes, reviewed fields only |
 | Metrics | Prometheus, up to 30 days and 5 GB | Never |
 | Alert state | Prometheus and Grafana | Never |
 | Raw traces | No local trace store | Never |
 | Raw Vault audit file | Loki | Never |
 
 Alloy is the export gate. Its data filter permits only reviewed security event
-classes. The firewall permits only one Cribl address and port. TLS checks the
-server name and CA. All three controls must pass.
+classes. One common gate adds the server-owned schema, environment, producer,
+matching service name, and time check before queue entry. The firewall permits
+only one Cribl address and port. TLS checks the server name and CA. All three
+controls must pass.
 
 The local disk queue is capped at 2 GiB. A failed batch retries for up to 24
 hours after dequeue. Alloy does not give each waiting record a hard 24-hour

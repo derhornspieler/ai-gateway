@@ -11,6 +11,7 @@ to users imported from the configured LDAP federation component.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -74,6 +75,9 @@ CONTROLLER_ADMIN_ROLES = (
 )
 CONTROLLER_KEY_SCHEMA = 1
 IDENTITY_STATE_SCHEMA = 1
+MANAGED_IDENTITY_POLICY_SCHEMA = 1
+MANAGED_IDENTITY_PENDING_SCHEMA = 1
+MANAGED_IDENTITY_PENDING_KEY = "managed_identity_pending_change"
 MAX_KEYSTORE_BYTES = 1024 * 1024
 MAX_KEY_PEM_BYTES = 32 * 1024
 MAX_PAGE_COUNT = 100
@@ -196,6 +200,8 @@ IDENTITY_AUDIT_ACTIONS = frozenset(
         "ldap_check",
         "ldap_drift_detected",
         "ldap_recovery",
+        "managed_identity_change_applied",
+        "managed_identity_change_planned",
         "managed_identity_drift_detected",
         "managed_identity_recovery",
     }
@@ -645,6 +651,7 @@ class KeycloakAdmin:
         admin_token: str,
         *,
         remove_extras: bool = True,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> bool:
         """Converge one OIDC client to only the three capability roles.
 
@@ -695,9 +702,13 @@ class KeycloakAdmin:
         changed = False
         if extras:
             if not remove_extras:
+                if before_change is not None:
+                    await before_change("relying_party_role_scope")
                 raise IdentityConflict(
                     f"OIDC client {client_id} has unmanaged realm-role scope mappings"
                 )
+            if before_change is not None:
+                await before_change("relying_party_role_scope")
             await self._request(
                 "DELETE",
                 endpoint,
@@ -712,6 +723,8 @@ class KeycloakAdmin:
             if name not in current_names
         ]
         if missing:
+            if before_change is not None:
+                await before_change("relying_party_role_scope")
             await self._request(
                 "POST",
                 endpoint,
@@ -738,7 +751,11 @@ class KeycloakAdmin:
             )
         return changed
 
-    async def _reconcile_relying_party_redirect_uris(self, admin_token: str) -> bool:
+    async def _reconcile_relying_party_redirect_uris(
+        self,
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
+    ) -> bool:
         """Converge ONLY the domain-derived callback allow-lists of the five
         managed first-party OIDC clients.
 
@@ -764,6 +781,8 @@ class KeycloakAdmin:
                 raise IdentityError(f"missing managed OIDC client spec for {client_id}")
             found = await self._find_client(realm, client_id, admin_token)
             if found is None:
+                if before_change is not None:
+                    await before_change("relying_party")
                 raise IdentityError(f"OIDC client {client_id} is missing")
             current = await self._get_client(realm, found, admin_token)
             desired_redirects = list(desired["redirectUris"])
@@ -789,6 +808,8 @@ class KeycloakAdmin:
                     current["attributes"] = attributes
                     needs_update = True
             if needs_update:
+                if before_change is not None:
+                    await before_change("relying_party")
                 await self._put_client(realm, current, admin_token)
                 changed = True
 
@@ -811,7 +832,11 @@ class KeycloakAdmin:
                     )
         return changed
 
-    async def _reconcile_wif_frontend_url(self, admin_token: str) -> bool:
+    async def _reconcile_wif_frontend_url(
+        self,
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
+    ) -> bool:
         """Keep the isolated WIF issuer on this deployment's domain."""
 
         realm = path_segment(self.settings.wif_realm, label="WIF realm")
@@ -836,6 +861,8 @@ class KeycloakAdmin:
         attributes = dict(raw_attributes or {})
         changed = attributes.get("frontendUrl") != desired
         if changed:
+            if before_change is not None:
+                await before_change("wif_frontend")
             attributes["frontendUrl"] = desired
             updated = dict(current)
             updated["attributes"] = attributes
@@ -888,7 +915,11 @@ class KeycloakAdmin:
             and document.get("adminEventsDetailsEnabled") is False
         )
 
-    async def _reconcile_security_event_logging(self, admin_token: str) -> bool:
+    async def _reconcile_security_event_logging(
+        self,
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
+    ) -> bool:
         """Enable only the reviewed Keycloak user-event log contract.
 
         Realm imports apply only to an empty database. Every deployment also
@@ -918,6 +949,8 @@ class KeycloakAdmin:
                 "adminEventsDetailsEnabled": False,
             }
             if not self._security_event_policy_matches(current, desired_types):
+                if before_change is not None:
+                    await before_change("security_event_logging")
                 updated = dict(current)
                 updated.update(desired)
                 await self._request(
@@ -1525,7 +1558,11 @@ class KeycloakAdmin:
         ]
 
     async def _ensure_relying_parties(
-        self, admin_token: str, *, preserve_unmanaged: bool = False
+        self,
+        admin_token: str,
+        *,
+        preserve_unmanaged: bool = False,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> bool:
         """Create/update and verify exact OIDC clients on restored realms.
 
@@ -1545,6 +1582,8 @@ class KeycloakAdmin:
                 realm, str(desired["clientId"]), admin_token
             )
             if found is None:
+                if before_change is not None:
+                    await before_change("relying_party")
                 found = await self._create_client(realm, desired, admin_token)
                 changed = True
             current = await self._get_client(realm, found, admin_token)
@@ -1564,6 +1603,8 @@ class KeycloakAdmin:
                     or mapper.get("name") != expected_mapper["name"]
                 ]
                 if unmanaged_mappers or len(current_mappers) > 1:
+                    if before_change is not None:
+                        await before_change("relying_party")
                     raise IdentityConflict(
                         f"OIDC client {desired['clientId']} has unmanaged protocol mappers"
                     )
@@ -1634,12 +1675,15 @@ class KeycloakAdmin:
                 current["secret"] = desired["secret"]
                 needs_update = True
             if needs_update:
+                if before_change is not None:
+                    await before_change("relying_party")
                 await self._put_client(realm, current, admin_token)
                 changed = True
 
             verified = await self._get_client(realm, current, admin_token)
             for field in (
                 "clientId",
+                "name",
                 "enabled",
                 "protocol",
                 "publicClient",
@@ -1704,10 +1748,15 @@ class KeycloakAdmin:
                     desired_scope_roles,
                     admin_token,
                     remove_extras=False,
+                    before_change=before_change,
                 )
             else:
                 scope_changed = await self._reconcile_client_realm_role_scope_mappings(
-                    realm, verified, desired_scope_roles, admin_token
+                    realm,
+                    verified,
+                    desired_scope_roles,
+                    admin_token,
+                    before_change=before_change,
                 )
             if scope_changed is True:
                 changed = True
@@ -1955,24 +2004,30 @@ class KeycloakAdmin:
         return key_doc
 
     async def _reconcile_broker(
-        self, admin_token: str
+        self,
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Reconcile and prove the WIF broker on every deployment."""
 
-        changed = await self._reconcile_wif_frontend_url(admin_token)
+        changed = await self._reconcile_wif_frontend_url(
+            admin_token, before_change
+        )
         broker = await self._find_client(
             self.settings.wif_realm,
             self.settings.wif_broker_client_id,
             admin_token,
         )
         if broker is None:
+            if before_change is not None:
+                await before_change("wif_broker")
             raise IdentityNotFound(
                 "the imported Anthropic WIF broker client is missing"
             )
         safe_realm = self.settings.wif_realm
         broker = await self._get_client(safe_realm, broker, admin_token)
         broker, scope_changed = await self._ensure_broker_scope_boundary(
-            broker, admin_token
+            broker, admin_token, before_change
         )
         changed = scope_changed or changed
 
@@ -1996,6 +2051,8 @@ class KeycloakAdmin:
             for name, value in desired_attributes.items()
         )
         if configuration_changed:
+            if before_change is not None:
+                await before_change("wif_broker")
             broker = dict(broker)
             broker["enabled"] = False
             broker.update(desired_fields)
@@ -2023,7 +2080,7 @@ class KeycloakAdmin:
             changed = True
 
         broker, mapper_changed = await self._ensure_broker_subject_mapper(
-            broker, admin_token
+            broker, admin_token, before_change
         )
         changed = mapper_changed or changed
         try:
@@ -2035,6 +2092,8 @@ class KeycloakAdmin:
         if isinstance(existing_key, dict):
             try:
                 if broker.get("enabled") is not True:
+                    if before_change is not None:
+                        await before_change("wif_broker")
                     broker = dict(broker)
                     broker["enabled"] = True
                     await self._put_client(safe_realm, broker, admin_token)
@@ -2056,7 +2115,7 @@ class KeycloakAdmin:
                 # Vault-held private key, or whose claims are not exact, must
                 # not remain enabled while setup attempts to repair it.
                 broker, disabled = await self._disable_broker(
-                    broker, admin_token
+                    broker, admin_token, before_change
                 )
                 changed = disabled or changed
                 if isinstance(exc, ValueError) or isinstance(
@@ -2064,7 +2123,11 @@ class KeycloakAdmin:
                 ) or not isinstance(exc, IdentityError):
                     raise
 
-        broker, disabled = await self._disable_broker(broker, admin_token)
+        if before_change is not None:
+            await before_change("wif_broker_key")
+        broker, disabled = await self._disable_broker(
+            broker, admin_token, before_change
+        )
         changed = disabled or changed
         broker = dict(broker)
         broker["enabled"] = False
@@ -2090,6 +2153,8 @@ class KeycloakAdmin:
         # certificate over the key that now lives in Vault.
         broker = await self._get_client(safe_realm, broker, admin_token)
         broker["enabled"] = True
+        if before_change is not None:
+            await before_change("wif_broker_key")
         await self._put_client(safe_realm, broker, admin_token)
         try:
             issued_token = await self._client_credentials_with_key(
@@ -2099,12 +2164,15 @@ class KeycloakAdmin:
                 issued_token, client_id=self.settings.wif_broker_client_id
             )
         except Exception:
-            await self._disable_broker(broker, admin_token)
+            await self._disable_broker(broker, admin_token, before_change)
             raise
         return key_doc, True
 
     async def _disable_broker(
-        self, broker: dict[str, Any], admin_token: str
+        self,
+        broker: dict[str, Any],
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Disable the approved broker and verify the fail-closed state."""
 
@@ -2112,6 +2180,8 @@ class KeycloakAdmin:
             raise IdentityError("refusing to disable an unapproved WIF broker")
         if broker.get("enabled") is False:
             return broker, False
+        if before_change is not None:
+            await before_change("wif_broker")
         disabled = dict(broker)
         disabled["enabled"] = False
         await self._put_client(self.settings.wif_realm, disabled, admin_token)
@@ -2166,7 +2236,10 @@ class KeycloakAdmin:
         return scopes
 
     async def _ensure_broker_scope_boundary(
-        self, broker: dict[str, Any], admin_token: str
+        self,
+        broker: dict[str, Any],
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Remove inherited scopes while the broker is verified disabled."""
 
@@ -2187,6 +2260,8 @@ class KeycloakAdmin:
         ):
             return broker, False
 
+        if before_change is not None:
+            await before_change("wif_broker_scope")
         broker = dict(broker)
         broker["enabled"] = False
         broker["fullScopeAllowed"] = False
@@ -2222,7 +2297,10 @@ class KeycloakAdmin:
         return broker, True
 
     async def _ensure_broker_subject_mapper(
-        self, broker: dict[str, Any], admin_token: str
+        self,
+        broker: dict[str, Any],
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Reconcile the stable access-token subject used by Anthropic WIF.
 
@@ -2257,7 +2335,9 @@ class KeycloakAdmin:
             if mapper.get("name") != BROKER_SUBJECT_MAPPER_NAME
         ]
         if unexpected or len(subject_mappers) > 1:
-            await self._disable_broker(broker, admin_token)
+            if before_change is not None:
+                await before_change("wif_broker_subject_mapper")
+            await self._disable_broker(broker, admin_token, before_change)
             raise IdentityConflict(
                 "the WIF broker has a competing subject protocol mapper"
             )
@@ -2283,13 +2363,14 @@ class KeycloakAdmin:
         if existing is not None and all(
             existing.get(name) == desired[name]
             for name in ("name", "protocol", "protocolMapper", "consentRequired")
-        ) and isinstance(existing.get("config"), dict) and all(
-            existing["config"].get(name) == value
-            for name, value in desired["config"].items()
-        ):
+        ) and existing.get("config") == desired["config"]:
             return broker, False
 
-        broker, _ = await self._disable_broker(broker, admin_token)
+        if before_change is not None:
+            await before_change("wif_broker_subject_mapper")
+        broker, _ = await self._disable_broker(
+            broker, admin_token, before_change
+        )
         if existing is None:
             await self._request(
                 "POST",
@@ -2298,16 +2379,37 @@ class KeycloakAdmin:
                 json_body=desired,
                 expected=(201, 204),
             )
-            return broker, True
-        mapper_id = path_segment(existing.get("id"), label="subject mapper UUID")
-        desired["id"] = mapper_id
-        await self._request(
-            "PUT",
-            f"{base}/{mapper_id}",
-            token=admin_token,
-            json_body=desired,
-            expected=(204,),
+        else:
+            mapper_id = path_segment(existing.get("id"), label="subject mapper UUID")
+            desired["id"] = mapper_id
+            await self._request(
+                "PUT",
+                f"{base}/{mapper_id}",
+                token=admin_token,
+                json_body=desired,
+                expected=(204,),
+            )
+        verified_payload = self._json(
+            await self._request(
+                "GET", base, token=admin_token, expected=(200,)
+            ),
+            "verified broker protocol mappers",
         )
+        verified_subject = [
+            mapper
+            for mapper in verified_payload
+            if isinstance(mapper, dict)
+            and isinstance(mapper.get("config"), dict)
+            and mapper["config"].get("claim.name") == "sub"
+        ] if isinstance(verified_payload, list) else []
+        expected_with_id = dict(desired)
+        if len(verified_subject) != 1 or any(
+            verified_subject[0].get(name) != expected_with_id[name]
+            for name in ("name", "protocol", "protocolMapper", "consentRequired")
+        ) or verified_subject[0].get("config") != expected_with_id["config"]:
+            raise IdentityError(
+                "Keycloak did not verify the WIF broker subject mapper"
+            )
         return broker, True
 
     async def _find_component(
@@ -2386,7 +2488,11 @@ class KeycloakAdmin:
         )
 
     async def _reconcile_ldap_component_config(
-        self, existing: dict[str, Any], spec: LdapFederationSpec, admin_token: str
+        self,
+        existing: dict[str, Any],
+        spec: LdapFederationSpec,
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """Push the spec-owned managed LDAP config onto an existing provider.
 
@@ -2413,6 +2519,8 @@ class KeycloakAdmin:
             current_config.get(name) != value for name, value in desired.items()
         )
         if changed:
+            if before_change is not None:
+                await before_change("ldap_config")
             merged = dict(current_config)
             merged.update(desired)
             updated = dict(existing)
@@ -2442,13 +2550,16 @@ class KeycloakAdmin:
         spec: LdapFederationSpec,
         admin_token: str,
         bind_password: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
-        """Store the current bind password without comparing masked readback.
+        """Store a planned bind password and prove the saved provider can use it.
 
         Keycloak returns a placeholder instead of the saved password. Comparing
-        that placeholder with the mounted secret would report drift forever, so
-        an existing managed component receives the supplied password on every
-        converge. The caller proves the password against LDAPS before this write.
+        that placeholder with the mounted secret would report drift forever.
+        The private Vault HMAC therefore limits this PUT to a planned credential
+        change. The caller first proves the supplied credential directly; this
+        method then runs a stored-provider sync so a 204 response alone can
+        never be treated as proof that Keycloak saved a working credential.
         """
 
         safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
@@ -2461,6 +2572,8 @@ class KeycloakAdmin:
         updated_config = dict(current_config)
         updated_config["bindCredential"] = [bind_password]
         updated["config"] = updated_config
+        if before_change is not None:
+            await before_change("ldap_bind_credential")
         await self._request(
             "PUT",
             f"/admin/realms/{safe_realm}/components/{component_id}",
@@ -2479,6 +2592,13 @@ class KeycloakAdmin:
         verified_id = await self._verify_bound_ldap_component(refreshed, admin_token)
         if verified_id != component_id:
             raise IdentityError("Keycloak returned a different LDAP provider after update")
+        await self._request(
+            "POST",
+            f"/admin/realms/{safe_realm}/user-storage/{component_id}/sync",
+            token=admin_token,
+            params={"action": "triggerFullSync"},
+            expected=(200,),
+        )
         return verified_id
 
     def _require_ldap_bind_password(self, bind_password: str | None) -> str:
@@ -2492,7 +2612,12 @@ class KeycloakAdmin:
         return bind_password
 
     async def _ensure_ldap_federation(
-        self, admin_token: str, bind_password: str | None
+        self,
+        admin_token: str,
+        bind_password: str | None,
+        *,
+        refresh_bind_credential: bool = True,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
         spec = ldap_federation_spec(self.settings)
         if spec is None:
@@ -2512,7 +2637,7 @@ class KeycloakAdmin:
             # run the strict inventory-bound + mapper verification (which now
             # matches).
             component_id = await self._reconcile_ldap_component_config(
-                existing, spec, admin_token
+                existing, spec, admin_token, before_change
             )
             # An EXISTING provider whose managed config equals the
             # inventory contract is still NOT proof that a login will succeed:
@@ -2522,19 +2647,27 @@ class KeycloakAdmin:
             # read-only, idempotent live proof on every reconcile.
             bind_password = self._require_ldap_bind_password(bind_password)
             await self._prove_ldap_directory(spec, admin_token, bind_password)
-            refreshed = await self._find_component(
-                self.settings.identity_realm, spec.provider_name, admin_token
-            )
-            if refreshed is None:
-                raise IdentityError(
-                    "the LDAP federation component vanished before credential refresh"
+            if refresh_bind_credential:
+                refreshed = await self._find_component(
+                    self.settings.identity_realm, spec.provider_name, admin_token
                 )
-            refreshed_id = await self._refresh_ldap_bind_credential(
-                refreshed, spec, admin_token, bind_password
-            )
-            if refreshed_id != component_id:
-                raise IdentityError("Keycloak changed the LDAP provider during reconcile")
-            return refreshed_id
+                if refreshed is None:
+                    raise IdentityError(
+                        "the LDAP federation component vanished before credential refresh"
+                    )
+                refreshed_id = await self._refresh_ldap_bind_credential(
+                    refreshed,
+                    spec,
+                    admin_token,
+                    bind_password,
+                    before_change,
+                )
+                if refreshed_id != component_id:
+                    raise IdentityError(
+                        "Keycloak changed the LDAP provider during reconcile"
+                    )
+                return refreshed_id
+            return component_id
         bind_password = self._require_ldap_bind_password(bind_password)
         safe_realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         await self._prove_ldap_directory(spec, admin_token, bind_password)
@@ -2589,6 +2722,8 @@ class KeycloakAdmin:
                 "customUserSearchFilter": [spec.user_filter],
             },
         }
+        if before_change is not None:
+            await before_change("ldap_provider")
         await self._request(
             "POST",
             f"/admin/realms/{safe_realm}/components",
@@ -3461,13 +3596,17 @@ class KeycloakAdmin:
         )
 
     async def _reconcile_deployment_bootstrap_cleanup(
-        self, admin_token: str
+        self,
+        admin_token: str,
+        before_change: Callable[[str], Awaitable[None]] | None = None,
     ) -> bool:
         """Remove only marked temporary principals and prove they are retired."""
 
         changed = False
         matches = await self._bootstrap_admin_users(admin_token)
         if matches:
+            if before_change is not None:
+                await before_change("bootstrap_cleanup")
             attributes = matches[0].get("attributes") or {}
             if attributes.get("is_temporary_admin") in (["true"], "true"):
                 await self._delete_bootstrap_principals(admin_token)
@@ -3482,6 +3621,8 @@ class KeycloakAdmin:
             "master", self.settings.keycloak_bootstrap_admin_client_id, admin_token
         )
         if client is not None:
+            if before_change is not None:
+                await before_change("bootstrap_cleanup")
             client_uuid = path_segment(client.get("id"), label="bootstrap client UUID")
             response = await self._request(
                 "GET",
@@ -3518,8 +3659,6 @@ class KeycloakAdmin:
             raise IdentityError(
                 "Keycloak did not retire the temporary bootstrap administrator"
             )
-        if changed:
-            await self._audit("bootstrap_cleanup", "success", {"changed": True})
         return changed
 
     def _vault_oidc_rp_escrow_doc(self) -> dict[str, Any] | None:
@@ -3590,6 +3729,27 @@ class KeycloakAdmin:
         if action not in IDENTITY_AUDIT_ACTIONS or status not in IDENTITY_AUDIT_OUTCOMES:
             logger.error("identity security event rejected an internal schema value")
             return
+        operation_id = detail.get("operation_id")
+        if operation_id is not None:
+            try:
+                parsed_operation_id = uuid.UUID(operation_id)
+            except (AttributeError, TypeError, ValueError):
+                logger.error("identity security event rejected an operation ID")
+                return
+            if (
+                parsed_operation_id.variant != uuid.RFC_4122
+                or parsed_operation_id.version != 4
+                or str(parsed_operation_id) != operation_id
+            ):
+                logger.error("identity security event rejected an operation ID")
+                return
+        change_kind = detail.get("change_kind")
+        if change_kind is not None and change_kind not in {
+            "planned_change",
+            "security_drift",
+        }:
+            logger.error("identity security event rejected a change kind")
+            return
         try:
             await self.db.record_history(
                 "identity",
@@ -3609,10 +3769,12 @@ class KeycloakAdmin:
             and key
             in {
                 "changed",
+                "change_kind",
                 "error_type",
                 "federation_configured",
                 "group",
                 "ldap_provider",
+                "operation_id",
                 "purpose",
                 "project",
                 "target_subject",
@@ -3642,6 +3804,248 @@ class KeycloakAdmin:
             {"error_type": type(error).__name__},
         )
 
+    async def audit_identity_mutation_failure(
+        self, action: str, operation_id: str, error: Exception
+    ) -> None:
+        """Record the controller's authoritative bounded mutation failure."""
+
+        if action not in {
+            "group_create",
+            "group_delete",
+            "group_member_add",
+            "group_member_remove",
+            "group_policy_update",
+        }:
+            logger.error("identity mutation audit rejected an internal action")
+            return
+        error_type = "InternalError"
+        if isinstance(error, IdentityNotFound):
+            error_type = "IdentityNotFound"
+        elif isinstance(error, IdentityConflict):
+            error_type = "IdentityConflict"
+        elif isinstance(error, IdentityError):
+            error_type = "IdentityError"
+        await self._audit(
+            action,
+            "failed",
+            {
+                "error_type": error_type,
+                "operation_id": operation_id,
+            },
+        )
+
+    @classmethod
+    def _managed_ldap_policy_sha256(cls, spec: LdapFederationSpec) -> str:
+        """Fingerprint only reviewed, non-secret LDAP policy fields."""
+
+        encoded = json.dumps(
+            cls._managed_ldap_config(spec),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _ldap_bind_credential_hmac_sha256(self, bind_password: str) -> str:
+        """Return a private change detector for the masked LDAP credential."""
+
+        secret = self._require_ldap_bind_password(bind_password)
+        key = self.settings.rotator_internal_token.strip()
+        if not self.settings.internal_token_ok() or len(key) < 32:
+            raise IdentityConflict(
+                "ROTATOR_INTERNAL_TOKEN is too weak for identity change detection"
+            )
+        message = b"aigw-managed-ldap-bind-v1\x00" + secret.encode("utf-8")
+        return hmac.new(key.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+    def _managed_identity_policy_sha256(
+        self, spec: LdapFederationSpec, bind_password: str
+    ) -> str:
+        """Return one private HMAC for the complete reviewed identity policy.
+
+        The canonical document exists only in memory. It deliberately includes
+        the LDAP bind credential and first-party client secrets so credential
+        rotation is a planned change. Only the keyed HMAC is stored in Vault;
+        neither the document nor its secrets may enter audit events or status.
+        """
+
+        ldap_bind_password = self._require_ldap_bind_password(bind_password)
+        key = self.settings.rotator_internal_token.strip()
+        if not self.settings.internal_token_ok() or len(key) < 32:
+            raise IdentityConflict(
+                "ROTATOR_INTERNAL_TOKEN is too weak for identity change detection"
+            )
+        broker_subject_mapper = {
+            "name": BROKER_SUBJECT_MAPPER_NAME,
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-hardcoded-claim-mapper",
+            "consentRequired": False,
+            "config": {
+                "claim.name": "sub",
+                "claim.value": service_account_subject(
+                    self.settings.wif_broker_client_id
+                ),
+                "jsonType.label": "String",
+                "access.token.claim": "true",
+                "id.token.claim": "false",
+                "userinfo.token.claim": "false",
+                "introspection.token.claim": "true",
+            },
+        }
+        relying_parties: list[dict[str, Any]] = []
+        for raw_spec in self._relying_party_specs():
+            client = dict(raw_spec)
+            client["redirectUris"] = sorted(raw_spec["redirectUris"])
+            client["webOrigins"] = sorted(raw_spec["webOrigins"])
+            client["protocolMappers"] = sorted(
+                raw_spec["protocolMappers"],
+                key=lambda mapper: json.dumps(
+                    mapper, separators=(",", ":"), sort_keys=True
+                ),
+            )
+            relying_parties.append(client)
+        relying_parties.sort(key=lambda client: str(client["clientId"]))
+        document = {
+            "schema_version": MANAGED_IDENTITY_POLICY_SCHEMA,
+            "aigw_domain": self.settings.aigw_domain,
+            "identity_realm": self.settings.identity_realm,
+            "ldap": {
+                "provider_name": spec.provider_name,
+                "config": self._managed_ldap_config(spec),
+                "bind_password": ldap_bind_password,
+                "mapper_constraints": {
+                    "read_only_if_present": "true",
+                    "mode_if_present": "READ_ONLY",
+                },
+            },
+            "relying_parties": relying_parties,
+            "relying_party_role_scopes": sorted(CAPABILITY_ROLES),
+            "broker": {
+                "realm": self.settings.wif_realm,
+                "frontend_url": self.settings.wif_keycloak_public_url,
+                "clientId": self.settings.wif_broker_client_id,
+                "enabled": True,
+                "publicClient": False,
+                "serviceAccountsEnabled": True,
+                "standardFlowEnabled": False,
+                "directAccessGrantsEnabled": False,
+                "clientAuthenticatorType": "client-jwt",
+                "fullScopeAllowed": False,
+                "attributes": {
+                    "token.endpoint.auth.signing.alg": "RS256",
+                    "use.jwks.url": "false",
+                },
+                "default_client_scopes": [],
+                "optional_client_scopes": [],
+                "subject_mapper": broker_subject_mapper,
+            },
+            "security_event_logging": {
+                "realms": sorted(KEYCLOAK_SECURITY_EVENT_REALMS),
+                "eventsEnabled": True,
+                "eventsExpiration": 86400,
+                "eventsListeners": ["jboss-logging"],
+                "enabledEventTypes": sorted(KEYCLOAK_SECURITY_EVENT_TYPES),
+                "adminEventsEnabled": False,
+                "adminEventsDetailsEnabled": False,
+            },
+            "bootstrap_principals": {
+                "expected_absent": True,
+                "client_id": self.settings.keycloak_bootstrap_admin_client_id,
+                "username": self.settings.keycloak_bootstrap_admin_username,
+                "required_marker": {"is_temporary_admin": "true"},
+            },
+        }
+        encoded = json.dumps(
+            document, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        message = b"aigw-managed-identity-policy-v1\x00" + encoded
+        return hmac.new(key.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _validated_managed_identity_pending(
+        state_doc: dict[str, Any], desired_policy_sha256: str
+    ) -> dict[str, Any] | None:
+        """Read one bounded pending lifecycle record or fail closed."""
+
+        pending = state_doc.get(MANAGED_IDENTITY_PENDING_KEY)
+        if pending is None:
+            return None
+        if not isinstance(pending, dict) or set(pending) != {
+            "schema_version",
+            "operation_id",
+            "change_kind",
+            "desired_policy_sha256",
+            "ldap_drift_detected",
+        }:
+            raise IdentityConflict("managed identity pending state is malformed")
+        operation_id = pending.get("operation_id")
+        try:
+            parsed = uuid.UUID(operation_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise IdentityConflict(
+                "managed identity pending operation ID is malformed"
+            ) from exc
+        if (
+            parsed.variant != uuid.RFC_4122
+            or parsed.version != 4
+            or str(parsed) != operation_id
+            or pending.get("schema_version") != MANAGED_IDENTITY_PENDING_SCHEMA
+            or pending.get("change_kind")
+            not in {"planned_change", "security_drift"}
+            or not isinstance(pending.get("ldap_drift_detected"), bool)
+            or not isinstance(pending.get("desired_policy_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", pending["desired_policy_sha256"]
+            )
+            is None
+        ):
+            raise IdentityConflict("managed identity pending state is malformed")
+        if pending["desired_policy_sha256"] != desired_policy_sha256:
+            raise IdentityConflict(
+                "managed identity policy changed while a recovery is pending"
+            )
+        return dict(pending)
+
+    def _persist_managed_identity_pending(
+        self,
+        *,
+        operation_id: str,
+        change_kind: str,
+        desired_policy_sha256: str,
+        ldap_drift_detected: bool,
+    ) -> None:
+        state_doc = self._identity_state()
+        pending = {
+            "schema_version": MANAGED_IDENTITY_PENDING_SCHEMA,
+            "operation_id": operation_id,
+            "change_kind": change_kind,
+            "desired_policy_sha256": desired_policy_sha256,
+            "ldap_drift_detected": ldap_drift_detected,
+        }
+        updated = dict(state_doc)
+        updated[MANAGED_IDENTITY_PENDING_KEY] = pending
+        if not self.vault.write_verified(
+            self.settings.identity_state_vault_path, updated
+        ):
+            raise IdentityError("Vault did not verify pending identity lifecycle")
+
+    @staticmethod
+    def _bootstrap_status_verified(
+        status: dict[str, Any], *, ldap_expected: bool
+    ) -> bool:
+        """Prove bootstrap controls before announcing their success."""
+
+        return (
+            status.get("configured") is True
+            and status.get("controller_usable") is True
+            and status.get("bootstrap_available") is False
+            and status.get("bootstrap_cleanup_required") is False
+            and status.get("ldap_configured") is ldap_expected
+            and status.get("break_glass_escrow_readable") is True
+            and status.get("break_glass_escrowed") is True
+            and status.get("vault_oidc_rp_escrow_readable") is True
+            and status.get("vault_oidc_rp_escrowed") is True
+        )
+
     async def _bootstrap_locked(self) -> dict[str, Any]:
         """Establish durable controls while ``_bootstrap_lock`` is held."""
 
@@ -3657,10 +4061,11 @@ class KeycloakAdmin:
             root = await self._root_group(controller_token, create=True)
             if root is None:
                 raise IdentityError("managed identity root group was not created")
-            federation_id = await self._ensure_ldap_federation(
-                admin_token, self._ldap_bind_password()
-            )
             federation_spec = ldap_federation_spec(self.settings)
+            bind_password = self._ldap_bind_password()
+            federation_id = await self._ensure_ldap_federation(
+                admin_token, bind_password
+            )
             broker_key = await self._ensure_broker(admin_token)
             # The temporary administrator is never destroyed until the durable
             # administrator is proven and escrowed.
@@ -3680,6 +4085,23 @@ class KeycloakAdmin:
                 "federation_provider_name": (
                     federation_spec.provider_name
                     if (federation_id and federation_spec is not None)
+                    else ""
+                ),
+                "managed_ldap_policy_sha256": (
+                    self._managed_ldap_policy_sha256(federation_spec)
+                    if federation_spec is not None
+                    else ""
+                ),
+                "managed_ldap_bind_credential_hmac_sha256": (
+                    self._ldap_bind_credential_hmac_sha256(bind_password)
+                    if federation_spec is not None
+                    else ""
+                ),
+                "managed_identity_policy_sha256": (
+                    self._managed_identity_policy_sha256(
+                        federation_spec, bind_password
+                    )
+                    if federation_spec is not None
                     else ""
                 ),
                 "identity_controller_client_id": (
@@ -3702,6 +4124,11 @@ class KeycloakAdmin:
             ):
                 raise IdentityError("Vault did not verify identity state")
             await self._delete_bootstrap_principals(admin_token)
+            result = await self.status()
+            if not self._bootstrap_status_verified(
+                result, ldap_expected=federation_spec is not None
+            ):
+                raise IdentityError("identity bootstrap did not verify")
             await self._audit(
                 "bootstrap",
                 "success",
@@ -3713,14 +4140,7 @@ class KeycloakAdmin:
                     "vault_oidc_rp_escrowed": True,
                 },
             )
-            result = await self.status()
-            if (
-                result.get("bootstrap_available") is False
-                and result.get("bootstrap_cleanup_required") is False
-            ):
-                await self._audit(
-                    "bootstrap_cleanup", "success", {"changed": True}
-                )
+            await self._audit("bootstrap_cleanup", "success", {"changed": True})
             return result
         except Exception as exc:
             await self._audit(
@@ -3855,10 +4275,15 @@ class KeycloakAdmin:
             and status.get("bootstrap_cleanup_required") is False
         )
 
-    def _update_deployment_federation_state(
-        self, federation_id: str, provider_name: str
+    def _finalize_deployment_identity_state(
+        self,
+        federation_id: str,
+        provider_name: str,
+        managed_ldap_policy_sha256: str,
+        managed_ldap_bind_credential_hmac_sha256: str,
+        managed_identity_policy_sha256: str,
     ) -> bool:
-        """Keep Vault's provider pointer aligned after a safe recreation."""
+        """Commit verified policy fields while preserving a pending lifecycle."""
 
         state_doc = self._identity_state()
         if (
@@ -3870,16 +4295,52 @@ class KeycloakAdmin:
         if (
             state_doc.get("federation_provider_id") == federation_id
             and state_doc.get("federation_provider_name") == provider_name
+            and state_doc.get("managed_ldap_policy_sha256")
+            == managed_ldap_policy_sha256
+            and state_doc.get("managed_ldap_bind_credential_hmac_sha256")
+            == managed_ldap_bind_credential_hmac_sha256
+            and state_doc.get("managed_identity_policy_sha256")
+            == managed_identity_policy_sha256
         ):
             return False
         updated = dict(state_doc)
         updated["federation_provider_id"] = federation_id
         updated["federation_provider_name"] = provider_name
+        updated["managed_ldap_policy_sha256"] = managed_ldap_policy_sha256
+        updated["managed_ldap_bind_credential_hmac_sha256"] = (
+            managed_ldap_bind_credential_hmac_sha256
+        )
+        updated["managed_identity_policy_sha256"] = (
+            managed_identity_policy_sha256
+        )
         if not self.vault.write_verified(
             self.settings.identity_state_vault_path, updated
         ):
             raise IdentityError("Vault did not verify the reconciled identity state")
         return True
+
+    def _clear_managed_identity_pending(
+        self, operation_id: str, desired_policy_sha256: str
+    ) -> None:
+        """Clear one terminal lifecycle only after its success audit is durable."""
+
+        state_doc = self._identity_state()
+        pending = self._validated_managed_identity_pending(
+            state_doc, desired_policy_sha256
+        )
+        if pending is None or pending["operation_id"] != operation_id:
+            raise IdentityConflict(
+                "managed identity pending state changed before completion"
+            )
+        updated = dict(state_doc)
+        updated.pop(MANAGED_IDENTITY_PENDING_KEY)
+        if not self.vault.write_verified(
+            self.settings.identity_state_vault_path, updated
+        ):
+            raise IdentityError("Vault did not clear pending identity lifecycle")
+        verified = self._identity_state()
+        if MANAGED_IDENTITY_PENDING_KEY in verified:
+            raise IdentityError("Vault did not verify pending lifecycle removal")
 
     async def converge_deployment_identity(self) -> str:
         """Idempotently deploy and prove Keycloak identity control.
@@ -3893,9 +4354,18 @@ class KeycloakAdmin:
             changed = False
             before = await self.status()
             deployment_was_verified = self._deployment_status_verified(before)
+            recovering_existing_state = (
+                not deployment_was_verified
+                and before.get("identity_state_absent") is False
+            )
             if not deployment_was_verified:
-                await self._bootstrap_locked()
-                changed = True
+                if before.get("identity_state_absent") is True:
+                    await self._bootstrap_locked()
+                    changed = True
+                elif not recovering_existing_state:
+                    raise IdentityConflict(
+                        "identity status did not identify a safe bootstrap state"
+                    )
 
             admin_token = await self._break_glass_admin_token()
             await self._audit(
@@ -3903,20 +4373,32 @@ class KeycloakAdmin:
                 "success",
                 {"purpose": "deployment_converge"},
             )
-            changed = (
-                await self._reconcile_security_event_logging(admin_token) or changed
-            )
-            _, broker_changed = await self._reconcile_broker(admin_token)
-            changed = broker_changed or changed
             spec = ldap_federation_spec(self.settings)
             if spec is None:
                 raise IdentityConflict(
                     "automatic identity deployment requires one LDAPS source"
                 )
             bind_password = self._ldap_bind_password()
+            state_doc = self._identity_state()
+            stored_provider_name = state_doc.get("federation_provider_name")
+            stored_provider_id = state_doc.get("federation_provider_id")
+            legacy_provider_name_missing = stored_provider_name in (None, "")
+            if not legacy_provider_name_missing and stored_provider_name != spec.provider_name:
+                raise IdentityConflict(
+                    "renaming the managed LDAP provider requires a reviewed migration"
+                )
             existing = await self._find_component(
                 self.settings.identity_realm, spec.provider_name, admin_token
             )
+            if legacy_provider_name_missing and stored_provider_id:
+                if (
+                    not isinstance(existing, dict)
+                    or existing.get("id") != stored_provider_id
+                    or existing.get("name") != spec.provider_name
+                ):
+                    raise IdentityConflict(
+                        "legacy LDAP provider identity requires a reviewed migration"
+                    )
             desired_config = {
                 name: [value]
                 for name, value in self._managed_ldap_config(spec).items()
@@ -3932,72 +4414,327 @@ class KeycloakAdmin:
                     for name, value in desired_config.items()
                 )
             )
-            ldap_drift = deployment_was_verified and ldap_changed
-            if ldap_drift:
-                await self._audit(
-                    "ldap_drift_detected",
-                    "failed",
-                    {"ldap_provider": spec.provider_name},
-                )
-            try:
-                federation_id = await self._ensure_ldap_federation(
-                    admin_token, bind_password
-                )
-                if not isinstance(federation_id, str) or not federation_id:
-                    raise IdentityError(
-                        "Keycloak did not return an LDAPS provider ID"
-                    )
-            except Exception as exc:
-                await self._audit(
-                    "ldap_check",
-                    "failed",
-                    {
-                        "error_type": type(exc).__name__,
-                        "ldap_provider": spec.provider_name,
-                    },
-                )
-                raise
-            changed = ldap_changed or changed
-            changed = (
-                self._update_deployment_federation_state(
-                    federation_id, spec.provider_name
-                )
-                or changed
+            desired_ldap_policy_sha256 = self._managed_ldap_policy_sha256(spec)
+            desired_ldap_bind_hmac_sha256 = (
+                self._ldap_bind_credential_hmac_sha256(bind_password)
             )
-            changed = (
-                await self._reconcile_relying_party_redirect_uris(admin_token)
-                or changed
+            desired_identity_policy_sha256 = (
+                self._managed_identity_policy_sha256(spec, bind_password)
             )
-            changed = (
-                await self._reconcile_deployment_bootstrap_cleanup(admin_token)
-                or changed
+            bind_credential_changed = (
+                state_doc.get("managed_ldap_bind_credential_hmac_sha256")
+                != desired_ldap_bind_hmac_sha256
             )
+            pending = self._validated_managed_identity_pending(
+                state_doc, desired_identity_policy_sha256
+            )
+            managed_change_kind = (
+                pending["change_kind"] if pending is not None else None
+            )
+            managed_operation_id = (
+                pending["operation_id"] if pending is not None else None
+            )
+            ldap_drift_reported = bool(
+                pending is not None and pending["ldap_drift_detected"]
+            )
+            lifecycle_start_emitted_this_run = False
+            ldap_drift_emitted_this_run = False
 
-            after = await self.status()
-            if not self._deployment_status_verified(after):
-                raise IdentityError("automatic identity deployment did not verify")
-            state_doc = self._identity_state()
-            if (
-                state_doc.get("federation_provider_id") != federation_id
-                or state_doc.get("federation_provider_name") != spec.provider_name
-            ):
-                raise IdentityError("durable identity state does not match live LDAPS")
-            if ldap_drift:
-                await self._audit(
-                    "ldap_recovery",
-                    "success",
-                    {"ldap_provider": spec.provider_name},
+            async def begin_managed_change(
+                change_kind: str, *, ldap_security_drift: bool = False
+            ) -> None:
+                """Persist and report one lifecycle before repairing live state."""
+
+                nonlocal managed_change_kind
+                nonlocal managed_operation_id
+                nonlocal ldap_drift_reported
+                nonlocal lifecycle_start_emitted_this_run
+                nonlocal ldap_drift_emitted_this_run
+
+                if managed_change_kind is None:
+                    managed_change_kind = change_kind
+                    managed_operation_id = str(uuid.uuid4())
+                    self._persist_managed_identity_pending(
+                        operation_id=managed_operation_id,
+                        change_kind=managed_change_kind,
+                        desired_policy_sha256=desired_identity_policy_sha256,
+                        ldap_drift_detected=ldap_security_drift,
+                    )
+                elif (
+                    managed_change_kind == "security_drift"
+                    and change_kind == "planned_change"
+                ):
+                    raise IdentityConflict(
+                        "managed identity policy changed while a recovery is pending"
+                    )
+
+                if not lifecycle_start_emitted_this_run:
+                    detail = {
+                        "changed": True,
+                        "change_kind": managed_change_kind,
+                        "operation_id": managed_operation_id,
+                    }
+                    if managed_change_kind == "planned_change":
+                        await self._audit(
+                            "managed_identity_change_planned", "success", detail
+                        )
+                    else:
+                        await self._audit(
+                            "managed_identity_drift_detected", "failed", detail
+                        )
+                    lifecycle_start_emitted_this_run = True
+
+                if ldap_security_drift and not ldap_drift_reported:
+                    if managed_operation_id is None:
+                        raise IdentityError(
+                            "managed identity lifecycle has no operation ID"
+                        )
+                    self._persist_managed_identity_pending(
+                        operation_id=managed_operation_id,
+                        change_kind=managed_change_kind,
+                        desired_policy_sha256=desired_identity_policy_sha256,
+                        ldap_drift_detected=True,
+                    )
+                    ldap_drift_reported = True
+                if ldap_security_drift and not ldap_drift_emitted_this_run:
+                    if managed_operation_id is None:
+                        raise IdentityError(
+                            "managed identity lifecycle has no operation ID"
+                        )
+                    await self._audit(
+                        "ldap_drift_detected",
+                        "failed",
+                        {
+                            "ldap_provider": spec.provider_name,
+                            "operation_id": managed_operation_id,
+                        },
+                    )
+                    ldap_drift_emitted_this_run = True
+
+            cleanup_changed = False
+            try:
+                if pending is not None:
+                    await begin_managed_change(
+                        managed_change_kind,
+                        ldap_security_drift=ldap_drift_reported,
+                    )
+                if deployment_was_verified or recovering_existing_state:
+                    desired_input_changed = (
+                        state_doc.get("managed_ldap_policy_sha256")
+                        != desired_ldap_policy_sha256
+                        or state_doc.get("managed_identity_policy_sha256")
+                        != desired_identity_policy_sha256
+                    )
+                    ldap_security_drift = (
+                        ldap_changed
+                        and state_doc.get("managed_ldap_policy_sha256")
+                        == desired_ldap_policy_sha256
+                    )
+                    if desired_input_changed:
+                        await begin_managed_change(
+                            "planned_change",
+                            ldap_security_drift=ldap_security_drift,
+                        )
+                    elif (
+                        ldap_changed
+                        or recovering_existing_state
+                        or legacy_provider_name_missing
+                    ):
+                        await begin_managed_change(
+                            "security_drift",
+                            ldap_security_drift=ldap_security_drift,
+                        )
+
+                async def mark_live_change(_control: str) -> None:
+                    if deployment_was_verified or recovering_existing_state:
+                        await begin_managed_change("security_drift")
+
+                if (
+                    recovering_existing_state
+                    and before.get("controller_usable") is not True
+                ):
+                    await self._ensure_controller(admin_token)
+                    changed = True
+
+                event_logging_changed = (
+                    await self._reconcile_security_event_logging(
+                        admin_token, mark_live_change
+                    )
                 )
-            if deployment_was_verified and changed:
-                await self._audit(
-                    "managed_identity_drift_detected",
-                    "failed",
-                    {"changed": True},
+                changed = event_logging_changed or changed
+
+                _, broker_changed = await self._reconcile_broker(
+                    admin_token, mark_live_change
                 )
+                changed = broker_changed or changed
+                try:
+                    if existing is not None and not ldap_changed:
+                        try:
+                            component_id = self._verify_ldap_component(existing)
+                            await self._verify_ldap_mappers(
+                                component_id, admin_token
+                            )
+                        except IdentityConflict:
+                            await mark_live_change("ldap_mapper")
+                            raise
+                    federation_id = await self._ensure_ldap_federation(
+                        admin_token,
+                        bind_password,
+                        refresh_bind_credential=bind_credential_changed,
+                        before_change=mark_live_change,
+                    )
+                    if not isinstance(federation_id, str) or not federation_id:
+                        raise IdentityError(
+                            "Keycloak did not return an LDAPS provider ID"
+                        )
+                except Exception as exc:
+                    if (
+                        isinstance(exc, IdentityConflict)
+                        and (deployment_was_verified or recovering_existing_state)
+                    ):
+                        await begin_managed_change("security_drift")
+                    await self._audit(
+                        "ldap_check",
+                        "failed",
+                        {
+                            "error_type": type(exc).__name__,
+                            "ldap_provider": spec.provider_name,
+                        },
+                    )
+                    raise
+                changed = ldap_changed or changed
+                relying_party_changed = await self._ensure_relying_parties(
+                    admin_token, before_change=mark_live_change
+                )
+                changed = relying_party_changed or changed
+                vault_rp_escrow = self._vault_oidc_rp_escrow_doc()
+                vault_rp_secret = self.settings.vault_oidc_client_secret
+                escrow_changed = (
+                    vault_rp_escrow is None
+                    or not hmac.compare_digest(
+                        str(vault_rp_escrow["client_secret"]).encode(),
+                        vault_rp_secret.encode(),
+                    )
+                )
+                if escrow_changed:
+                    await mark_live_change("vault_oidc_rp_escrow")
+                    self._escrow_vault_oidc_rp_secret()
+                    changed = True
+
+                cleanup_changed = (
+                    await self._reconcile_deployment_bootstrap_cleanup(
+                        admin_token, mark_live_change
+                    )
+                )
+                changed = cleanup_changed or changed
+
+                after = await self.status()
+                if not self._deployment_status_verified(after):
+                    raise IdentityError("automatic identity deployment did not verify")
+                state_changed = self._finalize_deployment_identity_state(
+                    federation_id,
+                    spec.provider_name,
+                    desired_ldap_policy_sha256,
+                    desired_ldap_bind_hmac_sha256,
+                    desired_identity_policy_sha256,
+                )
+                changed = state_changed or changed
+                state_doc = self._identity_state()
+                if (
+                    state_doc.get("federation_provider_id") != federation_id
+                    or state_doc.get("federation_provider_name")
+                    != spec.provider_name
+                    or state_doc.get("managed_ldap_policy_sha256")
+                    != desired_ldap_policy_sha256
+                    or state_doc.get("managed_ldap_bind_credential_hmac_sha256")
+                    != desired_ldap_bind_hmac_sha256
+                    or state_doc.get("managed_identity_policy_sha256")
+                    != desired_identity_policy_sha256
+                ):
+                    raise IdentityError(
+                        "durable identity state does not match live identity policy"
+                    )
+                final_pending = self._validated_managed_identity_pending(
+                    state_doc, desired_identity_policy_sha256
+                )
+                if managed_operation_id is None:
+                    if final_pending is not None:
+                        raise IdentityConflict(
+                            "managed identity lifecycle appeared during verification"
+                        )
+                elif (
+                    final_pending is None
+                    or final_pending["operation_id"] != managed_operation_id
+                    or final_pending["change_kind"] != managed_change_kind
+                ):
+                    raise IdentityConflict(
+                        "managed identity lifecycle changed during verification"
+                    )
+            except Exception:
+                if managed_change_kind is not None and managed_operation_id is not None:
+                    action = (
+                        "managed_identity_recovery"
+                        if managed_change_kind == "security_drift"
+                        else "managed_identity_change_applied"
+                    )
+                    await self._audit(
+                        action,
+                        "failed",
+                        {
+                            "changed": True,
+                            "change_kind": managed_change_kind,
+                            "operation_id": managed_operation_id,
+                        },
+                    )
+                raise
+
+            if managed_change_kind is not None:
+                changed = True
+            if managed_change_kind == "security_drift":
+                if ldap_drift_reported:
+                    await self._audit(
+                        "ldap_recovery",
+                        "success",
+                        {
+                            "ldap_provider": spec.provider_name,
+                            "operation_id": managed_operation_id,
+                        },
+                    )
                 await self._audit(
                     "managed_identity_recovery",
                     "success",
-                    {"changed": True},
+                    {
+                        "changed": True,
+                        "change_kind": managed_change_kind,
+                        "operation_id": managed_operation_id,
+                    },
+                )
+            elif managed_change_kind == "planned_change":
+                if ldap_drift_reported:
+                    await self._audit(
+                        "ldap_recovery",
+                        "success",
+                        {
+                            "ldap_provider": spec.provider_name,
+                            "operation_id": managed_operation_id,
+                        },
+                    )
+                await self._audit(
+                    "managed_identity_change_applied",
+                    "success",
+                    {
+                        "changed": True,
+                        "change_kind": managed_change_kind,
+                        "operation_id": managed_operation_id,
+                    },
+                )
+            if managed_operation_id is not None:
+                self._clear_managed_identity_pending(
+                    managed_operation_id, desired_identity_policy_sha256
+                )
+            if cleanup_changed:
+                await self._audit(
+                    "bootstrap_cleanup", "success", {"changed": True}
                 )
             await self._audit(
                 "deployment_converge",
@@ -4191,13 +4928,21 @@ class KeycloakAdmin:
         return normalized
 
     async def set_group_policy(
-        self, group_id: str, policy: dict[str, Any]
+        self,
+        group_id: str,
+        policy: dict[str, Any],
+        operation_id: str = "",
     ) -> dict[str, Any]:
         async with self._group_topology_lock:
-            return await self._set_group_policy_locked(group_id, policy)
+            return await self._set_group_policy_locked(
+                group_id, policy, operation_id
+            )
 
     async def _set_group_policy_locked(
-        self, group_id: str, policy: dict[str, Any]
+        self,
+        group_id: str,
+        policy: dict[str, Any],
+        operation_id: str = "",
     ) -> dict[str, Any]:
         """Write and verify one managed group's issuance policy attributes."""
 
@@ -4250,7 +4995,12 @@ class KeycloakAdmin:
         await self._audit(
             "group_policy_update",
             "success",
-            {"group_id": safe_group, "project": project_id, "policy": applied},
+            {
+                "group_id": safe_group,
+                "project": project_id,
+                "policy": applied,
+                **({"operation_id": operation_id} if operation_id else {}),
+            },
         )
         return {
             "id": safe_group,
@@ -4669,12 +5419,22 @@ class KeycloakAdmin:
             if member.get("federationLink") == provider_id
         ]
 
-    async def create_group(self, name: str, capabilities: list[str]) -> dict[str, Any]:
+    async def create_group(
+        self,
+        name: str,
+        capabilities: list[str],
+        operation_id: str = "",
+    ) -> dict[str, Any]:
         async with self._group_topology_lock:
-            return await self._create_group_locked(name, capabilities)
+            return await self._create_group_locked(
+                name, capabilities, operation_id
+            )
 
     async def _create_group_locked(
-        self, name: str, capabilities: list[str]
+        self,
+        name: str,
+        capabilities: list[str],
+        operation_id: str = "",
     ) -> dict[str, Any]:
         """Create one group while the managed topology lock is held."""
         clean_name = name.strip()
@@ -4741,6 +5501,7 @@ class KeycloakAdmin:
                 "group_id": group_id,
                 "group": clean_name,
                 "capabilities": sorted(capability_set),
+                **({"operation_id": operation_id} if operation_id else {}),
             },
         )
         return {
@@ -4750,11 +5511,13 @@ class KeycloakAdmin:
             "member_count": 0,
         }
 
-    async def delete_group(self, group_id: str) -> None:
+    async def delete_group(self, group_id: str, operation_id: str = "") -> None:
         async with self._group_topology_lock:
-            await self._delete_group_locked(group_id)
+            await self._delete_group_locked(group_id, operation_id)
 
-    async def _delete_group_locked(self, group_id: str) -> None:
+    async def _delete_group_locked(
+        self, group_id: str, operation_id: str = ""
+    ) -> None:
         """Delete an empty group while the managed topology lock is held."""
         token = await self._controller_token()
         await self._managed_group(group_id, token)
@@ -4771,14 +5534,22 @@ class KeycloakAdmin:
         await self._audit(
             "group_delete",
             "success",
-            {"group_id": safe_group, "group": safe_group},
+            {
+                "group_id": safe_group,
+                "group": safe_group,
+                **({"operation_id": operation_id} if operation_id else {}),
+            },
         )
 
-    async def add_member(self, group_id: str, user_id: str) -> None:
+    async def add_member(
+        self, group_id: str, user_id: str, operation_id: str = ""
+    ) -> None:
         async with self._group_topology_lock:
-            await self._add_member_locked(group_id, user_id)
+            await self._add_member_locked(group_id, user_id, operation_id)
 
-    async def _add_member_locked(self, group_id: str, user_id: str) -> None:
+    async def _add_member_locked(
+        self, group_id: str, user_id: str, operation_id: str = ""
+    ) -> None:
         """Add a federated user while the managed topology lock is held."""
         token = await self._controller_token()
         await self._managed_group(group_id, token)
@@ -4804,6 +5575,7 @@ class KeycloakAdmin:
                 "user_id": safe_user,
                 "group": safe_group,
                 "target_subject": safe_user,
+                **({"operation_id": operation_id} if operation_id else {}),
             },
         )
 
@@ -4907,11 +5679,15 @@ class KeycloakAdmin:
             )
         return any(role.get("name") == "aigw-admins" for role in roles)
 
-    async def remove_member(self, group_id: str, user_id: str) -> None:
+    async def remove_member(
+        self, group_id: str, user_id: str, operation_id: str = ""
+    ) -> None:
         async with self._group_topology_lock:
-            await self._remove_member_locked(group_id, user_id)
+            await self._remove_member_locked(group_id, user_id, operation_id)
 
-    async def _remove_member_locked(self, group_id: str, user_id: str) -> None:
+    async def _remove_member_locked(
+        self, group_id: str, user_id: str, operation_id: str = ""
+    ) -> None:
         """Check last-admin state and remove while the topology lock is held."""
         token = await self._controller_token()
         group = await self._managed_group(group_id, token)
@@ -5001,5 +5777,6 @@ class KeycloakAdmin:
                 "group": safe_group,
                 "target_subject": safe_user,
                 "project": project_id,
+                **({"operation_id": operation_id} if operation_id else {}),
             },
         )

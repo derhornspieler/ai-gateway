@@ -53,4 +53,8 @@ schema_config:
         period: 24h
 
 limits_config:
-  retention_period: 168h   # 7d local; long-term retention is Cribl's job
+  retention_period: 168h   # 7d for ordinary local troubleshooting logs
+  retention_stream:
+    - selector: '{job="controller-lifecycle"}'
+      priority: 10
+      period: 24h

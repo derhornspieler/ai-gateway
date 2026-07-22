@@ -1,0 +1,162 @@
+---
+# Record one controller-owned release lifecycle event on the managed target.
+# The caller supplies only reviewed identifiers. The target creates the time,
+# validates the complete record again, and appends it without reading stdin.
+# The host directory is persistent audit infrastructure. Neither this playbook
+# nor a source rollback truncates or removes records from a newer release.
+- name: Record one AI Gateway controller lifecycle event
+  hosts: gateway:generic_rocky9
+  gather_facts: false
+  become: true
+  vars:
+    controller_lifecycle_audit_directory: /var/log/ai-gateway-controller
+    controller_lifecycle_audit_file: /var/log/ai-gateway-controller/lifecycle.jsonl
+    controller_lifecycle_writer: /usr/local/sbin/aigw-controller-lifecycle-audit
+
+  pre_tasks:
+    - name: Validate the fixed controller lifecycle record
+      ansible.builtin.assert:
+        that:
+          - controller_lifecycle_action in ['upgrade', 'rollback']
+          - controller_lifecycle_outcome in ['started', 'success', 'failed']
+          - >-
+            controller_lifecycle_operation_id is match(
+              '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+            )
+          - controller_lifecycle_manifest_sha256 is match('^[0-9a-f]{64}$')
+          - controller_lifecycle_release_commit is match('^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
+          - controller_lifecycle_envoy_image_id is match('^sha256:[0-9a-f]{64}$')
+          - controller_lifecycle_egress_policy_sha256 is match('^[0-9a-f]{64}$')
+        quiet: true
+        fail_msg: Controller lifecycle audit inputs do not match the fixed schema.
+
+    - name: Inspect the controller lifecycle audit directory
+      ansible.builtin.stat:
+        path: "{{ controller_lifecycle_audit_directory }}"
+        follow: false
+        get_checksum: false
+      register: controller_lifecycle_audit_directory_before
+      changed_when: false
+
+    - name: Refuse an unsafe controller lifecycle audit directory
+      ansible.builtin.assert:
+        that:
+          - >-
+            not (controller_lifecycle_audit_directory_before.stat.exists | default(false)) or
+            (controller_lifecycle_audit_directory_before.stat.isdir | default(false))
+          - not (controller_lifecycle_audit_directory_before.stat.islnk | default(false))
+          - >-
+            not (controller_lifecycle_audit_directory_before.stat.exists | default(false)) or
+            controller_lifecycle_audit_directory_before.stat.uid == 0
+          - >-
+            not (controller_lifecycle_audit_directory_before.stat.exists | default(false)) or
+            controller_lifecycle_audit_directory_before.stat.gid == 473
+          - >-
+            not (controller_lifecycle_audit_directory_before.stat.exists | default(false)) or
+            controller_lifecycle_audit_directory_before.stat.mode == '0750'
+        quiet: true
+        fail_msg: Existing controller lifecycle audit directory is unsafe.
+
+    - name: Create the bounded controller lifecycle audit directory
+      ansible.builtin.file:
+        path: "{{ controller_lifecycle_audit_directory }}"
+        state: directory
+        owner: root
+        group: "473"
+        mode: "0750"
+        follow: false
+
+    - name: Inspect the fixed controller lifecycle writer destination
+      ansible.builtin.stat:
+        path: "{{ controller_lifecycle_writer }}"
+        follow: false
+        get_checksum: false
+      register: controller_lifecycle_writer_before
+      changed_when: false
+
+    - name: Refuse an unsafe existing controller lifecycle writer
+      ansible.builtin.assert:
+        that:
+          - >-
+            not (controller_lifecycle_writer_before.stat.exists | default(false)) or
+            (controller_lifecycle_writer_before.stat.isreg | default(false))
+          - not (controller_lifecycle_writer_before.stat.islnk | default(false))
+          - >-
+            not (controller_lifecycle_writer_before.stat.exists | default(false)) or
+            controller_lifecycle_writer_before.stat.uid == 0
+          - >-
+            not (controller_lifecycle_writer_before.stat.exists | default(false)) or
+            controller_lifecycle_writer_before.stat.gid == 0
+          - >-
+            not (controller_lifecycle_writer_before.stat.exists | default(false)) or
+            controller_lifecycle_writer_before.stat.mode == '0755'
+          - >-
+            not (controller_lifecycle_writer_before.stat.exists | default(false)) or
+            (controller_lifecycle_writer_before.stat.nlink | int) == 1
+        quiet: true
+        fail_msg: Existing controller lifecycle writer is unsafe.
+
+  tasks:
+    - name: Install the fixed controller lifecycle writer
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/controller-lifecycle-audit.py"
+        dest: "{{ controller_lifecycle_writer }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Append the validated controller lifecycle record
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - "{{ controller_lifecycle_writer }}"
+          - "{{ controller_lifecycle_action }}"
+          - "{{ controller_lifecycle_outcome }}"
+          - "{{ controller_lifecycle_operation_id }}"
+          - "{{ controller_lifecycle_manifest_sha256 }}"
+          - "{{ controller_lifecycle_release_commit }}"
+          - "{{ controller_lifecycle_envoy_image_id }}"
+          - "{{ controller_lifecycle_egress_policy_sha256 }}"
+      register: controller_lifecycle_append
+      changed_when: >-
+        controller_lifecycle_append.stdout == 'CONTROLLER_LIFECYCLE_AUDIT_RECORDED'
+      failed_when: >-
+        controller_lifecycle_append.rc != 0 or
+        controller_lifecycle_append.stdout != 'CONTROLLER_LIFECYCLE_AUDIT_RECORDED'
+
+    - name: Inspect the controller lifecycle audit files after append
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop:
+        - "{{ controller_lifecycle_audit_file }}"
+        - "{{ controller_lifecycle_audit_file }}.1"
+      register: controller_lifecycle_audit_files
+      changed_when: false
+
+    - name: Require bounded root-owned controller lifecycle audit files
+      ansible.builtin.assert:
+        that:
+          - >-
+            item.item != controller_lifecycle_audit_file or
+            (item.stat.exists | default(false))
+          - >-
+            not (item.stat.exists | default(false)) or
+            (item.stat.isreg | default(false))
+          - not (item.stat.islnk | default(false))
+          - not (item.stat.exists | default(false)) or item.stat.uid == 0
+          - not (item.stat.exists | default(false)) or item.stat.gid == 473
+          - not (item.stat.exists | default(false)) or item.stat.mode == '0640'
+          - >-
+            not (item.stat.exists | default(false)) or
+            (item.stat.nlink | int) == 1
+          - >-
+            not (item.stat.exists | default(false)) or
+            (item.stat.size | int) <= 8388608
+        quiet: true
+        fail_msg: Controller lifecycle audit file boundary is unsafe or oversized.
+      loop: "{{ controller_lifecycle_audit_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"

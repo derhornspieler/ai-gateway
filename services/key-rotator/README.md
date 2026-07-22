@@ -1,55 +1,93 @@
-# key-rotator — upstream vendor API-key rotation (custom component)
+# Key rotator and identity controller
 
-> **IMPLEMENTED:** see `Dockerfile`, `requirements.txt`, and `app/` in this
-> directory for the running service (FastAPI + APScheduler + hvac + psycopg,
-> OTel-instrumented). Drivers: `app/drivers/anthropic_wif.py` (WIF from
-> Keycloak) and `app/drivers/static_seed.py` (Anthropic static-key bootstrap
-> for local/dev testing).
-> The design docs below remain the source of truth for *why*; the code
-> implements the v5 design from `docs/solution-map.md` §1.7 and
-> `docs/anthropic-wif-bootstrap.md`.
+This Python service manages Anthropic credentials and the Keycloak identity
+state used by AI Gateway. The running code is in `app/`. The image build and
+locked dependencies are in `Dockerfile`, `requirements.txt`, and
+`requirements.lock`.
 
-## Configuration notes (current implementation)
+Read the [solution map](../../docs/solution-map.md) for the full system and the
+[Anthropic WIF guide](../../docs/anthropic-wif-bootstrap.md) for the provider
+flow.
 
-- `ROTATOR_INTERNAL_TOKEN` is **required** (min 16 chars, no placeholders):
-  the service refuses to start without it, and all routes except `/healthz`
-  require a matching `X-Internal-Auth` header (constant-time compared).
-- Keycloak client auth for the Anthropic WIF exchange is `private_key_jwt`
-  (RFC 7523) — key from `KC_CLIENT_ASSERTION_KEY_FILE` (mounted PEM) or
-  Vault KV v2 at `KC_CLIENT_ASSERTION_KEY_VAULT_PATH`
-  (default `ai-gateway/anthropic-wif-client-key`, fields `private_key_pem`
-  + optional `kid`). Static `kc_client_secret` fallback exists only behind
-  `ANTHROPIC_WIF_ALLOW_INSECURE_CLIENT_SECRET=true` (dev only, logs ERROR).
-- `JWKS_WATCH_INTERVAL_SECONDS` (default 300): Keycloak realm JWKS drift
-  watcher. It persists and alerts on a candidate full JWKS/hash but never
-  mutates the Anthropic issuer: that operation requires an interactive
-  `org:admin` token which the inference broker must not receive. After the
-  human update, record the exact approved hash as
-  `federation_jwks_sha256` in the `ai-gateway/anthropic-wif` Vault doc.
-The service also exposes the authenticated identity-administration controller
-used by the admin portal. It bootstraps a least-privilege Keycloak controller,
-manages the `aigw-managed` group tree, assigns existing Keycloak/federated
-users to capability groups, invalidates affected sessions, and protects the
-last managed administrator. When external LDAP is enabled, it also configures
-the bounded read-only directory provider; deployments with LDAP disabled leave
-that integration absent.
+## API protection
 
-## Rotation cycle (per vendor, on schedule + on-demand)
+`ROTATOR_INTERNAL_TOKEN` is required. It must have at least 16 characters and
+cannot be a placeholder. Every route except `/healthz` requires the same value
+in `X-Internal-Auth`. The comparison is constant-time.
 
-1. Authenticate through the configured implemented driver:
-   - **Anthropic**: Keycloak `private_key_jwt` exchange for short-lived WIF
-     tokens; JWKS drift is detected and requires explicit operator approval.
-   - **Static Anthropic seed**: explicit local/bootstrap path only.
-2. Canary-verify new key **through envoy-egress** (pinned path).
-3. Update LiteLLM credential (credentials API / DB) — hot reload, no restart.
-4. Grace window, then revoke/deactivate old key.
-5. Emit local OTel evidence plus a sanitized, structured rotation security
-   event. Only that reviewed event may enter the Cribl SOC log feed; the raw
-   span and ordinary service logs stay local.
+The service runs one process. Do not add workers or replicas. Its safety locks
+are local to that process.
 
-## Non-goals
+## Anthropic WIF
 
-The service does not rotate LiteLLM virtual keys (the developer portal owns
-that lifecycle), invent unsupported vendor APIs, or provide a generic
-SOPS/OpenBao adapter. Vault CE KV v2, Anthropic WIF, and the static Anthropic
-bootstrap driver are the supported scope. OpenAI is not a registered provider.
+Production uses Keycloak `private_key_jwt`. The private key comes from one of
+these reviewed sources:
+
+- `KC_CLIENT_ASSERTION_KEY_FILE`, for a mounted test key; or
+- Vault KV v2 at `KC_CLIENT_ASSERTION_KEY_VAULT_PATH`, which defaults to
+  `ai-gateway/anthropic-wif-client-key`.
+
+The Vault record contains `private_key_pem` and may contain `kid`.
+
+There is no production shared-secret fallback. The development-only fallback
+requires `ANTHROPIC_WIF_ALLOW_INSECURE_CLIENT_SECRET=true` and logs an error.
+Never enable it in production.
+
+`JWKS_WATCH_INTERVAL_SECONDS` defaults to 300 seconds. The watcher records a
+changed Keycloak public-key set and raises an alert. It does not update the
+Anthropic issuer. A human Anthropic organization administrator must approve
+that change with a fresh `org:admin` session.
+
+## Credential rotation
+
+Each planned or manual Anthropic rotation follows this order:
+
+1. Use Keycloak WIF to get a short-lived provider token.
+2. Check the new token through Envoy, the only provider path.
+3. Update the `anthropic-primary` LiteLLM credential without a restart.
+4. Wait for the reviewed grace period.
+5. Revoke or stop using the old token.
+6. Write bounded local history and a structured security event with no secret.
+
+The static Anthropic seed driver exists only for an explicit local or bootstrap
+path. OpenAI is not a registered provider.
+
+This service does not rotate LiteLLM virtual keys. The developer portal owns
+those keys.
+
+## Identity control
+
+The admin portal uses this service for the managed Keycloak state. It:
+
+- creates the least-privilege `aigw` identity controller;
+- manages the `aigw-managed` group tree;
+- assigns existing Keycloak or federated users to capability groups;
+- closes affected sessions after membership changes;
+- prevents removal of the last managed administrator; and
+- sets up the bounded, read-only LDAPS provider when LDAPS is enabled.
+
+Ansible starts this work automatically after Vault and LDAPS inputs are ready.
+The admin portal has no platform-initialization step. For exact redirects and
+the operator flow, see [identity operations](../../docs/identity-operations.md).
+
+## Logs and history
+
+Raw service logs and traces stay local. The service emits a small set of
+reviewed security events for rotation and identity changes. Those records use
+fixed fields and remove secret details before Alloy may send them to Cribl.
+See the [Cribl SOC handoff](../../docs/cribl-soc-handoff.md).
+
+## Test this service
+
+Run the service checks from this directory:
+
+```bash
+PYTHONPATH=. pytest -q
+ruff check app tests
+bandit -q -r app --severity-level medium --confidence-level medium
+```
+
+The full release gate also loads the exact offline seed into local Docker
+PreProd at `aigw.internal`. Follow the
+[acceptance test runbook](../../docs/test-runbook.md). No rehearsal VM is
+needed.

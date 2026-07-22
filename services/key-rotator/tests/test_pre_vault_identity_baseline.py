@@ -189,6 +189,7 @@ class FakePreVaultAdmin(KeycloakAdmin):
         admin_token,
         *,
         remove_extras=True,
+        before_change=None,
     ):
         assert remove_extras is False
         current = self.clients[client["clientId"]]["scopes"]
@@ -332,6 +333,7 @@ class FakeRelyingPartyAdmin(KeycloakAdmin):
         admin_token,
         *,
         remove_extras=True,
+        before_change=None,
     ):
         assert remove_extras is False
         extras = self.clients[client["clientId"]]["scopes"] - CAPABILITY_ROLES

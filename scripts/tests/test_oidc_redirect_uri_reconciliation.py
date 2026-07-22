@@ -87,9 +87,10 @@ class OidcRedirectUriReconciliationContractTests(unittest.TestCase):
         ]
         self.assertIn("await self._break_glass_admin_token()", converge)
         self.assertIn(
-            "await self._reconcile_relying_party_redirect_uris(admin_token)",
+            "relying_party_changed = await self._ensure_relying_parties(",
             converge,
         )
+        self.assertIn("admin_token, before_change=mark_live_change", converge)
         block = self.identity[
             self.identity.index("CONTROLLER_ADMIN_ROLES = (") : self.identity.index(
                 ")", self.identity.index("CONTROLLER_ADMIN_ROLES = (")

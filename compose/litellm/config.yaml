@@ -85,18 +85,12 @@ litellm_settings:
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL
-  # End-user attribution for the chat path: Open WebUI (with
-  # ENABLE_FORWARD_USER_INFO_HEADERS) sends the authenticated identity in
-  # X-OpenWebUI-User-* headers; the Email header carries the OIDC
-  # preferred_username because this deployment maps OAUTH_EMAIL_CLAIM to
-  # preferred_username (directory identities may have no mail attribute). LiteLLM
-  # records it as the request's end user, which reaches telemetry as
-  # metadata.user_api_key_end_user_id and becomes aigw.user.name /
-  # aigw.enduser.id in the audit stream.
-  # SECURITY: LiteLLM trusts this header from ANY authenticated caller, so it
-  # is ATTRIBUTION-ONLY (spend/logging). It grants no authorization; an API
-  # client spoofing it only mislabels its own already-authenticated traffic —
-  # the key identity is still recorded in aigw.user.id / aigw.api_key.id.
+  # Open WebUI 0.10.2 signed mode sends Authorization plus its short-lived JWT.
+  # It does not send a plain identity compatibility header. This legacy parser
+  # setting is not readable SOC identity; the custom OTel callback accepts a
+  # chat username only from the verified JWT and exact service-key metadata.
+  # Direct API callers cannot forge that assertion. Authorization continues to
+  # use the authenticated gateway key.
   user_header_name: X-OpenWebUI-User-Email
   store_model_in_db: false     # models are reviewed config; creds rotate via /credentials
   # Prompt/completion content belongs only in the access-controlled OTel trace

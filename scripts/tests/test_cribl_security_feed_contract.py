@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import runpy
 import unittest
 from pathlib import Path
 
@@ -100,7 +101,8 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             '"adminEventsEnabled": False',
             '"adminEventsDetailsEnabled": False',
             '"Keycloak did not verify the security event logging policy"',
-            "await self._reconcile_security_event_logging(admin_token)",
+            "await self._reconcile_security_event_logging(",
+            "admin_token, mark_live_change",
         ):
             self.assertIn(fragment, IDENTITY)
         constant = IDENTITY.split("KEYCLOAK_SECURITY_EVENT_TYPES = (", 1)[1].split(
@@ -110,10 +112,95 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
 
     def test_alloy_keycloak_allowlist_matches_the_realm_policy(self) -> None:
         match = re.search(
-            r"\(\?P<keycloak_event>([A-Z_|]+)\)\(\?:,\|\$\)", ALLOY
+            r'\^type="\(\?P<keycloak_event>([A-Z_|]+)\)"\(\?:,\|\$\)',
+            ALLOY,
         )
         self.assertIsNotNone(match)
         self.assertEqual(tuple(match.group(1).split("|")), EVENTS)
+
+    def test_alloy_keycloak_parser_requires_quoted_sanitized_fields(self) -> None:
+        keycloak = ALLOY.split('loki.process "cribl_keycloak_auth"', 1)[1].split(
+            'loki.process "cribl_envoy_tls"', 1
+        )[0]
+        for required in (
+            'expression = `^type="(?P<keycloak_event>',
+            'realmId="(?P<keycloak_realm_id>[A-Za-z0-9_.:@-]{1,128})"',
+            'clientId="(?P<keycloak_client_id>[A-Za-z0-9_.:@/-]{1,128})"',
+            'userId="(?P<keycloak_user_id>[A-Za-z0-9_.:@-]{1,128})"',
+        ):
+            self.assertIn(required, keycloak)
+        for unquoted in (
+            "expression = `^type=(?P<keycloak_event>",
+            "realmId=(?P<keycloak_realm_id>",
+            "clientId=(?P<keycloak_client_id>",
+            "userId=(?P<keycloak_user_id>",
+        ):
+            self.assertNotIn(unquoted, keycloak)
+        self.assertIn(
+            "'type=\"LOGIN\", realmId=\"aigw\", clientId=\"portal\", '",
+            PREPROD_RECEIPT,
+        )
+        self.assertIn(
+            '"type=LOGIN, realmId=aigw, clientId=portal, "',
+            PREPROD_RECEIPT,
+        )
+        self.assertIn("DENIED_KEYCLOAK_UNQUOTED_", PREPROD_RECEIPT)
+
+    def test_natural_keycloak_receipt_parser_matches_live_26_7_shape(self) -> None:
+        module = runpy.run_path(str(ROOT / "scripts/test-preprod-cribl-security.py"))
+        parser = module["natural_keycloak_receipts"]
+        realm_id = "123e4567-e89b-42d3-a456-426614174100"
+        user_id = "123e4567-e89b-42d3-a456-426614174101"
+
+        def event(name: str, *, user: str = user_id) -> str:
+            return json.dumps(
+                {
+                    "log.logger": "org.keycloak.events",
+                    "message": (
+                        f'type="{name}", realmId="{realm_id}", '
+                        'realmName="aigw", clientId="dev-portal", '
+                        f'userId="{user}", ipAddress="172.29.1.130", '
+                        'username="must-not-be-projected"'
+                    ),
+                },
+                separators=(",", ":"),
+            )
+
+        raw = "\n".join(event(name) for name in ("LOGIN", "LOGIN_ERROR", "LOGOUT"))
+        self.assertEqual(
+            parser(raw),
+            tuple(
+                "schema_version=1 event=aigw.keycloak.authentication "
+                f"event_type={name} realm_id={realm_id} "
+                f"client_id=dev-portal user_id={user_id}"
+                for name in ("LOGIN", "LOGIN_ERROR", "LOGOUT")
+            ),
+        )
+        self.assertIsNone(
+            parser(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "log.logger": "org.keycloak.events",
+                            "message": (
+                                f"type={name}, realmId={realm_id}, "
+                                "realmName=aigw, clientId=dev-portal, "
+                                f"userId={user_id}"
+                            ),
+                        },
+                        separators=(",", ":"),
+                    )
+                    for name in ("LOGIN", "LOGIN_ERROR", "LOGOUT")
+                )
+            )
+        )
+        with self.assertRaisesRegex(SystemExit, "one user and realm"):
+            parser(
+                "\n".join(
+                    event(name, user="different" if name == "LOGIN" else user_id)
+                    for name in ("LOGIN", "LOGIN_ERROR", "LOGOUT")
+                )
+            )
 
     def test_prometheus_retention_is_local_and_size_bounded(self) -> None:
         prometheus = COMPOSE.split("  prometheus:\n", 1)[1].split(
@@ -142,15 +229,56 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             "OTLP_FIXTURES_ACCEPTED",
             "OTLP_SPOOF_REJECTED",
             "LITELLM_REAL_REQUEST_ACCEPTED",
+            "OPENWEBUI_HEADER_RUNTIME_REQUEST_ACCEPTED",
+            "OPENWEBUI_INVALID_IDENTITY_REQUESTS_REJECTED",
             "DENIED_RAW_TRACE_",
             "DENIED_UNATTRIBUTED_TRACE_",
             "DENIED_UNTRUSTED_SOURCE_",
+            "REJECTED_OPENWEBUI_MISSING_JWT_",
+            "REJECTED_OPENWEBUI_INVALID_JWT_",
+            "REJECTED_OPENWEBUI_EXPIRED_JWT_",
+            "REJECTED_OPENWEBUI_CONFLICTING_JWT_",
+            "REJECTED_OPENWEBUI_PARTIAL_MARKER_",
             "FORGED_AUTH_MARKER_",
+            "FORGED_PRODUCER_",
+            "FORGED_LOG_ENV_",
+            "FORGED_LOG_SERVICE_",
+            "FORGED_RESOURCE_ENV_",
+            "FORGED_BODY_PRODUCER_",
+            "FORGED_BODY_ENV_",
+            "FORGED_BODY_SERVICE_",
+            "DENIED_ZERO_TIMESTAMP_",
+            "DENIED_STALE_TIMESTAMP_",
+            "DENIED_FUTURE_TIMESTAMP_",
+            "ALLOWED_RECENT_PAST_TIMESTAMP_",
+            "ALLOWED_CLOCK_SKEW_TIMESTAMP_",
             "real-ai-input-",
+            "runtime-openwebui-ai-input-",
             "DENIED_KEYCLOAK_MISSING_USER_",
+            "DENIED_KEYCLOAK_UNQUOTED_",
+            "DENIED_KEYCLOAK_IP_",
+            "DENIED_KEYCLOAK_USERNAME_",
+            "DENIED_KEYCLOAK_EMAIL_",
             "PROMPT_PASSWORD_",
             "PROMPT_BEARER_",
             "sk-ant-",
+            "SESSION_TOKEN_SECRET_",
+            "VAULT_UNSEAL_SECRET_",
+            "CLIENT_ASSERTION_SECRET_",
+            "QUOTED_MULTIWORD_INPUT_",
+            "ESCAPED_MULTIWORD_INPUT_",
+            "QUOTED_MULTIWORD_OUTPUT_",
+            "QUOTED_MULTIWORD_LEGACY_PROMPT_",
+            "ESCAPED_MULTIWORD_LEGACY_COMPLETION_",
+            "PEM_SECRET_",
+            "TRUNCATED_PEM_SECRET_",
+            "SAFE_SESSION_COUNT_",
+            "SAFE_VAULT_STATUS_",
+            "SAFE_CLIENT_ASSERTIVENESS_",
+            "SAFE_PUBLIC_KEY_",
+            "SAFE_PRIVATE_KEY_WORDS_",
+            "SAFE_PASSWORD_POLICY_",
+            "SAFE_VAULT_WORDS_",
             "denied_raw_metric_",
             "DENIED_RAW_LOG_",
             "DENIED_ORDINARY_LOG_",
@@ -171,17 +299,67 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             "<redacted-credential>",
             "<redacted-authorization>",
             "<redacted-vendor-key>",
+            "<redacted-jwt>",
+            "<redacted-vault-token>",
+            "<redacted-private-key>",
             '"verify",',
             "the live Vault audit receipt could not be generated",
             "wait_for_queue(preprod, model, populated=True)",
             "assert_otel_token_is_file_only(preprod)",
             "send_real_litellm_request(preprod, token)",
+            "send_openwebui_header_runtime_request(preprod, token)",
+            "exercise_natural_keycloak_auth(preprod, model)",
+            "set_natural_keycloak_fixture(preprod, model, fixture_token, fixture)",
+            "KEYCLOAK_NATURAL_AUTH_EVENTS_ACCEPTED",
+            "natural Keycloak success/logout flow",
+            "natural Keycloak failed-login flow",
+            "a raw Keycloak authentication field reached Cribl",
+            "write_controller_lifecycle_fixtures(token)",
             "exercise_tls_server_name_failure(preprod, model, tls_token)",
             "Alloy accepted a Cribl certificate with the wrong server name",
             'preprod.docker("restart", "--time", "10", alloy)',
             "PREPROD_CRIBL_SECURITY_FEED_PASSED",
         ):
             self.assertIn(marker, PREPROD_RECEIPT)
+
+        module = runpy.run_path(str(ROOT / "scripts/test-preprod-cribl-security.py"))
+        helpers = {
+            name: module[name]
+            for name in ("OTLP_FIXTURE_HELPER", "OTLP_SPOOF_HELPER")
+        }
+        self.assertEqual(
+            set(helpers), {"OTLP_FIXTURE_HELPER", "OTLP_SPOOF_HELPER"}
+        )
+        for name, helper in helpers.items():
+            compile(helper, name, "exec")
+        openwebui_helper = module["OPENWEBUI_HEADER_RUNTIME_REQUEST_HELPER"]
+        compile(openwebui_helper, "OPENWEBUI_HEADER_RUNTIME_REQUEST_HELPER", "exec")
+        self.assertIn(
+            "from open_webui.utils.headers import include_user_info_headers",
+            openwebui_helper,
+        )
+        self.assertIn("headers = include_user_info_headers(", openwebui_helper)
+        self.assertIn("except urllib.error.HTTPError as error:", openwebui_helper)
+        self.assertIn("not 400 <= rejected_status < 500", openwebui_helper)
+        self.assertIn("expired_token = jwt.encode(", openwebui_helper)
+        self.assertIn("duplicate_connection.putrequest(", openwebui_helper)
+        self.assertIn(
+            'duplicate_connection.putheader("X-OpenWebUI-User-Jwt", "not-a-jwt")',
+            openwebui_helper,
+        )
+        self.assertIn(
+            'duplicate_connection.putheader("x-openwebui-user-jwt", valid_token)',
+            openwebui_helper,
+        )
+        for hand_rolled in ("hmac.new", "urlsafe_b64encode"):
+            self.assertNotIn(hand_rolled, openwebui_helper)
+        self.assertIn("wif_provider_request_count(preprod)", PREPROD_RECEIPT)
+        self.assertIn('"metadata": {"aigw_service": "open-webui"}', PREPROD_RECEIPT)
+        self.assertIn("REJECTED_OPENWEBUI_PARTIAL_MARKER_", PREPROD_RECEIPT)
+        self.assertIn(
+            'fail("an invalid Open WebUI identity request reached the provider")',
+            PREPROD_RECEIPT,
+        )
         self.assertIn(
             "Prove the curated Cribl security feed and persistent recovery queue",
             PREPROD_TASKS,
@@ -213,7 +391,7 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
     def test_structured_security_events_use_a_fixed_field_projection(self) -> None:
         structured = ALLOY.split(
             'loki.process "cribl_structured_security"', 1
-        )[1].split('loki.source.file "vault_audit"', 1)[0]
+        )[1].split('loki.source.file "controller_lifecycle"', 1)[0]
         self.assertIn('source = "aigw_security_line"', structured)
         self.assertIn(
             'stage.output { source = "aigw_security_line" }', structured
@@ -226,6 +404,8 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         for field in (
             "security_subject",
             "security_project",
+            "security_attempt",
+            "security_rotation_id",
             "security_rotation_status",
             "security_policy_sha256",
             "security_providers",
@@ -238,12 +418,291 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         for reason in (
             "missing_portal_subject",
             "missing_rotation_vendor",
+            "malformed_rotation_id",
+            "malformed_rotation_attempt",
+            "unexpected_rotation_attempt",
+            "mismatched_rotation_status",
+            "mismatched_rotation_outcome",
             "missing_vault_state",
             "missing_egress_policy_digest",
             "missing_egress_ca_fingerprints",
             "missing_egress_failure_reason",
         ):
             self.assertIn(reason, structured)
+
+    def test_rotation_lifecycle_projection_is_bounded_and_correlated(self) -> None:
+        structured = ALLOY.split(
+            'loki.process "cribl_structured_security"', 1
+        )[1].split('loki.source.file "controller_lifecycle"', 1)[0]
+        for required in (
+            'security_attempt                 = "attempt"',
+            'security_rotation_id             = "rotation_id"',
+            'template = `{{ if kindIs "float64" .Value }}{{ .Value }}{{ end }}`',
+            'security_action!~\\"start|attempt|rotate|recovery\\"',
+            'security_rotation_status!~\\"started|success|failed|skipped|disabled|recovered\\"',
+            'security_rotation_id!~\\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\"',
+            'security_action=~\\"attempt|rotate|recovery\\",security_attempt!~\\"[1-9][0-9]{0,2}\\"',
+            'security_action=\\"start\\",security_attempt!=\\"\\"',
+            'security_action=\\"start\\",security_rotation_status=\\"started\\",security_outcome!=\\"success\\"',
+            'security_action=\\"recovery\\",security_rotation_status=\\"recovered\\",security_outcome!=\\"success\\"',
+            'security_action=~\\"attempt|rotate\\",security_rotation_status=\\"success\\",security_outcome!=\\"success\\"',
+            'security_action=~\\"attempt|rotate\\",security_rotation_status=~\\"failed|skipped|disabled\\",security_outcome!=\\"failure\\"',
+            'rotation_id={{ .security_rotation_id }}',
+            'attempt={{ .security_attempt }}',
+        ):
+            self.assertIn(required, structured)
+        self.assertNotIn("rollback", structured)
+
+        for marker in (
+            '"action":"start"',
+            '"action":"attempt"',
+            '"action":"rotate"',
+            '"action":"recovery"',
+            '"attempt":1',
+            '"attempt":2',
+            '"attempt":"1"',
+            "DENIED_ROTATION_ID_",
+            "DENIED_ROTATION_ATTEMPT_TYPE_",
+            "DENIED_ROTATION_START_ATTEMPT_",
+            "DENIED_ROTATION_START_OUTCOME_",
+            "DENIED_ROTATION_RECOVERY_OUTCOME_",
+            "DENIED_ROTATION_SUCCESS_OUTCOME_",
+            "DENIED_ROTATION_FAILURE_OUTCOME_",
+            "rotation_id=123e4567-e89b-42d3-a456-426614174000",
+            "rotation_status=recovered",
+        ):
+            self.assertIn(marker, PREPROD_RECEIPT)
+
+    def test_natural_portal_and_identity_events_have_exact_schemas(self) -> None:
+        structured = ALLOY.split(
+            'loki.process "cribl_structured_security"', 1
+        )[1].split('loki.source.file "controller_lifecycle"', 1)[0]
+        for action in (
+            "authorization[.](role[.]denied|step_up[.]required)",
+            "identity[.]group[.](create|delete)|identity[.]member[.]add",
+            "bootstrap_cleanup",
+            "break_glass_activate|break_glass_disable",
+            "ldap_check",
+            "ldap_drift_detected|ldap_recovery",
+            "managed_identity_change_applied|managed_identity_change_planned",
+            "managed_identity_drift_detected|managed_identity_recovery",
+        ):
+            self.assertIn(action, structured)
+        for reason in (
+            "mismatched_portal_event_schema",
+            "unexpected_portal_event_detail",
+            "mismatched_identity_event_schema",
+            "unexpected_identity_event_detail",
+        ):
+            self.assertIn(reason, structured)
+        for detail_flag in (
+            "security_detail_any",
+            "security_detail_except_changed",
+            "security_detail_except_error",
+            "security_detail_except_ldap",
+            "security_detail_except_ldap_error",
+            "security_detail_except_ldap_operation",
+            "security_detail_except_managed_change",
+            "security_detail_except_error_operation",
+        ):
+            self.assertIn(detail_flag, structured)
+            self.assertIn(f'"{detail_flag}",', structured)
+
+        for marker in (
+            '"action":"authorization.role.denied","outcome":"failure"',
+            '"action":"authorization.step_up.required","outcome":"failure"',
+            '"action":"identity.group.create","outcome":"intent"',
+            '"action":"identity.group.create","outcome":"success"',
+            '"action":"identity.group.delete","outcome":"failure"',
+            '"action":"identity.member.add","outcome":"indeterminate"',
+            '"action":"identity.group.policy","outcome":"success"',
+            '"action":"bootstrap_cleanup","outcome":"success","changed":true',
+            '"action":"break_glass_activate","outcome":"failed","error_type":"IdentityConflict"',
+            '"action":"ldap_check","outcome":"failed","error_type":"IdentityConflict"',
+            '"action":"ldap_drift_detected","outcome":"failed","ldap_provider":"corp-ad","operation_id"',
+            '"action":"ldap_recovery","outcome":"success","ldap_provider":"corp-ad","operation_id"',
+            '"action":"managed_identity_change_planned","outcome":"success","changed":true,"change_kind":"planned_change","operation_id"',
+            '"action":"managed_identity_change_applied","outcome":"success","changed":true,"change_kind":"planned_change","operation_id"',
+            '"action":"managed_identity_drift_detected","outcome":"failed","changed":true,"change_kind":"security_drift","operation_id"',
+            '"action":"managed_identity_recovery","outcome":"success","changed":true,"change_kind":"security_drift","operation_id"',
+            "DENIED_PORTAL_OUTCOME_",
+            "DENIED_PORTAL_DETAIL_",
+            "DENIED_BOOTSTRAP_OUTCOME_",
+            "DENIED_BREAK_GLASS_SCHEMA_",
+            "DENIED_LDAP_CHECK_OUTCOME_",
+            "DENIED_LDAP_RECOVERY_OUTCOME_",
+            "DENIED_MANAGED_RECOVERY_",
+        ):
+            self.assertIn(marker, PREPROD_RECEIPT)
+
+    def test_request_span_source_time_is_restored_before_the_common_gate(self) -> None:
+        request_filter = ALLOY.split(
+            'otelcol.processor.filter "aigw_request_spans"', 1
+        )[1].split('otelcol.processor.transform "aigw_request_event_time"', 1)[0]
+        time_bridge = ALLOY.split(
+            'otelcol.processor.transform "aigw_request_event_time"', 1
+        )[1].split('otelcol.connector.spanlogs "aigw_requests"', 1)[0]
+        request_stream = ALLOY.split(
+            'otelcol.processor.transform "aigw_request_stream"', 1
+        )[1].split('otelcol.processor.attributes "aigw_request_stream_labels"', 1)[0]
+        self.assertIn(
+            "traces = [otelcol.processor.transform.aigw_request_event_time.input]",
+            request_filter,
+        )
+        self.assertIn(
+            'set(attributes["aigw.security.source_time_unix_nano"], start_time_unix_nano)',
+            time_bridge,
+        )
+        spanlogs = ALLOY.split(
+            'otelcol.connector.spanlogs "aigw_requests"', 1
+        )[1].split('otelcol.processor.transform "aigw_request_stream"', 1)[0]
+        labels = spanlogs.split("  labels = [", 1)[1].split("  ]", 1)[0]
+        span_attributes = spanlogs.split("  span_attributes = [", 1)[1].split(
+            "  ]", 1
+        )[0]
+        self.assertIn('"aigw.security.source_time_unix_nano",', labels)
+        self.assertNotIn('"aigw.security.source_time_unix_nano",', span_attributes)
+        self.assertIn(
+            'set(time_unix_nano, attributes["aigw.security.source_time_unix_nano"])',
+            request_stream,
+        )
+        self.assertIn(
+            'delete_key(attributes, "aigw.security.source_time_unix_nano")',
+            request_stream,
+        )
+
+    def test_common_record_fields_are_server_owned_before_the_only_batch(self) -> None:
+        alloy = COMPOSE.split("  alloy:\n", 1)[1].split("\n  prometheus:", 1)[0]
+        preprod_alloy = PREPROD_OVERLAY.split("  alloy:\n", 1)[1].split(
+            "\n  prometheus:", 1
+        )[0]
+        self.assertIn("AIGW_DEPLOYMENT_ENVIRONMENT: production", alloy)
+        self.assertNotIn("${AIGW_DEPLOYMENT_ENVIRONMENT", alloy)
+        self.assertIn("AIGW_DEPLOYMENT_ENVIRONMENT: preprod", preprod_alloy)
+
+        contract = ALLOY.split(
+            'otelcol.processor.transform "cribl_security_contract"', 1
+        )[1].split('otelcol.processor.filter "cribl_common_record"', 1)[0]
+        for required in (
+            'set(attributes["aigw.security.event_class"], attributes["aigw_security_event_class"])',
+            'delete_matching_keys(attributes, "^(?:deployment\\\\.environment|service\\\\.name|aigw\\\\.security\\\\.producer|aigw_security_event_class)$")',
+            'set(attributes["aigw.security.schema_version"], 1)',
+            'set(resource.attributes["deployment.environment"], "` + '
+            'sys.env("AIGW_DEPLOYMENT_ENVIRONMENT") + `")',
+            'set(attributes["aigw.security.producer"], "")',
+            'set(resource.attributes["service.name"], "")',
+        ):
+            self.assertIn(required, contract)
+
+        mappings = {
+            "ai_request_audit": "litellm",
+            "keycloak_event": "keycloak",
+            "egress_tls": "envoy-egress",
+            "vault_audit": "vault",
+            "controller_lifecycle": "controller",
+        }
+        for event_class, producer in mappings.items():
+            condition = (
+                f'attributes["aigw.security.event_class"] == "{event_class}"'
+            )
+            self.assertIn(
+                f'set(attributes["aigw.security.producer"], "{producer}") where {condition}',
+                contract,
+            )
+            self.assertIn(
+                f'set(resource.attributes["service.name"], "{producer}") where {condition}',
+                contract,
+            )
+        for producer in (
+            "dev-portal",
+            "admin-portal",
+            "key-rotator",
+            "envoy-egress",
+        ):
+            condition = (
+                'attributes["aigw.security.event_class"] == "security_event" '
+                f'and attributes["service"] == "{producer}"'
+            )
+            self.assertIn(
+                f'set(attributes["aigw.security.producer"], "{producer}") where {condition}',
+                contract,
+            )
+            self.assertIn(
+                f'set(resource.attributes["service.name"], "{producer}") where {condition}',
+                contract,
+            )
+
+        self.assertIn(
+            "logs = [otelcol.processor.filter.cribl_common_record.input]", contract
+        )
+        self.assertEqual(ALLOY.count('otelcol.processor.batch "cribl_security"'), 1)
+        self.assertEqual(
+            ALLOY.count("logs = [otelcol.processor.batch.cribl_security.input]"), 1
+        )
+        self.assertEqual(ALLOY.count("logs = [otelcol.exporter.otlp.cribl.input]"), 1)
+
+    def test_common_record_gate_rejects_bad_identity_and_event_time(self) -> None:
+        gate = ALLOY.split(
+            'otelcol.processor.filter "cribl_common_record"', 1
+        )[1].split('otelcol.processor.batch "cribl_security"', 1)[0]
+        for required in (
+            'error_mode = "propagate"',
+            'attributes["aigw.security.schema_version"] != 1',
+            'resource.attributes["deployment.environment"] != "preprod"',
+            'resource.attributes["deployment.environment"] != "production"',
+            'not IsString(attributes["aigw.security.producer"])',
+            'resource.attributes["service.name"] != attributes["aigw.security.producer"]',
+            'time_unix_nano == 0',
+            'time_unix_nano < UnixNano(Now()) - 86400000000000',
+            'time_unix_nano > UnixNano(Now()) + 60000000000',
+            "logs = [otelcol.processor.batch.cribl_security.input]",
+        ):
+            self.assertIn(required, gate)
+        for event_class in (
+            "ai_request_audit",
+            "keycloak_event",
+            "egress_tls",
+            "vault_audit",
+            "security_event",
+            "controller_lifecycle",
+        ):
+            self.assertIn(
+                f'attributes["aigw.security.event_class"] == "{event_class}"',
+                gate,
+            )
+
+    def test_controller_lifecycle_source_is_exact_rotated_and_fixed_projection(self) -> None:
+        source = ALLOY.split(
+            'loki.source.file "controller_lifecycle"', 1
+        )[1].split('loki.process "cribl_controller_lifecycle"', 1)[0]
+        process = ALLOY.split(
+            'loki.process "cribl_controller_lifecycle"', 1
+        )[1].split('loki.source.file "vault_audit"', 1)[0]
+        for path in (
+            "/var/log/aigw/controller/lifecycle.jsonl",
+            "/var/log/aigw/controller/lifecycle.jsonl.1",
+        ):
+            self.assertIn(path, source)
+        for required in (
+            "upgrade|rollback",
+            "started|success|failed",
+            "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab]",
+            "(?:[0-9a-f]{40}|[0-9a-f]{64})",
+            "sha256:[0-9a-f]{64}",
+            'drop_counter_reason = "malformed_controller_lifecycle_record"',
+            "schema_version=1 event=aigw.controller.lifecycle",
+            'aigw_security_event_class = "controller_lifecycle"',
+            "otelcol.receiver.loki.cribl_security_logs.receiver",
+        ):
+            self.assertIn(required, process)
+        self.assertIn(
+            "/var/log/ai-gateway-controller:/var/log/aigw/controller:ro",
+            COMPOSE,
+        )
+        self.assertIn(
+            "./secrets/preprod-controller-lifecycle:/var/log/aigw/controller:ro",
+            PREPROD_OVERLAY,
+        )
 
     def test_preprod_uses_verified_tls_for_the_cribl_mock(self) -> None:
         for fragment in (

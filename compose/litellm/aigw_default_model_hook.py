@@ -3,7 +3,7 @@
 The admin portal stores each managed project's issuance policy in Keycloak
 group attributes; key mint and the retroactive policy re-tune stamp the
 project's ``default_model`` into every portal key's metadata as
-``aigw_default_model``. LiteLLM v1.91.3 has no native per-key default for a
+``aigw_default_model``. LiteLLM's pinned proxy has no native per-key default for a
 request that omits ``model`` (``default_key_generate_params`` only shapes
 key creation and the CLI ``--model`` default is proxy-global), so this
 reviewed pre-call hook is the server-side enforcement point: a request
@@ -39,11 +39,21 @@ re-converge — a manual ``compose up`` fails closed.
 
 from __future__ import annotations
 
+import hmac
 import re
 from typing import Any
 
 from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
+
+from aigw_openwebui_identity import (
+    OPENWEBUI_KEY_ALIAS,
+    OPENWEBUI_KEY_METADATA,
+    OPENWEBUI_KEY_OWNER,
+    openwebui_jwt_from_headers,
+    read_openwebui_forward_jwt_secret,
+    verified_openwebui_username,
+)
 
 # Kept textually identical to MODEL_NAME_RE in the identity controller and
 # the dev-portal LiteLLM client: model names travel from Keycloak group
@@ -60,6 +70,61 @@ def _deny(detail: str) -> HTTPException:
     """Build the request rejection LiteLLM's call-hook contract expects."""
 
     return HTTPException(status_code=400, detail={"error": detail})
+
+
+def _has_openwebui_service_marker(user_api_key_dict: Any) -> bool:
+    """Find any marker that reserves a key for Open WebUI."""
+
+    metadata = getattr(user_api_key_dict, "metadata", None)
+    return (
+        getattr(user_api_key_dict, "user_id", None) == OPENWEBUI_KEY_OWNER
+        or getattr(user_api_key_dict, "key_alias", None) == OPENWEBUI_KEY_ALIAS
+        or (
+            isinstance(metadata, dict)
+            and (
+                metadata.get("aigw_service") == "open-webui"
+                or metadata.get("aigw_project_id") == "open-webui"
+            )
+        )
+    )
+
+
+def _is_exact_openwebui_service_key(user_api_key_dict: Any) -> bool:
+    """Match the complete reconciled Open WebUI service-key tuple."""
+
+    return (
+        getattr(user_api_key_dict, "user_id", None) == OPENWEBUI_KEY_OWNER
+        and getattr(user_api_key_dict, "key_alias", None) == OPENWEBUI_KEY_ALIAS
+        and getattr(user_api_key_dict, "metadata", None) == OPENWEBUI_KEY_METADATA
+    )
+
+
+def _enforce_openwebui_identity(
+    user_api_key_dict: Any, data: Any, secret: str
+) -> None:
+    """Deny an unauditable Open WebUI inference before model dispatch."""
+
+    if not _has_openwebui_service_marker(user_api_key_dict):
+        return
+    if not _is_exact_openwebui_service_key(user_api_key_dict):
+        raise _deny("Open WebUI service key markers do not match")
+    proxy_request = (
+        data.get("proxy_server_request") if isinstance(data, dict) else None
+    )
+    headers = proxy_request.get("headers") if isinstance(proxy_request, dict) else None
+    token = openwebui_jwt_from_headers(headers)
+    secret_fields = data.get("secret_fields") if isinstance(data, dict) else None
+    raw_headers = (
+        secret_fields.get("raw_headers") if isinstance(secret_fields, dict) else None
+    )
+    raw_token = openwebui_jwt_from_headers(raw_headers)
+    if (
+        token is None
+        or raw_token is None
+        or not hmac.compare_digest(token, raw_token)
+        or verified_openwebui_username(token, secret) is None
+    ):
+        raise _deny("Open WebUI requires one valid signed user assertion")
 
 
 def resolve_request_model(
@@ -119,11 +184,17 @@ def resolve_request_model(
 
 
 class AIGWDefaultModelEnforcer(CustomLogger):
-    """Pre-call hook substituting the project's default model server-side."""
+    """Fail-closed identity gate plus project default-model enforcement."""
+
+    def __init__(self) -> None:
+        self._openwebui_forward_jwt_secret = read_openwebui_forward_jwt_secret()
 
     async def async_pre_call_hook(
         self, user_api_key_dict, cache, data, call_type
     ):
+        _enforce_openwebui_identity(
+            user_api_key_dict, data, self._openwebui_forward_jwt_secret
+        )
         if not isinstance(data, dict):
             return data
         resolved = resolve_request_model(

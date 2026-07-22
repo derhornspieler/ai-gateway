@@ -4,7 +4,7 @@
     "cribl-mock": ["cribl-mock/config.yaml"],
     "grafana": ["grafana/provisioning"],
     "keycloak": ["keycloak/realms"],
-    "litellm": ["litellm/config.yaml", "litellm/aigw_default_model_hook.py", "litellm/aigw_otel_callback.py", "secrets/litellm_otel_token"],
+    "litellm": ["litellm/config.yaml", "litellm/aigw_default_model_hook.py", "litellm/aigw_openwebui_identity.py", "litellm/aigw_otel_callback.py", "secrets/litellm_otel_token"],
     "loki": ["loki/config.yml"],
     "open-webui": ["certs/ca.pem"],
     "postgres": ["postgres/init"],

@@ -3,28 +3,19 @@
 **Goal:** make the gateway authenticate to Anthropic with short-lived,
 Keycloak-signed JWT tokens instead of a long-lived API key.
 
-**Audience:** an on-call operator. Follow the steps top-to-bottom. One action per
-step; run the command shown, confirm the "Expect" line, move on.
+**Audience:** an on-call operator. Follow the steps in order. Run each command
+and check its **Expect** line before you continue.
 
 **Authoritative reference:** [anthropic-wif-bootstrap.md](../anthropic-wif-bootstrap.md).
 This SOP is the checklist version of that runbook — it invents no steps the
 runbook does not support. When something goes wrong, that runbook and the
 [troubleshooting table](#8-troubleshooting) are the source of truth.
 
-> **Why this works (in plain terms).** WIF means the gateway *proves who it is*
-> to Anthropic with a short-lived JWT that your own Keycloak signs — no shared
-> API key ever leaves your network. You paste your Keycloak public keys into the
-> Anthropic Console once ("inline JWKS"), so Anthropic verifies each token
-> **offline** and never calls back to your Keycloak. The gateway mints, exchanges,
-> and refreshes these tokens automatically; a human Anthropic org-admin only does
-> the one-time Console setup and re-approves the keys whenever Keycloak rotates.
-
-> **This is a two-authority-domain flow.** A **human Anthropic org-admin** creates
-> the issuer, service account, and federation rule in the Console (Steps 3–4).
-> The **gateway** (key-rotator) does everything else — signing assertions,
-> exchanging them through Envoy, refreshing LiteLLM — with no operator action per
-> token. The inference path is never given `org:admin`, so it can never mutate
-> your Anthropic org.
+WIF lets the gateway prove its identity with a short-lived JWT signed by
+Keycloak. It does not send a shared API key outside your network. A human
+Anthropic organization administrator adds the Keycloak public keys, issuer,
+service account, and rule in the Anthropic Console. The gateway then creates
+and refreshes short-lived tokens. The inference path never gets `org:admin`.
 
 ---
 
@@ -105,8 +96,9 @@ Do this on the target VM.
    > harmless and expected, and `federation_jwks_sha256` is computed over both, so
    > the pasted set matches the recorded hash. (If the admin portal's *Broker
    > private_key_jwt* readiness ever disagrees with this export — export prints
-   > keys but the panel says "not ready" — trust this §2 export; that is the
-   > authoritative readiness check.)
+   > keys but the panel says "not ready" — trust the
+   > [Step 2 export](#2-export-the-gateways-public-keys-and-their-hash). It is
+   > the authoritative readiness check.)
 
 3. Copy the whole `keys` array and record the `federation_jwks_sha256` value in
    your controlled deployment evidence.
@@ -230,10 +222,9 @@ portal's *Nonsecret external enrollment bundle*):
    credential was hot-swapped, and the live JWKS matches the approved hash. No
    token or assertion is ever printed to reach this state.
 
-5. Run a **real inference canary** — use the acceptance-runbook canary in
-   [test-runbook.md §9](../test-runbook.md), **not** an invented one. It calls
-   `claude-haiku` through `https://api.$AIGW_DOMAIN` with a **disposable virtual
-   key read on stdin** (never the LiteLLM master key):
+5. Run the exact **real inference canary** below. It calls `claude-haiku-4-5`
+   through `https://api.$AIGW_DOMAIN` with a disposable virtual key read on
+   stdin. Never use the LiteLLM master key.
    ```bash
    read -rsp 'Disposable LiteLLM virtual key: ' AIGW_TEST_KEY; printf '\n'
    curl --fail --silent --show-error --cacert "$AIGW_CA" \
@@ -241,7 +232,7 @@ portal's *Nonsecret external enrollment bundle*):
      "https://api.$AIGW_DOMAIN/v1/chat/completions" \
      -H "Authorization: Bearer $AIGW_TEST_KEY" \
      -H 'Content-Type: application/json' \
-     --data '{"model":"claude-haiku","messages":[{"role":"user","content":"acceptance canary"}],"max_tokens":16}' \
+     --data '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"acceptance canary"}],"max_tokens":16}' \
      >/dev/null
    unset AIGW_TEST_KEY
    ```
@@ -330,7 +321,7 @@ opaque `invalid_grant`. Do this with **zero exchange outage** by overlapping key
 | Portal shows **`jwks_drift`**; watcher `baseline_unconfirmed` / `drift_detected` | Live Keycloak JWKS no longer matches the hash approved in the Console | Re-export ([Step 2](#2-export-the-gateways-public-keys-and-their-hash)), update the Console inline keys with an **org-admin**, then re-approve the new hash ([Step 6.4](#6-rotation-and-maintenance-when-keycloak-signing-keys-rotate)). Never write the hash before the Console update. |
 | Canary returns **401 at LiteLLM, no Envoy delta** | No provider request happened — `anthropic-primary` holds no valid token yet (rotation never ran or failed), or the wrong bearer was used | Check **Rotation history** for a `rotate`/`success`; click **Rotate now**; confirm `anthropic.token_exchange` is `ok`. Use a **disposable virtual key**, not the master key. |
 | Anthropic **`invalid_grant`** / `anthropic.token_exchange` alert on `/oauth/token` (400/401) | Clock skew or expiry, Console **max assertion lifetime too short**, replay/JTI rejection, or **stale inline JWKS** signature mismatch | Verify time sync; confirm the Console max assertion lifetime ≥ token lifetime and replay window; confirm the inline JWKS is current in **Console → Workload identity → History**; re-check exact issuer/subject/audience and the rule/workspace/service-account IDs. |
-| **"unstable subject claim"** locally | Identity init incomplete or a competing `sub` mapper exists | Confirm identity initialization completed and exactly one hardcoded `sub` mapper (`service-account-anthropic-token-broker`) exists — no competing subject mapper. |
+| **"unstable subject claim"** locally | Automatic identity setup is incomplete, or a competing `sub` mapper exists | Rerun the full Ansible converge. Confirm that exactly one fixed `sub` mapper exists with value `service-account-anthropic-token-broker`. |
 | **Keycloak client authentication fails** (before any exchange) | Broker disabled, wrong Vault key path, or missing `client-jwt` auth | Check the broker fingerprint, the Vault key path, that the client is enabled with the `client-jwt` authenticator, and the canonical frontend token audience. |
 | Token minted but **LiteLLM promotion fails** | Exchange succeeded but the credential hot-swap or state write failed | A token exchange alone is not a healthy rotation — check LiteLLM health / the credentials API and rotator DB persistence, then **Rotate now**. |
 
@@ -340,7 +331,8 @@ opaque `invalid_grant`. Do this with **zero exchange outage** by overlapping key
 
 - [anthropic-wif-bootstrap.md](../anthropic-wif-bootstrap.md) — the implemented
   runbook this SOP condenses (authoritative for edge cases).
-- [test-runbook.md §9](../test-runbook.md) — the real acceptance canary.
+- [Acceptance test record](../test-runbook.md#6-record-the-result) — where to
+  record the real canary result without saving a key or token.
 - [identity-operations.md](../identity-operations.md) — Keycloak controller and
   identity recovery.
 - Anthropic: [Workload Identity Federation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation)

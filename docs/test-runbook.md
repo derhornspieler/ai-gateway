@@ -40,7 +40,8 @@ Run these steps in order:
 7. Pass service, LDAPS, Root CA, Vault, WIF, OIDC, role, logout, and inference
    checks.
 8. Pass the real-browser checks.
-9. Destroy preprod and save the non-secret local test record.
+9. Run the exact-manifest clean-room teardown. Prove every owned resource and
+   release image is absent and unrelated image IDs are unchanged.
 10. Push the exact tested commit to `main`.
 11. Wait for every required GitHub job, including the release container scan.
 12. Save the final non-secret release record.
@@ -215,7 +216,7 @@ aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
 aigw-2026-07-21-linux-amd64.preprod.manifest.json
 ```
 
-For the current `r14` candidate, production has 23 external and 17 custom
+At this source revision, production has 23 external and 17 custom
 image references, for 40 total. Preprod has 24 external and 19 custom image
 references, for 43 total. The two preprod-only custom services are Samba AD
 and the WIF provider mock. Their Debian 13.6-slim base is the third extra
@@ -298,6 +299,9 @@ The run must prove:
 - Ansible set up Keycloak without a portal init step;
 - all three test users pass their allow and deny rules;
 - OIDC callbacks and logout work;
+- Ansible reconciled the exact Open WebUI workload key;
+- valid signed chat identity reached LiteLLM, while missing, bad, expired, or
+  duplicate assertions stopped before the mock provider;
 - WIF checks a real Keycloak JWT;
 - LiteLLM gets `pong` through the preprod-only TLS Envoy;
 - LiteLLM audit spans enter Alloy only through the bearer-authenticated
@@ -335,28 +339,39 @@ so breaks the supported login flow. Keycloak documents the hashed session
 format in its
 [26.1 release note](https://www.keycloak.org/2025/01/keycloak-2610-released).
 
-Remove the Root CA from the browser profile. The bounded destroy command in
-the next section removes the preprod hosts block. Do not save cookie values in
-the test record.
+Remove the Root CA from the browser profile. The exact-manifest teardown in the
+next section removes the preprod hosts block. Do not save cookie values in the
+test record.
 
 ## 4. Clean up and handle a failure
 
-After a pass or failure, run the bounded destroy play:
+After a release pass or failure, run the clean-room play with the exact tested
+preprod paths and hashes:
 
 ```bash
 ansible-playbook -i ansible/inventory/preprod.yml \
-  ansible/preprod-destroy.yml \
-  -e preprod_destroy_confirmation=DESTROY_AIGW_PREPROD \
+  ansible/preprod-clean-room.yml \
+  -e preprod_seed_archive=/absolute/private/path/aigw-YYYY-MM-DD.preprod.docker.tar.zst \
+  -e preprod_seed_archive_sha256=REPLACE_WITH_ARCHIVE_SHA256 \
+  -e preprod_seed_manifest=/absolute/private/path/aigw-YYYY-MM-DD.preprod.manifest.json \
+  -e preprod_seed_manifest_sha256=REPLACE_WITH_MANIFEST_SHA256 \
+  -e preprod_clean_room_confirmation=DESTROY_AIGW_PREPROD_RELEASE_IMAGES \
   --become-password-file "$HOME/.ssh/become"
 ```
 
-Use `--ask-become-pass` instead when needed. The destroy play removes only
-owned preprod resources, owned aliases, and the bounded hosts block. It
-preserves the test Root CA. A pass prints:
+Use `--ask-become-pass` instead when needed. This final step must prove that
+all owned containers, image aliases, image IDs, volumes, networks, generated
+state, hosts entries, and loopback aliases are absent. It must also prove that
+unrelated image IDs are unchanged. A pass prints one bounded receipt:
 
 ```text
-PREPROD_DESTROYED_CA_PRESERVED
+PREPROD_CLEAN_ROOM_OK {...}
 ```
+
+`ansible/preprod-destroy.yml` is still available for quick development
+cleanup. It preserves the test CA and does not prove absence of the exact
+manifest image set. Do not use its `PREPROD_DESTROYED_CA_PRESERVED` marker as
+release evidence.
 
 If a required check fails:
 
@@ -397,11 +412,12 @@ Record:
 - policy hash and Envoy image ID;
 - Docker version and operator;
 - each command and result marker;
+- the final exact-manifest teardown receipt and unrelated-image preservation
+  count;
 - each required GitHub job and final state; and
 - browser results without cookies.
 
 Accept the release only when every required step passed for the same source
 and files. If access, disk, registry login, or another input is missing, mark
 the release `BLOCKED`. A browser result from an older release does not approve
-a newer release. In particular, keep the accepted `r10` browser record as
-historical evidence until the browser test is run again for `r14`.
+a newer release. Keep old results only as dated historical evidence.

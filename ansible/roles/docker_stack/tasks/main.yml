@@ -94,6 +94,107 @@
     group: root
     mode: "0750"
 
+# Alloy reads this host source with its fixed gid 473 through a read-only bind.
+# Create it before Compose so Docker cannot silently make a root:root 0755
+# directory on a fresh host. A changed existing boundary fails closed.
+# Persistent, host-owned audit infrastructure. A source rollback must preserve
+# this directory and its records even when the previous Alloy image cannot read
+# a source introduced by a newer release.
+- name: Inspect the controller lifecycle audit source directory
+  ansible.builtin.stat:
+    path: /var/log/ai-gateway-controller
+    follow: false
+    get_checksum: false
+  register: controller_lifecycle_audit_source_before
+  changed_when: false
+
+- name: Refuse an unsafe controller lifecycle audit source directory
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (controller_lifecycle_audit_source_before.stat.exists | default(false)) or
+        (controller_lifecycle_audit_source_before.stat.isdir | default(false))
+      - not (controller_lifecycle_audit_source_before.stat.islnk | default(false))
+      - >-
+        not (controller_lifecycle_audit_source_before.stat.exists | default(false)) or
+        controller_lifecycle_audit_source_before.stat.uid == 0
+      - >-
+        not (controller_lifecycle_audit_source_before.stat.exists | default(false)) or
+        controller_lifecycle_audit_source_before.stat.gid == 473
+      - >-
+        not (controller_lifecycle_audit_source_before.stat.exists | default(false)) or
+        controller_lifecycle_audit_source_before.stat.mode == '0750'
+    quiet: true
+    fail_msg: Existing controller lifecycle audit source directory is unsafe.
+
+- name: Create the controller lifecycle audit source directory before Compose
+  ansible.builtin.file:
+    path: /var/log/ai-gateway-controller
+    state: directory
+    owner: root
+    group: "473"
+    mode: "0750"
+    follow: false
+
+- name: Inventory the fixed controller lifecycle audit source boundary
+  ansible.builtin.find:
+    paths:
+      - /var/log/ai-gateway-controller
+    recurse: false
+    hidden: true
+    file_type: any
+    follow: false
+  register: controller_lifecycle_audit_source_entries
+  changed_when: false
+  no_log: true
+
+- name: Refuse unknown controller lifecycle audit source entries
+  ansible.builtin.assert:
+    that:
+      - >-
+        controller_lifecycle_audit_source_entries.files |
+        map(attribute='path') |
+        difference([
+          '/var/log/ai-gateway-controller/lifecycle.jsonl',
+          '/var/log/ai-gateway-controller/lifecycle.jsonl.1'
+        ]) |
+        length == 0
+    quiet: true
+    fail_msg: Existing controller lifecycle audit source contains an unknown entry.
+
+- name: Inspect the fixed controller lifecycle audit source files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop:
+    - /var/log/ai-gateway-controller/lifecycle.jsonl
+    - /var/log/ai-gateway-controller/lifecycle.jsonl.1
+  register: controller_lifecycle_audit_source_files
+  changed_when: false
+
+- name: Refuse unsafe controller lifecycle audit source files
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (item.stat.exists | default(false)) or
+        (item.stat.isreg | default(false))
+      - not (item.stat.islnk | default(false))
+      - not (item.stat.exists | default(false)) or item.stat.uid == 0
+      - not (item.stat.exists | default(false)) or item.stat.gid == 473
+      - not (item.stat.exists | default(false)) or item.stat.mode == '0640'
+      - >-
+        not (item.stat.exists | default(false)) or
+        (item.stat.nlink | int) == 1
+      - >-
+        not (item.stat.exists | default(false)) or
+        (item.stat.size | int) <= 8388608
+    quiet: true
+    fail_msg: Existing controller lifecycle audit source file is unsafe.
+  loop: "{{ controller_lifecycle_audit_source_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
 - name: Validate the PostgreSQL 18 physical-volume contract
   ansible.builtin.assert:
     that:
@@ -451,6 +552,7 @@
     - grafana/provisioning/plugins/loki-drilldown.yml
     - litellm/config.yaml
     - litellm/aigw_default_model_hook.py
+    - litellm/aigw_openwebui_identity.py
     - litellm/aigw_otel_callback.py
     - loki/config.yml
     - postgres/init/01-init-databases.sh
@@ -657,6 +759,7 @@
       - aigw-compose.sh
       - aigw-runtime-up.sh
       - compute-bind-source-digests.py
+      - controller-lifecycle-audit.py
       - edge-tls.py
       - load-offline-image-seed.py
       - plan-compose-builds.py
@@ -2060,6 +2163,7 @@
           {'path': stack_dir ~ '/grafana/provisioning', 'recursive': true},
           {'path': stack_dir ~ '/keycloak/realms', 'recursive': true},
           {'path': stack_dir ~ '/litellm/aigw_default_model_hook.py', 'recursive': false},
+          {'path': stack_dir ~ '/litellm/aigw_openwebui_identity.py', 'recursive': false},
           {'path': stack_dir ~ '/litellm/aigw_otel_callback.py', 'recursive': false},
           {'path': stack_dir ~ '/litellm/config.yaml', 'recursive': false},
           {'path': stack_dir ~ '/loki/config.yml', 'recursive': false},

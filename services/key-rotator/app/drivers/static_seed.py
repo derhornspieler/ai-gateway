@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 
 from app.drivers.base import BaseDriver, DriverContext, RotationResult
-from app.vault_client import VaultError, mask_secret
+from app.vault_client import VaultError
 
 logger = logging.getLogger("key_rotator.drivers.static_seed")
 
@@ -77,10 +77,10 @@ class StaticSeedDriver(BaseDriver):
 
         try:
             secret = ctx.vault.read(f"ai-gateway/vendors/{self.vendor}")
-        except VaultError as exc:
+        except VaultError:
             # Transient vault error — do NOT self-disable, so a later run
             # can still seed once vault recovers.
-            detail = f"vault read error seeding {self.vendor}: {exc}"
+            detail = f"vault read failed while seeding {self.vendor}"
             logger.error("static_seed: %s", detail)
             return RotationResult(
                 status="failed",
@@ -96,7 +96,7 @@ class StaticSeedDriver(BaseDriver):
 
         cred_name = f"{self.vendor}-primary"
         await ctx.litellm.upsert_credential(cred_name, {"api_key": api_key})
-        detail = f"seeded litellm credential={cred_name} from vault key={mask_secret(api_key)}"
+        detail = f"seeded LiteLLM credential={cred_name} from reviewed Vault path"
         logger.info("static_seed: %s", detail)
         # One-shot: self-disable so subsequent reloads never re-seed (and
         # never overwrite a key the real driver later rotates in).

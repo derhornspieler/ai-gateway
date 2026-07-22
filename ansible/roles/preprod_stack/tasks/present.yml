@@ -288,6 +288,31 @@
       - start
   changed_when: true
 
+- name: Reconcile and verify the dedicated Open WebUI LiteLLM key
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ preprod_repo_root }}/scripts/preprod.py"
+      - --domain
+      - "{{ aigw_domain }}"
+      - --project
+      - "{{ preprod_project_name }}"
+      - --prefix
+      - "{{ preprod_resource_prefix }}"
+      - --subnet-octet
+      - "{{ preprod_subnet_octet | string }}"
+      - --image-mode
+      - "{{ preprod_image_mode }}"
+      - reconcile-openwebui-key
+  register: preprod_openwebui_key
+  changed_when: "'created=true' in preprod_openwebui_key.stdout"
+  failed_when: >-
+    preprod_openwebui_key.rc != 0 or
+    not (preprod_openwebui_key.stdout | trim is match(
+      '^PREPROD_OPENWEBUI_KEY_RECONCILED created=(?:true|false) models=[1-9][0-9]*$'
+    ))
+  no_log: true
+
 - name: Initialize or unseal the local test Vault
   ansible.builtin.command:
     argv:

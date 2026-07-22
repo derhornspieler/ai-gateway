@@ -22,6 +22,7 @@ flowchart LR
   LLM[LiteLLM audit traces] -->|bearer-auth OTLP/HTTP<br/>port 4319| AL[Alloy]
   APP[Other internal telemetry] -->|ordinary OTLP<br/>ports 4317 and 4318| AL
   LOG[Docker JSON logs<br/>read-only files] --> AL
+  CTRL[Target lifecycle files<br/>upgrade and rollback] -->|read-only file source| AL
   AL --> LK[(Loki<br/>local logs, 7 days)]
   AL --> PR[(Prometheus<br/>local metrics, 30 days or 5 GB)]
   PR -.approved backlog.-> AM[Future Alertmanager<br/>local group and resolve]
@@ -81,15 +82,33 @@ Alloy promotes these bounded request fields before deleting the raw metadata:
 
 - `aigw.user.id` — stable enforced subject;
 - `aigw.user.name` — readable attribution only;
-- `aigw.enduser.id` — the forwarded chat identity, when valid;
+- `aigw.user.name_source` — the reviewed source used for the readable name;
 - `aigw.api_key.id` — lowercase SHA-256 key identifier;
 - `aigw.project.id` — bounded project identifier; and
 - `aigw.request.id` — the LiteLLM call ID.
 
-The readable name comes from the first valid source: the forwarded chat user,
-the portal-stamped username, the key alias, or the subject ID. A caller can
-mislabel its own request, so this field never grants access. The enforced user
-and key IDs remain the audit boundary.
+LiteLLM's reviewed callback selects the readable name. It accepts only these
+sources:
+
+1. A portal-owned key with exact `created_via=dev-portal` metadata and a
+   bounded portal username. The source is `portal_key_metadata`.
+2. The exact Open WebUI service key plus a valid, short-lived HS256 assertion
+   signed by Open WebUI. The assertion subject becomes the stable user ID. Its
+   signed username or e-mail becomes the readable name and may contain `@`.
+   The source is `open_webui_signed_oidc`.
+3. The bounded subject of the authenticated key. The source is `key_subject`.
+
+A request body, plain forwarded user header, caller end-user field, and key
+alias can never supply the readable name. The exact Open WebUI alias is only
+one part of identifying its reviewed service key. It is not used as a person's
+name. Alloy keeps the selected source in `aigw.user.name_source`, removes the
+raw assertion, headers, end-user fields, alias, and LiteLLM authentication
+metadata, and drops a request whose name cannot be resolved.
+
+This name is for attribution, not authorization. Key and OIDC checks decide
+access before this audit record is made. For Open WebUI, the signed subject is
+the stable per-user audit ID. The shared LiteLLM key remains proof that the
+authorized service made the call.
 
 `aigw.user.name` and `aigw.project.id` become the Loki labels
 `aigw_user_name` and `aigw_project_id`. Request and key IDs stay line fields so
@@ -111,9 +130,27 @@ LiteLLM spend rows are a cost index. They are not a prompt store.
 `store_prompts_in_spend_logs` stays off. Grafana joins the hashed key to the
 key metadata when it needs a project.
 
-Open WebUI uses one shared inference-only key. Its enforced identity is the
-`svc-open-webui` service and project. The forwarded person name is useful
-attribution, but it is not independent proof of the person.
+Open WebUI uses one shared inference-only key. Its enforced service identity is
+the `svc-open-webui` service and project. The signed assertion adds a stable
+per-user subject and readable browser-user name to the request audit. LiteLLM's
+spend ledger still records the shared service key, so spend-based top-user
+reports do not become per-browser-user reports.
+
+## Common Cribl record
+
+Alloy adds the same server-owned fields to every record before the Cribl
+queue:
+
+- `aigw.security.schema_version=1`;
+- `deployment.environment=preprod` or `production`;
+- `aigw.security.producer`, set from the reviewed event class; and
+- `service.name`, which must exactly match the producer.
+
+The OTLP log time remains the real UTC source time. Alloy drops a record with a
+zero time, a time more than 24 hours old, or a time more than one minute in the
+future. It also drops an unknown producer or a producer/service mismatch. This
+check happens before the queue. Time spent waiting in the queue is covered by
+the separate queue rules below.
 
 ## Redaction
 
@@ -122,8 +159,11 @@ removes:
 
 - authorization values, API keys, tokens, cookies, and passwords;
 - client secrets, Vault tokens, unseal shares, and LDAP bind credentials;
+- raw JWTs and Open WebUI signed assertions;
 - raw headers, query strings, redirect URIs, and OIDC codes;
-- e-mail addresses and network peer addresses; and
+- caller end-user fields, key aliases, and raw LiteLLM authentication metadata;
+- e-mail addresses and network peer addresses, except the reviewed signed
+  Open WebUI username or e-mail selected as `aigw.user.name`; and
 - nested maps that cannot be proven safe.
 
 A transform error must drop the outbound record instead of sending an unsafe
@@ -242,6 +282,13 @@ The Docker socket is never mounted. A systemd reconciler repairs the bounded
 ACL during converge, after Compose starts, and every 15 seconds for log
 rotation. Do not grant broad Docker-root read access to fix a missing ACL.
 
+The separate controller lifecycle source is
+`/var/log/ai-gateway-controller`. Production permits only `lifecycle.jsonl`
+and `lifecycle.jsonl.1`, each root-owned, read-only to Alloy, and at most
+8 MiB. Ansible validates this boundary before Compose. The fixed writer records
+only upgrade or rollback `started`, `success`, and `failed` results. It never
+exports Ansible stdout. Source rollback preserves the files.
+
 Local preprod does not inspect the workstation's Docker root. Check the real
 ACL after a planned Docker restart on the production host. Do not add a
 separate rehearsal VM for this host-only check.
@@ -328,9 +375,15 @@ For the request audit, prove:
 
 - LiteLLM uses the authenticated receiver, and missing, wrong, or forged source
   proof is rejected;
+- portal, Open WebUI, and key-subject requests get the expected readable name
+  and exact `aigw.user.name_source`;
 - one valid request has the expected user, key, project, model, and request ID;
-- malformed identity fields do not become trusted fields;
+- caller body values, plain user headers, end-user fields, and key aliases do
+  not become trusted names;
+- an unresolved or malformed identity is dropped;
 - prompt and completion content appears only in the approved request dataset;
+- every Cribl record has schema version 1, a reviewed matching producer and
+  service, the exact deployment environment, and a recent UTC event time;
 - raw spans, metrics, and unrelated service logs do not reach Cribl; and
 - local Loki, Prometheus, and Grafana stay healthy during a Cribl
   outage.

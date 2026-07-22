@@ -83,6 +83,120 @@ class PreprodContractTests(unittest.TestCase):
         )
         self.assertEqual(parsed.command, "clean-room-seed")
 
+    def test_preprod_reconciles_the_openwebui_key_before_acceptance(self) -> None:
+        start = self.tasks.index("Start the isolated preprod project")
+        reconcile = self.tasks.index(
+            "Reconcile and verify the dedicated Open WebUI LiteLLM key"
+        )
+        acceptance = self.tasks.index(
+            "Run the full local preprod edge and identity acceptance gate"
+        )
+        self.assertLess(start, reconcile)
+        self.assertLess(reconcile, acceptance)
+        self.assertIn("reconcile-openwebui-key", self.tasks)
+        self.assertIn("preprod_openwebui_key.stdout | trim is match(", self.tasks)
+        self.assertIn('commands.add_parser("reconcile-openwebui-key")', self.script)
+        self.assertIn(
+            '"reconcile-openwebui-key": reconcile_openwebui_key,', self.script
+        )
+
+    def test_openwebui_key_reconciliation_keeps_secrets_on_stdin(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(
+            prefix="aigw-preprod", project="aigw-preprod", subnet_octet=29
+        )
+        image = subprocess.CompletedProcess([], 0, "a" * 64 + "\n", "")
+        scope = subprocess.CompletedProcess(
+            [], 0, "OPENWEBUI_MODELS_SCOPE_PASS models=1\n", ""
+        )
+        reconcile = subprocess.CompletedProcess(
+            [], 0, "OPENWEBUI_SERVICE_KEY_RECONCILED created=true\n", ""
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "reconcile-openwebui-key.py"
+            source.write_text("print('fixture')\n", encoding="utf-8")
+            secrets_dir = root / "secrets"
+            secrets_dir.mkdir()
+            with (
+                mock.patch.object(module, "OPENWEBUI_RECONCILE_SCRIPT", source),
+                mock.patch.object(module, "SECRETS_DIR", secrets_dir),
+                mock.patch.object(
+                    module,
+                    "preprod_env_value",
+                    side_effect=lambda name: {
+                        "LITELLM_MASTER_KEY": "sk-" + "m" * 32,
+                        "WEBUI_LITELLM_KEY": "sk-" + "w" * 32,
+                    }[name],
+                ),
+                mock.patch.object(
+                    module,
+                    "local_docker_endpoint",
+                    return_value="unix:///tmp/docker.sock",
+                ),
+                mock.patch.object(module, "verify_secret_bearing_portal_network"),
+                mock.patch.object(
+                    module, "compose", side_effect=[image, scope]
+                ) as compose,
+                mock.patch.object(module, "run", return_value=reconcile) as runner,
+                mock.patch("builtins.print"),
+            ):
+                module.reconcile_openwebui_key(args)
+
+        command = runner.call_args.args[0]
+        secret_input = json.loads(runner.call_args.kwargs["input_text"])
+        self.assertNotIn(secret_input["master_key"], command)
+        self.assertNotIn(secret_input["candidate_key"], command)
+        self.assertTrue(runner.call_args.kwargs["sensitive"])
+        self.assertIn("--read-only", command)
+        self.assertIn("no-new-privileges:true", command)
+        self.assertIn("aigw-preprod-net-portal", command)
+        self.assertTrue(
+            any(value.endswith(":/reconcile.py:ro,Z") for value in command)
+        )
+        self.assertEqual(compose.call_count, 2)
+
+    def test_openwebui_reconciliation_refuses_an_unowned_portal_endpoint(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(
+            prefix="aigw-preprod", project="aigw-preprod", subnet_octet=29
+        )
+        expected_subnet, expected_internal = module.desired_networks(args)[
+            "aigw-preprod-net-portal"
+        ]
+        network = {
+            "Driver": "bridge",
+            "Scope": "local",
+            "Internal": expected_internal,
+            "Labels": {"com.aigw.preprod.project": "aigw-preprod"},
+            "IPAM": {
+                "Config": [
+                    {
+                        "Subnet": expected_subnet,
+                        "IPRange": module.dynamic_ip_range(expected_subnet),
+                    }
+                ]
+            },
+            "Containers": {"a" * 64: {}},
+        }
+        endpoint = {
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "foreign",
+                    "com.aigw.preprod.project": "foreign",
+                    "com.docker.compose.service": "litellm",
+                }
+            },
+            "State": {"Running": True, "Health": {"Status": "healthy"}},
+        }
+        responses = (
+            subprocess.CompletedProcess([], 0, json.dumps([network]), ""),
+            subprocess.CompletedProcess([], 0, json.dumps([endpoint]), ""),
+        )
+        with mock.patch.object(module, "docker", side_effect=responses):
+            with self.assertRaisesRegex(SystemExit, "unowned endpoint"):
+                module.verify_secret_bearing_portal_network(args)
+
     def test_operator_entry_point_is_local_and_does_not_call_host_roles(self) -> None:
         inventory = (ROOT / "ansible/inventory/preprod.yml").read_text()
         playbook = (ROOT / "ansible/preprod.yml").read_text()
@@ -839,6 +953,164 @@ class PreprodContractTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(SystemExit, "unsafe generated"):
                     module._validate_clean_room_generated_state()
+
+    def test_clean_room_audit_fixture_fails_before_resource_destroy(self) -> None:
+        module = load_preprod_module()
+        plan = clean_room_plan(module)
+        inventory = {
+            "containers": {},
+            "images": {},
+            "non_target_ids": set(),
+            "generated_aliases": [],
+            "present_aliases": [],
+            "present_target_ids": set(),
+            "target_ids": {plan["groups"][0]["image_id"]},
+        }
+        args = types.SimpleNamespace(
+            confirm=module.CLEAN_ROOM_CONFIRMATION,
+            manifest_sha256="b" * 64,
+            project="aigw-preprod",
+            prefix="aigw-preprod",
+            subnet_octet=29,
+            image_mode="seed",
+        )
+        cases = (
+            ("unknown-entry", "unknown file"),
+            (
+                "dangling-directory",
+                "unsafe preprod controller audit fixture directory",
+            ),
+            ("dangling-file", "unsafe preprod controller audit fixture file"),
+            (
+                "unsafe-directory-mode",
+                "unsafe preprod controller audit fixture directory",
+            ),
+        )
+
+        for case, expected_error in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                audit_directory = root / "controller"
+                current = audit_directory / "lifecycle.jsonl"
+                rotated = audit_directory / "lifecycle.jsonl.1"
+                if case == "dangling-directory":
+                    audit_directory.symlink_to(
+                        root / "missing-controller", target_is_directory=True
+                    )
+                else:
+                    audit_directory.mkdir(mode=0o755)
+                    if case == "unknown-entry":
+                        (audit_directory / "unexpected").write_text(
+                            "do not remove\n", encoding="utf-8"
+                        )
+                    elif case == "dangling-file":
+                        current.symlink_to(root / "missing-lifecycle")
+                    else:
+                        audit_directory.chmod(0o700)
+
+                missing = root / "missing"
+                with (
+                    mock.patch.object(
+                        module, "PREPROD_CONTROLLER_AUDIT_DIR", audit_directory
+                    ),
+                    mock.patch.object(
+                        module, "PREPROD_CONTROLLER_AUDIT_FILES", (current, rotated)
+                    ),
+                    mock.patch.object(module, "SEED_RECEIPT", missing),
+                    mock.patch.object(module, "SEED_OVERLAY", missing),
+                    mock.patch.object(module, "VAULT_INIT_FILE", missing),
+                    mock.patch.object(module, "ENV_FILE", missing),
+                    mock.patch.object(
+                        module, "clean_room_purge_plan", return_value=plan
+                    ),
+                    mock.patch.object(
+                        module, "collect_clean_room_inventory", return_value=inventory
+                    ),
+                    mock.patch.object(module, "desired_networks", return_value={}),
+                    mock.patch.object(module, "_clean_room_list", return_value=[]),
+                    mock.patch.object(
+                        module, "_clean_room_network_inventory", return_value=[]
+                    ),
+                    mock.patch.object(
+                        module, "_destroy_project_resources"
+                    ) as destroy,
+                    self.assertRaisesRegex(SystemExit, expected_error),
+                ):
+                    module.clean_room_seed(args)
+                destroy.assert_not_called()
+
+    def test_clean_room_root_owned_audit_fixture_fails_before_destroy(self) -> None:
+        module = load_preprod_module()
+        plan = clean_room_plan(module)
+        inventory = {
+            "containers": {},
+            "images": {},
+            "non_target_ids": set(),
+            "generated_aliases": [],
+            "present_aliases": [],
+            "present_target_ids": set(),
+            "target_ids": {plan["groups"][0]["image_id"]},
+        }
+        args = types.SimpleNamespace(
+            confirm=module.CLEAN_ROOM_CONFIRMATION,
+            manifest_sha256="b" * 64,
+            project="aigw-preprod",
+            prefix="aigw-preprod",
+            subnet_octet=29,
+            image_mode="seed",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audit_directory = root / "controller"
+            audit_directory.mkdir(mode=0o755)
+            current = audit_directory / "lifecycle.jsonl"
+            current.write_text("root-owned fixture\n", encoding="utf-8")
+            current.chmod(0o644)
+            rotated = audit_directory / "lifecycle.jsonl.1"
+            missing = root / "missing"
+            path_type = type(audit_directory)
+            real_lstat = path_type.lstat
+
+            def root_owned_lstat(path):
+                metadata = real_lstat(path)
+                if path in {audit_directory, current}:
+                    values = list(metadata)
+                    values[4] = 0
+                    values[5] = 0
+                    return os.stat_result(values)
+                return metadata
+
+            with (
+                mock.patch.object(path_type, "lstat", root_owned_lstat),
+                mock.patch.object(module.os, "geteuid", return_value=12345),
+                mock.patch.object(module.os, "getegid", return_value=12345),
+                mock.patch.object(
+                    module, "PREPROD_CONTROLLER_AUDIT_DIR", audit_directory
+                ),
+                mock.patch.object(
+                    module, "PREPROD_CONTROLLER_AUDIT_FILES", (current, rotated)
+                ),
+                mock.patch.object(module, "SEED_RECEIPT", missing),
+                mock.patch.object(module, "SEED_OVERLAY", missing),
+                mock.patch.object(module, "VAULT_INIT_FILE", missing),
+                mock.patch.object(module, "ENV_FILE", missing),
+                mock.patch.object(module, "clean_room_purge_plan", return_value=plan),
+                mock.patch.object(
+                    module, "collect_clean_room_inventory", return_value=inventory
+                ),
+                mock.patch.object(module, "desired_networks", return_value={}),
+                mock.patch.object(module, "_clean_room_list", return_value=[]),
+                mock.patch.object(
+                    module, "_clean_room_network_inventory", return_value=[]
+                ),
+                mock.patch.object(module, "_destroy_project_resources") as destroy,
+                self.assertRaisesRegex(
+                    SystemExit, "unsafe preprod controller audit fixture directory"
+                ),
+            ):
+                module.clean_room_seed(args)
+            destroy.assert_not_called()
+            self.assertEqual(current.read_text(encoding="utf-8"), "root-owned fixture\n")
 
     def test_clean_room_network_inventory_binds_full_ids_to_names(self) -> None:
         module = load_preprod_module()

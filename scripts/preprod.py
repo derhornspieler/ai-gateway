@@ -30,6 +30,11 @@ VAULT_INIT_FILE = SECRETS_DIR / "preprod-vault-init.json"
 SEED_RECEIPT = SECRETS_DIR / "preprod-seed-receipt.json"
 SEED_OVERLAY = SECRETS_DIR / "preprod-seed-images.yml"
 PREPROD_ROOT_CA_FILE = SECRETS_DIR / "preprod-root-ca.pem"
+PREPROD_CONTROLLER_AUDIT_DIR = SECRETS_DIR / "preprod-controller-lifecycle"
+PREPROD_CONTROLLER_AUDIT_FILES = (
+    PREPROD_CONTROLLER_AUDIT_DIR / "lifecycle.jsonl",
+    PREPROD_CONTROLLER_AUDIT_DIR / "lifecycle.jsonl.1",
+)
 
 ROOT_UID = 0
 ROOT_GID = 0
@@ -68,6 +73,7 @@ LEGACY_PREPROD_VENDOR_SUBNET = "172.29.7.0/24"
 ENVOY_EGRESS_IMAGE = "ai-gateway/envoy-egress:1"
 ROOT_SEED_DOCKER_SOCKET = Path("/run/docker.sock")
 POSTGRES_RECONCILE_SCRIPT = "/docker-entrypoint-initdb.d/01-init-databases.sh"
+OPENWEBUI_RECONCILE_SCRIPT = REPO_ROOT / "scripts/reconcile-openwebui-key.py"
 POSTGRES_DIRECT_CONSUMERS = ("litellm", "keycloak", "key-rotator", "grafana")
 POSTGRES_RECONCILE_RESULTS = frozenset(
     {"AIGW_POSTGRES_CHANGED", "AIGW_POSTGRES_OK"}
@@ -154,6 +160,7 @@ PREPROD_BIND_SOURCES = (
     "cribl-mock/config.preprod-tls.yaml",
     "grafana/provisioning",
     "litellm/aigw_default_model_hook.py",
+    "litellm/aigw_openwebui_identity.py",
     "litellm/aigw_otel_callback.py",
     "loki/config.yml",
     "postgres/init",
@@ -164,6 +171,7 @@ PREPROD_BIND_SOURCES = (
     "secrets/preprod-alloy-config.alloy",
     "secrets/preprod-cribl.crt",
     "secrets/preprod-cribl.key",
+    "secrets/preprod-controller-lifecycle",
     "secrets/preprod-litellm-config.yaml",
     "secrets/preprod-wif-envoy.yaml",
     "secrets/preprod-realms",
@@ -1040,6 +1048,98 @@ def write_file(path: Path, content: str, mode: int, *, replace: bool = True) -> 
     temporary.replace(path)
 
 
+def prepare_controller_audit_fixture() -> None:
+    """Create one empty, portable preprod source for controller audit tests."""
+
+    try:
+        PREPROD_CONTROLLER_AUDIT_DIR.lstat()
+    except FileNotFoundError:
+        PREPROD_CONTROLLER_AUDIT_DIR.mkdir(mode=0o755)
+        PREPROD_CONTROLLER_AUDIT_DIR.chmod(0o755)
+        existing: tuple[Path, ...] = ()
+    else:
+        # Validate the complete boundary before resetting either audit file.
+        # A bad rotation or unknown entry must not destroy the current receipt.
+        existing = _validate_controller_audit_fixture() or ()
+
+    current, rotated = PREPROD_CONTROLLER_AUDIT_FILES
+    write_file(current, "", 0o644)
+    if rotated in existing:
+        rotated.unlink()
+
+
+def _validate_controller_audit_fixture() -> tuple[Path, ...] | None:
+    """Return the complete fixture allow-list, or None when it is absent."""
+
+    try:
+        directory_metadata = PREPROD_CONTROLLER_AUDIT_DIR.lstat()
+    except FileNotFoundError:
+        return None
+    expected_owner = (os.geteuid(), os.getegid())
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or stat.S_ISLNK(directory_metadata.st_mode)
+        or stat.S_IMODE(directory_metadata.st_mode) != 0o755
+        or (directory_metadata.st_uid, directory_metadata.st_gid)
+        != expected_owner
+    ):
+        fail("refusing an unsafe preprod controller audit fixture directory")
+    allowed_names = {path.name for path in PREPROD_CONTROLLER_AUDIT_FILES}
+    try:
+        entries = tuple(
+            sorted(PREPROD_CONTROLLER_AUDIT_DIR.iterdir(), key=lambda path: path.name)
+        )
+    except OSError:
+        fail("the preprod controller audit fixture changed during validation")
+    if {entry.name for entry in entries} - allowed_names:
+        fail("the preprod controller audit fixture contains an unknown file")
+    for path in entries:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            fail("the preprod controller audit fixture changed during validation")
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid) != expected_owner
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o644
+        ):
+            fail("refusing an unsafe preprod controller audit fixture file")
+    try:
+        final_directory_metadata = PREPROD_CONTROLLER_AUDIT_DIR.lstat()
+    except OSError:
+        fail("the preprod controller audit fixture changed during validation")
+    if (
+        final_directory_metadata.st_dev,
+        final_directory_metadata.st_ino,
+    ) != (directory_metadata.st_dev, directory_metadata.st_ino) or (
+        not stat.S_ISDIR(final_directory_metadata.st_mode)
+        or stat.S_ISLNK(final_directory_metadata.st_mode)
+        or stat.S_IMODE(final_directory_metadata.st_mode) != 0o755
+        or (
+            final_directory_metadata.st_uid,
+            final_directory_metadata.st_gid,
+        )
+        != expected_owner
+    ):
+        fail("the preprod controller audit fixture changed during validation")
+    return entries
+
+
+def remove_controller_audit_fixture() -> None:
+    """Remove only the two generated, non-secret controller audit test files."""
+
+    # Clean-room preflight checks the fixture first. Check it again here to
+    # catch a path replacement before cleanup starts.
+    entries = _validate_controller_audit_fixture()
+    if entries is None:
+        return
+    for path in entries:
+        path.unlink()
+    PREPROD_CONTROLLER_AUDIT_DIR.rmdir()
+
+
 def _validate_root_directory_lineage(directory: Path) -> None:
     """Reject a replaceable path before root reads or writes alias state."""
 
@@ -1804,6 +1904,9 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "REDIS_PASSWORD": static_hex("redis"),
         "WEBUI_LITELLM_KEY": "sk-" + static_hex("webui-litellm"),
         "WEBUI_SECRET_KEY": static_hex("webui-session"),
+        "OPENWEBUI_FORWARD_JWT_SECRET": static_hex(
+            "openwebui-forward-jwt", 64
+        ),
         "WEBUI_OIDC_CLIENT_SECRET": static_hex("webui-oidc"),
         "PORTAL_OIDC_CLIENT_SECRET": static_hex("portal-oidc"),
         "ADMIN_PORTAL_OIDC_CLIENT_SECRET": static_hex("admin-portal-oidc"),
@@ -1861,6 +1964,7 @@ def prepare(args: argparse.Namespace) -> None:
     ensure_directory(SECRETS_DIR)
     ensure_directory(REALMS_DIR, 0o755)
     ensure_directory(EDGE_CERTS_DIR)
+    prepare_controller_audit_fixture()
     prepare_certificates(args.domain)
     render_realms(args.domain)
     vendor_subnet = desired_networks(args)[f"{args.prefix}-net-vendor"][0]
@@ -2675,6 +2779,191 @@ def start(args: argparse.Namespace) -> None:
     print("PREPROD_STACK_STARTED")
 
 
+def verify_secret_bearing_portal_network(args: argparse.Namespace) -> None:
+    """Prove the one-shot key tool can reach only this project's LiteLLM."""
+
+    network_name = f"{args.prefix}-net-portal"
+    expected_subnet, expected_internal = desired_networks(args)[network_name]
+    try:
+        documents = json.loads(
+            docker("network", "inspect", network_name, capture=True).stdout
+        )
+        network = documents[0]
+    except (json.JSONDecodeError, IndexError, TypeError):
+        fail("Docker returned an invalid portal network inspection")
+    labels = network.get("Labels") or {}
+    if (
+        network.get("Driver") != "bridge"
+        or network.get("Scope") != "local"
+        or bool(network.get("Internal")) is not expected_internal
+        or network_subnets(network) != [expected_subnet]
+        or network_ip_ranges(network) != [dynamic_ip_range(expected_subnet)]
+        or not isinstance(labels, dict)
+        or labels.get("com.aigw.preprod.project") != args.project
+    ):
+        fail("the secret-bearing portal network is not the owned preprod network")
+
+    litellm_endpoints = 0
+    endpoints = network.get("Containers") or {}
+    if not isinstance(endpoints, dict):
+        fail("the portal network endpoint list is invalid")
+    for container_id in endpoints:
+        try:
+            containers = json.loads(
+                docker("inspect", container_id, capture=True).stdout
+            )
+            container = containers[0]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            fail("Docker returned an invalid portal endpoint inspection")
+        container_labels = container.get("Config", {}).get("Labels") or {}
+        if (
+            not isinstance(container_labels, dict)
+            or container_labels.get("com.docker.compose.project") != args.project
+            or container_labels.get("com.aigw.preprod.project") != args.project
+        ):
+            fail("the secret-bearing portal network has an unowned endpoint")
+        if container_labels.get("com.docker.compose.service") == "litellm":
+            state = container.get("State") or {}
+            if (
+                state.get("Running") is not True
+                or state.get("Health", {}).get("Status") != "healthy"
+            ):
+                fail("the portal network LiteLLM endpoint is not healthy")
+            litellm_endpoints += 1
+    if litellm_endpoints != 1:
+        fail("the secret-bearing portal network needs one LiteLLM endpoint")
+
+
+def reconcile_openwebui_key(args: argparse.Namespace) -> None:
+    """Create or repair the fixed Open WebUI key, then prove its model scope."""
+
+    try:
+        script_metadata = OPENWEBUI_RECONCILE_SCRIPT.lstat()
+    except FileNotFoundError:
+        fail("the Open WebUI key reconciliation script is missing")
+    if (
+        not stat.S_ISREG(script_metadata.st_mode)
+        or stat.S_ISLNK(script_metadata.st_mode)
+        or script_metadata.st_nlink != 1
+        or script_metadata.st_size <= 0
+        or script_metadata.st_size > 64 * 1024
+        or script_metadata.st_uid not in {ROOT_UID, os.geteuid()}
+    ):
+        fail("the Open WebUI key reconciliation script is unsafe")
+
+    images = compose(
+        args, "images", "--quiet", "dev-portal", capture=True
+    ).stdout.splitlines()
+    image_ids = {value.strip() for value in images if value.strip()}
+    if len(image_ids) != 1:
+        fail("preprod did not resolve one dev-portal runtime image")
+    image_id = image_ids.pop()
+    if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", image_id):
+        fail("preprod returned an invalid dev-portal runtime image ID")
+
+    master_key = preprod_env_value("LITELLM_MASTER_KEY")
+    candidate_key = preprod_env_value("WEBUI_LITELLM_KEY")
+    if (
+        not re.fullmatch(r"sk-[A-Za-z0-9_-]{16,256}", master_key)
+        or not re.fullmatch(r"sk-[A-Za-z0-9_-]{16,256}", candidate_key)
+        or master_key == candidate_key
+    ):
+        fail("the generated Open WebUI key inputs are invalid")
+    verify_secret_bearing_portal_network(args)
+
+    with tempfile.TemporaryDirectory(
+        prefix="preprod-openwebui-reconcile-", dir=SECRETS_DIR
+    ) as temporary:
+        staged_script = Path(temporary) / "reconcile.py"
+        shutil.copyfile(OPENWEBUI_RECONCILE_SCRIPT, staged_script)
+        staged_script.chmod(0o555)
+        result = run(
+            [
+                "docker",
+                "--host",
+                local_docker_endpoint(),
+                "run",
+                "--rm",
+                "-i",
+                "--network",
+                f"{args.prefix}-net-portal",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--user",
+                "65532:65532",
+                "--log-driver",
+                "none",
+                "--volume",
+                f"{staged_script}:/reconcile.py:ro,Z",
+                "--entrypoint",
+                "python3",
+                image_id,
+                "/reconcile.py",
+            ],
+            input_text=json.dumps(
+                {
+                    "master_key": master_key,
+                    "candidate_key": candidate_key,
+                },
+                separators=(",", ":"),
+            ),
+            capture=True,
+            sensitive=True,
+        )
+    receipt = result.stdout.strip()
+    match = re.fullmatch(
+        r"OPENWEBUI_SERVICE_KEY_RECONCILED created=(true|false)", receipt
+    )
+    if match is None:
+        fail("the Open WebUI key reconciler returned an invalid receipt")
+
+    scope = compose(
+        args,
+        "exec",
+        "-T",
+        "open-webui",
+        "python3",
+        "-c",
+        """
+import json
+import os
+import urllib.request
+
+request = urllib.request.Request(
+    os.environ["OPENAI_API_BASE_URL"].rstrip("/") + "/models",
+    headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]},
+)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open(request, timeout=15) as response:
+    raw = response.read(1048577)
+if len(raw) > 1048576:
+    raise SystemExit("Open WebUI model list was too large")
+document = json.loads(raw)
+models = sorted(
+    item.get("id") for item in document.get("data", [])
+    if isinstance(item, dict) and isinstance(item.get("id"), str)
+)
+if not models:
+    raise SystemExit("Open WebUI workload key lists no models")
+print("OPENWEBUI_MODELS_SCOPE_PASS models=%d" % len(models))
+""".strip(),
+        capture=True,
+        sensitive=True,
+    ).stdout.strip()
+    scope_match = re.fullmatch(
+        r"OPENWEBUI_MODELS_SCOPE_PASS models=([1-9][0-9]*)", scope
+    )
+    if scope_match is None:
+        fail("the Open WebUI workload key model scope did not verify")
+    print(
+        "PREPROD_OPENWEBUI_KEY_RECONCILED "
+        f"created={match.group(1)} models={scope_match.group(1)}"
+    )
+
+
 def container_state(args: argparse.Namespace, service: str) -> tuple[str, str]:
     identifier = compose(args, "ps", "-q", service, capture=True).stdout.strip()
     if not identifier:
@@ -3293,12 +3582,15 @@ def _clean_room_source_args(args: argparse.Namespace) -> argparse.Namespace:
 def _validate_clean_room_generated_state() -> int:
     """Validate every generated seed-state file before another mutation begins."""
 
+    _validate_controller_audit_fixture()
     allowed_owners = {(0, 0), (os.geteuid(), os.getegid())}
     count = 0
     for path, expected_mode in (
         (SEED_RECEIPT, 0o644),
         (SEED_OVERLAY, 0o644),
         (VAULT_INIT_FILE, 0o600),
+        (PREPROD_CONTROLLER_AUDIT_FILES[0], 0o644),
+        (PREPROD_CONTROLLER_AUDIT_FILES[1], 0o644),
     ):
         try:
             metadata = path.lstat()
@@ -3474,6 +3766,12 @@ def prove_clean_room_resource_absence(args: argparse.Namespace) -> None:
         except FileNotFoundError:
             continue
         fail(f"generated preprod state remains after clean-room removal: {path}")
+    try:
+        PREPROD_CONTROLLER_AUDIT_DIR.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        fail("generated preprod controller audit state remains after removal")
 
 
 def prove_clean_room_target_images_unused(target_ids: set[str]) -> None:
@@ -3564,6 +3862,7 @@ def _destroy_project_resources(
             fail(f"refusing to remove network {name} because its ownership label differs")
         docker("network", "rm", name, capture=quiet)
     remove_seed_output_files()
+    remove_controller_audit_fixture()
     for path in (VAULT_INIT_FILE,):
         if path.exists():
             path.unlink()
@@ -3718,6 +4017,7 @@ def parser() -> argparse.ArgumentParser:
     build_parser.add_argument("--pull", action="store_true")
     commands.add_parser("pull")
     commands.add_parser("start")
+    commands.add_parser("reconcile-openwebui-key")
     commands.add_parser("bootstrap-vault")
     commands.add_parser("auto-initialize-identity")
     commands.add_parser("configure-users")
@@ -3754,6 +4054,7 @@ def main() -> int:
         "build": build,
         "pull": pull,
         "start": start,
+        "reconcile-openwebui-key": reconcile_openwebui_key,
         "bootstrap-vault": bootstrap_vault,
         "auto-initialize-identity": auto_initialize_identity,
         "configure-users": configure_preprod_users,

@@ -23,7 +23,8 @@ the Rocky Linux host roles. It does not change a production project.
 | Quick source check | [Start from source](#start-from-source) |
 | Final release test | [Test an offline seed](#test-an-offline-seed) |
 | Manual browser test | [Local names](#local-names), then the [browser checks](test-runbook.md#3-run-the-real-browser-check) |
-| Clean removal | [Remove preprod](#remove-preprod) |
+| Final release teardown | [Finish with exact-manifest teardown](#finish-with-exact-manifest-teardown) |
+| Quick development cleanup | [Remove a development stack](#remove-a-development-stack) |
 
 The final release test must load the new preprod archive. A source-mode run is
 useful, but it is not final release proof.
@@ -198,6 +199,9 @@ The check uses a safe local name map. It does not need `/etc/hosts`. It proves:
 - all three users log in through LDAPS;
 - portal, chat, and admin role rules work;
 - Keycloak callbacks and logout work;
+- Ansible reconciles the exact Open WebUI workload key;
+- a valid signed chat identity reaches LiteLLM, while missing or bad chat
+  assertions stop before the mock provider;
 - WIF checks the live Keycloak JWT;
 - LiteLLM reaches the mock provider through the preprod-only TLS Envoy;
 - the exact production Envoy passes its immutable policy and CA startup gate; and
@@ -271,7 +275,33 @@ SEEDED_PREPROD_E2E_PASSED
 Follow the clean build, destroy, load, deploy, and browser order in the
 [acceptance test runbook](test-runbook.md#required-rehearsal-order).
 
-## Remove preprod
+## Finish with exact-manifest teardown
+
+After the release tests pass or fail, run the clean-room play again with the
+exact tested preprod pair. Replace the paths and hashes with values from that
+release:
+
+```bash
+ansible-playbook -i ansible/inventory/preprod.yml \
+  ansible/preprod-clean-room.yml \
+  -e preprod_seed_archive=/absolute/private/path/aigw-YYYY-MM-DD.preprod.docker.tar.zst \
+  -e preprod_seed_archive_sha256=REPLACE_WITH_ARCHIVE_SHA256 \
+  -e preprod_seed_manifest=/absolute/private/path/aigw-YYYY-MM-DD.preprod.manifest.json \
+  -e preprod_seed_manifest_sha256=REPLACE_WITH_MANIFEST_SHA256 \
+  -e preprod_clean_room_confirmation=DESTROY_AIGW_PREPROD_RELEASE_IMAGES \
+  --become-password-file "$HOME/.ssh/become"
+```
+
+Use `--ask-become-pass` instead when needed. This is the final release
+teardown. It validates the manifest boundary and proves that all owned
+containers, image aliases, image IDs, volumes, networks, generated state,
+hosts entries, and loopback aliases are absent. It also proves that unrelated
+image IDs were preserved. Save the one-line `PREPROD_CLEAN_ROOM_OK` receipt.
+
+Do not use `docker system prune` or a broad image delete. Do not accept the
+release if this exact-manifest teardown fails.
+
+## Remove a development stack
 
 ```bash
 ansible-playbook -i ansible/inventory/preprod.yml \
@@ -284,7 +314,8 @@ Add the same sudo option used during start.
 Destroy removes only owned `aigw-preprod` containers, volumes, networks,
 aliases, hosts entries, and the test Vault recovery record. It keeps the local
 test Root CA and leaf files, so a new run does not force a new browser trust
-step.
+step. It does not purge or prove absence of the exact manifest image set. Use
+it only for ordinary development cleanup, not a final release receipt.
 
 Preprod Samba lives only in `services/samba-ad-preprod`. No retired lab
 Compose file or profile is used.

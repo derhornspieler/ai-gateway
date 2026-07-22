@@ -75,6 +75,38 @@ class LockDeniedDB(RotationDB):
         yield False
 
 
+class HistoryFailingDB(RotationDB):
+    async def record_history(
+        self, _vendor: str, _action: str, _status: str, _detail: str
+    ) -> None:
+        raise RuntimeError("password=do-not-export-history-secret")
+
+
+class SettingsFailingDB(RotationDB):
+    async def get_settings(self, _vendor: str) -> dict | None:
+        raise RuntimeError("password=do-not-export-settings-secret")
+
+
+class ReconcileSettingsFailingDB(RotationDB):
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings_reads = 0
+
+    async def get_settings(self, vendor: str) -> dict | None:
+        self.settings_reads += 1
+        if self.settings_reads > 1:
+            raise RuntimeError("password=do-not-export-reconcile-secret")
+        return await super().get_settings(vendor)
+
+
+class LockExitFailingDB(RotationDB):
+    @asynccontextmanager
+    async def rotation_lock(self, vendor: str):
+        assert vendor == "anthropic"
+        yield True
+        raise RuntimeError("token=do-not-export-lock-secret")
+
+
 class SequenceDriver:
     def __init__(self, *results: RotationResult) -> None:
         self.results = list(results)
@@ -225,6 +257,29 @@ async def test_process_lock_skip_closes_started_lifecycle_with_bounded_attempt(
 
 
 @pytest.mark.asyncio
+async def test_process_lock_history_failure_still_closes_audit_lifecycle(
+    caplog,
+) -> None:
+    db = HistoryFailingDB()
+    scheduler = RotationScheduler(
+        settings(), db, object(), object(), {"anthropic": SequenceDriver()}
+    )
+    lock = scheduler._lock_for("anthropic")
+    await lock.acquire()
+    try:
+        with (
+            caplog.at_level("INFO", logger="key_rotator.scheduler"),
+            pytest.raises(RuntimeError, match="^rotation history persistence failed$"),
+        ):
+            await scheduler.run_rotation("anthropic")
+    finally:
+        lock.release()
+
+    assert_closed_pre_attempt_lifecycle(security_events(caplog), "skipped")
+    assert "do-not-export-history-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_distributed_lock_skip_closes_started_lifecycle_with_bounded_attempt(
     caplog,
 ) -> None:
@@ -239,6 +294,160 @@ async def test_distributed_lock_skip_closes_started_lifecycle_with_bounded_attem
     assert result.status == "skipped"
     assert len(db.history) == 1
     assert_closed_pre_attempt_lifecycle(security_events(caplog), "skipped")
+
+
+@pytest.mark.asyncio
+async def test_successful_rotation_history_failure_emits_truthful_terminal_result(
+    caplog,
+) -> None:
+    db = HistoryFailingDB()
+    scheduler = RotationScheduler(
+        settings(),
+        db,
+        object(),
+        object(),
+        {"anthropic": SequenceDriver(RotationResult(status="success"))},
+    )
+
+    with (
+        caplog.at_level("INFO", logger="key_rotator.scheduler"),
+        pytest.raises(RuntimeError, match="^rotation history persistence failed$"),
+    ):
+        await scheduler.run_rotation("anthropic")
+
+    events = security_events(caplog)
+    assert [event["action"] for event in events] == ["start", "attempt", "rotate"]
+    assert [event["rotation_status"] for event in events] == [
+        "started",
+        "success",
+        "success",
+    ]
+    assert events[0]["rotation_id"] == events[-1]["rotation_id"]
+    assert "do-not-export-history-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_settings_failure_after_start_closes_with_fixed_terminal_event(
+    caplog,
+) -> None:
+    scheduler = RotationScheduler(
+        settings(),
+        SettingsFailingDB(),
+        object(),
+        object(),
+        {"anthropic": SequenceDriver(RotationResult(status="success"))},
+    )
+
+    with (
+        caplog.at_level("INFO", logger="key_rotator.scheduler"),
+        pytest.raises(RuntimeError, match="^provider rotation control failed$"),
+    ):
+        await scheduler.run_rotation("anthropic")
+
+    events = security_events(caplog)
+    assert [event["action"] for event in events] == ["start", "attempt", "rotate"]
+    assert [event["rotation_status"] for event in events] == [
+        "started",
+        "failed",
+        "failed",
+    ]
+    assert "do-not-export-settings-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_lock_exit_failure_keeps_one_truthful_terminal_result(caplog) -> None:
+    scheduler = RotationScheduler(
+        settings(),
+        LockExitFailingDB(),
+        object(),
+        object(),
+        {"anthropic": SequenceDriver(RotationResult(status="success"))},
+    )
+
+    with (
+        caplog.at_level("INFO", logger="key_rotator.scheduler"),
+        pytest.raises(RuntimeError, match="^provider rotation control failed$"),
+    ):
+        await scheduler.run_rotation("anthropic")
+
+    events = security_events(caplog)
+    assert [event["action"] for event in events] == ["start", "attempt", "rotate"]
+    assert [event["rotation_status"] for event in events] == [
+        "started",
+        "success",
+        "success",
+    ]
+    assert "do-not-export-lock-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_reschedule_failure_closes_retry_lifecycle_without_secret(
+    caplog, monkeypatch
+) -> None:
+    scheduler = RotationScheduler(
+        settings(),
+        RotationDB(),
+        object(),
+        object(),
+        {
+            "anthropic": SequenceDriver(
+                RotationResult(
+                    status="failed",
+                    detail="token=driver-secret",
+                    next_run_seconds=30,
+                )
+            )
+        },
+    )
+
+    async def fail_reschedule(_vendor: str, _seconds: float) -> bool:
+        raise RuntimeError("api_key=do-not-export-reschedule-secret")
+
+    monkeypatch.setattr(scheduler, "_reschedule_dynamic", fail_reschedule)
+    with (
+        caplog.at_level("INFO", logger="key_rotator.scheduler"),
+        pytest.raises(RuntimeError, match="^provider rotation control failed$"),
+    ):
+        await scheduler.run_rotation("anthropic")
+
+    events = security_events(caplog)
+    assert [event["action"] for event in events] == ["start", "attempt", "rotate"]
+    assert events[-1]["rotation_status"] == "failed"
+    assert "anthropic" not in scheduler._rotation_lifecycles
+    assert "do-not-export-reschedule-secret" not in caplog.text
+    assert "driver-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_oneshot_reconcile_failure_preserves_provider_truth_and_is_sanitized(
+    caplog,
+) -> None:
+    scheduler = RotationScheduler(
+        settings(),
+        ReconcileSettingsFailingDB(),
+        object(),
+        object(),
+        {"anthropic": SequenceDriver(RotationResult(status="success"))},
+    )
+    scheduler._oneshot_scheduled.add("anthropic")
+
+    with (
+        caplog.at_level("INFO", logger="key_rotator.scheduler"),
+        pytest.raises(
+            RuntimeError,
+            match="^provider rotation lifecycle reconciliation failed$",
+        ),
+    ):
+        await scheduler.run_rotation("anthropic")
+
+    events = security_events(caplog)
+    assert [event["action"] for event in events] == ["start", "attempt", "rotate"]
+    assert [event["rotation_status"] for event in events] == [
+        "started",
+        "success",
+        "success",
+    ]
+    assert "do-not-export-reconcile-secret" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -373,9 +582,7 @@ async def test_terminal_failure_event_normalizes_status_and_excludes_error_text(
 
     assert result.status == "failed"
     assert len(db.history) == 1
-    assert db.history[0][3] == (
-        "rotation failed: stage=driver reason=unhandled_failure"
-    )
+    assert db.history[0][3] == "provider rotation failed"
     events = security_events(caplog)
     assert [event["action"] for event in events] == ["start", "attempt", "rotate"]
     assert [event["rotation_status"] for event in events] == [
@@ -445,9 +652,7 @@ async def test_anthropic_driver_failure_has_one_scheduler_owned_history_row(
     assert result.status == "failed"
     assert len(db.history) == 1
     assert db.history[0][:3] == ("anthropic", "rotate", "failed")
-    assert db.history[0][3] == (
-        "rotation failed: stage=vault_read reason=vault_unavailable"
-    )
+    assert db.history[0][3] == "provider rotation failed"
     events = security_events(caplog)
     assert [event["action"] for event in events] == ["start", "attempt", "rotate"]
     exported = "\n".join(json.dumps(event, sort_keys=True) for event in events)
@@ -476,9 +681,7 @@ async def test_client_assertion_failure_uses_only_fixed_safe_diagnostics(caplog)
         result = await scheduler.run_rotation("anthropic")
 
     assert result.status == "failed"
-    assert db.history[0][3] == (
-        "rotation failed: stage=token_exchange reason=internal_failure"
-    )
+    assert db.history[0][3] == "provider rotation failed"
     assert "do-not-export-assertion-secret" not in caplog.text
     assert "do-not-export-assertion-secret" not in json.dumps(health.snapshot())
 
@@ -498,9 +701,7 @@ async def test_provider_error_payload_never_enters_log_health_or_history(caplog)
         result = await scheduler.run_rotation("anthropic")
 
     assert result.status == "failed"
-    assert db.history[0][3] == (
-        "rotation failed: stage=token_exchange reason=request_rejected"
-    )
+    assert db.history[0][3] == "provider rotation failed"
     assert "provider-response-secret" not in caplog.text
     assert "provider-response-secret" not in json.dumps(health.snapshot())
     assert "provider-response-secret" not in json.dumps(db.history)
@@ -528,10 +729,42 @@ async def test_success_log_and_history_do_not_mention_the_access_token(caplog) -
             "anthropic",
             "rotate",
             "success",
-            "rotated anthropic-primary; expires_in=3600s; next refresh in 2880s",
+            "provider rotation completed",
         )
     ]
     audit_surface = caplog.text + json.dumps(db.history)
     assert "access-token-success-fragment" not in audit_surface
     assert "new token" not in audit_surface.lower()
     assert "<redacted>" not in audit_surface
+
+
+@pytest.mark.asyncio
+async def test_hostile_driver_detail_never_enters_rotation_history_or_logs(
+    caplog,
+) -> None:
+    db = RotationDB()
+    scheduler = RotationScheduler(
+        settings(),
+        db,
+        object(),
+        object(),
+        {
+            "anthropic": SequenceDriver(
+                RotationResult(
+                    status="success",
+                    detail=(
+                        "api_key=do-not-export token=do-not-export "
+                        "assertion=do-not-export secret=do-not-export"
+                    ),
+                )
+            )
+        },
+    )
+
+    with caplog.at_level("INFO", logger="key_rotator.scheduler"):
+        assert (await scheduler.run_rotation("anthropic")).status == "success"
+
+    assert db.history == [
+        ("anthropic", "rotate", "success", "provider rotation completed")
+    ]
+    assert "do-not-export" not in caplog.text

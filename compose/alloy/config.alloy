@@ -93,46 +93,28 @@ otelcol.processor.memory_limiter "default" {
   }
 }
 
-// Promote only server-authenticated LiteLLM key metadata into stable,
-// first-class trace correlation fields. These are trace attributes, never
-// metric labels. Client-supplied llm.user and raw authorization/token fields
-// are intentionally not authoritative inputs. Missing or malformed metadata
-// leaves the span untouched; error_mode=ignore prevents a bad optional field
-// from dropping prompt-bearing traces.
-//
-// aigw.user.name is the HUMAN-READABLE identity beside the stable opaque
-// aigw.user.id (Keycloak subject UUID). Source priority, first match wins:
-//   1. metadata.user_api_key_end_user_id — the end user LiteLLM records from
-//      general_settings.user_header_name (chat path: Open WebUI forwards the
-//      authenticated preferred_username) or a caller-supplied `user` field.
-//      ATTRIBUTION ONLY: it grants no authorization; an API caller spoofing
-//      it only mislabels its own already-authenticated traffic, whose key
-//      identity is still recorded in aigw.user.id / aigw.api_key.id. It is
-//      also kept as its own field, aigw.enduser.id.
-//   2. aigw_username from the key's portal-stamped metadata (dev-portal
-//      writes the OIDC preferred_username at mint time), extracted from the
-//      serialized server-side auth metadata like the project fallback below.
-//   3. metadata.user_api_key_alias — the key's human-chosen alias.
-//   4. aigw.user.id — so the field is always present for label filtering.
-// Every source is bounded and strictly validated: these become log fields
-// and (for aigw.user.name) a Loki stream label on the aigw-requests stream.
+// Build stable request attribution from LiteLLM's server callback fields.
+// Caller end-user fields, auth metadata text, key aliases, headers, and JWTs
+// are never name authority. The callback selects one reviewed source; Alloy
+// validates it, copies it to the public audit fields, and later deletes the
+// raw server fields.
 // BEGIN AIGW MANAGED TRACE CORRELATION
 otelcol.processor.transform "aigw_correlation" {
-  error_mode = "ignore"
+  error_mode = "propagate"
 
   trace_statements {
     context = "span"
     statements = [
       `set(attributes["aigw.user.id"], attributes["metadata.user_api_key_user_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_user_id"]) and IsMatch(attributes["metadata.user_api_key_user_id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
+      `set(attributes["aigw.user.id"], attributes["aigw.server.user.id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["aigw.server.user.id"]) and IsMatch(attributes["aigw.server.user.id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$") and attributes["aigw.server.user.name_source"] == "open_webui_signed_oidc"`,
       `set(attributes["aigw.api_key.id"], attributes["metadata.user_api_key_hash"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_hash"]) and IsMatch(attributes["metadata.user_api_key_hash"], "^[0-9a-f]{64}$")`,
       `set(attributes["aigw.request.id"], attributes["litellm.call_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["litellm.call_id"]) and IsMatch(attributes["litellm.call_id"], "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")`,
       `set(attributes["aigw.project.id"], attributes["metadata.user_api_key_project_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_project_id"]) and IsMatch(attributes["metadata.user_api_key_project_id"], "^[a-z0-9][a-z0-9_.-]{0,63}$")`,
       `set(attributes["aigw.project.id"], ExtractPatterns(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")["project"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.project.id"] == nil and IsString(attributes["metadata.user_api_key_auth_metadata"]) and IsMatch(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_project_id['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<project>[a-z0-9][a-z0-9_.-]{0,63})['\\\"]")`,
-      `set(attributes["aigw.enduser.id"], attributes["metadata.user_api_key_end_user_id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["metadata.user_api_key_end_user_id"]) and IsMatch(attributes["metadata.user_api_key_end_user_id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
-      `set(attributes["aigw.user.name"], attributes["aigw.enduser.id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["aigw.enduser.id"])`,
-      `set(attributes["aigw.user.name"], ExtractPatterns(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_username['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})['\\\"]")["username"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.user.name"] == nil and IsString(attributes["metadata.user_api_key_auth_metadata"]) and IsMatch(attributes["metadata.user_api_key_auth_metadata"], "['\\\"]aigw_username['\\\"][[:space:]]*:[[:space:]]*['\\\"](?P<username>[A-Za-z0-9][A-Za-z0-9_.@-]{0,63})['\\\"]")`,
-      `set(attributes["aigw.user.name"], attributes["metadata.user_api_key_alias"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.user.name"] == nil and IsString(attributes["metadata.user_api_key_alias"]) and IsMatch(attributes["metadata.user_api_key_alias"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
-      `set(attributes["aigw.user.name"], attributes["aigw.user.id"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and attributes["aigw.user.name"] == nil and IsString(attributes["aigw.user.id"])`,
+      `delete_key(attributes, "aigw.user.name")`,
+      `delete_key(attributes, "aigw.user.name_source")`,
+      `set(attributes["aigw.user.name"], attributes["aigw.server.user.name"]) where resource.attributes["service.name"] == "litellm" and name == "litellm_request" and IsString(attributes["aigw.server.user.name"]) and IsMatch(attributes["aigw.server.user.name"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$") and IsString(attributes["aigw.server.user.name_source"]) and (attributes["aigw.server.user.name_source"] == "portal_key_metadata" or attributes["aigw.server.user.name_source"] == "key_subject" or (attributes["aigw.server.user.name_source"] == "open_webui_signed_oidc" and IsString(attributes["aigw.server.user.id"]) and IsMatch(attributes["aigw.server.user.id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")))`,
+      `set(attributes["aigw.user.name_source"], attributes["aigw.server.user.name_source"]) where attributes["aigw.user.name"] != nil`,
     ]
   }
 
@@ -181,18 +163,38 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
   trace_statements {
     context = "span"
     statements = [
-      `replace_pattern(attributes["gen_ai.input.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.input.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n\\\"]{0,3}\\\"(?:\\\\.|[^\\\"\\\\\\r\\n])+(?:\\\\)?\\\"", "<redacted-credential>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.input.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n']{0,3}'(?:\\\\.|[^'\\\\\\r\\n])+(?:\\\\)?'", "<redacted-credential>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.input.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.input.messages"])`,
       `replace_pattern(attributes["gen_ai.input.messages"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.input.messages"])`,
       `replace_pattern(attributes["gen_ai.input.messages"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.input.messages"])`,
-      `replace_pattern(attributes["gen_ai.output.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.input.messages"], "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b", "<redacted-jwt>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.input.messages"], "\\b(?:hvs|hvb|hvr|s|b)\\.[A-Za-z0-9_-]{16,}\\b", "<redacted-vault-token>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.input.messages"], "(?s)-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----.*?(?:-----END (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----|$)", "<redacted-private-key>") where IsString(attributes["gen_ai.input.messages"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n\\\"]{0,3}\\\"(?:\\\\.|[^\\\"\\\\\\r\\n])+(?:\\\\)?\\\"", "<redacted-credential>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n']{0,3}'(?:\\\\.|[^'\\\\\\r\\n])+(?:\\\\)?'", "<redacted-credential>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.output.messages"])`,
       `replace_pattern(attributes["gen_ai.output.messages"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.output.messages"])`,
       `replace_pattern(attributes["gen_ai.output.messages"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.output.messages"])`,
-      `replace_pattern(attributes["gen_ai.prompt.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b", "<redacted-jwt>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "\\b(?:hvs|hvb|hvr|s|b)\\.[A-Za-z0-9_-]{16,}\\b", "<redacted-vault-token>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.output.messages"], "(?s)-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----.*?(?:-----END (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----|$)", "<redacted-private-key>") where IsString(attributes["gen_ai.output.messages"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n\\\"]{0,3}\\\"(?:\\\\.|[^\\\"\\\\\\r\\n])+(?:\\\\)?\\\"", "<redacted-credential>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n']{0,3}'(?:\\\\.|[^'\\\\\\r\\n])+(?:\\\\)?'", "<redacted-credential>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.prompt.0.content"])`,
       `replace_pattern(attributes["gen_ai.prompt.0.content"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.prompt.0.content"])`,
       `replace_pattern(attributes["gen_ai.prompt.0.content"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.prompt.0.content"])`,
-      `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b", "<redacted-jwt>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "\\b(?:hvs|hvb|hvr|s|b)\\.[A-Za-z0-9_-]{16,}\\b", "<redacted-vault-token>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.prompt.0.content"], "(?s)-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----.*?(?:-----END (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----|$)", "<redacted-private-key>") where IsString(attributes["gen_ai.prompt.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n\\\"]{0,3}\\\"(?:\\\\.|[^\\\"\\\\\\r\\n])+(?:\\\\)?\\\"", "<redacted-credential>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[^A-Za-z0-9\\r\\n]{0,3}[:=][^A-Za-z0-9\\r\\n']{0,3}'(?:\\\\.|[^'\\\\\\r\\n])+(?:\\\\)?'", "<redacted-credential>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(attributes["gen_ai.completion.0.content"])`,
       `replace_pattern(attributes["gen_ai.completion.0.content"], "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(attributes["gen_ai.completion.0.content"])`,
       `replace_pattern(attributes["gen_ai.completion.0.content"], "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b", "<redacted-jwt>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "\\b(?:hvs|hvb|hvr|s|b)\\.[A-Za-z0-9_-]{16,}\\b", "<redacted-vault-token>") where IsString(attributes["gen_ai.completion.0.content"])`,
+      `replace_pattern(attributes["gen_ai.completion.0.content"], "(?s)-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----.*?(?:-----END (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----|$)", "<redacted-private-key>") where IsString(attributes["gen_ai.completion.0.content"])`,
       // OTTL cannot recursively prove an array or map safe. Keep the reviewed
       // string form after the replacements above, and remove every other
       // representation before spanlogs can copy it into Loki or Cribl.
@@ -200,6 +202,10 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
       `delete_matching_keys(attributes, "^gen_ai\\.output\\.messages$") where attributes["gen_ai.output.messages"] != nil and not IsString(attributes["gen_ai.output.messages"])`,
       `delete_matching_keys(attributes, "^gen_ai\\.prompt\\.0\\.content$") where attributes["gen_ai.prompt.0.content"] != nil and not IsString(attributes["gen_ai.prompt.0.content"])`,
       `delete_matching_keys(attributes, "^gen_ai\\.completion\\.0\\.content$") where attributes["gen_ai.completion.0.content"] != nil and not IsString(attributes["gen_ai.completion.0.content"])`,
+      `delete_matching_keys(attributes, "^aigw\\.server\\.user\\.(?:id|name|name_source)$")`,
+      `delete_key(attributes, "aigw.enduser.id")`,
+      `delete_matching_keys(attributes, "(?i)^metadata\\.(?:headers?|request[_-]?headers?)$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:jwt|user[_-]?jwt|openwebui[_-]?user[_-]?jwt|x[_-]?openwebui[_-]?user[_-]?jwt|request[_-]?headers?)$")`,
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
       `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
@@ -354,9 +360,27 @@ otelcol.processor.filter "aigw_request_spans" {
       `resource.attributes["service.name"] != "litellm" or name != "litellm_request"`,
       `not IsString(attributes["aigw.user.id"]) or not IsMatch(attributes["aigw.user.id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
       `not IsString(attributes["aigw.user.name"]) or not IsMatch(attributes["aigw.user.name"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
+      `not IsString(attributes["aigw.user.name_source"]) or (attributes["aigw.user.name_source"] != "portal_key_metadata" and attributes["aigw.user.name_source"] != "open_webui_signed_oidc" and attributes["aigw.user.name_source"] != "key_subject")`,
       `not IsString(attributes["aigw.api_key.id"]) or not IsMatch(attributes["aigw.api_key.id"], "^[0-9a-f]{64}$")`,
       `not IsString(attributes["aigw.project.id"]) or not IsMatch(attributes["aigw.project.id"], "^[a-z0-9][a-z0-9_.-]{0,63}$")`,
       `not IsString(attributes["aigw.request.id"]) or not IsMatch(attributes["aigw.request.id"], "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")`,
+    ]
+  }
+  output {
+    traces = [otelcol.processor.transform.aigw_request_event_time.input]
+  }
+}
+
+// spanlogs does not copy an input span's timestamp into its OTLP LogRecord in
+// the pinned Alloy release. Carry the reviewed source time as one internal
+// attribute, then restore it to the real log timestamp immediately afterward.
+// The final common-record gate validates the resulting UTC epoch value.
+otelcol.processor.transform "aigw_request_event_time" {
+  error_mode = "propagate"
+  trace_statements {
+    context = "span"
+    statements = [
+      `set(attributes["aigw.security.source_time_unix_nano"], start_time_unix_nano)`,
     ]
   }
   output {
@@ -381,11 +405,14 @@ otelcol.connector.spanlogs "aigw_requests" {
   labels = [
     "aigw.user.name",
     "aigw.project.id",
+    // span_attributes are body fields only. Carry the source timestamp as a
+    // temporary log attribute so the next transform can restore it.
+    "aigw.security.source_time_unix_nano",
   ]
   span_attributes = [
     "aigw.user.id",
     "aigw.user.name",
-    "aigw.enduser.id",
+    "aigw.user.name_source",
     "aigw.api_key.id",
     "aigw.project.id",
     "aigw.request.id",
@@ -425,6 +452,8 @@ otelcol.processor.transform "aigw_request_stream" {
   log_statements {
     context = "log"
     statements = [
+      `set(time_unix_nano, attributes["aigw.security.source_time_unix_nano"])`,
+      `delete_key(attributes, "aigw.security.source_time_unix_nano")`,
       `set(attributes["aigw.security.event_class"], "ai_request_audit")`,
       `set(attributes["aigw.security.schema_version"], 1)`,
       `set(attributes["aigw.security.source"], "litellm_request")`,
@@ -459,15 +488,72 @@ otelcol.processor.attributes "aigw_request_stream_labels" {
   }
 }
 
-// Every approved external log carries the same versioned contract attribute,
+// Every approved external log receives the same server-owned common fields,
 // regardless of whether it began as a request spanlog or a classified Docker
-// record. A transform failure propagates and therefore cannot bypass the gate.
+// record. Clear ambiguous caller fields first, then assign one literal producer
+// and service identity from the reviewed event class. The structured-security
+// path may use only the four service names its earlier classifier admitted.
+// A transform failure propagates and therefore cannot bypass this boundary.
 otelcol.processor.transform "cribl_security_contract" {
   error_mode = "propagate"
   log_statements {
     context = "log"
     statements = [
+      `set(attributes["aigw.security.event_class"], attributes["aigw_security_event_class"]) where attributes["aigw.security.event_class"] == nil and IsString(attributes["aigw_security_event_class"])`,
+      `delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.producer|aigw_security_event_class)$")`,
       `set(attributes["aigw.security.schema_version"], 1)`,
+      `set(attributes["aigw.security.producer"], "")`,
+      `set(resource.attributes["service.name"], "")`,
+      `set(resource.attributes["deployment.environment"], "` + sys.env("AIGW_DEPLOYMENT_ENVIRONMENT") + `")`,
+      `set(attributes["aigw.security.producer"], "litellm") where attributes["aigw.security.event_class"] == "ai_request_audit"`,
+      `set(resource.attributes["service.name"], "litellm") where attributes["aigw.security.event_class"] == "ai_request_audit"`,
+      `set(attributes["aigw.security.producer"], "keycloak") where attributes["aigw.security.event_class"] == "keycloak_event"`,
+      `set(resource.attributes["service.name"], "keycloak") where attributes["aigw.security.event_class"] == "keycloak_event"`,
+      `set(attributes["aigw.security.producer"], "envoy-egress") where attributes["aigw.security.event_class"] == "egress_tls"`,
+      `set(resource.attributes["service.name"], "envoy-egress") where attributes["aigw.security.event_class"] == "egress_tls"`,
+      `set(attributes["aigw.security.producer"], "vault") where attributes["aigw.security.event_class"] == "vault_audit"`,
+      `set(resource.attributes["service.name"], "vault") where attributes["aigw.security.event_class"] == "vault_audit"`,
+      `set(attributes["aigw.security.producer"], "dev-portal") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "dev-portal"`,
+      `set(resource.attributes["service.name"], "dev-portal") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "dev-portal"`,
+      `set(attributes["aigw.security.producer"], "admin-portal") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "admin-portal"`,
+      `set(resource.attributes["service.name"], "admin-portal") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "admin-portal"`,
+      `set(attributes["aigw.security.producer"], "key-rotator") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "key-rotator"`,
+      `set(resource.attributes["service.name"], "key-rotator") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "key-rotator"`,
+      `set(attributes["aigw.security.producer"], "envoy-egress") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "envoy-egress"`,
+      `set(resource.attributes["service.name"], "envoy-egress") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "envoy-egress"`,
+      `set(attributes["aigw.security.producer"], "controller") where attributes["aigw.security.event_class"] == "controller_lifecycle"`,
+      `set(resource.attributes["service.name"], "controller") where attributes["aigw.security.event_class"] == "controller_lifecycle"`,
+    ]
+  }
+  output {
+    logs = [otelcol.processor.filter.cribl_common_record.input]
+  }
+}
+
+// Event time is the original OTLP/Docker/Vault UTC timestamp. Admit at most
+// the approved 24-hour delivery window at queue ingress and one minute of
+// forward clock skew. This keeps a host reboot or collector restart from
+// discarding unread records; queue delay happens after this gate. Zero, stale,
+// future, or unclassified records are removed before the only Cribl batch.
+// error_mode=propagate makes an evaluation error fail closed too.
+otelcol.processor.filter "cribl_common_record" {
+  error_mode = "propagate"
+  logs {
+    log_record = [
+      `attributes["aigw.security.schema_version"] != 1`,
+      `resource.attributes["deployment.environment"] != "preprod" and resource.attributes["deployment.environment"] != "production"`,
+      `not IsString(attributes["aigw.security.producer"]) or attributes["aigw.security.producer"] == ""`,
+      `not IsString(resource.attributes["service.name"]) or resource.attributes["service.name"] != attributes["aigw.security.producer"]`,
+      `attributes["aigw.security.event_class"] == "ai_request_audit" and attributes["aigw.security.producer"] != "litellm"`,
+      `attributes["aigw.security.event_class"] == "keycloak_event" and attributes["aigw.security.producer"] != "keycloak"`,
+      `attributes["aigw.security.event_class"] == "egress_tls" and attributes["aigw.security.producer"] != "envoy-egress"`,
+      `attributes["aigw.security.event_class"] == "vault_audit" and attributes["aigw.security.producer"] != "vault"`,
+      `attributes["aigw.security.event_class"] == "security_event" and attributes["aigw.security.producer"] != "dev-portal" and attributes["aigw.security.producer"] != "admin-portal" and attributes["aigw.security.producer"] != "key-rotator" and attributes["aigw.security.producer"] != "envoy-egress"`,
+      `attributes["aigw.security.event_class"] == "controller_lifecycle" and attributes["aigw.security.producer"] != "controller"`,
+      `attributes["aigw.security.event_class"] != "ai_request_audit" and attributes["aigw.security.event_class"] != "keycloak_event" and attributes["aigw.security.event_class"] != "egress_tls" and attributes["aigw.security.event_class"] != "vault_audit" and attributes["aigw.security.event_class"] != "security_event" and attributes["aigw.security.event_class"] != "controller_lifecycle"`,
+      `time_unix_nano == 0`,
+      `time_unix_nano < UnixNano(Now()) - 86400000000000`,
+      `time_unix_nano > UnixNano(Now()) + 60000000000`,
     ]
   }
   output {
@@ -663,23 +749,22 @@ loki.process "cribl_keycloak_auth" {
   }
   stage.regex {
     source     = "keycloak_message"
-    expression = `^type=(?P<keycloak_event>CLIENT_LOGIN|CLIENT_LOGIN_ERROR|CODE_TO_TOKEN|CODE_TO_TOKEN_ERROR|IDENTITY_PROVIDER_FIRST_LOGIN|IDENTITY_PROVIDER_FIRST_LOGIN_ERROR|IDENTITY_PROVIDER_LOGIN|IDENTITY_PROVIDER_LOGIN_ERROR|IDENTITY_PROVIDER_POST_LOGIN|IDENTITY_PROVIDER_POST_LOGIN_ERROR|IMPERSONATE|IMPERSONATE_ERROR|LOGIN|LOGIN_ERROR|LOGOUT|LOGOUT_ERROR|REFRESH_TOKEN|REFRESH_TOKEN_ERROR|USER_DISABLED_BY_PERMANENT_LOCKOUT|USER_DISABLED_BY_PERMANENT_LOCKOUT_ERROR|USER_DISABLED_BY_TEMPORARY_LOCKOUT|USER_DISABLED_BY_TEMPORARY_LOCKOUT_ERROR)(?:,|$)`
+    expression = `^type="(?P<keycloak_event>CLIENT_LOGIN|CLIENT_LOGIN_ERROR|CODE_TO_TOKEN|CODE_TO_TOKEN_ERROR|IDENTITY_PROVIDER_FIRST_LOGIN|IDENTITY_PROVIDER_FIRST_LOGIN_ERROR|IDENTITY_PROVIDER_LOGIN|IDENTITY_PROVIDER_LOGIN_ERROR|IDENTITY_PROVIDER_POST_LOGIN|IDENTITY_PROVIDER_POST_LOGIN_ERROR|IMPERSONATE|IMPERSONATE_ERROR|LOGIN|LOGIN_ERROR|LOGOUT|LOGOUT_ERROR|REFRESH_TOKEN|REFRESH_TOKEN_ERROR|USER_DISABLED_BY_PERMANENT_LOCKOUT|USER_DISABLED_BY_PERMANENT_LOCKOUT_ERROR|USER_DISABLED_BY_TEMPORARY_LOCKOUT|USER_DISABLED_BY_TEMPORARY_LOCKOUT_ERROR)"(?:,|$)`
   }
   stage.regex {
     source     = "keycloak_message"
-    expression = `(?:^|, )[Rr]ealm[Ii]d=(?P<keycloak_realm_id>[A-Za-z0-9_.:@-]{1,128})(?:,|$)`
+    expression = `(?:^|, )realmId="(?P<keycloak_realm_id>[A-Za-z0-9_.:@-]{1,128})"(?:,|$)`
   }
   stage.regex {
     source     = "keycloak_message"
-    expression = `(?:^|, )[Cc]lient[Ii]d=(?P<keycloak_client_id>[A-Za-z0-9_.:@/-]{1,128})(?:,|$)`
+    expression = `(?:^|, )clientId="(?P<keycloak_client_id>[A-Za-z0-9_.:@/-]{1,128})"(?:,|$)`
   }
   stage.regex {
     source     = "keycloak_message"
-    expression = `(?:^|, )[Uu]ser[Ii]d=(?P<keycloak_user_id>[A-Za-z0-9_.:@-]{1,128})(?:,|$)`
+    expression = `(?:^|, )userId="(?P<keycloak_user_id>[A-Za-z0-9_.:@-]{1,128})"(?:,|$)`
   }
   stage.labels {
     values = {
-      aigw_security_event_class = "keycloak_event",
       keycloak_event            = "",
       keycloak_client_id        = "",
       keycloak_realm_id         = "",
@@ -688,7 +773,8 @@ loki.process "cribl_keycloak_auth" {
   }
   stage.static_labels {
     values = {
-      aigw_security_schema = "1",
+      aigw_security_event_class = "keycloak_event",
+      aigw_security_schema      = "1",
     }
   }
   stage.match {
@@ -808,23 +894,29 @@ loki.process "cribl_structured_security" {
     source = "aigw_security_json"
     expressions = {
       security_action                  = "action",
+      security_attempt                 = "attempt",
       security_ca_fingerprints         = "ca_sha256_fingerprints",
       security_changed                 = "changed",
+      security_change_kind             = "change_kind",
       security_error_type              = "error_type",
       security_event                   = "event",
       security_exact_sans              = "exact_sans",
+      security_group                   = "group",
       security_ldap_provider           = "ldap_provider",
       security_outcome                 = "outcome",
+      security_operation_id            = "operation_id",
       security_policy_sha256            = "policy_sha256",
       security_project                 = "project",
       security_providers               = "providers",
       security_purpose                 = "purpose",
       security_reason                  = "reason",
+      security_rotation_id             = "rotation_id",
       security_rotation_status         = "rotation_status",
       security_schema                  = "schema_version",
       security_sni                     = "sni",
       security_state                   = "state",
       security_subject                 = "subject",
+      security_target_subject          = "target_subject",
       security_vendor                  = "vendor",
     }
   }
@@ -839,28 +931,127 @@ loki.process "cribl_structured_security" {
     source   = "security_changed"
     template = `{{ if eq .Value true }}true{{ else if eq .Value false }}false{{ end }}`
   }
+  // JSON numbers arrive as float64. Keep only that source type here; a quoted
+  // look-alike becomes empty, and the exact integer regex below rejects a
+  // fraction, zero, a negative value, or anything above 999.
+  stage.template {
+    source   = "security_attempt"
+    template = `{{ if kindIs "float64" .Value }}{{ .Value }}{{ end }}`
+  }
+  // These internal flags let the event-specific gates reject a field that its
+  // producer never emits. They are removed before export.
+  stage.template {
+    source   = "security_detail_any"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_group .security_ldap_provider .security_operation_id .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_changed"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_change_kind .security_error_type .security_exact_sans .security_group .security_ldap_provider .security_operation_id .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_error"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_exact_sans .security_group .security_ldap_provider .security_operation_id .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_ldap_error"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_exact_sans .security_group .security_operation_id .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_ldap"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_group .security_operation_id .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_group"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_ldap_provider .security_operation_id .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_group_target"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_ldap_provider .security_operation_id .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_group_target_project"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_ldap_provider .security_operation_id .security_policy_sha256 .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_group_operation"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_ldap_provider .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_group_target_operation"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_ldap_provider .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_group_project_operation"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_ldap_provider .security_policy_sha256 .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_group_target_project_operation"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_ldap_provider .security_policy_sha256 .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_project_operation"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_group .security_ldap_provider .security_policy_sha256 .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_error_operation"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_exact_sans .security_group .security_ldap_provider .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_ldap_operation"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_group .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_managed_change"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_error_type .security_exact_sans .security_group .security_ldap_provider .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
   stage.labels {
     values = {
-      aigw_security_event_class = "security_event",
       aigw_security_schema      = "security_schema",
       security_action           = "",
+      security_attempt          = "",
       security_ca_fingerprints  = "",
       security_changed          = "",
+      security_change_kind      = "",
+      security_detail_any       = "",
+      security_detail_except_changed = "",
+      security_detail_except_error = "",
+      security_detail_except_group = "",
+      security_detail_except_group_operation = "",
+      security_detail_except_group_project_operation = "",
+      security_detail_except_group_target = "",
+      security_detail_except_group_target_operation = "",
+      security_detail_except_group_target_project = "",
+      security_detail_except_group_target_project_operation = "",
+      security_detail_except_ldap = "",
+      security_detail_except_ldap_operation = "",
+      security_detail_except_ldap_error = "",
+      security_detail_except_managed_change = "",
+      security_detail_except_project_operation = "",
+      security_detail_except_error_operation = "",
       security_error_type       = "",
       security_event            = "",
       security_exact_sans       = "",
+      security_group            = "",
       security_ldap_provider    = "",
       security_outcome          = "",
+      security_operation_id     = "",
       security_policy_sha256    = "",
       security_project          = "",
       security_providers        = "",
       security_purpose          = "",
       security_reason           = "",
+      security_rotation_id      = "",
       security_rotation_status  = "",
       security_sni              = "",
       security_state            = "",
       security_subject          = "",
+      security_target_subject   = "",
       security_vendor           = "",
+    }
+  }
+  stage.static_labels {
+    values = {
+      aigw_security_event_class = "security_event",
     }
   }
   stage.match {
@@ -884,17 +1075,332 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "mismatched_security_emitter"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"key[.]generate|key[.]deactivate|egress[.]trust[.]verify|rotation[.]settings[.]update|rotation[.]trigger|provider[.]anthropic[.](configure|disable|delete)|identity[.]member[.]remove|identity[.]group[.]policy|admin[.]key[.](block|unblock|limits)\"}"
+    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"key[.]generate|key[.]deactivate|egress[.]trust[.]verify|rotation[.]settings[.]update|rotation[.]trigger|provider[.]anthropic[.](configure|disable|delete)|identity[.]member[.]remove|identity[.]group[.]policy|identity[.]group[.](create|delete)|identity[.]member[.]add|authorization[.](role[.]denied|step_up[.]required)|admin[.]key[.](block|unblock|limits)\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_portal_action"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.identity.audit\",security_action!~\"bootstrap|break_glass_use|deployment_converge|group_policy_update|group_create|group_delete|group_member_add|group_member_remove\"}"
+    selector            = "{security_event=\"aigw.identity.audit\",security_action!~\"bootstrap|bootstrap_cleanup|break_glass_activate|break_glass_disable|break_glass_use|deployment_converge|group_policy_update|group_create|group_delete|group_member_add|group_member_remove|ldap_check|ldap_drift_detected|ldap_recovery|managed_identity_change_applied|managed_identity_change_planned|managed_identity_drift_detected|managed_identity_recovery\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_identity_action"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.provider.rotation\",security_action!=\"rotate\"}"
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"authorization[.](role[.]denied|step_up[.]required)\",security_outcome!=\"failure\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"identity[.]group[.](create|delete)|identity[.]member[.]add\",security_outcome!~\"intent|success|failure|indeterminate\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"authorization[.](role[.]denied|step_up[.]required)\",security_detail_any!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"identity[.]group[.](create|delete)\",security_group=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"identity[.]group[.](create|delete)\",security_detail_except_group_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.add\",security_group=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.add\",security_target_subject=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.add\",security_detail_except_group_target_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.remove\",security_outcome!~\"intent|success|failure|indeterminate\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.remove\",security_group=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.remove\",security_target_subject=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.remove\",security_outcome=\"success\",security_project=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.remove\",security_outcome=\"success\",security_detail_except_group_target_project_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.member.remove\",security_outcome=~\"intent|failure|indeterminate\",security_detail_except_group_target_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"identity[.]group[.](create|delete|policy)|identity[.]member[.](add|remove)\",security_operation_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.group.policy\",security_outcome!~\"intent|success|failure|indeterminate\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.group.policy\",security_group=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.group.policy\",security_outcome=\"success\",security_project=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.group.policy\",security_outcome=\"success\",security_detail_except_group_project_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"identity.group.policy\",security_outcome=~\"intent|failure|indeterminate\",security_detail_except_group_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"key.generate\",security_outcome!~\"success|failure|denied-active-key|denied-membership\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"key.deactivate\",security_outcome!~\"success|failure|denied-membership|denied-ownership\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_outcome=\"denied-ownership\",security_action!=\"key.deactivate\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_outcome=\"denied-membership\",security_action!~\"key[.]generate|key[.]deactivate|admin[.]key[.]unblock\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"bootstrap_cleanup|managed_identity_change_applied|managed_identity_change_planned|managed_identity_drift_detected|managed_identity_recovery\",security_changed!=\"true\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_create|group_delete\",security_outcome!~\"success|failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_create|group_delete\",security_outcome=\"success\",security_group=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_create|group_delete\",security_outcome=\"success\",security_detail_except_group_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_member_add|group_member_remove\",security_outcome!~\"success|failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_member_add|group_member_remove\",security_outcome=\"success\",security_group=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_member_add|group_member_remove\",security_outcome=\"success\",security_target_subject=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"group_member_add\",security_outcome=\"success\",security_detail_except_group_target_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"group_member_remove\",security_outcome=\"success\",security_project=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"group_member_remove\",security_outcome=\"success\",security_detail_except_group_target_project_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_create|group_delete|group_member_add|group_member_remove|group_policy_update\",security_operation_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_create|group_delete|group_member_add|group_member_remove|group_policy_update\",security_outcome=\"failed\",security_error_type=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"group_create|group_delete|group_member_add|group_member_remove|group_policy_update\",security_outcome=\"failed\",security_detail_except_error_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"group_policy_update\",security_outcome!~\"success|failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"group_policy_update\",security_outcome=\"success\",security_project=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_event_target"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"group_policy_update\",security_outcome=\"success\",security_detail_except_project_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"bootstrap_cleanup\",security_detail_except_changed!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"bootstrap_cleanup\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"managed_identity_drift_detected\",security_outcome!=\"failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"managed_identity_recovery\",security_outcome!~\"success|failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"managed_identity_change_applied|managed_identity_change_planned|managed_identity_drift_detected|managed_identity_recovery\",security_operation_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"managed_identity_change_applied|managed_identity_change_planned|managed_identity_drift_detected|managed_identity_recovery\",security_detail_except_managed_change!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"managed_identity_change_applied|managed_identity_change_planned\",security_change_kind!=\"planned_change\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_change_kind"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"managed_identity_drift_detected|managed_identity_recovery\",security_change_kind!=\"security_drift\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_change_kind"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"managed_identity_change_planned\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"managed_identity_change_applied\",security_outcome!~\"success|failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"break_glass_activate|break_glass_disable\",security_outcome!~\"success|failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"break_glass_activate|break_glass_disable\",security_outcome=\"success\",security_detail_any!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"break_glass_activate|break_glass_disable\",security_outcome=\"failed\",security_error_type=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"break_glass_activate|break_glass_disable\",security_outcome=\"failed\",security_detail_except_error!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"ldap_check\",security_outcome!=\"failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"ldap_check\",security_ldap_provider=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"ldap_check\",security_error_type=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"ldap_check\",security_detail_except_ldap_error!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"ldap_drift_detected\",security_outcome!=\"failed\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=\"ldap_recovery\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"ldap_drift_detected|ldap_recovery\",security_ldap_provider=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_identity_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"ldap_drift_detected|ldap_recovery\",security_operation_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_identity_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action=~\"ldap_drift_detected|ldap_recovery\",security_detail_except_ldap_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action!~\"start|attempt|rotate|recovery\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_rotation_action"
   }
@@ -904,9 +1410,59 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "unapproved_rotation_vendor"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.provider.rotation\",security_rotation_status!~\"success|failed|skipped|disabled\"}"
+    selector            = "{security_event=\"aigw.provider.rotation\",security_rotation_status!~\"started|success|failed|skipped|disabled|recovered\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_rotation_status"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_rotation_id!~\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_rotation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=~\"attempt|rotate|recovery\",security_attempt!~\"[1-9][0-9]{0,2}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_rotation_attempt"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=\"start\",security_attempt!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_rotation_attempt"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=\"start\",security_rotation_status!=\"started\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_rotation_status"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=~\"attempt|rotate\",security_rotation_status!~\"success|failed|skipped|disabled\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_rotation_status"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=\"recovery\",security_rotation_status!=\"recovered\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_rotation_status"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=\"start\",security_rotation_status=\"started\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_rotation_outcome"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=\"recovery\",security_rotation_status=\"recovered\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_rotation_outcome"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=~\"attempt|rotate\",security_rotation_status=\"success\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_rotation_outcome"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.provider.rotation\",security_action=~\"attempt|rotate\",security_rotation_status=~\"failed|skipped|disabled\",security_outcome!=\"failure\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_rotation_outcome"
   }
   stage.match {
     selector            = "{security_event=\"aigw.vault.state\",security_action!=\"state_observed\"}"
@@ -924,7 +1480,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "unapproved_egress_action"
   }
   stage.match {
-    selector            = "{security_outcome!~\"success|failure|failed|mismatch|denied-active-key|denied-membership\"}"
+    selector            = "{security_outcome!~\"intent|success|failure|failed|indeterminate|mismatch|denied-active-key|denied-membership|denied-ownership\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_security_outcome"
   }
@@ -937,6 +1493,16 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "malformed_security_subject"
   }
   stage.match {
+    selector            = "{security_group!~\"|[A-Za-z0-9][A-Za-z0-9._-]{0,127}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_group"
+  }
+  stage.match {
+    selector            = "{security_target_subject!~\"|[A-Za-z0-9][A-Za-z0-9._-]{0,127}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_target_subject"
+  }
+  stage.match {
     selector            = "{security_project!~\"|[a-z0-9][a-z0-9_.-]{0,63}\"}"
     action              = "drop"
     drop_counter_reason = "malformed_security_project"
@@ -945,6 +1511,41 @@ loki.process "cribl_structured_security" {
     selector            = "{security_changed!~\"|true|false\"}"
     action              = "drop"
     drop_counter_reason = "malformed_security_changed"
+  }
+  stage.match {
+    selector            = "{security_change_kind!~\"|planned_change|security_drift\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_identity_change_kind"
+  }
+  stage.match {
+    selector            = "{security_operation_id!~\"|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_identity_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"identity[.]group[.](create|delete|policy)|identity[.]member[.](add|remove)\",security_operation_id!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action!~\"group_create|group_delete|group_member_add|group_member_remove|group_policy_update|ldap_drift_detected|ldap_recovery|managed_identity_change_applied|managed_identity_change_planned|managed_identity_drift_detected|managed_identity_recovery\",security_operation_id!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event!~\"aigw[.]portal[.]audit|aigw[.]identity[.]audit\",security_operation_id!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.identity.audit\",security_action!~\"managed_identity_change_applied|managed_identity_change_planned|managed_identity_drift_detected|managed_identity_recovery\",security_change_kind!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_change_kind"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.identity.audit\",security_change_kind!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_identity_change_kind"
   }
   stage.match {
     selector            = "{security_error_type!~\"|[A-Za-z][A-Za-z0-9_]{0,127}\"}"
@@ -1024,6 +1625,16 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "missing_rotation_status"
   }
   stage.match {
+    selector            = "{security_event!=\"aigw.provider.rotation\",security_rotation_id!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_rotation_id"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.provider.rotation\",security_attempt!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_rotation_attempt"
+  }
+  stage.match {
     selector            = "{security_event=\"aigw.vault.state\",security_state=\"\"}"
     action              = "drop"
     drop_counter_reason = "missing_vault_state"
@@ -1060,32 +1671,132 @@ loki.process "cribl_structured_security" {
   }
   stage.template {
     source = "aigw_security_line"
-    template = `schema_version=1 event={{ .security_event }} action={{ .security_action }} outcome={{ .security_outcome }}{{ if .security_subject }} subject={{ .security_subject }}{{ end }}{{ if .security_project }} project={{ .security_project }}{{ end }}{{ if .security_changed }} changed={{ .security_changed }}{{ end }}{{ if .security_error_type }} error_type={{ .security_error_type }}{{ end }}{{ if .security_ldap_provider }} ldap_provider={{ .security_ldap_provider }}{{ end }}{{ if .security_purpose }} purpose={{ .security_purpose }}{{ end }}{{ if .security_vendor }} vendor={{ .security_vendor }}{{ end }}{{ if .security_rotation_status }} rotation_status={{ .security_rotation_status }}{{ end }}{{ if .security_state }} state={{ .security_state }}{{ end }}{{ if .security_policy_sha256 }} policy_sha256={{ .security_policy_sha256 }}{{ end }}{{ if .security_providers }} providers={{ .security_providers }}{{ end }}{{ if .security_sni }} sni={{ .security_sni }}{{ end }}{{ if .security_exact_sans }} exact_sans={{ .security_exact_sans }}{{ end }}{{ if .security_ca_fingerprints }} ca_sha256_fingerprints={{ .security_ca_fingerprints }}{{ end }}{{ if .security_reason }} reason={{ .security_reason }}{{ end }}`
+    template = `schema_version=1 event={{ .security_event }} action={{ .security_action }} outcome={{ .security_outcome }}{{ if .security_subject }} subject={{ .security_subject }}{{ end }}{{ if .security_group }} group={{ .security_group }}{{ end }}{{ if .security_target_subject }} target_subject={{ .security_target_subject }}{{ end }}{{ if .security_project }} project={{ .security_project }}{{ end }}{{ if .security_changed }} changed={{ .security_changed }}{{ end }}{{ if .security_change_kind }} change_kind={{ .security_change_kind }}{{ end }}{{ if .security_operation_id }} operation_id={{ .security_operation_id }}{{ end }}{{ if .security_error_type }} error_type={{ .security_error_type }}{{ end }}{{ if .security_ldap_provider }} ldap_provider={{ .security_ldap_provider }}{{ end }}{{ if .security_purpose }} purpose={{ .security_purpose }}{{ end }}{{ if .security_vendor }} vendor={{ .security_vendor }}{{ end }}{{ if .security_rotation_id }} rotation_id={{ .security_rotation_id }}{{ end }}{{ if .security_attempt }} attempt={{ .security_attempt }}{{ end }}{{ if .security_rotation_status }} rotation_status={{ .security_rotation_status }}{{ end }}{{ if .security_state }} state={{ .security_state }}{{ end }}{{ if .security_policy_sha256 }} policy_sha256={{ .security_policy_sha256 }}{{ end }}{{ if .security_providers }} providers={{ .security_providers }}{{ end }}{{ if .security_sni }} sni={{ .security_sni }}{{ end }}{{ if .security_exact_sans }} exact_sans={{ .security_exact_sans }}{{ end }}{{ if .security_ca_fingerprints }} ca_sha256_fingerprints={{ .security_ca_fingerprints }}{{ end }}{{ if .security_reason }} reason={{ .security_reason }}{{ end }}`
   }
   stage.output { source = "aigw_security_line" }
   stage.label_drop {
     values = [
       "security_action",
+      "security_attempt",
       "security_ca_fingerprints",
       "security_changed",
+      "security_change_kind",
+      "security_detail_any",
+      "security_detail_except_changed",
+      "security_detail_except_error",
+      "security_detail_except_error_operation",
+      "security_detail_except_group",
+      "security_detail_except_group_operation",
+      "security_detail_except_group_project_operation",
+      "security_detail_except_group_target",
+      "security_detail_except_group_target_operation",
+      "security_detail_except_group_target_project",
+      "security_detail_except_group_target_project_operation",
+      "security_detail_except_ldap",
+      "security_detail_except_ldap_operation",
+      "security_detail_except_ldap_error",
+      "security_detail_except_managed_change",
+      "security_detail_except_project_operation",
       "security_error_type",
       "security_event",
       "security_exact_sans",
+      "security_group",
       "security_ldap_provider",
       "security_outcome",
+      "security_operation_id",
       "security_policy_sha256",
       "security_project",
       "security_providers",
       "security_purpose",
       "security_reason",
+      "security_rotation_id",
       "security_rotation_status",
       "security_sni",
       "security_state",
       "security_subject",
+      "security_target_subject",
       "security_vendor",
     ]
   }
   forward_to = [otelcol.receiver.loki.cribl_security_logs.receiver]
+}
+
+// The controller writes one exact, sorted JSON schema to an owned two-file
+// rotation boundary. Match the full line so extra keys, missing keys, quoted
+// numeric fields, unknown actions, and malformed release identifiers fail
+// closed. Rebuild the exported body from the fixed captures only.
+loki.source.file "controller_lifecycle" {
+  targets = [
+    {
+      __path__ = "/var/log/aigw/controller/lifecycle.jsonl",
+      job      = "controller-lifecycle",
+    },
+    {
+      __path__ = "/var/log/aigw/controller/lifecycle.jsonl.1",
+      job      = "controller-lifecycle",
+    },
+  ]
+  forward_to = [loki.process.cribl_controller_lifecycle.receiver]
+  file_match {
+    enabled     = true
+    sync_period = "10s"
+  }
+}
+
+loki.process "cribl_controller_lifecycle" {
+  stage.regex {
+    expression = `^\{"action":"(?P<controller_action>upgrade|rollback)","egress_policy_sha256":"(?P<controller_egress_policy_sha256>[0-9a-f]{64})","envoy_image_id":"(?P<controller_envoy_image_id>sha256:[0-9a-f]{64})","event":"aigw\.controller\.lifecycle","operation_id":"(?P<controller_operation_id>[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","outcome":"(?P<controller_outcome>started|success|failed)","release_commit":"(?P<controller_release_commit>(?:[0-9a-f]{40}|[0-9a-f]{64}))","release_manifest_sha256":"(?P<controller_release_manifest_sha256>[0-9a-f]{64})","schema_version":(?P<controller_schema>1),"timestamp":"(?P<controller_timestamp>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z)"\}$`
+  }
+  stage.labels {
+    values = {
+      controller_action                  = "",
+      controller_egress_policy_sha256    = "",
+      controller_envoy_image_id          = "",
+      controller_operation_id            = "",
+      controller_outcome                 = "",
+      controller_release_commit          = "",
+      controller_release_manifest_sha256 = "",
+      controller_schema                  = "",
+      controller_timestamp               = "",
+    }
+  }
+  stage.match {
+    selector            = "{controller_schema!=\"1\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_controller_lifecycle_record"
+  }
+  stage.timestamp {
+    source = "controller_timestamp"
+    format = "2006-01-02T15:04:05.000Z"
+  }
+  stage.template {
+    source = "controller_security_line"
+    template = `schema_version=1 event=aigw.controller.lifecycle action={{ .controller_action }} outcome={{ .controller_outcome }} operation_id={{ .controller_operation_id }} release_manifest_sha256={{ .controller_release_manifest_sha256 }} release_commit={{ .controller_release_commit }} envoy_image_id={{ .controller_envoy_image_id }} egress_policy_sha256={{ .controller_egress_policy_sha256 }}`
+  }
+  stage.output { source = "controller_security_line" }
+  stage.static_labels {
+    values = {
+      aigw_security_event_class = "controller_lifecycle",
+      aigw_security_schema      = "1",
+    }
+  }
+  stage.label_drop {
+    values = [
+      "controller_action",
+      "controller_egress_policy_sha256",
+      "controller_envoy_image_id",
+      "controller_operation_id",
+      "controller_outcome",
+      "controller_release_commit",
+      "controller_release_manifest_sha256",
+      "controller_schema",
+      "controller_timestamp",
+    ]
+  }
+  forward_to = [
+    loki.write.local.receiver,
+    otelcol.receiver.loki.cribl_security_logs.receiver,
+  ]
 }
 
 // Vault writes its HMAC-protected JSON audit records to a dedicated read-only

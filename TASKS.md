@@ -2,92 +2,52 @@
 
 ## Active
 
-<a id="finish-r14-visual-browser-acceptance"></a>
+<a id="complete-current-candidate-release-acceptance"></a>
 
-- [ ] **Finish `r14` visual browser acceptance** - Candidate `r14` was built
-  from pushed commit `c5c1e503053c76e35f8bb93d242a9ac630d1b98e`. Its exact
-  preprod pair passed clean-room purge, fresh archive loading, one Ansible
-  seed-mode deploy, and the full integration and end-to-end gate. The initial
-  pre-deploy purge receipt removed 26 containers, 19 networks, 11 volumes, 62
-  aliases, and all 43 target image IDs while preserving 185 unrelated IDs.
-  Pulls and source builds stayed off. All 25 long-running containers were
-  healthy on the exact manifest image IDs. The run ended with
-  `PREPROD_CLEAN_ROOM_OK`, `PREPROD_E2E_PASSED`, and
-  `SEEDED_PREPROD_E2E_PASSED`.
+- [ ] **Complete the current source candidate release acceptance** - The
+  current worktree has changes that are newer than every saved release receipt.
+  Old `r10` through `r14` results are history. They do not approve this source.
 
-  The r14 test also proved that LiteLLM audit spans use Alloy's authenticated
-  receiver and that missing, wrong, or caller-forged source proof is rejected.
-  The visual browser replay could not run because no browser session exists.
-  Reload the exact r14 preprod pair and run that replay when a browser is
-  available. Keep the `r10` Chrome result as historical evidence; do not use it
-  as `r14` proof.
+  - Commit the final source locally. Build a new Anthropic-only production pair
+    and matching preprod pair from that exact commit. Push that same commit only
+    after the local release gate passes.
+  - Use the preprod pair for the only release rehearsal. Run the exact-manifest
+    clean-room purge, require a fresh archive `LOADED` result, and deploy once
+    with `ansible/preprod.yml`. Do not create a Rocky or Parallels test VM.
+  - Run the full integration, end-to-end, identity, telemetry, Cribl,
+    upgrade/rollback contract, Vault restart, and browser gates against those
+    exact image IDs. A browser result from an older seed is not proof.
+  - Save the commit, four file hashes, provider policy digest, Envoy image ID,
+    container health, test markers, and GitHub job results. These values are
+    pending until the new seed run finishes.
+  - End with `ansible/preprod-clean-room.yml` and the exact tested manifest.
+    Prove all owned containers, images, volumes, networks, generated state,
+    hosts entries, and loopback aliases are absent. Also prove unrelated image
+    IDs are unchanged. The ordinary destroy play is only development cleanup.
 
-  After testing, the final bounded clean-room teardown returned
-  `PREPROD_CLEAN_ROOM_OK` for project `aigw-preprod`, cleanup-receipt schema 1,
-  and manifest
-  `1ab6902ace9c1b25a3e8a3a1d1a81e014dbf60d0045d8e67a4b8604b7b58ceab`.
-  It removed 26 containers, 19 networks, 11 volumes, 43 image aliases, 43 image
-  IDs, and three generated state files while preserving 185 unrelated image
-  IDs. Ansible also removed the owned macOS loopback aliases and marker-bounded
-  hosts fragment.
-- [ ] **Finish the approved Cribl security-event feed** - Alloy now sends a
-  small, versioned security feed over verified OTLP/gRPC TLS. Raw metrics, raw
-  traces, alerts, ordinary service logs, and the raw Vault audit file stay
-  local. The persistent queue is capped at 2 GiB and retries a dequeued batch
-  for up to 24 hours. Prometheus stays local with a 30-day and 5 GB cap.
+- [ ] **Finish the current-candidate Cribl release receipt** - The in-stack
+  security-feed contract is implemented, but the final receipt must come from
+  the exact new preprod seed above.
 
-  - **Implemented event paths:** AI request audit, the exact Keycloak
-    authentication event list, reviewed portal actions, identity deployment
-    success/failure, deployment break-glass use, provider-rotation terminal
-    result, Vault state, bounded Vault audit metadata, Envoy startup success or
-    failure, and selected-provider TLS failure.
-  - **Fixed-field boundary:** Alloy rebuilds structured records from approved
-    scalar fields. It never exports the source JSON, an unknown field, a nested
-    value, or an unparsed fallback. The Anthropic startup record contains the
-    policy digest, provider, SNI, exact SAN, and reviewed CA fingerprints. The
-    Envoy image ID is correlated from the verified manifest and live Docker
-    inspection; it is not self-embedded in the image event.
-  - **Current test evidence:** the preprod Docker-log records are synthetic
-    classifier fixtures. They prove allow, deny, fixed-field, unknown-field,
-    and nested-secret behavior. The AI request follows Alloy's real OTLP path,
-    and the Vault audit check follows the real Vault file path. Verified TLS,
-    wrong-server-name rejection, queue outage/recovery, and Alloy restart also
-    pass. Do not use a synthetic fixture as proof that a live producer emitted
-    an event.
-  - **Prompt-value redaction gap:** Alloy redacts three tested credential forms
-    from the four reviewed string fields: named credential assignments, Bearer
-    or Basic tokens, and `sk-` or `sk-ant-` keys. It now removes a non-string or
-    nested value before spanlogs can copy it to Loki or Cribl. Still add narrow,
-    reviewed string patterns for other supported secret formats. Do not use a
-    generic high-entropy rule that would destroy useful prompt records.
-  - **Attribution gap:** AI request export now requires bounded user ID, user
-    name, key hash, project ID, and request ID fields. Still prove readable-name
-    quality for chat, direct API, and every supported client path.
-    `aigw.user.name` is readable attribution, not an authorization fact. Keep
-    stable subject, key, and project evidence separate.
-  - **Source authentication is complete:** commit `c5c1e50` added a dedicated
-    bearer-authenticated LiteLLM receiver. The open receiver removes a
-    caller-owned trust marker and rejects `service.name=litellm`. Alloy stamps
-    its own marker only after the token passes. Commit `33c79e5` validates a
-    restored token before it repairs the exact reader group and file mode.
-  - **Common-record gap:** the handoff expects a recent UTC time, fixed
-    environment, producer, and schema on every record. The current projection
-    does not enforce all four fields for every event class. Add fixed
-    `preprod`/`production` values, a reviewed producer name, and recent-time
-    checks. Test every record class and reject a zero or stale timestamp.
-  - **Event gaps:** add a reviewed sender for controller-only events; provider
-    rotation start, attempt, failure, and recovery; application authorization
-    denials and uncovered privileged changes; LDAP and managed-identity drift,
-    reconcile failure, and recovery; and break-glass activation, disable, and
-    cleanup. Current provider-key promotion does not restore the previous
-    secret. Design and implement a safe recovery or rollback capability before
-    adding an event that claims it happened. Add natural producer receipt tests
-    for every new event.
-  - **External acceptance:** the Cribl/SOC team must supply the approved
-    endpoint and CA, repeat the wire and field receipt, enforce and prove
-    24-hour destination retention, and decide whether the gateway also needs a
-    hard per-record 24-hour queue age. Keep queue alerts on the local metrics
-    path; never send alert payloads through the SOC feed.
+  - Alloy applies one common-record gate with a server-owned schema,
+    environment, producer, matching service name, and recent UTC time.
+  - The reviewed feed includes AI request audit, natural quoted Keycloak login
+    events, portal and identity actions, provider rotation, Vault state and
+    bounded audit metadata, Envoy trust events, and controller upgrade or
+    rollback events from the protected target file source.
+  - Prompt and completion fields use the six reviewed secret patterns and drop
+    non-string or nested values. Unknown source fields are ignored; malformed
+    or missing approved fields drop the outbound record.
+  - Open WebUI's signed subject is the stable per-user audit ID. Its signed
+    username or e-mail is the one reviewed readable-name exception and may
+    contain `@`. The shared LiteLLM key proves service authorization only.
+  - Managed identity uses planned/applied or security-drift/recovery events.
+    One durable UUID follows retries through the pending Vault state. LDAP
+    provider rename fails closed unless a legacy blank-name record points to
+    the same live provider ID.
+  - A source-mode preprod test has received natural quoted `LOGIN`,
+    `LOGIN_ERROR`, and `LOGOUT` records. Treat that as implementation evidence,
+    not final release proof. Repeat it through the exact seeded run.
 
 ## Waiting On
 
@@ -109,7 +69,7 @@
   - Review every finding. Fix it or add an owned, dated, package-specific waiver
     with a clear reason. Record the remaining risk. A missing credential or
     skipped image is not a pass.
-  - Keep this as one release gate with the active r14 browser item. Customer
+  - Keep this as one release gate with the active current-candidate item. Customer
     Cribl receipt and retention remain the separate acceptance task below.
 
 <a id="complete-the-customer-cribl-acceptance-ceremony"></a>
@@ -172,18 +132,39 @@
   exact DHI PostgreSQL 17.10 and 18.4 images both work with the current
   database setup, LiteLLM, Keycloak, key-rotator, Grafana access rules,
   PostgreSQL 16 logical restore, and same-major physical restore. PostgreSQL
-  18.4 is stable, and the operator selected it. Release `r10` then put the exact
-  PostgreSQL 18 image in both seeds and passed two clean seeded preprod starts
-  with every database consumer healthy. Finish this item with
-  production-sized PostgreSQL 16 test data, a forced safe pre-cutover rollback,
-  a refused post-cutover downgrade, and a same-major PostgreSQL 18 physical
-  restore on an approved production-like host. Git history contains no recorded
-  technical reason for the original PostgreSQL 16 choice; describe any claim
-  beyond that as an inference.
+  18.4 is stable, and the operator selected it. Earlier seeded preprod runs put
+  the exact PostgreSQL 18 image in both seeds and started every database
+  consumer. Finish this item in local Docker preprod, using the exact current
+  preprod seed and synthetic production-sized PostgreSQL 16 data. Force a safe
+  pre-cutover rollback, prove a post-cutover downgrade is refused, and restore
+  a same-major PostgreSQL 18 backup. End with exact-manifest clean-room
+  teardown. Do not create a separate host or VM. Git history contains no
+  recorded technical reason for the original PostgreSQL 16 choice; describe
+  any claim beyond that as an inference.
+
+<a id="review-every-container-image-and-language-dependency-version"></a>
+
+- [ ] **Review every container image and language dependency version** - Check
+  each DHI and non-DHI runtime, build image, Python package, and Go toolchain.
+  Prefer the newest compatible stable release. Keep an older version only with
+  a written support, migration, or compatibility reason. For every promoted
+  pin, rebuild both schema-v2 seed pairs, run the full exact-seed local preprod
+  gate, prove rollback, and let GitHub scan the exact release. Record the
+  platform, digest, support state, security fixes, and decision. See the
+  [image update workflow](docs/image-update-workflow.md).
+
+<a id="run-a-new-operator-documentation-usability-review"></a>
+
+- [ ] **Run a new-operator documentation usability review** - The active guides
+  and diagrams use short sentences, direct commands, and checked links. Ask a
+  new preprod operator and a production operator to follow them without verbal
+  help. Fix unclear words, steps, links, bookmarks, and diagram labels. Save the
+  review notes with the next release evidence.
 - [ ] **Add model-aware usage, limits, catalog, cost, dashboards, and routing**
   - Start this only after the current release gates are complete. It does not
-    block r14. Reuse the existing LiteLLM, portal, Postgres, and Grafana paths;
-    do not add a second billing or identity source without an approved design.
+    block the current release. Reuse the existing LiteLLM, portal, Postgres,
+    and Grafana paths; do not add a second billing or identity source without
+    an approved design.
   - **Track tokens by model, user, and project:** Record the requested model,
     actual provider model, stable user ID, project ID, input tokens, output
     tokens, cache-write tokens, and cache-read tokens for each completed
@@ -242,16 +223,20 @@
 
 ## Done
 
-- [x] ~~Rewrite and verify all active documentation and diagrams~~ (2026-07-21)
-  - All 48 active documentation pages now separate preprod from production and
-    use short, direct operator language at about an eighth-grade reading level.
-    Obsolete lab material is archived and labeled as non-operational.
+The dated `r7` through `r14` entries below are historical checkpoints. They do
+not approve the current source candidate.
+
+- [x] ~~Rewrite active documentation and add automated documentation checks~~ (2026-07-21)
+  - Active documentation separates preprod from production and uses short,
+    direct operator language. Obsolete lab material is archived and labeled as
+    non-operational.
   - Architecture, deployment, identity, network, security, provider, release,
     Cribl, PostgreSQL, Vault, and testing diagrams and procedures match the
     deployed design. The automated link, anchor/bookmark, navigation, and
     Mermaid-reference validator is green.
   - The test runbook explains unit, contract, integration, end-to-end, browser,
-    and final release gates.
+    and final release gates. The new-operator usability review remains open
+    above; automated checks cannot prove that every reader understands a page.
 - [x] ~~Run real-browser release acceptance~~ (2026-07-21)
   - System Chrome followed the domain-derived redirects between the developer
     portal, admin portal, Open WebUI, Grafana, and Keycloak.
@@ -328,15 +313,12 @@
     operator guides explain selection, capture provenance, CA rotation,
     validation, and recovery. They also separate certificate integrity, CA
     organization country, endpoint geography, and data residency.
-  - Exact r14 seeded preprod selected only `anthropic` and passed the owner-
-    approved live acceptance gate. Its policy digest is
-    `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`,
-    and its Envoy image ID is
-    `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
-    Seeded local preprod is the owner-approved live acceptance gate. No
-    separate rehearsal environment is required.
+  - Historical seeded preprod proved the Anthropic-only path. The current
+    candidate must create its own receipt through the active gate above.
+    Seeded local preprod is the live acceptance environment. No separate
+    rehearsal host or VM is required.
   - This closes the Envoy core, not the whole release. The
-    [active r14 browser check](#finish-r14-visual-browser-acceptance),
+    [current-candidate release check](#complete-current-candidate-release-acceptance),
     [credential-gated DHI security audit](#provide-protected-dhi-credentials-and-finish-the-release-security-audit),
     and [customer Cribl acceptance](#complete-the-customer-cribl-acceptance-ceremony)
     remain open.

@@ -52,144 +52,50 @@ before it changes anything.
 - Production keeps its firewall, routing, SELinux, encrypted-state, backup,
   Vault, and network checks. Preprod does not weaken those production rules.
 
-## Current release candidate: r14
+## Current source candidate
 
-Release candidate `r14` was built from pushed commit
-`c5c1e503053c76e35f8bb93d242a9ac630d1b98e`. Its production scope has 23
-external and 17 custom image references, for 40 total. Its preprod scope has 24
-external and 19 custom image references, for 43 total.
+The current worktree is newer than every saved offline-seed receipt. It is not
+release-approved yet. The final commit, four release-file hashes, policy
+digest, Envoy image ID, exact container image IDs, browser result, GitHub scan,
+and teardown receipt are all pending.
 
-There are two preprod-only custom services: `samba-ad:preprod` and
-`wif-provider-mock:preprod`. The Debian 13.6-slim base used by those builds is
-the third extra preprod image reference. None of these three references is in
-the production seed. Anthropic is the only selected provider.
+The current source adds these release controls:
 
-The exact `r14` preprod archive passed the clean-room Ansible test. The initial
-pre-deploy purge receipt removed 26 containers, 19 networks, 11 volumes, 62
-image aliases, and all 43 target image IDs. It preserved 185 unrelated image
-IDs. The archive then loaded fresh. Seed mode skipped pulls and source builds.
+- The Open WebUI assertion carries a stable per-user subject. Its signed
+  username or e-mail may become the reviewed readable audit name. The shared
+  LiteLLM key remains service authorization evidence only.
+- Managed identity changes use a durable UUID and pending Vault record. Planned
+  inventory changes use planned/applied events. Unexpected live changes use
+  security-drift/recovery events. LDAP provider rename fails closed unless a
+  legacy blank-name record points to the same live provider ID.
+- Alloy applies one common record gate before the Cribl queue. It also reads
+  protected target-side upgrade and rollback records. Prompt fields use the
+  reviewed redaction patterns before export.
+- A source-mode preprod receipt has seen natural quoted Keycloak `LOGIN`,
+  `LOGIN_ERROR`, and `LOGOUT` events. This is useful implementation evidence,
+  but it is not evidence for the final offline seed.
 
-The seeded test passed Redis first start, Vault, automatic Keycloak and LDAPS
-identity setup, all three users, WIF, OIDC roles and logout, edge inference,
-and Cribl queue outage and recovery. The Cribl test also proved that LiteLLM
-used the authenticated receiver and that a missing token, wrong token, or
-forged source marker could not create an AI audit record. The run ended with:
+The release owner must now build a new Anthropic-only schema-v2 pair from one
+exact local commit. The matching preprod pair must pass a fresh archive load,
+one Ansible seed-mode deploy, the full automated and browser checks, and a
+final exact-manifest clean-room teardown. Push that same commit after the local
+gate passes. Local seeded preprod is the only release rehearsal. Do not create
+a Rocky or Parallels test VM.
 
-```text
-PREPROD_CLEAN_ROOM_OK
-PREPROD_E2E_PASSED
-SEEDED_PREPROD_E2E_PASSED
-```
+The final teardown must prove that all owned containers, images, volumes,
+networks, generated files, hosts entries, and loopback aliases are absent. It
+must also prove that unrelated image IDs are unchanged. The ordinary destroy
+play is useful for development, but it is not the final release receipt.
 
-After the tests, the final bounded clean-room teardown returned
-`PREPROD_CLEAN_ROOM_OK` for project `aigw-preprod`, cleanup-receipt schema 1,
-and manifest
-`1ab6902ace9c1b25a3e8a3a1d1a81e014dbf60d0045d8e67a4b8604b7b58ceab`.
-It removed 26 containers, 19 networks, 11 volumes, 43 image aliases, 43 image
-IDs, and three generated state files. It preserved 185 unrelated image IDs.
-Ansible also removed the owned macOS loopback aliases and marker-bounded hosts
-fragment.
-
-| `r14` artifact | SHA-256 |
-| --- | --- |
-| Production archive | `b04cce16df11c366a098b3a9d801bc57a96051e0766caba182cd342493285298` |
-| Production manifest | `9b2efbd2f6768bd98f969b3f4312cf8d0cff9b1761d5d59dd7ebd44a6869c92f` |
-| Preprod archive | `482618f21eb5e09c3f41e9c9c55deada7e317edf4c4fada0f96dd7e93ff2a691` |
-| Preprod manifest | `1ab6902ace9c1b25a3e8a3a1d1a81e014dbf60d0045d8e67a4b8604b7b58ceab` |
-
-The exact r14 manifest selects only `anthropic`, with route `/anthropic/` and
-hostname, SNI, and SAN `api.anthropic.com`. Its Envoy policy digest is
-`8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
-Its Envoy image ID is
-`sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
-The two reviewed CA SHA-256 fingerprints are
-`1dfc1605fbad358d8bc844f76d15203fac9ca5c1a79fd4857ffaf2864fbebf96`
-and
-`349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d`.
-
-The visual browser replay has not run for `r14` because no browser session
-exists. Do not use the accepted `r10` browser result as proof for `r14`.
-
-The Open WebUI derivative in `r14` is `0.10.2-aigw2`. Its committed local
-OpenVEX review covers the one raw Scout finding, `CVE-2026-45829`, and expires
-on 2026-10-19. That review is unsigned and Git-reviewed; it is separate from
-Docker-signed DHI VEX. The protected GitHub release scan for the exact `r14`
-images is still blocked on its required DHI credentials, so this candidate is
-not release-approved.
-
-The r14 image pair was built at `c5c1e50`. Current deployment source also
-includes pushed follow-up `33c79e5`. That follow-up does not change the image
-set. It validates a restored LiteLLM telemetry token before Ansible repairs its
-reader group and mode.
-
-## Final local release evidence
-
-The last fully accepted local release is `r10`.
-
-The ARM64 `r10` release test ran on 2026-07-21. It built both schema-v2 seeds,
-destroyed the old owned test stack, removed all old release images, loaded the
-new preprod archive, and deployed once with Ansible in seed mode.
-
-The clean-room receipt removed 26 containers, 19 networks, 11 volumes, and 43
-release image IDs. It preserved 129 unrelated image IDs.
-
-After the documentation overhaul, the same `r10` preprod seed was tested again
-from a full clean room. The repeat removed the same owned resources and release
-images, preserved the same 129 unrelated image IDs, loaded the archive again,
-and performed one Ansible seed-mode deploy with pulls and source builds
-disabled. All 25 long-running containers were healthy at the end.
-
-The final markers were:
-
-```text
-PREPROD_CLEAN_ROOM_OK
-PREPROD_E2E_PASSED
-SEEDED_PREPROD_E2E_PASSED
-```
-
-All 25 long-running containers were healthy. The checks covered the Root CA,
-Samba AD and LDAPS, all three test users, automatic Keycloak setup, OIDC roles
-and callbacks, Vault init and unseal, WIF, mock inference, the immutable
-production Envoy startup gate, and the curated Cribl TLS queue and recovery
-path.
-
-The `r10` production seed has 40 image references. Its preprod seed has 43.
-Production does not contain the preprod-only Samba AD or WIF mock images, or
-their extra Debian base reference.
-
-| Artifact | SHA-256 |
-| --- | --- |
-| Production archive | `958ee15a3609a9bdee13d7144b941cbb4379136b1d674103f5ae887bf04cd453` |
-| Production manifest | `0960fab4f0133cf4be610c8e552a554eb3d795d5114bb108201243deb90c3da7` |
-| Preprod archive | `73e244dc6fc6fd347f7b8711a8710b586f554c603bcb1c4e0a3ca5938f0ad7e8` |
-| Preprod manifest | `80173e1a67fcb0997fd90572a1f1e8087d22ecd9a2438038f33f1191d93d7d02` |
-
-The selected provider is `anthropic`. The Envoy policy digest is
-`8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
-The Envoy image ID is
-`sha256:4fc925d12af6f8a693c363a5249ff7b71851c2276a3fcab7b3f6379fc2f66b35`.
-Two clean builds produced that same Envoy image ID.
-
-For `r10`, local code checks also passed: 762 infrastructure contracts, 147
-portal tests, 323 key-rotator tests, all four Go race and vet suites, Compose
-rendering, identity policy, documentation links, YAML lint, ShellCheck, Ruff,
-and Bandit.
-
-System Chrome also passed the real-browser acceptance check. It followed the
-domain-derived redirects for the developer portal, admin portal, Open WebUI,
-Grafana, and Keycloak. Allowed roles reached their pages, denied roles saw a
-403 page, logout cleared the application and Keycloak sessions, and Back plus
-Refresh did not reopen the protected developer page. The browser reported TLS
-1.3, `*.aigw.internal`, and the AI Gateway preprod test Root CA. The separate
-certificate tests proved the Root CA chain and names.
+Old `r7` through `r14` results remain dated history in [TASKS.md](../TASKS.md).
+They show that earlier code passed earlier tests. They do not approve this
+source candidate and must not supply its hashes or browser result.
 
 ## Gates that remain open
 
-- **r14 browser acceptance:** the exact `r14` seed passed clean-room loading,
-  Ansible deployment, integration, end-to-end, and authenticated Cribl checks.
-  Repeat the real-browser test for `r14` when a browser session is available.
-  Until then, `r10` remains the last release with full local and visual browser
-  acceptance.
+- **Current-candidate acceptance:** build and test a new exact seed from the
+  final pushed commit. The current candidate has no final seed, browser, or
+  teardown receipt yet.
 - **Credential-gated security audit:** credential-independent GitHub jobs are
   green. The DHI image jobs stop at their required credential gate because the
   `release-container-security` environment has no DHI secrets. Add approved
@@ -199,15 +105,14 @@ certificate tests proved the Root CA chain and names.
 - **Production ceremonies:** customer TLS, external LDAPS, Vault key custody,
   Anthropic enrollment, production backups, the real Cribl endpoint, and final
   access approval need customer operators. This is operator-owned work.
-- **Cribl retention:** the seeded receipt and outage recovery passed. The Cribl
-  team must still apply and prove its 24-hour destination retention. If a hard
-  24-hour age limit is required on the local queue, that control is still a
-  release gate. Trusted readable attribution and broader reviewed string-secret
-  patterns also remain open. See the
-  [Cribl handoff](cribl-soc-handoff.md).
+- **Cribl acceptance:** repeat the local receipt through the exact current
+  seed. The Cribl team must still apply and prove its 24-hour destination
+  retention. If a hard 24-hour age limit is required on the local queue, that
+  control is still a release gate. See the [Cribl handoff](cribl-soc-handoff.md).
 - **PostgreSQL migration size:** PostgreSQL 18.4 is stable and passed the full
-  seeded preprod stack. The production-sized PostgreSQL 16-to-18 rehearsal and
-  forced rollback cases remain in [TASKS.md](../TASKS.md).
+  seeded preprod stack in earlier tests. The production-sized PostgreSQL
+  16-to-18 rehearsal and forced rollback cases remain in
+  [TASKS.md](../TASKS.md). Run them in local seeded preprod, not on another VM.
 - **High availability:** the Compose design has no HA. See
   [scaling and availability](high-availability.md).
 - **Repository history:** the active tree has no prohibited customer or

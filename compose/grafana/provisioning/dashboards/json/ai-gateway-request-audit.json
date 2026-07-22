@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "ADM-only request audit over the dedicated Loki stream Alloy derives from litellm_request spans. Filter by readable user name or project with the dropdowns (Loki labels), or by opaque user ID, nonreversible API-key fingerprint, or request ID, and inspect the retained prompt/completion content per request.",
+  "description": "ADM-only request audit over the dedicated Loki stream Alloy derives from litellm_request spans. Filter by the server-selected attribution name or project with the dropdowns (Loki labels), or by opaque user ID, nonreversible API-key fingerprint, or request ID, and inspect the retained prompt/completion content per request.",
   "editable": false,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -41,7 +41,7 @@
           "showLineNumbers": false,
           "showMiniMap": false
         },
-        "content": "### Request audit contract\nEvery `litellm_request` span becomes one log line in the Loki stream `{service_name=\"aigw-requests\"}`. Each line carries `aigw.user.id` (stable subject UUID), `aigw.user.name` (readable identity: chat end user, portal username, or key alias — attribution only, never an authorization record), `aigw.enduser.id`, `aigw.project.id`, `aigw.api_key.id` (SHA-256 fingerprint only), `aigw.request.id`, the model/token/cost fields, and the approved `gen_ai.input.messages` / `gen_ai.output.messages` content; `| logfmt` exposes them as `aigw_user_id`-style fields (Logs Drilldown filters work the same way). `aigw_user_name` and `aigw_project_id` are also Loki stream labels — use the User/Project dropdowns above to filter every panel. Raw authorization, API keys, request headers, email, IP, and unfiltered LiteLLM auth metadata are removed before any export. Prompt content is sensitive and this dashboard is intentionally ADM-only.",
+        "content": "### Request audit contract\nEvery accepted `litellm_request` span becomes one log line in the Loki stream `{service_name=\"aigw-requests\"}`. Each line carries `aigw.user.id` (stable key subject), `aigw.user.name` (server-selected attribution only), `aigw.user.name_source`, `aigw.project.id`, `aigw.api_key.id` (SHA-256 fingerprint only), `aigw.request.id`, the model/token/cost fields, and approved prompt/completion content. Name sources are `portal_key_metadata`, `open_webui_signed_oidc`, or `key_subject`. Caller body values, plain user headers, end-user fields, and key aliases are never name authority. An unresolved name is dropped. `| logfmt` exposes fields with names such as `aigw_user_id`. `aigw_user_name` and `aigw_project_id` are also Loki stream labels, so the User and Project lists filter every panel. Raw authorization, API keys, JWTs, request headers, end-user fields, email, IP, and LiteLLM authentication metadata are removed before export. The readable name helps attribution; it never grants access. Prompt content is sensitive, so this dashboard is ADM-only.",
         "mode": "markdown"
       },
       "pluginVersion": "12.4.5",

@@ -92,8 +92,9 @@ class IdentityAutoBootstrapContractTests(unittest.TestCase):
         for text in (
             "async with self._bootstrap_lock",
             "await self._ensure_ldap_federation(",
-            "await self._reconcile_relying_party_redirect_uris(admin_token)",
-            "await self._reconcile_deployment_bootstrap_cleanup(admin_token)",
+            "await self._ensure_relying_parties(",
+            "await self._reconcile_deployment_bootstrap_cleanup(",
+            "self._escrow_vault_oidc_rp_secret()",
             "if not self._deployment_status_verified(after)",
         ):
             self.assertIn(text, converge)

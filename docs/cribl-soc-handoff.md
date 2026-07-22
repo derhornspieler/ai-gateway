@@ -80,18 +80,55 @@ record. The original span must not leave the gateway. The record may contain:
 Prompt and completion content is high-sensitivity data. It is allowed only in
 this dataset. It must not appear in runtime logs, metrics, or another SOC event
 class. For the four reviewed string prompt and completion attributes, Alloy
-applies three tested patterns: a named credential assignment, a Bearer or Basic
-token, and an `sk-` or `sk-ant-` key. A non-string or nested value is removed
-before spanlogs can copy it into Loki or Cribl. It is not recursively redacted.
-Broader string-secret formats are not covered yet. That gap remains open in
-[TASKS.md](../TASKS.md).
+redacts six narrow value shapes:
 
-The stable user, key, and project values come from the authenticated gateway
-key metadata. AI request export now fails closed unless bounded user ID,
-readable user name, key hash, project ID, and request ID fields are all present.
-`aigw.user.name` is readable attribution only. A direct API caller can label its
-own already-authorized request, so that name must not be treated as proof of
-identity. Readable-name quality checks for every client path remain open.
+- named credentials, including session material, Vault recovery material, and
+  client assertions;
+- Bearer and Basic authorization values;
+- `sk-` and `sk-ant-` vendor keys;
+- three-part JWT values;
+- Vault `hvs.`, `hvb.`, and `hvr.` tokens; and
+- complete or cut-off private-key PEM blocks.
+
+A non-string or nested prompt value is removed before spanlogs can copy it into
+Loki or Cribl. The filter is not recursive and does not use a broad
+high-entropy guess. Treat all prompt content as sensitive even after these
+patterns run.
+
+The stable user, key, and project values come from reviewed server-owned
+sources. For a portal or direct API key, the authenticated key supplies the
+subject. For Open WebUI, the signed assertion subject supplies the stable
+per-user ID. A separate reviewed callback selects the readable name. AI
+request export fails closed unless the bounded user ID, readable name, name
+source, key hash, project ID, and request ID are all present.
+
+#### How the readable name is selected
+
+The callback accepts only these name sources:
+
+| `aigw.user.name_source` | Required proof | Readable value |
+|---|---|---|
+| `portal_key_metadata` | A portal-owned key with exact `created_via=dev-portal` metadata and no service-key marker | Bounded portal username |
+| `open_webui_signed_oidc` | The exact Open WebUI service key and a valid, short-lived HS256 assertion signed by Open WebUI | Signed username or e-mail; `@` is allowed |
+| `key_subject` | A bounded subject on the authenticated key | Key subject |
+
+The Open WebUI key check uses its exact owner, alias, and service metadata. Its
+alias identifies that one reviewed service key; an alias is never copied into
+the readable-name field. The signed assertion must use the reviewed issuer,
+required claims, and a lifetime of no more than five minutes. Its subject is
+the stable human audit ID. Its signed username or e-mail is the readable name.
+The shared LiteLLM key remains service authorization evidence only.
+
+A request body, plain forwarded identity header, caller end-user field, and
+arbitrary key alias can never supply the readable name. Alloy copies the
+server-selected name and source, then removes the raw server fields, assertion,
+headers, end-user fields, alias, and LiteLLM authentication metadata. An
+unresolved or malformed name is dropped.
+
+`aigw.user.name` is attribution, not authorization. Key and OIDC checks decide
+access before this record is created. Open WebUI still uses one shared service
+key in the LiteLLM spend ledger, even though its signed assertion adds a
+per-browser-user name to this request-audit record.
 
 #### How Alloy proves the LiteLLM source
 
@@ -123,8 +160,8 @@ Classes: `keycloak_event`, `aigw.portal.audit`, and `aigw.identity.audit`
 
 This class includes structured security events, not all Keycloak or portal
 logs. The current implementation exports the Keycloak events listed below,
-reviewed portal audit actions, identity deployment results, and break-glass use
-during deployment.
+reviewed portal actions, authorization denials, identity changes, managed
+identity checks, and the break-glass lifecycle.
 
 For Keycloak, accept records only from the `org.keycloak.events` category. The
 exact `EventType` success/error pairs are:
@@ -140,9 +177,11 @@ Each name also includes its matching `_ERROR` name. No other Keycloak event is
 allowed. Keycloak admin events, profile changes, registration events, and
 ordinary server logs stay local.
 
-This does not yet cover every application authorization denial, every
-privileged identity change, or the full break-glass lifecycle. Those event
-gaps remain open.
+Keycloak 26 writes these event lines with quoted values. The parser accepts the
+exact quoted form and does not turn off Keycloak's log sanitization. A local
+source-mode preprod run has received natural `LOGIN`, `LOGIN_ERROR`, and
+`LOGOUT` events from the real Keycloak container. The final exact-seed receipt
+is still pending.
 
 ### 3. Provider and Envoy trust events
 
@@ -174,23 +213,70 @@ self-embedded in the event.
 
 The current implementation exports:
 
-- the terminal provider-rotation result: `success`, `failed`, `skipped`, or
-  `disabled`;
+- provider-rotation start, attempt, terminal result, and recovery events;
 - Vault state changes: `sealed`, `unsealed`, `uninitialized`, or `unavailable`;
 - bounded metadata derived from selected Vault audit records; and
-- identity deployment results and break-glass use during that deployment.
+- identity deployment, bootstrap cleanup, break-glass, LDAP drift, and managed
+  identity drift events.
+
+One provider rotation uses one canonical UUIDv4 `rotation_id`. `start` has no
+attempt number. `attempt`, terminal `rotate`, and `recovery` use an integer
+attempt from 1 through 999. A recovery record means a later rotation succeeded
+after a known failure. It does not mean the old credential was restored, and
+there is no provider rollback action.
 
 The raw Vault audit record always stays local. The outbound copy contains only
 record type, approved operation, a short path class, outcome, and the fact that
 the source value was HMAC-protected. It never contains a Vault token, request
 body, response body, full path, or raw JSON.
 
-Controller-side Ansible output is not collected by Alloy. Rotation start,
-attempt, failure, and recovery stages, broader break-glass actions,
-authorization denials, and LDAP/managed-identity drift and recovery still need
-reviewed producers and receipt tests. Provider-key promotion does not restore
-the previous secret today. Design and implement safe recovery or rollback
-before adding an event that claims it happened.
+Managed identity has two separate event pairs:
+
+- `managed_identity_change_planned` and `managed_identity_change_applied` mean
+  the reviewed desired policy changed; and
+- `managed_identity_drift_detected` and `managed_identity_recovery` mean live
+  security state moved away from the last verified policy.
+
+The controller writes one pending record to Vault before the first live
+mutation. One canonical UUIDv4 follows retries and the terminal event. The
+pending record is cleared only after live verification, durable state
+verification, and the terminal audit event pass. A malformed pending record or
+a changed desired-policy digest stops before another live mutation.
+
+LDAP provider rename also stops before mutation. The only automatic legacy
+case is an old blank provider name whose stored provider ID matches the same
+live desired-name provider. Any other name or ID change needs a reviewed
+migration.
+
+### 5. Controller upgrade and rollback events
+
+Class: `controller_lifecycle`
+
+Event: `aigw.controller.lifecycle`
+
+Allowed actions are `upgrade` and `rollback`. Allowed outcomes are `started`,
+`success`, and `failed`. One UUIDv4 ties the upgrade and any rollback together.
+Each record also contains the release manifest hash, source commit, Envoy image
+ID, and egress-policy digest. The target creates the UTC timestamp.
+
+Production does not export Ansible stdout. Ansible calls a fixed root-only
+writer on the target. The writer appends only to:
+
+```text
+/var/log/ai-gateway-controller/lifecycle.jsonl
+/var/log/ai-gateway-controller/lifecycle.jsonl.1
+```
+
+The directory is `root:473` mode `0750`. Both files are `root:473` mode `0640`,
+single-link regular files, with an 8 MiB limit each. Symlinks, extra file
+shapes, bad ownership, bad modes, and oversized files fail closed. Ansible
+validates the directory before Compose. Alloy reads it through a read-only
+bind. A source rollback preserves this target audit evidence.
+
+Local preprod uses an operator-owned generated fixture at
+`compose/secrets/preprod-controller-lifecycle`. It exercises the exact Alloy
+file-source parser. It is not a production ownership example. Final clean-room
+teardown must remove this generated fixture before it removes release images.
 
 ### Current structured marker allow-list
 
@@ -199,15 +285,19 @@ Alloy accepts only these exact pairs:
 
 | `event` | Allowed `action` values |
 |---|---|
-| `aigw.portal.audit` | `key.generate`, `key.deactivate`, `egress.trust.verify`, `rotation.settings.update`, `rotation.trigger`, `provider.anthropic.configure`, `provider.anthropic.disable`, `provider.anthropic.delete`, `identity.member.remove`, `identity.group.policy`, `admin.key.block`, `admin.key.unblock`, `admin.key.limits` |
-| `aigw.identity.audit` | `bootstrap`, `break_glass_use`, `deployment_converge`, `group_policy_update`, `group_create`, `group_delete`, `group_member_add`, `group_member_remove` |
-| `aigw.provider.rotation` | `rotate` |
+| `aigw.portal.audit` | `key.generate`, `key.deactivate`, `egress.trust.verify`, `rotation.settings.update`, `rotation.trigger`, `provider.anthropic.configure`, `provider.anthropic.disable`, `provider.anthropic.delete`, `identity.group.create`, `identity.group.delete`, `identity.member.add`, `identity.member.remove`, `identity.group.policy`, `authorization.role.denied`, `authorization.step_up.required`, `admin.key.block`, `admin.key.unblock`, `admin.key.limits` |
+| `aigw.identity.audit` | `bootstrap`, `bootstrap_cleanup`, `break_glass_activate`, `break_glass_disable`, `break_glass_use`, `deployment_converge`, `group_policy_update`, `group_create`, `group_delete`, `group_member_add`, `group_member_remove`, `ldap_check`, `ldap_drift_detected`, `ldap_recovery`, `managed_identity_change_planned`, `managed_identity_change_applied`, `managed_identity_drift_detected`, `managed_identity_recovery` |
+| `aigw.provider.rotation` | `start`, `attempt`, `rotate`, `recovery` |
 | `aigw.vault.state` | `state_observed` |
 | `aigw.egress.trust` | `startup_gate` |
 
-Allowed outcomes are `success`, `failure`, `failed`, `mismatch`,
-`denied-active-key`, and `denied-membership`. A service/event mismatch, an
-unknown action, or an unknown outcome is dropped.
+The full checked outcome vocabulary is `intent`, `success`, `failure`,
+`failed`, `indeterminate`, `mismatch`, `denied-active-key`,
+`denied-membership`, and `denied-ownership`. Each action uses only its reviewed
+subset. Identity deployment events use `success` or `failed`. Rotation events
+use `success` or `failure`, with the action and status checked together. A
+service/event mismatch, unknown action, mismatched outcome, or unknown target
+is dropped.
 
 ### Fixed-field projection
 
@@ -215,15 +305,21 @@ The marker body is input only. Alloy never uses it as the outbound body. Alloy
 checks the emitter, event, action, outcome, and each approved scalar field. It
 then builds a new line from this fixed list:
 
-- `subject`, `project`, `changed`, `error_type`, and `ldap_provider`;
-- `purpose`, `vendor`, `rotation_status`, and `state`; and
+- `subject`, `project`, `group`, `target_subject`, `changed`, `change_kind`,
+  `operation_id`, `error_type`, and `ldap_provider`;
+- `purpose`, `vendor`, `rotation_id`, `attempt`, `rotation_status`, and `state`;
+  and
 - `policy_sha256`, `providers`, `sni`, `exact_sans`,
   `ca_sha256_fingerprints`, and `reason`.
 
 Each field has a short format or exact value rule. Required fields depend on
-the event. A missing, malformed, unknown, or nested value drops the outbound
-copy. The original local log remains available in Loki. There is no raw-JSON
-fallback.
+the event. `group` and `target_subject` allow only letters, numbers, dot,
+underscore, and hyphen, with a maximum of 128 characters. Group create/delete
+requires `group`. Member add/remove requires both `group` and `target_subject`.
+A successful member removal also requires its bounded `project`. An unknown
+source field or nested source value is ignored and never copied. A missing or
+malformed required approved field drops the outbound copy. The original local
+log remains available in Loki. There is no raw-JSON fallback.
 
 Keycloak, Envoy TLS, and Vault audit classifiers use the same rule: parse a
 known source, keep only approved scalar values, and build a new line. The AI
@@ -258,33 +354,46 @@ Every record must contain:
 | Field | Rule |
 |---|---|
 | `aigw.security.schema_version` | Integer `1` on every outbound OTLP log |
-| event class | `ai_request_audit`, `keycloak_event`, or one reviewed `event` value |
+| `aigw.security.event_class` | `ai_request_audit`, `keycloak_event`, `egress_tls`, `vault_audit`, `security_event`, or `controller_lifecycle` |
 | `event` | Reviewed structured-event name, not free text; not used for the request or Keycloak class |
 | `outcome` | Exact reviewed value when the class has an outcome |
-| `service.name` | Reviewed producer name |
-| event time | UTC source timestamp |
+| `aigw.security.producer` | Server-selected producer from the table below |
+| `service.name` | Must exactly match `aigw.security.producer` |
+| OTLP log time | Real UTC source timestamp; not zero, over 24 hours old, or over one minute in the future |
 | `deployment.environment` | Exact `preprod` or `production` value |
 
 Add only the fields needed for that event class. Missing required fields must
 drop the outbound copy and raise a local counter. Do not forward an unparsed
 line as a fallback.
 
-One fail-closed Alloy transform adds the common schema attribute immediately
-before the only Cribl batch. A producer may also carry `schema_version=1` in
-its JSON body, but the OTLP attribute above is the machine contract.
+Alloy selects the producer from the reviewed event class:
 
-This table is the required target contract. In `r14`, the schema field is
-enforced, but every event class does not yet enforce the environment, producer,
-and recent UTC time. Keep the common-record backlog item open until live tests
-prove all four common fields for every event class.
+| Event class or structured source | Producer and `service.name` |
+|---|---|
+| AI request audit | `litellm` |
+| Keycloak event | `keycloak` |
+| Envoy TLS event | `envoy-egress` |
+| Vault audit event | `vault` |
+| Structured security event | Exact source service: `dev-portal`, `admin-portal`, `key-rotator`, or `envoy-egress` |
+| Controller lifecycle file source | `controller` |
+
+One fail-closed Alloy path removes caller versions of the common fields and
+adds the server-owned schema, environment, producer, and service immediately
+before the only Cribl batch. A producer may also carry `schema_version=1` in
+its JSON body, but the OTLP attribute above is the machine contract. The time
+gate runs before queue entry. Time spent waiting in the queue is governed by
+the separate queue rules.
 
 Alloy must remove these values before the allow-list check:
 
 - authorization headers, API keys, access tokens, refresh tokens, and cookies;
 - passwords, LDAP bind credentials, client secrets, and Vault tokens;
 - Vault unseal shares, private keys, and recovery material;
-- raw HTTP headers, query strings, redirect URIs, and OIDC codes;
-- e-mail addresses and network peer addresses; and
+- raw JWTs, signed Open WebUI assertions, HTTP headers, query strings,
+  redirect URIs, and OIDC codes;
+- caller end-user values, key aliases, and raw LiteLLM authentication metadata;
+- e-mail addresses and network peer addresses, except the reviewed signed
+  Open WebUI username or e-mail selected as `aigw.user.name`; and
 - nested maps that cannot be proven safe.
 
 Use stable opaque IDs when possible. `aigw.user.name` is readable attribution,
@@ -293,41 +402,22 @@ safe integrity metadata. The Envoy image ID stays in the verified release and
 live-inspection evidence; it is not added to the startup event.
 
 The AI request dataset is the one exception for approved prompt and completion
-content. The current redactor covers three obvious credential forms in the
-four reviewed string attributes. It removes non-string or nested prompt values
-because it cannot prove them safe. It does not cover every possible secret
-format inside a string. Treat the remaining content as sensitive.
+content. The redactor covers the six narrow value shapes listed above and
+removes non-string or nested prompt values because it cannot prove them safe.
+It cannot recognize every secret a person could place in plain text. Treat the
+remaining content as sensitive.
 
-## Remaining event and data gaps
+## Remaining deployment and data gaps
 
-Keep the Cribl backlog item open until these gaps are closed:
+The in-stack contract is implemented. These items still need an external trust
+boundary:
 
-1. Extend prompt and completion redaction beyond the three current string
-   patterns. Add only narrow, reviewed patterns for supported secret formats.
-   Keep removing non-string and nested values before export.
-2. Enforce the common record contract. Every event class needs a recent UTC
-   time, fixed `preprod` or `production` environment, reviewed producer name,
-   and schema version. Reject a missing, zero, stale, or caller-controlled
-   value.
-3. Prove readable-name quality for chat, direct
-   API, and every other supported client path. Keep readable names separate
-   from authorization evidence.
-4. Add a reviewed path for controller-only events. Alloy cannot read Ansible
-   output today.
-5. Add provider-rotation start, attempt, failure, and recovery events. Only the
-   terminal result is exported now. Current promotion does not restore the
-   previous secret, so design and implement safe recovery or rollback before
-   adding a rollback event.
-6. Add application authorization-denial and privileged-change events that are
-   not already covered by the exact Keycloak event list.
-7. Add LDAP and managed-identity drift detection, reconcile failure, and
-   recovery events.
-8. Add the remaining break-glass activation, disable, and cleanup events.
-9. Add natural producer receipt tests for each new event before calling it
-   implemented.
+1. The customer Cribl address, certificate, route, and exact 24-hour retention
+   setting must be tested at the real endpoint.
+2. Alloy has no hard per-record queue age. If policy requires that bound, keep
+   production export blocked until the sender or Cribl route can enforce it.
 
-The separate customer endpoint, 24-hour retention, and hard queue-age choices
-also remain open. See [TASKS.md](../TASKS.md).
+Track these remaining items in [TASKS.md](../TASKS.md).
 
 ## What stays local
 
@@ -454,20 +544,37 @@ python3 -I scripts/test-preprod-cribl-security.py --image-mode seed
 
 Know what this test proves:
 
-- The Docker-log records for Keycloak, portal, identity, provider rotation,
-  Vault state, Envoy startup, and Envoy TLS failure are synthetic fixtures.
-  They prove the Alloy classifiers, fixed-field projection, allow-list, and
-  deny rules. They do not prove that every live producer emitted every event.
-- The fixture includes an unknown field and a nested secret. The test proves
-  neither value reached the Cribl mock.
+- Most Docker-log records for portal, identity, provider rotation, Vault state,
+  Envoy startup, and Envoy TLS failure are synthetic fixtures. They prove the
+  Alloy classifiers, fixed-field projection, allow-list, and deny rules. They
+  do not prove that every live producer emitted every event.
+- A source-mode preprod receipt uses real Keycloak container logs for one
+  successful login, one failed login, and one logout. It proves the natural
+  quoted Keycloak 26 event form. Repeat it through the exact release seed
+  before release approval.
+- The controller fixture enters through the exact read-only file source and
+  fixed parser. It is operator-owned generated preprod state, not a copy of the
+  root-owned production boundary. Clean-room teardown must remove it before
+  release images.
+- The fixtures cover bounded portal and identity targets, the complete rotation
+  lifecycle, mismatched outcomes, an unknown field, and a nested secret. The
+  test proves that malformed or unapproved values did not reach the mock.
 - The AI request test uses Alloy's bearer-authenticated LiteLLM receiver,
   filter, batch, and queue. Its input is a test span, but it follows the natural
   OTLP path. The test also proves that the ordinary receiver cannot forge the
-  source marker and that port 4319 rejects a missing or wrong token.
+  source marker and that port 4319 rejects a missing or wrong token. This
+  receipt covers the portal and key-subject sources, caller spoof attempts, and
+  an unresolved name. Callback tests cover the signed Open WebUI subject as the
+  stable user ID, its signed username or e-mail as the readable name, and the
+  shared key as service authorization evidence only.
+- Every accepted fixture must arrive with schema version 1, the exact
+  environment, a matching producer and service, and its real UTC event time.
+  Zero, stale, and future times are negative tests.
 - The Vault audit check reads the real Vault audit file path. It does not place
   a fake Vault record in the Docker-log fixture.
 
-Producer unit and contract tests cover the current emitters. Add a natural
+Producer unit and contract tests cover the current emitters. The final
+current-candidate receipt is still pending the exact seeded run. Add a natural
 producer receipt test for every new event family.
 
 Repeat these checks against the real Cribl source during an approved production
@@ -475,20 +582,25 @@ window:
 
 1. Send one real approved AI request with a unique request ID.
 2. Perform one successful Keycloak login, one failed login, and one logout.
-3. Capture one real portal action, identity deployment result, provider
-   rotation terminal result, and Vault state change.
-4. Capture one safe Envoy startup record and, in a bounded test, one TLS
+3. Capture one authorization denial and one portal identity change. Check the
+   bounded actor, group, and target subject.
+4. Capture identity drift detection and recovery, each stage of one provider
+   rotation, and one Vault state change. Correlate the rotation with its UUID.
+5. Capture one controller upgrade lifecycle. If a rollback test is approved,
+   prove the same operation UUID joins upgrade failure and rollback result.
+6. Capture one safe Envoy startup record and, in a bounded test, one TLS
    failure record.
-5. Correlate the startup policy digest with the Envoy image ID in the verified
+7. Correlate the startup policy digest with the Envoy image ID in the verified
    manifest and the live Docker inspection result.
-6. Confirm that Cribl received each allowed record once or with a documented
+8. Confirm that Cribl received each allowed record once or with a documented
    at-least-once duplicate.
-7. Confirm the exact fixed fields. Search for rejected unknown, nested, raw,
-   and secret values and prove they are absent.
-8. Generate an OTLP metric, a raw span, and an ordinary service log. Prove that
+9. Confirm every common field, readable name source, target, and fixed event
+   field. Search for rejected unknown, nested, raw, spoofed, and secret values
+   and prove they are absent.
+10. Generate an OTLP metric, a raw span, and an ordinary service log. Prove that
    Cribl received none of them.
-9. Confirm Loki and Prometheus still received their local data.
-10. Save the source configuration, route configuration, 24-hour retention
+11. Confirm Loki and Prometheus still received their local data.
+12. Save the source configuration, route configuration, 24-hour retention
     proof, search results, source commit, manifest, and live image inspection
     with the release evidence.
 

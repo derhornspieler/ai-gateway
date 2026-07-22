@@ -71,6 +71,11 @@ class LiteLLMOtelAuthenticationContractTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, block)
         self.assertIn(
+            "./litellm/aigw_openwebui_identity.py:"
+            "/app/aigw_openwebui_identity.py:ro,Z",
+            block,
+        )
+        self.assertIn(
             "./litellm/aigw_otel_callback.py:/app/aigw_otel_callback.py:ro,Z",
             block,
         )
@@ -138,6 +143,7 @@ class LiteLLMOtelAuthenticationContractTests(unittest.TestCase):
             [
                 "litellm/config.yaml",
                 "litellm/aigw_default_model_hook.py",
+                "litellm/aigw_openwebui_identity.py",
                 "litellm/aigw_otel_callback.py",
                 "secrets/litellm_otel_token",
             ],
