@@ -7,13 +7,14 @@ import time
 from base64 import b64decode
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
 
 import httpx
 import pytest
 from itsdangerous import TimestampSigner
 
-from app import litellm_client
+from app import litellm_client, model_admin
 from app.config import settings
 from app import main
 from conftest import portal_user, session_cookie
@@ -23,6 +24,7 @@ from conftest import portal_user, session_cookie
 # route tests. Keep the real helper so dedicated fail-closed tests can exercise
 # its upstream and payload validation directly.
 LIVE_PROJECT_IDS = main._live_project_ids
+LIVE_PROJECT_POLICIES = main._live_project_policies
 
 
 def security_events(caplog) -> list[dict]:
@@ -88,6 +90,17 @@ def test_operation_id_requires_canonical_rfc4122_uuid4() -> None:
         main._rotator_headers("not-a-uuid")
 
 
+def test_governance_actor_header_is_bounded_and_requires_an_operation() -> None:
+    operation_id = "123e4567-e89b-42d3-a456-426614174000"
+    headers = main._rotator_headers(operation_id, "admin-subject:1")
+    assert headers["X-AIGW-Operation-ID"] == operation_id
+    assert headers["X-AIGW-Actor-ID"] == "admin-subject:1"
+    with pytest.raises(ValueError, match="invalid model-governance actor ID"):
+        main._rotator_headers(None, "admin-subject:1")
+    with pytest.raises(ValueError, match="invalid model-governance actor ID"):
+        main._rotator_headers(operation_id, "bad/actor")
+
+
 def portal_key(
     *,
     owner: str,
@@ -97,10 +110,22 @@ def portal_key(
     blocked: bool | None = None,
     expires: str | None = None,
     default_model: str | None = None,
+    policy_revision: str | None = None,
 ) -> dict:
+    if policy_revision is None:
+        policy_revision = litellm_client.project_policy_revision(
+            {
+                "tpm_limit": None,
+                "rpm_limit": None,
+                "allowed_models": None,
+                "default_model": None,
+                "model_limits": {},
+            }
+        )
     metadata = {
         "created_via": "dev-portal",
         "aigw_project_id": project,
+        "aigw_policy_revision_v1": policy_revision,
     }
     if default_model is not None:
         metadata["aigw_default_model"] = default_model
@@ -243,6 +268,37 @@ def test_key_creation_uses_immutable_subject_and_rejects_bad_csrf(
     assert "no-store" in good.headers["cache-control"]
     assert good.headers["referrer-policy"] == "no-referrer"
     assert "default-src 'none'" in good.headers["content-security-policy"]
+
+
+def test_one_time_key_is_destroyed_before_tab_exit_or_browser_history_restore():
+    loader = main.templates.env.loader
+    base = loader.get_source(main.templates.env, "base.html")[0]
+    index = loader.get_source(main.templates.env, "index.html")[0]
+
+    # The history entry records whether its reveal has been consumed. This
+    # covers non-BFCache history reconstruction where pageshow.persisted is
+    # false, which the former guard missed.
+    assert "state.aigwOneTimeSecretConsumed === true" in base
+    assert 'entries[0].type === "back_forward"' in base
+    assert "alreadyConsumed || restoredFromBrowserHistory()" in base
+    # Scrub the text and remove its whole reveal before a tab switch, form
+    # submit, page hide, popstate, or normal same-window link navigation.
+    assert 'if (name !== "keys") consumeOneTimeSecret();' in base
+    assert 'document.addEventListener("submit"' in base
+    assert 'window.addEventListener("pagehide", consumeOneTimeSecret);' in base
+    assert 'window.addEventListener("popstate", consumeOneTimeSecret);' in base
+    assert "reveal.remove();" in base
+    assert "window.location.replace(destination);" in base
+    assert "[data-one-time-secret][hidden] { display: none !important; }" in base
+    assert "reveal.hidden = false;" in base
+    assert 'class="card reveal" data-one-time-secret hidden' in index
+    # Tab hash updates must preserve the consumed marker instead of replacing
+    # it with null.
+    assert (
+        'window.history.replaceState(window.history.state, "", "#tab-" + name);'
+        in base
+    )
+    assert 'window.history.replaceState(null, "", "#tab-" + name);' not in base
 
 
 @pytest.mark.parametrize(
@@ -446,6 +502,7 @@ async def test_shielded_post_generation_liveness_survives_waiter_cancellation(
                 portal_user(subject="cancelled-owner"),
                 "ai-gateway",
                 "sk-cancelled-secret",
+                "a" * 64,
             )
         )
     )
@@ -461,9 +518,209 @@ async def test_shielded_post_generation_liveness_survives_waiter_cancellation(
 
     assert verification.done() is False
     release.set()
-    with pytest.raises(litellm_client.LiteLLMError, match="membership changed"):
+    with pytest.raises(
+        litellm_client.LiteLLMError, match="membership or policy changed"
+    ):
         await verification
     assert deactivated == ["sk-cancelled-secret"]
+
+
+@pytest.mark.asyncio
+async def test_post_generation_policy_revision_race_revokes_before_disclosure(
+    monkeypatch,
+):
+    """A key minted under the old policy is blocked when cutover wins."""
+
+    old_policy = dict(RESTRICTED_POLICY)
+    new_policy = {**RESTRICTED_POLICY, "rpm_limit": 10}
+    expected_revision = litellm_client.project_policy_revision(old_policy)
+    deactivated: list[str] = []
+
+    async def live_projects(_request, _user):
+        return ("ai-gateway",)
+
+    async def live_policies(_request, _user, _project_ids):
+        return {"ai-gateway": new_policy}
+
+    async def key_deactivate(key):
+        deactivated.append(key)
+        return {"blocked": True}
+
+    monkeypatch.setattr(main, "_live_project_ids", live_projects)
+    monkeypatch.setattr(main, "_live_project_policies", live_policies)
+    monkeypatch.setattr(litellm_client, "key_deactivate", key_deactivate)
+
+    with pytest.raises(
+        litellm_client.LiteLLMError,
+        match="membership or policy changed",
+    ):
+        await main._verify_post_generation_liveness(
+            SimpleNamespace(session={}),
+            portal_user(subject="policy-race-owner"),
+            "ai-gateway",
+            "sk-policy-race-secret",
+            expected_revision,
+        )
+    assert deactivated == ["sk-policy-race-secret"]
+
+
+@pytest.mark.asyncio
+async def test_post_deactivation_waits_out_cutover_and_repairs_stale_unblock(
+    monkeypatch,
+):
+    """A stale policy writer cannot undo a developer's durable deactivation."""
+
+    policy = dict(RESTRICTED_POLICY)
+    state = portal_key(
+        owner="deactivation-race-owner",
+        token="deactivation-race-hash",
+        blocked=False,
+        policy_revision=litellm_client.project_policy_revision(policy),
+    )
+    policy_reads = 0
+    updates: list[dict] = []
+
+    async def live_policies(_request, _user, _project_ids):
+        nonlocal policy_reads
+        policy_reads += 1
+        if policy_reads == 1:
+            # The admin container has staged a revision. Model the stale
+            # retune write that removed the first block marker and unblocked.
+            raise main.HTTPException(
+                status_code=503,
+                detail="Project policy reconciliation is incomplete.",
+            )
+        return {"ai-gateway": policy}
+
+    async def admin_key_lookup(_token):
+        return dict(state)
+
+    async def key_update(_token, update):
+        updates.append(dict(update))
+        state.update(update)
+        return {}
+
+    monkeypatch.setattr(main, "_live_project_policies", live_policies)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    monkeypatch.setattr(main, "DEACTIVATION_POLICY_POLL_SECONDS", 0)
+
+    await main._verify_post_deactivation_liveness(
+        SimpleNamespace(session={}),
+        portal_user(subject="deactivation-race-owner"),
+        "ai-gateway",
+        "deactivation-race-hash",
+    )
+
+    assert policy_reads >= 3
+    assert state["blocked"] is True
+    assert state["metadata"][
+        litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
+    ] is True
+    assert litellm_client.PORTAL_POLICY_GATE_METADATA_KEY not in state["metadata"]
+    assert len(updates) == 1
+
+
+@pytest.mark.asyncio
+async def test_developer_deactivation_survives_a_cross_container_stale_write(
+    monkeypatch,
+):
+    """The developer marker and post-check beat a stale admin retune snapshot."""
+
+    monkeypatch.setattr(main, "_admin_key_policy_lock", asyncio.Lock())
+    monkeypatch.setattr(main, "DEACTIVATION_POLICY_POLL_SECONDS", 0)
+    policy = dict(RESTRICTED_POLICY)
+    revision = litellm_client.project_policy_revision(policy)
+    state = portal_key(
+        owner="cross-container-owner",
+        token="cross-container-hash",
+        blocked=False,
+        policy_revision=revision,
+    )
+    pending = {"value": True}
+    stale_read = asyncio.Event()
+    release_stale_write = asyncio.Event()
+
+    async def rotator_put(_path, _payload, *, operation_id=None):
+        return _staged_policy_result(policy)
+
+    async def gate(_project_id, _revision):
+        return 0
+
+    async def transition(path, _payload, *, operation_id=None, actor_id=None):
+        is_activate = path.endswith("/activate")
+        pending["value"] = is_activate
+        intended = _normalized_test_policy(policy)
+        return {
+            "active_policy": intended,
+            "policy": intended,
+            "policy_revision": revision,
+            "reconciliation_pending": is_activate,
+        }
+
+    async def stale_retune(_project_id, _policy, _models):
+        snapshot = dict(state)
+        snapshot["metadata"] = dict(state["metadata"])
+        stale_read.set()
+        await release_stale_write.wait()
+        # This models the admin container writing a snapshot it read before
+        # the developer container added its durable block marker.
+        snapshot["blocked"] = False
+        snapshot["metadata"].pop(
+            litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY, None
+        )
+        state.clear()
+        state.update(snapshot)
+        return 0, 0
+
+    async def live_policies(_request, _user, _project_ids):
+        if pending["value"]:
+            raise main.HTTPException(
+                status_code=503,
+                detail="Project policy reconciliation is incomplete.",
+            )
+        return {"ai-gateway": policy}
+
+    async def lookup(_token):
+        return dict(state) | {"metadata": dict(state["metadata"])}
+
+    async def update(_token, changes):
+        state.update(changes)
+        if "metadata" in changes:
+            state["metadata"] = dict(changes["metadata"])
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_rotator_post", transition)
+    monkeypatch.setattr(main, "_gate_project_keys", gate)
+    monkeypatch.setattr(main, "_retune_project_keys", stale_retune)
+    monkeypatch.setattr(main, "_live_project_policies", live_policies)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", lookup)
+    monkeypatch.setattr(litellm_client, "key_update", update)
+
+    policy_task = asyncio.create_task(
+        main._apply_project_policy("group-1", policy, "operation-1", ["claude-haiku"])
+    )
+    await stale_read.wait()
+    await main._block_key_with_durable_intent(dict(state))
+    post_check = asyncio.create_task(
+        main._verify_post_deactivation_liveness(
+            SimpleNamespace(session={}),
+            portal_user(subject="cross-container-owner"),
+            "ai-gateway",
+            "cross-container-hash",
+        )
+    )
+    await asyncio.sleep(0)
+    release_stale_write.set()
+    await policy_task
+    await post_check
+
+    assert state["blocked"] is True
+    assert state["metadata"][
+        litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
+    ] is True
+    assert litellm_client.PORTAL_POLICY_GATE_METADATA_KEY not in state["metadata"]
 
 
 def test_deactivate_denies_cross_owner_and_cross_project(
@@ -591,12 +848,23 @@ def test_deactivation_then_regeneration(client, set_session, monkeypatch):
         assert user_id == owner
         return [dict(entry) for entry in state]
 
-    async def key_deactivate(key):
-        deactivated.append(key)
+    async def key_update(key, updates):
         for entry in state:
             if entry["token"] == key:
-                entry["blocked"] = True
-        return {"key": key, "blocked": True}
+                entry.update(updates)
+                if (
+                    updates.get("blocked") is True
+                    and updates.get("metadata", {}).get(
+                        litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
+                    )
+                    is True
+                ):
+                    deactivated.append(key)
+                return {}
+        raise AssertionError("unknown key")
+
+    async def admin_key_lookup(key):
+        return dict(next(entry for entry in state if entry["token"] == key))
 
     async def key_generate(user_id, alias, project_id, project_policy=None, username=None):
         state.append(
@@ -610,7 +878,8 @@ def test_deactivation_then_regeneration(client, set_session, monkeypatch):
         return {"key": "sk-new-once", "key_alias": alias}
 
     monkeypatch.setattr(litellm_client, "key_list", key_list)
-    monkeypatch.setattr(litellm_client, "key_deactivate", key_deactivate)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
     monkeypatch.setattr(litellm_client, "key_generate", key_generate)
     csrf = "c" * 43
     set_session({"user": portal_user(subject=owner), "csrf_token": csrf})
@@ -1871,6 +2140,57 @@ async def test_live_project_lookup_sorts_canonical_membership(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_live_project_policy_requires_ready_matching_revision(monkeypatch):
+    policy = dict(RESTRICTED_POLICY)
+    revision = litellm_client.project_policy_revision(policy)
+
+    async def rotator_get(path):
+        assert path == "/identity/projects/subject-123"
+        return {
+            "projects": ["ai-gateway"],
+            "policies": {"ai-gateway": policy},
+            "policy_reconciliation": {
+                "ai-gateway": {"ready": True, "revision": revision}
+            },
+        }
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    assert await LIVE_PROJECT_POLICIES(
+        SimpleNamespace(session={}), portal_user(), ("ai-gateway",)
+    ) == {"ai-gateway": policy}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready,revision", [(False, "valid"), (True, "wrong")])
+async def test_live_project_policy_fails_closed_during_reconciliation(
+    monkeypatch, ready, revision
+):
+    policy = dict(RESTRICTED_POLICY)
+    expected_revision = litellm_client.project_policy_revision(policy)
+
+    async def rotator_get(_path):
+        return {
+            "projects": ["ai-gateway"],
+            "policies": {"ai-gateway": policy},
+            "policy_reconciliation": {
+                "ai-gateway": {
+                    "ready": ready,
+                    "revision": (
+                        expected_revision if revision == "valid" else "0" * 64
+                    ),
+                }
+            },
+        }
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    with pytest.raises(main.HTTPException) as caught:
+        await LIVE_PROJECT_POLICIES(
+            SimpleNamespace(session={}), portal_user(), ("ai-gateway",)
+        )
+    assert caught.value.status_code == 503
+
+
 def test_provider_status_allowlists_only_public_enrollment_material() -> None:
     raw = {
         "vendor": "anthropic",
@@ -2669,7 +2989,201 @@ RESTRICTED_POLICY = {
     "rpm_limit": 30,
     "allowed_models": ["claude-haiku"],
     "default_model": "claude-haiku",
+    "model_limits": {},
 }
+
+
+def _normalized_test_policy(policy: dict) -> dict:
+    normalized = dict(policy)
+    normalized.setdefault("default_model", None)
+    normalized.setdefault("model_limits", {})
+    return normalized
+
+
+def _staged_policy_result(policy: dict) -> dict:
+    intended = _normalized_test_policy(policy)
+    return {
+        "id": "group-1",
+        "name": "ai-gateway",
+        "active_policy": {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": None,
+            "default_model": None,
+            "model_limits": {},
+        },
+        "policy": intended,
+        "policy_revision": litellm_client.project_policy_revision(intended),
+        "reconciliation_pending": True,
+    }
+
+
+def _policy_transition_stub(policy: dict, calls: list) -> Any:
+    intended = _normalized_test_policy(policy)
+    revision = litellm_client.project_policy_revision(intended)
+
+    async def transition(path, payload, *, operation_id=None, actor_id=None):
+        calls.append((path, payload, operation_id))
+        assert payload == {"policy_revision": revision}
+        pending = path.endswith("/activate")
+        assert pending or path.endswith("/complete")
+        return {
+            "id": "group-1",
+            "name": "ai-gateway",
+            "active_policy": intended,
+            "policy": intended,
+            "policy_revision": revision,
+            "reconciliation_pending": pending,
+        }
+
+    return transition
+
+
+@pytest.mark.asyncio
+async def test_admin_key_block_waits_for_complete_policy_cutover(monkeypatch):
+    """The admin process never interleaves a manual edit with reconciliation."""
+
+    monkeypatch.setattr(main, "_admin_key_policy_lock", asyncio.Lock())
+    policy = dict(RESTRICTED_POLICY)
+    gate_started = asyncio.Event()
+    release_gate = asyncio.Event()
+    events: list[str] = []
+    key_state = portal_key(
+        owner="admin-block-owner",
+        token="admin-block-hash",
+        blocked=False,
+    )
+
+    async def rotator_put(_path, _payload, *, operation_id=None):
+        events.append("stage")
+        return _staged_policy_result(policy)
+
+    async def gate(_project_id, _revision):
+        events.append("gate")
+        gate_started.set()
+        await release_gate.wait()
+        return 0
+
+    async def transition(path, _payload, *, operation_id=None, actor_id=None):
+        phase = "activate" if path.endswith("/activate") else "complete"
+        events.append(phase)
+        intended = _normalized_test_policy(policy)
+        return {
+            "active_policy": intended,
+            "policy": intended,
+            "policy_revision": litellm_client.project_policy_revision(intended),
+            "reconciliation_pending": phase == "activate",
+        }
+
+    async def retune(_project_id, _policy, _models):
+        events.append("retune")
+        return 0, 0
+
+    async def lookup(_token):
+        events.append("admin-lookup")
+        return dict(key_state)
+
+    async def update(_token, changes):
+        events.append("admin-update")
+        key_state.update(changes)
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_rotator_post", transition)
+    monkeypatch.setattr(main, "_gate_project_keys", gate)
+    monkeypatch.setattr(main, "_retune_project_keys", retune)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", lookup)
+    monkeypatch.setattr(litellm_client, "key_update", update)
+
+    policy_task = asyncio.create_task(
+        main._apply_project_policy("group-1", policy, "operation-1", ["claude-haiku"])
+    )
+    await gate_started.wait()
+    block_task = asyncio.create_task(main._admin_block_key("admin-block-hash"))
+    await asyncio.sleep(0)
+    assert "admin-lookup" not in events
+
+    release_gate.set()
+    await policy_task
+    await block_task
+    assert events.index("complete") < events.index("admin-lookup")
+    assert key_state["blocked"] is True
+    assert key_state["metadata"][
+        litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_membership_removal_waits_for_complete_policy_cutover(monkeypatch):
+    """Both membership-revocation key passes share the admin policy lock."""
+
+    monkeypatch.setattr(main, "_admin_key_policy_lock", asyncio.Lock())
+    policy = dict(RESTRICTED_POLICY)
+    gate_started = asyncio.Event()
+    release_gate = asyncio.Event()
+    events: list[str] = []
+
+    async def rotator_put(_path, _payload, *, operation_id=None):
+        events.append("stage")
+        return _staged_policy_result(policy)
+
+    async def gate(_project_id, _revision):
+        events.append("gate")
+        gate_started.set()
+        await release_gate.wait()
+        return 0
+
+    async def transition(path, _payload, *, operation_id=None, actor_id=None):
+        phase = "activate" if path.endswith("/activate") else "complete"
+        events.append(phase)
+        intended = _normalized_test_policy(policy)
+        return {
+            "active_policy": intended,
+            "policy": intended,
+            "policy_revision": litellm_client.project_policy_revision(intended),
+            "reconciliation_pending": phase == "activate",
+        }
+
+    async def retune(_project_id, _policy, _models):
+        events.append("retune")
+        return 0, 0
+
+    async def managed_project(_group_id):
+        events.append("resolve-member-project")
+        return "ai-gateway"
+
+    async def deactivate(_user_id, _project_id):
+        events.append("deactivate")
+
+    async def remove(_path, *, operation_id=None):
+        events.append("remove-member")
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_rotator_post", transition)
+    monkeypatch.setattr(main, "_gate_project_keys", gate)
+    monkeypatch.setattr(main, "_retune_project_keys", retune)
+    monkeypatch.setattr(main, "_managed_project_for_group", managed_project)
+    monkeypatch.setattr(main, "_deactivate_subject_project_keys", deactivate)
+    monkeypatch.setattr(main, "_rotator_delete", remove)
+
+    policy_task = asyncio.create_task(
+        main._apply_project_policy("group-1", policy, "operation-1", ["claude-haiku"])
+    )
+    await gate_started.wait()
+    removal_task = asyncio.create_task(
+        main._remove_member_and_deactivate_keys(
+            "group-1", "developer-1", "operation-2"
+        )
+    )
+    await asyncio.sleep(0)
+    assert "resolve-member-project" not in events
+
+    release_gate.set()
+    await policy_task
+    assert await removal_task == "ai-gateway"
+    assert events.index("complete") < events.index("resolve-member-project")
+    assert events[-3:] == ["deactivate", "remove-member", "deactivate"]
 
 
 def test_index_shows_rate_limits_and_models_but_never_cost(
@@ -2737,6 +3251,9 @@ def test_key_mint_carries_the_projects_runtime_policy(
                 token="minted-hash",
                 alias=alias,
                 default_model=(project_policy or {}).get("default_model"),
+                policy_revision=(project_policy or {}).get(
+                    litellm_client.PROJECT_POLICY_REVISION_FIELD
+                ),
             )
         )
         return {"key": "sk-minted-once", "key_alias": alias}
@@ -2754,7 +3271,72 @@ def test_key_mint_carries_the_projects_runtime_policy(
     )
 
     assert response.status_code == 201
-    assert generated == [RESTRICTED_POLICY]
+    assert generated == [
+        {
+            **RESTRICTED_POLICY,
+            litellm_client.PROJECT_POLICY_REVISION_FIELD: (
+                litellm_client.project_policy_revision(RESTRICTED_POLICY)
+            ),
+        }
+    ]
+
+
+def test_unrestricted_policy_mints_an_explicit_current_model_scope(
+    client, set_session, monkeypatch
+):
+    generated = []
+    inventory: list[dict] = []
+
+    async def key_list(_user_id):
+        return [dict(entry) for entry in inventory]
+
+    async def key_generate(
+        user_id, alias, project_id, project_policy=None, username=None
+    ):
+        generated.append(project_policy)
+        inventory.append(
+            portal_key(
+                owner=user_id,
+                token="minted-hash",
+                alias=alias,
+                policy_revision=(project_policy or {}).get(
+                    litellm_client.PROJECT_POLICY_REVISION_FIELD
+                ),
+            )
+        )
+        return {"key": "sk-minted-once"}
+
+    monkeypatch.setattr(litellm_client, "key_list", key_list)
+    monkeypatch.setattr(litellm_client, "key_generate", key_generate)
+    csrf = "c" * 43
+    set_session({"user": portal_user(), "csrf_token": csrf})
+
+    response = client.post(
+        "/keys",
+        data={"alias": "laptop", "project_id": "ai-gateway", "csrf_token": csrf},
+    )
+
+    assert response.status_code == 201
+    assert generated == [
+        {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": ["claude-haiku", "claude-sonnet"],
+            "default_model": None,
+            "model_limits": {},
+            litellm_client.PROJECT_POLICY_REVISION_FIELD: (
+                litellm_client.project_policy_revision(
+                    {
+                        "tpm_limit": None,
+                        "rpm_limit": None,
+                        "allowed_models": None,
+                        "default_model": None,
+                        "model_limits": {},
+                    }
+                )
+            ),
+        }
+    ]
 
 
 def test_unreadable_project_policy_fails_the_mint_closed(
@@ -2967,7 +3549,21 @@ def test_project_policy_save_retunes_existing_project_keys(
     admin_client, set_admin_session, monkeypatch
 ):
     puts = []
+    posts = []
     key_updates = []
+    policy = {
+        "tpm_limit": 50000,
+        "rpm_limit": 30,
+        "allowed_models": ["claude-haiku"],
+        "default_model": "claude-haiku",
+        "model_limits": {
+            "claude-haiku": {
+                "max_output_tokens_per_request": 4096,
+                "output_tokens_per_utc_minute": 100000,
+            }
+        },
+    }
+    revision = litellm_client.project_policy_revision(policy)
     key_state: dict[str, dict] = {
         "portal-1": full_key_object(
             token="portal-1",
@@ -3002,16 +3598,7 @@ def test_project_policy_save_retunes_existing_project_keys(
 
     async def rotator_put(path, payload, *, operation_id=None):
         puts.append((path, payload))
-        return {
-            "id": "group-1",
-            "name": "ai-gateway",
-            "policy": {
-                "tpm_limit": 50000,
-                "rpm_limit": 30,
-                "allowed_models": ["claude-haiku"],
-                "default_model": "claude-haiku",
-            },
-        }
+        return _staged_policy_result(policy)
 
     async def admin_key_list_page(page):
         assert page == 1
@@ -3028,6 +3615,7 @@ def test_project_policy_save_retunes_existing_project_keys(
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_rotator_post", _policy_transition_stub(policy, posts))
     monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
     monkeypatch.setattr(litellm_client, "key_update", key_update)
     monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
@@ -3047,6 +3635,9 @@ def test_project_policy_save_retunes_existing_project_keys(
             "rpm_limit": "30",
             "allowed_models": "claude-haiku",
             "default_model": "claude-haiku",
+            "limit_models": "claude-haiku",
+            "max_output_tokens_per_request": "4096",
+            "output_tokens_per_utc_minute": "100000",
             "csrf_token": csrf,
         },
         follow_redirects=True,
@@ -3055,12 +3646,7 @@ def test_project_policy_save_retunes_existing_project_keys(
     assert puts == [
         (
             "/identity/groups/group-1/policy",
-            {
-                "tpm_limit": 50000,
-                "rpm_limit": 30,
-                "allowed_models": ["claude-haiku"],
-                "default_model": "claude-haiku",
-            },
+            policy,
         )
     ]
     # Retroactive re-tune touches exactly the project's portal keys — never
@@ -3071,6 +3657,39 @@ def test_project_policy_save_retunes_existing_project_keys(
         (
             "portal-1",
             {
+                "blocked": True,
+                "metadata": {
+                    "created_via": "dev-portal",
+                    "aigw_project_id": "ai-gateway",
+                    "aigw_policy_gate_v1": revision,
+                },
+            },
+        ),
+        (
+            "portal-1",
+            {
+                "tpm_limit": 50000,
+                "rpm_limit": 30,
+                "models": ["claude-haiku"],
+                "blocked": True,
+                "metadata": {
+                    "created_via": "dev-portal",
+                    "aigw_project_id": "ai-gateway",
+                    "aigw_default_model": "claude-haiku",
+                    "aigw_model_limits_v1": (
+                        '{"claude-haiku":{'
+                        '"max_output_tokens_per_request":4096,'
+                        '"output_tokens_per_utc_minute":100000}}'
+                    ),
+                    "aigw_policy_revision_v1": revision,
+                    "aigw_policy_gate_v1": revision,
+                },
+            },
+        ),
+        ("portal-1", {"blocked": False}),
+        (
+            "portal-1",
+            {
                 "tpm_limit": 50000,
                 "rpm_limit": 30,
                 "models": ["claude-haiku"],
@@ -3078,11 +3697,22 @@ def test_project_policy_save_retunes_existing_project_keys(
                     "created_via": "dev-portal",
                     "aigw_project_id": "ai-gateway",
                     "aigw_default_model": "claude-haiku",
+                    "aigw_model_limits_v1": (
+                        '{"claude-haiku":{'
+                        '"max_output_tokens_per_request":4096,'
+                        '"output_tokens_per_utc_minute":100000}}'
+                    ),
+                    "aigw_policy_revision_v1": revision,
                 },
             },
-        )
+        ),
     ]
-    assert "1 existing keys re-tuned" in response.text
+    assert [call[0] for call in posts] == [
+        "/identity/groups/group-1/policy/activate",
+        "/identity/groups/group-1/policy/complete",
+    ]
+    assert len({call[2] for call in posts}) == 1
+    assert "1 active keys gated and 1 keys reconciled" in response.text
 
 
 def test_project_policy_deny_all_models_scopes_keys_to_the_sentinel(
@@ -3092,7 +3722,25 @@ def test_project_policy_deny_all_models_scopes_keys_to_the_sentinel(
     that matches no real model, so API/tooling keys can call nothing. Chat is
     gated separately by the aigw-chat role."""
     puts = []
+    posts = []
     key_updates = []
+    policy = {
+        "tpm_limit": None,
+        "rpm_limit": None,
+        "allowed_models": [litellm_client.NO_MODELS_SENTINEL],
+        "default_model": None,
+        "model_limits": {},
+    }
+    key_state = {
+        "portal-1": full_key_object(
+            token="portal-1",
+            user_id="dev-a",
+            metadata={
+                "created_via": "dev-portal",
+                "aigw_project_id": "ai-gateway",
+            },
+        )
+    }
 
     async def rotator_get(path):
         if path == "/identity/groups":
@@ -3106,27 +3754,27 @@ def test_project_policy_deny_all_models_scopes_keys_to_the_sentinel(
 
     async def rotator_put(path, payload, *, operation_id=None):
         puts.append((path, payload))
-        return {"id": "group-1", "name": "ai-gateway",
-                "policy": {"tpm_limit": None, "rpm_limit": None,
-                           "allowed_models": [litellm_client.NO_MODELS_SENTINEL],
-                           "default_model": None}}
+        return _staged_policy_result(policy)
 
     async def admin_key_list_page(page):
-        return {"keys": [full_key_object(
-            token="portal-1", user_id="dev-a",
-            metadata={"created_via": "dev-portal", "aigw_project_id": "ai-gateway"})],
-            "page": 1, "total_pages": 1, "total_count": 1}
+        return {
+            "keys": [dict(entry) for entry in key_state.values()],
+            "page": 1,
+            "total_pages": 1,
+            "total_count": 1,
+        }
 
     async def key_update(key, updates):
         key_updates.append((key, updates))
+        key_state[key].update(updates)
         return {}
 
     async def admin_key_lookup(token):
-        return full_key_object(token=token, user_id="dev-a",
-            metadata={"created_via": "dev-portal", "aigw_project_id": "ai-gateway"})
+        return dict(key_state[token])
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_rotator_post", _policy_transition_stub(policy, posts))
     monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
     monkeypatch.setattr(litellm_client, "key_update", key_update)
     monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
@@ -3140,13 +3788,12 @@ def test_project_policy_deny_all_models_scopes_keys_to_the_sentinel(
               "default_model": "", "csrf_token": csrf},
         follow_redirects=True)
 
-    assert puts == [("/identity/groups/group-1/policy", {
-        "tpm_limit": None, "rpm_limit": None,
-        "allowed_models": [litellm_client.NO_MODELS_SENTINEL],
-        "default_model": None})]
+    assert puts == [("/identity/groups/group-1/policy", policy)]
     # The re-tuned key is scoped to the sentinel — no real model is callable.
-    assert key_updates and key_updates[0][1]["models"] == [
-        litellm_client.NO_MODELS_SENTINEL]
+    assert key_state["portal-1"]["models"] == [litellm_client.NO_MODELS_SENTINEL]
+    assert key_state["portal-1"]["blocked"] is False
+    assert len(key_updates) == 4
+    assert len(posts) == 2
 
 
 def test_project_policy_all_and_none_are_mutually_exclusive(
@@ -3222,7 +3869,17 @@ def test_key_mint_is_not_disclosed_when_the_default_model_stamp_is_missing(
 def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
     admin_client, set_admin_session, monkeypatch, caplog
 ):
-    """A re-tune whose default stamp does not land verifies closed, not silent."""
+    """A failed re-tune stays gated and the same-policy retry can finish."""
+
+    policy = {
+        "tpm_limit": 50000,
+        "rpm_limit": 30,
+        "allowed_models": ["claude-haiku"],
+        "default_model": "claude-haiku",
+        "model_limits": {},
+    }
+    posts = []
+    drop_retune_metadata = {"value": True}
 
     key_state = {
         "portal-1": full_key_object(
@@ -3241,24 +3898,25 @@ def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
         return {"admin": True}
 
     async def rotator_put(path, payload, *, operation_id=None):
-        return {
-            "id": "group-1",
-            "name": "ai-gateway",
-            "policy": {
-                "tpm_limit": 50000,
-                "rpm_limit": 30,
-                "allowed_models": ["claude-haiku"],
-                "default_model": "claude-haiku",
-            },
-        }
+        return _staged_policy_result(policy)
 
     async def admin_key_list_page(page):
         keys = [dict(entry) for entry in key_state.values()]
         return {"keys": keys, "page": 1, "total_pages": 1, "total_count": len(keys)}
 
     async def key_update(key, updates):
-        # Upstream accepts the update but silently drops the metadata stamp.
-        applied = {name: value for name, value in updates.items() if name != "metadata"}
+        # The gate lands. On the first re-tune attempt, upstream accepts the
+        # update but silently drops the new policy metadata.
+        drops_stamp = (
+            drop_retune_metadata["value"]
+            and litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY
+            in updates.get("metadata", {})
+        )
+        applied = {
+            name: value
+            for name, value in updates.items()
+            if not (drops_stamp and name == "metadata")
+        }
         key_state[key].update(applied)
         return {}
 
@@ -3267,6 +3925,7 @@ def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_rotator_post", _policy_transition_stub(policy, posts))
     monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
     monkeypatch.setattr(litellm_client, "key_update", key_update)
     monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
@@ -3292,7 +3951,11 @@ def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
             follow_redirects=True,
         )
 
-    assert "1 could not be verified" in response.text
+    assert "Policy reconciliation is incomplete" in response.text
+    assert key_state["portal-1"]["blocked"] is True
+    assert litellm_client.PORTAL_POLICY_GATE_METADATA_KEY in key_state[
+        "portal-1"
+    ]["metadata"]
     events = security_events(caplog)
     operation_id = events[0]["operation_id"]
     assert events == [
@@ -3308,6 +3971,150 @@ def test_project_policy_retune_counts_an_unverified_default_stamp_as_failed(
         }
         for outcome in ("intent", "indeterminate")
     ]
+
+    # A retry of the same pending policy resumes safely. The key receives the
+    # complete policy while blocked and is unblocked only after verification.
+    drop_retune_metadata["value"] = False
+    caplog.clear()
+    with caplog.at_level("INFO", logger="dev-portal"):
+        retried = admin_client.post(
+            "/admin/identity/groups/group-1/policy",
+            data={
+                "tpm_limit": "50000",
+                "rpm_limit": "30",
+                "allowed_models": "claude-haiku",
+                "default_model": "claude-haiku",
+                "csrf_token": csrf,
+            },
+            follow_redirects=True,
+        )
+    assert "Project policy saved" in retried.text
+    assert key_state["portal-1"]["blocked"] is False
+    assert key_state["portal-1"]["metadata"][
+        litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY
+    ] == litellm_client.project_policy_revision(policy)
+    assert litellm_client.PORTAL_POLICY_GATE_METADATA_KEY not in key_state[
+        "portal-1"
+    ]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_project_policy_failed_unblock_keeps_durable_gate_for_retry(
+    monkeypatch,
+):
+    policy = {
+        **RESTRICTED_POLICY,
+        litellm_client.PROJECT_POLICY_REVISION_FIELD: (
+            litellm_client.project_policy_revision(RESTRICTED_POLICY)
+        ),
+    }
+    revision = policy[litellm_client.PROJECT_POLICY_REVISION_FIELD]
+    key_state = full_key_object(
+        token="portal-1",
+        user_id="dev-a",
+        blocked=True,
+        metadata={
+            "created_via": "dev-portal",
+            "aigw_project_id": "ai-gateway",
+            litellm_client.PORTAL_POLICY_GATE_METADATA_KEY: revision,
+        },
+    )
+    fail_unblock = {"value": True}
+
+    async def admin_key_list_page(page):
+        assert page == 1
+        return {
+            "keys": [dict(key_state)],
+            "page": 1,
+            "total_pages": 1,
+            "total_count": 1,
+        }
+
+    async def key_update(_key, updates):
+        if updates == {"blocked": False} and fail_unblock["value"]:
+            raise litellm_client.LiteLLMError("lost unblock response")
+        key_state.update(updates)
+        return {}
+
+    async def admin_key_lookup(_key):
+        return dict(key_state)
+
+    monkeypatch.setattr(
+        litellm_client, "admin_key_list_page", admin_key_list_page
+    )
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+
+    assert await main._retune_project_keys(
+        "ai-gateway", policy, ["claude-haiku"]
+    ) == (0, 1)
+    assert key_state["blocked"] is True
+    assert key_state["metadata"][
+        litellm_client.PORTAL_POLICY_GATE_METADATA_KEY
+    ] == revision
+
+    fail_unblock["value"] = False
+    assert await main._retune_project_keys(
+        "ai-gateway", policy, ["claude-haiku"]
+    ) == (1, 0)
+    assert key_state["blocked"] is False
+    assert litellm_client.PORTAL_POLICY_GATE_METADATA_KEY not in key_state[
+        "metadata"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_policy_retry_preserves_a_durable_manual_block(monkeypatch):
+    """A later policy retry never mistakes a manual block for its own gate."""
+
+    policy = {
+        **RESTRICTED_POLICY,
+        litellm_client.PROJECT_POLICY_REVISION_FIELD: (
+            litellm_client.project_policy_revision(RESTRICTED_POLICY)
+        ),
+    }
+    key_state = full_key_object(
+        token="portal-manual-block",
+        user_id="dev-a",
+        blocked=True,
+        models=["claude-sonnet"],
+        metadata={
+            "created_via": "dev-portal",
+            "aigw_project_id": "ai-gateway",
+            litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY: "0" * 64,
+            litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY: True,
+        },
+    )
+    updates: list[dict] = []
+
+    async def admin_key_list_page(_page):
+        return {
+            "keys": [dict(key_state)],
+            "page": 1,
+            "total_pages": 1,
+            "total_count": 1,
+        }
+
+    async def key_update(_key, change):
+        updates.append(dict(change))
+        key_state.update(change)
+        return {}
+
+    async def admin_key_lookup(_key):
+        return dict(key_state)
+
+    monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
+    monkeypatch.setattr(litellm_client, "key_update", key_update)
+    monkeypatch.setattr(litellm_client, "admin_key_lookup", admin_key_lookup)
+
+    assert await main._retune_project_keys(
+        "ai-gateway", policy, ["claude-haiku"]
+    ) == (1, 0)
+    assert key_state["blocked"] is True
+    assert key_state["metadata"][
+        litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
+    ] is True
+    assert all(change.get("blocked") is not False for change in updates)
 
 
 def _unlimited_group(group_id="group-1", name="ai-gateway", **policy_overrides):
@@ -3339,28 +4146,33 @@ def _unlimited_group(group_id="group-1", name="ai-gateway", **policy_overrides):
 def test_project_policy_retune_exception_is_correlated_indeterminate(
     admin_client, set_admin_session, monkeypatch, caplog, retune_failure
 ):
+    policy = {
+        "tpm_limit": 1000,
+        "rpm_limit": None,
+        "allowed_models": None,
+        "default_model": None,
+        "model_limits": {},
+    }
+    posts = []
+
     async def rotator_get(path):
         if path == "/identity/groups":
             return [_unlimited_group()]
         return {"admin": True}
 
     async def rotator_put(path, payload, *, operation_id=None):
-        return {
-            "id": "group-1",
-            "name": "ai-gateway",
-            "policy": {
-                "tpm_limit": 1000,
-                "rpm_limit": None,
-                "allowed_models": None,
-                "default_model": None,
-            },
-        }
+        return _staged_policy_result(policy)
 
-    async def fail_retune(_project_id, _policy):
+    async def gate_keys(_project_id, _policy_revision):
+        return 0
+
+    async def fail_retune(_project_id, _policy, _configured_models=None):
         raise retune_failure
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_rotator_post", _policy_transition_stub(policy, posts))
+    monkeypatch.setattr(main, "_gate_project_keys", gate_keys)
     monkeypatch.setattr(main, "_retune_project_keys", fail_retune)
     csrf = "c" * 43
     set_admin_session(
@@ -3481,6 +4293,923 @@ def test_project_policy_refuses_silent_widening_of_deconfigured_restriction(
     assert "claude-opus" in response.text
 
 
+# --- model-governance admin surface ------------------------------------------
+
+
+def _governed_model_row(**overrides):
+    row = {
+        "operation_id": "11111111-1111-4111-8111-111111111111",
+        "gateway_model_name": "claude-sonnet-4-5",
+        "provider_name": "anthropic",
+        "provider_model_id": "claude-sonnet-4-5",
+        "initial_visible_in_discovery": False,
+        "visible_in_discovery": False,
+        "lifecycle_state": "draft",
+        "active": False,
+        "last_event_sequence": None,
+        "source_reference": "anthropic-model-catalog-2026-07-22",
+        "review_note": "Reviewed against the approved provider catalog.",
+        "document_sha256": "a" * 64,
+        "created_at": "2026-07-22T12:00:00Z",
+        # These server-owned fields must never enter the portal view model.
+        "api_base": "http://envoy-egress:8080/anthropic",
+        "litellm_credential_name": "anthropic-primary",
+    }
+    row.update(overrides)
+    return row
+
+
+def _governed_price_row(**overrides):
+    row = {
+        "version_id": "anthropic-sonnet-input-2026-08-01",
+        "operation_id": "22222222-2222-4222-8222-222222222222",
+        "gateway_model_name": "claude-sonnet-4-5",
+        "provider_name": "anthropic",
+        "usage_class": "normal_input",
+        "token_unit": 1_000_000,
+        "amount": "30",
+        "currency": "USD",
+        "explicit_free": False,
+        "effective_at": "2026-08-01T00:00:00Z",
+        "source_reference": "anthropic-pricing-2026-07-22",
+        "review_note": "Reviewed by the platform pricing owner.",
+        "document_sha256": "b" * 64,
+    }
+    row.update(overrides)
+    return row
+
+
+def _governance_audit_row(**overrides):
+    row = {
+        "operation_id": "11111111-1111-4111-8111-111111111111",
+        "actor": "subject-123",
+        "action": "model_version_created",
+        "resource_type": "model_version",
+        "resource_id": "claude-sonnet-4-5",
+        "document_sha256": "a" * 64,
+        "created_at": "2026-07-22T12:00:00Z",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_model_and_price_views_are_bounded_allowlists() -> None:
+    models = model_admin.safe_governed_models([_governed_model_row()])
+    assert models[0]["gateway_model_name"] == "claude-sonnet-4-5"
+    assert "api_base" not in models[0]
+    assert "litellm_credential_name" not in models[0]
+
+    prices = model_admin.safe_governed_prices(
+        [_governed_price_row()], gateway_model_name="claude-sonnet-4-5"
+    )
+    assert prices[0]["amount"] == "30"
+    assert prices[0]["token_unit"] == 1_000_000
+    assert prices[0]["usage_class_label"] == "Normal input"
+
+    audit = model_admin.safe_governance_audit([_governance_audit_row()])
+    assert audit[0]["action"] == "model_version_created"
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        [_governed_model_row(provider_name="unreviewed")],
+        [_governed_model_row(operation_id="not-a-uuid")],
+        [_governed_model_row(source_reference="https://provider.test/models")],
+        [_governed_model_row(document_sha256="0" * 63)],
+    ],
+)
+def test_model_view_rejects_malformed_or_unreviewed_rows(document) -> None:
+    with pytest.raises(ValueError, match="governed model row"):
+        model_admin.safe_governed_models(document)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        [_governed_price_row(gateway_model_name="other-model")],
+        [_governed_price_row(usage_class="blended-input")],
+        [_governed_price_row(token_unit=3, amount="1")],
+        [_governed_price_row(amount="0", explicit_free=False)],
+        [_governed_price_row(currency="EUR")],
+    ],
+)
+def test_price_view_rejects_ambiguous_or_inexact_rows(document) -> None:
+    with pytest.raises(ValueError, match="governed price row"):
+        model_admin.safe_governed_prices(
+            document, gateway_model_name="claude-sonnet-4-5"
+        )
+
+
+def _backdate_preview_row(**overrides):
+    row = {
+        "preview_id": "33333333-3333-4333-8333-333333333333",
+        "candidate_sha256": "c" * 64,
+        "preview_sha256": "d" * 64,
+        "gateway_model_name": "claude-sonnet-4-5",
+        "usage_class": "normal_input",
+        "token_unit": 1_000_000,
+        "amount": "30",
+        "explicit_free": False,
+        "effective_at": "2026-07-01T00:00:00Z",
+        "effective_to": "2026-08-01T00:00:00Z",
+        "source_reference": "anthropic-pricing-correction-2026-07-22",
+        "review_note": "Corrects the reviewed price on this date.",
+        "affected_count": 1,
+        "shown_affected_count": 1,
+        "affected_rows_truncated": False,
+        "old_total_usd": "0.0003",
+        "new_total_usd": "0.0004",
+        "delta_usd": "0.0001",
+        "old_unknown_count": 0,
+        "new_unknown_count": 0,
+        "affected_rows": [
+            {
+                "usage_event_id": "e" * 64,
+                "usage_class": "normal_input",
+                "units": 10,
+                "previous_component_cost_usd": "0.0003",
+                "new_component_cost_usd": "0.0004",
+                "component_delta_usd": "0.0001",
+                "previous_total_cost_usd": "0.0003",
+                "new_total_cost_usd": "0.0004",
+                "row_sha256": "f" * 64,
+            }
+        ],
+    }
+    row.update(overrides)
+    return row
+
+
+def test_backdate_preview_view_preserves_unknown_and_signed_delta() -> None:
+    row = _backdate_preview_row(
+        old_total_usd=None,
+        delta_usd=None,
+        old_unknown_count=1,
+        affected_rows=[
+            {
+                **_backdate_preview_row()["affected_rows"][0],
+                "previous_component_cost_usd": None,
+                "component_delta_usd": None,
+                "previous_total_cost_usd": None,
+            }
+        ],
+    )
+
+    preview = model_admin.safe_backdate_preview(row)
+
+    assert preview["old_total_usd"] is None
+    assert preview["delta_usd"] is None
+    assert preview["affected_rows"][0]["component_delta_usd"] is None
+
+    negative = model_admin.safe_backdate_preview(
+        _backdate_preview_row(
+            old_total_usd="0.0004",
+            new_total_usd="0.0003",
+            delta_usd="-0.0001",
+            affected_rows=[
+                {
+                    **_backdate_preview_row()["affected_rows"][0],
+                    "previous_component_cost_usd": "0.0004",
+                    "new_component_cost_usd": "0.0003",
+                    "component_delta_usd": "-0.0001",
+                    "previous_total_cost_usd": "0.0004",
+                    "new_total_cost_usd": "0.0003",
+                }
+            ],
+        )
+    )
+    assert negative["delta_usd"] == "-0.0001"
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        _backdate_preview_row(candidate_sha256="c" * 63),
+        _backdate_preview_row(old_total_usd="-0.0001"),
+        _backdate_preview_row(shown_affected_count=0),
+        _backdate_preview_row(old_total_usd=None, old_unknown_count=0),
+    ],
+)
+def test_backdate_preview_view_rejects_malformed_or_inconsistent_rows(
+    document,
+) -> None:
+    with pytest.raises(ValueError, match="backdate"):
+        model_admin.safe_backdate_preview(document)
+
+
+def _model_governance_admin_rotator(monkeypatch):
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        if path in {"/status", "/settings"} or path.startswith("/history"):
+            return []
+        if path == "/providers/anthropic":
+            return {
+                "vendor": "anthropic",
+                "state": "awaiting_enrollment",
+                "configured": False,
+                "enabled": False,
+                "private_key_jwt_ready": True,
+                "nonsecret_ids": {},
+            }
+        if path == "/identity/status":
+            return None
+        if path == "/model-governance/models":
+            return [_governed_model_row()]
+        if path == (
+            "/model-governance/models/claude-sonnet-4-5/prices"
+        ):
+            return [_governed_price_row()]
+        if path == "/model-governance/audit?limit=50":
+            return [_governance_audit_row()]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+
+
+def test_admin_page_renders_governed_models_prices_and_backdate_preview(
+    admin_client, set_admin_session, monkeypatch
+):
+    _model_governance_admin_rotator(monkeypatch)
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": "c" * 43,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.get("/admin#tab-models")
+
+    assert response.status_code == 200
+    assert "Models &amp; pricing" in response.text
+    assert "claude-sonnet-4-5" in response.text
+    assert "$30" in response.text
+    assert "1,000,000 tokens" in response.text
+    assert "Backdating never rewrites history" in response.text
+    assert 'action="/admin/model-governance/models"' in response.text
+    assert 'action="/admin/model-governance/lifecycle"' in response.text
+    assert 'value="activate"' in response.text
+    assert 'action="/admin/model-governance/prices"' in response.text
+    assert (
+        'action="/admin/model-governance/prices/backdate/preview"'
+        in response.text
+    )
+    for forbidden in (
+        'name="actor_id"',
+        'name="hostname"',
+        'name="api_base"',
+        'name="ca_file"',
+        'name="credential"',
+    ):
+        assert forbidden not in response.text
+
+
+def test_model_create_uses_oidc_actor_uuid4_and_hidden_default(
+    admin_client, set_admin_session, monkeypatch, caplog
+):
+    captured = {}
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(
+        path, payload=None, *, operation_id=None, actor_id=None
+    ):
+        captured.update(
+            path=path,
+            payload=payload,
+            operation_id=operation_id,
+            actor_id=actor_id,
+        )
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/model-governance/models",
+            data={
+                "gateway_model_name": "claude-sonnet-4-5",
+                "provider_name": "anthropic",
+                "provider_model_id": "claude-sonnet-4-5",
+                "source_reference": "anthropic-model-catalog-2026-07-22",
+                "review_note": "Reviewed against the approved provider catalog.",
+                "csrf_token": csrf,
+                # Extra browser fields never become controller input.
+                "actor_id": "spoofed-admin",
+                "hostname": "attacker.test",
+                "api_base": "https://attacker.test",
+                "ca_file": "/tmp/unreviewed.pem",
+                "visible_in_discovery": "true",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert captured["path"] == "/model-governance/models"
+    assert captured["actor_id"] == "subject-123"
+    assert main._canonical_operation_id(captured["operation_id"])
+    assert captured["payload"] == {
+        "gateway_model_name": "claude-sonnet-4-5",
+        "provider_name": "anthropic",
+        "provider_model_id": "claude-sonnet-4-5",
+        "visible_in_discovery": False,
+        "source_reference": "anthropic-model-catalog-2026-07-22",
+        "review_note": "Reviewed against the approved provider catalog.",
+    }
+    assert [event["outcome"] for event in security_events(caplog)] == [
+        "intent",
+        "success",
+    ]
+    assert {
+        event["action"] for event in security_events(caplog)
+    } == {"model.governance.create"}
+
+
+@pytest.mark.parametrize("action", ["activate", "show", "hide", "retire"])
+def test_model_lifecycle_uses_step_up_actor_csrf_and_uuid4(
+    admin_client, set_admin_session, monkeypatch, caplog, action
+):
+    captured = {}
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(
+        path, payload=None, *, operation_id=None, actor_id=None
+    ):
+        captured.update(
+            path=path,
+            payload=payload,
+            operation_id=operation_id,
+            actor_id=actor_id,
+        )
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/model-governance/lifecycle",
+            data={
+                "gateway_model_name": "claude-sonnet-4-5",
+                "action": action,
+                "csrf_token": csrf,
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert captured["path"] == (
+        f"/model-governance/models/claude-sonnet-4-5/{action}"
+    )
+    assert captured["payload"] == {}
+    assert captured["actor_id"] == "subject-123"
+    assert main._canonical_operation_id(captured["operation_id"])
+    assert [event["outcome"] for event in security_events(caplog)] == [
+        "intent",
+        "success",
+    ]
+    assert {
+        event["action"] for event in security_events(caplog)
+    } == {f"model.governance.{action}"}
+
+
+def test_model_lifecycle_rejects_bad_csrf_before_controller_call(
+    admin_client, set_admin_session, monkeypatch
+):
+    called = False
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": "c" * 43,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+    response = admin_client.post(
+        "/admin/model-governance/lifecycle",
+        data={
+            "gateway_model_name": "claude-sonnet-4-5",
+            "action": "activate",
+            "csrf_token": "x" * 43,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "csrf_ok", "fresh_step_up", "expected_location"),
+    [
+        ("unreviewed", True, True, "/admin?price_model=claude-sonnet-4-5#tab-models"),
+        ("anthropic", False, True, "/admin?price_model=claude-sonnet-4-5#tab-models"),
+        ("anthropic", True, False, "/admin/reauth"),
+    ],
+)
+def test_model_create_rejects_unapproved_provider_bad_csrf_or_stale_step_up(
+    admin_client,
+    set_admin_session,
+    monkeypatch,
+    provider_name,
+    csrf_ok,
+    fresh_step_up,
+    expected_location,
+):
+    called = False
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    session = {
+        "user": portal_user(roles=[settings.admin_role]),
+        "csrf_token": csrf,
+    }
+    if fresh_step_up:
+        session["admin_reauth_at"] = int(time.time())
+    set_admin_session(session)
+
+    response = admin_client.post(
+        "/admin/model-governance/models",
+        data={
+            "gateway_model_name": "claude-sonnet-4-5",
+            "provider_name": provider_name,
+            "provider_model_id": "claude-sonnet-4-5",
+            "source_reference": "anthropic-model-catalog-2026-07-22",
+            "review_note": "Reviewed against the approved provider catalog.",
+            "csrf_token": csrf if csrf_ok else "x" * 43,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == expected_location
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("amount", "explicit_free", "expected_free"),
+    [("30", None, False), ("0", "1", True)],
+)
+def test_future_price_uses_exact_text_and_oidc_actor(
+    admin_client,
+    set_admin_session,
+    monkeypatch,
+    amount,
+    explicit_free,
+    expected_free,
+    caplog,
+):
+    captured = {}
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(
+        path, payload=None, *, operation_id=None, actor_id=None
+    ):
+        captured.update(
+            path=path,
+            payload=payload,
+            operation_id=operation_id,
+            actor_id=actor_id,
+        )
+        return {}
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+    form = {
+        "gateway_model_name": "claude-sonnet-4-5",
+        "usage_class": "normal_input",
+        "token_unit": "1000000",
+        "amount": amount,
+        "effective_at_utc": (
+            datetime.now(timezone.utc) + timedelta(days=2)
+        ).strftime("%Y-%m-%dT%H:%M"),
+        "source_reference": "anthropic-pricing-2026-07-22",
+        "review_note": "Reviewed by the platform pricing owner.",
+        "csrf_token": csrf,
+        "actor_id": "spoofed-admin",
+        "currency": "EUR",
+        "version_id": "attacker-controlled",
+    }
+    if explicit_free is not None:
+        form["explicit_free"] = explicit_free
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/model-governance/prices",
+            data=form,
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert captured["path"] == "/model-governance/prices"
+    assert captured["actor_id"] == "subject-123"
+    assert main._canonical_operation_id(captured["operation_id"])
+    assert captured["payload"]["version_id"] == (
+        "price-" + captured["operation_id"]
+    )
+    assert captured["payload"]["amount"] == amount
+    assert captured["payload"]["token_unit"] == 1_000_000
+    assert captured["payload"]["explicit_free"] is expected_free
+    assert captured["payload"]["effective_at"].endswith("Z")
+    assert "currency" not in captured["payload"]
+    assert [event["outcome"] for event in security_events(caplog)] == [
+        "intent",
+        "success",
+    ]
+    assert {event["action"] for event in security_events(caplog)} == {
+        "model.price.create"
+    }
+
+
+def test_backdate_preview_uses_stored_controller_receipt(
+    admin_client, set_admin_session, monkeypatch, caplog
+):
+    captured = {}
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(
+        path, payload=None, *, operation_id=None, actor_id=None
+    ):
+        captured.update(
+            path=path,
+            payload=payload,
+            operation_id=operation_id,
+            actor_id=actor_id,
+        )
+        return _backdate_preview_row(preview_id=operation_id)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/model-governance/prices/backdate/preview",
+            data={
+                "gateway_model_name": "claude-sonnet-4-5",
+                "usage_class": "normal_input",
+                "token_unit": "1000000",
+                "amount": "30",
+                "effective_at_utc": (
+                    datetime.now(timezone.utc) - timedelta(days=2)
+                ).strftime("%Y-%m-%dT%H:%M"),
+                "source_reference": "anthropic-pricing-correction-2026-07-22",
+                "review_note": "Corrects the reviewed price on this date.",
+                "csrf_token": csrf,
+                "candidate_sha256": "0" * 64,
+                "preview_sha256": "0" * 64,
+                "actor_id": "spoofed-admin",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 200
+    assert "Review the backdated price" in response.text
+    assert "30 USD per 1000000 tokens" in response.text
+    assert "anthropic-pricing-correction-2026-07-22" in response.text
+    assert "Corrects the reviewed price on this date." in response.text
+    assert "0.0001 USD" in response.text
+    assert "CONFIRM BACKDATED PRICE" in response.text
+    assert f'name="preview_id" value="{captured["operation_id"]}"' in response.text
+    assert captured["path"] == "/model-governance/prices/backdate/preview"
+    assert captured["actor_id"] == "subject-123"
+    assert main._canonical_operation_id(captured["operation_id"])
+    assert captured["payload"]["version_id"] == (
+        "price-" + captured["operation_id"]
+    )
+    assert captured["payload"]["amount"] == "30"
+    assert captured["payload"]["explicit_free"] is False
+    assert "candidate_sha256" not in captured["payload"]
+    assert "preview_sha256" not in captured["payload"]
+    assert [event["outcome"] for event in security_events(caplog)] == [
+        "intent",
+        "success",
+    ]
+    assert {event["action"] for event in security_events(caplog)} == {
+        "model.price.backdate.preview"
+    }
+
+
+def test_backdate_confirm_binds_both_digests_and_new_operation(
+    admin_client, set_admin_session, monkeypatch, caplog
+):
+    captured = {}
+    preview_id = "33333333-3333-4333-8333-333333333333"
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(
+        path, payload=None, *, operation_id=None, actor_id=None
+    ):
+        captured.update(
+            path=path,
+            payload=payload,
+            operation_id=operation_id,
+            actor_id=actor_id,
+        )
+        return {
+            "preview_id": preview_id,
+            "candidate_sha256": "c" * 64,
+            "preview_sha256": "d" * 64,
+            "confirmation_operation_id": operation_id,
+            "version_id": f"price-{preview_id}",
+            "gateway_model_name": "claude-sonnet-4-5",
+            "usage_class": "normal_input",
+            "affected_count": 1,
+            "adjustment_count": 1,
+            "delta_usd": "-0.0001",
+        }
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    with caplog.at_level("INFO", logger="dev-portal"):
+        response = admin_client.post(
+            "/admin/model-governance/prices/backdate/confirm",
+            data={
+                "preview_id": preview_id,
+                "candidate_sha256": "c" * 64,
+                "preview_sha256": "d" * 64,
+                "gateway_model_name": "forged-model",
+                "usage_class": "output",
+                "confirmation": "CONFIRM BACKDATED PRICE",
+                "csrf_token": csrf,
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert captured["path"] == (
+        f"/model-governance/prices/backdate/{preview_id}/confirm"
+    )
+    assert captured["actor_id"] == "subject-123"
+    assert main._canonical_operation_id(captured["operation_id"])
+    assert captured["payload"] == {
+        "candidate_sha256": "c" * 64,
+        "preview_sha256": "d" * 64,
+        "confirmation": "CONFIRM BACKDATED PRICE",
+    }
+    assert [event["outcome"] for event in security_events(caplog)] == [
+        "intent",
+        "success",
+    ]
+    assert {event["action"] for event in security_events(caplog)} == {
+        "model.price.backdate.confirm"
+    }
+    success_event = next(
+        event
+        for event in security_events(caplog)
+        if event["outcome"] == "success"
+    )
+    assert success_event["model"] == "claude-sonnet-4-5"
+    assert success_event["usage_class"] == "normal_input"
+    assert "forged-model" not in response.headers["location"]
+
+
+@pytest.mark.parametrize(
+    ("fresh_step_up", "confirmation", "expected_location"),
+    [
+        (False, "CONFIRM BACKDATED PRICE", "/admin/reauth"),
+        (
+            True,
+            "CONFIRM BACKDATED COST!",
+            "/admin#tab-models",
+        ),
+    ],
+)
+def test_backdate_confirm_rejects_stale_step_up_or_wrong_phrase(
+    admin_client,
+    set_admin_session,
+    monkeypatch,
+    fresh_step_up,
+    confirmation,
+    expected_location,
+):
+    called = False
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    session = {
+        "user": portal_user(roles=[settings.admin_role]),
+        "csrf_token": csrf,
+    }
+    if fresh_step_up:
+        session["admin_reauth_at"] = int(time.time())
+    set_admin_session(session)
+
+    response = admin_client.post(
+        "/admin/model-governance/prices/backdate/confirm",
+        data={
+            "preview_id": "33333333-3333-4333-8333-333333333333",
+            "candidate_sha256": "c" * 64,
+            "preview_sha256": "d" * 64,
+            "gateway_model_name": "claude-sonnet-4-5",
+            "usage_class": "normal_input",
+            "confirmation": confirmation,
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == expected_location
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("csrf_ok", "fresh_step_up", "expected_location"),
+    [
+        (False, True, "/admin?price_model=claude-sonnet-4-5#tab-models"),
+        (True, False, "/admin/reauth"),
+    ],
+)
+def test_price_create_rejects_bad_csrf_or_stale_step_up(
+    admin_client,
+    set_admin_session,
+    monkeypatch,
+    csrf_ok,
+    fresh_step_up,
+    expected_location,
+):
+    called = False
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    session = {
+        "user": portal_user(roles=[settings.admin_role]),
+        "csrf_token": csrf,
+    }
+    if fresh_step_up:
+        session["admin_reauth_at"] = int(time.time())
+    set_admin_session(session)
+
+    response = admin_client.post(
+        "/admin/model-governance/prices",
+        data={
+            "gateway_model_name": "claude-sonnet-4-5",
+            "usage_class": "normal_input",
+            "token_unit": "1000000",
+            "amount": "30",
+            "effective_at_utc": (
+                datetime.now(timezone.utc) + timedelta(days=2)
+            ).strftime("%Y-%m-%dT%H:%M"),
+            "source_reference": "anthropic-pricing-2026-07-22",
+            "review_note": "Reviewed by the platform pricing owner.",
+            "csrf_token": csrf if csrf_ok else "x" * 43,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == expected_location
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("amount", "unit", "effective_delta"),
+    [("1", "3", timedelta(days=2)), ("30", "1000000", timedelta(days=-1))],
+)
+def test_price_rejects_inexact_unit_or_backdate_without_controller_call(
+    admin_client,
+    set_admin_session,
+    monkeypatch,
+    amount,
+    unit,
+    effective_delta,
+):
+    called = False
+
+    async def rotator_get(path):
+        assert path == "/identity/authorization/subject-123"
+        return {"admin": True}
+
+    async def rotator_post(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_rotator_post", rotator_post)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/model-governance/prices",
+        data={
+            "gateway_model_name": "claude-sonnet-4-5",
+            "usage_class": "normal_input",
+            "token_unit": unit,
+            "amount": amount,
+            "effective_at_utc": (
+                datetime.now(timezone.utc) + effective_delta
+            ).strftime("%Y-%m-%dT%H:%M"),
+            "source_reference": "anthropic-pricing-2026-07-22",
+            "review_note": "Reviewed by the platform pricing owner.",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert called is False
+
+
 # --- tabbed console surface ---------------------------------------------------
 
 
@@ -3507,6 +5236,10 @@ def _happy_admin_rotator(monkeypatch, *, status=None, settings_payload=None):
             }
         if path == "/identity/status":
             return None
+        if path == "/model-governance/models":
+            return []
+        if path == "/model-governance/audit?limit=50":
+            return []
         raise AssertionError(path)
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
@@ -3538,7 +5271,7 @@ def test_dev_portal_renders_the_two_tab_rail_with_inline_connect_panel(
     assert "/admin" not in response.text
 
 
-def test_admin_console_renders_the_five_tab_rail(
+def test_admin_console_renders_the_six_tab_rail(
     admin_client, set_admin_session, monkeypatch
 ):
     _happy_admin_rotator(monkeypatch)
@@ -3551,10 +5284,12 @@ def test_admin_console_renders_the_five_tab_rail(
     for pinned in (
         'data-tab="identity"',
         'href="/admin/keys"',
+        'data-tab="models"',
         'data-tab="providers"',
         'data-tab="rotation"',
         'data-tab="audit"',
         'id="tab-identity" role="tabpanel"',
+        'id="tab-models" role="tabpanel"',
         'id="tab-providers" role="tabpanel"',
         'id="tab-rotation" role="tabpanel"',
         'id="tab-audit" role="tabpanel"',
@@ -3907,6 +5642,14 @@ def test_project_policy_widens_deconfigured_restriction_only_with_explicit_optou
     admin_client, set_admin_session, monkeypatch
 ):
     puts = []
+    posts = []
+    policy = {
+        "tpm_limit": 1000,
+        "rpm_limit": None,
+        "allowed_models": None,
+        "default_model": None,
+        "model_limits": {},
+    }
 
     async def rotator_get(path):
         if path == "/identity/groups":
@@ -3919,22 +5662,14 @@ def test_project_policy_widens_deconfigured_restriction_only_with_explicit_optou
 
     async def rotator_put(path, payload, *, operation_id=None):
         puts.append(payload)
-        return {
-            "id": "group-1",
-            "name": "ai-gateway",
-            "policy": {
-                "tpm_limit": 1000,
-                "rpm_limit": None,
-                "allowed_models": None,
-                "default_model": None,
-            },
-        }
+        return _staged_policy_result(policy)
 
     async def admin_key_list_page(page):
         return {"keys": [], "page": 1, "total_pages": 1, "total_count": 0}
 
     monkeypatch.setattr(main, "_rotator_get", rotator_get)
     monkeypatch.setattr(main, "_rotator_put", rotator_put)
+    monkeypatch.setattr(main, "_rotator_post", _policy_transition_stub(policy, posts))
     monkeypatch.setattr(litellm_client, "admin_key_list_page", admin_key_list_page)
     csrf = "c" * 43
     set_admin_session(
@@ -3956,14 +5691,8 @@ def test_project_policy_widens_deconfigured_restriction_only_with_explicit_optou
     )
 
     # The explicit opt-out widens deliberately: allowed_models cleared to None.
-    assert puts == [
-        {
-            "tpm_limit": 1000,
-            "rpm_limit": None,
-            "allowed_models": None,
-            "default_model": None,
-        }
-    ]
+    assert puts == [policy]
+    assert len(posts) == 2
     assert "Project policy saved" in response.text
 
 

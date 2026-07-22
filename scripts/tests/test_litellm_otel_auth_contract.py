@@ -57,6 +57,7 @@ class LiteLLMOtelAuthenticationContractTests(unittest.TestCase):
     def test_litellm_uses_only_the_reviewed_callback(self) -> None:
         self.assertIn(
             'callbacks: ["aigw_otel_callback.aigw_otel", '
+            '"aigw_usage_callback.aigw_usage", '
             '"aigw_default_model_hook.aigw_default_model_enforcer"]',
             CONFIG,
         )
@@ -76,11 +77,23 @@ class LiteLLMOtelAuthenticationContractTests(unittest.TestCase):
             block,
         )
         self.assertIn(
+            "./litellm/aigw_model_limits.py:/app/aigw_model_limits.py:ro,Z",
+            block,
+        )
+        self.assertIn(
             "./litellm/aigw_otel_callback.py:/app/aigw_otel_callback.py:ro,Z",
             block,
         )
         self.assertIn(
+            "./litellm/aigw_usage_callback.py:/app/aigw_usage_callback.py:ro,Z",
+            block,
+        )
+        self.assertIn(
             "./secrets/litellm_otel_token:/run/secrets/litellm_otel_token:ro,z",
+            block,
+        )
+        self.assertIn(
+            "./secrets/litellm_usage_token:/run/secrets/litellm_usage_token:ro,z",
             block,
         )
 
@@ -136,6 +149,9 @@ class LiteLLMOtelAuthenticationContractTests(unittest.TestCase):
                 "alloy/config.alloy",
                 "certs/cribl-ca.pem",
                 "secrets/litellm_otel_token",
+                "secrets/alert_state_ca.pem",
+                "secrets/alert_state_alloy.crt",
+                "secrets/alert_state_alloy.key",
             ],
         )
         self.assertEqual(
@@ -143,9 +159,12 @@ class LiteLLMOtelAuthenticationContractTests(unittest.TestCase):
             [
                 "litellm/config.yaml",
                 "litellm/aigw_default_model_hook.py",
+                "litellm/aigw_model_limits.py",
                 "litellm/aigw_openwebui_identity.py",
                 "litellm/aigw_otel_callback.py",
+                "litellm/aigw_usage_callback.py",
                 "secrets/litellm_otel_token",
+                "secrets/litellm_usage_token",
             ],
         )
         alloy = COMPOSE.split("  alloy:\n", 1)[1].split("\n  prometheus:", 1)[0]

@@ -107,17 +107,27 @@ POLICY_TPM_ATTRIBUTE = "aigw.policy.tpm_limit"
 POLICY_RPM_ATTRIBUTE = "aigw.policy.rpm_limit"
 POLICY_MODELS_ATTRIBUTE = "aigw.policy.allowed_models"
 POLICY_DEFAULT_MODEL_ATTRIBUTE = "aigw.policy.default_model"
-POLICY_ATTRIBUTES = frozenset(
+POLICY_MODEL_LIMITS_ATTRIBUTE = "aigw.policy.model_limits_v1"
+POLICY_PENDING_ATTRIBUTE = "aigw.policy.pending_v1"
+POLICY_PENDING_SCHEMA = 1
+POLICY_REVISION_RE = re.compile(r"[0-9a-f]{64}")
+ACTIVE_POLICY_ATTRIBUTES = frozenset(
     {
         POLICY_TPM_ATTRIBUTE,
         POLICY_RPM_ATTRIBUTE,
         POLICY_MODELS_ATTRIBUTE,
         POLICY_DEFAULT_MODEL_ATTRIBUTE,
+        POLICY_MODEL_LIMITS_ATTRIBUTE,
     }
 )
+POLICY_ATTRIBUTES = ACTIVE_POLICY_ATTRIBUTES | {POLICY_PENDING_ATTRIBUTE}
 MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}")
 MAX_POLICY_MODELS = 32
 POLICY_LIMIT_MAX = 1_000_000_000
+MODEL_REQUEST_OUTPUT_MAX = 1_000_000
+MODEL_LIMIT_FIELDS = frozenset(
+    {"max_output_tokens_per_request", "output_tokens_per_utc_minute"}
+)
 # The dedicated Open WebUI chat gate role. Open WebUI's OAUTH_ALLOWED_ROLES is
 # pinned to exactly this role, so a realm that lacks it (or a client that does
 # not map it) silently 403s every non-admin chat login.
@@ -3775,6 +3785,7 @@ class KeycloakAdmin:
                 "group",
                 "ldap_provider",
                 "operation_id",
+                "policy_revision",
                 "purpose",
                 "project",
                 "target_subject",
@@ -4836,6 +4847,7 @@ class KeycloakAdmin:
             "rpm_limit": None,
             "allowed_models": None,
             "default_model": None,
+            "model_limits": {},
         }
         for attribute, knob in (
             (POLICY_TPM_ATTRIBUTE, "tpm_limit"),
@@ -4872,7 +4884,74 @@ class KeycloakAdmin:
                     "group default model is outside its allowed models"
                 )
             policy["default_model"] = raw_default
+
+        raw_model_limits = cls._single_policy_attribute(
+            attributes, POLICY_MODEL_LIMITS_ATTRIBUTE
+        )
+        if raw_model_limits is not None:
+            if len(raw_model_limits.encode("utf-8")) > 8192:
+                raise IdentityConflict("group per-model limit policy is invalid")
+            try:
+                model_limits = json.loads(raw_model_limits)
+            except (TypeError, ValueError) as exc:
+                raise IdentityConflict(
+                    "group per-model limit policy is invalid"
+                ) from exc
+            normalized_limits = cls._validated_model_limits(
+                model_limits, policy["allowed_models"]
+            )
+            canonical = json.dumps(
+                normalized_limits,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            if not hmac.compare_digest(canonical, raw_model_limits):
+                raise IdentityConflict("group per-model limit policy is invalid")
+            policy["model_limits"] = normalized_limits
         return policy
+
+    @staticmethod
+    def _validated_model_limits(
+        model_limits: Any, allowed_models: Any
+    ) -> dict[str, dict[str, int]]:
+        """Return one bounded map tied to an explicit model allowlist."""
+
+        if not isinstance(model_limits, dict) or len(model_limits) > MAX_POLICY_MODELS:
+            raise IdentityConflict("group per-model limit policy is invalid")
+        if model_limits and not isinstance(allowed_models, list):
+            # A wildcard key would silently authorize a hidden/future model.
+            raise IdentityConflict(
+                "per-model limits require an explicit model allowlist"
+            )
+        allowed = set(allowed_models or [])
+        normalized: dict[str, dict[str, int]] = {}
+        for model, limits in model_limits.items():
+            if (
+                not isinstance(model, str)
+                or MODEL_NAME_RE.fullmatch(model) is None
+                or model not in allowed
+                or not isinstance(limits, dict)
+                or set(limits) != MODEL_LIMIT_FIELDS
+            ):
+                raise IdentityConflict("group per-model limit policy is invalid")
+            request_cap = limits["max_output_tokens_per_request"]
+            minute_cap = limits["output_tokens_per_utc_minute"]
+            if (
+                isinstance(request_cap, bool)
+                or not isinstance(request_cap, int)
+                or not 1 <= request_cap <= MODEL_REQUEST_OUTPUT_MAX
+                or isinstance(minute_cap, bool)
+                or not isinstance(minute_cap, int)
+                or not 1 <= minute_cap <= POLICY_LIMIT_MAX
+                or request_cap > minute_cap
+            ):
+                raise IdentityConflict("group per-model limit policy is invalid")
+            normalized[model] = {
+                "max_output_tokens_per_request": request_cap,
+                "output_tokens_per_utc_minute": minute_cap,
+            }
+        return dict(sorted(normalized.items()))
 
     @staticmethod
     def _validated_policy_input(policy: dict[str, Any]) -> dict[str, Any]:
@@ -4883,6 +4962,7 @@ class KeycloakAdmin:
             "rpm_limit",
             "allowed_models",
             "default_model",
+            "model_limits",
         }:
             raise IdentityConflict("group policy update has an invalid shape")
 
@@ -4925,7 +5005,159 @@ class KeycloakAdmin:
                     "group default model is outside its allowed models"
                 )
         normalized["default_model"] = default_model
+        normalized["model_limits"] = KeycloakAdmin._validated_model_limits(
+            policy["model_limits"], models
+        )
         return normalized
+
+    @staticmethod
+    def _policy_revision(policy: dict[str, Any]) -> str:
+        """Return the stable revision for one already-normalized policy."""
+
+        encoded = json.dumps(
+            policy,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+        return hashlib.sha256(b"aigw-project-policy-v1\0" + encoded).hexdigest()
+
+    @staticmethod
+    def _canonical_policy_operation_id(operation_id: str) -> str:
+        try:
+            parsed = uuid.UUID(operation_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise IdentityConflict("group policy operation ID is invalid") from exc
+        if (
+            parsed.variant != uuid.RFC_4122
+            or parsed.version != 4
+            or str(parsed) != operation_id
+        ):
+            raise IdentityConflict("group policy operation ID is invalid")
+        return operation_id
+
+    @classmethod
+    def _pending_group_policy(cls, group: dict[str, Any]) -> dict[str, Any] | None:
+        """Read one durable pending policy without weakening malformed state."""
+
+        attributes = group.get("attributes") or {}
+        if not isinstance(attributes, dict):
+            raise IdentityConflict("group attributes were invalid")
+        raw = cls._single_policy_attribute(attributes, POLICY_PENDING_ATTRIBUTE)
+        if raw is None:
+            return None
+        if len(raw.encode("utf-8")) > 16 * 1024:
+            raise IdentityConflict("pending group policy is invalid")
+        try:
+            document = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise IdentityConflict("pending group policy is invalid") from exc
+        if not isinstance(document, dict) or set(document) != {
+            "operation_id",
+            "policy",
+            "revision",
+            "schema_version",
+        }:
+            raise IdentityConflict("pending group policy is invalid")
+        if document.get("schema_version") != POLICY_PENDING_SCHEMA:
+            raise IdentityConflict("pending group policy is invalid")
+        operation_id = cls._canonical_policy_operation_id(
+            document.get("operation_id")
+        )
+        normalized = cls._validated_policy_input(document.get("policy"))
+        revision = document.get("revision")
+        if (
+            not isinstance(revision, str)
+            or POLICY_REVISION_RE.fullmatch(revision) is None
+            or not hmac.compare_digest(revision, cls._policy_revision(normalized))
+        ):
+            raise IdentityConflict("pending group policy is invalid")
+        canonical = json.dumps(
+            {
+                "operation_id": operation_id,
+                "policy": normalized,
+                "revision": revision,
+                "schema_version": POLICY_PENDING_SCHEMA,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        if not hmac.compare_digest(raw, canonical):
+            raise IdentityConflict("pending group policy is invalid")
+        return {
+            "operation_id": operation_id,
+            "policy": normalized,
+            "revision": revision,
+        }
+
+    @staticmethod
+    def _attributes_with_active_policy(
+        raw_attributes: dict[str, Any], policy: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Replace only active policy fields and preserve pending/foreign data."""
+
+        attributes = {
+            name: value
+            for name, value in raw_attributes.items()
+            if name not in ACTIVE_POLICY_ATTRIBUTES
+        }
+        if policy["tpm_limit"] is not None:
+            attributes[POLICY_TPM_ATTRIBUTE] = [str(policy["tpm_limit"])]
+        if policy["rpm_limit"] is not None:
+            attributes[POLICY_RPM_ATTRIBUTE] = [str(policy["rpm_limit"])]
+        if policy["allowed_models"] is not None:
+            attributes[POLICY_MODELS_ATTRIBUTE] = [
+                ",".join(policy["allowed_models"])
+            ]
+        if policy["default_model"] is not None:
+            attributes[POLICY_DEFAULT_MODEL_ATTRIBUTE] = [policy["default_model"]]
+        if policy["model_limits"]:
+            attributes[POLICY_MODEL_LIMITS_ATTRIBUTE] = [
+                json.dumps(
+                    policy["model_limits"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+            ]
+        return attributes
+
+    async def _write_group_attributes(
+        self,
+        group_id: str,
+        group: dict[str, Any],
+        attributes: dict[str, Any],
+        token: str,
+    ) -> dict[str, Any]:
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        safe_group = path_segment(group_id, label="group UUID")
+        await self._request(
+            "PUT",
+            f"/admin/realms/{realm}/groups/{safe_group}",
+            token=token,
+            json_body={
+                "id": group.get("id"),
+                "name": group.get("name"),
+                "attributes": attributes,
+            },
+            expected=(204,),
+        )
+        return await self._managed_group(group_id, token)
+
+    @classmethod
+    def _group_policy_reconciliation(cls, group: dict[str, Any]) -> dict[str, Any]:
+        active = cls._group_policy(group)
+        pending = cls._pending_group_policy(group)
+        intended = active if pending is None else pending["policy"]
+        return {
+            "active_policy": active,
+            "policy": intended,
+            "policy_revision": cls._policy_revision(intended),
+            "reconciliation_pending": pending is not None,
+            "operation_id": None if pending is None else pending["operation_id"],
+        }
 
     async def set_group_policy(
         self,
@@ -4944,69 +5176,181 @@ class KeycloakAdmin:
         policy: dict[str, Any],
         operation_id: str = "",
     ) -> dict[str, Any]:
-        """Write and verify one managed group's issuance policy attributes."""
+        """Persist intended policy while leaving the active policy unchanged.
+
+        This is phase one of a recoverable cross-system change. The caller
+        must gate existing LiteLLM keys before activating this pending policy.
+        Repeating the same request resumes safely; a different pending intent
+        is rejected until the first operation is completed.
+        """
 
         normalized = self._validated_policy_input(policy)
+        if not operation_id:
+            # Direct library callers predating the HTTP operation-ID contract
+            # still receive a durable correlation ID. The API path always
+            # supplies its already-validated caller ID.
+            operation_id = str(uuid.uuid4())
+        operation_id = self._canonical_policy_operation_id(operation_id)
+        revision = self._policy_revision(normalized)
         token = await self._controller_token()
         group = await self._managed_group(group_id, token)
         project_id = self._managed_project_id(group)
-
         raw_attributes = group.get("attributes") or {}
         if not isinstance(raw_attributes, dict):
             raise IdentityConflict("group attributes were invalid")
-        # Preserve every non-policy attribute byte-for-byte; this controller
-        # only owns the aigw.policy.* namespace on managed project groups.
-        attributes = {
-            name: value
-            for name, value in raw_attributes.items()
-            if name not in POLICY_ATTRIBUTES
-        }
-        if normalized["tpm_limit"] is not None:
-            attributes[POLICY_TPM_ATTRIBUTE] = [str(normalized["tpm_limit"])]
-        if normalized["rpm_limit"] is not None:
-            attributes[POLICY_RPM_ATTRIBUTE] = [str(normalized["rpm_limit"])]
-        if normalized["allowed_models"] is not None:
-            attributes[POLICY_MODELS_ATTRIBUTE] = [
-                ",".join(normalized["allowed_models"])
-            ]
-        if normalized["default_model"] is not None:
-            attributes[POLICY_DEFAULT_MODEL_ATTRIBUTE] = [
-                normalized["default_model"]
-            ]
-
-        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         safe_group = path_segment(group_id, label="group UUID")
-        await self._request(
-            "PUT",
-            f"/admin/realms/{realm}/groups/{safe_group}",
-            token=token,
-            json_body={
-                "id": group.get("id"),
-                "name": group.get("name"),
-                "attributes": attributes,
-            },
-            expected=(204,),
-        )
-        # Verify the effect from a fresh authoritative read: a 204 alone must
-        # not be trusted to have persisted the exact restriction.
-        applied = self._group_policy(await self._managed_group(group_id, token))
-        if applied != normalized:
-            raise IdentityError("group policy did not verify after update")
+        existing = self._pending_group_policy(group)
+        if existing is not None:
+            if not hmac.compare_digest(existing["revision"], revision):
+                raise IdentityConflict(
+                    "a different group policy reconciliation is already pending"
+                )
+            stored_operation_id = existing["operation_id"]
+        else:
+            pending_document = json.dumps(
+                {
+                    "operation_id": operation_id,
+                    "policy": normalized,
+                    "revision": revision,
+                    "schema_version": POLICY_PENDING_SCHEMA,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            attributes = dict(raw_attributes)
+            attributes[POLICY_PENDING_ATTRIBUTE] = [pending_document]
+            verified = await self._write_group_attributes(
+                group_id, group, attributes, token
+            )
+            existing = self._pending_group_policy(verified)
+            if existing is None or not hmac.compare_digest(
+                existing["revision"], revision
+            ):
+                raise IdentityError("pending group policy did not verify after update")
+            group = verified
+            stored_operation_id = operation_id
         await self._audit(
             "group_policy_update",
             "success",
             {
                 "group_id": safe_group,
                 "project": project_id,
-                "policy": applied,
-                **({"operation_id": operation_id} if operation_id else {}),
+                "operation_id": operation_id,
+                "policy_revision": revision,
+                "purpose": "staged",
             },
         )
         return {
             "id": safe_group,
             "name": str(group.get("name") or ""),
-            "policy": applied,
+            "active_policy": self._group_policy(group),
+            "policy": normalized,
+            "policy_revision": revision,
+            "reconciliation_pending": True,
+            "reconciliation_operation_id": stored_operation_id,
         }
+
+    async def activate_group_policy(
+        self, group_id: str, revision: str, operation_id: str
+    ) -> dict[str, Any]:
+        """Activate one pending policy only after callers gate existing keys."""
+
+        if not isinstance(revision, str) or POLICY_REVISION_RE.fullmatch(revision) is None:
+            raise IdentityConflict("group policy revision is invalid")
+        operation_id = self._canonical_policy_operation_id(operation_id)
+        async with self._group_topology_lock:
+            token = await self._controller_token()
+            group = await self._managed_group(group_id, token)
+            project_id = self._managed_project_id(group)
+            pending = self._pending_group_policy(group)
+            active = self._group_policy(group)
+            if pending is None:
+                if not hmac.compare_digest(self._policy_revision(active), revision):
+                    raise IdentityConflict("pending group policy was not found")
+                return self._group_policy_reconciliation(group)
+            if not hmac.compare_digest(pending["revision"], revision):
+                raise IdentityConflict("group policy revision changed")
+            if active != pending["policy"]:
+                raw_attributes = group.get("attributes") or {}
+                if not isinstance(raw_attributes, dict):
+                    raise IdentityConflict("group attributes were invalid")
+                attributes = self._attributes_with_active_policy(
+                    raw_attributes, pending["policy"]
+                )
+                group = await self._write_group_attributes(
+                    group_id, group, attributes, token
+                )
+            state = self._group_policy_reconciliation(group)
+            if (
+                state["active_policy"] != pending["policy"]
+                or state["reconciliation_pending"] is not True
+                or not hmac.compare_digest(state["policy_revision"], revision)
+            ):
+                raise IdentityError("active group policy did not verify")
+            await self._audit(
+                "group_policy_update",
+                "success",
+                {
+                    "group_id": path_segment(group_id, label="group UUID"),
+                    "project": project_id,
+                    "operation_id": operation_id,
+                    "policy_revision": revision,
+                    "purpose": "activated",
+                },
+            )
+            return state
+
+    async def complete_group_policy(
+        self, group_id: str, revision: str, operation_id: str
+    ) -> dict[str, Any]:
+        """Clear a pending marker only after every LiteLLM key verifies."""
+
+        if not isinstance(revision, str) or POLICY_REVISION_RE.fullmatch(revision) is None:
+            raise IdentityConflict("group policy revision is invalid")
+        operation_id = self._canonical_policy_operation_id(operation_id)
+        async with self._group_topology_lock:
+            token = await self._controller_token()
+            group = await self._managed_group(group_id, token)
+            project_id = self._managed_project_id(group)
+            pending = self._pending_group_policy(group)
+            active = self._group_policy(group)
+            if pending is None:
+                if not hmac.compare_digest(self._policy_revision(active), revision):
+                    raise IdentityConflict("completed group policy revision changed")
+                return self._group_policy_reconciliation(group)
+            if (
+                not hmac.compare_digest(pending["revision"], revision)
+                or active != pending["policy"]
+            ):
+                raise IdentityConflict("group policy is not ready to complete")
+            raw_attributes = group.get("attributes") or {}
+            if not isinstance(raw_attributes, dict):
+                raise IdentityConflict("group attributes were invalid")
+            attributes = dict(raw_attributes)
+            attributes.pop(POLICY_PENDING_ATTRIBUTE, None)
+            group = await self._write_group_attributes(
+                group_id, group, attributes, token
+            )
+            state = self._group_policy_reconciliation(group)
+            if (
+                state["reconciliation_pending"] is not False
+                or state["active_policy"] != active
+                or not hmac.compare_digest(state["policy_revision"], revision)
+            ):
+                raise IdentityError("completed group policy did not verify")
+            await self._audit(
+                "group_policy_update",
+                "success",
+                {
+                    "group_id": path_segment(group_id, label="group UUID"),
+                    "project": project_id,
+                    "operation_id": operation_id,
+                    "policy_revision": revision,
+                    "purpose": "completed",
+                },
+            )
+            return state
 
     async def _revoke_portal_project_keys(self, user_id: str, project_id: str) -> None:
         """Fail closed unless LiteLLM confirms portal-key revocation.
@@ -5145,6 +5489,7 @@ class KeycloakAdmin:
         bindings = await self._user_project_bindings(user_id, token)
         realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         policies: dict[str, Any] = {}
+        reconciliation: dict[str, Any] = {}
         for project_id in sorted(bindings):
             response = await self._request(
                 "GET",
@@ -5155,8 +5500,55 @@ class KeycloakAdmin:
             group = self._json(response, "project policy group")
             if not isinstance(group, dict):
                 raise IdentityError("Keycloak project group was invalid")
-            policies[project_id] = self._group_policy(group)
-        return {"projects": sorted(bindings), "policies": policies}
+            policy_state = self._group_policy_reconciliation(group)
+            policies[project_id] = policy_state["policy"]
+            reconciliation[project_id] = {
+                "ready": policy_state["reconciliation_pending"] is False,
+                "revision": policy_state["policy_revision"],
+            }
+        return {
+            "projects": sorted(bindings),
+            "policies": policies,
+            "policy_reconciliation": reconciliation,
+        }
+
+    async def project_policy_reconciliation_ready(self) -> bool:
+        """Return false while any durable project-policy intent is pending."""
+
+        token = await self._controller_token()
+        state_doc = self._identity_state()
+        root_id = path_segment(
+            state_doc.get("managed_root_group_id"), label="managed root UUID"
+        )
+        realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
+        for page in range(MAX_PAGE_COUNT):
+            response = await self._request(
+                "GET",
+                f"/admin/realms/{realm}/groups/{root_id}/children",
+                token=token,
+                params={
+                    "first": page * PAGE_SIZE,
+                    "max": PAGE_SIZE,
+                    "briefRepresentation": "false",
+                },
+                expected=(200,),
+            )
+            payload = self._json(response, "managed groups")
+            if not isinstance(payload, list) or any(
+                not isinstance(group, dict) for group in payload
+            ):
+                raise IdentityError("Keycloak managed groups were invalid")
+            if any(
+                self._group_policy_reconciliation(group)[
+                    "reconciliation_pending"
+                ]
+                is True
+                for group in payload
+            ):
+                return False
+            if len(payload) < PAGE_SIZE:
+                return True
+        raise IdentityConflict("managed group count exceeds the supported safety bound")
 
     async def chat_capability_health(self) -> dict[str, Any]:
         """Report whether the live realm wires the dedicated aigw-chat gate.
@@ -5360,6 +5752,7 @@ class KeycloakAdmin:
                     continue
                 group_id = path_segment(group.get("id"), label="group UUID")
                 members = await self._members(group_id, token)
+                policy_state = self._group_policy_reconciliation(group)
                 result.append(
                     {
                         "id": group_id,
@@ -5371,12 +5764,58 @@ class KeycloakAdmin:
                         # the same attribute parser applies; a malformed
                         # policy fails the listing closed instead of showing
                         # a restricted project as unlimited.
-                        "policy": self._group_policy(group),
+                        "policy": policy_state["policy"],
+                        "policy_reconciliation": {
+                            "ready": (
+                                policy_state["reconciliation_pending"] is False
+                            ),
+                            "revision": policy_state["policy_revision"],
+                            "active_policy": policy_state["active_policy"],
+                        },
                     }
                 )
             if len(payload) < PAGE_SIZE:
                 return sorted(result, key=lambda group: group["name"].lower())
         raise IdentityConflict("managed group count exceeds the supported safety bound")
+
+    async def projects_assigning_model(self, model_name: str) -> list[str]:
+        """Return managed projects that still authorize one model.
+
+        A legacy null allowlist means "all models".  Treat it as assigned so
+        retirement cannot turn an unclear policy into accidental access or a
+        broken project.  Operators must first save an explicit allowlist.
+        """
+
+        if MODEL_NAME_RE.fullmatch(model_name) is None:
+            raise IdentityConflict("model name is invalid")
+        assigned: list[str] = []
+        for group in await self.list_groups():
+            policies = [group.get("policy")]
+            reconciliation = group.get("policy_reconciliation")
+            if isinstance(reconciliation, dict) and reconciliation.get(
+                "ready"
+            ) is False:
+                policies.append(reconciliation.get("active_policy"))
+            if any(not isinstance(policy, dict) for policy in policies):
+                raise IdentityConflict("group model policy is invalid")
+            if any(
+                policy.get("allowed_models") is None
+                or (
+                    isinstance(policy.get("allowed_models"), list)
+                    and model_name in policy["allowed_models"]
+                )
+                or policy.get("default_model") == model_name
+                or (
+                    isinstance(policy.get("model_limits"), dict)
+                    and model_name in policy["model_limits"]
+                )
+                for policy in policies
+            ):
+                group_id = group.get("id")
+                if not isinstance(group_id, str) or not group_id:
+                    raise IdentityConflict("managed group ID is invalid")
+                assigned.append(group_id)
+        return assigned
 
     async def search_users(self, query: str = "") -> list[dict[str, Any]]:
         if len(query) > 64 or any(ord(ch) < 32 for ch in query):

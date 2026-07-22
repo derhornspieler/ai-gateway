@@ -15,8 +15,10 @@ Schema v2 makes two file pairs from one build:
 The production archive has no preprod-only image bytes. Do not send the
 preprod pair to a production host.
 
-At this source revision, production has 23 external and 17 custom references,
-for 40 total. Preprod has 25 external and 19 custom references, for 44 total.
+At this source revision, production has 24 external and 19 custom references,
+for 43 total. Preprod has 26 external and 21 custom references, for 47 total.
+The production count now includes the Alertmanager base and custom image and
+the reviewed LiteLLM security derivative.
 Samba AD and the WIF provider mock are the two preprod-only custom services.
 Their Debian 13.6-slim base is also preprod-only. The last extra reference is
 the archive-only PostgreSQL 16 source used to rehearse the PostgreSQL 18
@@ -34,8 +36,8 @@ Most operators should use the image updater. Run it from the repository root:
 python3 -I scripts/update-images.py prepare \
   --provider anthropic \
   --platform linux/amd64 \
-  --archive /absolute/private/path/aigw-2026-07-21-linux-amd64.docker.tar.zst \
-  --manifest /absolute/private/path/aigw-2026-07-21-linux-amd64.manifest.json
+  --archive /absolute/private/path/aigw-2026-07-22-linux-amd64.docker.tar.zst \
+  --manifest /absolute/private/path/aigw-2026-07-22-linux-amd64.manifest.json
 ```
 
 Use `linux/arm64` for an ARM64 target. Anthropic is the only approved provider
@@ -45,10 +47,10 @@ option for a custom hostname or CA path.
 The command creates these four files:
 
 ```text
-aigw-2026-07-21-linux-amd64.docker.tar.zst
-aigw-2026-07-21-linux-amd64.manifest.json
-aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
-aigw-2026-07-21-linux-amd64.preprod.manifest.json
+aigw-2026-07-22-linux-amd64.docker.tar.zst
+aigw-2026-07-22-linux-amd64.manifest.json
+aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst
+aigw-2026-07-22-linux-amd64.preprod.manifest.json
 ```
 
 All paths must be absolute and different. The tool writes each file with mode
@@ -66,15 +68,15 @@ This command is for release-tool maintenance. Normal operators should use
 `update-images.py`.
 
 ```bash
-install -d -m 0700 "$PWD/private/offline-images/2026-07-21-linux-amd64"
+install -d -m 0700 "$PWD/private/offline-images/2026-07-22-linux-amd64"
 python3 -I scripts/rebuild-offline-image-seed.py \
   --prepare-release \
   --provider anthropic \
   --platform linux/amd64 \
   --materialize-missing-source-tags \
   --allow-unprivileged-controller \
-  "$PWD/private/offline-images/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst" \
-  "$PWD/private/offline-images/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json"
+  "$PWD/private/offline-images/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.docker.tar.zst" \
+  "$PWD/private/offline-images/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.manifest.json"
 ```
 
 `update-images.py prepare` adds
@@ -164,9 +166,9 @@ Set these five inventory values. Each path is on the production VM:
 
 ```yaml
 offline_image_seed_enabled: true
-offline_image_seed_remote_path: /var/tmp/aigw-2026-07-21-linux-amd64.docker.tar.zst
+offline_image_seed_remote_path: /var/tmp/aigw-2026-07-22-linux-amd64.docker.tar.zst
 offline_image_seed_sha256: <archive-sha256>
-offline_image_seed_manifest_remote_path: /var/tmp/aigw-2026-07-21-linux-amd64.manifest.json
+offline_image_seed_manifest_remote_path: /var/tmp/aigw-2026-07-22-linux-amd64.manifest.json
 offline_image_seed_manifest_sha256: <manifest-sha256>
 ```
 
@@ -175,8 +177,8 @@ SHA-256 values on the controller:
 
 ```bash
 shasum -a 256 \
-  /absolute/private/path/aigw-2026-07-21-linux-amd64.docker.tar.zst \
-  /absolute/private/path/aigw-2026-07-21-linux-amd64.manifest.json
+  /absolute/private/path/aigw-2026-07-22-linux-amd64.docker.tar.zst \
+  /absolute/private/path/aigw-2026-07-22-linux-amd64.manifest.json
 ```
 
 On the VM, install each file as a regular, non-symlink file. Use owner
@@ -208,8 +210,8 @@ The normal path is:
 
 ```bash
 python3 -I scripts/update-images.py test-preprod \
-  --archive /absolute/private/path/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
-  --manifest /absolute/private/path/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  --archive /absolute/private/path/aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst \
+  --manifest /absolute/private/path/aigw-2026-07-22-linux-amd64.preprod.manifest.json \
   --load-archive \
   --become-password-file "$HOME/.ssh/become"
 ```
@@ -250,8 +252,8 @@ The lower-level receipt command is for troubleshooting:
 
 ```bash
 python3 -I scripts/load-offline-image-seed.py local-release-receipt \
-  /absolute/private/path/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
-  /absolute/private/path/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  /absolute/private/path/aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst \
+  /absolute/private/path/aigw-2026-07-22-linux-amd64.preprod.manifest.json \
   <preprod-manifest-sha256> \
   "$PWD"
 ```

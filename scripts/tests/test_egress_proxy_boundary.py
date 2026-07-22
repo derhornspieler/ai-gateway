@@ -40,7 +40,15 @@ class EgressProxyBoundaryTests(unittest.TestCase):
         )[0]
         self.assertIn("net-vendor: {}", envoy_networks)
         self.assertIn("net-metrics: {}", envoy_networks)
-        self.assertIn("- targets: [\"envoy-egress:9902\"]", (ROOT / "compose" / "prometheus" / "prometheus.yml").read_text(encoding="utf-8"))
+        alloy = (ROOT / "compose" / "alloy" / "config.alloy").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            '{ "__address__" = "envoy-egress:9902", '
+            '"__metrics_path__" = "/stats/prometheus", '
+            '"job" = "envoy-egress" }',
+            alloy,
+        )
 
 
 if __name__ == "__main__":

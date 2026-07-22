@@ -19,6 +19,18 @@ datasources:
     access: proxy
     url: http://loki:3100
     editable: false
+  # Prometheus remains the only rule evaluator. This private datasource lets
+  # operators view active/inhibited alerts and manage silences in Grafana's
+  # Alerting UI; Grafana-managed alert forwarding stays explicitly disabled.
+  - name: Alertmanager
+    type: alertmanager
+    uid: alertmanager
+    access: proxy
+    url: http://alertmanager:9093
+    editable: false
+    jsonData:
+      implementation: prometheus
+      handleGrafanaManagedAlerts: false
   # Owner-approved admin cost/usage path: a READ-ONLY PostgreSQL datasource
   # over LiteLLM's own computed spend rows (metadata only — prompt storage in
   # spend logs is pinned off). The grafana_ro role may CONNECT only to the
@@ -37,6 +49,26 @@ datasources:
       database: litellm
       # Plaintext on the dedicated internal-only net-db-grafana bridge matches
       # the platform's container-to-container transport posture.
+      sslmode: disable
+      maxOpenConns: 4
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+      postgresVersion: 1800
+      timescaledb: false
+    secureJsonData:
+      password: $__env{AIGW_PG_GRAFANA_RO_PASSWORD}
+  # Immutable usage and configured-cost evidence lives in the rotator
+  # database. Grafana can read only the two security-barrier report views;
+  # it cannot read or change the append-only evidence tables.
+  - name: AI Gateway Usage
+    type: grafana-postgresql-datasource
+    uid: aigw-usage
+    access: proxy
+    url: postgres:5432
+    user: grafana_ro
+    editable: false
+    jsonData:
+      database: rotator
       sslmode: disable
       maxOpenConns: 4
       maxIdleConns: 2

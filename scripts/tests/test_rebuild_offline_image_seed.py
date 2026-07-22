@@ -1149,7 +1149,7 @@ class OfflineImageSeedBuilderTests(unittest.TestCase):
         scopes = builder.collect_project_image_reference_scopes(project_root)
         references = scopes["preprod"]
 
-        self.assertEqual(len(references), 25)
+        self.assertEqual(len(references), 26)
         self.assertIn(PINNED_DEBIAN, references)
         self.assertIn(PINNED_FRONTEND, references)
         self.assertIn(PINNED_PREPROD_POSTGRES16, references)

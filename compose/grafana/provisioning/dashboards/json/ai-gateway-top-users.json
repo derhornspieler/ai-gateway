@@ -20,6 +20,14 @@
       "keepTime": true,
       "tags": [],
       "targetBlank": false,
+      "title": "AI Gateway Model Usage and Cost",
+      "type": "link",
+      "url": "/d/aigw-model-usage/ai-gateway-model-usage-and-cost"
+    },
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
       "title": "AI Gateway Overview",
       "type": "link",
       "url": "/d/aigw-overview/ai-gateway-overview"

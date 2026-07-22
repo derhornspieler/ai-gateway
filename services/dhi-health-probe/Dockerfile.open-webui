@@ -24,16 +24,21 @@ RUN --network=none apt-get autopurge -y \
     && ! command -v pandoc \
     && ! command -v ffmpeg \
     && test -x /usr/local/bin/python3
-# Update the four runtime packages that have fixed releases. The wheels and
+# Update the six runtime packages that have fixed releases. The wheels and
 # their reviewed hashes are committed so this step needs no package index.
 RUN --network=none \
     --mount=type=bind,source=openwebui-wheels,target=/tmp/aigw-wheels,readonly \
+    --mount=type=bind,source=runtime-security-wheels,target=/tmp/aigw-security-wheels,readonly \
     cd /tmp/aigw-wheels \
+    && sha256sum -c SHA256SUMS \
+    && cd /tmp/aigw-security-wheels \
     && sha256sum -c SHA256SUMS \
     && architecture="$(dpkg --print-architecture)" \
     && test "$architecture" = amd64 -o "$architecture" = arm64 \
     && python3 -I -m pip install --no-index --no-deps --force-reinstall \
-      any/*.whl "$architecture"/*.whl \
+      /tmp/aigw-wheels/any/*.whl \
+      "/tmp/aigw-wheels/$architecture"/*.whl \
+      /tmp/aigw-security-wheels/*.whl \
     && python3 -I -m pip uninstall -y \
       accelerate colbert-ai ctranslate2 datasets faster-whisper nltk \
       pyarrow pymilvus python-jose python-pptx rapidocr-onnxruntime \
@@ -42,7 +47,7 @@ RUN --network=none \
     && rm -f /usr/local/bin/uv /usr/local/bin/uvx \
     && python3 -I -m pip check \
     && python3 -I -c \
-      "import cryptography,importlib.metadata,mcp,multipart,PIL; assert cryptography.__version__ == '49.0.0'; assert importlib.metadata.version('mcp') == '1.28.1'; assert multipart.__version__ == '0.0.32'; assert PIL.__version__ == '12.3.0'"
+      "import cryptography,importlib.metadata,mcp,multipart,PIL; assert cryptography.__version__ == '49.0.0'; assert importlib.metadata.version('GitPython') == '3.1.54'; assert importlib.metadata.version('mcp') == '1.28.1'; assert importlib.metadata.version('pyasn1') == '0.6.4'; assert multipart.__version__ == '0.0.32'; assert PIL.__version__ == '12.3.0'"
 # The immutable upstream image contains Python and this exact module. The
 # patcher verifies both complete source hashes and both narrow promotion
 # snippets before changing bytes; the verifier executes the patched role method

@@ -32,6 +32,7 @@ EDGE_CERTS_DIR = SECRETS_DIR / "preprod-edge-certs"
 VAULT_INIT_FILE = SECRETS_DIR / "preprod-vault-init.json"
 SEED_RECEIPT = SECRETS_DIR / "preprod-seed-receipt.json"
 SEED_OVERLAY = SECRETS_DIR / "preprod-seed-images.yml"
+PROVIDER_POLICY_RECEIPT = SECRETS_DIR / "provider_policy_receipt.json"
 PREPROD_CREDENTIAL_SEED = SECRETS_DIR / "preprod-credential-seed-v1"
 PREPROD_CREDENTIAL_SEED_BYTES = 32
 PREPROD_CREDENTIAL_CONTEXT = b"aigw-preprod-credential-v1"
@@ -167,12 +168,15 @@ COMPOSE_FILES = (
 # identity controller writes it only after Keycloak starts, so it is tracked
 # here but deliberately excluded from the immutable configuration digest.
 PREPROD_BIND_SOURCES = (
+    "alertmanager/alertmanager.yml",
     "cribl-mock/config.yaml",
     "cribl-mock/config.preprod-tls.yaml",
     "grafana/provisioning",
     "litellm/aigw_default_model_hook.py",
+    "litellm/aigw_model_limits.py",
     "litellm/aigw_openwebui_identity.py",
     "litellm/aigw_otel_callback.py",
+    "litellm/aigw_usage_callback.py",
     "loki/config.yml",
     "postgres/init",
     "prometheus/prometheus.yml",
@@ -180,6 +184,12 @@ PREPROD_BIND_SOURCES = (
     "secrets/preprod-edge-certs",
     "secrets/preprod-edge-forwarder.yaml",
     "secrets/preprod-alloy-config.alloy",
+    "secrets/preprod-prometheus.yml",
+    "secrets/preprod-alert-rules.yml",
+    "secrets/preprod-alert-state-alloy.crt",
+    "secrets/preprod-alert-state-alloy.key",
+    "secrets/preprod-alert-state-prometheus.crt",
+    "secrets/preprod-alert-state-prometheus.key",
     "secrets/preprod-cribl.crt",
     "secrets/preprod-cribl.key",
     "secrets/preprod-controller-lifecycle",
@@ -187,6 +197,7 @@ PREPROD_BIND_SOURCES = (
     "secrets/preprod-wif-envoy.yaml",
     "secrets/preprod-realms",
     "secrets/preprod-root-ca.pem",
+    "secrets/provider_policy_receipt.json",
     "secrets/preprod-samba-admin-password",
     "secrets/preprod-samba-bind-password",
     "secrets/preprod-samba.crt",
@@ -195,6 +206,7 @@ PREPROD_BIND_SOURCES = (
     "secrets/preprod-wif.crt",
     "secrets/preprod-wif.key",
     "secrets/litellm_otel_token",
+    "secrets/litellm_usage_token",
     "secrets/redis_password",
     "secrets/redis_users.acl",
     "secrets/samba_user_preprod-admin_password",
@@ -1703,6 +1715,10 @@ def certificate_paths() -> dict[str, Path]:
         "cribl_cert": SECRETS_DIR / "preprod-cribl.crt",
         "wif_key": SECRETS_DIR / "preprod-wif.key",
         "wif_cert": SECRETS_DIR / "preprod-wif.crt",
+        "alert_server_key": SECRETS_DIR / "preprod-alert-state-alloy.key",
+        "alert_server_cert": SECRETS_DIR / "preprod-alert-state-alloy.crt",
+        "alert_client_key": SECRETS_DIR / "preprod-alert-state-prometheus.key",
+        "alert_client_cert": SECRETS_DIR / "preprod-alert-state-prometheus.crt",
     }
 
 
@@ -1728,7 +1744,14 @@ def generate_root_ca(paths: dict[str, Path]) -> None:
 
 
 def generate_leaf(
-    paths: dict[str, Path], key_name: str, cert_name: str, common_name: str, sans: list[str]
+    paths: dict[str, Path],
+    key_name: str,
+    cert_name: str,
+    common_name: str,
+    sans: list[str],
+    *,
+    extended_key_usage: str = "serverAuth",
+    key_mode: int = 0o600,
 ) -> None:
     key_path = paths[key_name]
     cert_path = paths[cert_name]
@@ -1738,12 +1761,16 @@ def generate_leaf(
         with tempfile.TemporaryDirectory(prefix="aigw-preprod-cert-") as directory:
             csr = Path(directory) / "leaf.csr"
             extensions = Path(directory) / "extensions.cnf"
-            extensions.write_text(
-                "basicConstraints=critical,CA:FALSE\n"
-                "keyUsage=critical,digitalSignature,keyEncipherment\n"
-                "extendedKeyUsage=serverAuth\n"
-                f"subjectAltName={','.join('DNS:' + name for name in sans)}\n"
-            )
+            extension_lines = [
+                "basicConstraints=critical,CA:FALSE",
+                "keyUsage=critical,digitalSignature,keyEncipherment",
+                f"extendedKeyUsage={extended_key_usage}",
+            ]
+            if sans:
+                extension_lines.append(
+                    f"subjectAltName={','.join('DNS:' + name for name in sans)}"
+                )
+            extensions.write_text("\n".join(extension_lines) + "\n")
             run(
                 [
                     "openssl", "req", "-new", "-newkey", "rsa:2048", "-sha256", "-nodes",
@@ -1758,15 +1785,34 @@ def generate_leaf(
                     "-extfile", str(extensions), "-out", str(cert_path),
                 ]
             )
-        key_path.chmod(0o600)
-        cert_path.chmod(0o644)
-    run(
-        [
-            "openssl", "verify", "-CAfile", str(paths["root_cert"]),
-            "-verify_hostname", sans[0], str(cert_path),
-        ],
-        capture=True,
-    )
+    key_path.chmod(key_mode)
+    cert_path.chmod(0o644)
+    verify = [
+        "openssl", "verify", "-CAfile", str(paths["root_cert"]),
+        "-purpose", "sslserver" if extended_key_usage == "serverAuth" else "sslclient",
+    ]
+    verify.append(str(cert_path))
+    run(verify, capture=True)
+    if sans:
+        certificate_text = run(
+            ["openssl", "x509", "-in", str(cert_path), "-noout", "-text"],
+            capture=True,
+        ).stdout
+        marker = "X509v3 Subject Alternative Name:"
+        lines = certificate_text.splitlines()
+        matches = [
+            index for index, line in enumerate(lines) if line.strip() == marker
+        ]
+        actual_sans: set[str] = set()
+        if len(matches) == 1 and matches[0] + 1 < len(lines):
+            actual_sans = {
+                value.strip()
+                for value in lines[matches[0] + 1].strip().split(",")
+                if value.strip()
+            }
+        expected_sans = {f"DNS:{name}" for name in sans}
+        if actual_sans != expected_sans:
+            fail(f"the preprod certificate for {common_name} has unexpected SANs")
 
 
 def prepare_certificates(domain: str) -> None:
@@ -1783,6 +1829,26 @@ def prepare_certificates(domain: str) -> None:
         "wif_cert",
         f"wif-provider-mock.{domain}",
         [f"wif-provider-mock.{domain}"],
+    )
+    # These world-readable key modes are limited to the root-only local
+    # compose/secrets directory. Docker Desktop cannot preserve Linux numeric
+    # group ownership on bind mounts; production uses root:<service> 0440.
+    generate_leaf(
+        paths,
+        "alert_server_key",
+        "alert_server_cert",
+        "alloy-alert-state",
+        ["alloy-alert-state"],
+        key_mode=0o644,
+    )
+    generate_leaf(
+        paths,
+        "alert_client_key",
+        "alert_client_cert",
+        "prometheus-alert-state",
+        [],
+        extended_key_usage="clientAuth",
+        key_mode=0o644,
     )
     for certificate_name in ("edge_cert", "samba_cert", "cribl_cert", "wif_cert"):
         leaf = run(
@@ -2018,7 +2084,67 @@ def render_preprod_alloy_config() -> None:
     rendered = before + secure_block + after
     if "insecure = true" in rendered.split(begin, 1)[1].split(end, 1)[0]:
         fail("the preprod Alloy configuration retained plaintext Cribl export")
+    fixture_begin = "    // BEGIN AIGW PREPROD ALERT FIXTURE"
+    fixture_end = "    // END AIGW PREPROD ALERT FIXTURE"
+    fixture_block = (
+        fixture_begin
+        + '\n    { "__address__" = "alert-fixture:9101", "job" = "alert-fixture" },\n'
+        + fixture_end
+    )
+    if rendered.count(fixture_begin) != 1 or rendered.count(fixture_end) != 1:
+        fail("the Alloy preprod alert fixture markers changed")
+    fixture_prefix, fixture_remainder = rendered.split(fixture_begin, 1)
+    _old_fixture, fixture_suffix = fixture_remainder.split(fixture_end, 1)
+    rendered = fixture_prefix + fixture_block + fixture_suffix
+    alert_suffix = '|AIGatewayCertificateExpiryCritical"'
+    if rendered.count(alert_suffix) != 1:
+        fail("the Alloy alert-state allow-list changed")
+    rendered = rendered.replace(
+        alert_suffix,
+        '|AIGatewayCertificateExpiryCritical|AIGatewayPreprodAcceptance"',
+        1,
+    )
     write_file(SECRETS_DIR / "preprod-alloy-config.alloy", rendered, 0o644)
+
+
+def render_preprod_prometheus_config() -> None:
+    """Add only the bounded local acceptance rule to the production policy."""
+
+    source = (COMPOSE_DIR / "prometheus/prometheus.yml").read_text(encoding="utf-8")
+    rule_files = "rule_files:\n  - /etc/prometheus/rules.yml\n"
+    if source.count(rule_files) != 1:
+        fail("the Prometheus rule file list changed")
+    rendered = source.replace(
+        rule_files,
+        rule_files + "  - /etc/prometheus/preprod-alert-rules.yml\n",
+        1,
+    )
+    alert_suffix = "|AIGatewayCertificateExpiryCritical\n"
+    if rendered.count(alert_suffix) != 1:
+        fail("the Prometheus alert-state allow-list changed")
+    rendered = rendered.replace(
+        alert_suffix,
+        "|AIGatewayCertificateExpiryCritical|AIGatewayPreprodAcceptance\n",
+        1,
+    )
+    write_file(SECRETS_DIR / "preprod-prometheus.yml", rendered, 0o644)
+    rules = """\
+groups:
+  - name: aigw-preprod-acceptance
+    rules:
+      - alert: AIGatewayPreprodAcceptance
+        expr: aigw_preprod_alert_test{job="alert-fixture"} == 1
+        for: 15s
+        labels:
+          severity: warning
+          owner: release-validation
+          alert_class: preprod-acceptance
+        annotations:
+          summary: AI Gateway PreProd alert acceptance fixture is active
+          description: A bounded local test input is proving the alert lifecycle.
+          runbook_source: docs/test-runbook.md#local-offline-seed-release-acceptance
+"""
+    write_file(SECRETS_DIR / "preprod-alert-rules.yml", rules, 0o644)
 
 
 def render_edge_forwarder() -> None:
@@ -2150,6 +2276,8 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "ALLOY_TELEMETRY_IP": f"172.{subnet}.13.2",
         "ALLOY_OBSERVABILITY_IP": f"172.{subnet}.15.2",
         "PROMETHEUS_OBSERVABILITY_IP": f"172.{subnet}.15.3",
+        "ALERTMANAGER_OBSERVABILITY_IP": f"172.{subnet}.15.4",
+        "PROMETHEUS_RETENTION_SIZE": "1GB",
         "PORTAL_KEY_DEFAULT_MAX_BUDGET": "none",
         "PORTAL_KEY_DEFAULT_TPM_LIMIT": "none",
         "PORTAL_KEY_DEFAULT_RPM_LIMIT": "none",
@@ -2209,12 +2337,14 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "PREPROD_HOST_GID": str(os.getgid()),
         "PREPROD_DOCKER_ENDPOINT": local_docker_endpoint(),
         "PREPROD_WIF_ENVOY_IMAGE": envoy_base_image_reference(),
+        "KEY_ROTATOR_PROVIDER_POLICY_RECEIPT_FILE": "",
+        "KEY_ROTATOR_EGRESS_POLICY_SHA256": "",
         "AIGW_PREPROD_CONFIG_DIGEST": digest,
     }
     for name in (
         "TRAEFIK_INT", "TRAEFIK_ADM", "LITELLM", "OPEN_WEBUI", "KEYCLOAK",
-        "VAULT", "POSTGRES", "REDIS", "ALLOY", "PROMETHEUS", "LOKI",
-        "GRAFANA", "CRIBL_MOCK", "SAMBA_AD", "KEY_ROTATOR_LDAP",
+        "VAULT", "POSTGRES", "REDIS", "ALLOY", "PROMETHEUS", "ALERTMANAGER", "LOKI",
+        "GRAFANA", "CRIBL_MOCK", "SAMBA_AD", "KEY_ROTATOR",
     ):
         values[f"AIGW_BIND_DIGEST_{name}"] = digest
     return values
@@ -2235,6 +2365,10 @@ def prepare(args: argparse.Namespace) -> None:
     ensure_directory(REALMS_DIR, 0o755)
     ensure_directory(EDGE_CERTS_DIR)
     ensure_credential_seed(args)
+    # Source mode never inherits trust from an earlier seeded rehearsal.
+    # Seed activation replaces this zero-byte file only after the loader has
+    # verified the exact schema-v2 archive, manifest, and image IDs.
+    write_file(PROVIDER_POLICY_RECEIPT, "", 0o644)
     prepare_controller_audit_fixture()
     prepare_certificates(args.domain)
     render_realms(args.domain)
@@ -2242,6 +2376,7 @@ def prepare(args: argparse.Namespace) -> None:
     render_wif_mock_envoy(args.domain, vendor_subnet)
     render_preprod_litellm_config()
     render_preprod_alloy_config()
+    render_preprod_prometheus_config()
     render_edge_forwarder()
     for filename, label in (
         ("preprod-samba-admin-password", "samba-domain-admin"),
@@ -2271,6 +2406,13 @@ def prepare(args: argparse.Namespace) -> None:
     write_file(
         SECRETS_DIR / "litellm_otel_token",
         credential_hex("litellm-otel", 64),
+        0o600,
+    )
+    # A different token authenticates usage writes.  LiteLLM cannot use it
+    # for the rotator's admin routes or Alloy's trace receiver.
+    write_file(
+        SECRETS_DIR / "litellm_usage_token",
+        credential_hex("litellm-usage", 64),
         0o600,
     )
     jwks_path = SECRETS_DIR / "preprod-wif-jwks.json"
@@ -2352,6 +2494,51 @@ def seed_egress_policy(receipt: dict[str, Any]) -> dict[str, Any]:
     return policy
 
 
+def canonical_provider_policy_receipt(policy: dict[str, Any]) -> str:
+    """Return the exact non-secret receipt accepted by key-rotator.
+
+    The release-only ``envoy_image_id`` proves which image was loaded, but it
+    is not part of the receipt baked into that image. Rebuild the fixed field
+    order here instead of sorting keys; key-rotator deliberately rejects any
+    noncanonical serialization.
+    """
+
+    provider_fields = (
+        "name",
+        "api_hostname",
+        "route_prefix",
+        "sni",
+        "exact_sans",
+        "ca_file",
+        "ca_bundle_sha256",
+        "ca_sha256_fingerprints",
+        "provenance_sha256",
+    )
+    providers = policy.get("providers")
+    if not isinstance(providers, list):
+        fail("the offline seed provider policy has no provider records")
+    canonical_providers: list[dict[str, Any]] = []
+    for provider in providers:
+        if not isinstance(provider, dict) or set(provider) != set(provider_fields):
+            fail("the offline seed provider policy has a malformed provider record")
+        canonical_providers.append(
+            {field: provider[field] for field in provider_fields}
+        )
+    document = {
+        "schema_version": policy["schema_version"],
+        "egress_policy_sha256": policy["egress_policy_sha256"],
+        "envoy_config_sha256": policy["envoy_config_sha256"],
+        "selected_providers": policy["selected_providers"],
+        "providers": canonical_providers,
+    }
+    return json.dumps(
+        document,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ) + "\n"
+
+
 def seed_service_images(
     model: dict[str, Any], receipt: dict[str, Any]
 ) -> dict[str, str]:
@@ -2431,6 +2618,12 @@ def seed_service_images(
         if service_name in service_images:
             fail(f"the preprod Envoy service collides with {service_name}")
         service_images[service_name] = wif_envoy_image
+    if "prometheus" in service_images:
+        if "alert-fixture" in service_images:
+            fail("the preprod alert fixture collides with a production service")
+        # The fixture executes the exact health-probe binary already carried by
+        # the seeded Prometheus image. It introduces no third image or pull.
+        service_images["alert-fixture"] = service_images["prometheus"]
     return service_images
 
 
@@ -2496,6 +2689,43 @@ def verify_rendered_resource_ownership(
         for mount in node_mounts
     ):
         fail("preprod node-exporter must not mount the local host root")
+
+    # Some narrow unit fixtures exercise only resource ownership with a
+    # reduced service map. The real Compose model always has key-rotator; when
+    # present, its governance activation is an exact fail-closed contract.
+    rotator = services.get("key-rotator")
+    if rotator is not None:
+        if not isinstance(rotator, dict):
+            fail("the rendered preprod key-rotator is invalid")
+        rotator_environment = rotator.get("environment")
+        if not isinstance(rotator_environment, dict):
+            fail("the rendered key-rotator has no environment")
+        receipt_file_value = rotator_environment.get("PROVIDER_POLICY_RECEIPT_FILE")
+        policy_digest_value = rotator_environment.get("AIGW_EGRESS_POLICY_SHA256")
+        if args.image_mode == "seed":
+            try:
+                release_receipt = json.loads(SEED_RECEIPT.read_text(encoding="utf-8"))
+                policy = seed_egress_policy(release_receipt)
+                receipt_content = PROVIDER_POLICY_RECEIPT.read_text(encoding="utf-8")
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                fail("the seeded provider policy activation is unreadable")
+            if (
+                receipt_file_value != "/run/secrets/provider_policy_receipt.json"
+                or policy_digest_value != policy["egress_policy_sha256"]
+                or receipt_content != canonical_provider_policy_receipt(policy)
+            ):
+                fail("the rendered key-rotator is not bound to the exact seed policy")
+        else:
+            try:
+                receipt_size = PROVIDER_POLICY_RECEIPT.stat().st_size
+            except OSError:
+                fail("the source-build provider policy boundary is missing")
+            if (
+                receipt_file_value != ""
+                or policy_digest_value != ""
+                or receipt_size != 0
+            ):
+                fail("source mode must keep model governance unavailable")
 
     bind_consumers: dict[str, set[str]] = {}
     bind_mounts: list[tuple[str, dict[str, Any]]] = []
@@ -2708,11 +2938,19 @@ def _activate_seed(args: argparse.Namespace) -> None:
     if receipt.get("schema_version") != 2:
         fail("preprod seed mode requires a schema-v2 release receipt")
     policy = seed_egress_policy(receipt)
+    provider_policy_content = canonical_provider_policy_receipt(policy)
+    write_file(PROVIDER_POLICY_RECEIPT, provider_policy_content, 0o644)
 
     values = environment_values(args)
     values["AIGW_EGRESS_SOURCE_DATE_EPOCH"] = "0"
     values["AIGW_EGRESS_PROVIDERS"] = ",".join(policy["selected_providers"])
     values["AIGW_EGRESS_POLICY_SHA256"] = policy["egress_policy_sha256"]
+    values["KEY_ROTATOR_PROVIDER_POLICY_RECEIPT_FILE"] = (
+        "/run/secrets/provider_policy_receipt.json"
+    )
+    values["KEY_ROTATOR_EGRESS_POLICY_SHA256"] = policy[
+        "egress_policy_sha256"
+    ]
     content = "# Generated private PreProd credentials. Do not commit.\n"
     content += "".join(f"{name}={value}\n" for name, value in values.items())
     write_file(ENV_FILE, content, 0o600)
@@ -2782,8 +3020,13 @@ def recorded_preprod_owner() -> tuple[int, int]:
     return uid, gid
 
 
-def seed_output_files() -> tuple[Path, Path, Path]:
-    return SEED_RECEIPT, SEED_OVERLAY, POSTGRES18_REHEARSAL_RECEIPT
+def seed_output_files() -> tuple[Path, Path, Path, Path]:
+    return (
+        SEED_RECEIPT,
+        SEED_OVERLAY,
+        PROVIDER_POLICY_RECEIPT,
+        POSTGRES18_REHEARSAL_RECEIPT,
+    )
 
 
 def activate_seed(args: argparse.Namespace) -> None:
@@ -2815,8 +3058,19 @@ def verify_seed_images(args: argparse.Namespace) -> None:
         != ",".join(policy["selected_providers"])
         or preprod_env_value("AIGW_EGRESS_POLICY_SHA256")
         != policy["egress_policy_sha256"]
+        or preprod_env_value("KEY_ROTATOR_PROVIDER_POLICY_RECEIPT_FILE")
+        != "/run/secrets/provider_policy_receipt.json"
+        or preprod_env_value("KEY_ROTATOR_EGRESS_POLICY_SHA256")
+        != policy["egress_policy_sha256"]
     ):
         fail("the preprod environment does not match the seed Envoy policy")
+    expected_provider_policy = canonical_provider_policy_receipt(policy)
+    try:
+        deployed_provider_policy = PROVIDER_POLICY_RECEIPT.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        fail("the preprod provider policy receipt is unreadable")
+    if deployed_provider_policy != expected_provider_policy:
+        fail("the preprod provider policy receipt differs from the release")
     for canonical, record in sorted(custom_images.items()):
         if not isinstance(record, dict):
             fail(f"the seed record for {canonical} is invalid")
@@ -2853,6 +3107,8 @@ def verify_seed_images(args: argparse.Namespace) -> None:
     del expected_policy["envoy_image_id"]
     if live_policy != expected_policy:
         fail("the seeded Envoy image policy differs from the release receipt")
+    if runtime.stdout != expected_provider_policy:
+        fail("the seeded Envoy image returned a noncanonical provider policy")
     for reference, expected_id in sorted(external_images.items()):
         if not isinstance(reference, str) or not isinstance(expected_id, str):
             fail("the seed external-image receipt is invalid")
@@ -3268,6 +3524,343 @@ def verify_volume_init(args: argparse.Namespace) -> None:
         fail("Docker returned invalid volume-init state")
     if state.get("Status") != "exited" or state.get("ExitCode") != 0:
         fail("preprod volume-init did not exit successfully")
+
+
+def verify_alerting_graph(args: argparse.Namespace) -> None:
+    """Prove the private evaluator, lifecycle, and dashboard path end to end."""
+
+    identifiers = {}
+    for service in (
+        "alert-fixture",
+        "cribl-mock",
+        "dev-portal",
+        "grafana",
+        "prometheus",
+    ):
+        matches = compose(args, "ps", "-q", service, capture=True).stdout.splitlines()
+        if len(matches) != 1 or not matches[0].strip():
+            fail(f"preprod alert verification found no exact {service} container")
+        identifiers[service] = matches[0].strip()
+    try:
+        portal_image = json.loads(
+            docker("inspect", identifiers["dev-portal"], capture=True).stdout
+        )[0]["Image"]
+        prometheus_image = json.loads(
+            docker("inspect", identifiers["prometheus"], capture=True).stdout
+        )[0]["Image"]
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+        fail("Docker returned invalid preprod alert verifier image metadata")
+    for name, image in (
+        ("portal", portal_image),
+        ("Prometheus", prometheus_image),
+    ):
+        if not isinstance(image, str) or IMAGE_ID_RE.fullmatch(image) is None:
+            fail(f"the preprod {name} verifier image ID is invalid")
+
+    # Exercise warning/critical activation and recovery against committed
+    # synthetic inputs with the exact running Prometheus image. The disposable
+    # process has no network, secret mount, Docker socket, or writable root.
+    fault_test = clean_room_docker(
+        "run", "--rm", "--pull=never", "--network", "none",
+        "--read-only", "--tmpfs",
+        "/tmp:rw,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+        "--user", "65532:65532", "--log-driver", "none",
+        "--volume", f"{COMPOSE_DIR / 'prometheus'}:/work:ro",
+        "--workdir", "/work", "--entrypoint", "promtool",
+        prometheus_image, "test", "rules", "rules.test.yml",
+    )
+    fault_output = f"{fault_test.stdout}\n{fault_test.stderr}"
+    if fault_test.returncode != 0 or "SUCCESS" not in fault_output:
+        fail("preprod Prometheus alert fault/recovery tests failed")
+    print("PREPROD_ALERT_RULE_UNIT_TEST_PASS")
+
+    program = r"""
+import json
+import sqlite3
+import urllib.parse
+import urllib.request
+
+
+def fetch(url):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=5) as response:
+        if response.status != 200:
+            raise SystemExit("private observability API returned non-success")
+        return json.load(response)
+
+
+database = sqlite3.connect(
+    "file:/var/lib/grafana/grafana.db?mode=ro", uri=True, timeout=5
+)
+datasources = set(database.execute("SELECT name, uid, type, url FROM data_source"))
+if datasources != {
+    ("Prometheus", "prometheus", "prometheus", "http://prometheus:9090"),
+    ("Loki", "loki", "loki", "http://loki:3100"),
+    ("Alertmanager", "alertmanager", "alertmanager", "http://alertmanager:9093"),
+    (
+        "LiteLLM Spend",
+        "litellm-spend",
+        "grafana-postgresql-datasource",
+        "postgres:5432",
+    ),
+    (
+        "AI Gateway Usage",
+        "aigw-usage",
+        "grafana-postgresql-datasource",
+        "postgres:5432",
+    ),
+}:
+    raise SystemExit("Grafana did not provision the exact five-datasource graph")
+rows = list(
+    database.execute(
+        '''
+        SELECT value FROM resource
+        WHERE namespace = 'default'
+          AND "group" = 'dashboard.grafana.app'
+          AND resource = 'dashboards'
+          AND name = 'aigw-alerts-capacity'
+        '''
+    )
+)
+if len(rows) != 1:
+    raise SystemExit("Grafana did not provision the exact alert dashboard")
+dashboard = json.loads(rows[0][0])
+metadata = dashboard.get("metadata", {})
+annotations = metadata.get("annotations", {})
+if (
+    dashboard.get("spec", {}).get("title") != "AI Gateway Alerts and Capacity"
+    or annotations.get("grafana.app/managedBy") != "classic-file-provisioning"
+    or annotations.get("grafana.app/sourcePath")
+    != "/etc/grafana/provisioning/dashboards/json/ai-gateway-alerts-capacity.json"
+):
+    raise SystemExit("Grafana alert dashboard provenance drifted")
+
+rules = fetch("http://prometheus:9090/api/v1/rules?type=alert")
+if rules.get("status") != "success":
+    raise SystemExit("Prometheus alert-rule API failed")
+watchdogs = [
+    rule
+    for group in rules.get("data", {}).get("groups", [])
+    for rule in group.get("rules", [])
+    if rule.get("name") == "AIGatewayWatchdog"
+]
+if (
+    len(watchdogs) != 1
+    or watchdogs[0].get("health") != "ok"
+    or watchdogs[0].get("state") != "firing"
+):
+    raise SystemExit("Prometheus watchdog is not healthy and firing")
+
+status = fetch("http://alertmanager:9093/api/v2/status")
+if (
+    status.get("versionInfo", {}).get("version") != "0.33.1"
+    or status.get("cluster", {}).get("status") != "disabled"
+):
+    raise SystemExit("Alertmanager version or private single-node mode drifted")
+receivers = fetch("http://alertmanager:9093/api/v2/receivers")
+if receivers != [{
+    "labels": {"name": "aigw-local-dashboard"},
+    "name": "aigw-local-dashboard",
+}]:
+    raise SystemExit("Alertmanager receiver inventory drifted")
+query = urllib.parse.urlencode(
+    {"filter": 'alertname="AIGatewayWatchdog"', "active": "true"}
+)
+alerts = fetch("http://alertmanager:9093/api/v2/alerts?" + query)
+if len(alerts) != 1:
+    raise SystemExit("Alertmanager did not receive the exact watchdog")
+watchdog = alerts[0]
+if (
+    watchdog.get("labels", {}).get("severity") != "none"
+    or watchdog.get("status", {}).get("state") != "active"
+    or watchdog.get("status", {}).get("silencedBy") != []
+    or watchdog.get("status", {}).get("inhibitedBy") != []
+    or watchdog.get("receivers") != [{"name": "aigw-local-dashboard"}]
+):
+    raise SystemExit("Alertmanager watchdog lifecycle state drifted")
+print("PREPROD_ALERTING_GRAPH_PASS")
+""".strip()
+
+    network = f"{args.prefix}-net-observability"
+    command = (
+        "run", "--rm", "--pull=never", "--network", network,
+        "--volumes-from", f"{identifiers['grafana']}:ro",
+        "--read-only", "--tmpfs",
+        "/tmp:rw,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+        "--user", "65532:65532", "--log-driver", "none",
+        "--entrypoint", "/opt/venv/bin/python", portal_image,
+        "-I", "-c", program,
+    )
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        result = clean_room_docker(*command)
+        if result.returncode == 0 and result.stdout.strip() == (
+            "PREPROD_ALERTING_GRAPH_PASS"
+        ):
+            print("PREPROD_ALERTING_GRAPH_PASS")
+            break
+        time.sleep(5)
+    else:
+        fail("the preprod Prometheus, Alertmanager, and Grafana graph did not verify")
+
+    lifecycle_program = r"""
+import json
+import sqlite3
+import sys
+import urllib.parse
+import urllib.request
+
+
+def fetch(url):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=5) as response:
+        if response.status != 200:
+            raise SystemExit("private observability API returned non-success")
+        return json.load(response)
+
+
+def query(expression):
+    encoded = urllib.parse.urlencode({"query": expression})
+    document = fetch("http://prometheus:9090/api/v1/query?" + encoded)
+    if document.get("status") != "success":
+        raise SystemExit("Prometheus query failed")
+    return document.get("data", {}).get("result", [])
+
+
+def panel_expression(title):
+    database = sqlite3.connect(
+        "file:/var/lib/grafana/grafana.db?mode=ro", uri=True, timeout=5
+    )
+    rows = list(
+        database.execute(
+            '''
+            SELECT value FROM resource
+            WHERE namespace = 'default'
+              AND "group" = 'dashboard.grafana.app'
+              AND resource = 'dashboards'
+              AND name = 'aigw-alerts-capacity'
+            '''
+        )
+    )
+    if len(rows) != 1:
+        raise SystemExit("Grafana alert dashboard is missing")
+    dashboard = json.loads(rows[0][0]).get("spec", {})
+    matches = [panel for panel in dashboard.get("panels", []) if panel.get("title") == title]
+    if len(matches) != 1 or len(matches[0].get("targets", [])) != 1:
+        raise SystemExit("Grafana alert panel query drifted")
+    target = matches[0]["targets"][0]
+    if target.get("datasource") != {"type": "prometheus", "uid": "prometheus"}:
+        raise SystemExit("Grafana alert panel left the Prometheus datasource")
+    return target.get("expr")
+
+
+phase = sys.argv[1]
+if phase not in {"firing", "resolved"}:
+    raise SystemExit("invalid alert lifecycle phase")
+name = "AIGatewayPreprodAcceptance"
+rules = fetch("http://prometheus:9090/api/v1/rules?type=alert")
+matches = [
+    rule
+    for group in rules.get("data", {}).get("groups", [])
+    for rule in group.get("rules", [])
+    if rule.get("name") == name
+]
+if len(matches) != 1 or matches[0].get("health") != "ok":
+    raise SystemExit("PreProd acceptance rule is missing or unhealthy")
+direct = query('ALERTS{alertname="' + name + '",alertstate="firing"}')
+active_query = urllib.parse.urlencode(
+    {"filter": 'alertname="' + name + '"', "active": "true"}
+)
+active = fetch("http://alertmanager:9093/api/v2/alerts?" + active_query)
+
+if phase == "firing":
+    panel = query(panel_expression("Active Alerts"))
+    if (
+        matches[0].get("state") != "firing"
+        or len(direct) != 1
+        or len(active) != 1
+        or active[0].get("status", {}).get("state") != "active"
+        or not any(item.get("metric", {}).get("alertname") == name for item in panel)
+    ):
+        raise SystemExit("the live PreProd alert did not reach every firing path")
+    print("PREPROD_ALERT_LIVE_FIRING_PASS")
+else:
+    panel = query(panel_expression("Recently Resolved Alerts"))
+    if (
+        matches[0].get("state") != "inactive"
+        or direct
+        or active
+        or not any(item.get("metric", {}).get("alertname") == name for item in panel)
+    ):
+        raise SystemExit("the live PreProd alert did not reach every resolved path")
+    print("PREPROD_ALERT_LIVE_RESOLVED_PASS")
+""".strip()
+
+    def set_fixture(active: bool) -> None:
+        compose(
+            args,
+            "exec",
+            "-T",
+            "alert-fixture",
+            "/usr/local/bin/aigw-health-probe",
+            "fixture-state",
+            "--state-file=/state/active",
+            f"--active={'true' if active else 'false'}",
+            capture=True,
+        )
+
+    def wait_for_lifecycle(phase: str, marker: str) -> None:
+        lifecycle_command = (
+            "run", "--rm", "--pull=never", "--network", network,
+            "--volumes-from", f"{identifiers['grafana']}:ro",
+            "--read-only", "--tmpfs",
+            "/tmp:rw,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "--user", "65532:65532", "--log-driver", "none",
+            "--entrypoint", "/opt/venv/bin/python", portal_image,
+            "-I", "-c", lifecycle_program, phase,
+        )
+        lifecycle_deadline = time.monotonic() + 120
+        while time.monotonic() < lifecycle_deadline:
+            lifecycle_result = clean_room_docker(*lifecycle_command)
+            if (
+                lifecycle_result.returncode == 0
+                and lifecycle_result.stdout.strip() == marker
+            ):
+                print(marker)
+                return
+            time.sleep(5)
+        fail(f"the live PreProd alert never reached the {phase} state")
+
+    def wait_for_cribl_alert(since: str) -> None:
+        deadline = time.monotonic() + 90
+        markers = (
+            "ALERTS",
+            "AIGatewayPreprodAcceptance",
+            "alert-state",
+        )
+        while time.monotonic() < deadline:
+            result = docker(
+                "logs", "--since", since, identifiers["cribl-mock"], capture=True
+            )
+            logs = f"{result.stdout}\n{result.stderr}"
+            if all(marker in logs for marker in markers):
+                print("PREPROD_ALERT_CRIBL_EXPORT_PASS")
+                return
+            time.sleep(2)
+        fail("the live PreProd alert did not reach the Cribl mock through Alloy")
+
+    set_fixture(False)
+    cribl_cursor = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        set_fixture(True)
+        wait_for_lifecycle("firing", "PREPROD_ALERT_LIVE_FIRING_PASS")
+        wait_for_cribl_alert(cribl_cursor)
+    finally:
+        set_fixture(False)
+    wait_for_lifecycle("resolved", "PREPROD_ALERT_LIVE_RESOLVED_PASS")
 
 
 def wait_for_container(args: argparse.Namespace, service: str, wanted: str, timeout: int) -> None:
@@ -3785,6 +4378,7 @@ def verify(args: argparse.Namespace) -> None:
                 f"preprod service {service} is not running and healthy: "
                 f"status={status} health={health}"
             )
+    verify_alerting_graph(args)
     verify_edge_routes(args)
     status_code, identity = internal_call(args, "GET", "/identity/status")
     identity_fields = {
@@ -3917,6 +4511,7 @@ def _validate_clean_room_generated_state() -> int:
     for path, expected_mode in (
         (SEED_RECEIPT, 0o644),
         (SEED_OVERLAY, 0o644),
+        (PROVIDER_POLICY_RECEIPT, 0o644),
         (POSTGRES18_REHEARSAL_RECEIPT, 0o644),
         (VAULT_INIT_FILE, 0o600),
         (PREPROD_CONTROLLER_AUDIT_FILES[0], 0o644),
@@ -4100,6 +4695,7 @@ def prove_clean_room_resource_absence(args: argparse.Namespace) -> None:
     for path in (
         SEED_RECEIPT,
         SEED_OVERLAY,
+        PROVIDER_POLICY_RECEIPT,
         POSTGRES18_REHEARSAL_RECEIPT,
         VAULT_INIT_FILE,
     ):

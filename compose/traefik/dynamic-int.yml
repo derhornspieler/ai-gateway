@@ -13,10 +13,18 @@ http:
       # and control-plane handlers below /v1 (for example /v1/model/info,
       # /v1/memory, and /v1/workflows). Keep this list exact and deliberately
       # small; query strings do not affect Traefik Path matching.
-      rule: 'Host(`api.{{ env "DOMAIN" }}`) && (Path(`/v1/chat/completions`) || Path(`/chat/completions`) || Path(`/v1/completions`) || Path(`/completions`) || Path(`/v1/embeddings`) || Path(`/embeddings`) || Path(`/v1/models`) || PathPrefix(`/v1/models/`) || Path(`/models`) || PathPrefix(`/models/`) || Path(`/v1/messages`) || Path(`/v1/messages/count_tokens`) || Path(`/health/liveliness`) || Path(`/health/readiness`))'
+      rule: 'Host(`api.{{ env "DOMAIN" }}`) && (Path(`/v1/chat/completions`) || Path(`/chat/completions`) || Path(`/v1/completions`) || Path(`/completions`) || Path(`/v1/embeddings`) || Path(`/embeddings`) || Path(`/v1/messages`) || Path(`/v1/messages/count_tokens`) || Path(`/health/liveliness`) || Path(`/health/readiness`))'
       priority: 100
       entryPoints: [websecure]
       service: litellm
+      tls: {}
+    api-model-discovery:
+      # Model discovery is a separate fail-closed filter. It preserves
+      # LiteLLM key scoping, then removes hidden and unmanaged DB models.
+      rule: 'Host(`api.{{ env "DOMAIN" }}`) && (Path(`/v1/models`) || PathPrefix(`/v1/models/`) || Path(`/models`) || PathPrefix(`/models/`))'
+      priority: 110
+      entryPoints: [websecure]
+      service: dev-portal
       tls: {}
     # Catch-all deny for the api host. deny-all never matches a real client,
     # so every non-allow-listed path gets 403 before reaching litellm.

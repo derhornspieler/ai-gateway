@@ -7,12 +7,22 @@ release.
 A pin is a fixed version and SHA-256 digest. It prevents a registry tag from
 changing after review.
 
+The final 2026-07-22 check found newer registry digests for the same Grafana
+`13.1.0`, Python `3.14.6`, and Vault `2.0.3` DHI tags. The source pins now use
+those newer digests. The committed digest still cannot move after release.
+The next release must repeat this check before it accepts a rebuilt tag.
+
 ## Result
 
-The release uses the newest stable and compatible version available from its
-reviewed source. The exact PreProd seed passed the full Ansible test with all
-25 long-running services healthy. It also passed the PostgreSQL 16-to-18 move,
-rollback, downgrade refusal, physical restore, and final cleanup checks.
+The current source selects the newest stable and compatible version available
+from each reviewed source. Version selection is complete. Runtime acceptance
+is not: the current source now renders 26 long-running services in normal
+PreProd and still needs a new exact-seed test.
+
+The last accepted seed ran 25 long-running services. It passed the full
+Ansible test, the PostgreSQL 16-to-18 move, rollback, downgrade refusal,
+physical restore, and final cleanup. That result is historical evidence, not a
+pass for the new image digests and feature changes.
 
 Two projects published a newer upstream release after their matching Docker
 Hardened Image (DHI):
@@ -21,7 +31,8 @@ Hardened Image (DHI):
 - Grafana upstream is `13.1.1`; DHI offers `13.1.0`.
 
 Do not swap those two images to another registry without a new review. Their
-selected DHI versions are the newest DHI tags and passed the exact seed test.
+selected DHI versions are the newest DHI tags. The current exact-seed gate must
+test them with the rest of this source candidate.
 
 ## DHI release images
 
@@ -31,6 +42,7 @@ version and image variant.
 
 | Component | Selected DHI tag | Decision |
 | --- | --- | --- |
+| Alertmanager | `0.33.1` | Current stable release; open DHI security finding below |
 | Alloy | `1.17.1` | Newest DHI; upstream `1.18.0` is not in DHI yet |
 | BusyBox | `1.38.0-alpine` | Current |
 | CoreDNS | `1.14.6` | Current |
@@ -62,7 +74,7 @@ the binary version and both digests.
 | --- | --- | --- |
 | Debian build base | `13.6-slim` | Current Debian stable point release |
 | Dockerfile frontend | `1.25.0` | Current published frontend tag |
-| LiteLLM | `v1.93.0` | Current upstream release |
+| LiteLLM base | `v1.93.0` | Current upstream release; final image is the reviewed `1.93.0-aigw1` derivative |
 | Open WebUI base | `v0.10.2` | Current upstream release; final image is the reviewed `0.10.2-aigw2` derivative |
 | Traefik binary source | `v3.7.8` | Current upstream release |
 | Vault UI binary source | `2.0.3` | Matches the current reviewed Vault release |
@@ -89,6 +101,14 @@ matched the current published version on 2026-07-22:
 The hash-locked transitive packages passed `pip-audit`. A future direct pin
 change must regenerate the matching lock file and rebuild the release.
 
+The LiteLLM derivative keeps the exact `v1.93.0` application base. Its
+network-disabled build replaces only `pyasn1` `0.6.3` with the reviewed
+`0.6.4` wheel. The Open WebUI derivative installs reviewed `pyasn1` `0.6.4`
+and `GitPython` `3.1.54` wheels along with its existing runtime updates. The
+repository stores each wheel and its SHA-256 hash. Both AMD64 and ARM64 builds
+passed read-only package checks. The current exact-seed and GitHub scan gates
+still must pass before release.
+
 ## Production host tools
 
 The production inventory pins this compatible set:
@@ -106,18 +126,27 @@ update.
 
 ## Security gate
 
-The source, dependency, CodeQL, secret, and repository Trivy checks passed in
-GitHub. Final DHI image, VEX, SBOM, and container scans still require protected
-`DHI_USERNAME` and `DHI_PASSWORD` repository secrets. A local DHI login must
-not be copied into GitHub. The image review is complete, but the separate
-credential-gated security audit is not complete until those jobs pass and a
-person reviews every finding.
+Version review does not replace a security scan. The protected GitHub
+environment now has `DHI_USERNAME` and `DHI_PASSWORD`. A local DHI login must
+not be copied into GitHub. Push the exact tested commit, run every source and
+image scan, and save the SBOM and provenance for each final image. The separate
+security audit is not complete until the blocking jobs pass and a person
+reviews every finding and waiver.
+
+The 2026-07-22 DHI reports found `GHSA-hrxh-6v49-42gf` in the gRPC `1.82.0`
+library inside Alertmanager `0.33.1` on both AMD64 and ARM64. gRPC `1.82.1`
+contains the fix. DHI had no rebuilt Alertmanager image and no signed VEX
+statement for this finding. Older DHI tags and the Alpine `0.33.1` image were
+not safer. Keep the newest Debian pin, keep the scan blocking, and recheck DHI.
+Do not create a local waiver. The durable acceptance steps are in
+[TASKS.md](../TASKS.md#recheck-and-clear-the-dhi-alertmanager-security-finding).
 
 ## Sources and next review
 
 Use these primary sources during the next review:
 
 - [DHI catalog CLI](https://docs.docker.com/dhi/how-to/cli/)
+- [Prometheus and Alertmanager downloads](https://prometheus.io/download/)
 - [Debian releases](https://www.debian.org/releases/)
 - [Docker Engine 29 release notes](https://docs.docker.com/engine/release-notes/29/)
 - [Go downloads](https://go.dev/dl/)

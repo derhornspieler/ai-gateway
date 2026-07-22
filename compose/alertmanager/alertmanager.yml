@@ -1,0 +1,28 @@
+# Local-only alert lifecycle. Prometheus is the sole rule evaluator; this
+# receiver deliberately has no external integration. Operators use the
+# provisioned Grafana dashboard and Alertmanager datasource over the private
+# observability network.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: aigw-local-dashboard
+  group_by: [alertname, alert_class, severity, owner]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h
+
+# A critical condition suppresses its lower-severity companion for the same
+# bounded resource. Labels absent from both alerts compare equal, so every
+# paired rule carries the same alert_class and the applicable resource labels.
+inhibit_rules:
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: [alert_class, instance, device, mountpoint, service]
+
+# Safe default: retain/group/deduplicate lifecycle state locally and send
+# nothing to e-mail, chat, webhooks, Cribl, or any other external destination.
+receivers:
+  - name: aigw-local-dashboard

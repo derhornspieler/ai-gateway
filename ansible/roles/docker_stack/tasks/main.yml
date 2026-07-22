@@ -30,6 +30,7 @@
       - alloy_telemetry_ip == '172.28.13.2'
       - alloy_observability_ip == '172.28.15.2'
       - prometheus_observability_ip == '172.28.15.3'
+      - alertmanager_observability_ip == '172.28.15.4'
       - platform_dns_ip == '172.28.18.2'
       - keycloak_internal_ip == '172.28.2.3'
       - (docker_networks | selectattr('name', 'equalto', 'net-chat') | map(attribute='subnet') | first) == '172.28.3.0/24'
@@ -56,6 +57,16 @@
       Platform split DNS requires the already-validated, non-placeholder ADM/VPN
       client CIDR and it must remain distinct from the internal-user CIDR.
   when: platform_authoritative_dns_enabled | bool
+
+- name: Validate the bounded Prometheus retention size
+  ansible.builtin.assert:
+    that:
+      - prometheus_retention_size is string
+      - prometheus_retention_size is match('^[1-9][0-9]{0,5}(MB|GB|TB)$')
+    quiet: true
+    fail_msg: >-
+      prometheus_retention_size must be a whole positive MB, GB, or TB value.
+      Prometheus retains metrics for 30 days or this size cap, whichever comes first.
 
 - name: Process optional offline external-image seed before Compose
   ansible.builtin.include_tasks: offline_image_seed.yml
@@ -475,6 +486,7 @@
     group: root
     mode: "0755"
   loop:
+    - alertmanager
     - alloy
     - cribl-mock
     - grafana
@@ -510,7 +522,9 @@
     (not (item.isreg | default(false) | bool)) or
     ((item.path | basename) not in
       [
+        'ai-gateway-alerts-capacity.json',
         'ai-gateway-live-logs.json',
+        'ai-gateway-model-usage.json',
         'ai-gateway-overview.json',
         'ai-gateway-request-audit.json',
         'ai-gateway-top-projects.json',
@@ -531,6 +545,7 @@
     # but unable to load TLS/routes. Only the PostgreSQL initializer executes.
     mode: "{{ '0755' if item == 'postgres/init/01-init-databases.sh' else '0644' }}"
   loop:
+    - alertmanager/alertmanager.yml
     - bind-source-digest-inputs.json
     - docker-compose.yml
     - docker-compose.platform-dns.yml
@@ -539,7 +554,9 @@
     - cribl-mock/config.yaml
     - grafana/provisioning/alerting/empty.yml
     - grafana/provisioning/dashboards/dashboards.yml
+    - grafana/provisioning/dashboards/json/ai-gateway-alerts-capacity.json
     - grafana/provisioning/dashboards/json/ai-gateway-live-logs.json
+    - grafana/provisioning/dashboards/json/ai-gateway-model-usage.json
     - grafana/provisioning/dashboards/json/ai-gateway-overview.json
     - grafana/provisioning/dashboards/json/ai-gateway-request-audit.json
     - grafana/provisioning/dashboards/json/ai-gateway-top-projects.json
@@ -552,10 +569,14 @@
     - grafana/provisioning/plugins/loki-drilldown.yml
     - litellm/config.yaml
     - litellm/aigw_default_model_hook.py
+    - litellm/aigw_model_limits.py
     - litellm/aigw_openwebui_identity.py
     - litellm/aigw_otel_callback.py
+    - litellm/aigw_usage_callback.py
     - loki/config.yml
     - postgres/init/01-init-databases.sh
+    - postgres/init/02-governance.sql
+    - postgres/init/03-usage-accounting.sql
     - prometheus/prometheus.yml
     - prometheus/rules.yml
     - traefik/traefik-int.yml
@@ -597,6 +618,8 @@
   loop:
     - postgres/init
     - postgres/init/01-init-databases.sh
+    - postgres/init/02-governance.sql
+    - postgres/init/03-usage-accounting.sql
   register: postgres_init_mount
 
 - name: Verify PostgreSQL can traverse and execute its initialization mount
@@ -606,11 +629,17 @@
       - postgres_init_mount.results[0].stat.mode == '0755'
       - postgres_init_mount.results[1].stat.isreg | default(false)
       - postgres_init_mount.results[1].stat.mode in ['0555', '0755']
+      - postgres_init_mount.results[2].stat.isreg | default(false)
+      - postgres_init_mount.results[2].stat.mode == '0644'
+      - postgres_init_mount.results[3].stat.isreg | default(false)
+      - postgres_init_mount.results[3].stat.mode == '0644'
     quiet: true
     fail_msg: >-
       The PostgreSQL image drops privileges before enumerating
       /docker-entrypoint-initdb.d; its non-secret init directory must be 0755
-      and 01-init-databases.sh must be world-readable/executable.
+      and 01-init-databases.sh must be world-readable/executable. The
+      governance and usage-accounting migrations must be world-readable
+      regular SQL files.
 
 # Realm imports: Ansible vars are the single source of truth. The static
 # compose/keycloak/realms/*.json copied above are pure-docker-compose dev
@@ -677,7 +706,7 @@
     # adding minutes to every converge and shipping dev tooling to the host.
     - item.path is not regex('(^|/)(__pycache__|\.pytest_cache|\.ruff_cache|\.venv|venv|\.tox|node_modules|\.git|secrets)(/|$)')
     - item.path is not regex('(^|/)\.env(?:\.|$)|\.(?:pyc|pyo|pyd|key|p12|pfx)$')
-    - item.path is regex('(^|/)(Dockerfile(?:\.open-webui|\.grafana)?|\.dockerignore|README\.md|SHA256SUMS|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch|whl)|upstream-provenance\.json|(?:oauth|chroma)-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
+    - item.path is regex('(^|/)(Dockerfile(?:\.open-webui|\.grafana|\.litellm)?|\.dockerignore|README\.md|SHA256SUMS|policy-rc\.d|go\.mod|samba-ad-(entrypoint|healthcheck|secret-tool)|requirements[^/]*\.(txt|lock)|[^/]+\.(py|go|html|ya?ml|sh|pem|patch|whl)|envoy\.yaml\.tmpl|providers/(?:catalog\.json|provenance/[a-z0-9-]+\.json)|upstream-provenance\.json|(?:oauth|chroma)-v0\.10\.2\.sha256-fixture|Corefile|db\.aigw\.internal(?:\.adm)?)$')
 
 # Ansible vars are the single source of truth for the runtime DNS views. The
 # repo-committed services/platform-dns files staged above are reviewed defaults for
@@ -1345,6 +1374,128 @@
     group: root
     mode: "0700"
 
+- name: Create root-only alert-state PKI state directory
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/.state/alert-state-mtls"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Reconcile the private Prometheus-to-Alloy mTLS identity
+  ansible.builtin.script:
+    cmd: >-
+      ensure-alert-state-mtls.py
+      --secrets-dir {{ stack_dir }}/secrets
+      --state-dir {{ stack_dir }}/.state/alert-state-mtls
+    executable: python3
+  register: aigw_alert_state_mtls
+  changed_when: "'changed=true' in aigw_alert_state_mtls.stdout"
+
+# The seed loader has already checked the schema-v2 manifest, archive, loaded
+# image IDs, and immutable Envoy labels. Ask that exact loaded Envoy image for
+# its canonical receipt (which intentionally omits envoy_image_id), then prove
+# it still matches the loader-validated release record before mounting it into
+# key-rotator. The separately trusted digest travels through .env, not this
+# file. Source builds get an actively cleared file and no activation values.
+- name: Read the canonical provider policy from the exact seeded Envoy image
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --host
+      - unix:///run/docker.sock
+      - run
+      - --rm
+      - --network
+      - none
+      - --read-only
+      - --user
+      - "65532:65532"
+      - --cap-drop
+      - ALL
+      - --security-opt
+      - no-new-privileges:true
+      - "{{ aigw_expected_envoy_image_id }}"
+      - receipt
+  register: aigw_provider_policy_receipt_raw
+  changed_when: false
+  when: offline_image_seed_enabled | bool
+
+- name: Bind the canonical provider policy to the validated release receipt
+  ansible.builtin.assert:
+    that:
+      - >-
+        (aigw_provider_policy_receipt_raw.stdout | from_json).keys() | sort ==
+        ['egress_policy_sha256', 'envoy_config_sha256', 'providers',
+         'schema_version', 'selected_providers']
+      - >-
+        (aigw_provider_policy_receipt_raw.stdout | from_json).schema_version ==
+        aigw_release_egress_policy.schema_version
+      - >-
+        (aigw_provider_policy_receipt_raw.stdout | from_json).egress_policy_sha256 ==
+        aigw_release_egress_policy.egress_policy_sha256
+      - >-
+        (aigw_provider_policy_receipt_raw.stdout | from_json).envoy_config_sha256 ==
+        aigw_release_egress_policy.envoy_config_sha256
+      - >-
+        (aigw_provider_policy_receipt_raw.stdout | from_json).selected_providers ==
+        aigw_release_egress_policy.selected_providers
+      - >-
+        (aigw_provider_policy_receipt_raw.stdout | from_json).providers ==
+        aigw_release_egress_policy.providers
+      - aigw_provider_policy_receipt_raw.stdout | length < 1048576
+    quiet: true
+    fail_msg: >-
+      The exact seeded Envoy image did not return the canonical provider policy
+      recorded by the validated schema-v2 release.
+  when: offline_image_seed_enabled | bool
+
+- name: Materialize the canonical seeded provider policy for key-rotator
+  ansible.builtin.copy:
+    content: "{{ aigw_provider_policy_receipt_raw.stdout }}\n"
+    dest: "{{ stack_dir }}/secrets/provider_policy_receipt.json"
+    owner: root
+    group: "65532"
+    mode: "0440"
+    follow: false
+  when: offline_image_seed_enabled | bool
+
+- name: Clear provider policy trust outside exact seed mode
+  ansible.builtin.copy:
+    content: ""
+    dest: "{{ stack_dir }}/secrets/provider_policy_receipt.json"
+    owner: root
+    group: "65532"
+    mode: "0440"
+    follow: false
+  when: not (offline_image_seed_enabled | bool)
+
+- name: Inspect the provider policy file boundary
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/secrets/provider_policy_receipt.json"
+    follow: false
+  register: aigw_provider_policy_receipt_file
+
+- name: Require the exact provider policy file boundary
+  ansible.builtin.assert:
+    that:
+      - aigw_provider_policy_receipt_file.stat.isreg | default(false)
+      - not (aigw_provider_policy_receipt_file.stat.islnk | default(false))
+      - aigw_provider_policy_receipt_file.stat.uid == 0
+      - aigw_provider_policy_receipt_file.stat.gid == 65532
+      - aigw_provider_policy_receipt_file.stat.mode == '0440'
+      - (aigw_provider_policy_receipt_file.stat.nlink | int) == 1
+      - >-
+        ((offline_image_seed_enabled | bool) and
+         (aigw_provider_policy_receipt_file.stat.size | int) > 0 and
+         (aigw_provider_policy_receipt_file.stat.size | int) < 1048576) or
+        ((not (offline_image_seed_enabled | bool)) and
+         (aigw_provider_policy_receipt_file.stat.size | int) == 0)
+    quiet: true
+    fail_msg: >-
+      The provider policy must be one bounded root:65532 0440 regular file,
+      and it must be empty outside exact schema-v2 seed mode.
+
 # LiteLLM authenticates to Alloy with one stable, target-local token. Generate
 # it once instead of putting it in inventory, Compose environment metadata, or
 # a command argument. Both readers get only group-read access to this file.
@@ -1458,6 +1609,117 @@
       - (litellm_otel_token_after.stat.size | int) == 64
     quiet: true
     fail_msg: LiteLLM telemetry token creation did not produce the exact boundary.
+  no_log: true
+
+# LiteLLM has one narrow credential for prompt-free usage writes. It is not
+# the rotator admin token and cannot call any other key-rotator route.
+- name: Inspect the stable LiteLLM usage token without following links
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/secrets/litellm_usage_token"
+    follow: false
+    get_checksum: false
+  register: litellm_usage_token_before
+  no_log: true
+
+- name: Reject an unsafe pre-existing LiteLLM usage token
+  ansible.builtin.assert:
+    that:
+      - not (litellm_usage_token_before.stat.islnk | default(false))
+      - litellm_usage_token_before.stat.isreg | default(false)
+      - litellm_usage_token_before.stat.uid == 0
+      - litellm_usage_token_before.stat.gid in [0, 65532]
+      - litellm_usage_token_before.stat.mode == '0440'
+      - (litellm_usage_token_before.stat.nlink | int) == 1
+      - (litellm_usage_token_before.stat.size | int) == 64
+    quiet: true
+    fail_msg: Existing LiteLLM usage token has an unsafe object, owner, or mode.
+  when: litellm_usage_token_before.stat.exists
+  no_log: true
+
+- name: Create the stable LiteLLM usage token once
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import secrets
+        import sys
+
+        path = sys.argv[1]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o440)
+        try:
+            os.fchown(descriptor, 0, 65532)
+            os.fchmod(descriptor, 0o440)
+            payload = secrets.token_hex(32).encode("ascii")
+            while payload:
+                written = os.write(descriptor, payload)
+                if written <= 0:
+                    raise OSError("short write creating LiteLLM usage token")
+                payload = payload[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+      - "{{ stack_dir }}/secrets/litellm_usage_token"
+  when: not litellm_usage_token_before.stat.exists
+  no_log: true
+
+- name: Validate the stable LiteLLM usage token content
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import re
+        import sys
+
+        path = sys.argv[1]
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            payload = os.read(descriptor, 65)
+        finally:
+            os.close(descriptor)
+        if re.fullmatch(rb"[0-9a-f]{64}", payload) is None:
+            raise SystemExit("malformed LiteLLM usage token")
+      - "{{ stack_dir }}/secrets/litellm_usage_token"
+  changed_when: false
+  no_log: true
+
+- name: Normalize the validated LiteLLM usage token boundary
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/secrets/litellm_usage_token"
+    state: file
+    owner: root
+    group: "65532"
+    mode: "0440"
+    follow: false
+  no_log: true
+
+- name: Require the exact stable LiteLLM usage token boundary
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/secrets/litellm_usage_token"
+    follow: false
+    get_checksum: false
+  register: litellm_usage_token_after
+  no_log: true
+
+- name: Verify the exact stable LiteLLM usage token boundary
+  ansible.builtin.assert:
+    that:
+      - litellm_usage_token_after.stat.isreg | default(false)
+      - not (litellm_usage_token_after.stat.islnk | default(false))
+      - litellm_usage_token_after.stat.uid == 0
+      - litellm_usage_token_after.stat.gid == 65532
+      - litellm_usage_token_after.stat.mode == '0440'
+      - (litellm_usage_token_after.stat.nlink | int) == 1
+      - (litellm_usage_token_after.stat.size | int) == 64
+    quiet: true
+    fail_msg: LiteLLM usage token creation did not produce the exact boundary.
   no_log: true
 
 - name: Materialize Redis authentication files outside command and environment metadata
@@ -2069,12 +2331,16 @@
         |
         combine(
           (aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).platform_dns
-          if (platform_authoritative_dns_enabled | bool) else {}
+          if (platform_authoritative_dns_enabled | bool) else {},
+          recursive=true,
+          list_merge='append'
         )
         |
         combine(
           (aigw_bind_source_digest_manifest_raw.content | b64decode | from_json).identity_ldap
-          if (identity_ldap_enabled | bool) else {}
+          if (identity_ldap_enabled | bool) else {},
+          recursive=true,
+          list_merge='append'
         )
       }}
 
@@ -2157,22 +2423,32 @@
     aigw_selinux_ro_bind_sources: >-
       {{
         [
+          {'path': stack_dir ~ '/alertmanager/alertmanager.yml', 'recursive': false},
           {'path': stack_dir ~ '/alloy/config.alloy', 'recursive': false},
           {'path': stack_dir ~ '/certs', 'recursive': true},
           {'path': stack_dir ~ '/cribl-mock/config.yaml', 'recursive': false},
           {'path': stack_dir ~ '/grafana/provisioning', 'recursive': true},
           {'path': stack_dir ~ '/keycloak/realms', 'recursive': true},
           {'path': stack_dir ~ '/litellm/aigw_default_model_hook.py', 'recursive': false},
+          {'path': stack_dir ~ '/litellm/aigw_model_limits.py', 'recursive': false},
           {'path': stack_dir ~ '/litellm/aigw_openwebui_identity.py', 'recursive': false},
           {'path': stack_dir ~ '/litellm/aigw_otel_callback.py', 'recursive': false},
+          {'path': stack_dir ~ '/litellm/aigw_usage_callback.py', 'recursive': false},
           {'path': stack_dir ~ '/litellm/config.yaml', 'recursive': false},
           {'path': stack_dir ~ '/loki/config.yml', 'recursive': false},
           {'path': stack_dir ~ '/postgres/init', 'recursive': true},
           {'path': stack_dir ~ '/prometheus/prometheus.yml', 'recursive': false},
           {'path': stack_dir ~ '/prometheus/rules.yml', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/alert_state_ca.pem', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/alert_state_alloy.crt', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/alert_state_alloy.key', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/alert_state_prometheus.crt', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/alert_state_prometheus.key', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/provider_policy_receipt.json', 'recursive': false},
           {'path': stack_dir ~ '/secrets/redis_password', 'recursive': false},
           {'path': stack_dir ~ '/secrets/redis_users.acl', 'recursive': false},
           {'path': stack_dir ~ '/secrets/litellm_otel_token', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/litellm_usage_token', 'recursive': false},
           {'path': stack_dir ~ '/traefik/dynamic-adm.yml', 'recursive': false},
           {'path': stack_dir ~ '/traefik/dynamic-int.yml', 'recursive': false},
           {'path': stack_dir ~ '/traefik/traefik-adm.yml', 'recursive': false},
@@ -2517,6 +2793,7 @@
             "vault_audit": (1000, 473, 0o2750),
             "alloy_data": (473, 473, 0o700),
             "prom_data": (65532, 65532, 0o700),
+            "alertmanager_data": (65532, 65532, 0o700),
             "loki_data": (65532, 65532, 0o700),
             "grafana_data": (65532, 65532, 0o700),
         }
@@ -2613,6 +2890,7 @@
             "vault_audit": (1000, 473, 0o2750),
             "alloy_data": (473, 473, 0o700),
             "prom_data": (65532, 65532, 0o700),
+            "alertmanager_data": (65532, 65532, 0o700),
             "loki_data": (65532, 65532, 0o700),
             "grafana_data": (65532, 65532, 0o700),
         }
@@ -2809,14 +3087,15 @@
     quiet: true
     fail_msg: >-
       PostgreSQL service-role drift: roles must have exact least-privilege
-      attributes, no memberships, exact database ownership, and CONNECT only
-      to their own database; postgres alone retains maintenance access.
+      attributes, no memberships, and exact database ownership. Service roles
+      connect only to their own database. The read-only Grafana role connects
+      only to the two reviewed reporting databases.
   vars:
     expected_postgres_connect_matrix:
       - grafana_ro|keycloak|false
       - grafana_ro|litellm|true
       - grafana_ro|postgres|false
-      - grafana_ro|rotator|false
+      - grafana_ro|rotator|true
       - keycloak|keycloak|true
       - keycloak|litellm|false
       - keycloak|postgres|false
@@ -2932,7 +3211,7 @@
           'oauth2-proxy-prometheus', 'litellm',
           'open-webui', 'keycloak', 'dev-portal', 'admin-portal',
           'key-rotator', 'vault', 'postgres', 'redis',
-          'prometheus', 'node-exporter', 'loki', 'grafana'
+          'prometheus', 'alertmanager', 'node-exporter', 'loki', 'grafana'
         ] + (['oauth2-proxy-vault', 'vault-ui-proxy']
              if (aigw_vault_ui_enabled | bool) else [])) | to_json }}
     stdin: "{{ effective_compose_model.stdout }}"
@@ -3976,7 +4255,7 @@
            'dev-portal', 'open-webui'
          ]
          + (['vault-ui-proxy'] if (aigw_vault_ui_enabled | bool) else [])
-         + ['prometheus', 'grafana', 'traefik-int', 'traefik-adm'] }}
+         + ['alertmanager', 'prometheus', 'grafana', 'traefik-int', 'traefik-adm'] }}
     dependencies: false
     state: present
     build: never
@@ -4070,12 +4349,11 @@
         - openwebui_reconcile_staging is defined
         - openwebui_reconcile_staging.path is defined
 
-- name: Prove Open WebUI's workload key lists the full model catalog
-  # Owner decision 2026-07-16: the shared chat key is UNRESTRICTED on models
-  # (the admin portal governs access, not a per-key allowlist), so this proves
-  # the key is functional and unrestricted — it lists the same models the proxy
-  # serves — rather than pinning an exact scope that a catalog change would
-  # break. The key's ROUTE scope (list-models + chat only) is unchanged.
+- name: Prove Open WebUI's workload key lists its reconciled public models
+  # The reconciler snapshots the current public model list into an exact key
+  # allowlist. It rejects empty lists and wildcards, then verifies this same
+  # workload-key view. A future model is not authorized until the next reviewed
+  # converge updates the key. The route scope remains list-models + chat only.
   ansible.builtin.command:
     argv:
       - "{{ stack_dir }}/scripts/aigw-compose.sh"

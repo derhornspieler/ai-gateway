@@ -225,10 +225,11 @@ exit 64
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no stateful image change detected", result.stderr)
 
-    def test_alloy_and_lab_samba_are_in_stateful_gate(self) -> None:
+    def test_observability_state_and_lab_samba_are_in_stateful_gate(self) -> None:
         source = CHECK.read_text()
         stateful = source.split("stateful=(", 1)[1].split(")", 1)[0].split()
         self.assertIn("alloy", stateful)
+        self.assertIn("alertmanager", stateful)
         self.assertIn("samba-ad", stateful)
 
 

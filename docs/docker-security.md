@@ -48,19 +48,30 @@ as the reviewed option. Some DHI runtimes are shellless, so local builds add a
 small static health probe.
 
 Current DHI-based services include PostgreSQL 18.4, BusyBox, Keycloak, Vault,
-Redis, OAuth2 Proxy, Alloy, Prometheus, Loki, Grafana, node-exporter, the OTel
-collector, Envoy, portals, key-rotator, and optional platform DNS. Traefik uses
-a reviewed patched binary on a DHI runtime.
+Redis, OAuth2 Proxy, Alloy, Prometheus, Alertmanager, Loki, Grafana,
+node-exporter, the OTel collector, Envoy, portals, key-rotator, and optional
+platform DNS. Traefik uses a reviewed patched binary on a DHI runtime.
 
 Three reviewed upstream exceptions remain:
 
 | Image | Reason |
 | --- | --- |
-| LiteLLM `v1.93.0` | The reviewed upstream image was safer and compatible |
+| LiteLLM `1.93.0-aigw1` | Exact upstream `v1.93.0` base with one reviewed, offline security-wheel replacement |
 | Open WebUI `0.10.2-aigw2` | No matching application DHI image was available |
 | Samba AD test image | Local preprod only; never a production directory |
 
 An exception does not allow a floating tag or skipped scan.
+
+### LiteLLM security derivative
+
+The `1.93.0-aigw1` image keeps the exact upstream LiteLLM `v1.93.0` base. Its
+network-disabled build removes only `pyasn1` `0.6.3` and installs the reviewed
+`0.6.4` wheel. The wheel and its SHA-256 hash are committed. The build fails if
+the base package layout or installed version changes. It also pins the runtime
+user to `65532:65532`.
+
+Read-only package checks passed for AMD64 and ARM64. The exact offline-seed
+PreProd test and protected GitHub image scans still must pass before release.
 
 ### Open WebUI chat-only image
 
@@ -78,9 +89,9 @@ image and has fewer runtime paths:
   bypassed for this chat-only deployment.
 
 The offline build also installs reviewed wheels for cryptography 49.0.0,
-Pillow 12.3.0, MCP 1.28.1, and python-multipart 0.0.32. Compiled wheels are
-committed for both AMD64 and ARM64. Their hashes are checked before install,
-and the Docker build has no network.
+Pillow 12.3.0, MCP 1.28.1, python-multipart 0.0.32, `pyasn1` 0.6.4, and
+GitPython 3.1.54. Compiled wheels are committed for both AMD64 and ARM64.
+Their hashes are checked before install, and the Docker build has no network.
 
 Open WebUI has no DHI VEX statement. The repository therefore carries one
 local OpenVEX review for `CVE-2026-45829`. It is tied to the exact `aigw2`
@@ -258,5 +269,8 @@ the matching NAT rules. Envoy admin, databases, cache, Vault, and telemetry
 listeners stay on private Docker networks.
 
 Alloy may make one outbound TLS connection to the approved Cribl address and
-port. Only the curated SOC log set can use it. Metrics, alerts, raw traces, and
-normal service logs stay local. See the [Cribl handoff](cribl-soc-handoff.md).
+port. Alloy is the only telemetry component allowed to use that path. It sends
+admitted, sanitized logs, metrics, and traces with native OTLP/gRPC. Local
+logs and metrics remain available in Loki and Prometheus. No service,
+Prometheus process, or alert component may create a second Cribl connection.
+See the [Cribl telemetry handoff](cribl-soc-handoff.md).

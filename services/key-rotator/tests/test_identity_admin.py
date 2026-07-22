@@ -1784,6 +1784,7 @@ def test_group_policy_parses_attributes_and_fails_closed_on_malformed() -> None:
         "rpm_limit": None,
         "allowed_models": None,
         "default_model": None,
+        "model_limits": {},
     }
     assert parse({}) == unlimited
     assert parse({"attributes": {}}) == unlimited
@@ -1796,6 +1797,10 @@ def test_group_policy_parses_attributes_and_fails_closed_on_malformed() -> None:
                 "aigw.policy.rpm_limit": ["60"],
                 "aigw.policy.allowed_models": ["claude-sonnet,claude-haiku"],
                 "aigw.policy.default_model": ["claude-sonnet"],
+                "aigw.policy.model_limits_v1": [
+                    '{"claude-haiku":{"max_output_tokens_per_request":4096,'
+                    '"output_tokens_per_utc_minute":100000}}'
+                ],
             }
         }
     )
@@ -1804,6 +1809,12 @@ def test_group_policy_parses_attributes_and_fails_closed_on_malformed() -> None:
         "rpm_limit": 60,
         "allowed_models": ["claude-haiku", "claude-sonnet"],
         "default_model": "claude-sonnet",
+        "model_limits": {
+            "claude-haiku": {
+                "max_output_tokens_per_request": 4096,
+                "output_tokens_per_utc_minute": 100000,
+            }
+        },
     }
 
     # A malformed restriction must never fall back to unlimited.
@@ -1820,6 +1831,33 @@ def test_group_policy_parses_attributes_and_fails_closed_on_malformed() -> None:
             "aigw.policy.default_model": ["claude-opus"],
         },
         {"aigw.policy.default_model": ["not a model"]},
+        {
+            "aigw.policy.model_limits_v1": [
+                '{"claude-haiku":{"max_output_tokens_per_request":10,'
+                '"output_tokens_per_utc_minute":100}}'
+            ]
+        },
+        {
+            "aigw.policy.allowed_models": ["claude-haiku"],
+            "aigw.policy.model_limits_v1": [
+                '{ "claude-haiku": {"max_output_tokens_per_request": 10, '
+                '"output_tokens_per_utc_minute": 100} }'
+            ],
+        },
+        {
+            "aigw.policy.allowed_models": ["claude-haiku"],
+            "aigw.policy.model_limits_v1": [
+                '{"claude-opus":{"max_output_tokens_per_request":10,'
+                '"output_tokens_per_utc_minute":100}}'
+            ],
+        },
+        {
+            "aigw.policy.allowed_models": ["claude-haiku"],
+            "aigw.policy.model_limits_v1": [
+                '{"claude-haiku":{"max_output_tokens_per_request":101,'
+                '"output_tokens_per_utc_minute":100}}'
+            ],
+        },
     ):
         with pytest.raises(IdentityConflict):
             parse({"attributes": attributes})
@@ -1875,49 +1913,89 @@ async def test_set_group_policy_writes_verifies_and_preserves_foreign_attributes
     None
 ):
     admin = policy_admin()
-    result = await admin.set_group_policy(
-        "group-1",
-        {
-            "tpm_limit": 100000,
-            "rpm_limit": 60,
-            "allowed_models": ["claude-sonnet", "claude-haiku"],
-            "default_model": "claude-sonnet",
-        },
-    )
-    assert result == {
-        "id": "group-1",
-        "name": "project-a",
-        "policy": {
-            "tpm_limit": 100000,
-            "rpm_limit": 60,
-            "allowed_models": ["claude-haiku", "claude-sonnet"],
-            "default_model": "claude-sonnet",
+    operation_id = "11111111-1111-4111-8111-111111111111"
+    desired = {
+        "tpm_limit": 100000,
+        "rpm_limit": 60,
+        "allowed_models": ["claude-sonnet", "claude-haiku"],
+        "default_model": "claude-sonnet",
+        "model_limits": {
+            "claude-haiku": {
+                "max_output_tokens_per_request": 4096,
+                "output_tokens_per_utc_minute": 100000,
+            }
         },
     }
+    result = await admin.set_group_policy(
+        "group-1",
+        desired,
+        operation_id,
+    )
+    normalized = {**desired, "allowed_models": ["claude-haiku", "claude-sonnet"]}
+    assert result["id"] == "group-1"
+    assert result["name"] == "project-a"
+    assert result["policy"] == normalized
+    assert result["active_policy"]["tpm_limit"] == 5
+    assert result["reconciliation_pending"] is True
+    revision = result["policy_revision"]
     written = admin.puts[0]["attributes"]
-    # Only the aigw.policy.* namespace is owned here; every other attribute
-    # (including a stale policy value) must be preserved or replaced exactly.
+    # Staging persists the intended policy but leaves the old active policy in
+    # force until the caller has gated every stale LiteLLM key.
     assert written["custom.marker"] == ["keep-me"]
-    assert written["aigw.policy.tpm_limit"] == ["100000"]
-    assert written["aigw.policy.allowed_models"] == ["claude-haiku,claude-sonnet"]
+    assert written["aigw.policy.tpm_limit"] == ["5"]
+    assert "aigw.policy.allowed_models" not in written
+    assert "aigw.policy.pending_v1" in written
 
-    # Resetting to the platform default removes the policy attributes.
-    cleared = await admin.set_group_policy(
+    activated = await admin.activate_group_policy(
+        "group-1", revision, operation_id
+    )
+    assert activated["active_policy"] == normalized
+    assert activated["reconciliation_pending"] is True
+    active_attributes = admin.puts[1]["attributes"]
+    assert active_attributes["custom.marker"] == ["keep-me"]
+    assert active_attributes["aigw.policy.tpm_limit"] == ["100000"]
+    assert active_attributes["aigw.policy.allowed_models"] == [
+        "claude-haiku,claude-sonnet"
+    ]
+    assert active_attributes["aigw.policy.model_limits_v1"] == [
+        '{"claude-haiku":{"max_output_tokens_per_request":4096,'
+        '"output_tokens_per_utc_minute":100000}}'
+    ]
+    assert "aigw.policy.pending_v1" in active_attributes
+
+    completed = await admin.complete_group_policy(
+        "group-1", revision, operation_id
+    )
+    assert completed["reconciliation_pending"] is False
+    assert "aigw.policy.pending_v1" not in admin.puts[2]["attributes"]
+
+    # Resetting to the platform default uses the same three durable phases.
+    staged_clear = await admin.set_group_policy(
         "group-1",
         {
             "tpm_limit": None,
             "rpm_limit": None,
             "allowed_models": None,
             "default_model": None,
+            "model_limits": {},
         },
+        "22222222-2222-4222-8222-222222222222",
     )
-    assert cleared["policy"] == {
+    assert staged_clear["policy"] == {
         "tpm_limit": None,
         "rpm_limit": None,
         "allowed_models": None,
         "default_model": None,
+        "model_limits": {},
     }
-    assert admin.puts[1]["attributes"] == {"custom.marker": ["keep-me"]}
+    clear_revision = staged_clear["policy_revision"]
+    await admin.activate_group_policy(
+        "group-1", clear_revision, "22222222-2222-4222-8222-222222222222"
+    )
+    await admin.complete_group_policy(
+        "group-1", clear_revision, "22222222-2222-4222-8222-222222222222"
+    )
+    assert admin.puts[-1]["attributes"] == {"custom.marker": ["keep-me"]}
 
 
 @pytest.mark.asyncio
@@ -1932,21 +2010,92 @@ async def test_set_group_policy_fails_closed_when_the_write_does_not_verify() ->
                 "rpm_limit": None,
                 "allowed_models": None,
                 "default_model": None,
+                "model_limits": {},
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_pending_group_policy_retry_is_idempotent_and_recoverable() -> None:
+    admin = policy_admin()
+    desired = {
+        "tpm_limit": 1000,
+        "rpm_limit": 10,
+        "allowed_models": ["claude-haiku"],
+        "default_model": "claude-haiku",
+        "model_limits": {},
+    }
+    first_operation = "11111111-1111-4111-8111-111111111111"
+    retry_operation = "22222222-2222-4222-8222-222222222222"
+
+    staged = await admin.set_group_policy(
+        "group-1", desired, first_operation
+    )
+    revision = staged["policy_revision"]
+    assert len(admin.puts) == 1
+
+    # A new request may resume the same durable intent without creating a
+    # second Keycloak write. A different intent cannot replace pending work.
+    retried = await admin.set_group_policy(
+        "group-1", desired, retry_operation
+    )
+    assert retried["policy_revision"] == revision
+    assert retried["reconciliation_operation_id"] == first_operation
+    assert len(admin.puts) == 1
+    with pytest.raises(IdentityConflict, match="already pending"):
+        await admin.set_group_policy(
+            "group-1",
+            {**desired, "tpm_limit": 999},
+            retry_operation,
+        )
+
+    # A lost Keycloak activation write keeps the pending marker and old active
+    # policy. The same revision can be activated and completed on retry.
+    admin.persist_writes = False
+    with pytest.raises(IdentityError, match="did not verify"):
+        await admin.activate_group_policy(
+            "group-1", revision, retry_operation
+        )
+    assert admin._group_policy_reconciliation(admin.group)[
+        "reconciliation_pending"
+    ] is True
+    assert admin._group_policy(admin.group)["tpm_limit"] == 5
+
+    admin.persist_writes = True
+    activated = await admin.activate_group_policy(
+        "group-1", revision, retry_operation
+    )
+    assert activated["active_policy"] == desired
+    completed = await admin.complete_group_policy(
+        "group-1", revision, retry_operation
+    )
+    assert completed["reconciliation_pending"] is False
 
 
 @pytest.mark.asyncio
 async def test_set_group_policy_rejects_invalid_requests_before_keycloak() -> None:
     admin = policy_admin()
     for bad in (
-        {"tpm_limit": 0, "rpm_limit": None, "allowed_models": None, "default_model": None},
-        {"tpm_limit": None, "rpm_limit": None, "allowed_models": [], "default_model": None},
+        {
+            "tpm_limit": 0,
+            "rpm_limit": None,
+            "allowed_models": None,
+            "default_model": None,
+            "model_limits": {},
+        },
+        {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": [],
+            "default_model": None,
+            "model_limits": {},
+        },
         {
             "tpm_limit": None,
             "rpm_limit": None,
             "allowed_models": ["claude-sonnet"],
             "default_model": "claude-opus",
+            "model_limits": {},
         },
         {"tpm_limit": None},
         {
@@ -1954,7 +2103,32 @@ async def test_set_group_policy_rejects_invalid_requests_before_keycloak() -> No
             "rpm_limit": None,
             "allowed_models": None,
             "default_model": None,
+            "model_limits": {},
             "max_budget": 5,
+        },
+        {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": None,
+            "default_model": None,
+            "model_limits": {
+                "claude-haiku": {
+                    "max_output_tokens_per_request": 10,
+                    "output_tokens_per_utc_minute": 100,
+                }
+            },
+        },
+        {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": ["claude-haiku"],
+            "default_model": None,
+            "model_limits": {
+                "claude-opus": {
+                    "max_output_tokens_per_request": 10,
+                    "output_tokens_per_utc_minute": 100,
+                }
+            },
         },
     ):
         with pytest.raises(IdentityConflict):
@@ -2016,6 +2190,21 @@ async def test_user_project_policies_reads_fresh_authoritative_groups() -> None:
                 "rpm_limit": 120,
                 "allowed_models": ["claude-haiku"],
                 "default_model": None,
+                "model_limits": {},
+            }
+        },
+        "policy_reconciliation": {
+            "project-a": {
+                "ready": True,
+                "revision": admin._policy_revision(
+                    {
+                        "tpm_limit": None,
+                        "rpm_limit": 120,
+                        "allowed_models": ["claude-haiku"],
+                        "default_model": None,
+                        "model_limits": {},
+                    }
+                ),
             }
         },
     }

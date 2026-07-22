@@ -36,6 +36,56 @@ func TestHTTPProbeRejectsRedirect(t *testing.T) {
 	}
 }
 
+func TestMetricFixtureFiresAndResetsWithoutLabels(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "active")
+	handler := metricFixtureHandler(stateFile)
+
+	readMetric := func() string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("unexpected metric response: %d", response.Code)
+		}
+		return response.Body.String()
+	}
+
+	if body := readMetric(); !strings.Contains(body, "aigw_preprod_alert_test 0\n") {
+		t.Fatalf("fixture should start inactive: %q", body)
+	}
+	if err := run([]string{"fixture-state", "--state-file", stateFile, "--active=true"}); err != nil {
+		t.Fatal(err)
+	}
+	if body := readMetric(); !strings.Contains(body, "aigw_preprod_alert_test 1\n") {
+		t.Fatalf("fixture should be active: %q", body)
+	}
+	if err := run([]string{"fixture-state", "--state-file", stateFile, "--active=false"}); err != nil {
+		t.Fatal(err)
+	}
+	if body := readMetric(); !strings.Contains(body, "aigw_preprod_alert_test 0\n") {
+		t.Fatalf("fixture should reset: %q", body)
+	}
+	if strings.Contains(readMetric(), "{") {
+		t.Fatal("fixture metric must remain label-free")
+	}
+}
+
+func TestMetricFixtureRejectsUnsafeState(t *testing.T) {
+	directory := t.TempDir()
+	stateFile := filepath.Join(directory, "active")
+	target := filepath.Join(directory, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, stateFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"fixture-state", "--state-file", stateFile, "--active=true"}); err == nil {
+		t.Fatal("expected symlinked state to fail")
+	}
+}
+
 func TestRedisProbe(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

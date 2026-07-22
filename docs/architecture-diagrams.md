@@ -18,13 +18,15 @@ GitHub renders these Mermaid diagrams. Provider details are in
   [developer keys](#6-logic-flow--developer-key-lifecycle), and
   [Anthropic WIF](#7-security-flow--provider-credential-rotation-anthropic-wif).
 - Security and telemetry: [layered enforcement](#8-security-design--layered-enforcement)
-  and [local versus SOC telemetry](#9-telemetry-and-soc-log-flow).
+  and [local versus SOC telemetry](#9-telemetry-and-soc-export-flow).
 - Release path: [Ansible order](#10-deployment-logic--ansible-converge-order),
   [provider selection](#11-provider-selection-and-immutable-envoy-build),
   [provider runtime](#12-runtime-request-path-for-selected-providers),
   [CA review and rotation](#13-ca-capture-review-rotation-and-approval), and
   [seed validation and rollback](#14-offline-seed-validation-deployment-and-rollback).
-- Identity control: [managed change and drift recovery](#15-managed-identity-change-and-recovery).
+- Managed control: [identity change and drift recovery](#15-managed-identity-change-and-recovery),
+  [model lifecycle and discovery](#16-governed-model-lifecycle-and-discovery), and
+  [usage and reviewed pricing](#17-usage-and-reviewed-pricing).
 
 ## 1. Network topology and trust zones
 
@@ -165,8 +167,9 @@ flowchart LR
 
   DP -->|live project checks| KR[key-rotator]
   DP -->|create and manage own keys| LL
-  AP -->|identity + rotation control| KR
+  AP -->|identity, rotation, model,<br/>and price control| KR
   AP -->|admin key controls| LL
+  LL -->|prompt-free usage callback| KR
   LL -->|selected provider path| EV[Envoy egress] --> V[Selected provider APIs]
   KR --> EV
   LL & KC & KR --> PG[(Postgres)]
@@ -240,8 +243,16 @@ flowchart TD
   PROJ -- yes --> MINT[dev-portal calls LiteLLM to mint a scoped key<br/>project ID = group name in key metadata]
   MINT --> SHOW[One-time plaintext key shown once<br/>never stored or logged]
   SHOW --> USE[AI tool calls api.DOMAIN /v1 with key]
+  SHOW --> LEAVE[User changes portal tab or page]
+  LEAVE --> ERASE[Browser clears the plaintext and replaces<br/>the secret-bearing history entry]
+  ERASE --> BACK[Back or Forward cannot show the key again]
   REM([Admin removes member from group]) --> KILL[key-rotator logs user out of Keycloak<br/>and deactivates that subject's project keys<br/>before and after the membership change]
 ```
+
+The key panel starts hidden until its exit guards are active. The response is
+not cacheable. The browser removes the whole panel before normal navigation,
+page hiding, form submission, or portal tab changes. A browser-history restore
+must pass the same consumed-state check and cannot reveal the key again.
 
 ## 7. Security flow — provider credential rotation (Anthropic WIF)
 
@@ -288,15 +299,18 @@ flowchart TB
   L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
 ```
 
-## 9. Telemetry and SOC log flow
+## 9. Telemetry and SOC export flow
 
-Prompts and replies are sensitive. Alloy turns the reviewed `litellm_request`
-span into a log. The raw span never leaves the gateway. The log stays in Loki
-and may enter the narrow Cribl SOC feed.
+Alloy is the only collection and export choke point. It sends every admitted
+log, metric, and trace to Cribl after redaction. Logs and metrics also keep
+their local paths. This release has no local trace store.
 
-Metrics, raw traces, normal service logs, and alert data never enter Cribl.
-See [observability operations](observability-operations.md) and the
-[Cribl SOC handoff](cribl-soc-handoff.md).
+Prompts and replies are sensitive. Alloy accepts LiteLLM request traces on a
+separate authenticated receiver, removes secrets, and turns each reviewed
+`litellm_request` span into a local request-audit log. The sanitized source
+trace and log may enter Cribl. See
+[observability operations](observability-operations.md) and the
+[Cribl telemetry handoff](cribl-soc-handoff.md).
 
 ```mermaid
 flowchart LR
@@ -305,17 +319,18 @@ flowchart LR
   KC[Keycloak<br/>auth events] --> AL
   SE[Reviewed trust and<br/>security-control events] --> AL
   CT[/Target lifecycle files<br/>upgrade and rollback/] -->|read-only| AL
-  DL[Other Docker JSON logs<br/>uid-473 ACL tail] --> AL
+  DL[Docker JSON logs<br/>uid-473 ACL tail] --> AL
   VA[Vault raw audit tail] --> AL
+  MS[Approved metric endpoints<br/>including node-exporter] -->|scrape| AL
 
-  AL -->|local logs + request audit| LK[(Loki — 7 days)]
-  AL -->|local metrics + spanmetrics| PR[(Prometheus<br/>30 days or 5 GB, first limit wins)]
-  NE[node-exporter] --> PR
-  PR -.approved backlog.-> AM[Future Alertmanager<br/>local only]
-  AL -->|approved security candidates only| RED[Fixed fields + reviewed<br/>prompt secret redaction]
-  RED --> COMMON[Common gate:<br/>schema, environment, producer,<br/>service match, recent UTC time]
-  COMMON -.curated OTLP logs over TLS only.-> CR[Cribl SOC destination<br/>must enforce 24-hour retention]
-  GF[Grafana — ADM leg,<br/>behind oauth2-proxy] --> LK & PR
+  AL -->|admitted local logs| LK[(Loki — 7 days)]
+  AL -->|admitted local metrics| PR[(Prometheus<br/>up to 30 days or configured size cap<br/>first limit wins)]
+  PR -->|firing and resolved state| AM[Alertmanager<br/>private, no FQDN]
+  PR -->|ALERTS and ALERTS_FOR_STATE only<br/>private mutual TLS| AL
+  AL --> RED[Secret removal + fixed fields<br/>for sensitive event classes]
+  RED --> COMMON[Common gate:<br/>server-owned environment,<br/>source and recent UTC time]
+  COMMON -->|logs, metrics, and traces<br/>OTLP/gRPC with TLS| CR[Cribl destination<br/>24-hour retention]
+  GF[Grafana — ADM leg,<br/>behind oauth2-proxy] --> LK & PR & AM
 ```
 
 Alloy adds the trusted LiteLLM source marker only after port 4319 checks the
@@ -373,7 +388,7 @@ flowchart LR
   CANON --> MAN[Matching schema-v2 manifest<br/>egress-policy receipts]
   ID --> MAN
   MAN --> PROD[Production offline seed<br/>no preprod-only images]
-  MAN --> PRE[Preprod offline seed<br/>production plus Samba AD, WIF mock,<br/>and their extra Debian base]
+  MAN --> PRE[Preprod offline seed<br/>production plus Samba AD, WIF mock,<br/>their Debian base, and the PostgreSQL 16<br/>migration-test source]
 ```
 
 The catalog is not copied into the image. Only selected records enter the
@@ -444,7 +459,7 @@ flowchart TD
   BUILD --> PRODSEED[Production archive and manifest]
   PRESEED --> LLOAD[Local loader checks archive allow-list,<br/>source hashes, policy, labels, and image IDs]
   LLOAD --> PE2E[Ansible local preprod<br/>pull never, no build]
-  PE2E --> PGATE{Full end-to-end and<br/>browser tests passed?}
+  PE2E --> PGATE{Full end-to-end, Vault restart,<br/>and browser tests passed?}
   PGATE --> CLEAN[Run exact-manifest clean-room teardown]
   CLEAN --> ABSENT{Owned resources and images absent?<br/>Unrelated images preserved?}
   ABSENT -- no --> FIX[Reject release and fix source]
@@ -500,3 +515,81 @@ flowchart TD
 
 A managed LDAP provider rename needs a reviewed migration. A legacy blank name
 is adopted only when its saved provider ID matches the same live provider.
+
+## 16. Governed model lifecycle and discovery
+
+PostgreSQL is the model source of truth. LiteLLM holds only the checked runtime
+copy. A draft or retired model cannot remain in that copy. An unexpected or
+changed LiteLLM row makes the controller unready instead of widening access.
+
+```mermaid
+flowchart TD
+  ADM[Admin with recent Keycloak login] --> PORTAL[Admin portal Models page]
+  RECEIPT[Loaded Envoy provider-policy receipt<br/>Anthropic selected] --> CONTROL[key-rotator model controller]
+  PORTAL -->|create draft, activate,<br/>show, hide, or retire| CONTROL
+  CONTROL --> POLICY[(Append-only model policy<br/>and lifecycle events)]
+  POLICY --> STATE{Saved model state}
+  STATE -- draft or retired --> ABSENT[LiteLLM deployment must be absent]
+  STATE -- active --> PROJECT[Check exact Keycloak<br/>project assignments]
+  PROJECT --> PROJECTION[Create or verify exact<br/>managed LiteLLM projection]
+  ABSENT --> VERIFY{Full bounded inventory exact?}
+  PROJECTION --> VERIFY
+  VERIFY -->|no: unmanaged, duplicate,<br/>changed, or malformed| NOTREADY[Fail readiness closed]
+  VERIFY -- yes --> READY[Controller ready]
+  READY --> FILTER[Dev portal discovery filter]
+  CALLER[Caller model list] --> FILTER
+  FULL[Full LiteLLM inventory] --> FILTER
+  POLICY --> FILTER
+  FILTER --> PUBLIC[Return only active, visible,<br/>caller-allowed models]
+  POLICY --> EXACT[Hidden active model:<br/>callable only by assigned exact name]
+  PROJECT --> RETIRE{Any live assignment remains?}
+  RETIRE -- yes --> BLOCK[Block retirement]
+  RETIRE -- no --> ABSENT
+```
+
+Native LiteLLM model and configuration mutations are blocked at the ADM edge.
+Use the [model lifecycle SOP](sop/model-lifecycle.md) for operator steps and
+the [model control plan](model-governance-plan.md) for the remaining work.
+
+## 17. Usage and reviewed pricing
+
+The usage callback contains no prompt, reply, API key, or request header. A
+separate private token lets it call only the usage endpoint. Each accepted
+event and each price version is append-only.
+
+```mermaid
+flowchart LR
+  REQ[User or tool request] --> LL[LiteLLM 1.93.0]
+  LL -->|selected route| EV[Envoy] --> AN[Anthropic]
+  LL -->|prompt-free result<br/>private usage token| API[key-rotator usage endpoint]
+  API --> CHECK{Shape, identity,<br/>token classes, event ID valid?}
+  CHECK -- no --> REJECT[Reject malformed or<br/>conflicting event]
+  CHECK -- yes --> LEDGER[(Append-only usage ledger)]
+  ADMIN[Admin with login<br/>from last 5 minutes] --> PRICE[Admin portal price form]
+  PRICE --> WHEN{Future or backdated?}
+  WHEN -->|future| PRICES[(Append-only price versions)]
+  WHEN -->|past or current| PREVIEW[Store affected window,<br/>all row hashes, and exact delta]
+  PREVIEW --> REVIEW[Show totals and up to<br/>100 row details]
+  REVIEW -->|fresh login plus<br/>exact phrase| CONFIRM[Recheck policy, usage,<br/>adjustments, and digests]
+  CONFIRM --> PRICES
+  CONFIRM --> ADJUST[(Append-only cost adjustments)]
+  PRICES --> COST[Bind exact price IDs<br/>and component costs]
+  LEDGER --> COST
+  ADJUST --> VIEW
+  COST --> VIEW[Reviewed read-only views]
+  VIEW --> GF[Grafana Model Usage and Cost]
+  API --> AUDIT[Bounded stored, replay,<br/>conflict, or write-failure audit]
+  REJECT --> AUDIT
+  LL -. endpoint unavailable .-> GAP[Prompt-free delivery-failure audit]
+  GAP --> AL
+  AUDIT --> AL[Alloy redaction and policy gate]
+  AL --> LK[(Loki)]
+  AL --> CR[Cribl over OTLP/gRPC TLS]
+```
+
+Exact callback replays return the saved receipt. The same event ID with
+different data is a conflict. Missing usage or price stays unknown, never
+zero. Backdating is implemented with immutable preview evidence and
+append-only adjustments. It is not production-accepted until the exact-seed
+PreProd and rollback tests pass. See
+[usage and cost accounting](usage-and-cost-accounting.md).

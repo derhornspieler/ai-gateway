@@ -13,9 +13,24 @@ RUN apt-get update \
         samba-ad-dc="${SAMBA_DEBIAN_VERSION}" \
         samba-ad-provision="${SAMBA_DEBIAN_VERSION}" \
         tini \
+    # These command-line tools are pulled in for Debian package setup. The
+    # running directory controller does not use them. Remove them after every
+    # package operation so their parser vulnerabilities are not in PreProd.
+    && dpkg --purge --force-depends \
+        dirmngr gnupg gnupg-l10n gpg gpg-agent gpgconf gpgsm \
+    && dpkg --purge --force-depends --force-remove-essential \
+        gzip ncurses-bin perl-base \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/samba/smb.conf \
-    && chmod 0755 /usr/sbin/policy-rc.d
+    && chmod 0755 /usr/sbin/policy-rc.d \
+    && ! command -v perl \
+    && ! command -v gzip \
+    && ! command -v infocmp \
+    && ! command -v gpg \
+    && python3 -I -c "from samba.netcmd.main import samba_tool" \
+    && samba-tool --help >/dev/null \
+    && samba --version >/dev/null \
+    && openssl version >/dev/null
 
 COPY samba-ad-entrypoint /usr/local/sbin/samba-ad-entrypoint
 COPY samba-ad-healthcheck /usr/local/sbin/samba-ad-healthcheck

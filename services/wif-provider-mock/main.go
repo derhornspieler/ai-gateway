@@ -38,6 +38,11 @@ type tokenStore struct {
 	ready   bool
 }
 
+type messageTestState struct {
+	mutex         sync.Mutex
+	retriedModels map[string]bool
+}
+
 type config struct {
 	address          string
 	certFile         string
@@ -53,6 +58,7 @@ type config struct {
 	federationRuleID string
 	workspaceID      string
 	tokens           *tokenStore
+	messageTests     *messageTestState
 }
 
 type jwksDocument struct {
@@ -155,6 +161,7 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("TLS_SERVER_NAME must be under aigw.internal")
 	}
 	cfg.tokens = &tokenStore{}
+	cfg.messageTests = &messageTestState{retriedModels: make(map[string]bool)}
 	return cfg, nil
 }
 
@@ -256,7 +263,38 @@ func (cfg config) messages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "model and messages are required", http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	messageDocument := string(request["messages"])
+	if strings.Contains(messageDocument, "AIGW_PREPROD_FAIL_ALWAYS_") {
+		http.Error(w, "planned preprod provider failure", http.StatusInternalServerError)
+		return
+	}
+	if strings.Contains(messageDocument, "AIGW_PREPROD_RETRY_ONCE_") &&
+		cfg.messageTests.firstAttempt(model) {
+		http.Error(w, "planned preprod retry", http.StatusInternalServerError)
+		return
+	}
+
+	usage := map[string]any{
+		"input_tokens":                10,
+		"cache_creation_input_tokens": 50,
+		"cache_read_input_tokens":     40,
+		"output_tokens":               50,
+		"cache_creation": map[string]int{
+			"ephemeral_5m_input_tokens": 20,
+			"ephemeral_1h_input_tokens": 30,
+		},
+	}
+	if strings.Contains(messageDocument, "AIGW_PREPROD_NO_USAGE_") {
+		usage = nil
+	}
+
+	var stream bool
+	_ = json.Unmarshal(request["stream"], &stream)
+	if stream {
+		writeMessageStream(w, model, usage)
+		return
+	}
+	response := map[string]any{
 		"id":            "msg_preprod_001",
 		"type":          "message",
 		"role":          "assistant",
@@ -264,8 +302,53 @@ func (cfg config) messages(w http.ResponseWriter, r *http.Request) {
 		"content":       []map[string]string{{"type": "text", "text": "pong"}},
 		"stop_reason":   "end_turn",
 		"stop_sequence": nil,
-		"usage":         map[string]int{"input_tokens": 1, "output_tokens": 1},
-	})
+	}
+	if usage != nil {
+		response["usage"] = usage
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (state *messageTestState) firstAttempt(model string) bool {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	if state.retriedModels[model] {
+		return false
+	}
+	state.retriedModels[model] = true
+	return true
+}
+
+func writeMessageStream(w http.ResponseWriter, model string, usage map[string]any) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	frames := []map[string]any{
+		{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": "msg_preprod_stream_001", "type": "message",
+				"role": "assistant", "model": model, "content": []any{},
+				"stop_reason": nil, "stop_sequence": nil,
+				"usage": map[string]int{"input_tokens": 10, "output_tokens": 0},
+			},
+		},
+		{"type": "content_block_start", "index": 0, "content_block": map[string]string{"type": "text", "text": ""}},
+		{"type": "content_block_delta", "index": 0, "delta": map[string]string{"type": "text_delta", "text": "pong"}},
+		{"type": "content_block_stop", "index": 0},
+		{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]int{"output_tokens": 50}},
+		{"type": "message_stop"},
+	}
+	if usage != nil {
+		frames[0]["message"].(map[string]any)["usage"] = usage
+	}
+	for _, frame := range frames {
+		encoded, err := json.Marshal(frame)
+		if err != nil {
+			return
+		}
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", frame["type"], encoded)
+	}
 }
 
 func (store *tokenStore) issue(now time.Time) (string, error) {

@@ -178,6 +178,43 @@ class Rocky9ProductionTerminologyTests(unittest.TestCase):
             len(generated.removeprefix(entry["prefix"])), entry["min_length"]
         )
 
+    def test_openwebui_key_uses_a_bounded_explicit_model_snapshot(self) -> None:
+        reconcile = _load_reconcile_openwebui_key_module()
+        response = {
+            "data": [
+                {"id": "claude-sonnet-5"},
+                {"id": "claude-haiku-4-5"},
+            ]
+        }
+        with mock.patch.object(reconcile, "request", return_value=(200, response)):
+            self.assertEqual(
+                reconcile.model_names("sk-" + "m" * 32),
+                ["claude-haiku-4-5", "claude-sonnet-5"],
+            )
+
+        source = RECONCILE_OPENWEBUI_KEY.read_text(encoding="utf-8")
+        self.assertNotIn('MODELS = ["all-proxy-models"]', source)
+        self.assertIn("models = model_names(master)", source)
+        self.assertIn("if model_names(candidate) != models:", source)
+
+    def test_openwebui_key_fails_closed_on_an_unsafe_model_snapshot(self) -> None:
+        reconcile = _load_reconcile_openwebui_key_module()
+        invalid_responses = (
+            {},
+            {"data": []},
+            {"data": [{"id": "claude-sonnet-5"}] * 2},
+            {"data": [{"id": "all-proxy-models"}]},
+            {"data": [{"id": "bad model"}]},
+            {"data": [{"id": f"model-{index}"} for index in range(33)]},
+        )
+        for response in invalid_responses:
+            with self.subTest(response=response):
+                with mock.patch.object(
+                    reconcile, "request", return_value=(200, response)
+                ):
+                    with self.assertRaises(SystemExit):
+                        reconcile.model_names("sk-" + "m" * 32)
+
     def test_production_bootstrap_emits_canonical_layout_and_five_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

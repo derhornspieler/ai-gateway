@@ -86,9 +86,11 @@ assert set(manifest) == {"base", "platform_dns", "identity_ldap"}
 service_pattern = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 segment_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 assert set(manifest["base"]).isdisjoint(manifest["platform_dns"])
-# The external directory overlay mounts one extra CA into Keycloak's truststore,
-# so it replaces Keycloak's base source list and may re-state `keycloak`.
-assert (set(manifest["base"]) & set(manifest["identity_ldap"])) <= {"keycloak"}
+# Optional profiles add sources to an existing service's base list. They must
+# never replace the release-bound key-rotator receipt or Keycloak realms.
+assert (set(manifest["base"]) & set(manifest["identity_ldap"])) <= {
+    "keycloak", "key-rotator"
+}
 assert set(manifest["identity_ldap"]).isdisjoint(manifest["platform_dns"])
 assert set(manifest["identity_ldap"]) == {"keycloak", "key-rotator"}
 assert manifest["platform_dns"] == {
@@ -100,10 +102,13 @@ assert manifest["platform_dns"] == {
 }
 assert manifest["identity_ldap"]["keycloak"] == [
     "keycloak/identity-ldap-ca.pem",
-    "keycloak/realms",
 ]
 assert manifest["identity_ldap"]["key-rotator"] == [
     "secrets/identity_ldap_bind_password"
+]
+assert manifest["base"]["key-rotator"] == [
+    "secrets/provider_policy_receipt.json",
+    "secrets/litellm_usage_token",
 ]
 for profile in ("base", "platform_dns", "identity_ldap"):
     assert isinstance(manifest[profile], dict) and manifest[profile]
@@ -132,13 +137,16 @@ import sys
 
 root = Path(sys.argv[1])
 for relative in (
+    "alertmanager/alertmanager.yml",
     "traefik/traefik-int.yml",
     "traefik/traefik-adm.yml",
     "traefik/dynamic-int.yml",
     "traefik/dynamic-adm.yml",
     "grafana/provisioning/alerting/empty.yml",
     "grafana/provisioning/dashboards/dashboards.yml",
+    "grafana/provisioning/dashboards/json/ai-gateway-alerts-capacity.json",
     "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
+    "grafana/provisioning/dashboards/json/ai-gateway-model-usage.json",
     "grafana/provisioning/dashboards/json/ai-gateway-overview.json",
     "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
     "grafana/provisioning/dashboards/json/ai-gateway-top-projects.json",
@@ -154,6 +162,7 @@ for relative in (
     assert path.is_file() and not path.is_symlink(), relative
     assert stat.S_IMODE(path.stat().st_mode) == 0o644, relative
 for relative in (
+    "alertmanager",
     "traefik",
     "grafana",
     "grafana/provisioning",
@@ -485,7 +494,7 @@ for required in (
     assert required in rollback, required
 assert "shell=True" not in rollback
 stateful = gate.split("stateful=(", 1)[1].split(")", 1)[0].split()
-for required in ("open-webui", "vault", "alloy", "prometheus", "loki", "grafana", "samba-ad"):
+for required in ("open-webui", "vault", "alloy", "prometheus", "alertmanager", "loki", "grafana", "samba-ad"):
     assert required in stateful, required
 assert "tempo" not in stateful
 
@@ -1052,6 +1061,7 @@ env \
   ALLOY_TELEMETRY_IP=172.28.13.2 \
   ALLOY_OBSERVABILITY_IP=172.28.15.2 \
   PROMETHEUS_OBSERVABILITY_IP=172.28.15.3 \
+  ALERTMANAGER_OBSERVABILITY_IP=172.28.15.4 \
   PLATFORM_DNS_IP=172.28.18.2 \
   PLATFORM_DNS_ADM_CIDR=10.8.10.0/24 \
   AIGW_BIND_DIGEST_TRAEFIK_INT=0000000000000000000000000000000000000000000000000000000000000001 \
@@ -1064,11 +1074,12 @@ env \
   AIGW_BIND_DIGEST_REDIS=0000000000000000000000000000000000000000000000000000000000000008 \
   AIGW_BIND_DIGEST_ALLOY=0000000000000000000000000000000000000000000000000000000000000009 \
   AIGW_BIND_DIGEST_PROMETHEUS=000000000000000000000000000000000000000000000000000000000000000a \
+  AIGW_BIND_DIGEST_ALERTMANAGER=000000000000000000000000000000000000000000000000000000000000000c \
   AIGW_BIND_DIGEST_LOKI=000000000000000000000000000000000000000000000000000000000000000b \
   AIGW_BIND_DIGEST_GRAFANA=000000000000000000000000000000000000000000000000000000000000000d \
   AIGW_BIND_DIGEST_CRIBL_MOCK=000000000000000000000000000000000000000000000000000000000000000e \
   AIGW_BIND_DIGEST_PLATFORM_DNS=000000000000000000000000000000000000000000000000000000000000000f \
-  AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP=0000000000000000000000000000000000000000000000000000000000000012 \
+  AIGW_BIND_DIGEST_KEY_ROTATOR=0000000000000000000000000000000000000000000000000000000000000012 \
   KEYCLOAK_INTERNAL_IP=172.28.2.3 \
   IDENTITY_LDAP_HOST=dc1.corp.example.com \
   IDENTITY_LDAP_DIRECTORY_IP=10.20.5.10 \
@@ -1161,6 +1172,7 @@ assert model["traefik-adm"]["environment"]["VAULT_UI_ENABLED"] == "false"
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -1261,6 +1273,13 @@ assert "/health/liveliness" not in litellm_probe[3]
 # browser sign-in is the DEDICATED break-glass credential — never the master
 # key, which must never be typed into a browser.
 litellm_env = services["litellm"]["environment"]
+assert services["litellm"]["build"]["dockerfile"] == "Dockerfile.litellm"
+assert services["litellm"]["build"]["network"] == "none"
+assert services["litellm"]["image"] == "ai-gateway/litellm:1.93.0-aigw1"
+assert services["litellm"]["build"]["args"]["BASE_IMAGE"] == (
+    "ghcr.io/berriai/litellm:v1.93.0@sha256:"
+    "a1745e629abfb17d434426ff48b115f54f4f4c4a0f5af241de569e93c63c411e"
+)
 assert "DISABLE_ADMIN_UI" not in litellm_env
 assert litellm_env["UI_USERNAME"] == "litellm-breakglass"
 assert litellm_env["UI_PASSWORD"] == "ValidationUiBreakglass_0123456789ABC"
@@ -1345,6 +1364,11 @@ assert volume_init_mounts["/state/openwebui"] == {
     "volume": {},
 }
 assert "chown -hR 65532:65532 /state/openwebui && chmod 0700 /state/openwebui" in volume_init["command"][0]
+assert volume_init_mounts["/state/alertmanager"] == {
+    "type": "volume", "source": "alertmanager_data",
+    "target": "/state/alertmanager", "volume": {},
+}
+assert "chown 65532:65532 /state/alertmanager && chmod 0700 /state/alertmanager" in volume_init["command"][0]
 redis = services["redis"]
 assert redis["user"] == "65532:65532"
 assert "REDIS_PASSWORD" not in redis.get("environment", {})
@@ -1369,6 +1393,38 @@ assert redis["healthcheck"]["test"] == [
 ]
 prometheus_probe = services["prometheus"]["healthcheck"]["test"]
 assert prometheus_probe == ["CMD", "/usr/local/bin/aigw-health-probe", "http", "--url", "http://172.28.15.3:9090/-/ready"]
+alertmanager = services["alertmanager"]
+assert alertmanager["image"] == "ai-gateway/dhi-alertmanager:0.33.1-probe"
+assert alertmanager["user"] == "65532:65532"
+assert alertmanager["read_only"] is True
+assert alertmanager["pids_limit"] == 256
+assert alertmanager["deploy"]["resources"]["limits"]["pids"] == 256
+assert alertmanager.get("ports", []) == []
+assert alertmanager["networks"] == {
+    "net-observability": {"ipv4_address": "172.28.15.4"},
+}
+assert alertmanager["command"] == [
+    "--config.file=/etc/alertmanager/alertmanager.yml",
+    "--storage.path=/alertmanager",
+    "--data.retention=120h",
+    "--cluster.listen-address=",
+    "--web.listen-address=172.28.15.4:9093",
+]
+assert alertmanager["healthcheck"]["test"] == [
+    "CMD", "/usr/local/bin/aigw-health-probe", "http", "--url",
+    "http://172.28.15.4:9093/-/ready",
+]
+alertmanager_mounts = {mount["target"]: mount for mount in alertmanager["volumes"]}
+assert set(alertmanager_mounts) == {
+    "/etc/alertmanager/alertmanager.yml", "/alertmanager",
+}
+assert alertmanager_mounts["/etc/alertmanager/alertmanager.yml"]["type"] == "bind"
+assert alertmanager_mounts["/etc/alertmanager/alertmanager.yml"]["read_only"] is True
+assert alertmanager_mounts["/etc/alertmanager/alertmanager.yml"]["bind"]["selinux"] == "Z"
+assert alertmanager_mounts["/alertmanager"] == {
+    "type": "volume", "source": "alertmanager_data",
+    "target": "/alertmanager", "volume": {},
+}
 alloy = services["alloy"]
 assert alloy["user"] == "473:473"
 assert alloy["cap_drop"] == ["ALL"]
@@ -1400,6 +1456,9 @@ assert services["node-exporter"]["healthcheck"]["test"] == [
 node_exporter = services["node-exporter"]
 assert node_exporter["user"] == "65532:65532"
 assert node_exporter["read_only"] is True
+assert "--path.rootfs=/host" in node_exporter["command"]
+assert "--path.procfs=/host/proc" in node_exporter["command"]
+assert "--path.sysfs=/host/sys" in node_exporter["command"]
 assert node_exporter["tmpfs"] == [
     "/tmp",
     "/host/run:uid=65532,gid=65532,mode=0555,noexec,nosuid,nodev,size=1m",
@@ -1446,8 +1505,8 @@ assert "com.aigw.contract.selinux-generation" not in services["volume-init"].get
 )
 bind_digest_services = {
     "traefik-int", "traefik-adm", "litellm", "open-webui", "keycloak",
-    "vault", "postgres", "redis", "alloy", "prometheus", "loki",
-    "grafana", "cribl-mock",
+    "vault", "postgres", "redis", "alloy", "prometheus", "alertmanager", "loki",
+    "grafana", "cribl-mock", "key-rotator",
 }
 assert bind_digest_services == set(manifest["base"])
 bind_digest_environment = {
@@ -1461,9 +1520,11 @@ bind_digest_environment = {
     "redis": "AIGW_BIND_DIGEST_REDIS",
     "alloy": "AIGW_BIND_DIGEST_ALLOY",
     "prometheus": "AIGW_BIND_DIGEST_PROMETHEUS",
+    "alertmanager": "AIGW_BIND_DIGEST_ALERTMANAGER",
     "loki": "AIGW_BIND_DIGEST_LOKI",
     "grafana": "AIGW_BIND_DIGEST_GRAFANA",
     "cribl-mock": "AIGW_BIND_DIGEST_CRIBL_MOCK",
+    "key-rotator": "AIGW_BIND_DIGEST_KEY_ROTATOR",
 }
 assert set(bind_digest_environment) == bind_digest_services
 
@@ -1534,7 +1595,7 @@ expected_dhi = {
     "oauth2-proxy", "oauth2-proxy-grafana", "oauth2-proxy-prometheus",
     "oauth2-proxy-vault", "keycloak", "vault", "postgres",
     "vault-ui-proxy",
-    "redis", "alloy", "prometheus", "node-exporter", "loki",
+    "redis", "alloy", "prometheus", "alertmanager", "node-exporter", "loki",
     "grafana", "cribl-mock",
 }
 for name in expected_dhi:
@@ -1590,6 +1651,25 @@ for path, expected_options in {
 assert services["oauth2-proxy-grafana"]["networks"]["net-grafana"]["ipv4_address"] == "172.28.6.3"
 assert services["key-rotator"]["environment"]["KEYCLOAK_PUBLIC_URL"] == "https://auth.aigw.internal"
 assert services["key-rotator"]["environment"]["WIF_KEYCLOAK_PUBLIC_URL"] == "https://idp.wif.aigw.internal"
+rotator_policy_file = services["key-rotator"]["environment"][
+    "PROVIDER_POLICY_RECEIPT_FILE"
+]
+rotator_policy_digest = services["key-rotator"]["environment"][
+    "AIGW_EGRESS_POLICY_SHA256"
+]
+assert (rotator_policy_file, rotator_policy_digest) == ("", "") or (
+    rotator_policy_file == "/run/secrets/provider_policy_receipt.json"
+    and re.fullmatch(r"[0-9a-f]{64}", rotator_policy_digest)
+    and rotator_policy_digest == os.environ["AIGW_EGRESS_POLICY_SHA256"]
+)
+provider_policy_mount = next(
+    mount for mount in services["key-rotator"]["volumes"]
+    if mount["target"] == "/run/secrets/provider_policy_receipt.json"
+)
+assert provider_policy_mount["type"] == "bind"
+assert provider_policy_mount["read_only"] is True
+assert provider_policy_mount["bind"]["selinux"] == "Z"
+assert Path(provider_policy_mount["source"]).name == "provider_policy_receipt.json"
 # The vault OIDC relying-party secret reaches exactly two consumers: Keycloak
 # (realm-import ${VAR} substitution) and the rotator (reconcile + escrow).
 # Vault itself never receives it via environment — the root-token ceremony
@@ -1656,8 +1736,8 @@ assert adm_zone["bind"]["selinux"] == "Z"
 assert Path(adm_zone["source"]).name == "db.aigw.internal.adm"
 bind_digest_services = {
     "traefik-int", "traefik-adm", "litellm", "open-webui", "keycloak",
-    "vault", "postgres", "redis", "alloy", "prometheus", "loki",
-    "grafana", "cribl-mock", "platform-dns",
+    "vault", "postgres", "redis", "alloy", "prometheus", "alertmanager", "loki",
+    "grafana", "cribl-mock", "key-rotator", "platform-dns",
 }
 expected_bind_sources = dict(manifest["base"])
 expected_bind_sources.update(manifest["platform_dns"])
@@ -1673,9 +1753,11 @@ bind_digest_environment = {
     "redis": "AIGW_BIND_DIGEST_REDIS",
     "alloy": "AIGW_BIND_DIGEST_ALLOY",
     "prometheus": "AIGW_BIND_DIGEST_PROMETHEUS",
+    "alertmanager": "AIGW_BIND_DIGEST_ALERTMANAGER",
     "loki": "AIGW_BIND_DIGEST_LOKI",
     "grafana": "AIGW_BIND_DIGEST_GRAFANA",
     "cribl-mock": "AIGW_BIND_DIGEST_CRIBL_MOCK",
+    "key-rotator": "AIGW_BIND_DIGEST_KEY_ROTATOR",
     "platform-dns": "AIGW_BIND_DIGEST_PLATFORM_DNS",
 }
 assert set(bind_digest_environment) == bind_digest_services
@@ -1862,7 +1944,8 @@ internal_members = {
 assert internal_members == {"keycloak", "alloy", "cribl-mock"}, internal_members
 
 expected_bind_sources = dict(manifest["base"])
-expected_bind_sources.update(manifest["identity_ldap"])
+for service, sources in manifest["identity_ldap"].items():
+    expected_bind_sources.setdefault(service, []).extend(sources)
 
 def project_bind_sources(service):
     sources = set()
@@ -1884,7 +1967,7 @@ assert keycloak["labels"]["com.aigw.contract.bind-source-digest"] == os.environ[
     "AIGW_BIND_DIGEST_KEYCLOAK"
 ]
 assert rotator["labels"]["com.aigw.contract.bind-source-digest"] == os.environ[
-    "AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP"
+    "AIGW_BIND_DIGEST_KEY_ROTATOR"
 ]
 '\'' "$2/bind-source-digest-inputs.json" "$1"
   ' sh "$ROOT" "$COMPOSE_DIR"
@@ -1956,6 +2039,7 @@ assert len(re.findall(
 # exact callback list.
 assert len(re.findall(
     r'(?m)^  callbacks: \["aigw_otel_callback\.aigw_otel", '
+    r'"aigw_usage_callback\.aigw_usage", '
     r'"aigw_default_model_hook\.aigw_default_model_enforcer"\]$',
     text,
 )) == 1
@@ -1973,14 +2057,29 @@ for required in (
     'DEFAULT_MODEL_METADATA_KEY = "aigw_default_model"',
     'DEFAULT_MODEL_SENTINEL = "aigw-default"',
     "raise _deny(",
-    "HTTPException(status_code=400",
+    "HTTPException(status_code=status_code",
+    "from aigw_model_limits import (",
+    "await enforce_model_limits(",
     "_enforce_openwebui_identity(",
     "Open WebUI requires one valid signed user assertion",
-    'MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")',
 ):
     assert required in hook_source, required
+
+limits = Path(sys.argv[1]).parent / "aigw_model_limits.py"
+limits_source = limits.read_text()
+compile(limits_source, str(limits), "exec")
+for required in (
+    'MODEL_LIMITS_METADATA_KEY = "aigw_model_limits_v1"',
+    'MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")',
+    "class RedisOutputReservations:",
+    "client = self._redis()",
+    "result = await client.eval(",
+    "async def enforce_model_limits(",
+    "AIGW_SECURITY_EVENT %s",
+):
+    assert required in limits_source, required
 for forbidden in ("subprocess", "socket", "urllib", "requests", "http.client"):
-    assert f"import {forbidden}" not in hook_source, forbidden
+    assert f"import {forbidden}" not in hook_source + limits_source, forbidden
 
 # The pre-call gate and telemetry callback share one pure JWT verifier. It has
 # no exporter or LiteLLM import side effect, so request admission cannot depend
@@ -2029,6 +2128,25 @@ for required in (
     assert required in otel_source, required
 for forbidden in ("subprocess", "socket", "urllib", "requests", "http.client"):
     assert f"import {forbidden}" not in otel_source, forbidden
+
+# Usage accounting has its own callback and credential. The callback copies a
+# prompt-free allow-list to one fixed local endpoint; it cannot choose a host.
+usage_callback = Path(sys.argv[1]).parent / "aigw_usage_callback.py"
+usage_source = usage_callback.read_text()
+compile(usage_source, str(usage_callback), "exec")
+for required in (
+    'SOURCE_VERSION = "litellm-1.93.0"',
+    'TOKEN_PATH = "/run/secrets/litellm_usage_token"',
+    'USAGE_URL = "http://key-rotator:8080/usage/events"',
+    'headers={"X-AIGW-Usage-Auth": self._token}',
+    "class AigwUsageCallback(CustomLogger):",
+    "async def async_log_success_event(",
+    "async def async_log_failure_event(",
+    "aigw_usage = AigwUsageCallback()",
+):
+    assert required in usage_source, required
+for forbidden in ("subprocess", "socket", "urllib", "requests"):
+    assert f"import {forbidden}" not in usage_source, forbidden
 PY
 
 python3 -I - "$COMPOSE_DIR/alloy/config.alloy" <<'PY'
@@ -2062,9 +2180,13 @@ for required in (
     'time_unix_nano > UnixNano(Now()) + 60000000000',
 ):
     assert required in text, required
-assert text.count('otelcol.processor.batch "cribl_security"') == 1
-assert text.count('logs = [otelcol.processor.batch.cribl_security.input]') == 1
-assert text.count('logs = [otelcol.exporter.otlp.cribl.input]') == 1
+for signal in ("logs", "metrics", "traces"):
+    assert text.count(f'otelcol.processor.batch "cribl_{signal}"') == 1
+    assert f"otelcol.processor.batch.cribl_{signal}.input" in text
+assert text.count('otelcol.exporter.otlp.cribl.input') == 3
+assert 'prometheus.scrape "gateway"' in text
+assert 'otelcol.receiver.prometheus "gateway"' in text
+assert 'otelcol.receiver.loki "cribl_admitted_logs"' in text
 begin = "// BEGIN AIGW MANAGED CRIBL TLS"
 end = "// END AIGW MANAGED CRIBL TLS"
 assert text.count(begin) == text.count(end) == 1
@@ -2304,7 +2426,11 @@ compile(source, str(path), "exec")
 for required in (
     'ALIAS = "aigw-open-webui-service"',
     'USER_ID = "svc-open-webui"',
-    'MODELS = ["all-proxy-models"]',
+    'MAX_MODELS = 32',
+    'MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")',
+    'models = model_names(master)',
+    '"models": models',
+    'if model_names(candidate) != models:',
     'ROUTES = ["/v1/models", "/v1/chat/completions"]',
     '"aigw_key_kind": "service"',
     '"aigw_service": "open-webui"',
@@ -2315,6 +2441,7 @@ for required in (
     'if candidate == master:',
 ):
     assert required in source
+assert 'MODELS = ["all-proxy-models"]' not in source
 for forbidden in ("service_account_id", "key_type", "team_id"):
     assert forbidden not in source
 PY

@@ -502,6 +502,7 @@
             if status.get("NoNewPrivs") != "1" or status.get("Seccomp") != "2":
                 raise SystemExit(f"{service}: live NNP/seccomp contract drift")
             expected_uid = {
+                "alertmanager": "65532",
                 "alloy": "473",
                 "grafana": "65532",
                 "node-exporter": "65532",
@@ -531,7 +532,7 @@
             'litellm', 'open-webui', 'keycloak',
             'dev-portal', 'admin-portal',
             'envoy-egress', 'key-rotator', 'vault', 'postgres', 'redis',
-            'alloy', 'prometheus', 'node-exporter', 'loki', 'grafana',
+            'alloy', 'prometheus', 'alertmanager', 'node-exporter', 'loki', 'grafana',
             'cribl-mock'
           ]
           + (['oauth2-proxy-vault', 'vault-ui-proxy']
@@ -1018,7 +1019,7 @@
             'oauth2-proxy', 'oauth2-proxy-grafana',
             'oauth2-proxy-prometheus', 'litellm', 'open-webui', 'keycloak',
             'dev-portal', 'admin-portal', 'key-rotator', 'vault', 'postgres',
-            'redis', 'prometheus', 'node-exporter', 'loki', 'grafana'
+            'redis', 'prometheus', 'alertmanager', 'node-exporter', 'loki', 'grafana'
           ]
           + (['oauth2-proxy-vault', 'vault-ui-proxy']
              if (aigw_vault_ui_enabled | bool) else [])
@@ -1302,6 +1303,8 @@
         root = Path(sys.argv[1])
         identity_ldap_enabled = sys.argv[2] == "true"
         expected = {
+            "alertmanager": ("dir", 0, 0, 0o755),
+            "alertmanager/alertmanager.yml": ("file", 0, 0, 0o644),
             "certs": ("dir", 0, 65532, 0o750),
             "certs/int.key": ("file", 0, 65532, 0o640),
             "certs/int.crt": ("file", 0, 0, 0o644),
@@ -1316,7 +1319,9 @@
             "grafana/provisioning/dashboards": ("dir", 0, 0, 0o755),
             "grafana/provisioning/dashboards/json": ("dir", 0, 0, 0o755),
             "grafana/provisioning/dashboards/dashboards.yml": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/ai-gateway-alerts-capacity.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json": ("file", 0, 0, 0o644),
+            "grafana/provisioning/dashboards/json/ai-gateway-model-usage.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/ai-gateway-overview.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json": ("file", 0, 0, 0o644),
             "grafana/provisioning/dashboards/json/ai-gateway-top-projects.json": ("file", 0, 0, 0o644),
@@ -1544,11 +1549,18 @@
         expected = {
             ("Prometheus", "prometheus", "prometheus", "http://prometheus:9090"),
             ("Loki", "loki", "loki", "http://loki:3100"),
+            ("Alertmanager", "alertmanager", "alertmanager", "http://alertmanager:9093"),
             # Owner-approved read-only LiteLLM spend path (grafana_ro role,
             # SELECT-only grants) over the dedicated net-db-grafana bridge.
             (
                 "LiteLLM Spend",
                 "litellm-spend",
+                "grafana-postgresql-datasource",
+                "postgres:5432",
+            ),
+            (
+                "AI Gateway Usage",
+                "aigw-usage",
                 "grafana-postgresql-datasource",
                 "postgres:5432",
             ),
@@ -1579,13 +1591,21 @@
                 """
             )
         )
-        if len(resources) != 9:
+        if len(resources) != 11:
             raise SystemExit("Grafana unified-storage resource inventory is not exact")
 
         expected_dashboards = {
+            "aigw-alerts-capacity": (
+                "AI Gateway Alerts and Capacity",
+                "/etc/grafana/provisioning/dashboards/json/ai-gateway-alerts-capacity.json",
+            ),
             "aigw-live-logs": (
                 "AI Gateway Live Logs",
                 "/etc/grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
+            ),
+            "aigw-model-usage": (
+                "AI Gateway Model Usage and Cost",
+                "/etc/grafana/provisioning/dashboards/json/ai-gateway-model-usage.json",
             ),
             "aigw-overview": (
                 "AI Gateway Overview",
@@ -1675,6 +1695,7 @@
         # readiness endpoint from Grafana's private observability plane.
         for url in (
             "http://prometheus:9090/-/ready",
+            "http://alertmanager:9093/-/ready",
             "http://loki:3100/ready",
         ):
             with urllib.request.urlopen(url, timeout=10) as response:
@@ -1686,7 +1707,85 @@
   until: grafana_datasource_graph.rc == 0
   changed_when: false
 
-- name: Prove Prometheus loaded the exact reviewed scrape and alert graph
+- name: Prove Alertmanager loaded the exact private lifecycle graph and watchdog
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import json
+        import sys
+        import urllib.parse
+        import urllib.request
+
+        base = f"http://{sys.argv[1]}:9093"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def fetch(path):
+            with opener.open(base + path, timeout=10) as response:
+                if response.status != 200:
+                    raise SystemExit(f"Alertmanager API failed for {path}")
+                return json.load(response)
+
+        status = fetch("/api/v2/status")
+        if status.get("versionInfo", {}).get("version") != "0.33.1":
+            raise SystemExit("Alertmanager runtime version is not the reviewed pin")
+        if status.get("cluster", {}).get("status") != "disabled":
+            raise SystemExit("single-node Alertmanager gossip listener is not disabled")
+        config = status.get("config", {}).get("original", "")
+        required = (
+            "resolve_timeout: 5m",
+            "receiver: aigw-local-dashboard",
+            "group_by: [alertname, alert_class, severity, owner]",
+            "group_wait: 30s",
+            "group_interval: 5m",
+            "repeat_interval: 12h",
+            'severity="critical"',
+            'severity="warning"',
+            "equal: [alert_class, instance, device, mountpoint, service]",
+            "- name: aigw-local-dashboard",
+        )
+        if any(marker not in config for marker in required):
+            raise SystemExit("Alertmanager lifecycle configuration drifted")
+        forbidden = (
+            "email_configs:", "webhook_configs:", "slack_configs:",
+            "msteams_configs:", "msteamsv2_configs:", "pagerduty_configs:",
+            "opsgenie_configs:", "sns_configs:", "telegram_configs:",
+            "discord_configs:", "webex_configs:", "rocketchat_configs:",
+        )
+        if any(marker in config for marker in forbidden):
+            raise SystemExit("Alertmanager has an external notification receiver")
+        receivers = fetch("/api/v2/receivers")
+        if receivers != [{
+            "labels": {"name": "aigw-local-dashboard"},
+            "name": "aigw-local-dashboard",
+        }]:
+            raise SystemExit("Alertmanager receiver inventory is not exact")
+        query = urllib.parse.urlencode(
+            {"filter": 'alertname="AIGatewayWatchdog"', "active": "true"}
+        )
+        alerts = fetch("/api/v2/alerts?" + query)
+        if len(alerts) != 1:
+            raise SystemExit("Alertmanager did not receive the exact watchdog alert")
+        watchdog = alerts[0]
+        if (
+            watchdog.get("labels", {}).get("severity") != "none"
+            or watchdog.get("labels", {}).get("owner") != "platform-operations"
+            or watchdog.get("status", {}).get("state") != "active"
+            or watchdog.get("status", {}).get("silencedBy") != []
+            or watchdog.get("status", {}).get("inhibitedBy") != []
+            or watchdog.get("receivers") != [{"name": "aigw-local-dashboard"}]
+        ):
+            raise SystemExit("Alertmanager watchdog lifecycle state is not exact")
+      - "{{ alertmanager_observability_ip }}"
+  register: alertmanager_lifecycle_graph
+  retries: 24
+  delay: 5
+  until: alertmanager_lifecycle_graph.rc == 0
+  changed_when: false
+
+- name: Prove Prometheus received the exact Alloy scrape and alert graph
   ansible.builtin.command:
     argv:
       - python3
@@ -1706,9 +1805,9 @@
                 raise SystemExit(f"Prometheus API failed for {path}")
             return payload["data"]
 
-        targets = fetch("/targets?state=active")["activeTargets"]
+        targets = fetch("/query?query=up")["result"]
         actual_targets = {
-            (target["labels"].get("job"), target["discoveredLabels"].get("__address__"))
+            (target["metric"].get("job"), target["metric"].get("instance"))
             for target in targets
         }
         expected_targets = {
@@ -1716,20 +1815,23 @@
             ("traefik", "traefik-adm:9100"),
             ("envoy-egress", "envoy-egress:9902"),
             ("keycloak", "keycloak:9000"),
-            ("alloy", "alloy:12345"),
+            ("alloy", f"{sys.argv[2]}:12345"),
             ("grafana", "grafana:3000"),
             ("prometheus", "prometheus-observability:9090"),
+            ("alertmanager", "alertmanager:9093"),
             ("loki", "loki:3100"),
             ("node-exporter", "node-exporter:9100"),
         }
         if actual_targets != expected_targets or len(targets) != len(expected_targets):
-            raise SystemExit("Prometheus scrape target graph does not match reviewed source")
+            raise SystemExit("Prometheus did not receive the exact Alloy scrape graph")
         failed_targets = [
             target for target in targets
-            if target.get("health") != "up" or target.get("lastError")
+            if not isinstance(target.get("value"), list)
+            or len(target["value"]) != 2
+            or target["value"][1] != "1"
         ]
         if failed_targets:
-            raise SystemExit("one or more reviewed Prometheus targets is not cleanly up")
+            raise SystemExit("one or more reviewed Alloy scrape targets is not up")
 
         groups = fetch("/rules?type=alert")["groups"]
         actual_rules = {
@@ -1738,7 +1840,10 @@
             for rule in group["rules"]
         }
         expected_rules = {
+            ("aigw-observability-pipeline", "AIGatewayWatchdog"),
             ("aigw-observability-pipeline", "AIGatewayScrapeTargetDown"),
+            ("aigw-observability-pipeline", "AIGatewayAlertmanagerUnavailable"),
+            ("aigw-observability-pipeline", "AIGatewayAlertmanagerDeliveryFailures"),
             ("aigw-observability-pipeline", "AIGatewayAlloyExporterSendFailures"),
             ("aigw-observability-pipeline", "AIGatewayAlloyExporterEnqueueFailures"),
             ("aigw-observability-pipeline", "AIGatewayAlloyExporterQueueSaturation"),
@@ -1746,9 +1851,29 @@
             ("aigw-observability-pipeline", "AIGatewayLokiWriteRetriesHigh"),
             ("aigw-observability-pipeline", "AIGatewayPrometheusRemoteWriteFailures"),
             ("aigw-observability-pipeline", "AIGatewayPrometheusRemoteWriteBacklog"),
+            ("aigw-state-capacity", "AIGatewayHostCPUHigh"),
+            ("aigw-state-capacity", "AIGatewayHostCPUCritical"),
+            ("aigw-state-capacity", "AIGatewayHostLoadHigh"),
+            ("aigw-state-capacity", "AIGatewayHostLoadCritical"),
+            ("aigw-state-capacity", "AIGatewayHostMemoryLow"),
+            ("aigw-state-capacity", "AIGatewayHostMemoryCritical"),
+            ("aigw-state-capacity", "AIGatewayHostSwapHigh"),
+            ("aigw-state-capacity", "AIGatewayHostOOMKill"),
             ("aigw-state-capacity", "AIGatewayFilesystemSpaceLow"),
             ("aigw-state-capacity", "AIGatewayFilesystemSpaceCritical"),
             ("aigw-state-capacity", "AIGatewayFilesystemPredictedFull"),
+            ("aigw-state-capacity", "AIGatewayFilesystemInodesLow"),
+            ("aigw-state-capacity", "AIGatewayFilesystemInodesCritical"),
+            ("aigw-state-capacity", "AIGatewayHostDiskLatencyHigh"),
+            ("aigw-state-capacity", "AIGatewayHostDiskIOSaturation"),
+            ("aigw-state-capacity", "AIGatewayHostFileDescriptorsHigh"),
+            ("aigw-state-capacity", "AIGatewayHostFileDescriptorsCritical"),
+            ("aigw-service-safety", "AIGatewayServiceLatencyHigh"),
+            ("aigw-service-safety", "AIGatewayServiceLatencyCritical"),
+            ("aigw-service-safety", "AIGatewayServiceErrorRateHigh"),
+            ("aigw-service-safety", "AIGatewayServiceErrorRateCritical"),
+            ("aigw-service-safety", "AIGatewayCertificateExpiresSoon"),
+            ("aigw-service-safety", "AIGatewayCertificateExpiryCritical"),
         }
         if actual_rules != expected_rules:
             raise SystemExit("Prometheus alert rule graph does not match reviewed source")
@@ -1761,6 +1886,7 @@
         if unhealthy_rules:
             raise SystemExit("one or more reviewed Prometheus rules failed evaluation")
       - "{{ prometheus_observability_ip }}"
+      - "{{ alloy_observability_ip }}"
   register: prometheus_observability_graph
   retries: 12
   delay: 5
@@ -1797,6 +1923,15 @@
         )
         if not filesystems or not all(float(item["value"][1]) > 0 for item in filesystems):
             raise SystemExit("node-exporter did not expose the host root filesystem")
+        for expression, description in (
+            ('node_cpu_seconds_total{job="node-exporter",mode="idle"}', "CPU"),
+            ('node_memory_MemAvailable_bytes{job="node-exporter"}', "memory"),
+            ('node_vmstat_oom_kill{job="node-exporter"}', "OOM"),
+            ('node_disk_io_time_seconds_total{job="node-exporter"}', "disk I/O"),
+            ('node_filesystem_files_free{job="node-exporter"}', "inode"),
+        ):
+            if not query(expression):
+                raise SystemExit(f"node-exporter did not expose host {description} metrics")
       - "{{ prometheus_observability_ip }}"
   changed_when: false
 

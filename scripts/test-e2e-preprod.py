@@ -86,13 +86,21 @@ def run(command: list[str], *, body: str | None = None) -> str:
     return result.stdout
 
 
-def curl_json(hostname: str, address: str, path: str, *, body: dict | None = None) -> object:
+def curl_json(
+    hostname: str,
+    address: str,
+    path: str,
+    *,
+    body: dict | None = None,
+    expected_status: int = 200,
+) -> object:
+    if type(expected_status) is not int or not 100 <= expected_status <= 599:
+        fail("the expected HTTP status is invalid")
     command = [
         "curl",
         "--disable",
         "--silent",
         "--show-error",
-        "--fail-with-body",
         "--http1.1",
         "--connect-timeout",
         "10",
@@ -104,27 +112,42 @@ def curl_json(hostname: str, address: str, path: str, *, body: dict | None = Non
         str(CA_FILE),
         "--resolve",
         f"{hostname}:443:{address}",
+        "--write-out",
+        "\n%{http_code}",
     ]
     curl_config = None
     if body is not None:
+
         def quoted(value: str) -> str:
             return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
-        curl_config = "\n".join(
-            [
-                'request = "POST"',
-                'header = "Content-Type: application/json"',
-                'header = "Authorization: Bearer '
-                + quoted(env_value("LITELLM_MASTER_KEY"))
-                + '"',
-                'data-binary = "' + quoted(json.dumps(body, separators=(",", ":"))) + '"',
-            ]
-        ) + "\n"
+        curl_config = (
+            "\n".join(
+                [
+                    'request = "POST"',
+                    'header = "Content-Type: application/json"',
+                    'header = "Authorization: Bearer '
+                    + quoted(env_value("LITELLM_MASTER_KEY"))
+                    + '"',
+                    'data-binary = "'
+                    + quoted(json.dumps(body, separators=(",", ":")))
+                    + '"',
+                ]
+            )
+            + "\n"
+        )
         command.extend(["--config", "-"])
     command.append(f"https://{hostname}{path}")
     raw = run(command, body=curl_config)
     try:
-        return json.loads(raw)
+        response_body, status_text = raw.rsplit("\n", 1)
+        status = int(status_text)
+    except (ValueError, TypeError):
+        fail(f"{hostname}{path} returned no valid HTTP status")
+    if status != expected_status:
+        fail(f"{hostname}{path} returned HTTP {status}, expected {expected_status}")
+    try:
+        return json.loads(response_body)
     except json.JSONDecodeError:
         fail(f"{hostname}{path} returned invalid JSON")
 
@@ -294,6 +317,107 @@ def main() -> int:
         isinstance(item, dict) and item.get("text") == "pong" for item in content
     ):
         fail("the end-to-end WIF inference path did not return pong")
+
+    denied = curl_json(
+        "api.aigw.internal",
+        "127.0.2.1",
+        "/v1/messages",
+        expected_status=400,
+        body={
+            "model": "aigw-auto",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "Do not dispatch."}],
+        },
+    )
+    if "automatic model routing is not enabled" not in json.dumps(denied).lower():
+        fail("the reserved automatic-routing model did not fail closed")
+    print("PREPROD_AUTO_ROUTER_DENIAL_PASSED")
+
+    limit_arguments = [
+        sys.executable,
+        "-I",
+        str(ROOT / "scripts/test-preprod-model-limits.py"),
+        "--image-mode",
+        args.image_mode,
+        "--postgres-major",
+        args.postgres_major,
+    ]
+    limit_acceptance = run(limit_arguments)
+    for marker in (
+        "PREPROD_MODEL_REQUEST_CAP_PASSED",
+        "PREPROD_MODEL_MINUTE_RESERVATION_PASSED",
+        "PREPROD_MODEL_REDIS_FAILURE_PASSED",
+        "PREPROD_MODEL_REDIS_RECOVERY_PASSED",
+        "PREPROD_MODEL_LIMITS_PASSED",
+    ):
+        if marker not in limit_acceptance:
+            fail(f"preprod model-limit acceptance omitted {marker}")
+        print(marker)
+
+    if args.image_mode == "seed":
+        lifecycle_acceptance = run(
+            [
+                sys.executable,
+                "-I",
+                str(ROOT / "scripts/test-preprod-model-lifecycle.py"),
+                "--image-mode",
+                "seed",
+                "--postgres-major",
+                args.postgres_major,
+            ]
+        )
+        for marker in (
+            "PREPROD_MODEL_DRAFT_HIDDEN_PASSED",
+            "PREPROD_MODEL_HIDDEN_CALL_PASSED",
+            "PREPROD_MODEL_DISCOVERY_PASSED",
+            "PREPROD_MODEL_ASSIGNMENT_GATE_PASSED",
+            "PREPROD_MODEL_RETIREMENT_PASSED",
+            "PREPROD_MODEL_LIFECYCLE_PASSED",
+        ):
+            if marker not in lifecycle_acceptance:
+                fail(f"preprod model lifecycle acceptance omitted {marker}")
+            print(marker)
+
+        usage_acceptance = run(
+            [
+                sys.executable,
+                "-I",
+                str(ROOT / "scripts/test-preprod-usage-accounting.py"),
+                "--image-mode",
+                "seed",
+                "--postgres-major",
+                args.postgres_major,
+            ],
+            body=directory_password("preprod-admin") + "\n",
+        )
+        for marker in (
+            "PREPROD_PRICE_PORTAL_STEP_UP_PASSED",
+            "PREPROD_PRICE_PORTAL_PREVIEW_PASSED",
+            "PREPROD_PRICE_PORTAL_CSRF_PASSED",
+            "PREPROD_PRICE_PORTAL_CONFIRM_PASSED",
+            "PREPROD_PRICE_PORTAL_CLEANUP_PASSED",
+            "PREPROD_PRICE_PORTAL_PASSED",
+            "PREPROD_PRICE_AUDIT_SOURCE_PASSED",
+            "PREPROD_PRICE_AUDIT_EXPORT_PASSED",
+            "PREPROD_USAGE_REPLAY_GUARD_PASSED",
+            "PREPROD_USAGE_UNKNOWN_PASSED",
+            "PREPROD_USAGE_BACKDATE_PASSED",
+            "PREPROD_USAGE_REPORTING_PASSED",
+            "PREPROD_USAGE_GRAFANA_RO_PASSED",
+            "PREPROD_USAGE_APPEND_ONLY_PASSED",
+            "PREPROD_USAGE_REAL_REQUEST_PASSED",
+            "PREPROD_USAGE_STREAM_PASSED",
+            "PREPROD_USAGE_RETRY_PASSED",
+            "PREPROD_USAGE_FAILURE_PASSED",
+            "PREPROD_USAGE_ACCOUNTING_CORE_PASSED",
+            "PREPROD_USAGE_AUDIT_EXPORT_PASSED",
+            "PREPROD_USAGE_DELIVERY_GAP_REQUEST_PASSED",
+            "PREPROD_USAGE_DELIVERY_GAP_PASSED",
+            "PREPROD_USAGE_ACCOUNTING_PASSED",
+        ):
+            if marker not in usage_acceptance:
+                fail(f"preprod usage acceptance omitted {marker}")
+            print(marker)
 
     print("PREPROD_E2E_PASSED")
     return 0

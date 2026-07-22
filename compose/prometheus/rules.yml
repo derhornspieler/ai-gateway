@@ -1,118 +1,439 @@
 groups:
   - name: aigw-observability-pipeline
     rules:
+      - alert: AIGatewayWatchdog
+        expr: vector(1)
+        for: 0m
+        labels: { severity: none, owner: platform-operations, alert_class: watchdog }
+        annotations:
+          summary: "AI Gateway alert path watchdog"
+          description: "This alert must always be firing in Alertmanager and visible in Grafana."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#alert-path-watchdog"
+
       - alert: AIGatewayScrapeTargetDown
         expr: up == 0
         for: 2m
-        labels: { severity: critical }
+        labels: { severity: critical, owner: platform-operations, alert_class: availability }
         annotations:
           summary: "Prometheus target {{ $labels.job }} is down"
-          description: "Prometheus cannot scrape {{ $labels.instance }} for job {{ $labels.job }}."
+          description: "Prometheus has received no successful scrape for {{ $labels.instance }} for two minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#service-availability-alerts"
+
+      - alert: AIGatewayAlertmanagerUnavailable
+        expr: prometheus_notifications_alertmanagers_discovered{job="prometheus"} < 1
+        for: 2m
+        labels: { severity: critical, owner: platform-operations, alert_class: alert-lifecycle }
+        annotations:
+          summary: "Prometheus cannot discover Alertmanager"
+          description: "Prometheus has had no Alertmanager notification target for two minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#alert-path-watchdog"
+
+      - alert: AIGatewayAlertmanagerDeliveryFailures
+        expr: |-
+          increase(prometheus_notifications_errors_total{job="prometheus"}[5m]) > 0
+          or increase(prometheus_notifications_dropped_total{job="prometheus"}[5m]) > 0
+        for: 2m
+        labels: { severity: critical, owner: platform-operations, alert_class: alert-lifecycle }
+        annotations:
+          summary: "Prometheus cannot deliver alerts to Alertmanager"
+          description: "Prometheus notification errors or drops have continued for two minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#alert-path-watchdog"
 
       - alert: AIGatewayAlloyExporterSendFailures
-        expr: >-
-          increase(otelcol_exporter_send_failed_log_records_total{
-            job="alloy",component_id="otelcol.exporter.otlp.cribl"}[2m]) > 0
+        expr: |-
+          increase(otelcol_exporter_send_failed_log_records_total{job="alloy",component_id="otelcol.exporter.otlp.cribl"}[2m]) > 0
+          or increase(otelcol_exporter_send_failed_metric_points_total{job="alloy",component_id="otelcol.exporter.otlp.cribl"}[2m]) > 0
+          or increase(otelcol_exporter_send_failed_spans_total{job="alloy",component_id="otelcol.exporter.otlp.cribl"}[2m]) > 0
         # One transient retry must not page. Requiring a non-zero two-minute
         # window continuously for five minutes detects a sustained outage.
         for: 5m
-        labels: { severity: warning, owner: platform-operations }
+        labels: { severity: warning, owner: platform-operations, alert_class: cribl-delivery }
         annotations:
-          summary: "Alloy cannot deliver security logs to Cribl"
-          description: "The Cribl log exporter has failed for five minutes; its persistent queue is retaining approved security logs for retry."
-          runbook_url: "https://docs.aigw.internal/observability-operations#cribl-delivery-alerts"
+          summary: "Alloy cannot deliver telemetry to Cribl"
+          description: "The Cribl exporter has failed for five minutes; its persistent queue is retaining admitted logs, metrics, or traces for retry."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#cribl-delivery-alerts"
 
       - alert: AIGatewayAlloyExporterEnqueueFailures
-        expr: >-
-          otelcol_exporter_enqueue_failed_log_records_total{
-            job="alloy",component_id="otelcol.exporter.otlp.cribl"} > 0
+        expr: |-
+          otelcol_exporter_enqueue_failed_log_records_total{job="alloy",component_id="otelcol.exporter.otlp.cribl"} > 0
+          or otelcol_exporter_enqueue_failed_metric_points_total{job="alloy",component_id="otelcol.exporter.otlp.cribl"} > 0
+          or otelcol_exporter_enqueue_failed_spans_total{job="alloy",component_id="otelcol.exporter.otlp.cribl"} > 0
         # block_on_overflow=false protects collector availability, but a full
         # queue then rejects new telemetry. Latch the cumulative loss signal
         # until Alloy restarts: a range increase can miss the first failure
         # when its labeled counter series is first created at a non-zero value.
         for: 0m
-        labels: { severity: critical, owner: platform-operations }
+        labels: { severity: critical, owner: platform-operations, alert_class: cribl-delivery }
         annotations:
-          summary: "Cribl security-log queue rejected a record"
-          description: "The Cribl exporter could not enqueue an approved security log; delivery data was lost before export."
-          runbook_url: "https://docs.aigw.internal/observability-operations#cribl-delivery-alerts"
+          summary: "Cribl queue rejected telemetry"
+          description: "The Cribl exporter could not enqueue an admitted log, metric point, or span; delivery data was lost before export."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#cribl-delivery-alerts"
 
       - alert: AIGatewayAlloyExporterQueueSaturation
         expr: >-
           (otelcol_exporter_queue_size{job="alloy",component_id="otelcol.exporter.otlp.cribl"}
           / otelcol_exporter_queue_capacity{job="alloy",component_id="otelcol.exporter.otlp.cribl"}) > 0.80
         for: 5m
-        labels: { severity: warning, owner: platform-operations }
+        labels: { severity: warning, owner: platform-operations, alert_class: cribl-delivery }
         annotations:
-          summary: "Cribl security-log queue is over 80% full"
-          description: "The approved security-log delivery queue is close to exhaustion."
-          runbook_url: "https://docs.aigw.internal/observability-operations#cribl-delivery-alerts"
+          summary: "Cribl telemetry queue is over 80% full"
+          description: "The admitted telemetry delivery queue is close to exhaustion."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#cribl-delivery-alerts"
 
       - alert: AIGatewayLokiWriteDrops
         expr: increase(loki_write_dropped_entries_total{job="alloy"}[5m]) > 0
         for: 2m
-        labels: { severity: critical }
+        labels: { severity: critical, owner: platform-operations, alert_class: local-log-storage }
         annotations:
           summary: "Alloy permanently dropped Loki log entries"
           description: "Loki writer dropped entries after retries (reason={{ $labels.reason }})."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#local-telemetry-alerts"
 
       - alert: AIGatewayLokiWriteRetriesHigh
         expr: increase(loki_write_batch_retries_total{job="alloy"}[5m]) >= 3
         for: 2m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: platform-operations, alert_class: local-log-storage }
         annotations:
           summary: "Alloy is repeatedly retrying Loki writes"
           description: "The Loki writer retried at least three batches in five minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#local-telemetry-alerts"
 
       - alert: AIGatewayPrometheusRemoteWriteFailures
         expr: >-
           increase(prometheus_remote_storage_samples_failed_total{job="alloy"}[5m]) > 0
         for: 2m
-        labels: { severity: critical }
+        labels: { severity: critical, owner: platform-operations, alert_class: local-metric-storage }
         annotations:
           summary: "Alloy remote-write samples failed permanently"
           description: "Remote write {{ $labels.remote_name }} could not deliver samples to Prometheus."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#local-telemetry-alerts"
 
       - alert: AIGatewayPrometheusRemoteWriteBacklog
         expr: >-
           prometheus_remote_storage_samples_pending{job="alloy"}
           > 2 * prometheus_remote_storage_max_samples_per_send{job="alloy"}
         for: 5m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: platform-operations, alert_class: local-metric-storage }
         annotations:
           summary: "Alloy remote-write queue has a sustained backlog"
           description: "Remote write {{ $labels.remote_name }} has more than two full batches pending."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#local-telemetry-alerts"
 
   - name: aigw-state-capacity
     rules:
+      - alert: AIGatewayHostCPUHigh
+        expr: >-
+          100 * (1 - avg by (instance)
+          (rate(node_cpu_seconds_total{job="node-exporter",mode="idle"}[5m]))) > 85
+        for: 15m
+        labels: { severity: warning, owner: platform-operations, alert_class: host-cpu }
+        annotations:
+          summary: "AI Gateway host CPU is over 85% busy"
+          description: "Host CPU has stayed above 85% for fifteen minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostCPUCritical
+        expr: >-
+          100 * (1 - avg by (instance)
+          (rate(node_cpu_seconds_total{job="node-exporter",mode="idle"}[5m]))) > 95
+        for: 10m
+        labels: { severity: critical, owner: platform-operations, alert_class: host-cpu }
+        annotations:
+          summary: "AI Gateway host CPU is over 95% busy"
+          description: "Host CPU has stayed above 95% for ten minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostLoadHigh
+        expr: >-
+          node_load15{job="node-exporter"}
+          / on (instance) count by (instance)
+          (node_cpu_seconds_total{job="node-exporter",mode="idle"}) > 1
+        for: 15m
+        labels: { severity: warning, owner: platform-operations, alert_class: host-load }
+        annotations:
+          summary: "AI Gateway host load exceeds its CPU count"
+          description: "The fifteen-minute load average per logical CPU is above 1.0."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostLoadCritical
+        expr: >-
+          node_load15{job="node-exporter"}
+          / on (instance) count by (instance)
+          (node_cpu_seconds_total{job="node-exporter",mode="idle"}) > 1.5
+        for: 10m
+        labels: { severity: critical, owner: platform-operations, alert_class: host-load }
+        annotations:
+          summary: "AI Gateway host load is critically high"
+          description: "The fifteen-minute load average per logical CPU is above 1.5."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostMemoryLow
+        expr: >-
+          node_memory_MemAvailable_bytes{job="node-exporter"}
+          / node_memory_MemTotal_bytes{job="node-exporter"} < 0.15
+        for: 10m
+        labels: { severity: warning, owner: platform-operations, alert_class: host-memory }
+        annotations:
+          summary: "AI Gateway host has less than 15% memory available"
+          description: "Available host memory has stayed below 15% for ten minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostMemoryCritical
+        expr: >-
+          node_memory_MemAvailable_bytes{job="node-exporter"}
+          / node_memory_MemTotal_bytes{job="node-exporter"} < 0.05
+        for: 5m
+        labels: { severity: critical, owner: platform-operations, alert_class: host-memory }
+        annotations:
+          summary: "AI Gateway host has less than 5% memory available"
+          description: "Available host memory has stayed below 5% for five minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostSwapHigh
+        expr: >-
+          ((node_memory_SwapTotal_bytes{job="node-exporter"}
+          - node_memory_SwapFree_bytes{job="node-exporter"})
+          / node_memory_SwapTotal_bytes{job="node-exporter"}) > 0.80
+          and node_memory_SwapTotal_bytes{job="node-exporter"} > 0
+        for: 10m
+        labels: { severity: warning, owner: platform-operations, alert_class: host-memory }
+        annotations:
+          summary: "AI Gateway host swap is over 80% used"
+          description: "Configured swap has stayed over 80% used for ten minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostOOMKill
+        expr: increase(node_vmstat_oom_kill{job="node-exporter"}[10m]) > 0
+        for: 0m
+        labels: { severity: critical, owner: platform-operations, alert_class: host-memory }
+        annotations:
+          summary: "AI Gateway host killed a process for lack of memory"
+          description: "The Linux OOM killer ran during the last ten minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
       - alert: AIGatewayFilesystemSpaceLow
         expr: >-
-          (node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}
-          / node_filesystem_size_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}) < 0.15
-          and node_filesystem_readonly == 0
+          (node_filesystem_avail_bytes{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}
+          / node_filesystem_size_bytes{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}) < 0.15
+          and node_filesystem_readonly{job="node-exporter"} == 0
         for: 10m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: platform-operations, alert_class: filesystem-space }
         annotations:
           summary: "AI Gateway host filesystem has less than 15% free"
           description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.device }} is approaching capacity."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
 
       - alert: AIGatewayFilesystemSpaceCritical
         expr: >-
-          (node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}
-          / node_filesystem_size_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}) < 0.05
-          and node_filesystem_readonly == 0
+          (node_filesystem_avail_bytes{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}
+          / node_filesystem_size_bytes{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}) < 0.05
+          and node_filesystem_readonly{job="node-exporter"} == 0
         for: 5m
-        labels: { severity: critical }
+        labels: { severity: critical, owner: platform-operations, alert_class: filesystem-space }
         annotations:
           summary: "AI Gateway host filesystem has less than 5% free"
           description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.device }} is near exhaustion."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
 
       - alert: AIGatewayFilesystemPredictedFull
         expr: >-
-          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs"}[6h], 24 * 3600) < 0
-          and node_filesystem_readonly == 0
+          predict_linear(node_filesystem_avail_bytes{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}[6h], 24 * 3600) < 0
+          and node_filesystem_readonly{job="node-exporter"} == 0
         for: 30m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: platform-operations, alert_class: filesystem-space }
         annotations:
           summary: "AI Gateway host filesystem predicted full within 24 hours"
           description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.device }} is growing too quickly."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayFilesystemInodesLow
+        expr: >-
+          (node_filesystem_files_free{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}
+          / node_filesystem_files{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}) < 0.15
+          and node_filesystem_files{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"} > 0
+          and node_filesystem_readonly{job="node-exporter"} == 0
+        for: 10m
+        labels: { severity: warning, owner: platform-operations, alert_class: filesystem-inodes }
+        annotations:
+          summary: "AI Gateway host filesystem has less than 15% inodes free"
+          description: "Filesystem {{ $labels.mountpoint }} is running out of file entries."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayFilesystemInodesCritical
+        expr: >-
+          (node_filesystem_files_free{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}
+          / node_filesystem_files{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"}) < 0.05
+          and node_filesystem_files{job="node-exporter",fstype!~"tmpfs|devtmpfs|overlay|squashfs"} > 0
+          and node_filesystem_readonly{job="node-exporter"} == 0
+        for: 5m
+        labels: { severity: critical, owner: platform-operations, alert_class: filesystem-inodes }
+        annotations:
+          summary: "AI Gateway host filesystem has less than 5% inodes free"
+          description: "Filesystem {{ $labels.mountpoint }} is near inode exhaustion."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostDiskLatencyHigh
+        expr: >-
+          (rate(node_disk_read_time_seconds_total{job="node-exporter",device!~"^(ram|loop|fd|sr)[0-9]*$"}[5m])
+          + rate(node_disk_write_time_seconds_total{job="node-exporter",device!~"^(ram|loop|fd|sr)[0-9]*$"}[5m]))
+          / clamp_min(
+          rate(node_disk_reads_completed_total{job="node-exporter",device!~"^(ram|loop|fd|sr)[0-9]*$"}[5m])
+          + rate(node_disk_writes_completed_total{job="node-exporter",device!~"^(ram|loop|fd|sr)[0-9]*$"}[5m]), 0.001) > 0.05
+        for: 10m
+        labels: { severity: warning, owner: platform-operations, alert_class: host-disk-io }
+        annotations:
+          summary: "AI Gateway host disk latency is high"
+          description: "Average I/O service time on {{ $labels.device }} is over 50 ms."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostDiskIOSaturation
+        expr: >-
+          rate(node_disk_io_time_seconds_total{job="node-exporter",device!~"^(ram|loop|fd|sr)[0-9]*$"}[5m]) > 0.90
+        for: 10m
+        labels: { severity: critical, owner: platform-operations, alert_class: host-disk-io }
+        annotations:
+          summary: "AI Gateway host disk is over 90% busy"
+          description: "Disk {{ $labels.device }} has been busy over 90% of the time for ten minutes."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostFileDescriptorsHigh
+        expr: >-
+          node_filefd_allocated{job="node-exporter"}
+          / node_filefd_maximum{job="node-exporter"} > 0.80
+        for: 10m
+        labels: { severity: warning, owner: platform-operations, alert_class: host-file-descriptors }
+        annotations:
+          summary: "AI Gateway host file descriptors are over 80% used"
+          description: "Open file descriptors are approaching the host limit."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+      - alert: AIGatewayHostFileDescriptorsCritical
+        expr: >-
+          node_filefd_allocated{job="node-exporter"}
+          / node_filefd_maximum{job="node-exporter"} > 0.95
+        for: 5m
+        labels: { severity: critical, owner: platform-operations, alert_class: host-file-descriptors }
+        annotations:
+          summary: "AI Gateway host file descriptors are over 95% used"
+          description: "Open file descriptors are close to the host limit."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#host-capacity-alerts"
+
+  - name: aigw-service-safety
+    rules:
+      - alert: AIGatewayServiceLatencyHigh
+        expr: |-
+          histogram_quantile(0.95,
+            sum by (instance, service, le)
+              (rate(traefik_service_request_duration_seconds_bucket{job="traefik"}[5m]))) > 2
+          and on (instance, service)
+            sum by (instance, service)
+              (rate(traefik_service_requests_total{job="traefik"}[5m])) > 0.10
+        for: 10m
+        labels: { severity: warning, owner: platform-operations, alert_class: service-latency }
+        annotations:
+          summary: "AI Gateway service latency is high"
+          description: "The p95 response time for {{ $labels.service }} is over two seconds."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#service-latency-and-error-alerts"
+
+      - alert: AIGatewayServiceLatencyCritical
+        expr: |-
+          histogram_quantile(0.95,
+            sum by (instance, service, le)
+              (rate(traefik_service_request_duration_seconds_bucket{job="traefik"}[5m]))) > 5
+          and on (instance, service)
+            sum by (instance, service)
+              (rate(traefik_service_requests_total{job="traefik"}[5m])) > 0.10
+        for: 5m
+        labels: { severity: critical, owner: platform-operations, alert_class: service-latency }
+        annotations:
+          summary: "AI Gateway service latency is critical"
+          description: "The p95 response time for {{ $labels.service }} is over five seconds."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#service-latency-and-error-alerts"
+
+      - alert: AIGatewayServiceErrorRateHigh
+        expr: |-
+          (sum by (instance, service)
+            (rate(traefik_service_requests_total{job="traefik",code=~"5.."}[5m]))
+          / sum by (instance, service)
+            (rate(traefik_service_requests_total{job="traefik"}[5m]))) > 0.05
+          and on (instance, service)
+            sum by (instance, service)
+              (rate(traefik_service_requests_total{job="traefik"}[5m])) > 0.10
+        for: 10m
+        labels: { severity: warning, owner: platform-operations, alert_class: service-errors }
+        annotations:
+          summary: "AI Gateway service error rate is high"
+          description: "More than 5% of requests to {{ $labels.service }} returned 5xx errors."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#service-latency-and-error-alerts"
+
+      - alert: AIGatewayServiceErrorRateCritical
+        expr: |-
+          (sum by (instance, service)
+            (rate(traefik_service_requests_total{job="traefik",code=~"5.."}[5m]))
+          / sum by (instance, service)
+            (rate(traefik_service_requests_total{job="traefik"}[5m]))) > 0.20
+          and on (instance, service)
+            sum by (instance, service)
+              (rate(traefik_service_requests_total{job="traefik"}[5m])) > 0.10
+        for: 5m
+        labels: { severity: critical, owner: platform-operations, alert_class: service-errors }
+        annotations:
+          summary: "AI Gateway service error rate is critical"
+          description: "More than 20% of requests to {{ $labels.service }} returned 5xx errors."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#service-latency-and-error-alerts"
+
+      - alert: AIGatewayCertificateExpiresSoon
+        expr: >-
+          min by (instance) (traefik_tls_certs_not_after{job="traefik"})
+          - time() < 30 * 24 * 3600
+        for: 30m
+        labels: { severity: warning, owner: platform-operations, alert_class: edge-certificate }
+        annotations:
+          summary: "AI Gateway edge certificate expires within 30 days"
+          description: "At least one certificate loaded by {{ $labels.instance }} needs planned renewal."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#certificate-expiry-alerts"
+
+      - alert: AIGatewayCertificateExpiryCritical
+        expr: >-
+          min by (instance) (traefik_tls_certs_not_after{job="traefik"})
+          - time() < 7 * 24 * 3600
+        for: 5m
+        labels: { severity: critical, owner: platform-operations, alert_class: edge-certificate }
+        annotations:
+          summary: "AI Gateway edge certificate expires within 7 days"
+          description: "At least one certificate loaded by {{ $labels.instance }} needs immediate renewal."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#certificate-expiry-alerts"

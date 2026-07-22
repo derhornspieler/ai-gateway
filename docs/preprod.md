@@ -66,7 +66,8 @@ does not use this forwarder.
 
 Preprod does not mount the workstation root or read other projects' Docker
 logs. It still checks local Loki, Prometheus, Grafana, and the Cribl mock. It
-does not prove production firewall rules, customer PKI, or Cribl retention.
+proves that admitted logs, metrics, and traces pass through Alloy to the mock.
+It does not prove production firewall rules, customer PKI, or Cribl retention.
 
 ## Requirements
 
@@ -84,9 +85,10 @@ On macOS, Docker Desktop needs these two `/24` aliases on `lo0`:
 - Internal: `127.0.2.1` in `127.0.2.0/24`
 - ADM: `127.0.3.1` in `127.0.3.0/24`
 
-Ansible uses sudo only to add missing macOS aliases and to manage the bounded
-hosts block. Docker still runs as the current user. Linux skips the alias task
-but still updates the hosts block.
+Ansible uses sudo to manage the bounded hosts block. On macOS, it also adds
+missing loopback aliases. On Linux, it gives the fixed service group read-only
+access to two private LiteLLM token files. Docker still runs as the current
+user.
 
 You may use `--ask-become-pass`. You may also use a private password file:
 
@@ -215,7 +217,28 @@ The Ansible play runs this check after stack health and identity checks. A pass
 prints:
 
 ```text
+PREPROD_AUTO_ROUTER_DENIAL_PASSED
+PREPROD_MODEL_REQUEST_CAP_PASSED
+PREPROD_MODEL_MINUTE_RESERVATION_PASSED
+PREPROD_MODEL_REDIS_FAILURE_PASSED
+PREPROD_MODEL_LIMITS_PASSED
+PREPROD_ALERT_RULE_UNIT_TEST_PASS
+PREPROD_ALERTING_GRAPH_PASS
+PREPROD_ALERT_LIVE_FIRING_PASS
+PREPROD_ALERT_CRIBL_EXPORT_PASS
+PREPROD_ALERT_LIVE_RESOLVED_PASS
 PREPROD_E2E_PASSED
+```
+
+An exact seed-mode run also prints:
+
+```text
+PREPROD_MODEL_DRAFT_HIDDEN_PASSED
+PREPROD_MODEL_HIDDEN_CALL_PASSED
+PREPROD_MODEL_DISCOVERY_PASSED
+PREPROD_MODEL_ASSIGNMENT_GATE_PASSED
+PREPROD_MODEL_RETIREMENT_PASSED
+PREPROD_MODEL_LIFECYCLE_PASSED
 ```
 
 To rerun only the check:
@@ -238,6 +261,22 @@ The check uses a safe local name map. It does not need `/etc/hosts`. It proves:
   assertions stop before the mock provider;
 - WIF checks the live Keycloak JWT;
 - LiteLLM reaches the mock provider through the preprod-only TLS Envoy;
+- the reserved `aigw-auto` model returns HTTP 400 before provider dispatch;
+- a temporary project key rejects an output request above its model cap;
+- two parallel requests share one atomic UTC-minute output reservation;
+- a Redis outage returns HTTP 503 and does not reach the mock provider;
+- the test restarts Redis, waits for health, and deletes its temporary key;
+- the committed alert rules activate and recover for the fixed fault cases,
+  including a filesystem-space case;
+- the watchdog reaches private Alertmanager and the provisioned Grafana
+  dashboard can read its lifecycle state;
+- a bounded, label-free test metric fires one non-watchdog alert, reaches
+  Prometheus, Alertmanager, the Grafana dashboard query, and Cribl through
+  Alloy, then resolves after the fixture is reset;
+- in seed mode, a temporary governed model stays inert as a draft, works by
+  exact name while hidden, follows filtered discovery, refuses retirement
+  while a temporary project assigns it, then removes its test state and
+  retires cleanly;
 - the exact production Envoy passes its immutable policy and CA startup gate; and
 - the mock response is `pong`.
 
@@ -302,6 +341,22 @@ Expected final markers are:
 
 ```text
 PREPROD_CLEAN_ROOM_OK ...
+PREPROD_AUTO_ROUTER_DENIAL_PASSED
+PREPROD_MODEL_REQUEST_CAP_PASSED
+PREPROD_MODEL_MINUTE_RESERVATION_PASSED
+PREPROD_MODEL_REDIS_FAILURE_PASSED
+PREPROD_MODEL_LIMITS_PASSED
+PREPROD_MODEL_DRAFT_HIDDEN_PASSED
+PREPROD_MODEL_HIDDEN_CALL_PASSED
+PREPROD_MODEL_DISCOVERY_PASSED
+PREPROD_MODEL_ASSIGNMENT_GATE_PASSED
+PREPROD_MODEL_RETIREMENT_PASSED
+PREPROD_MODEL_LIFECYCLE_PASSED
+PREPROD_ALERT_RULE_UNIT_TEST_PASS
+PREPROD_ALERTING_GRAPH_PASS
+PREPROD_ALERT_LIVE_FIRING_PASS
+PREPROD_ALERT_CRIBL_EXPORT_PASS
+PREPROD_ALERT_LIVE_RESOLVED_PASS
 PREPROD_E2E_PASSED
 SEEDED_PREPROD_E2E_PASSED
 ```

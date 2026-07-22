@@ -61,6 +61,23 @@
   register: preprod_prepare
   changed_when: "'PREPROD_PREPARED' in preprod_prepare.stdout"
 
+# A native Linux engine preserves host inode ownership on bind mounts. Both
+# readers run with gid 65532, so give only that service group read access.
+# Docker Desktop maps these private 0600 files itself; changing their group on
+# macOS would expose them to an unrelated local group.
+- name: Grant native Linux services read-only access to their private tokens
+  ansible.builtin.file:
+    path: "{{ preprod_repo_root }}/compose/secrets/{{ item }}"
+    group: "65532"
+    mode: "0640"
+    follow: false
+  become: true
+  loop:
+    - litellm_otel_token
+    - litellm_usage_token
+  no_log: true
+  when: preprod_host_kernel.stdout | trim == 'Linux'
+
 - name: Prove the root loader uses the operator's exact Docker engine
   ansible.builtin.command:
     argv:
@@ -427,7 +444,7 @@
     preprod_end_to_end_acceptance.rc != 0 or
     'PREPROD_E2E_PASSED' not in preprod_end_to_end_acceptance.stdout
 
-- name: Prove the curated Cribl security feed and persistent recovery queue
+- name: Prove the full Cribl telemetry mirror and persistent recovery queue
   ansible.builtin.command:
     argv:
       - python3
@@ -435,12 +452,12 @@
       - "{{ preprod_repo_root }}/scripts/test-preprod-cribl-security.py"
       - --image-mode
       - "{{ preprod_image_mode }}"
-  register: preprod_cribl_security_acceptance
+  register: preprod_cribl_telemetry_acceptance
   changed_when: false
   failed_when: >-
-    preprod_cribl_security_acceptance.rc != 0 or
-    'PREPROD_CRIBL_SECURITY_FEED_PASSED' not in
-    preprod_cribl_security_acceptance.stdout
+    preprod_cribl_telemetry_acceptance.rc != 0 or
+    'PREPROD_CRIBL_TELEMETRY_PASSED' not in
+    preprod_cribl_telemetry_acceptance.stdout
 
 - name: Report the full local preprod acceptance result
   ansible.builtin.debug:

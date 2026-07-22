@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Price backdate preview — AI Gateway{% endblock %}
+{% block tabs %}
+<nav class="tabs" role="tablist" aria-label="Admin console sections">
+  <a role="tab" href="/admin" aria-selected="false">Identity &amp; Access</a>
+  <a role="tab" href="/admin/keys" aria-selected="false">API Keys</a>
+  <a role="tab" href="/admin#tab-models" aria-selected="true" aria-current="page">Models &amp; Pricing</a>
+  <a role="tab" href="/admin#tab-providers" aria-selected="false">Providers &amp; JWT</a>
+  <a role="tab" href="/admin#tab-rotation" aria-selected="false">Key Rotation</a>
+  <a role="tab" href="/admin#tab-audit" aria-selected="false">Audit</a>
+</nav>
+{% endblock %}
+{% block content %}
+<h1 class="page">Review the backdated price</h1>
+<p class="sub">This is a stored preview. No price or usage row has changed. Confirmation adds one price version and immutable cost adjustments in one transaction.</p>
+
+<div class="card">
+  <h3>Impact summary</h3>
+  <div class="tblwrap">
+    <table class="keys narrow">
+      <tbody>
+        <tr><th>Model</th><td><code>{{ preview.gateway_model_name }}</code></td></tr>
+        <tr><th>Usage class</th><td>{{ preview.usage_class_label }}</td></tr>
+        <tr><th>New price</th><td class="tnum">{{ preview.amount }} USD per {{ preview.token_unit }} tokens{% if preview.explicit_free %} (explicitly free){% endif %}</td></tr>
+        <tr><th>Effective window</th><td><code>{{ preview.effective_at }}</code> to <code>{{ preview.effective_to or "no later price" }}</code></td></tr>
+        <tr><th>Reviewed source</th><td><code>{{ preview.source_reference }}</code></td></tr>
+        <tr><th>Review reason</th><td>{{ preview.review_note }}</td></tr>
+        <tr><th>Affected usage rows</th><td class="tnum">{{ preview.affected_count }}</td></tr>
+        <tr><th>Old total</th><td class="tnum">{{ preview.old_total_usd if preview.old_total_usd is not none else "Unknown" }} USD</td></tr>
+        <tr><th>New total</th><td class="tnum">{{ preview.new_total_usd if preview.new_total_usd is not none else "Unknown" }} USD</td></tr>
+        <tr><th>Exact change</th><td class="tnum">{{ preview.delta_usd if preview.delta_usd is not none else "Unknown" }} USD</td></tr>
+        <tr><th>Unknown totals</th><td class="tnum">old {{ preview.old_unknown_count }}, new {{ preview.new_unknown_count }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Preview SHA-256<br><code class="hash">{{ preview.preview_sha256 }}</code></p>
+</div>
+
+{% if preview.affected_rows %}
+<div class="card" style="padding: 0; overflow: hidden;">
+  <div class="tblwrap">
+    <table class="keys">
+      <thead><tr><th>Usage event</th><th class="tnum">Tokens</th><th class="tnum">Old class cost</th><th class="tnum">New class cost</th><th class="tnum">Change</th></tr></thead>
+      <tbody>
+        {% for row in preview.affected_rows %}
+        <tr>
+          <td><code class="trunc wide" title="{{ row.usage_event_id }}">{{ row.usage_event_id }}</code></td>
+          <td class="tnum">{{ row.units }}</td>
+          <td class="tnum">{{ row.previous_component_cost_usd if row.previous_component_cost_usd is not none else "Unknown" }}</td>
+          <td class="tnum">{{ row.new_component_cost_usd }}</td>
+          <td class="tnum">{{ row.component_delta_usd if row.component_delta_usd is not none else "Unknown" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if preview.affected_rows_truncated %}<p class="note" style="padding: 0 20px 16px;">The first {{ preview.shown_affected_count }} rows are shown. All {{ preview.affected_count }} rows are stored and bound to the preview digest.</p>{% endif %}
+</div>
+{% endif %}
+
+<div class="trustbox warn">
+  <strong>This changes historical configured cost.</strong>
+  <p class="note" style="margin: 5px 0 0;">Type <code>CONFIRM BACKDATED PRICE</code>. If prices, usage, or adjustments changed after this preview, confirmation fails and you must preview again.</p>
+</div>
+
+<form method="post" action="/admin/model-governance/prices/backdate/confirm" data-confirm="Confirm this exact backdated price and append its cost adjustments?">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="preview_id" value="{{ preview.preview_id }}">
+  <input type="hidden" name="candidate_sha256" value="{{ preview.candidate_sha256 }}">
+  <input type="hidden" name="preview_sha256" value="{{ preview.preview_sha256 }}">
+  <label class="fld" for="backdate-confirmation">Confirmation phrase</label>
+  <input id="backdate-confirmation" type="text" name="confirmation" required minlength="23" maxlength="23" autocomplete="off">
+  <div style="display: flex; gap: 10px; margin-top: 14px;">
+    <button type="submit" class="danger">Confirm backdated price</button>
+    <a class="btn ghost" href="/admin?price_model={{ preview.gateway_model_name | urlencode }}#tab-models">Cancel</a>
+  </div>
+</form>
+{% endblock %}

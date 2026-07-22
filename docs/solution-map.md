@@ -14,6 +14,8 @@ Start with these pages when you need more detail:
 - [Local preprod](preprod.md)
 - [Image update workflow](image-update-workflow.md)
 - [Test runbook](test-runbook.md)
+- [Model lifecycle SOP](sop/model-lifecycle.md)
+- [Usage and cost accounting](usage-and-cost-accounting.md)
 
 ## Two deployment types
 
@@ -75,11 +77,11 @@ controls when the required inputs are present.
 
 ## Running services
 
-The base Compose file defines one short-lived setup job and 23 long-running
+The base Compose file defines one short-lived setup job and 24 long-running
 services. Two of those services, `vault-ui-proxy` and
 `oauth2-proxy-vault`, run only when the `vault-ui` profile is enabled. Optional
 platform DNS adds one more service. Local preprod adds four test-only services
-and runs 25 long-running containers in its normal profile.
+and runs 26 long-running containers in its normal profile.
 
 | Service | Job |
 | --- | --- |
@@ -90,23 +92,24 @@ and runs 25 long-running containers in its normal profile.
 | `oauth2-proxy-grafana` | Admin role gate for Grafana |
 | `oauth2-proxy-prometheus` | Admin role gate for Prometheus |
 | `oauth2-proxy-vault` | Optional admin role gate for the Vault UI |
-| `litellm` | AI API, virtual keys, budgets, and provider routing |
+| `litellm` | AI API, virtual keys, limits, provider routing, and prompt-free usage callback |
 | `open-webui` | Browser chat |
 | `keycloak` | Login, roles, OIDC clients, and LDAPS federation |
 | `dev-portal` | User key creation and tool examples |
-| `admin-portal` | User, group, project, and provider controls |
+| `admin-portal` | User, project, provider, model, and price controls |
 | `vault-ui-proxy` | Optional fixed Vault UI and `/v1` proxy |
 | `envoy-egress` | The only provider internet path |
-| `key-rotator` | Provider secrets, WIF, and identity control |
+| `key-rotator` | Provider secrets, WIF, identity, model, price, and usage control |
 | `vault` | Provider secrets, PKI, key material, and audit data |
 | `postgres` | Separate LiteLLM, Keycloak, and rotator databases |
 | `redis` | Private, non-persistent LiteLLM cache |
-| `alloy` | Local log and metric collection plus the SOC export |
+| `alloy` | The only log, metric, and trace collection and Cribl export path |
 | `prometheus` | Local metrics and alert rule checks |
+| `alertmanager` | Private alert grouping, inhibition, and resolved lifecycle |
 | `node-exporter` | Host capacity metrics |
 | `loki` | Local operational, audit, and request logs |
 | `grafana` | Local dashboards and alert views |
-| `cribl-mock` | Local TLS receipt test for the curated SOC feed |
+| `cribl-mock` | Local TLS receipt test for admitted logs, metrics, and traces |
 | `platform-dns` | Optional split, non-recursive DNS for the domain |
 
 Preprod adds these test-only services:
@@ -271,8 +274,27 @@ catalog entry, CA evidence, offline build, and full seed test.
 ## Data and secrets
 
 PostgreSQL 18 holds separate LiteLLM, Keycloak, and rotator databases. Each
-service login can connect only to its own database. Grafana has read-only
-access to approved LiteLLM spend fields and cannot read prompt fields.
+application login can connect only to its database. The rotator database has
+append-only model, price, and prompt-free usage records. A separate no-login
+role owns that schema, so the application cannot edit or delete old evidence.
+
+The saved model policy is the source of truth. key-rotator checks and repairs
+the LiteLLM runtime copy, and it fails readiness on unmanaged or changed model
+rows. Public discovery shows only active, visible models allowed for the
+caller. An assigned hidden model remains callable only by its exact name.
+
+A project may set a maximum output size per request and a fixed UTC-minute
+output quota for each allowed model. LiteLLM checks the request cap and makes
+one atomic Redis reservation before provider dispatch. Redis errors deny the
+controlled request; the gateway does not fall back to a local counter. These
+two controls do not claim rolling windows, monthly limits, per-user limits, or
+money budgets.
+
+Grafana's `grafana_ro` login can read only approved reporting views and narrow
+LiteLLM spend columns. It cannot read prompt fields. The usage callback sends
+no prompt, reply, key, or request header. Missing usage or price data stays
+unknown instead of becoming zero. See the [model lifecycle SOP](sop/model-lifecycle.md)
+and [usage and cost accounting](usage-and-cost-accounting.md).
 
 Redis is a password-protected, non-persistent cache. The server reads a hash
 verifier file. Clients read a separate password file. Docker metadata does not
@@ -295,22 +317,26 @@ one-shot check.
 Alloy collects local service logs and metrics. It does not mount the Docker
 socket. Narrow file ACLs let it read only Docker JSON logs.
 
-Prometheus keeps metrics for up to 30 days, with a 5 GB size cap. Grafana
-shows dashboards and local alert state. Alerts cover early warning and hard
-failure conditions. Alertmanager lifecycle work remains in the backlog.
+Prometheus keeps metrics for up to 30 days or until its configured size cap is
+reached, whichever comes first. The default cap is 5 GB. Grafana shows
+dashboards and local alert state. Alerts cover early warning and hard failure
+conditions. Private Alertmanager groups, deduplicates, inhibits, and records
+resolved alert state. It has no host port or FQDN.
 
 Loki keeps local operational and request logs. The request stream may include
 prompt and response content, so it is high-sensitivity data.
 
-The Cribl path sends only the approved SOC log set over verified TLS. It
-includes request audit data, login and access events, provider trust failures,
-managed identity changes, and controller upgrade or rollback results. Alloy
-rebuilds each record from approved fields and applies one common schema,
-environment, producer, service-name, and time gate. It does not send metrics,
-alerts, raw traces, or all service logs. The local queue has back-pressure
-controls and a 24-hour retry window, but it does not yet enforce a hard
-per-record 24-hour age limit. The Cribl destination must enforce its own
-24-hour retention.
+The Cribl path sends every log, metric, and trace admitted by Alloy over
+verified OTLP/gRPC TLS. Ordinary logs are redacted. Security-sensitive logs,
+such as request audit, login, provider trust, identity, Vault, and controller
+lifecycle events, are rebuilt from fixed approved fields. Alloy applies one
+common schema, environment, producer, service-name, and time gate. Prometheus
+returns only its generated `ALERTS` and `ALERTS_FOR_STATE` series to a private,
+mutual-TLS Alloy listener. That branch goes only to Cribl and never back to
+Prometheus. Alertmanager does not send a second notification stream. The local
+queue has back-pressure controls and a 24-hour retry window, but it does not
+enforce a hard per-record 24-hour age limit. The Cribl destination must enforce
+its own 24-hour retention.
 
 See [observability operations](observability-operations.md) and the
 [Cribl handoff](cribl-soc-handoff.md).
@@ -350,12 +376,13 @@ Envoy image and provider policy as one release unit.
   [project status](project-status.md#current-source-candidate).
 - Production LDAPS, TLS, Vault custody, Anthropic enrollment, Cribl, backup,
   and change-window steps need customer operators.
-- A full production-sized PostgreSQL 16-to-18 local seeded-preprod rehearsal
-  is still open. It does not need another host or VM.
-- GitHub DHI image builds and Trivy scans need approved DHI credentials in the
-  protected GitHub environment.
-- The protected container scan and capacity alert expansion are tracked in
-  [TASKS.md](../TASKS.md).
+- The production-sized PostgreSQL 16-to-18 local seeded-PreProd rehearsal
+  passed for the last accepted seed. The real Linux migration commands remain
+  a production maintenance-window gate; no rehearsal VM is required.
+- The protected GitHub environment has approved DHI credentials. The current
+  commit still needs every exact image build and blocking security check.
+- The current exact-seed test, protected container scan, and live alert-path
+  acceptance are tracked in [TASKS.md](../TASKS.md).
 
 Do not call the release production-approved until the dated gates in
 [project status](project-status.md) pass and the release owner accepts the
@@ -372,7 +399,7 @@ remaining risks.
 | Separate Docker networks | A service gets only the paths it needs. |
 | Four OAuth2 Proxy gates | Each admin tool gets a separate OIDC cookie and role gate. |
 | Vault CE | The design needs KV, PKI, audit, and local secret custody. |
-| Local metrics and selected SOC logs | Operations data stays local while the SOC receives only its approved feed. |
+| Alloy as the telemetry choke point | Local logs and metrics keep working while every admitted log, metric, and trace is mirrored safely to Cribl. |
 
 Older lab, Caddy, flat-network, CONNECT-proxy, OpenBao, and manual-init designs
 are retired. Archived pages are history, not current instructions.

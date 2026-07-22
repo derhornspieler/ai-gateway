@@ -12,6 +12,14 @@
       "keepTime": true,
       "tags": [],
       "targetBlank": false,
+      "title": "Alerts and Capacity",
+      "type": "link",
+      "url": "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity"
+    },
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
       "title": "Live Loki Logs",
       "type": "link",
       "url": "/d/aigw-live-logs/ai-gateway-live-logs"

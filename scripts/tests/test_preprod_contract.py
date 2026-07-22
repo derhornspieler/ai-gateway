@@ -2283,7 +2283,19 @@ class PreprodContractTests(unittest.TestCase):
                 "egress_policy_sha256": "4" * 64,
                 "envoy_config_sha256": "5" * 64,
                 "selected_providers": ["anthropic"],
-                "providers": [{"name": "anthropic"}],
+                "providers": [
+                    {
+                        "name": "anthropic",
+                        "api_hostname": "api.anthropic.com",
+                        "route_prefix": "/anthropic/",
+                        "sni": "api.anthropic.com",
+                        "exact_sans": ["api.anthropic.com"],
+                        "ca_file": "anthropic-ca.pem",
+                        "ca_bundle_sha256": "6" * 64,
+                        "ca_sha256_fingerprints": ["7" * 64],
+                        "provenance_sha256": "8" * 64,
+                    }
+                ],
                 "envoy_image_id": "sha256:" + "a" * 64,
             },
         }
@@ -2297,9 +2309,13 @@ class PreprodContractTests(unittest.TestCase):
             receipt_path = temporary / "receipt.json"
             overlay_path = temporary / "images.yml"
             environment_path = temporary / "preprod.env"
+            provider_policy_path = temporary / "provider_policy_receipt.json"
             with (
                 mock.patch.object(module, "SEED_RECEIPT", receipt_path),
                 mock.patch.object(module, "SEED_OVERLAY", overlay_path),
+                mock.patch.object(
+                    module, "PROVIDER_POLICY_RECEIPT", provider_policy_path
+                ),
                 mock.patch.object(module, "ENV_FILE", environment_path),
                 mock.patch.object(module, "check_context"),
                 mock.patch.object(
@@ -2329,6 +2345,7 @@ class PreprodContractTests(unittest.TestCase):
             ):
                 module._activate_seed(args)
             overlay = overlay_path.read_text(encoding="utf-8")
+            provider_policy = provider_policy_path.read_text(encoding="utf-8")
 
         self.assertEqual(overlay.count("pull_policy: never"), 7)
         self.assertEqual(overlay.count("build: !reset null"), 4)
@@ -2346,6 +2363,11 @@ class PreprodContractTests(unittest.TestCase):
         self.assertIn("  wif-egress-mock:\n", overlay)
         self.assertIn("  preprod-edge-forwarder:\n", overlay)
         self.assertIn(f"image: {envoy_base_reference}", overlay)
+        self.assertNotIn("envoy_image_id", provider_policy)
+        self.assertEqual(
+            provider_policy,
+            module.canonical_provider_policy_receipt(receipt["egress_policy"]),
+        )
 
         missing_external = {**receipt, "external_images": {}}
         with self.assertRaisesRegex(SystemExit, "no external image for service vault"):
@@ -2521,6 +2543,25 @@ class PreprodContractTests(unittest.TestCase):
     def test_prepare_creates_the_redis_bind_files_needed_on_a_clean_checkout(self) -> None:
         self.assertIn('SECRETS_DIR / "redis_password"', self.script)
         self.assertIn('SECRETS_DIR / "redis_users.acl"', self.script)
+
+    def test_native_linux_services_can_read_private_litellm_tokens(self) -> None:
+        tasks = (
+            ROOT
+            / "ansible/roles/preprod_stack/tasks/present.yml"
+        ).read_text()
+        section = tasks.split(
+            "- name: Grant native Linux services read-only access to their private tokens",
+            1,
+        )[1].split("- name: Prove the root loader uses", 1)[0]
+
+        self.assertIn('group: "65532"', section)
+        self.assertIn('mode: "0640"', section)
+        self.assertIn("follow: false", section)
+        self.assertIn("become: true", section)
+        self.assertIn("- litellm_otel_token", section)
+        self.assertIn("- litellm_usage_token", section)
+        self.assertIn("preprod_host_kernel.stdout | trim == 'Linux'", section)
+        self.assertIn("no_log: true", section)
 
     def test_preprod_redis_keeps_its_password_private_on_docker_desktop(self) -> None:
         redis = self.compose.split("  redis:\n", 1)[1].split(
@@ -2941,6 +2982,7 @@ class PreprodContractTests(unittest.TestCase):
             mock.patch.object(
                 module, "container_state", return_value=("running", "healthy")
             ),
+            mock.patch.object(module, "verify_alerting_graph") as alerting_graph,
             mock.patch.object(
                 module,
                 "internal_call",
@@ -2951,6 +2993,7 @@ class PreprodContractTests(unittest.TestCase):
         ):
             module.verify(mock.Mock())
         volume_init.assert_called_once()
+        alerting_graph.assert_called_once()
         edge_routes.assert_called_once()
         self.assertEqual(
             [call.args[1:] for call in wait.call_args_list],
@@ -3048,7 +3091,7 @@ class PreprodContractTests(unittest.TestCase):
             "Run the full local preprod edge and identity acceptance gate"
         )
         cribl_acceptance = self.tasks.index(
-            "Prove the curated Cribl security feed and persistent recovery queue"
+            "Prove the full Cribl telemetry mirror and persistent recovery queue"
         )
         report = self.tasks.index("Report the full local preprod acceptance result")
         self.assertLess(internal_verify, acceptance)
@@ -3060,7 +3103,7 @@ class PreprodContractTests(unittest.TestCase):
         self.assertIn("--image-mode", acceptance_block)
         self.assertIn('"{{ preprod_image_mode }}"', acceptance_block)
         self.assertIn("PREPROD_E2E_PASSED", acceptance_block)
-        self.assertIn("PREPROD_CRIBL_SECURITY_FEED_PASSED", acceptance_block)
+        self.assertIn("PREPROD_CRIBL_TELEMETRY_PASSED", acceptance_block)
 
     def test_seed_mode_uses_exact_transfer_ids_and_cannot_build_or_pull(self) -> None:
         self.assertIn('"ai-gateway/samba-ad:preprod"', self.script)
@@ -3107,6 +3150,8 @@ class PreprodContractTests(unittest.TestCase):
             env_file = secrets / "preprod.env"
             receipt = secrets / "preprod-seed-receipt.json"
             overlay = secrets / "preprod-seed-images.yml"
+            provider_policy = secrets / "provider_policy_receipt.json"
+            rehearsal = secrets / "preprod-postgres18-rehearsal-receipt.json"
             uid = os.geteuid()
             gid = os.getegid()
             env_file.write_text(
@@ -3120,6 +3165,10 @@ class PreprodContractTests(unittest.TestCase):
                 mock.patch.object(module, "ENV_FILE", env_file),
                 mock.patch.object(module, "SEED_RECEIPT", receipt),
                 mock.patch.object(module, "SEED_OVERLAY", overlay),
+                mock.patch.object(module, "PROVIDER_POLICY_RECEIPT", provider_policy),
+                mock.patch.object(
+                    module, "POSTGRES18_REHEARSAL_RECEIPT", rehearsal
+                ),
                 mock.patch.object(module.os, "geteuid", return_value=0),
             ):
                 with self.assertRaisesRegex(SystemExit, "recorded non-root operator"):
@@ -3128,12 +3177,17 @@ class PreprodContractTests(unittest.TestCase):
             def write_caller_outputs(_args) -> None:
                 module.write_file(receipt, "caller activation\n", 0o644)
                 module.write_file(overlay, "caller overlay\n", 0o644)
+                module.write_file(provider_policy, "caller policy\n", 0o644)
 
             with (
                 mock.patch.object(module, "REPO_ROOT", repo),
                 mock.patch.object(module, "ENV_FILE", env_file),
                 mock.patch.object(module, "SEED_RECEIPT", receipt),
                 mock.patch.object(module, "SEED_OVERLAY", overlay),
+                mock.patch.object(module, "PROVIDER_POLICY_RECEIPT", provider_policy),
+                mock.patch.object(
+                    module, "POSTGRES18_REHEARSAL_RECEIPT", rehearsal
+                ),
                 mock.patch.object(module, "_activate_seed", side_effect=write_caller_outputs),
                 mock.patch.object(module.os, "geteuid", return_value=uid),
                 mock.patch.object(module.os, "getegid", return_value=gid),
@@ -3142,6 +3196,7 @@ class PreprodContractTests(unittest.TestCase):
                 module.remove_seed_output_files()
             self.assertFalse(receipt.exists())
             self.assertFalse(overlay.exists())
+            self.assertFalse(provider_policy.exists())
 
     def test_root_loader_marker_stays_in_digest_scoped_temporary_stage(self) -> None:
         defaults = (ROOT / "ansible/roles/preprod_stack/defaults/main.yml").read_text()
@@ -3240,6 +3295,9 @@ class PreprodContractTests(unittest.TestCase):
         self.assertNotIn("OnlyForTesting", self.script)
         self.assertNotIn("aigw-preprod-only:", self.script)
         module = load_preprod_module()
+        self.assertIn(
+            "litellm/aigw_model_limits.py", module.PREPROD_BIND_SOURCES
+        )
         self.assertNotIn(
             "secrets/preprod-credential-seed-v1", module.PREPROD_BIND_SOURCES
         )

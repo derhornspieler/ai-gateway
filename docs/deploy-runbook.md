@@ -30,7 +30,7 @@ You provide only the items that belong to your site:
 | LDAPS bind password | When `identity_ldap_enabled: true` |
 | Edge certificate or intermediate CA files | Based on the selected TLS mode |
 | Anthropic WIF identifiers | At go-live, after the provider setup ceremony |
-| Cribl worker details and CA | Only when the optional SOC log feed is on |
+| Cribl worker details and CA | Only when the optional Cribl telemetry feed is on |
 
 Rules for every secret:
 
@@ -246,12 +246,16 @@ The result must include `"ping": "pong"`.
 
 ## Part 5 — Register the DNS names
 
-Create these records before the full converge:
+Create these split-DNS records before the full converge:
 
-| Names | Target |
-| --- | --- |
-| `portal.<domain>`, `api.<domain>`, `auth.<domain>` | Internal IP |
-| `chat.<domain>`, `admin.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, `vault.<domain>` | ADM IP |
+| DNS view | Names | Target |
+| --- | --- | --- |
+| Internal users | `portal.<domain>`, `api.<domain>`, `auth.<domain>`, `chat.<domain>` | Internal IP |
+| Administrators | `auth.<domain>`, `chat.<domain>`, `admin.<domain>`, `litellm-admin.<domain>`, `grafana.<domain>`, `prometheus.<domain>`, and optional `vault.<domain>` | ADM IP |
+| Administrators | `portal.<domain>`, `api.<domain>` | Internal IP |
+
+`auth.<domain>` and `chat.<domain>` resolve to different addresses in the two
+views. Do not point internal users at the ADM address.
 
 See the [FQDN inventory](fqdn-inventory.md) for the full split-DNS rules.
 
@@ -373,13 +377,15 @@ The admin portal does not ask the user to initialize identity.
 2. On the ADM network, open `https://admin.<domain>` and
    `https://grafana.<domain>`. Both must redirect to Keycloak and return after
    login.
-3. Open `https://chat.<domain>` on ADM and `https://portal.<domain>` on the
+3. In Grafana, open **AI Gateway Alerts and Capacity**. The watchdog must be
+   firing. Alertmanager has no separate FQDN or host port.
+4. Open `https://chat.<domain>` on ADM and `https://portal.<domain>` on the
    internal network.
-4. Test logout from each app. It must end the Keycloak session and return to
+5. Test logout from each app. It must end the Keycloak session and return to
    the same deployed domain.
-5. Enroll Anthropic WIF with the
+6. Enroll Anthropic WIF with the
    [WIF setup SOP](sop/anthropic-wif-jwt-setup.md).
-6. Run the needed parts of the [acceptance test runbook](test-runbook.md).
+7. Run the needed parts of the [acceptance test runbook](test-runbook.md).
 
 Save only non-secret test evidence.
 

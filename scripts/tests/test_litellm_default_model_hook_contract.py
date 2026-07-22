@@ -29,6 +29,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 HOOK = ROOT / "compose" / "litellm" / "aigw_default_model_hook.py"
+MODEL_LIMITS = ROOT / "compose" / "litellm" / "aigw_model_limits.py"
 LITELLM_CONFIG = ROOT / "compose" / "litellm" / "config.yaml"
 COMPOSE = ROOT / "compose" / "docker-compose.yml"
 DIGEST_INPUTS = ROOT / "compose" / "bind-source-digest-inputs.json"
@@ -41,8 +42,11 @@ MODEL_NAME_RE_LITERAL = 're.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")'
 # fullmatch); the character-class body is the shared contract.
 MODEL_NAME_GRAMMAR = "[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}"
 METADATA_KEY_LITERAL = '"aigw_default_model"'
+MODEL_LIMITS_METADATA_KEY_LITERAL = '"aigw_model_limits_v1"'
+RESERVED_AUTO_ROUTER_LITERAL = '"aigw-auto"'
 
 _STUBBED_MODULES = (
+    "aigw_model_limits",
     "aigw_openwebui_identity",
     "fastapi",
     "litellm",
@@ -77,9 +81,7 @@ def _load_hook_module():
     callback_stub = types.ModuleType("aigw_openwebui_identity")
     callback_stub.OPENWEBUI_KEY_OWNER = "svc-open-webui"
     callback_stub.OPENWEBUI_KEY_ALIAS = "aigw-open-webui-service"
-    callback_stub.OPENWEBUI_IDENTITY_GATE_FIELD = (
-        "aigw_openwebui_identity_gate_v1"
-    )
+    callback_stub.OPENWEBUI_IDENTITY_GATE_FIELD = "aigw_openwebui_identity_gate_v1"
     callback_stub.OPENWEBUI_KEY_METADATA = {
         "aigw_key_kind": "service",
         "aigw_service": "open-webui",
@@ -125,9 +127,13 @@ def _load_hook_module():
     sys.modules["litellm.integrations"] = integrations_stub
     sys.modules["litellm.integrations.custom_logger"] = custom_logger_stub
     try:
-        spec = importlib.util.spec_from_file_location(
-            "aigw_default_model_hook", HOOK
+        limits_spec = importlib.util.spec_from_file_location(
+            "aigw_model_limits", MODEL_LIMITS
         )
+        limits_module = importlib.util.module_from_spec(limits_spec)
+        sys.modules["aigw_model_limits"] = limits_module
+        limits_spec.loader.exec_module(limits_module)
+        spec = importlib.util.spec_from_file_location("aigw_default_model_hook", HOOK)
         module = importlib.util.module_from_spec(spec)
         sys.modules["aigw_default_model_hook"] = module
         spec.loader.exec_module(module)
@@ -141,13 +147,64 @@ def _load_hook_module():
 
 
 class _KeyStub:
-    def __init__(
-        self, metadata=None, models=None, *, user_id=None, key_alias=None
-    ):
+    def __init__(self, metadata=None, models=None, *, user_id=None, key_alias=None):
         self.metadata = metadata
         self.models = models
         self.user_id = user_id
         self.key_alias = key_alias
+
+
+def _model_limit_metadata(
+    *, request_cap: int = 60, minute_cap: int = 100
+) -> dict[str, str]:
+    limits = {
+        "claude-haiku": {
+            "max_output_tokens_per_request": request_cap,
+            "output_tokens_per_utc_minute": minute_cap,
+        }
+    }
+    return {
+        "created_via": "dev-portal",
+        "aigw_project_id": "project-a",
+        "aigw_model_limits_v1": json.dumps(
+            limits, sort_keys=True, separators=(",", ":")
+        ),
+    }
+
+
+class _RedisStub:
+    def __init__(self, results=None, error: Exception | None = None, times=None):
+        self.results = list(results or [[1, 1, 1]])
+        self.error = error
+        self.calls = []
+        self.times = list(times or [(60, 0)])
+
+    async def time(self):
+        if self.error is not None:
+            raise self.error
+        return self.times.pop(0) if len(self.times) > 1 else self.times[0]
+
+    async def eval(self, script, key_count, *arguments):
+        self.calls.append((script, key_count, arguments))
+        if self.error is not None:
+            raise self.error
+        return self.results.pop(0)
+
+
+class _AtomicRedisStub:
+    def __init__(self):
+        self.total = 0
+        self.lock = asyncio.Lock()
+
+    async def time(self):
+        return (60, 0)
+
+    async def eval(self, _script, _key_count, _key, amount, limit, _minute):
+        async with self.lock:
+            if self.total + amount > limit:
+                return [0, self.total, 1]
+            self.total += amount
+            return [1, self.total, 1]
 
 
 class DefaultModelHookWiringContract(unittest.TestCase):
@@ -158,6 +215,10 @@ class DefaultModelHookWiringContract(unittest.TestCase):
         self.assertIn(
             "- ./litellm/aigw_default_model_hook.py:"
             "/app/aigw_default_model_hook.py:ro,Z",
+            compose,
+        )
+        self.assertIn(
+            "- ./litellm/aigw_model_limits.py:/app/aigw_model_limits.py:ro,Z",
             compose,
         )
         self.assertIn(
@@ -174,6 +235,7 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             len(
                 re.findall(
                     r"(?m)^  callbacks: \[\"aigw_otel_callback\.aigw_otel\", "
+                    r"\"aigw_usage_callback\.aigw_usage\", "
                     r"\"aigw_default_model_hook\."
                     r"aigw_default_model_enforcer\"\]$",
                     config,
@@ -189,25 +251,35 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             [
                 "litellm/config.yaml",
                 "litellm/aigw_default_model_hook.py",
+                "litellm/aigw_model_limits.py",
                 "litellm/aigw_openwebui_identity.py",
                 "litellm/aigw_otel_callback.py",
+                "litellm/aigw_usage_callback.py",
                 "secrets/litellm_otel_token",
+                "secrets/litellm_usage_token",
             ],
         )
 
     def test_hook_ships_via_sync_allowlist_and_selinux_boundary(self) -> None:
         source = DOCKER_STACK.read_text(encoding="utf-8")
-        sync = source.split(
-            "- name: Sync allow-listed compose configuration files", 1
-        )[1].split("- name: Render plane-specific container resolver lists", 1)[0]
+        sync = source.split("- name: Sync allow-listed compose configuration files", 1)[
+            1
+        ].split("- name: Render plane-specific container resolver lists", 1)[0]
         self.assertIn("- litellm/aigw_default_model_hook.py", sync)
+        self.assertIn("- litellm/aigw_model_limits.py", sync)
         self.assertIn("- litellm/aigw_openwebui_identity.py", sync)
         self.assertIn("- litellm/aigw_otel_callback.py", sync)
+        self.assertIn("- litellm/aigw_usage_callback.py", sync)
         boundary = source.split(
             "- name: Define the exact SELinux read-only bind-source boundary", 1
         )[1]
         self.assertIn(
             "{'path': stack_dir ~ '/litellm/aigw_default_model_hook.py', "
+            "'recursive': false},",
+            boundary,
+        )
+        self.assertIn(
+            "{'path': stack_dir ~ '/litellm/aigw_model_limits.py', "
             "'recursive': false},",
             boundary,
         )
@@ -222,27 +294,46 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             boundary,
         )
         self.assertIn(
-            "{'path': stack_dir ~ '/secrets/litellm_otel_token', "
+            "{'path': stack_dir ~ '/litellm/aigw_usage_callback.py', "
             "'recursive': false},",
+            boundary,
+        )
+        self.assertIn(
+            "{'path': stack_dir ~ '/secrets/litellm_otel_token', 'recursive': false},",
+            boundary,
+        )
+        self.assertIn(
+            "{'path': stack_dir ~ '/secrets/litellm_usage_token', 'recursive': false},",
             boundary,
         )
 
     def test_model_grammar_and_metadata_key_stay_textually_identical(self) -> None:
         hook = HOOK.read_text(encoding="utf-8")
+        limits = MODEL_LIMITS.read_text(encoding="utf-8")
         portal = PORTAL_CLIENT.read_text(encoding="utf-8")
         identity = IDENTITY.read_text(encoding="utf-8")
-        for source in (hook, portal):
+        for source in (limits, portal):
             self.assertIn(MODEL_NAME_RE_LITERAL, source)
-        for source in (hook, portal, identity):
+        for source in (limits, portal, identity):
             self.assertIn(MODEL_NAME_GRAMMAR, source)
+        self.assertIn("MODEL_NAME_RE,", hook)
         # The metadata field the hook reads is exactly the one the portal
         # stamps at mint and re-stamps on the retroactive policy re-tune.
-        self.assertIn(
-            f"DEFAULT_MODEL_METADATA_KEY = {METADATA_KEY_LITERAL}", hook
-        )
+        self.assertIn(f"DEFAULT_MODEL_METADATA_KEY = {METADATA_KEY_LITERAL}", hook)
         self.assertIn(
             f"PORTAL_DEFAULT_MODEL_METADATA_KEY = {METADATA_KEY_LITERAL}",
             portal,
+        )
+        self.assertIn(
+            f"MODEL_LIMITS_METADATA_KEY = {MODEL_LIMITS_METADATA_KEY_LITERAL}",
+            limits,
+        )
+        self.assertIn(
+            "PORTAL_MODEL_LIMITS_METADATA_KEY = " + MODEL_LIMITS_METADATA_KEY_LITERAL,
+            portal,
+        )
+        self.assertIn(
+            'POLICY_MODEL_LIMITS_ATTRIBUTE = "aigw.policy.model_limits_v1"', identity
         )
 
     def test_docstring_pins_the_sentinel_restricted_key_caveat(self) -> None:
@@ -263,6 +354,13 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             hook,
         )
 
+    def test_auto_router_name_stays_reserved(self) -> None:
+        hook = HOOK.read_text(encoding="utf-8")
+        self.assertIn(
+            "RESERVED_AUTO_ROUTER_MODEL = " + RESERVED_AUTO_ROUTER_LITERAL,
+            hook,
+        )
+
     def test_config_comment_pins_the_sentinel_restricted_key_caveat(self) -> None:
         config = LITELLM_CONFIG.read_text(encoding="utf-8")
         self.assertIn(
@@ -272,7 +370,7 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             "with no model\n"
             "  # allowlist (or the all-proxy-models wildcard) -- LiteLLM's "
             "own auth\n"
-            "  # layer rejects an explicit \"aigw-default\" string on a "
+            '  # layer rejects an explicit "aigw-default" string on a '
             "restricted key\n"
             "  # before this hook runs. Callers should OMIT `model` to "
             "get the project\n"
@@ -282,9 +380,17 @@ class DefaultModelHookWiringContract(unittest.TestCase):
 
     def test_hook_keeps_a_minimal_import_surface(self) -> None:
         hook = HOOK.read_text(encoding="utf-8")
+        limits = MODEL_LIMITS.read_text(encoding="utf-8")
         compile(hook, str(HOOK), "exec")
-        for forbidden in ("subprocess", "socket", "urllib", "requests", "os"):
-            self.assertNotIn(f"import {forbidden}", hook)
+        compile(limits, str(MODEL_LIMITS), "exec")
+        # os is the reviewed exception: Redis host/password come from the
+        # existing Compose environment. Network/process convenience modules
+        # remain forbidden; the hook can reach only redis:6379 through the
+        # narrowly constructed redis-py client.
+        for forbidden in ("subprocess", "socket", "urllib", "requests"):
+            self.assertNotIn(f"import {forbidden}", hook + limits)
+        self.assertIn('host != "redis"', limits)
+        self.assertIn("port=6379", limits)
 
 
 class DefaultModelResolutionBehavior(unittest.TestCase):
@@ -314,6 +420,240 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
                 key, None, data, "completion"
             )
         )
+
+    def _run_limited(
+        self,
+        data,
+        redis,
+        *,
+        metadata=None,
+        models=None,
+        call_type="completion",
+    ):
+        limiter = self.hook.RedisOutputReservations(redis)
+        enforcer = self.hook.AIGWDefaultModelEnforcer(limiter=limiter)
+        key = _KeyStub(metadata=metadata, models=models)
+        return asyncio.run(enforcer.async_pre_call_hook(key, None, data, call_type))
+
+    def test_per_model_limit_reserves_before_dispatch(self) -> None:
+        redis = _RedisStub()
+        data = self._run_limited(
+            {"model": "claude-haiku", "max_tokens": 40},
+            redis,
+            metadata=_model_limit_metadata(),
+            models=["claude-haiku"],
+        )
+        self.assertEqual(data["max_tokens"], 40)
+        self.assertEqual(len(redis.calls), 1)
+        script, key_count, arguments = redis.calls[0]
+        self.assertEqual(key_count, 1)
+        self.assertIn("redis.call('TIME')", script)
+        self.assertIn("redis.call('INFO', 'server')", script)
+        self.assertRegex(arguments[0], r"^aigw:model-output:v1:[0-9a-f]{64}:1$")
+        self.assertEqual(arguments[1:], (40, 100, 1))
+
+    def test_missing_output_cap_uses_server_owned_request_cap(self) -> None:
+        redis = _RedisStub()
+        data = self._run_limited(
+            {"model": "claude-haiku"},
+            redis,
+            metadata=_model_limit_metadata(request_cap=25, minute_cap=100),
+            models=["claude-haiku"],
+        )
+        self.assertEqual(data["max_tokens"], 25)
+        self.assertEqual(redis.calls[0][2][1], 25)
+
+    def test_responses_api_uses_and_enforces_max_output_tokens(self) -> None:
+        redis = _RedisStub()
+        data = self._run_limited(
+            {"model": "claude-haiku"},
+            redis,
+            metadata=_model_limit_metadata(request_cap=25, minute_cap=100),
+            models=["claude-haiku"],
+            call_type="responses",
+        )
+        self.assertEqual(data["max_output_tokens"], 25)
+        self.assertNotIn("max_tokens", data)
+        self.assertEqual(redis.calls[0][2][1], 25)
+
+        denied_redis = _RedisStub()
+        with self.assertRaises(_StubHTTPException) as denied:
+            self._run_limited(
+                {"model": "claude-haiku", "max_output_tokens": 26},
+                denied_redis,
+                metadata=_model_limit_metadata(request_cap=25, minute_cap=100),
+                models=["claude-haiku"],
+                call_type="responses",
+            )
+        self.assertEqual(denied.exception.status_code, 400)
+        self.assertEqual(denied_redis.calls, [])
+
+    def test_any_output_limit_field_over_the_cap_is_denied(self) -> None:
+        redis = _RedisStub()
+        with self.assertRaises(_StubHTTPException) as denied:
+            self._run_limited(
+                {
+                    "model": "claude-haiku",
+                    "max_tokens": 10,
+                    "max_output_tokens": 61,
+                },
+                redis,
+                metadata=_model_limit_metadata(),
+                models=["claude-haiku"],
+                call_type="responses",
+            )
+        self.assertEqual(denied.exception.status_code, 400)
+        self.assertEqual(redis.calls, [])
+
+    def test_request_cap_and_minute_cap_return_safe_client_denials(self) -> None:
+        redis = _RedisStub(results=[[0, 90, 1]])
+        with self.assertRaises(_StubHTTPException) as request_denied:
+            self._run_limited(
+                {"model": "claude-haiku", "max_tokens": 61},
+                redis,
+                metadata=_model_limit_metadata(),
+                models=["claude-haiku"],
+            )
+        self.assertEqual(request_denied.exception.status_code, 400)
+        self.assertEqual(redis.calls, [])
+
+        with self.assertRaises(_StubHTTPException) as minute_denied:
+            self._run_limited(
+                {"model": "claude-haiku", "max_tokens": 40},
+                redis,
+                metadata=_model_limit_metadata(),
+                models=["claude-haiku"],
+            )
+        self.assertEqual(minute_denied.exception.status_code, 429)
+
+    def test_redis_error_restart_and_bad_result_fail_closed(self) -> None:
+        cases = (
+            _RedisStub(error=RuntimeError("secret-bearing redis failure")),
+            _RedisStub(results=[[-1, 0, 1]]),
+            _RedisStub(results=[[1, "not-an-int", 1]]),
+        )
+        for redis in cases:
+            with self.subTest(redis=redis):
+                with self.assertRaises(_StubHTTPException) as denied:
+                    self._run_limited(
+                        {"model": "claude-haiku", "max_tokens": 10},
+                        redis,
+                        metadata=_model_limit_metadata(),
+                        models=["claude-haiku"],
+                    )
+                self.assertEqual(denied.exception.status_code, 503)
+                self.assertNotIn("secret-bearing", str(denied.exception.detail))
+
+    def test_utc_minute_boundary_retries_once_without_losing_atomicity(self) -> None:
+        redis = _RedisStub(
+            results=[[-3, 0, 2], [1, 10, 2]],
+            times=[(60, 999999), (120, 0)],
+        )
+        self._run_limited(
+            {"model": "claude-haiku", "max_tokens": 10},
+            redis,
+            metadata=_model_limit_metadata(),
+            models=["claude-haiku"],
+        )
+        self.assertEqual(len(redis.calls), 2)
+
+    def test_policy_must_be_canonical_and_explicitly_scoped(self) -> None:
+        canonical = _model_limit_metadata()
+        malformed = dict(canonical)
+        malformed["aigw_model_limits_v1"] = json.dumps(
+            json.loads(canonical["aigw_model_limits_v1"]), indent=2
+        )
+        for metadata, models in (
+            (malformed, ["claude-haiku"]),
+            (canonical, []),
+            (canonical, ["all-proxy-models"]),
+            (canonical, ["claude-sonnet"]),
+        ):
+            with self.subTest(metadata=metadata, models=models):
+                with self.assertRaises(_StubHTTPException) as denied:
+                    self._run_limited(
+                        {"model": "claude-haiku", "max_tokens": 10},
+                        _RedisStub(),
+                        metadata=metadata,
+                        models=models,
+                    )
+                self.assertEqual(denied.exception.status_code, 400)
+
+    def test_each_retry_and_stream_attempt_keeps_its_conservative_reservation(
+        self,
+    ) -> None:
+        redis = _RedisStub(results=[[1, 40, 1], [1, 80, 1]])
+        for _attempt in range(2):
+            self._run_limited(
+                {"model": "claude-haiku", "max_tokens": 40, "stream": True},
+                redis,
+                metadata=_model_limit_metadata(),
+                models=["claude-haiku"],
+                call_type="acompletion",
+            )
+        self.assertEqual([call[2][1] for call in redis.calls], [40, 40])
+        source = HOOK.read_text(encoding="utf-8") + MODEL_LIMITS.read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("async_post_call_success_hook", source)
+        self.assertNotIn("async_post_call_failure_hook", source)
+
+    def test_parallel_requests_cannot_bypass_the_atomic_minute_reservation(
+        self,
+    ) -> None:
+        async def run_parallel():
+            redis = _AtomicRedisStub()
+            enforcer = self.hook.AIGWDefaultModelEnforcer(
+                limiter=self.hook.RedisOutputReservations(redis)
+            )
+            key = _KeyStub(metadata=_model_limit_metadata(), models=["claude-haiku"])
+
+            async def one_request():
+                try:
+                    await enforcer.async_pre_call_hook(
+                        key,
+                        None,
+                        {"model": "claude-haiku", "max_tokens": 60},
+                        "acompletion",
+                    )
+                    return 200
+                except _StubHTTPException as error:
+                    return error.status_code
+
+            statuses = await asyncio.gather(one_request(), one_request())
+            return statuses, redis.total
+
+        statuses, total = asyncio.run(run_parallel())
+        self.assertEqual(sorted(statuses), [200, 429])
+        self.assertEqual(total, 60)
+
+    def test_limit_audit_is_bounded_and_carries_no_request_content(self) -> None:
+        with self.assertLogs("litellm.aigw_model_limits", level="INFO") as logs:
+            self._run_limited(
+                {
+                    "model": "claude-haiku",
+                    "max_tokens": 10,
+                    "messages": [{"content": "do-not-log-this-prompt"}],
+                    "request_id": "do-not-log-this-request",
+                    "api_key": "do-not-log-this-key",
+                },
+                _RedisStub(),
+                metadata=_model_limit_metadata(),
+                models=["claude-haiku"],
+            )
+        joined = "\n".join(logs.output)
+        self.assertIn('"event":"aigw.model.limit"', joined)
+        self.assertIn('"project":"project-a"', joined)
+        self.assertIn('"model":"claude-haiku"', joined)
+        for forbidden in (
+            "do-not-log-this-prompt",
+            "do-not-log-this-request",
+            "do-not-log-this-key",
+            "messages",
+            "request_id",
+            "api_key",
+        ):
+            self.assertNotIn(forbidden, joined)
 
     def test_missing_model_resolves_to_the_projects_default(self) -> None:
         metadata = {
@@ -345,7 +685,14 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
     def test_keys_without_a_default_are_treated_natively(self) -> None:
         # No portal default: a missing model stays missing so LiteLLM's own
         # rejection applies, and an explicit model passes through.
-        data = self._run_hook({}, metadata={"created_via": "dev-portal"})
+        data = self._run_hook(
+            {},
+            metadata={
+                "created_via": "dev-portal",
+                "aigw_project_id": "ai-gateway",
+            },
+            models=["gpt"],
+        )
         self.assertNotIn("model", data)
         data = self._run_hook({"model": "gpt"}, metadata={})
         self.assertEqual(data["model"], "gpt")
@@ -374,6 +721,67 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
         for models in (None, [], ["all-proxy-models"]):
             data = self._run_hook({}, metadata=metadata, models=models)
             self.assertEqual(data["model"], "claude-haiku")
+
+    def test_portal_wildcard_keys_are_denied_before_future_models_can_match(
+        self,
+    ) -> None:
+        metadata = {
+            "created_via": "dev-portal",
+            "aigw_project_id": "ai-gateway",
+        }
+        for models in (None, [], ["all-proxy-models"]):
+            with self.subTest(models=models):
+                with self.assertRaises(_StubHTTPException) as denied:
+                    self._run_hook(
+                        {"model": "claude-sonnet"},
+                        metadata=metadata,
+                        models=models,
+                    )
+                self.assertEqual(denied.exception.status_code, 400)
+
+    def test_reserved_auto_router_is_denied_for_every_key_scope(self) -> None:
+        keys = (
+            {"metadata": {}, "models": ["aigw-auto"]},
+            {
+                "metadata": {
+                    "created_via": "dev-portal",
+                    "aigw_project_id": "ai-gateway",
+                },
+                "models": ["aigw-auto"],
+            },
+            {"metadata": {}, "models": None},
+            {"metadata": {}, "models": []},
+            {"metadata": {}, "models": ["all-proxy-models"]},
+        )
+        for key in keys:
+            with self.subTest(key=key):
+                with self.assertRaises(_StubHTTPException) as denied:
+                    self._run_hook({"model": "aigw-auto"}, **key)
+                self.assertEqual(denied.exception.status_code, 400)
+                self.assertEqual(
+                    denied.exception.detail,
+                    {"error": "automatic model routing is not enabled"},
+                )
+
+    def test_reserved_auto_router_default_denies_every_request(self) -> None:
+        metadata = {"aigw_default_model": "aigw-auto"}
+        for request in (
+            {},
+            {"model": "aigw-default"},
+            {"model": "claude-sonnet"},
+        ):
+            with self.subTest(request=request):
+                with self.assertRaises(_StubHTTPException) as denied:
+                    self._run_hook(
+                        dict(request),
+                        metadata=metadata,
+                        models=["aigw-auto", "claude-sonnet"],
+                    )
+                self.assertEqual(denied.exception.status_code, 400)
+                self.assertEqual(
+                    denied.exception.detail,
+                    {"error": ("this key's automatic-routing policy is not enabled")},
+                )
 
     def test_unreadable_metadata_fails_closed_when_a_default_is_needed(
         self,
@@ -422,6 +830,35 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
             True,
         )
 
+    def test_valid_openwebui_key_cannot_use_reserved_auto_router(self) -> None:
+        metadata = {
+            "aigw_key_kind": "service",
+            "aigw_service": "open-webui",
+            "aigw_project_id": "open-webui",
+        }
+        request = {
+            "model": "aigw-auto",
+            "proxy_server_request": {
+                "headers": {"X-OpenWebUI-User-Jwt": "valid.jwt.token"}
+            },
+            "secret_fields": {
+                "raw_headers": {"X-OpenWebUI-User-Jwt": "valid.jwt.token"}
+            },
+        }
+        with self.assertRaises(_StubHTTPException) as denied:
+            self._run_hook(
+                request,
+                metadata=metadata,
+                models=["all-proxy-models"],
+                user_id="svc-open-webui",
+                key_alias="aigw-open-webui-service",
+            )
+        self.assertEqual(denied.exception.status_code, 400)
+        self.assertEqual(
+            denied.exception.detail,
+            {"error": "automatic model routing is not enabled"},
+        )
+
     def test_openwebui_missing_invalid_expired_and_conflicting_assertions_deny(
         self,
     ) -> None:
@@ -446,9 +883,7 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
             ),
         )
         for cleaned_headers, raw_headers in cases:
-            with self.subTest(
-                cleaned_headers=cleaned_headers, raw_headers=raw_headers
-            ):
+            with self.subTest(cleaned_headers=cleaned_headers, raw_headers=raw_headers):
                 request = {
                     "model": "claude-sonnet",
                     "proxy_server_request": {
@@ -515,7 +950,9 @@ class DefaultModelResolutionBehavior(unittest.TestCase):
                 "metadata": {
                     "created_via": "dev-portal",
                     "aigw_username": "directory.user",
+                    "aigw_project_id": "project-a",
                 },
+                "models": ["claude-sonnet"],
                 "user_id": "directory.user",
                 "key_alias": "portal-key",
             },

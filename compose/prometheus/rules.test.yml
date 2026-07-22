@@ -1,0 +1,141 @@
+rule_files:
+  - rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: watchdog-is-always-firing
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: AIGatewayWatchdog
+        exp_alerts:
+          - exp_labels:
+              alert_class: watchdog
+              owner: platform-operations
+              severity: none
+            exp_annotations:
+              summary: AI Gateway alert path watchdog
+              description: This alert must always be firing in Alertmanager and visible in Grafana.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#alert-path-watchdog
+
+  - name: cpu-memory-and-disk-pressure-fire-and-recover
+    interval: 1m
+    input_series:
+      - series: 'node_cpu_seconds_total{job="node-exporter",instance="gateway",cpu="0",mode="idle"}'
+        values: '0+3x22'
+      - series: 'node_memory_MemAvailable_bytes{job="node-exporter",instance="gateway"}'
+        values: '10x22'
+      - series: 'node_memory_MemTotal_bytes{job="node-exporter",instance="gateway"}'
+        values: '100x22'
+      - series: 'node_disk_io_time_seconds_total{job="node-exporter",instance="gateway",device="vda"}'
+        values: '0+57x22'
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: AIGatewayHostCPUHigh
+        exp_alerts:
+          - exp_labels:
+              alert_class: host-cpu
+              instance: gateway
+              owner: platform-operations
+              severity: warning
+            exp_annotations:
+              summary: AI Gateway host CPU is over 85% busy
+              description: Host CPU has stayed above 85% for fifteen minutes.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#host-capacity-alerts
+      - eval_time: 11m
+        alertname: AIGatewayHostMemoryLow
+        exp_alerts:
+          - exp_labels:
+              alert_class: host-memory
+              instance: gateway
+              job: node-exporter
+              owner: platform-operations
+              severity: warning
+            exp_annotations:
+              summary: AI Gateway host has less than 15% memory available
+              description: Available host memory has stayed below 15% for ten minutes.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#host-capacity-alerts
+      - eval_time: 16m
+        alertname: AIGatewayHostDiskIOSaturation
+        exp_alerts:
+          - exp_labels:
+              alert_class: host-disk-io
+              device: vda
+              instance: gateway
+              job: node-exporter
+              owner: platform-operations
+              severity: critical
+            exp_annotations:
+              summary: AI Gateway host disk is over 90% busy
+              description: Disk vda has been busy over 90% of the time for ten minutes.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#host-capacity-alerts
+      - eval_time: 30m
+        alertname: AIGatewayHostCPUHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: AIGatewayHostMemoryLow
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: AIGatewayHostDiskIOSaturation
+        exp_alerts: []
+
+  - name: cribl-queue-pressure-fires-and-recovers
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_queue_size{job="alloy",component_id="otelcol.exporter.otlp.cribl"}'
+        values: '90x7 10x8'
+      - series: 'otelcol_exporter_queue_capacity{job="alloy",component_id="otelcol.exporter.otlp.cribl"}'
+        values: '100x16'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AIGatewayAlloyExporterQueueSaturation
+        exp_alerts:
+          - exp_labels:
+              alert_class: cribl-delivery
+              component_id: otelcol.exporter.otlp.cribl
+              job: alloy
+              owner: platform-operations
+              severity: warning
+            exp_annotations:
+              summary: Cribl telemetry queue is over 80% full
+              description: The admitted telemetry delivery queue is close to exhaustion.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#cribl-delivery-alerts
+      - eval_time: 14m
+        alertname: AIGatewayAlloyExporterQueueSaturation
+        exp_alerts: []
+
+  - name: filesystem-space-pressure-fires-and-recovers
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter",instance="gateway",device="/dev/vda1",mountpoint="/",fstype="xfs"}'
+        values: '10x13 50x18'
+      - series: 'node_filesystem_size_bytes{job="node-exporter",instance="gateway",device="/dev/vda1",mountpoint="/",fstype="xfs"}'
+        values: '100x31'
+      - series: 'node_filesystem_readonly{job="node-exporter",instance="gateway",device="/dev/vda1",mountpoint="/",fstype="xfs"}'
+        values: '0x31'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: AIGatewayFilesystemSpaceLow
+        exp_alerts:
+          - exp_labels:
+              alert_class: filesystem-space
+              device: /dev/vda1
+              fstype: xfs
+              instance: gateway
+              job: node-exporter
+              mountpoint: /
+              owner: platform-operations
+              severity: warning
+            exp_annotations:
+              summary: AI Gateway host filesystem has less than 15% free
+              description: Filesystem / on /dev/vda1 is approaching capacity.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#host-capacity-alerts
+      - eval_time: 30m
+        alertname: AIGatewayFilesystemSpaceLow
+        exp_alerts: []

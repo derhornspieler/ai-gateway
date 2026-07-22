@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import ast
 import re
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PROMETHEUS = ROOT / "compose/prometheus/prometheus.yml"
+ALLOY = ROOT / "compose/alloy/config.alloy"
 RULES = ROOT / "compose/prometheus/rules.yml"
+RULE_TESTS = ROOT / "compose/prometheus/rules.test.yml"
 COMPOSE = ROOT / "compose/docker-compose.yml"
 VERIFY = ROOT / "ansible/roles/verify/tasks/main.yml"
 
@@ -30,33 +31,45 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.prometheus = PROMETHEUS.read_text(encoding="utf-8")
+        cls.alloy = ALLOY.read_text(encoding="utf-8")
         cls.rules = RULES.read_text(encoding="utf-8")
+        cls.rule_tests = RULE_TESTS.read_text(encoding="utf-8")
         cls.compose = COMPOSE.read_text(encoding="utf-8")
         cls.verify = VERIFY.read_text(encoding="utf-8")
 
-    def test_scrape_inventory_is_exact_and_reachable_on_private_planes(self) -> None:
-        job_blocks = re.findall(
-            r"^  - job_name: ([a-z0-9-]+)(.*?)(?=^  - job_name: |\Z)",
-            self.prometheus,
-            flags=re.MULTILINE | re.DOTALL,
-        )
-        targets: set[tuple[str, str]] = set()
-        for job, block in job_blocks:
-            for rendered in re.findall(r"targets: (\[[^\n]+\])", block):
-                for target in ast.literal_eval(rendered):
-                    targets.add((job, target))
+    def test_alloy_owns_the_exact_private_scrape_inventory(self) -> None:
+        self.assertIn("scrape_configs: []", self.prometheus)
+        scrape = self.alloy.split('prometheus.scrape "gateway"', 1)[1].split(
+            'otelcol.receiver.prometheus "gateway"', 1
+        )[0]
+        targets = {
+            line.strip().removesuffix(",")
+            for line in scrape.splitlines()
+            if line.strip().startswith('{ "__address__"')
+        }
         expected = {
-            ("traefik", "traefik-int:9100"),
-            ("traefik", "traefik-adm:9100"),
-            ("envoy-egress", "envoy-egress:9902"),
-            ("keycloak", "keycloak:9000"),
-            ("alloy", "alloy:12345"),
-            ("grafana", "grafana:3000"),
-            ("prometheus", "prometheus-observability:9090"),
-            ("loki", "loki:3100"),
-            ("node-exporter", "node-exporter:9100"),
+            '{ "__address__" = "traefik-int:9100", "job" = "traefik" }',
+            '{ "__address__" = "traefik-adm:9100", "job" = "traefik" }',
+            '{ "__address__" = "envoy-egress:9902", "__metrics_path__" = "/stats/prometheus", "job" = "envoy-egress" }',
+            '{ "__address__" = "keycloak:9000", "__metrics_path__" = "/metrics", "job" = "keycloak" }',
+            '{ "__address__" = sys.env("ALLOY_OBSERVABILITY_IP") + ":12345", "job" = "alloy" }',
+            '{ "__address__" = "grafana:3000", "job" = "grafana" }',
+            '{ "__address__" = "prometheus-observability:9090", "job" = "prometheus" }',
+            '{ "__address__" = "alertmanager:9093", "job" = "alertmanager" }',
+            '{ "__address__" = "loki:3100", "job" = "loki" }',
+            '{ "__address__" = "node-exporter:9100", "job" = "node-exporter" }',
         }
         self.assertEqual(targets, expected)
+        self.assertIn("scrape_interval = \"15s\"", scrape)
+        self.assertIn(
+            "forward_to = [otelcol.receiver.prometheus.gateway.receiver]", scrape
+        )
+        receiver = self.alloy.split(
+            'otelcol.receiver.prometheus "gateway"', 1
+        )[1].split('otelcol.exporter.loki "local"', 1)[0]
+        self.assertIn(
+            "metrics = [otelcol.processor.memory_limiter.default.input]", receiver
+        )
 
         shared_plane = {
             "traefik-int": "net-metrics",
@@ -66,21 +79,27 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "alloy": "net-observability",
             "grafana": "net-observability",
             "prometheus": "net-observability",
+            "alertmanager": "net-observability",
             "loki": "net-observability",
             "node-exporter": "net-metrics",
         }
+        alloy_service = service_block(self.compose, "alloy")
         prometheus_service = service_block(self.compose, "prometheus")
         self.assertIn("aliases: [prometheus-observability]", prometheus_service)
         for service_name, network in shared_plane.items():
-            self.assertIn(network, prometheus_service)
             self.assertIn(network, service_block(self.compose, service_name))
+        self.assertIn("net-metrics: {}", alloy_service)
+        self.assertNotIn("net-metrics", prometheus_service)
         for forbidden in ("vault", "litellm", "postgres", "redis", "tempo"):
-            self.assertFalse(any(job == forbidden for job, _target in targets))
+            self.assertNotIn(f'"job" = "{forbidden}"', scrape)
 
-    def test_alerts_cover_reviewed_restart_safe_failure_signals(self) -> None:
+    def test_alerts_cover_the_exact_collectable_lifecycle_and_capacity_signals(self) -> None:
         alerts = set(re.findall(r"^      - alert: (\S+)$", self.rules, re.MULTILINE))
         expected = {
+            "AIGatewayWatchdog",
             "AIGatewayScrapeTargetDown",
+            "AIGatewayAlertmanagerUnavailable",
+            "AIGatewayAlertmanagerDeliveryFailures",
             "AIGatewayAlloyExporterSendFailures",
             "AIGatewayAlloyExporterEnqueueFailures",
             "AIGatewayAlloyExporterQueueSaturation",
@@ -88,11 +107,45 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "AIGatewayLokiWriteRetriesHigh",
             "AIGatewayPrometheusRemoteWriteFailures",
             "AIGatewayPrometheusRemoteWriteBacklog",
+            "AIGatewayHostCPUHigh",
+            "AIGatewayHostCPUCritical",
+            "AIGatewayHostLoadHigh",
+            "AIGatewayHostLoadCritical",
+            "AIGatewayHostMemoryLow",
+            "AIGatewayHostMemoryCritical",
+            "AIGatewayHostSwapHigh",
+            "AIGatewayHostOOMKill",
             "AIGatewayFilesystemSpaceLow",
             "AIGatewayFilesystemSpaceCritical",
             "AIGatewayFilesystemPredictedFull",
+            "AIGatewayFilesystemInodesLow",
+            "AIGatewayFilesystemInodesCritical",
+            "AIGatewayHostDiskLatencyHigh",
+            "AIGatewayHostDiskIOSaturation",
+            "AIGatewayHostFileDescriptorsHigh",
+            "AIGatewayHostFileDescriptorsCritical",
+            "AIGatewayServiceLatencyHigh",
+            "AIGatewayServiceLatencyCritical",
+            "AIGatewayServiceErrorRateHigh",
+            "AIGatewayServiceErrorRateCritical",
+            "AIGatewayCertificateExpiresSoon",
+            "AIGatewayCertificateExpiryCritical",
         }
         self.assertEqual(alerts, expected)
+
+        for name in expected:
+            rule = alert_block(self.rules, name)
+            self.assertIn("owner: platform-operations", rule, name)
+            self.assertIn("alert_class:", rule, name)
+            self.assertIn(
+                'runbook_url: "/d/aigw-alerts-capacity/'
+                'ai-gateway-alerts-and-capacity?viewPanel=17"',
+                rule,
+                name,
+            )
+            self.assertIn("runbook_source: \"docs/observability-operations.md#", rule, name)
+            self.assertNotIn("docs.aigw.internal", rule, name)
+            self.assertRegex(rule, r"severity: (none|warning|critical)", name)
 
         fragments = {
             "AIGatewayScrapeTargetDown": ("up == 0",),
@@ -140,8 +193,8 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
         self.assertIn("for: 5m", send_failures)
         self.assertIn("severity: warning", send_failures)
         self.assertIn("persistent queue", send_failures)
-        self.assertNotIn("send_failed_spans", send_failures)
-        self.assertNotIn("send_failed_metric_points", send_failures)
+        self.assertIn("send_failed_spans", send_failures)
+        self.assertIn("send_failed_metric_points", send_failures)
 
         enqueue_failures = alert_block(
             self.rules, "AIGatewayAlloyExporterEnqueueFailures"
@@ -151,35 +204,153 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
         self.assertIn("delivery data was lost", enqueue_failures)
         self.assertNotIn("increase(", enqueue_failures)
         self.assertIn('component_id="otelcol.exporter.otlp.cribl"} > 0', enqueue_failures)
-        self.assertNotIn("enqueue_failed_spans", enqueue_failures)
-        self.assertNotIn("enqueue_failed_metric_points", enqueue_failures)
+        self.assertIn("enqueue_failed_spans", enqueue_failures)
+        self.assertIn("enqueue_failed_metric_points", enqueue_failures)
 
-        self.assertNotIn("\nalerting:", self.prometheus)
+        self.assertIn("\nalerting:\n", self.prometheus)
+        self.assertIn("- targets: [alertmanager:9093]", self.prometheus)
+        self.assertIn("api_version: v2", self.prometheus)
+        self.assertIn("evaluation_interval: 15s", self.prometheus)
+
+        # No rule may claim a signal this deployment does not continuously
+        # collect. Docker lifecycle/health needs the Docker API, Vault seal
+        # state needs a reliable live exporter, backup state needs a producer,
+        # and host networking is not truthful from the container namespace.
+        lowered = self.rules.lower()
+        for unsupported in (
+            "container_last_seen",
+            "container_start_time_seconds",
+            "docker_container",
+            "vault_core_unsealed",
+            "backup_last_success",
+            "node_network_",
+            "node_nf_conntrack_",
+        ):
+            self.assertNotIn(unsupported, lowered)
+
+    def test_alert_state_returns_to_cribl_only_over_private_mtls(self) -> None:
+        alert_names = set(
+            re.findall(r"^      - alert: (\S+)$", self.rules, re.MULTILINE)
+        )
+        prometheus_allowlist = re.search(
+            r"(?m)^        regex: (AIGateway\S+)$", self.prometheus
+        )
+        alloy_allowlist = re.search(
+            r'(?m)^    regex         = "(AIGateway[^"]+)"$', self.alloy
+        )
+        self.assertIsNotNone(prometheus_allowlist)
+        self.assertIsNotNone(alloy_allowlist)
+        self.assertEqual(set(prometheus_allowlist.group(1).split("|")), alert_names)
+        self.assertEqual(set(alloy_allowlist.group(1).split("|")), alert_names)
+        self.assertNotIn("AIGatewayPreprodAcceptance", alert_names)
+
+        for required in (
+            "url: https://alloy-alert-state:12346/api/v1/metrics/write",
+            "ca_file: /run/secrets/alert_state_ca.pem",
+            "cert_file: /run/secrets/alert_state_prometheus.crt",
+            "key_file: /run/secrets/alert_state_prometheus.key",
+            "server_name: alloy-alert-state",
+            "min_version: TLS13",
+            "regex: ALERTS|ALERTS_FOR_STATE",
+            "action: labelkeep",
+        ):
+            self.assertIn(required, self.prometheus)
+
+        branch = self.alloy.split(
+            'prometheus.receive_http "alert_state"', 1
+        )[1].split('prometheus.scrape "gateway"', 1)[0]
+        for required in (
+            'listen_address       = sys.env("ALLOY_OBSERVABILITY_IP")',
+            "listen_port          = 12346",
+            'client_auth_type = "RequireAndVerifyClientCert"',
+            'client_ca_file   = "/run/secrets/alert_state_ca.pem"',
+            'min_version      = "TLS13"',
+            'regex         = "ALERTS|ALERTS_FOR_STATE"',
+            'regex  = "__name__|alertname|alertstate|severity|owner|alert_class|instance|job|device|mountpoint|service|component_id|remote_name"',
+            'replacement  = "alert-state"',
+            "max_cache_size = 128",
+            "metrics = [otelcol.processor.batch.cribl_metrics.input]",
+        ):
+            self.assertIn(required, branch)
+        self.assertNotIn("prometheus.remote_write.local", branch)
+        self.assertNotIn("otelcol.exporter.prometheus.local", branch)
+
+        alloy = service_block(self.compose, "alloy")
+        prometheus = service_block(self.compose, "prometheus")
+        self.assertIn("aliases: [alloy-alert-state]", alloy)
+        for path in (
+            "alert_state_ca.pem",
+            "alert_state_alloy.crt",
+            "alert_state_alloy.key",
+        ):
+            self.assertIn(path, alloy)
+        for path in (
+            "alert_state_ca.pem",
+            "alert_state_prometheus.crt",
+            "alert_state_prometheus.key",
+        ):
+            self.assertIn(path, prometheus)
 
     def test_deploy_verifier_requires_exact_targets_and_healthy_rules(self) -> None:
         self.assertIn(
-            "Prove Prometheus loaded the exact reviewed scrape and alert graph",
+            "Prove Prometheus received the exact Alloy scrape and alert graph",
             self.verify,
         )
         for target in (
             "prometheus-observability:9090",
+            "alertmanager:9093",
             "loki:3100",
             "node-exporter:9100",
-            "alloy:12345",
+            'f"{sys.argv[2]}:12345"',
         ):
             self.assertIn(target, self.verify)
+        self.assertIn('fetch("/query?query=up")["result"]', self.verify)
+        self.assertNotIn('/targets?state=active', self.verify)
         for alert in (
-            "AIGatewayScrapeTargetDown",
-            "AIGatewayAlloyExporterSendFailures",
-            "AIGatewayAlloyExporterEnqueueFailures",
-            "AIGatewayAlloyExporterQueueSaturation",
-            "AIGatewayLokiWriteDrops",
-            "AIGatewayPrometheusRemoteWriteFailures",
-            "AIGatewayPrometheusRemoteWriteBacklog",
+            "AIGatewayWatchdog",
+            "AIGatewayAlertmanagerUnavailable",
+            "AIGatewayHostCPUCritical",
+            "AIGatewayFilesystemInodesCritical",
+            "AIGatewayHostDiskIOSaturation",
+            "AIGatewayServiceLatencyCritical",
+            "AIGatewayServiceErrorRateCritical",
+            "AIGatewayCertificateExpiryCritical",
         ):
             self.assertIn(alert, self.verify)
         self.assertNotIn("AIGatewayTempoRefusedSpans", self.verify)
         self.assertIn('rule.get("health") != "ok"', self.verify)
+
+    def test_fault_inputs_cover_collectable_pressure_and_recovery(self) -> None:
+        for required in (
+            "watchdog-is-always-firing",
+            "cpu-memory-and-disk-pressure-fire-and-recover",
+            "cribl-queue-pressure-fires-and-recovers",
+            "filesystem-space-pressure-fires-and-recovers",
+            "node_cpu_seconds_total",
+            "node_memory_MemAvailable_bytes",
+            "node_disk_io_time_seconds_total",
+            "otelcol_exporter_queue_size",
+            "node_filesystem_avail_bytes",
+            "node_filesystem_size_bytes",
+            "node_filesystem_readonly",
+            "AIGatewayHostCPUHigh",
+            "AIGatewayHostMemoryLow",
+            "AIGatewayHostDiskIOSaturation",
+            "AIGatewayAlloyExporterQueueSaturation",
+            "AIGatewayFilesystemSpaceLow",
+        ):
+            self.assertIn(required, self.rule_tests)
+        # The empty expected sets are explicit recovery checks after each
+        # injected pressure series disappears or returns below threshold.
+        self.assertGreaterEqual(self.rule_tests.count("exp_alerts: []"), 5)
+        for unsupported in (
+            "node_network_",
+            "node_nf_conntrack_",
+            "docker_container",
+            "vault_core_unsealed",
+            "backup_last_success",
+        ):
+            self.assertNotIn(unsupported, self.rule_tests)
 
     def test_volume_initializer_logs_have_exact_compose_routing_labels(self) -> None:
         initializer = service_block(self.compose, "volume-init")

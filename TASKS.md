@@ -6,10 +6,17 @@
 
 - [ ] **Complete the current source candidate release acceptance** - The
   release built from `77c50d3` is the last fully tested exact seed. The current
-  source removes committed deterministic PreProd credentials and the static
-  WIF mock token. The WIF image therefore changed. Do not promote the older
-  archive as the current release. Build a new schema-v2 seed and repeat the
-  clean-room Ansible PreProd test after these fixes reach `main`.
+  source changes PreProd credentials, image digests, alerting, telemetry, model
+  controls, usage, and pricing. Runtime image inputs changed. Do not promote
+  the older archive as the current release. After the feature work settles,
+  build a new schema-v2 seed from the same candidate commit and repeat the
+  clean-room Ansible PreProd test before pushing that commit to `main`.
+
+  - Keep working when one external or environment-specific check cannot run.
+    Do not weaken that check or claim it passed. Finish every independent task
+    and list the exact uncompleted check, reason, evidence, and next command in
+    the final release summary. An unavailable outside dependency is a recorded
+    exception, not a reason to abandon the rest of the goal.
 
   - The previous Anthropic-only ARM64 production release contains 23 external and 17
     custom images. Its archive SHA-256 is
@@ -44,9 +51,9 @@
     window gate on the existing production Linux host. No rehearsal VM will be
     created, and the local receipt does not claim those commands ran.
   - The previous release passed 875 infrastructure contracts, 532 Python
-    service tests, four Go
-    race/vet suites, Compose, identity, ShellCheck, yamllint, Bandit, Ruff,
-    dependency audit, documentation links, and Ansible syntax checks passed.
+    service tests, four Go race/vet suites, Compose, identity, ShellCheck,
+    yamllint, Bandit, Ruff, dependency audit, documentation links, and Ansible
+    syntax checks.
   - Final exact-manifest teardown removed 26 containers, 19 networks, 11
     volumes, all 44 release aliases and image IDs, and six run-state files
     while preserving all 16 unrelated image IDs. Separate read-only checks
@@ -67,13 +74,29 @@
     fixes pass local contract tests, a byte-for-byte two-build Envoy check, and
     an isolated signed-VEX fetch with no Docker Desktop credential fallback.
     Push them and require the complete GitHub image matrices to pass.
-  - Current-source local validation passes 882 infrastructure contracts,
-    Compose rendering, identity policy, documentation links, ShellCheck,
-    PreProd Ansible syntax, and the changed WIF Go race/vet suite.
-  - Real-browser acceptance remains `BLOCKED/NOT RUN`: this session exposed no
-    browser backend. The browserless OIDC, cookie-scope, role, logout, and
-    callback tests passed, but they do not replace the manual browser checklist.
-    Do not create a Rocky or Parallels test VM for either remaining gate.
+  - Current-source checks are being rerun as the active features settle. Do not
+    copy an interim test count into release evidence. Record the final count
+    only after every source-level gate passes on the exact candidate commit.
+  - Real-browser acceptance is `NOT RUN` for the current candidate. A browser
+    controller is available now, but the exact seed is not running yet. The
+    browserless OIDC, cookie, role, logout, and callback tests do not replace
+    the browser checklist. Do not create a Rocky or Parallels test VM for this
+    gate.
+
+- [ ] **Prove one-time developer keys cannot return through browser history** -
+  The portal now hides the key panel until its exit guards are active. It
+  clears the plaintext and removes the whole panel on a portal-tab change,
+  form submission, link navigation, page hide, or history navigation. Normal
+  links replace the secret-bearing history entry. A restored page checks its
+  consumed marker and browser navigation type even when `pageshow.persisted`
+  is false. The server still sends `Cache-Control: no-store` and never stores
+  the plaintext for redisplay.
+
+  - The developer-portal security suite and repository contracts pass.
+  - Keep this item open until the exact seeded PreProd browser test creates a
+    temporary key, leaves the page, uses Back and Forward, and proves that the
+    key and generated snippets never return. Revoke that test key and record no
+    plaintext value.
 
 <a id="provide-protected-dhi-credentials-and-finish-the-release-security-audit"></a>
 
@@ -91,12 +114,15 @@
   - Keep this as one release gate with the active current-candidate item. The
     customer Cribl receipt and retention are a separate acceptance task.
 
-- [x] ~~Finish the current-candidate Cribl release receipt~~ (2026-07-22) -
-  The exact new preprod seed produced the final receipt. Manifest
+- [x] ~~Record the last accepted seed's Cribl release receipt~~ (2026-07-22) -
+  The last accepted exact PreProd seed produced this receipt. Manifest
   `c19b82a39c5d07342361d431e8bad0d978ef71c314f530c1c0d9aa4689a5eea7`
   passed the natural Keycloak, authenticated LiteLLM, malformed-field,
   redaction, TLS, bounded backpressure, outage, and recovery checks twice,
   including after the Vault restart.
+
+  Later runtime and telemetry changes still require the Cribl receipt to run
+  again as part of the open current-candidate exact-seed gate above.
 
   - Alloy applies one common-record gate with a server-owned schema,
     environment, producer, matching service name, and recent UTC time.
@@ -128,18 +154,23 @@
   also required on the gateway queue.
 - [ ] **GitHub history and owner cleanup decision** - Forward-tree cleanup is in scope now. Removing personal author metadata from old commits or changing the repository owner requires an explicit repository transfer/history-rewrite decision.
 
-## Someday
+## Active alerting work
 
-- [ ] **Add proactive capacity alerts to the Grafana dashboard** - Build
-  this after the current release work is complete. Docker health checks only
+- [ ] **Finish proactive capacity alerts in the Grafana dashboard** - Source
+  now includes the private Alertmanager, Prometheus rule groups, Grafana data
+  source, Alerts and Capacity dashboard, and fault/recovery rule tests. Keep
+  this item open until the current exact seed passes the live alert path and
+  teardown. Docker health checks only
   mark one container healthy or unhealthy; they do not forecast host pressure
   or show an operator what needs attention. Keep the reviewed Prometheus rules
   as the only source of alert evaluation. Use Alertmanager for grouping,
   deduplication, inhibition, and resolved lifecycle state, and show active and
   recently resolved alerts in Grafana. The Grafana dashboard is the approved
   destination; do not require email, Slack, Teams, or another external
-  receiver. This operations-alert path is separate from the Cribl security log
-  export: never send alert payloads through the SOC log schema.
+  receiver. Alloy is the one outbound telemetry choke point. Mirror the
+  admitted metrics, logs, and traces to Cribl as well as their local stores.
+  Alert state should travel through the same metric stream; do not add a second
+  direct Alertmanager-to-Cribl path.
   - Keep the existing scrape-down, telemetry-queue, filesystem-low,
     filesystem-critical, and 24-hour disk-exhaustion forecast rules. Add
     reviewed warning and critical rules for CPU/load saturation, memory and
@@ -160,6 +191,9 @@
   - Add a dead-man/watchdog rule and dashboard panel so a silent Prometheus to
     Alertmanager to Grafana path is visible. Bind both APIs only to their
     private observability network and expose no unauthenticated host port.
+    Do not add an Alertmanager FQDN by default; Grafana is the operator-facing
+    alert UI. A future native Alertmanager UI needs its own ADM-only edge,
+    OIDC, cookie, CSP, and browser review.
   - Add Grafana capacity and active-alert views for the same rules; do not
     create a second set of conflicting Grafana-managed alert rules. Update the
     observability architecture, operator runbook, troubleshooting steps, and
@@ -171,6 +205,22 @@
     which host-level signals local Docker Desktop preprod cannot faithfully
     prove. Do not claim those host-only checks passed based on Docker Desktop
     results, and do not require a separate rehearsal VM.
+  - Source and contract tests cover the watchdog, active and resolved state,
+    CPU, memory, filesystem, and Cribl-queue fault and recovery paths. The final
+    exact-seed receipt must prove the live Prometheus to Alertmanager to Grafana
+    path. Host network, container restart and health, Vault seal, and backup
+    alerts remain honest gaps until a safe continuous metric source exists.
+
+## Someday
+
+- [ ] **Explore Admin Portal access to Grafana dashboards** - This is a future
+  convenience feature, not part of the current release. Compare a normal link
+  to the existing admin-only Grafana origin with embedded panels. Prefer the
+  link unless embedding has a clear operator benefit. Before any iframe work,
+  review CSP `frame-src` and `frame-ancestors`, clickjacking, cross-origin and
+  SameSite cookies, OIDC redirects, logout, role checks, and the ADM-only
+  network boundary. Never copy a Grafana token or session cookie into the
+  portal. Add an ADR, browser tests, and rollback steps before implementation.
 <a id="run-a-new-operator-documentation-usability-review"></a>
 
 - [ ] **Run a new-operator documentation usability review** - The active guides
@@ -178,72 +228,135 @@
   new preprod operator and a production operator to follow them without verbal
   help. Fix unclear words, steps, links, bookmarks, and diagram labels. Save the
   review notes with the next release evidence.
+
+## Active model-governance work
+
 <a id="add-model-aware-usage-limits-catalog-cost-dashboards-and-routing"></a>
 
 - [ ] **Add model-aware usage, limits, catalog, cost, dashboards, and routing**
-  - Start this only after the current release gates are complete. It does not
-    block the current release. Reuse the existing LiteLLM, portal, Postgres,
-    and Grafana paths; do not add a second billing or identity source without
-    an approved design.
+  - The current release remains the first promotion priority. Source work may
+    move in parallel, but no feature may be promoted before the release gates
+    pass. Reuse the existing LiteLLM, portal, Postgres, and Grafana paths; do
+    not add a second billing or identity source without an approved design.
   - Use the durable
     [implementation plan](docs/model-governance-plan.md). Keep it current when
     a design decision or upstream contract changes.
-  - **Track tokens by model, user, and project:** Record the requested model,
-    actual provider model, stable user ID, project ID, input tokens, output
-    tokens, cache-write tokens, and cache-read tokens for each completed
-    request. Keep request IDs for audit joins. Do not put prompts, API keys, or
-    high-cardinality request IDs in Prometheus labels. Define retry, streaming,
-    failed-request, and missing-usage behavior. Acceptance requires contract
-    tests, database migration and rollback tests, and seeded preprod requests
-    proving the totals match LiteLLM and provider receipts.
-  - **Design and enforce per-model token limits:** Decide which controls the
-    product needs before writing code: a per-request maximum output, a fixed or
-    rolling time-window quota, tokens per minute, a money budget, or a reviewed
-    combination. Define units, reset rules, and precedence when model, user,
-    project, and key rules overlap. Do not treat these controls as the same
-    limit. For each hard limit, reserve or check capacity before the provider
-    call so parallel requests cannot bypass it. Return a safe denial and emit an
-    audit event. Acceptance requires tests for every chosen control, precedence,
-    boundaries, reset or rolling windows, concurrency, streaming, retries,
-    admin RBAC, and fail-closed database errors.
-  - **Add hidden custom models:** Let an administrator add a model that normal
-    users cannot see until it is assigned. Require an explicit reviewed
-    provider and provider model name. Store an explicit
-    `visible_in_discovery` flag, or an equally clear inverse `hidden` flag. A
-    hidden model must stay absent from `/v1/models` and user-facing discovery
-    until an administrator makes it visible, even if the model can be assigned
-    through the admin path. Reject an arbitrary provider hostname, route, CA
-    file, or provider that is absent from the immutable Envoy release. Keep
-    credentials in Vault and never return them through the portal. Acceptance
-    requires create, update, assign, visibility, hidden-discovery, revoke,
-    duplicate-name, unsupported-provider, audit, restart, backup, restore, and
-    seeded preprod tests.
-  - **Build Grafana token dashboards:** Add admin-only views for token use by
-    model, project, and user. Show input, output, cache-write, cache-read, total,
-    request count, failures, and cost. Use bounded filters and a data source that
-    can answer per-user questions without unsafe Prometheus labels. Show the
-    data time range and an `unknown` bucket instead of hiding incomplete rows.
-    Acceptance requires dashboard schema tests, role checks, seeded data, and
-    totals that reconcile with the usage store.
-  - **Account for cached and regular token cost:** Research the current official
-    Anthropic request/response fields and pricing documentation before design.
-    Record regular input, cache creation, cache read, and output units
-    separately. Version and date every price entry so a later price change does
-    not rewrite old cost. Handle models, cache durations, or usage fields with
-    no reviewed price as `unknown`, not zero. Acceptance requires saved source
-    links, dated pricing fixtures, payload fixtures, rounding tests, historical
-    price-change tests, and totals reconciled to an approved Anthropic example.
-    Add an admin portal price workflow. An admin selects the model, usage class,
-    token unit, decimal price, currency, and effective time. Support an explicit
-    audited backdated-price and reprice flow that previews the affected rows and
-    cost delta, appends new immutable revisions, and never overwrites old price
-    or calculation history.
-  - **Export the new audit events through Alloy to Cribl:** Send model-policy,
-    pricing, backdating, limit-denial, and routing security events through the
-    existing sanitized OTLP log branch. The external hop remains native OTLP
-    over gRPC and verified TLS. Do not send metrics, raw traces, alert payloads,
-    or unrelated debug logs. Add schema, redaction, allow-list, queue,
-    back-pressure, and Cribl receipt tests.
+  - [x] Complete the fail-closed policy foundation (2026-07-22): model drafts are
+    bound to the exact Envoy provider-policy receipt; reserved LiteLLM and
+    gateway control names are rejected; five token price classes use exact
+    decimal math, whole-policy duplicate checks, immutable effective dates,
+    and complete backdate preview windows; and `aigw-auto` is denied for every
+    key scope. The [routing ADR](docs/automatic-model-routing-adr.md) records
+    the remaining choices. The append-only database, API, portal, runtime
+    reconciliation, usage, price, and report work now builds on this
+    foundation. Promotion still depends on the current-candidate release gate.
+  - [ ] **Finish live acceptance for usage, cost, backdating, and reporting:**
+    The source work is complete. The prompt-free LiteLLM callback records the
+    requested and actual model, stable user and project, logical request ID,
+    stream and retry state, five token classes, completeness, and separate
+    LiteLLM, provider, and configured costs. Unknown usage or price stays
+    `NULL`; it never becomes zero. Request IDs stay in the database and log
+    body, never a Prometheus or Loki label. An exact callback replay returns
+    its saved receipt. Changed replay data is a conflict. A callback delivery
+    failure never fails or retries a completed provider response; it emits a
+    bounded accounting-gap event through Alloy to Loki and Cribl.
+
+    Price audit data comes from the committed backend row, not from portal
+    hidden fields or echoed form values. The record includes the exact saved
+    model, provider, usage class, amount, token unit, effective time, source
+    reference, operation ID, and policy digests. The free-form review note
+    stays in PostgreSQL. Logs contain only its SHA-256 digest.
+
+    PostgreSQL keeps model, price, usage, preview, and adjustment evidence in
+    an owner-controlled append-only schema. Every clean or existing-volume
+    reconcile runs `02-governance.sql` and then `03-usage-accounting.sql`
+    before consumers and requires both content-free schema receipts. The
+    application login cannot update, delete, truncate, own, or disable a
+    guard. Grafana's **AI Gateway Usage** source can read only the two reviewed
+    reporting views. The dashboard shows all five token classes by model,
+    project, and stable user; keeps three cost sources separate; shows
+    incomplete data; and exposes accounting-delivery gaps without using
+    high-cardinality labels.
+    Live acceptance connects with the real `grafana_ro` credential, checks the
+    two dashboard views against exact ledger totals, and proves that login
+    cannot read the private usage table.
+
+    The admin portal accepts future prices and a separate backdate flow.
+    Preview and confirmation each require an `aigw-admins` Keycloak login from
+    the last five minutes plus CSRF. The stored preview binds the exact price
+    policy, usage rows, prior adjustments, affected count, totals, and digest.
+    It shows up to 100 row details, stores and hashes all affected rows, and
+    refuses more than 10,000 rows. Confirmation requires
+    `CONFIRM BACKDATED PRICE`, rechecks every digest in one transaction, and
+    appends one price and immutable adjustments. A stale preview, changed
+    digest, reused operation ID with different input, or second confirmation
+    fails closed.
+
+    Keep this item open until one newly built schema-v2 offline seed is loaded
+    with pulls and source builds disabled and deployed through
+    `ansible/preprod.yml`. Test normal, streaming, internal retry, failure,
+    missing usage, missing price, delivery gap, exact replay, changed replay,
+    backdate preview, stale conflict, confirmation, Grafana totals, Alloy and
+    Cribl receipts, service restart, backup and restore, upgrade and rollback,
+    and final owned-resource cleanup. Reconcile every expected token and cost
+    total with the ledger and provider mock. Follow
+    [usage and cost accounting](docs/usage-and-cost-accounting.md).
+    Local PreProd must keep its real Docker log root unmounted. For this one
+    gate, validate the exact fresh `key-rotator` and LiteLLM producer lines,
+    preserve their timestamp and stream in Docker's JSON envelope, and pass
+    only those bounded lines through the owned empty-log volume. The helper
+    runs with no network, a read-only root, and no capabilities, then removes
+    the fixture after Cribl receipt. Unknown producers or event shapes fail
+    closed.
+  - [ ] **Finish live acceptance for per-model token limits:** The source work
+    is complete for two named controls: maximum output tokens per request and
+    output tokens per fixed UTC minute. An admin sets both values for each
+    allowed model in a Keycloak project policy. The request cap is checked
+    before provider dispatch. Redis makes the minute reservation atomic, so
+    parallel requests share one quota, and a Redis error returns HTTP 503
+    before dispatch. Safe audit records report only the model, project,
+    control, result, and bounded reason. Unit, portal, policy, concurrency,
+    denial, and fail-closed contract tests pass. The PreProd harness checks an
+    over-limit request, parallel reservations, Redis failure, recovery, and
+    cleanup. Keep this item open until the newly built exact seed prints all
+    `PREPROD_MODEL_*` limit markers and passes release rollback. Other limit
+    types, including rolling windows and money budgets, need a separate
+    product decision and are not claimed by this release.
+  - [ ] **Finish live acceptance for hidden custom models:** The source work is
+    complete. An administrator can create an inert draft from the reviewed
+    provider catalog, activate it, show or hide it in filtered discovery, and
+    retire it. Model records and lifecycle events are append-only, so a changed
+    model becomes a new version instead of rewriting an old row. LiteLLM is a
+    checked runtime copy. Missing, extra, duplicate, changed, or malformed DB
+    deployments make the controller unready. Native LiteLLM model mutations are
+    blocked at the edge. Retirement is blocked while a Keycloak project still
+    assigns the model. Project policy changes now save a pending intent, block
+    stale active keys, activate the policy, re-tune and verify every project
+    key, and then clear the pending marker. Key creation and controller
+    readiness fail closed until that work finishes. Submitting the same policy
+    again safely resumes an interrupted change. Hostnames, routes, CA paths,
+    credentials, unknown providers, reserved names, and arbitrary egress
+    origins are not accepted.
+    Unit, API, restart-state, projection, discovery, portal, migration, and
+    model-governance contract tests pass. The seed-only acceptance test now
+    creates a draft, calls it by exact name while hidden, tests show and hide
+    discovery, proves the project-assignment retirement gate, cleans up the
+    project and key, and retires the model. Keep this item open until a newly
+    built exact seed runs that test plus the release backup, restore, and
+    rollback gates.
+    Follow the [model lifecycle SOP](docs/sop/model-lifecycle.md).
+  - **Export all admitted telemetry through Alloy to Cribl:** Alloy is the one
+    outbound choke point. Mirror every metric, log, and trace that Alloy accepts
+    to Cribl, including model-policy, pricing, backdating, limit-denial, routing,
+    service, and alert-state data. Keep the local Prometheus, Loki, and Grafana
+    paths. This release has no local trace store. The external hop remains
+    native OTLP over gRPC and verified TLS. Source-side secret removal still
+    applies: credentials, API keys, and
+    fields rejected before Alloy admission do not become exportable. Rework the
+    old SOC-log-only allow-list, queue sizing, bounded backpressure, 24-hour
+    Cribl retention contract, local metric retention of up to 30 days or the
+    configured size cap (first limit wins), schemas, volume estimates, outage
+    behavior, and receipt tests for the full stream.
   - **Explore automatic model routing:** Write an ADR before code. Evaluate the
     LiteLLM routing features that can choose a model from a user's prompt.
     Document prompt privacy, supported signals, quality, latency, cost, limits,
@@ -296,10 +409,28 @@ not approve the current source candidate.
     of mixing in upstream containerd `2.3`.
   - Every direct Python runtime and test dependency matched its current PyPI
     project version. The four Go modules use only the standard library. The
-    exact ARM64 seed build and full local rehearsal passed. See the
+    last accepted exact ARM64 seed passed its full local rehearsal. Refreshed
+    same-tag digests and later feature changes still need the active
+    current-candidate seed gate above. See the
     [dated version review](docs/image-version-review.md) for every pin and the
     review method. GitHub's protected DHI scans remain the separate security
     audit gate; version review does not replace those scans.
+
+<a id="recheck-and-clear-the-dhi-alertmanager-security-finding"></a>
+
+- [ ] **Recheck and clear the DHI Alertmanager security finding**
+  - On 2026-07-22, the signed DHI reports for Alertmanager `0.33.1` showed
+    `GHSA-hrxh-6v49-42gf` in gRPC `1.82.0` on both AMD64 and ARM64. The fixed
+    gRPC version is `1.82.1`. DHI had not published a rebuilt image or a signed
+    VEX statement for the finding.
+  - Older DHI Alertmanager tags are not a safe fallback. Tags `0.32.2` and
+    `0.32.1` contain the same finding, and older tags add more high or critical
+    findings. The Alpine `0.33.1` image also contains the same finding.
+  - Keep the newest Debian `0.33.1` pin. Do not add a local waiver or weaken the
+    GitHub scan. Recheck DHI for a rebuilt digest with gRPC `1.82.1` or newer,
+    or for an exact DHI-signed VEX statement.
+  - Acceptance: update the exact pin, rebuild the schema-v2 seed, pass the
+    full local PreProd test, and make both GitHub architecture scans green.
 - [x] ~~Rewrite active documentation and add automated documentation checks~~ (2026-07-21)
   - Active documentation separates preprod from production and uses short,
     direct operator language. Obsolete lab material is archived and labeled as
@@ -352,8 +483,8 @@ not approve the current source candidate.
     image IDs. It then freshly loaded the preprod archive and deployed it with
     Ansible in seed mode. The run ended with `PREPROD_E2E_PASSED` and
     `SEEDED_PREPROD_E2E_PASSED` after Vault, LDAPS, automatic Keycloak setup,
-    static users, OIDC roles, WIF, the immutable production Envoy startup gate,
-    and local mock inference passed.
+    fixed test usernames, OIDC roles, WIF, the immutable production Envoy
+    startup gate, and local mock inference passed.
   - Production archive SHA-256:
     `74b6d1df3325863c3bc7dc218edd97faa231dbac7bd2ea83553b6d48ea625c66`.
     Production manifest SHA-256:
@@ -370,7 +501,7 @@ not approve the current source candidate.
     rollback fail closed. Contract tests cover source-tag materialization,
     exact transfer IDs, preprod-byte rejection, validation, and rollback.
 
-- [x] ~~Complete immutable, provider-selectable Envoy releases~~ (2026-07-21)
+- [x] ~~Immutable, provider-selectable Envoy egress image builds~~ (2026-07-21)
   - The release CLI accepts repeated provider names, canonicalizes them, and
     resolves them only through the committed provider catalog. It rejects an
     empty set, unknown provider, arbitrary hostname, and arbitrary CA path.
@@ -434,7 +565,7 @@ not approve the current source candidate.
   - Fresh seed loading and Ansible ended with `PREPROD_E2E_PASSED` and
     `SEEDED_PREPROD_E2E_PASSED`. The tests covered the authenticated LiteLLM
     audit path and the full Cribl gate. Browser acceptance did not run because
-    no browser session exists, so it remains active above.
+    no browser session existed during that run, so it remains active above.
   - The initial pre-deploy purge removed 26 containers, 19 networks, 11
     volumes, 62 aliases, and all 43 target image IDs while preserving 185
     unrelated image IDs.
@@ -468,7 +599,7 @@ not approve the current source candidate.
   - After a Vault restart, the test proved `initialized=true` and `sealed=true`.
     The same seed-mode converge auto-unsealed Vault and passed the full edge,
     identity, and Cribl tests again. Visual browser acceptance remains active
-    above because the current runtime exposes no browser.
+    above because the runtime available during that run exposed no browser.
 
 - [x] ~~Build, hash-check, and seed-test the `r12` schema-v2 candidate~~
   (2026-07-21)

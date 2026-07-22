@@ -28,7 +28,9 @@ const (
 )
 
 func usage() error {
-	return errors.New("usage: aigw-health-probe http|redis [options]")
+	return errors.New(
+		"usage: aigw-health-probe http|redis|metric-fixture|fixture-state [options]",
+	)
 }
 
 func main() {
@@ -47,9 +49,127 @@ func run(args []string) error {
 		return runHTTP(args[1:])
 	case "redis":
 		return runRedis(args[1:])
+	case "metric-fixture":
+		return runMetricFixture(args[1:])
+	case "fixture-state":
+		return runFixtureState(args[1:])
 	default:
 		return usage()
 	}
+}
+
+func runMetricFixture(args []string) error {
+	fs := flag.NewFlagSet("metric-fixture", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	address := fs.String("listen", "127.0.0.1:9101", "HTTP listen address")
+	stateFile := fs.String("state-file", "", "absolute path to the fixture state file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *address == "" {
+		return errors.New("metric fixture accepts flags only")
+	}
+	if *stateFile == "" || !filepath.IsAbs(*stateFile) {
+		return errors.New("metric fixture requires an absolute --state-file")
+	}
+	server := &http.Server{
+		Addr:              *address,
+		Handler:           metricFixtureHandler(*stateFile),
+		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       3 * time.Second,
+		WriteTimeout:      3 * time.Second,
+		IdleTimeout:       15 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve metric fixture: %w", err)
+	}
+	return nil
+}
+
+func metricFixtureHandler(stateFile string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = io.WriteString(writer, "ok\n")
+	})
+	mux.HandleFunc("/metrics", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		active, err := fixtureIsActive(stateFile)
+		if err != nil {
+			http.Error(writer, "fixture state unavailable", http.StatusInternalServerError)
+			return
+		}
+		value := "0"
+		if active {
+			value = "1"
+		}
+		writer.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = io.WriteString(
+			writer,
+			"# HELP aigw_preprod_alert_test Bounded local PreProd alert acceptance input.\n"+
+				"# TYPE aigw_preprod_alert_test gauge\n"+
+				"aigw_preprod_alert_test "+value+"\n",
+		)
+	})
+	return mux
+}
+
+func fixtureIsActive(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("fixture state must be a regular file")
+	}
+	return true, nil
+}
+
+func runFixtureState(args []string) error {
+	fs := flag.NewFlagSet("fixture-state", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	stateFile := fs.String("state-file", "", "absolute path to the fixture state file")
+	active := fs.String("active", "", "true or false")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *stateFile == "" || !filepath.IsAbs(*stateFile) {
+		return errors.New("fixture-state requires an absolute --state-file")
+	}
+	wanted, err := strconv.ParseBool(*active)
+	if err != nil {
+		return errors.New("fixture-state requires --active=true or --active=false")
+	}
+	if wanted {
+		descriptor, createErr := os.OpenFile(
+			*stateFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600,
+		)
+		if errors.Is(createErr, os.ErrExist) {
+			_, inspectErr := fixtureIsActive(*stateFile)
+			return inspectErr
+		}
+		if createErr != nil {
+			return fmt.Errorf("activate fixture: %w", createErr)
+		}
+		return descriptor.Close()
+	}
+	if _, inspectErr := fixtureIsActive(*stateFile); inspectErr != nil {
+		return inspectErr
+	}
+	if removeErr := os.Remove(*stateFile); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return fmt.Errorf("deactivate fixture: %w", removeErr)
+	}
+	return nil
 }
 
 func runHTTP(args []string) error {

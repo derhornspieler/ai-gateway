@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove the local preprod SOC allow-list, redaction, queue, and recovery."""
+"""Prove local Cribl telemetry scope, redaction, TLS, queue, and recovery."""
 
 from __future__ import annotations
 
@@ -249,7 +249,7 @@ denied_span = {
     "kind": 2,
     "startTimeUnixNano": now,
     "endTimeUnixNano": str(int(now) + 1000),
-    "attributes": [text("receipt.denied", "DENIED_RAW_TRACE_" + token)],
+    "attributes": [text("receipt.marker", "ADMITTED_SANITIZED_TRACE_" + token)],
 }
 unattributed_span = {
     "traceId": trace_id,
@@ -259,7 +259,7 @@ unattributed_span = {
     "startTimeUnixNano": now,
     "endTimeUnixNano": str(int(now) + 1000),
     "attributes": [
-        text("gen_ai.input.messages", "DENIED_UNATTRIBUTED_TRACE_" + token)
+        text("gen_ai.input.messages", "ADMITTED_UNATTRIBUTED_TRACE_" + token)
     ],
 }
 nested_prompt_span = {
@@ -371,12 +371,27 @@ post(
     "/v1/metrics",
     {
         "resourceMetrics": [{
-            "resource": {"attributes": [text("service.name", "receipt-test")]},
+            "resource": {"attributes": [
+                text("service.name", "receipt-test"),
+                text("deployment.environment", "FORGED_METRIC_ENV_" + token),
+                text("session_token", "METRIC_RESOURCE_SECRET_" + token),
+            ]},
             "scopeMetrics": [{
-                "scope": {"name": "aigw.preprod.receipt"},
+                "scope": {
+                    "name": "aigw.preprod.receipt",
+                    "attributes": [
+                        text("client_assertion", "METRIC_SCOPE_SECRET_" + token),
+                    ],
+                },
                 "metrics": [{
-                    "name": "denied_raw_metric_" + token,
-                    "gauge": {"dataPoints": [{"timeUnixNano": now, "asInt": "1"}]},
+                    "name": "admitted_metric_" + token,
+                    "gauge": {"dataPoints": [{
+                        "timeUnixNano": now,
+                        "asInt": "1",
+                        "attributes": [
+                            text("tls.private_key_pem", "METRIC_POINT_SECRET_" + token),
+                        ],
+                    }]},
                 }],
             }],
         }]
@@ -386,13 +401,22 @@ post(
     "/v1/logs",
     {
         "resourceLogs": [{
-            "resource": {"attributes": [text("service.name", "receipt-test")]},
+            "resource": {"attributes": [
+                text("service.name", "receipt-test"),
+                text("deployment.environment", "FORGED_OTLP_LOG_ENV_" + token),
+                text("vault_unseal_share", "OTLP_LOG_RESOURCE_SECRET_" + token),
+            ]},
             "scopeLogs": [{
                 "scope": {"name": "aigw.preprod.receipt"},
                 "logRecords": [{
                     "timeUnixNano": now,
                     "severityNumber": 9,
-                    "body": {"stringValue": "DENIED_RAW_LOG_" + token},
+                    "body": {
+                        "stringValue": (
+                            "ADMITTED_LOG_" + token +
+                            " password=OTLP_LOG_BODY_SECRET_" + token
+                        ),
+                    },
                 }],
             }],
         }]
@@ -1046,6 +1070,11 @@ def fixture_lines(token: str) -> str:
     portal_add_op = "123e4567-e89b-42d3-a456-426614174012"
     portal_remove_op = "123e4567-e89b-42d3-a456-426614174013"
     portal_policy_op = "123e4567-e89b-42d3-a456-426614174014"
+    portal_model_op = "123e4567-e89b-42d3-a456-426614174015"
+    portal_price_op = "123e4567-e89b-42d3-a456-426614174016"
+    portal_backdate_preview_op = "123e4567-e89b-42d3-a456-426614174017"
+    portal_backdate_confirm_op = "123e4567-e89b-42d3-a456-426614174018"
+    portal_model_activate_op = "123e4567-e89b-42d3-a456-426614174019"
     identity_create_op = "123e4567-e89b-42d3-a456-426614174020"
     identity_delete_op = "123e4567-e89b-42d3-a456-426614174021"
     identity_add_op = "123e4567-e89b-42d3-a456-426614174022"
@@ -1148,6 +1177,64 @@ def fixture_lines(token: str) -> str:
         f'"action":"identity.group.policy","outcome":"intent","subject":"group-policy-ok-{token}","group":"team-policy-ok-{token}","operation_id":"{portal_policy_op}"}}',
         'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
         f'"action":"identity.group.policy","outcome":"success","subject":"group-policy-ok-{token}","group":"team-policy-ok-{token}","project":"receipt-project","operation_id":"{portal_policy_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.governance.create","outcome":"intent","subject":"model-admin-{token}","model":"claude-sonnet-4-5","provider":"anthropic","operation_id":"{portal_model_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.governance.create","outcome":"success","subject":"model-admin-{token}","model":"claude-sonnet-4-5","provider":"anthropic","operation_id":"{portal_model_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.governance.activate","outcome":"intent","subject":"model-admin-{token}","model":"claude-sonnet-4-5","operation_id":"{portal_model_activate_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.governance.activate","outcome":"success","subject":"model-admin-{token}","model":"claude-sonnet-4-5","operation_id":"{portal_model_activate_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.price.create","outcome":"intent","subject":"price-admin-{token}","model":"claude-sonnet-4-5","usage_class":"cache_read","operation_id":"{portal_price_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.price.create","outcome":"success","subject":"price-admin-{token}","model":"claude-sonnet-4-5","usage_class":"cache_read","operation_id":"{portal_price_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.price.backdate.preview","outcome":"intent","subject":"price-admin-{token}","model":"claude-sonnet-4-5","usage_class":"cache_read","operation_id":"{portal_backdate_preview_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.price.backdate.preview","outcome":"success","subject":"price-admin-{token}","model":"claude-sonnet-4-5","usage_class":"cache_read","operation_id":"{portal_backdate_preview_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.price.backdate.confirm","outcome":"intent","subject":"price-admin-{token}","operation_id":"{portal_backdate_confirm_op}"}}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+        f'"action":"model.price.backdate.confirm","outcome":"success","subject":"price-admin-{token}","model":"claude-sonnet-4-5","usage_class":"cache_read","operation_id":"{portal_backdate_confirm_op}"}}',
+    )
+    price_events = tuple(
+        "AIGW_SECURITY_EVENT "
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "event": "aigw.price.audit",
+                "action": action,
+                "outcome": "success",
+                "operation_id": operation_id,
+                "subject": f"trusted-price-{token}",
+                "model": "claude-sonnet-4-5",
+                "provider": "anthropic",
+                "usage_class": "cache_read",
+                "amount_usd": "30.000000000000",
+                "token_unit": "1000000",
+                "effective_at": "2026-07-01T00:00:00Z",
+                "source_reference": "anthropic-price-review-2026-07-22",
+                "review_note_sha256": token * 4,
+                "old_policy_sha256": token[::-1] * 4,
+                "candidate_sha256": candidate,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for action, operation_id, candidate in (
+            ("create", "123e4567-e89b-42d3-a456-426614174030", "a" * 64),
+            (
+                "backdate_preview",
+                "123e4567-e89b-42d3-a456-426614174031",
+                "b" * 64,
+            ),
+            (
+                "backdate_confirm",
+                "123e4567-e89b-42d3-a456-426614174032",
+                "b" * 64,
+            ),
+        )
     )
     portal_key_denials = (
         ("key.generate", "denied-membership", f"generate-membership-{token}"),
@@ -1239,10 +1326,75 @@ def fixture_lines(token: str) -> str:
         },
         separators=(",", ":"),
     )
+    model_limits = (
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.model.limit",'
+        '"action":"reserve","outcome":"success","project":"receipt-project",'
+        '"model":"claude-sonnet-4-5","control":"output_tokens_per_utc_minute",'
+        '"reason":"capacity_reserved"}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.model.limit",'
+        '"action":"deny","outcome":"denied","project":"receipt-project",'
+        '"model":"claude-sonnet-4-5","control":"max_output_per_request",'
+        '"reason":"request_cap_exceeded"}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.model.limit",'
+        '"action":"deny","outcome":"denied","project":"receipt-project",'
+        '"model":"claude-sonnet-4-5","control":"output_tokens_per_utc_minute",'
+        '"reason":"minute_quota_exceeded"}',
+        'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.model.limit",'
+        '"action":"fail_closed","outcome":"failure","project":"receipt-project",'
+        '"model":"claude-sonnet-4-5","control":"output_tokens_per_utc_minute",'
+        '"reason":"redis_unavailable"}',
+    )
     denied = (
         ("keycloak", keycloak_missing_user),
         ("keycloak", keycloak_unquoted),
-        ("dev-portal", f"DENIED_ORDINARY_LOG_{token}"),
+        (
+            "dev-portal",
+            f"ADMITTED_ORDINARY_LOG_{token} "
+            f"session_token=DOCKER_SESSION_SECRET_{token} "
+            f"eyJkb2NrZXI.RG9ja2VyUGF5bG9hZA.RG9ja2VyU2lnbmF0dXJl{token} "
+            f"hvs.DOCKER_VAULT_TOKEN_{token} "
+            "-----BEGIN PRIVATE KEY-----\n"
+            f"DOCKER_PEM_SECRET_{token}\n"
+            "-----END PRIVATE KEY-----",
+        ),
+        (
+            "admin-portal",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+            '"action":"model.governance.create","outcome":"success",'
+            f'"subject":"model-admin-{token}","model":"claude-sonnet-4-5",'
+            f'"operation_id":"{portal_model_op}","marker":"DENIED_MODEL_PROVIDER_{token}"}}',
+        ),
+        (
+            "admin-portal",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+            '"action":"model.price.create","outcome":"success",'
+            f'"subject":"price-admin-{token}","model":"claude-sonnet-4-5",'
+            f'"usage_class":"unreviewed","operation_id":"{portal_price_op}",'
+            f'"marker":"DENIED_MODEL_USAGE_CLASS_{token}"}}',
+        ),
+        (
+            "admin-portal",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
+            '"action":"rotation.trigger","outcome":"success",'
+            f'"subject":"model-admin-{token}","model":"claude-sonnet-4-5",'
+            f'"marker":"DENIED_UNEXPECTED_MODEL_{token}"}}',
+        ),
+        (
+            "litellm",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.model.limit",'
+            '"action":"reserve","outcome":"success","project":"receipt-project",'
+            '"model":"claude-sonnet-4-5","control":"output_tokens_per_utc_minute",'
+            '"reason":"capacity_reserved",'
+            f'"prompt":"MODEL_LIMIT_PROMPT_SECRET_{token}",'
+            f'"marker":"DENIED_MODEL_LIMIT_EXTRA_{token}"}}',
+        ),
+        (
+            "litellm",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.model.limit",'
+            '"action":"deny","outcome":"success","project":"receipt-project",'
+            '"model":"claude-sonnet-4-5","control":"max_output_per_request",'
+            f'"reason":"request_cap_exceeded","marker":"DENIED_MODEL_LIMIT_OUTCOME_{token}"}}',
+        ),
         (
             "dev-portal",
             'AIGW_SECURITY_EVENT {"schema_version":9,"event":"aigw.portal.audit",'
@@ -1252,6 +1404,21 @@ def fixture_lines(token: str) -> str:
             "dev-portal",
             'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.portal.audit",'
             f'"action":"not.approved","outcome":"success","marker":"DENIED_ACTION_{token}"}}',
+        ),
+        (
+            "key-rotator",
+            'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.price.audit",'
+            '"action":"create","outcome":"success",'
+            f'"operation_id":"123e4567-e89b-42d3-a456-426614174033",'
+            f'"subject":"trusted-price-{token}","model":"claude-sonnet-4-5",'
+            '"provider":"anthropic","usage_class":"cache_read",'
+            '"amount_usd":"30.000000000000","token_unit":"1000000",'
+            '"effective_at":"2026-07-01T00:00:00Z",'
+            '"source_reference":"anthropic-price-review-2026-07-22",'
+            f'"review_note":"PRICE_REVIEW_NOTE_SECRET_{token}",'
+            f'"review_note_sha256":"{token * 4}",'
+            f'"old_policy_sha256":"{token[::-1] * 4}",'
+            f'"candidate_sha256":"{"c" * 64}"}}',
         ),
         (
             "key-rotator",
@@ -1427,6 +1594,12 @@ def fixture_lines(token: str) -> str:
     records.extend(
         docker_log_line("key-rotator", rotation, timestamp)
         for rotation in rotations
+    )
+    records.extend(
+        docker_log_line("litellm", event, timestamp) for event in model_limits
+    )
+    records.extend(
+        docker_log_line("key-rotator", event, timestamp) for event in price_events
     )
     records.extend(
         docker_log_line("admin-portal", event, timestamp)
@@ -1842,7 +2015,7 @@ def wait_for_receipts(
         if all(marker in latest for marker in markers):
             return latest
         time.sleep(1)
-    fail("Cribl mock did not receive every approved security record")
+    fail("Cribl mock did not receive every admitted telemetry receipt")
 
 
 def read_preprod_developer_password() -> str:
@@ -2218,6 +2391,19 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"event=aigw.portal.audit action=identity.member.remove outcome=success subject=member-remove-ok-{token} group=team-remove-ok-{token} target_subject=target-remove-ok-{token} project=receipt-project operation_id=123e4567-e89b-42d3-a456-426614174013",
         f"event=aigw.portal.audit action=identity.group.policy outcome=intent subject=group-policy-ok-{token} group=team-policy-ok-{token} operation_id=123e4567-e89b-42d3-a456-426614174014",
         f"event=aigw.portal.audit action=identity.group.policy outcome=success subject=group-policy-ok-{token} group=team-policy-ok-{token} project=receipt-project operation_id=123e4567-e89b-42d3-a456-426614174014",
+        f"event=aigw.portal.audit action=model.governance.create outcome=intent subject=model-admin-{token} model=claude-sonnet-4-5 provider=anthropic operation_id=123e4567-e89b-42d3-a456-426614174015",
+        f"event=aigw.portal.audit action=model.governance.create outcome=success subject=model-admin-{token} model=claude-sonnet-4-5 provider=anthropic operation_id=123e4567-e89b-42d3-a456-426614174015",
+        f"event=aigw.portal.audit action=model.governance.activate outcome=intent subject=model-admin-{token} model=claude-sonnet-4-5 operation_id=123e4567-e89b-42d3-a456-426614174019",
+        f"event=aigw.portal.audit action=model.governance.activate outcome=success subject=model-admin-{token} model=claude-sonnet-4-5 operation_id=123e4567-e89b-42d3-a456-426614174019",
+        f"event=aigw.portal.audit action=model.price.create outcome=intent subject=price-admin-{token} model=claude-sonnet-4-5 usage_class=cache_read operation_id=123e4567-e89b-42d3-a456-426614174016",
+        f"event=aigw.portal.audit action=model.price.create outcome=success subject=price-admin-{token} model=claude-sonnet-4-5 usage_class=cache_read operation_id=123e4567-e89b-42d3-a456-426614174016",
+        f"event=aigw.portal.audit action=model.price.backdate.preview outcome=intent subject=price-admin-{token} model=claude-sonnet-4-5 usage_class=cache_read operation_id=123e4567-e89b-42d3-a456-426614174017",
+        f"event=aigw.portal.audit action=model.price.backdate.preview outcome=success subject=price-admin-{token} model=claude-sonnet-4-5 usage_class=cache_read operation_id=123e4567-e89b-42d3-a456-426614174017",
+        f"event=aigw.portal.audit action=model.price.backdate.confirm outcome=intent subject=price-admin-{token} operation_id=123e4567-e89b-42d3-a456-426614174018",
+        f"event=aigw.portal.audit action=model.price.backdate.confirm outcome=success subject=price-admin-{token} model=claude-sonnet-4-5 usage_class=cache_read operation_id=123e4567-e89b-42d3-a456-426614174018",
+        f"event=aigw.price.audit action=create outcome=success subject=trusted-price-{token} model=claude-sonnet-4-5 provider=anthropic usage_class=cache_read amount_usd=30.000000000000 token_unit=1000000 effective_at=2026-07-01T00:00:00Z source_reference=anthropic-price-review-2026-07-22 review_note_sha256={token * 4} old_policy_sha256={token[::-1] * 4} candidate_sha256={'a' * 64} operation_id=123e4567-e89b-42d3-a456-426614174030",
+        f"event=aigw.price.audit action=backdate_preview outcome=success subject=trusted-price-{token} model=claude-sonnet-4-5 provider=anthropic usage_class=cache_read amount_usd=30.000000000000 token_unit=1000000 effective_at=2026-07-01T00:00:00Z source_reference=anthropic-price-review-2026-07-22 review_note_sha256={token * 4} old_policy_sha256={token[::-1] * 4} candidate_sha256={'b' * 64} operation_id=123e4567-e89b-42d3-a456-426614174031",
+        f"event=aigw.price.audit action=backdate_confirm outcome=success subject=trusted-price-{token} model=claude-sonnet-4-5 provider=anthropic usage_class=cache_read amount_usd=30.000000000000 token_unit=1000000 effective_at=2026-07-01T00:00:00Z source_reference=anthropic-price-review-2026-07-22 review_note_sha256={token * 4} old_policy_sha256={token[::-1] * 4} candidate_sha256={'b' * 64} operation_id=123e4567-e89b-42d3-a456-426614174032",
         f"event=aigw.portal.audit action=key.generate outcome=denied-membership subject=generate-membership-{token} project=aigw-users",
         f"event=aigw.portal.audit action=key.deactivate outcome=denied-membership subject=deactivate-membership-{token} project=aigw-users",
         f"event=aigw.portal.audit action=key.deactivate outcome=denied-ownership subject=deactivate-ownership-{token} project=aigw-users",
@@ -2248,6 +2434,10 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         "event=aigw.provider.rotation action=rotate outcome=success vendor=anthropic rotation_id=123e4567-e89b-42d3-a456-426614174000 attempt=2 rotation_status=success",
         "event=aigw.provider.rotation action=recovery outcome=success vendor=anthropic rotation_id=123e4567-e89b-42d3-a456-426614174000 attempt=2 rotation_status=recovered",
         "event=aigw.vault.state action=state_observed outcome=success state=unsealed",
+        "event=aigw.model.limit action=reserve outcome=success model=claude-sonnet-4-5 control=output_tokens_per_utc_minute project=receipt-project reason=capacity_reserved",
+        "event=aigw.model.limit action=deny outcome=denied model=claude-sonnet-4-5 control=max_output_per_request project=receipt-project reason=request_cap_exceeded",
+        "event=aigw.model.limit action=deny outcome=denied model=claude-sonnet-4-5 control=output_tokens_per_utc_minute project=receipt-project reason=minute_quota_exceeded",
+        "event=aigw.model.limit action=fail_closed outcome=failure model=claude-sonnet-4-5 control=output_tokens_per_utc_minute project=receipt-project reason=redis_unavailable",
         "event=aigw.vault.audit",
         "hmac_protected=true",
         f"event=aigw.controller.lifecycle action=upgrade outcome=success operation_id=123e4567-e89b-42d3-a456-426614174000 release_manifest_sha256={token[::-1] * 4} release_commit={token * 2 + token[:8]} envoy_image_id=sha256:{token * 4} egress_policy_sha256={token * 4}",
@@ -2281,6 +2471,10 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"DSA_PEM_SECRET_{token}",
         f"ENCRYPTED_PEM_SECRET_{token}",
         f"TRUNCATED_PEM_SECRET_{token}",
+        f"DOCKER_SESSION_SECRET_{token}",
+        f"RG9ja2VyU2lnbmF0dXJl{token}",
+        f"hvs.DOCKER_VAULT_TOKEN_{token}",
+        f"DOCKER_PEM_SECRET_{token}",
         f"METADATA_HEADERS_SECRET_{token}",
         f"METADATA_REQUEST_HEADERS_SECRET_{token}",
         f"REQUEST_HEADERS_SECRET_{token}",
@@ -2303,7 +2497,6 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"PORTAL_SECRET_{token}",
         f"UNAPPROVED_FIELD_{token}",
         f"NESTED_SECRET_{token}",
-        f"DENIED_ORDINARY_LOG_{token}",
         f"DENIED_SCHEMA_{token}",
         f"DENIED_ACTION_{token}",
         f"DENIED_VENDOR_{token}",
@@ -2325,16 +2518,19 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"DENIED_LDAP_CHECK_OUTCOME_{token}",
         f"DENIED_LDAP_RECOVERY_OUTCOME_{token}",
         f"DENIED_MANAGED_RECOVERY_{token}",
+        f"DENIED_MODEL_PROVIDER_{token}",
+        f"DENIED_MODEL_USAGE_CLASS_{token}",
+        f"DENIED_UNEXPECTED_MODEL_{token}",
+        f"PRICE_REVIEW_NOTE_SECRET_{token}",
+        f"MODEL_LIMIT_PROMPT_SECRET_{token}",
+        f"DENIED_MODEL_LIMIT_EXTRA_{token}",
+        f"DENIED_MODEL_LIMIT_OUTCOME_{token}",
         f"DENIED_VAULT_STATE_{token}",
         f"DENIED_MALFORMED_{token}",
         f"DENIED_CONTROLLER_EXTRA_{token}",
         f"DENIED_CONTROLLER_ACTION_{token}",
         f"DENIED_CONTROLLER_SCHEMA_TYPE_{token}",
         f"DENIED_CONTROLLER_MISSING_{token}",
-        f"DENIED_RAW_TRACE_{token}",
-        f"DENIED_UNATTRIBUTED_TRACE_{token}",
-        f"DENIED_UNREVIEWED_NAME_SOURCE_{token}",
-        f"DENIED_MALFORMED_SERVER_NAME_{token}",
         f"REJECTED_OPENWEBUI_MISSING_JWT_{token}",
         f"REJECTED_OPENWEBUI_INVALID_JWT_{token}",
         f"REJECTED_OPENWEBUI_EXPIRED_JWT_{token}",
@@ -2346,25 +2542,27 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"FORGED_LOG_ENV_{token}",
         f"FORGED_LOG_SERVICE_{token}",
         f"FORGED_RESOURCE_ENV_{token}",
+        f"FORGED_METRIC_ENV_{token}",
+        f"METRIC_RESOURCE_SECRET_{token}",
+        f"METRIC_SCOPE_SECRET_{token}",
+        f"METRIC_POINT_SECRET_{token}",
+        f"FORGED_OTLP_LOG_ENV_{token}",
+        f"OTLP_LOG_RESOURCE_SECRET_{token}",
+        f"OTLP_LOG_BODY_SECRET_{token}",
         f"FORGED_BODY_PRODUCER_{token}",
         f"FORGED_BODY_ENV_{token}",
         f"FORGED_BODY_SERVICE_{token}",
-        f"DENIED_ZERO_TIMESTAMP_{token}",
-        f"DENIED_STALE_TIMESTAMP_{token}",
-        f"DENIED_FUTURE_TIMESTAMP_{token}",
         "aigw.security.source_time_unix_nano",
         f"denied-changed-string-{token}",
         f"denied-changed-null-{token}",
         f"denied-changed-number-{token}",
         f"untrusted-call-{token}",
         f"DENIED_KEYCLOAK_MISSING_USER_{token}",
-        f"denied_raw_metric_{token}",
-        f"DENIED_RAW_LOG_{token}",
         "provider=openai reason=tls_transport_failure",
     )
     leaked = [marker for marker in forbidden if marker in logs]
     if leaked:
-        fail("Cribl received a secret or a signal outside the allow-list")
+        fail("Cribl received a secret or a rejected structured record")
 
 
 def read_alloy_metrics(preprod: Preprod, model: dict[str, Any]) -> str:
@@ -2406,32 +2604,42 @@ def read_alloy_metrics(preprod: Preprod, model: dict[str, Any]) -> str:
     )
 
 
-def cribl_queue_size(metrics: str) -> float:
-    matches: list[float] = []
+def cribl_queue_sizes(metrics: str) -> dict[str, float]:
+    matches: dict[str, float] = {}
     for line in metrics.splitlines():
         if not line.startswith("otelcol_exporter_queue_size{"):
             continue
         labels, separator, value = line.rpartition(" ")
         if not separator:
             continue
-        if (
-            'component_id="otelcol.exporter.otlp.cribl"' in labels
-            and 'data_type="logs"' in labels
-        ):
-            try:
-                matches.append(float(value))
-            except ValueError:
-                fail("Alloy returned an invalid Cribl queue metric")
-    if len(matches) != 1:
-        fail("Alloy did not expose one Cribl log queue metric")
-    return matches[0]
+        if 'component_id="otelcol.exporter.otlp.cribl"' not in labels:
+            continue
+        signal = next(
+            (
+                candidate
+                for candidate in ("logs", "metrics", "traces")
+                if f'data_type="{candidate}"' in labels
+            ),
+            None,
+        )
+        if signal is None or signal in matches:
+            fail("Alloy returned an ambiguous Cribl queue metric")
+        try:
+            matches[signal] = float(value)
+        except ValueError:
+            fail("Alloy returned an invalid Cribl queue metric")
+    if set(matches) != {"logs", "metrics", "traces"}:
+        fail("Alloy did not expose all three Cribl signal queue metrics")
+    return matches
 
 
 def wait_for_queue(preprod: Preprod, model: dict[str, Any], *, populated: bool) -> None:
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
-        size = cribl_queue_size(read_alloy_metrics(preprod, model))
-        if (populated and size > 0) or (not populated and size == 0):
+        sizes = cribl_queue_sizes(read_alloy_metrics(preprod, model))
+        if (populated and all(size > 0 for size in sizes.values())) or (
+            not populated and all(size == 0 for size in sizes.values())
+        ):
             return
         time.sleep(1)
     state = "grow" if populated else "drain"
@@ -2632,6 +2840,11 @@ def main() -> int:
             preprod,
             (
                 f"allowed-ai-input-{token}",
+                f"ADMITTED_SANITIZED_TRACE_{token}",
+                f"ADMITTED_UNATTRIBUTED_TRACE_{token}",
+                f"admitted_metric_{token}",
+                f"ADMITTED_LOG_{token}",
+                f"ADMITTED_ORDINARY_LOG_{token}",
                 f"real-ai-input-{token}",
                 f"runtime-openwebui-ai-input-{token}",
                 f"aigw.user.name: Str(natural-portal-{token})",
@@ -2653,6 +2866,7 @@ def main() -> int:
                 "event=aigw.provider.rotation action=rotate outcome=success vendor=anthropic",
                 "event=aigw.provider.rotation action=recovery outcome=success vendor=anthropic",
                 "event=aigw.vault.state action=state_observed outcome=success state=unsealed",
+                "event=aigw.model.limit action=reserve outcome=success model=claude-sonnet-4-5 control=output_tokens_per_utc_minute project=receipt-project reason=capacity_reserved",
                 "event=aigw.vault.audit",
                 "event=aigw.controller.lifecycle action=upgrade outcome=success",
                 "event=aigw.controller.lifecycle action=rollback outcome=failed",
@@ -2669,7 +2883,7 @@ def main() -> int:
     finally:
         empty_controller_lifecycle_fixtures()
 
-    print("PREPROD_CRIBL_SECURITY_FEED_PASSED")
+    print("PREPROD_CRIBL_TELEMETRY_PASSED")
     return 0
 
 

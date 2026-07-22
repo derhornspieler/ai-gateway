@@ -31,6 +31,39 @@ def placeholder_egress_plan(builder, providers: tuple[str, ...]):
     )
 
 
+def require_build_recipe(service_name: str, service: object) -> None:
+    """Require one rendered Compose build without duplicating image naming.
+
+    Compose may leave ``image`` unset. The authoritative build planner turns
+    that supported shape into ``<project>-<service>``. Its record is checked
+    separately below, so rejecting an implicit name here would disagree with
+    the release builder without adding a security check.
+    """
+
+    if not isinstance(service, dict) or not service.get("build"):
+        raise ReleaseSecurityError(
+            f"scan matrix no longer matches the release build for {service_name}"
+        )
+
+
+def require_planned_build(
+    service_name: str,
+    build_record: object,
+    expected_image: str,
+    expected_input_digest: str,
+) -> None:
+    """Bind a matrix entry to the planner's exact image and source digest."""
+
+    if (
+        not isinstance(build_record, dict)
+        or build_record.get("image") != expected_image
+        or build_record.get("digest") != expected_input_digest
+    ):
+        raise ReleaseSecurityError(
+            f"scan matrix build-input digest no longer matches {service_name}"
+        )
+
+
 def build_image(
     root: Path,
     config_path: Path,
@@ -67,14 +100,7 @@ def build_image(
     preprod_builds = builder.add_preprod_build_services(model, root)
     services = model.get("services")
     service = services.get(service_name) if isinstance(services, dict) else None
-    if (
-        not isinstance(service, dict)
-        or not service.get("build")
-        or service.get("image") != expected_image
-    ):
-        raise ReleaseSecurityError(
-            f"scan matrix no longer matches the release build for {service_name}"
-        )
+    require_build_recipe(service_name, service)
 
     with tempfile.TemporaryDirectory(prefix="aigw-ci-build-proof-") as temporary:
         build_plan = planner.plan_compose_builds(
@@ -91,14 +117,12 @@ def build_image(
         if isinstance(manifest_services, dict)
         else None
     )
-    if (
-        not isinstance(build_record, dict)
-        or build_record.get("image") != expected_image
-        or build_record.get("digest") != expected_input_digest
-    ):
-        raise ReleaseSecurityError(
-            f"scan matrix build-input digest no longer matches {service_name}"
-        )
+    require_planned_build(
+        service_name,
+        build_record,
+        expected_image,
+        expected_input_digest,
+    )
 
     if service_name == builder.ENVOY_SERVICE:
         image_id = builder.build_immutable_envoy_image(

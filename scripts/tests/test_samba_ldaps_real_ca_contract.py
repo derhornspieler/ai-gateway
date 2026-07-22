@@ -74,7 +74,8 @@ class PreprodCertificateGenerationTests(unittest.TestCase):
             '"openssl", "verify", "-CAfile", str(paths["root_cert"])',
             self.script,
         )
-        self.assertIn('"-verify_hostname", sans[0]', self.script)
+        self.assertIn('marker = "X509v3 Subject Alternative Name:"', self.script)
+        self.assertIn("if actual_sans != expected_sans:", self.script)
 
     def test_partial_ca_or_leaf_state_fails_closed(self) -> None:
         self.assertIn(
@@ -89,7 +90,10 @@ class PreprodCertificateGenerationTests(unittest.TestCase):
     def test_private_keys_and_public_certificates_have_bounded_modes(self) -> None:
         self.assertIn('paths["root_key"].chmod(0o600)', self.script)
         self.assertIn('paths["root_cert"].chmod(0o644)', self.script)
-        self.assertIn("key_path.chmod(0o600)", self.script)
+        self.assertIn("key_mode: int = 0o600", self.script)
+        self.assertIn("key_path.chmod(key_mode)", self.script)
+        self.assertEqual(self.script.count("key_mode=0o644"), 2)
+        self.assertIn("ensure_private_directory(SECRETS_DIR)", self.script)
         self.assertIn("cert_path.chmod(0o644)", self.script)
 
 

@@ -869,7 +869,7 @@ EXPECTED_ROLE_MATRIX = sorted(
         "grafana_ro|keycloak|false",
         "grafana_ro|litellm|true",
         "grafana_ro|postgres|false",
-        "grafana_ro|rotator|false",
+        "grafana_ro|rotator|true",
         "keycloak|keycloak|true",
         "keycloak|litellm|false",
         "keycloak|postgres|false",

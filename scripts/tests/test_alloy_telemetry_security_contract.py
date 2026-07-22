@@ -120,6 +120,22 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         for signal in ("traces", "logs", "metrics"):
             self.assertRegex(
                 self.sanitizer,
+                rf"{signal}\s+= \[otelcol\.processor\.transform\.aigw_signal_context\.input\]",
+            )
+        context = self.alloy.split(
+            'otelcol.processor.transform "aigw_signal_context"', 1
+        )[1].split('otelcol.processor.batch "default"', 1)[0]
+        self.assertIn('error_mode = "propagate"', context)
+        self.assertEqual(
+            context.count(
+                '`set(attributes["deployment.environment"], "` + '
+                'sys.env("AIGW_DEPLOYMENT_ENVIRONMENT") + `")`'
+            ),
+            3,
+        )
+        for signal in ("traces", "logs", "metrics"):
+            self.assertRegex(
+                context,
                 rf"{signal}\s+= \[otelcol\.processor\.batch\.default\.input\]",
             )
 
@@ -154,6 +170,14 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "http.client_ip",
             "url.query",
             "enduser.email",
+            "session_token",
+            "auth.session_cookie",
+            "vault_unseal_share",
+            "secrets.vault_recovery_key",
+            "client_assertion",
+            "oidc.id_token",
+            "jwt",
+            "tls.private_key_pem",
         )
         for key in sensitive:
             self.assertTrue(
@@ -300,19 +324,19 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         self.assertIn("- --disable-reporting", alloy_service)
 
     def test_request_stream_is_filtered_allowlisted_and_labeled_for_drilldown(self) -> None:
-        # The Loki request stream must be fed from the SANITIZED trace path.
-        # Raw traces stay local to span-derived metrics and the exact request
-        # converter; the default batch must never reference Cribl.
+        # The Loki request stream and Cribl trace copy must both be fed from the
+        # sanitized path. The exporter is still behind signal-specific batches.
         batch = self.alloy.split('otelcol.processor.batch "default"', 1)[1].split(
             "\n}\n", 1
         )[0]
         self.assertNotIn("otelcol.exporter.otlp.cribl.input", batch)
         self.assertIn("otelcol.connector.spanmetrics.default.input", batch)
         self.assertIn("otelcol.processor.filter.aigw_request_spans.input", batch)
+        self.assertIn("otelcol.processor.batch.cribl_traces.input", batch)
 
         # Only the exact litellm_request span may become a log line; sibling
         # spans (raw vendor payload, proxy request) and same-name spans from a
-        # different service are dropped before the external log queue.
+        # different service cannot become a normalized request-audit log.
         span_filter = self.alloy.split(
             'otelcol.processor.filter "aigw_request_spans"', 1
         )[1].split("\n}\n", 1)[0]
@@ -435,16 +459,22 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "otelcol.processor.transform.cribl_security_contract.input", labels
         )
 
-    def test_cribl_has_one_logs_only_fail_closed_queue_ingress(self) -> None:
+    def test_cribl_mirrors_all_signals_through_separate_batches(self) -> None:
+        self.assertEqual(self.alloy.count('otelcol.exporter.otlp "cribl"'), 1)
         self.assertEqual(
-            self.alloy.count("otelcol.exporter.otlp.cribl.input"), 1
+            self.alloy.count('endpoint = sys.env("CRIBL_OTLP_ENDPOINT")'), 1
         )
-        security_batch = self.alloy.split(
-            'otelcol.processor.batch "cribl_security"', 1
-        )[1].split("\n}\n", 1)[0]
-        self.assertIn("logs = [otelcol.exporter.otlp.cribl.input]", security_batch)
-        self.assertNotIn("traces", security_batch)
-        self.assertNotIn("metrics", security_batch)
+        self.assertEqual(self.compose.count("\n      CRIBL_OTLP_ENDPOINT:"), 1)
+        self.assertEqual(self.alloy.count("otelcol.exporter.otlp.cribl.input"), 3)
+        for signal in ("logs", "metrics", "traces"):
+            batch = self.alloy.split(
+                f'otelcol.processor.batch "cribl_{signal}"', 1
+            )[1].split("\n}\n", 1)[0]
+            self.assertIn(
+                f"{signal} = [otelcol.exporter.otlp.cribl.input]", batch
+            )
+            for other in {"logs", "metrics", "traces"} - {signal}:
+                self.assertNotIn(f"{other} =", batch)
         self.assertNotIn('otelcol.receiver.loki "file_logs"', self.alloy)
         self.assertNotIn('otelcol.processor.batch "file_logs"', self.alloy)
         contract = self.alloy.split(
@@ -459,7 +489,39 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
         default_batch = self.alloy.split(
             'otelcol.processor.batch "default"', 1
         )[1].split("\n}\n", 1)[0]
-        self.assertNotIn("cribl", default_batch.lower())
+        for signal in ("logs", "metrics", "traces"):
+            self.assertIn(f"otelcol.processor.batch.cribl_{signal}.input", default_batch)
+
+        docker = self.alloy.split('loki.process "docker"', 1)[1].split(
+            'loki.process "cribl_admitted_docker"', 1
+        )[0]
+        for replacement in (
+            "<redacted-credential>",
+            "<redacted-authorization>",
+            "<redacted-vendor-key>",
+            "<redacted-jwt>",
+            "<redacted-vault-token>",
+            "<redacted-private-key>",
+        ):
+            self.assertIn(replacement, docker)
+
+        admitted = self.alloy.split(
+            'loki.process "cribl_admitted_docker"', 1
+        )[1].split('loki.process "cribl_keycloak_auth"', 1)[0]
+        for required in (
+            "AIGW_SECURITY_EVENT",
+            '"log\\.logger":"org\\.keycloak\\.events"',
+            '"upstream_transport_failure_reason":',
+            'drop_counter_reason = "raw_security_record_requires_projection"',
+            "otelcol.receiver.loki.cribl_admitted_logs.receiver",
+            'otelcol.processor.transform "cribl_admitted_logs"',
+            "otelcol.processor.batch.cribl_logs.input",
+            "<redacted-credential>",
+            "<redacted-jwt>",
+            "<redacted-vault-token>",
+            "<redacted-private-key>",
+        ):
+            self.assertIn(required, admitted)
 
         vault = self.alloy.split('loki.source.file "vault_audit"', 1)[1].split(
             "\n}\n", 1
@@ -522,8 +584,13 @@ class AlloyTelemetrySecurityContractTests(unittest.TestCase):
             "aigw.provider.rotation",
             "aigw.vault.state",
             "aigw.egress.trust",
+            "aigw.model.limit",
         ):
             self.assertIn(event, structured)
+        self.assertIn(
+            'service!~\\"dev-portal|admin-portal|key-rotator|envoy-egress|litellm\\"',
+            structured,
+        )
         self.assertIn('source   = "security_schema"', structured)
         self.assertIn('template = "{{ .Value }}"', structured)
         self.assertIn('aigw_security_schema      = "security_schema"', structured)

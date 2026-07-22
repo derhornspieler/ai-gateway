@@ -1,0 +1,207 @@
+{
+  "annotations": {"list": []},
+  "description": "Prompt-free usage and cost evidence from the append-only AI Gateway ledger. Unknown values stay unknown. Booked cost never changes; current cost includes confirmed backdate adjustments. Request IDs appear only in the bounded audit table and are not metric labels.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {"keepTime": true, "tags": [], "targetBlank": false, "title": "AI Gateway Top Projects", "type": "link", "url": "/d/aigw-top-projects/ai-gateway-top-projects"},
+    {"keepTime": true, "tags": [], "targetBlank": false, "title": "AI Gateway Top Users", "type": "link", "url": "/d/aigw-top-users/ai-gateway-top-users"},
+    {"keepTime": true, "tags": [], "targetBlank": false, "title": "AI Gateway Overview", "type": "link", "url": "/d/aigw-overview/ai-gateway-overview"}
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+      "description": "Top models by current configured cost. The five token classes remain separate. Unknown-cost counts show where totals cannot be reconciled.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}}, "noValue": "No data"}, "overrides": []},
+      "gridPos": {"h": 11, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"cellHeight": "sm", "footer": {"show": false}, "showHeader": true, "sortBy": []},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(requested_model, 'unattributed') AS \"model\",\n  COUNT(*) AS \"requests\",\n  COUNT(*) FILTER (WHERE status = 'failure') AS \"failed_requests\",\n  COUNT(*) FILTER (WHERE usage_completeness <> 'complete') AS \"incomplete_usage\",\n  SUM(normal_input_tokens) AS \"normal_input_tokens\",\n  SUM(cache_creation_5m_tokens) AS \"cache_creation_5m_tokens\",\n  SUM(cache_creation_1h_tokens) AS \"cache_creation_1h_tokens\",\n  SUM(cache_read_tokens) AS \"cache_read_tokens\",\n  SUM(output_tokens) AS \"output_tokens\",\n  CASE WHEN COUNT(*) FILTER (WHERE status = 'success' AND current_configured_total_cost_usd IS NULL) = 0\n       THEN SUM(current_configured_total_cost_usd) FILTER (WHERE status = 'success') END AS \"current_cost_usd\",\n  COUNT(*) FILTER (WHERE status = 'success' AND current_configured_total_cost_usd IS NULL) AS \"unknown_cost_rows\"\nFROM aigw_governance.usage_reporting\nWHERE $__timeFilter(occurred_at)\nGROUP BY 1\nORDER BY current_cost_usd DESC NULLS LAST, requests DESC\nLIMIT 10",
+          "refId": "A"
+        }
+      ],
+      "title": "Model Usage and Current Cost",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+      "description": "Top project and model pairs. Missing signed project identity stays visible as unattributed.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}}, "noValue": "No data"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 11},
+      "id": 2,
+      "options": {"cellHeight": "sm", "footer": {"show": false}, "showHeader": true, "sortBy": []},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(project_id, 'unattributed') AS \"project\",\n  COALESCE(requested_model, 'unattributed') AS \"model\",\n  COUNT(*) AS \"requests\",\n  COUNT(*) FILTER (WHERE status = 'failure') AS \"failed_requests\",\n  SUM(normal_input_tokens + cache_creation_5m_tokens + cache_creation_1h_tokens + cache_read_tokens + output_tokens) AS \"known_tokens\",\n  CASE WHEN COUNT(*) FILTER (WHERE status = 'success' AND current_configured_total_cost_usd IS NULL) = 0\n       THEN SUM(current_configured_total_cost_usd) FILTER (WHERE status = 'success') END AS \"current_cost_usd\"\nFROM aigw_governance.usage_reporting\nWHERE $__timeFilter(occurred_at)\nGROUP BY 1, 2\nORDER BY current_cost_usd DESC NULLS LAST, requests DESC\nLIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Project and Model Pairs",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+      "description": "Top stable user and model pairs. This uses the signed stable user ID, not a request header or prompt field.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}}, "noValue": "No data"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 11},
+      "id": 3,
+      "options": {"cellHeight": "sm", "footer": {"show": false}, "showHeader": true, "sortBy": []},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COALESCE(stable_user_id, 'unattributed') AS \"user\",\n  COALESCE(requested_model, 'unattributed') AS \"model\",\n  COUNT(*) AS \"requests\",\n  COUNT(*) FILTER (WHERE status = 'failure') AS \"failed_requests\",\n  SUM(normal_input_tokens + cache_creation_5m_tokens + cache_creation_1h_tokens + cache_read_tokens + output_tokens) AS \"known_tokens\",\n  CASE WHEN COUNT(*) FILTER (WHERE status = 'success' AND current_configured_total_cost_usd IS NULL) = 0\n       THEN SUM(current_configured_total_cost_usd) FILTER (WHERE status = 'success') END AS \"current_cost_usd\"\nFROM aigw_governance.usage_reporting\nWHERE $__timeFilter(occurred_at)\nGROUP BY 1, 2\nORDER BY current_cost_usd DESC NULLS LAST, requests DESC\nLIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "Top User and Model Pairs",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+      "description": "Daily known token totals. Missing or partial usage is shown in the data-quality panel and is never filled with zero.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "bars", "fillOpacity": 55, "lineWidth": 1, "stacking": {"group": "A", "mode": "normal"}}, "noValue": "No data", "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 21},
+      "id": 4,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  date_trunc('day', occurred_at) AS \"time\",\n  SUM(normal_input_tokens) AS \"normal_input\",\n  SUM(cache_creation_5m_tokens) AS \"cache_creation_5m\",\n  SUM(cache_creation_1h_tokens) AS \"cache_creation_1h\",\n  SUM(cache_read_tokens) AS \"cache_read\",\n  SUM(output_tokens) AS \"output\"\nFROM aigw_governance.usage_reporting\nWHERE $__timeFilter(occurred_at)\nGROUP BY 1\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Daily Token Mix",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+      "description": "Daily cost sources. A line is blank for a day when any successful row lacks that cost source. Booked cost is original evidence. Current cost includes confirmed adjustments.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}, "decimals": 6, "noValue": "No data", "unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 30},
+      "id": 5,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  date_trunc('day', occurred_at) AS \"time\",\n  CASE WHEN COUNT(*) FILTER (WHERE status = 'success' AND litellm_cost_usd IS NULL) = 0 THEN SUM(litellm_cost_usd) FILTER (WHERE status = 'success') END AS \"litellm_cost\",\n  CASE WHEN COUNT(*) FILTER (WHERE status = 'success' AND provider_cost_usd IS NULL) = 0 THEN SUM(provider_cost_usd) FILTER (WHERE status = 'success') END AS \"provider_cost\",\n  CASE WHEN COUNT(*) FILTER (WHERE status = 'success' AND booked_configured_total_cost_usd IS NULL) = 0 THEN SUM(booked_configured_total_cost_usd) FILTER (WHERE status = 'success') END AS \"booked_configured_cost\",\n  CASE WHEN COUNT(*) FILTER (WHERE status = 'success' AND current_configured_total_cost_usd IS NULL) = 0 THEN SUM(current_configured_total_cost_usd) FILTER (WHERE status = 'success') END AS \"current_configured_cost\"\nFROM aigw_governance.usage_reporting\nWHERE $__timeFilter(occurred_at)\nGROUP BY 1\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Daily Cost Reconciliation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+      "description": "Configured cost by token class. A class total stays unknown when any positive-token component has no reviewed price.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}}, "noValue": "No data"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 39},
+      "id": 6,
+      "options": {"cellHeight": "sm", "footer": {"show": false}, "showHeader": true, "sortBy": []},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  usage_class AS \"usage_class\",\n  SUM(token_count) AS \"known_tokens\",\n  COUNT(*) FILTER (WHERE token_count > 0 AND current_cost_usd IS NULL) AS \"unknown_cost_rows\",\n  CASE WHEN COUNT(*) FILTER (WHERE token_count > 0 AND booked_cost_usd IS NULL) = 0 THEN SUM(booked_cost_usd) END AS \"booked_cost_usd\",\n  CASE WHEN COUNT(*) FILTER (WHERE token_count > 0 AND current_cost_usd IS NULL) = 0 THEN SUM(current_cost_usd) END AS \"current_cost_usd\"\nFROM aigw_governance.usage_component_reporting\nWHERE $__timeFilter(occurred_at)\n  AND status = 'success'\nGROUP BY usage_class\nORDER BY usage_class",
+          "refId": "A"
+        }
+      ],
+      "title": "Cost by Token Class",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+      "description": "Counts that explain incomplete reconciliation. Unknown is a gap, not zero. Adjustment count is append-only history.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}}, "noValue": "No data"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 39},
+      "id": 7,
+      "options": {"cellHeight": "sm", "footer": {"show": false}, "showHeader": true, "sortBy": []},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  COUNT(*) AS \"requests\",\n  COUNT(*) FILTER (WHERE status = 'failure') AS \"failed_requests\",\n  COUNT(*) FILTER (WHERE usage_completeness = 'partial') AS \"partial_usage\",\n  COUNT(*) FILTER (WHERE usage_completeness = 'unknown') AS \"unknown_usage\",\n  COUNT(*) FILTER (WHERE status = 'success' AND litellm_cost_usd IS NULL) AS \"unknown_litellm_cost\",\n  COUNT(*) FILTER (WHERE status = 'success' AND provider_cost_usd IS NULL) AS \"unknown_provider_cost\",\n  COUNT(*) FILTER (WHERE status = 'success' AND current_configured_total_cost_usd IS NULL) AS \"unknown_configured_cost\",\n  SUM(adjustment_count) AS \"adjustments\"\nFROM aigw_governance.usage_reporting\nWHERE $__timeFilter(occurred_at)",
+          "refId": "A"
+        }
+      ],
+      "title": "Accounting Data Quality",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "description": "LiteLLM completed the provider response but could not deliver its prompt-free usage event. The provider response is not retried because that could cause a second charge. Investigate every gap.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [], "noValue": "No data", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 48},
+      "id": 8,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showPercentChange": false, "textMode": "auto", "wideLayout": true},
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "editorMode": "code",
+          "expr": "sum(count_over_time({service=\"litellm\"} |= \"AIGW_SECURITY_EVENT\" |= \"\\\"event\\\":\\\"aigw.usage.audit\\\"\" |= \"\\\"action\\\":\\\"delivery_failure\\\"\" [$__range]))",
+          "legendFormat": "delivery gaps",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "Accounting Delivery Gaps",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+      "description": "The newest 100 prompt-free evidence rows. Request ID is shown only here for audit joins. It is never a Prometheus or Loki label.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}}, "noValue": "No data"}, "overrides": []},
+      "gridPos": {"h": 12, "w": 18, "x": 6, "y": 48},
+      "id": 9,
+      "options": {"cellHeight": "sm", "footer": {"show": false}, "showHeader": true, "sortBy": []},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "aigw-usage"},
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  occurred_at AS \"time\",\n  event_id AS \"event_id\",\n  request_id AS \"request_id\",\n  COALESCE(requested_model, 'unattributed') AS \"requested_model\",\n  COALESCE(actual_model, 'unattributed') AS \"actual_model\",\n  COALESCE(project_id, 'unattributed') AS \"project\",\n  COALESCE(stable_user_id, 'unattributed') AS \"user\",\n  status,\n  usage_completeness,\n  litellm_cost_usd,\n  provider_cost_usd,\n  booked_configured_total_cost_usd,\n  current_configured_total_cost_usd,\n  adjustment_count\nFROM aigw_governance.usage_reporting\nWHERE $__timeFilter(occurred_at)\nORDER BY occurred_at DESC, event_id\nLIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "title": "Recent Usage Evidence",
+      "type": "table"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 42,
+  "tags": ["ai-gateway", "cost", "models", "usage"],
+  "templating": {"list": []},
+  "time": {"from": "now-7d", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "AI Gateway Model Usage and Cost",
+  "uid": "aigw-model-usage",
+  "version": 2,
+  "weekStart": ""
+}

@@ -93,7 +93,7 @@ class VaultUIUpstreamProvenanceTests(unittest.TestCase):
         self.assertTrue(
             stages[-1].startswith(
                 "FROM dhi.io/vault:2.0.3@sha256:"
-                "2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e"
+                "754dc49e181b867bc58aa44694507ff7c0ffa178db8778333700062c85e09726"
             )
         )
 

@@ -23,7 +23,13 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    model_validator,
+)
 
 from app import health
 from app.config import Settings, get_settings
@@ -31,6 +37,12 @@ from app.db import Database
 from app.drivers.anthropic_wif import AnthropicWifDriver
 from app.drivers.static_seed import StaticSeedDriver
 from app.litellm_client import LiteLLMClient
+from app.model_catalog import ProviderPolicyReceipt, load_provider_policy_receipt
+from app.model_governance_api import (
+    model_policy_lock,
+    router as model_governance_router,
+)
+from app.model_reconciler import ModelReconciler
 from app.identity import (
     IdentityConflict,
     IdentityError,
@@ -46,7 +58,11 @@ from app.provider_auth import (
     ProviderRegistry,
     ProviderUnavailable,
 )
+from app.pricing_api import router as pricing_router
 from app.scheduler import RotationScheduler
+from app.usage import read_usage_token
+from app.usage_api import router as usage_router
+from app.usage_store import PostgresUsageStore
 from app.vault_client import VaultClient, VaultError
 
 logging.basicConfig(
@@ -59,6 +75,23 @@ app = FastAPI(title="key-rotator", version="1.0.0")
 # Simple module-level app state (avoids a DI framework for a small
 # internal-only service). Populated in on_startup, read by route handlers.
 state: dict[str, Any] = {}
+app.state.aigw_services = state
+app.include_router(model_governance_router)
+app.include_router(pricing_router)
+app.include_router(usage_router)
+
+
+def _configured_provider_policy(
+    settings: Settings,
+) -> ProviderPolicyReceipt | None:
+    """Load deployment trust once, before any network client is created."""
+
+    if not settings.provider_policy_receipt_file:
+        return None
+    return load_provider_policy_receipt(
+        settings.provider_policy_receipt_file,
+        expected_policy_sha256=settings.aigw_egress_policy_sha256,
+    )
 
 
 class SettingsUpdate(BaseModel):
@@ -99,6 +132,21 @@ class IdentityGroupCreate(BaseModel):
     capabilities: list[str] = Field(min_length=1, max_length=4)
 
 
+class IdentityModelLimits(BaseModel):
+    """The two conservative output controls supported in the first release."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_output_tokens_per_request: StrictInt = Field(ge=1, le=1_000_000)
+    output_tokens_per_utc_minute: StrictInt = Field(ge=1, le=1_000_000_000)
+
+    @model_validator(mode="after")
+    def request_cap_fits_minute_cap(self) -> "IdentityModelLimits":
+        if self.max_output_tokens_per_request > self.output_tokens_per_utc_minute:
+            raise ValueError("request output cap cannot exceed the minute cap")
+        return self
+
+
 class IdentityGroupPolicyUpdate(BaseModel):
     """Requested per-project issuance policy; null means platform default.
 
@@ -114,6 +162,17 @@ class IdentityGroupPolicyUpdate(BaseModel):
         default=None, min_length=1, max_length=32
     )
     default_model: str | None = Field(default=None, min_length=1, max_length=128)
+    model_limits: dict[str, IdentityModelLimits] = Field(
+        default_factory=dict, max_length=32
+    )
+
+
+class IdentityGroupPolicyRevision(BaseModel):
+    """Expected durable policy revision for activate/complete phases."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class ProviderLifecycleRequest(BaseModel):
@@ -181,6 +240,14 @@ async def internal_auth_middleware(request: Request, call_next):
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    # LiteLLM has a separate write-only credential. The route performs its
+    # own authentication before it parses JSON. Do not widen this exception
+    # to a prefix or another method.
+    if request.method == "POST" and request.url.path == "/usage/events":
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     settings: Optional[Settings] = state.get("settings")
     if (
         settings is None
@@ -199,9 +266,9 @@ async def internal_auth_middleware(request: Request, call_next):
     admin_authorized = hmac.compare_digest(
         supplied.encode(), settings.rotator_internal_token.encode()
     )
-    portal_route = (
-        request.method == "GET"
-        and re.fullmatch(
+    portal_route = request.method == "GET" and (
+        request.url.path == "/model-governance/discovery"
+        or re.fullmatch(
             r"/identity/projects/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
             request.url.path,
         )
@@ -234,11 +301,28 @@ async def on_startup() -> None:
             "strong, non-placeholder values; refusing to start with auth disabled"
         )
 
+    state.pop("provider_policy", None)
+    state.pop("model_reconciler", None)
+    state.pop("usage_token", None)
+    state.pop("usage_store", None)
+    provider_policy = _configured_provider_policy(settings)
+    if provider_policy is not None:
+        state["provider_policy"] = provider_policy
+
     state["settings"] = settings
 
     db = Database(settings)
     await db.connect_with_retry(max_wait_seconds=60)
     state["db"] = db
+    state["usage_token"] = read_usage_token()
+    state["usage_store"] = PostgresUsageStore(
+        db,
+        egress_policy_sha256=(
+            provider_policy.egress_policy_sha256
+            if provider_policy is not None
+            else None
+        ),
+    )
 
     vault = VaultClient(settings)
     await vault.connect_with_retry(max_wait_seconds=60)
@@ -246,6 +330,22 @@ async def on_startup() -> None:
 
     litellm = LiteLLMClient(settings)
     state["litellm"] = litellm
+
+    if provider_policy is not None:
+        model_reconciler = ModelReconciler(
+            db,
+            litellm,
+            egress_policy_sha256=provider_policy.egress_policy_sha256,
+        )
+        state["model_reconciler"] = model_reconciler
+        try:
+            await model_reconciler.reconcile()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "initial model reconciliation failed (%s); retrying in background",
+                type(exc).__name__,
+            )
+        model_reconciler.start()
 
     # Group removal must revoke static LiteLLM portal keys at the authoritative
     # identity mutation boundary, not only in the browser admin portal.
@@ -300,6 +400,9 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    model_reconciler: Optional[ModelReconciler] = state.get("model_reconciler")
+    if model_reconciler:
+        await model_reconciler.shutdown()
     scheduler: Optional[RotationScheduler] = state.get("scheduler")
     if scheduler:
         await scheduler.shutdown()
@@ -330,7 +433,23 @@ async def readyz() -> JSONResponse:
     """Non-sensitive readiness for the post-bootstrap deployment gate."""
     db: Optional[Database] = state.get("db")
     vault: Optional[VaultClient] = state.get("vault")
-    ready = bool(db and vault and await db.ready() and vault.ready())
+    model_reconciler: Optional[ModelReconciler] = state.get("model_reconciler")
+    models_ready = model_reconciler is None or model_reconciler.ready
+    identity: Optional[KeycloakAdmin] = state.get("identity")
+    try:
+        policies_ready = bool(
+            identity and await identity.project_policy_reconciliation_ready()
+        )
+    except Exception:  # noqa: BLE001 - ambiguous reconciliation is not ready
+        policies_ready = False
+    ready = bool(
+        db
+        and vault
+        and await db.ready()
+        and vault.ready()
+        and models_ready
+        and policies_ready
+    )
     return JSONResponse(status_code=200 if ready else 503, content={"ready": ready})
 
 
@@ -708,9 +827,82 @@ async def identity_set_group_policy(
     identity: KeycloakAdmin = state["identity"]
     operation_id = _identity_operation_id(request)
     try:
-        return await identity.set_group_policy(
-            group_id, body.model_dump(), operation_id
+        async with model_policy_lock(state):
+            requested = body.model_dump()
+            allowed_models = requested["allowed_models"]
+            if allowed_models and "all-proxy-models" in allowed_models:
+                raise HTTPException(
+                    status_code=422,
+                    detail="wildcard model assignments are not allowed",
+                )
+            receipt = state.get("provider_policy")
+            db: Database = state["db"]
+            if isinstance(receipt, ProviderPolicyReceipt):
+                for model_name in allowed_models or []:
+                    governed = await db.get_governed_model(
+                        model_name,
+                        egress_policy_sha256=receipt.egress_policy_sha256,
+                    )
+                    if governed is not None and governed.get("active") is not True:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="inactive governed models cannot be assigned",
+                        )
+            return await identity.set_group_policy(
+                group_id, requested, operation_id
+            )
+    except HTTPException:
+        raise
+    except IdentityError as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_policy_update", operation_id, exc
         )
+        raise _identity_http_error(exc) from exc
+    except Exception as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_policy_update", operation_id, exc
+        )
+        raise
+
+
+@app.post("/identity/groups/{group_id}/policy/activate")
+async def identity_activate_group_policy(
+    group_id: str, body: IdentityGroupPolicyRevision, request: Request
+) -> dict[str, Any]:
+    """Activate a staged policy after the portal proves old keys are gated."""
+
+    identity: KeycloakAdmin = state["identity"]
+    operation_id = _identity_operation_id(request)
+    try:
+        async with model_policy_lock(state):
+            return await identity.activate_group_policy(
+                group_id, body.policy_revision, operation_id
+            )
+    except IdentityError as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_policy_update", operation_id, exc
+        )
+        raise _identity_http_error(exc) from exc
+    except Exception as exc:
+        await identity.audit_identity_mutation_failure(
+            "group_policy_update", operation_id, exc
+        )
+        raise
+
+
+@app.post("/identity/groups/{group_id}/policy/complete")
+async def identity_complete_group_policy(
+    group_id: str, body: IdentityGroupPolicyRevision, request: Request
+) -> dict[str, Any]:
+    """Clear a pending marker only after every project key verifies."""
+
+    identity: KeycloakAdmin = state["identity"]
+    operation_id = _identity_operation_id(request)
+    try:
+        async with model_policy_lock(state):
+            return await identity.complete_group_policy(
+                group_id, body.policy_revision, operation_id
+            )
     except IdentityError as exc:
         await identity.audit_identity_mutation_failure(
             "group_policy_update", operation_id, exc

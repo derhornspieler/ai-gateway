@@ -23,6 +23,16 @@ http:
       middlewares: [deny-all]
       service: oauth2-proxy # unreachable — deny-all rejects before the OIDC gate
       tls: {}
+    litellm-admin-model-mutation-deny:
+      # Runtime models belong to the first-party governed workflow. Keep the
+      # native UI readable, but block its model/config mutation APIs at the
+      # ADM edge. Key-rotator reaches LiteLLM only on the private bridge.
+      rule: 'Host(`litellm-admin.{{ env "DOMAIN" }}`) && (PathPrefix(`/model/`) || PathPrefix(`/model_group/`) || Path(`/config/field/update`))'
+      priority: 125
+      entryPoints: [websecure]
+      middlewares: [deny-all]
+      service: oauth2-proxy # unreachable — deny-all rejects before OIDC
+      tls: {}
     litellm-admin-root:
       rule: 'Host(`litellm-admin.{{ env "DOMAIN" }}`) && Path(`/`)'
       priority: 110

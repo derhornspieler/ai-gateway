@@ -13,15 +13,17 @@ import urllib.request
 
 
 BASE = "http://litellm:4000"
+PUBLIC_MODELS_BASE = "http://dev-portal:8080"
 ALIAS = "aigw-open-webui-service"
 USER_ID = "svc-open-webui"
-# Unrestricted model scope (owner decision 2026-07-16): the shared chat key may
-# reach every model in the LiteLLM catalog — the admin portal governs access,
-# not a hardcoded per-key allowlist, and new models must appear in chat without
-# re-scoping. "all-proxy-models" is LiteLLM's all-models wildcard (see
-# compose/litellm/aigw_default_model_hook.py ALL_PROXY_MODELS). The ROUTES scope
-# below still restricts the key to listing models and chat only.
-MODELS = ["all-proxy-models"]
+# Take an exact snapshot of the current public LiteLLM model list on every
+# converge. An empty model list and ``all-proxy-models`` both authorize future
+# models, so neither is safe for this browser-facing service key.
+MAX_MODELS = 32
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")
+RESERVED_MODELS = frozenset(
+    {"aigw-auto", "aigw-default", "aigw-no-models", "all-proxy-models"}
+)
 ROUTES = ["/v1/models", "/v1/chat/completions"]
 METADATA = {
     "aigw_key_kind": "service",
@@ -35,10 +37,17 @@ def fail(message: str) -> None:
     raise SystemExit(message)
 
 
-def request(path: str, master: str, *, method: str = "GET", payload=None):
+def request(
+    path: str,
+    master: str,
+    *,
+    method: str = "GET",
+    payload=None,
+    base: str = BASE,
+):
     body = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(
-        BASE + path,
+        base + path,
         data=body,
         method=method,
         headers={
@@ -80,6 +89,30 @@ def lookup(master: str, field: str, value: str) -> list[dict]:
     return records(data)
 
 
+def model_names(credential: str) -> list[str]:
+    """Return one bounded, canonical model list visible to a credential."""
+
+    _, data = request(
+        "/v1/models", credential, base=PUBLIC_MODELS_BASE
+    )
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not 0 < len(rows) <= MAX_MODELS:
+        fail("LiteLLM returned an invalid public model list")
+    names: list[str] = []
+    for row in rows:
+        name = row.get("id") if isinstance(row, dict) else None
+        if (
+            not isinstance(name, str)
+            or MODEL_RE.fullmatch(name) is None
+            or name in RESERVED_MODELS
+        ):
+            fail("LiteLLM returned an invalid public model name")
+        names.append(name)
+    if len(set(names)) != len(names):
+        fail("LiteLLM returned duplicate public model names")
+    return sorted(names)
+
+
 def normalized_json(value):
     if isinstance(value, str):
         try:
@@ -89,12 +122,12 @@ def normalized_json(value):
     return value
 
 
-def exact_record(record: dict, token_hash: str) -> None:
+def exact_record(record: dict, token_hash: str, models: list[str]) -> None:
     if record.get("token") != token_hash:
         fail("Open WebUI key token hash drifted")
     if record.get("key_alias") != ALIAS or record.get("user_id") != USER_ID:
         fail("Open WebUI key identity drifted")
-    if record.get("models") != MODELS or record.get("allowed_routes") != ROUTES:
+    if record.get("models") != models or record.get("allowed_routes") != ROUTES:
         fail("Open WebUI key scope drifted after reconciliation")
     if normalized_json(record.get("metadata")) != METADATA:
         fail("Open WebUI key metadata drifted after reconciliation")
@@ -121,6 +154,7 @@ def main() -> int:
     if candidate == master:
         fail("Open WebUI workload key must not equal the master key")
     token_hash = hashlib.sha256(candidate.encode()).hexdigest()
+    models = model_names(master)
 
     by_alias = [item for item in lookup(master, "key_alias", ALIAS) if item.get("key_alias") == ALIAS]
     by_hash = [item for item in lookup(master, "key_hash", token_hash) if item.get("token") == token_hash]
@@ -134,7 +168,7 @@ def main() -> int:
     payload = {
         "key_alias": ALIAS,
         "user_id": USER_ID,
-        "models": MODELS,
+        "models": models,
         "allowed_routes": ROUTES,
         "metadata": METADATA,
         "permissions": {},
@@ -162,7 +196,9 @@ def main() -> int:
         fail("Open WebUI workload key was not uniquely reconciled")
     if final_alias[0].get("token") != final_hash[0].get("token"):
         fail("Open WebUI final lookups resolved different tokens")
-    exact_record(final_alias[0], token_hash)
+    exact_record(final_alias[0], token_hash, models)
+    if model_names(candidate) != models:
+        fail("Open WebUI workload key does not list its exact model scope")
 
     # The workload key may use inference routes only, never proxy management.
     req = urllib.request.Request(

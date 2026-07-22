@@ -32,6 +32,20 @@ One human plain language review remains. It is tracked in
 4. Define any security word they do not know.
 5. Save the notes and final link report with release evidence.
 
+## Finish alert dashboard acceptance
+
+The source includes a private Alertmanager, Prometheus alert rules, and the
+Grafana **AI Gateway Alerts and Capacity** dashboard. Prometheus is the only
+rule evaluator. Grafana is the operator UI. Alertmanager has no host port or
+FQDN, and it sends no direct notification to Cribl.
+
+Keep this work open until the current exact seed proves the live watchdog,
+active and resolved alerts, fault recovery, and dashboard data. Local Docker
+cannot prove Rocky host network, container restart, Vault seal, or backup
+signals. Do not report those gaps as passed and do not add a privileged Docker
+socket collector to make the test green. See
+[observability operations](observability-operations.md#local-alerts).
+
 ## Run a full security audit
 
 Review the full code and release, including:
@@ -47,17 +61,16 @@ Use the GitHub container-security workflow for the release scan. It must build
 the custom images, resolve exact image IDs, and run Trivy on source and images.
 Do not replace it with an unrecorded local scan.
 
-The workflow currently stops at its required DHI login gate because the
-protected GitHub environment has no approved DHI secrets. Do not weaken that
-gate. Add approved secrets, rerun the workflow, then fix each finding or add a
-short waiver with an owner, reason, and end date.
+The protected GitHub environment now has approved DHI secrets. Keep the login
+gate fail closed. Run the workflow to completion, then fix each finding or add
+a short waiver with an owner, reason, and end date.
 
 Publish a dated report. Include commands, tool versions, image IDs, findings,
 fixes, waivers, and remaining risk.
 
-## Plan model controls, pricing, and routing
+## Finish model controls, pricing, and routing
 
-The future model-control work now has a durable
+The current model-control work has a durable
 [implementation plan](model-governance-plan.md). It covers:
 
 - hidden models tied to the immutable provider release;
@@ -67,5 +80,13 @@ The future model-control work now has a durable
 - audited Alloy-to-Cribl events over OTLP/gRPC and TLS; and
 - a disabled local-only automatic-routing prototype.
 
-This plan is not a finished feature. Follow its phased tests, migrations, and
-rollback gates after the current release work is complete.
+The [automatic routing ADR](automatic-model-routing-adr.md) compares the safe
+choices and keeps the proposed router disabled until its release tests pass.
+
+The governed catalog, lifecycle, filtered discovery, project assignment gate,
+two per-model output controls, prompt-free usage ledger, five-part configured
+cost, backdate adjustment flow, and usage dashboard are complete in source.
+They have unit, contract, portal, migration, and PostgreSQL 18 coverage plus
+seed-only PreProd acceptance harnesses. They are not release-accepted until
+the new exact seed, browser, Grafana, Cribl, backup, restore, and rollback
+gates pass. Automatic routing remains design-only and disabled.

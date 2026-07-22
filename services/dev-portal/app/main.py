@@ -15,16 +15,18 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import logging
 import re
 import secrets
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
 from fastapi import (
@@ -40,8 +42,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import auth, litellm_client, tools
+from . import auth, litellm_client, model_admin, tools
 from .config import settings
+from .model_discovery import router as model_discovery_router
 
 logger = logging.getLogger("dev-portal")
 
@@ -96,6 +99,14 @@ PORTAL_AUDIT_ACTIONS = frozenset(
         "identity.member.remove",
         "key.deactivate",
         "key.generate",
+        "model.governance.create",
+        "model.governance.activate",
+        "model.governance.show",
+        "model.governance.hide",
+        "model.governance.retire",
+        "model.price.create",
+        "model.price.backdate.confirm",
+        "model.price.backdate.preview",
         "provider.anthropic.configure",
         "provider.anthropic.delete",
         "provider.anthropic.disable",
@@ -117,6 +128,8 @@ PORTAL_AUDIT_OUTCOMES = frozenset(
 )
 PROJECT_LOCK_STRIPES = 64
 AMBIGUOUS_GENERATE_CLEANUP_LIMIT = 8
+DEACTIVATION_POLICY_WAIT_SECONDS = 120
+DEACTIVATION_POLICY_POLL_SECONDS = 1
 ROTATOR_RESPONSE_MAX_BYTES = 1024 * 1024
 DEFINITIVE_IDENTITY_MUTATION_STATUS_CODES = frozenset(
     {400, 401, 403, 404, 409, 422}
@@ -150,11 +163,18 @@ _PEM_CERTIFICATE_RE = re.compile(
     r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", re.S
 )
 _project_locks = tuple(asyncio.Lock() for _ in range(PROJECT_LOCK_STRIPES))
+# The admin portal is one container with one worker. This lock serializes
+# policy cutover with manual key edits inside that process. The developer
+# portal is a separate container, so cross-container safety comes from the
+# durable manual-block marker and the post-mutation checks below, not this
+# process-local lock.
+_admin_key_policy_lock = asyncio.Lock()
 # A browser disconnect must not cancel a post-generation authorization check
 # halfway through and leave its plaintext-bearing response path in an
 # indeterminate state. Keep shielded tasks strongly referenced until they have
 # completed; asyncio itself retains only weak references to scheduled tasks.
 _post_generation_liveness_tasks: set[asyncio.Task[None]] = set()
+_post_deactivation_liveness_tasks: set[asyncio.Task[None]] = set()
 
 
 class ActiveProjectKeyExists(Exception):
@@ -282,6 +302,7 @@ admin_app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+app.include_router(model_discovery_router)
 
 
 def _install_session_middleware(target: FastAPI, cookie_name: str) -> None:
@@ -507,10 +528,11 @@ async def admin_root() -> RedirectResponse:
 def _project_lock(user_id: str, project_id: str) -> asyncio.Lock:
     """Bounded lock striping prevents unbounded user-controlled lock growth.
 
-    The deployed portal is one container with one explicitly configured
-    Uvicorn worker. This lock serializes the list/generate/verify transaction
-    for an owner+project pair inside that topology; post-generate verification
-    additionally fails closed if a future unsupported replica races it.
+    The developer portal is one container with one explicitly configured
+    Uvicorn worker. This lock serializes its list/generate/deactivate checks
+    for an owner+project pair. The admin portal is a separate container, so
+    policy races are closed by controller revisions, durable key markers, and
+    shielded post-mutation checks rather than this process-local lock.
     """
     digest = hashlib.blake2s(
         f"{user_id}\0{project_id}".encode("utf-8"), digest_size=2
@@ -648,6 +670,108 @@ def _entry_delete_id(entry: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _metadata_replacement_updates(
+    entry: dict[str, Any], metadata: dict[str, Any], *, blocked: bool
+) -> dict[str, Any]:
+    """Build one provenance-safe metadata replacement for LiteLLM."""
+
+    updates: dict[str, Any] = {"blocked": blocked, "metadata": metadata}
+    if (
+        litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY in metadata
+        or litellm_client.PORTAL_MODEL_LIMITS_METADATA_KEY in metadata
+    ):
+        models = entry.get("models")
+        if not isinstance(models, list) or not models or any(
+            not isinstance(model, str) for model in models
+        ):
+            raise litellm_client.LiteLLMError(
+                "portal key model scope is invalid"
+            )
+        updates["models"] = sorted(models)
+    return updates
+
+
+async def _block_key_with_durable_intent(
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Block one pre-resolved key and make a portal block survive policy retry."""
+
+    concrete = _entry_delete_id(entry)
+    if concrete is None:
+        raise litellm_client.LiteLLMError(
+            "key has no concrete identifier for a durable block"
+        )
+    project_id = _entry_project_id(entry)
+    if project_id is None:
+        updates: dict[str, Any] = {"blocked": True}
+    else:
+        metadata = dict(_key_metadata(entry))
+        metadata[litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY] = True
+        metadata.pop(litellm_client.PORTAL_POLICY_GATE_METADATA_KEY, None)
+        updates = _metadata_replacement_updates(entry, metadata, blocked=True)
+    try:
+        await litellm_client.key_update(concrete, updates)
+    except litellm_client.LiteLLMError:
+        # A lost response may still have committed. The exact read below is
+        # the decision and keeps the operation retry-safe.
+        pass
+    after = await litellm_client.admin_key_lookup(concrete)
+    if after.get("blocked") is not True:
+        raise litellm_client.LiteLLMError("key remained active after block")
+    if project_id is not None:
+        after_metadata = _key_metadata(after)
+        if (
+            _entry_project_id(after) != project_id
+            or after_metadata.get(
+                litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
+            )
+            is not True
+            or litellm_client.PORTAL_POLICY_GATE_METADATA_KEY in after_metadata
+        ):
+            raise litellm_client.LiteLLMError(
+                "portal key durable block did not verify"
+            )
+    return after
+
+
+async def _unblock_key_with_durable_intent(
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Unblock one pre-resolved key and explicitly clear its manual marker."""
+
+    concrete = _entry_delete_id(entry)
+    if concrete is None:
+        raise litellm_client.LiteLLMError(
+            "key has no concrete identifier for unblock"
+        )
+    project_id = _entry_project_id(entry)
+    if project_id is None:
+        updates: dict[str, Any] = {"blocked": False}
+    else:
+        metadata = dict(_key_metadata(entry))
+        metadata.pop(litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY, None)
+        metadata.pop(litellm_client.PORTAL_POLICY_GATE_METADATA_KEY, None)
+        updates = _metadata_replacement_updates(entry, metadata, blocked=False)
+    try:
+        await litellm_client.key_update(concrete, updates)
+    except litellm_client.LiteLLMError:
+        pass
+    after = await litellm_client.admin_key_lookup(concrete)
+    if after.get("blocked") is True:
+        raise litellm_client.LiteLLMError("key remained blocked after unblock")
+    if project_id is not None:
+        after_metadata = _key_metadata(after)
+        if (
+            _entry_project_id(after) != project_id
+            or litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY in after_metadata
+            or litellm_client.PORTAL_POLICY_GATE_METADATA_KEY in after_metadata
+        ):
+            raise litellm_client.LiteLLMError(
+                "portal key durable unblock did not verify"
+            )
+    return after
 
 
 def _resolve_owned_project_key(
@@ -828,6 +952,39 @@ async def _generate_project_key(
                 raise litellm_client.LiteLLMError(
                     "minted key did not verify the project's default model"
                 )
+            if project_policy is not None:
+                model_limits = project_policy.get("model_limits", {})
+                allowed_models = project_policy.get("allowed_models") or []
+                expected_revision = project_policy.get(
+                    litellm_client.PROJECT_POLICY_REVISION_FIELD
+                )
+                if (
+                    not isinstance(expected_revision, str)
+                    or litellm_client.POLICY_REVISION_RE.fullmatch(
+                        expected_revision
+                    )
+                    is None
+                    or _key_metadata(active[0]).get(
+                        litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY
+                    )
+                    != expected_revision
+                ):
+                    raise litellm_client.LiteLLMError(
+                        "minted key did not verify the project's policy revision"
+                    )
+                expected_limits = (
+                    litellm_client.canonical_model_limits(
+                        model_limits, allowed_models
+                    )
+                    if model_limits
+                    else None
+                )
+                if _key_metadata(active[0]).get(
+                    litellm_client.PORTAL_MODEL_LIMITS_METADATA_KEY
+                ) != expected_limits:
+                    raise litellm_client.LiteLLMError(
+                        "minted key did not verify the project's per-model limits"
+                    )
         except Exception:
             # Never disclose a key that could not be proven unique/manageable.
             # /key/update accepts either plaintext or its stored hash. If the
@@ -918,20 +1075,134 @@ async def _verify_post_generation_liveness(
     user: dict[str, Any],
     project_id: str,
     key_value: str,
+    expected_policy_revision: str,
 ) -> None:
-    """Prove membership again, revoking an undisclosed key on every failure."""
+    """Prove membership and policy revision before disclosing a new key."""
 
     try:
         projects = await _live_project_ids(request, user)
+        policies = await _live_project_policies(request, user, projects)
     except Exception:  # noqa: BLE001 - HTTP 503/ambiguous membership is unsafe
         await _deactivate_undisclosed_generated_key(key_value)
         raise
 
-    if project_id not in projects:
+    current_policy = policies.get(project_id)
+    try:
+        current_revision = litellm_client.project_policy_revision(current_policy)
+    except litellm_client.LiteLLMError:
+        current_revision = ""
+    if project_id not in projects or not hmac.compare_digest(
+        current_revision, expected_policy_revision
+    ):
         await _deactivate_undisclosed_generated_key(key_value)
         raise litellm_client.LiteLLMError(
-            "project membership changed during key generation"
+            "project membership or policy changed during key generation"
         )
+
+
+def _retain_post_deactivation_liveness_task(
+    task: asyncio.Task[None],
+) -> asyncio.Task[None]:
+    """Keep a deactivation check alive after a browser disconnect."""
+
+    _post_deactivation_liveness_tasks.add(task)
+
+    def _complete(completed: asyncio.Task[None]) -> None:
+        _post_deactivation_liveness_tasks.discard(completed)
+        if completed.cancelled():
+            logger.error("post-deactivation policy verification was cancelled")
+            return
+        if completed.exception() is not None:
+            logger.warning("post-deactivation policy verification failed closed")
+
+    task.add_done_callback(_complete)
+    return task
+
+
+async def _verify_post_deactivation_liveness(
+    request: Request,
+    user: dict[str, Any],
+    project_id: str,
+    concrete_id: str,
+) -> None:
+    """Keep a developer-deactivated key blocked across policy cutover.
+
+    The policy controller and developer portal run in different containers.
+    A temporary policy gate could otherwise be mistaken for the only reason a
+    key is blocked and a retry could turn it back on. The durable manual marker
+    is the primary control. This check waits out a pending revision and repairs
+    a stale cross-process write before the route reports success.
+    """
+
+    subject = user.get("sub")
+    if not isinstance(subject, str):
+        raise litellm_client.LiteLLMError("deactivation owner is invalid")
+    deadline = time.monotonic() + DEACTIVATION_POLICY_WAIT_SECONDS
+    while True:
+        try:
+            before = await _live_project_policies(
+                request, user, (project_id,)
+            )
+        except HTTPException as exc:
+            if exc.status_code != 503 or time.monotonic() >= deadline:
+                raise litellm_client.LiteLLMError(
+                    "project policy did not settle after key deactivation"
+                ) from exc
+            await asyncio.sleep(DEACTIVATION_POLICY_POLL_SECONDS)
+            continue
+        try:
+            before_revision = litellm_client.project_policy_revision(
+                before[project_id]
+            )
+            entry = await litellm_client.admin_key_lookup(concrete_id)
+            if (
+                entry.get("user_id") != subject
+                or _entry_project_id(entry) != project_id
+            ):
+                raise litellm_client.LiteLLMError(
+                    "deactivated key ownership changed"
+                )
+            metadata = _key_metadata(entry)
+            if (
+                entry.get("blocked") is not True
+                or metadata.get(
+                    litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
+                )
+                is not True
+                or litellm_client.PORTAL_POLICY_GATE_METADATA_KEY in metadata
+            ):
+                await _block_key_with_durable_intent(entry)
+            after = await _live_project_policies(request, user, (project_id,))
+            after_revision = litellm_client.project_policy_revision(
+                after[project_id]
+            )
+        except HTTPException as exc:
+            if exc.status_code != 503 or time.monotonic() >= deadline:
+                raise litellm_client.LiteLLMError(
+                    "project policy did not settle after key deactivation"
+                ) from exc
+            await asyncio.sleep(DEACTIVATION_POLICY_POLL_SECONDS)
+            continue
+        if hmac.compare_digest(before_revision, after_revision):
+            final = await litellm_client.admin_key_lookup(concrete_id)
+            final_metadata = _key_metadata(final)
+            if (
+                final.get("user_id") == subject
+                and _entry_project_id(final) == project_id
+                and final.get("blocked") is True
+                and final_metadata.get(
+                    litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
+                )
+                is True
+                and litellm_client.PORTAL_POLICY_GATE_METADATA_KEY
+                not in final_metadata
+            ):
+                return
+        if time.monotonic() >= deadline:
+            raise litellm_client.LiteLLMError(
+                "key deactivation could not be verified after policy cutover"
+            )
+        await asyncio.sleep(DEACTIVATION_POLICY_POLL_SECONDS)
 
 
 async def _project_policy_view(
@@ -1043,13 +1314,39 @@ async def create_key(
     # decides this key's rate caps and model set. Unreadable or ambiguous
     # policy fails the mint closed (503) rather than minting unlimited.
     policies = await _live_project_policies(request, user, project_ids)
+    project_policy = dict(policies[clean_project])
+    try:
+        policy_revision = litellm_client.project_policy_revision(project_policy)
+    except litellm_client.LiteLLMError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Current project policy could not be verified.",
+        ) from exc
+    if project_policy["allowed_models"] is None:
+        # Expand "all" to the exact public model set at mint time. An empty
+        # LiteLLM allowlist means every present and future model, which could
+        # silently authorize a later hidden model.
+        try:
+            public_models = await litellm_client.model_names()
+        except litellm_client.LiteLLMError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Current model access policy could not be verified.",
+            ) from exc
+        if not public_models:
+            raise HTTPException(
+                status_code=503,
+                detail="No public model is available for key creation.",
+            )
+        project_policy["allowed_models"] = public_models
+    project_policy[litellm_client.PROJECT_POLICY_REVISION_FIELD] = policy_revision
     try:
         key_value, keys = await _generate_project_key(
             user["sub"],
             clean_alias,
             clean_project,
             project_ids,
-            policies[clean_project],
+            project_policy,
             # Telemetry attribution: the authenticated preferred_username is
             # stamped into key metadata (aigw_username) so the audit stream
             # can render a readable identity beside the subject UUID.
@@ -1062,7 +1359,11 @@ async def create_key(
         post_generation_liveness = _retain_post_generation_liveness_task(
             asyncio.create_task(
                 _verify_post_generation_liveness(
-                    request, user, clean_project, key_value
+                    request,
+                    user,
+                    clean_project,
+                    key_value,
+                    policy_revision,
                 )
             )
         )
@@ -1177,7 +1478,17 @@ async def deactivate_key(
                     status_code=403,
                     detail="You can only deactivate a key in your own project.",
                 )
-            await litellm_client.key_deactivate(concrete_id)
+            targets = [
+                entry
+                for entry in before
+                if _entry_delete_id(entry) == concrete_id
+                and entry.get("portal_project_id") == clean_project
+            ]
+            if len(targets) != 1:
+                raise litellm_client.LiteLLMError(
+                    "owned project key did not resolve exactly once"
+                )
+            await _block_key_with_durable_intent(targets[0])
             after = _portal_key_inventory(
                 await litellm_client.key_list(user["sub"]),
                 user["sub"],
@@ -1191,6 +1502,18 @@ async def deactivate_key(
                 raise litellm_client.LiteLLMError(
                     "key remained active after deactivation"
                 )
+
+        post_deactivation_liveness = _retain_post_deactivation_liveness_task(
+            asyncio.create_task(
+                _verify_post_deactivation_liveness(
+                    request,
+                    user,
+                    clean_project,
+                    concrete_id,
+                )
+            )
+        )
+        await asyncio.shield(post_deactivation_liveness)
 
         _audit("key.deactivate", "success", user, project=clean_project)
         auth.flash(request, "Key deactivated. You may now generate another.", "success")
@@ -1249,7 +1572,10 @@ async def snippets_page(
 # --- admin / rotation control ---
 
 
-def _rotator_headers(operation_id: str | None = None) -> dict[str, str]:
+def _rotator_headers(
+    operation_id: str | None = None,
+    actor_id: str | None = None,
+) -> dict[str, str]:
     headers: dict[str, str] = {}
     if settings.rotator_internal_token:
         headers["X-Internal-Auth"] = settings.rotator_internal_token
@@ -1257,6 +1583,10 @@ def _rotator_headers(operation_id: str | None = None) -> dict[str, str]:
         if not _canonical_operation_id(operation_id):
             raise ValueError("invalid identity mutation operation ID")
         headers["X-AIGW-Operation-ID"] = operation_id
+    if actor_id is not None:
+        if operation_id is None or model_admin.ACTOR_RE.fullmatch(actor_id) is None:
+            raise ValueError("invalid model-governance actor ID")
+        headers["X-AIGW-Actor-ID"] = actor_id
     return headers
 
 
@@ -1275,7 +1605,7 @@ async def _rotator_get(path: str) -> Any:
     ) as client:
         resp = await client.get(url, headers=_rotator_headers())
     resp.raise_for_status()
-    return resp.json()
+    return _rotator_response(resp)
 
 
 async def _live_project_ids(request: Request, user: dict[str, Any]) -> tuple[str, ...]:
@@ -1316,12 +1646,21 @@ def _validated_policy_object(raw: Any) -> dict[str, Any] | None:
     keys, so anything ambiguous returns ``None`` and the caller fails closed
     — a malformed restriction must never be treated as unlimited.
     """
-    if not isinstance(raw, dict) or set(raw) != {
+    if not isinstance(raw, dict) or set(raw) not in (
+        {
+            "tpm_limit",
+            "rpm_limit",
+            "allowed_models",
+            "default_model",
+        },
+        {
         "tpm_limit",
         "rpm_limit",
         "allowed_models",
         "default_model",
-    }:
+        "model_limits",
+        },
+    ):
         return None
     for knob in ("tpm_limit", "rpm_limit"):
         value = raw[knob]
@@ -1352,11 +1691,19 @@ def _validated_policy_object(raw: Any) -> dict[str, Any] | None:
         or (models is not None and default_model not in models)
     ):
         return None
+    try:
+        canonical_limits = litellm_client.canonical_model_limits(
+            raw.get("model_limits", {}), models or []
+        )
+        model_limits = json.loads(canonical_limits)
+    except (litellm_client.LiteLLMError, TypeError, ValueError):
+        return None
     return {
         "tpm_limit": raw["tpm_limit"],
         "rpm_limit": raw["rpm_limit"],
         "allowed_models": models,
         "default_model": default_model,
+        "model_limits": model_limits,
     }
 
 
@@ -1381,7 +1728,12 @@ async def _live_project_policies(
             detail="Current project policy could not be verified.",
         ) from exc
     raw_policies = raw.get("policies") if isinstance(raw, dict) else None
-    if not isinstance(raw_policies, dict):
+    raw_reconciliation = (
+        raw.get("policy_reconciliation") if isinstance(raw, dict) else None
+    )
+    if not isinstance(raw_policies, dict) or not isinstance(
+        raw_reconciliation, dict
+    ):
         raise HTTPException(
             status_code=503,
             detail="Current project policy could not be verified.",
@@ -1393,6 +1745,31 @@ async def _live_project_policies(
             raise HTTPException(
                 status_code=503,
                 detail="Current project policy was ambiguous.",
+            )
+        state = raw_reconciliation.get(project_id)
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"ready", "revision"}
+            or state.get("ready") is not True
+            or not isinstance(state.get("revision"), str)
+            or litellm_client.POLICY_REVISION_RE.fullmatch(state["revision"])
+            is None
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Project policy reconciliation is incomplete.",
+            )
+        try:
+            expected_revision = litellm_client.project_policy_revision(policy)
+        except litellm_client.LiteLLMError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Current project policy was ambiguous.",
+            ) from exc
+        if not hmac.compare_digest(state["revision"], expected_revision):
+            raise HTTPException(
+                status_code=503,
+                detail="Current project policy revision was ambiguous.",
             )
         policies[project_id] = policy
     return policies
@@ -1420,7 +1797,7 @@ async def _deactivate_subject_project_keys(user_id: str, project_id: str) -> Non
             raise litellm_client.LiteLLMError(
                 "active project key has no concrete identifier"
             )
-        await litellm_client.key_deactivate(concrete)
+        await _block_key_with_durable_intent(entry)
     after = _portal_key_inventory(
         await litellm_client.key_list(user_id), user_id, allowed
     )
@@ -1428,6 +1805,22 @@ async def _deactivate_subject_project_keys(user_id: str, project_id: str) -> Non
         raise litellm_client.LiteLLMError(
             "project key remained active after membership revocation"
         )
+
+
+async def _remove_member_and_deactivate_keys(
+    group_id: str, user_id: str, operation_id: str
+) -> str:
+    """Serialize membership removal and both key passes with policy cutover."""
+
+    async with _admin_key_policy_lock:
+        project_id = await _managed_project_for_group(group_id)
+        await _deactivate_subject_project_keys(user_id, project_id)
+        await _rotator_delete(
+            f"/identity/groups/{group_id}/members/{user_id}",
+            operation_id=operation_id,
+        )
+        await _deactivate_subject_project_keys(user_id, project_id)
+        return project_id
 
 
 async def _rotator_put(
@@ -1452,12 +1845,15 @@ async def _rotator_post(
     payload: dict[str, Any] | None = None,
     *,
     operation_id: str | None = None,
+    actor_id: str | None = None,
 ) -> Any:
     url = settings.rotator_url.rstrip("/") + path
     async with httpx.AsyncClient(
         timeout=10, trust_env=False, follow_redirects=False
     ) as client:
-        kwargs: dict[str, Any] = {"headers": _rotator_headers(operation_id)}
+        kwargs: dict[str, Any] = {
+            "headers": _rotator_headers(operation_id, actor_id)
+        }
         if payload is not None:
             kwargs["json"] = payload
         resp = await client.post(url, **kwargs)
@@ -1563,6 +1959,51 @@ async def require_recent_live_admin(
     return user
 
 
+async def _model_admin_rotator_post(*args: Any, **kwargs: Any) -> Any:
+    """Late-bound adapter so tests and recovery hooks can replace the client."""
+
+    return await _rotator_post(*args, **kwargs)
+
+
+def _render_price_backdate_preview(
+    *,
+    request: Request,
+    user: dict[str, Any],
+    preview: dict[str, Any],
+) -> HTMLResponse:
+    """Render the stored impact receipt without putting it in a cookie."""
+
+    return templates.TemplateResponse(
+        request,
+        "admin_price_backdate_preview.html",
+        {
+            "user": user,
+            "is_admin": True,
+            "admin_surface": True,
+            "preview": preview,
+            "identity_step_up_recent": auth.has_recent_admin_reauthentication(
+                request
+            ),
+            "identity_step_up_expires_at": (
+                auth.admin_reauthentication_expires_at(request)
+            ),
+            "csrf_token": auth.get_csrf_token(request),
+            "flashes": auth.pop_flash(request),
+        },
+    )
+
+
+admin_app.include_router(
+    model_admin.build_router(
+        require_recent_live_admin=require_recent_live_admin,
+        rotator_post=_model_admin_rotator_post,
+        render_backdate_preview=_render_price_backdate_preview,
+        audit=_audit,
+        mutation_result=_identity_mutation_result,
+    )
+)
+
+
 def _safe_identity_status(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -1650,6 +2091,47 @@ def _safe_identity_groups(raw: Any) -> list[dict[str, Any]]:
                 "rpm_limit": None,
                 "allowed_models": None,
                 "default_model": None,
+                "model_limits": {},
+            }
+        raw_reconciliation = item.get("policy_reconciliation")
+        if raw_reconciliation is None:
+            policy_reconciliation = {
+                "ready": True,
+                "revision": litellm_client.project_policy_revision(policy),
+                "active_policy": policy,
+            }
+        else:
+            if (
+                not isinstance(raw_reconciliation, dict)
+                or set(raw_reconciliation)
+                != {"active_policy", "ready", "revision"}
+                or not isinstance(raw_reconciliation.get("ready"), bool)
+                or not isinstance(raw_reconciliation.get("revision"), str)
+                or litellm_client.POLICY_REVISION_RE.fullmatch(
+                    raw_reconciliation["revision"]
+                )
+                is None
+            ):
+                raise ValueError("identity group response was invalid or ambiguous")
+            active_policy = _validated_policy_object(
+                raw_reconciliation.get("active_policy")
+            )
+            if active_policy is None:
+                raise ValueError("identity group response was invalid or ambiguous")
+            try:
+                intended_revision = litellm_client.project_policy_revision(policy)
+            except litellm_client.LiteLLMError as exc:
+                raise ValueError(
+                    "identity group response was invalid or ambiguous"
+                ) from exc
+            if not hmac.compare_digest(
+                intended_revision, raw_reconciliation["revision"]
+            ):
+                raise ValueError("identity group response was invalid or ambiguous")
+            policy_reconciliation = {
+                "ready": raw_reconciliation["ready"],
+                "revision": raw_reconciliation["revision"],
+                "active_policy": active_policy,
             }
         result.append(
             {
@@ -1658,6 +2140,7 @@ def _safe_identity_groups(raw: Any) -> list[dict[str, Any]]:
                 "capabilities": sorted(set(capabilities)),
                 "member_count": min(count, 1_000_000),
                 "policy": policy,
+                "policy_reconciliation": policy_reconciliation,
             }
         )
     return result
@@ -2154,6 +2637,13 @@ async def admin_page(
     identity_users: list[dict[str, Any]] = []
     identity_members: list[dict[str, Any]] = []
     selected_group: dict[str, Any] | None = None
+    governed_models: list[dict[str, Any]] = []
+    governed_prices: list[dict[str, Any]] = []
+    governance_audit: list[dict[str, str]] = []
+    governance_available = False
+    selected_price_model = request.query_params.get("price_model", "")
+    if model_admin.MODEL_NAME_RE.fullmatch(selected_price_model) is None:
+        selected_price_model = ""
     selected_group_id = request.query_params.get("group_id", "")
     if not IDENTITY_ID_RE.fullmatch(selected_group_id):
         selected_group_id = ""
@@ -2252,6 +2742,49 @@ async def admin_page(
     except Exception:  # noqa: BLE001
         auth.flash(request, "Could not reach the identity controller.", "error")
 
+    # Model and price records come from a separate append-only control plane.
+    # Copy only the small public view models defined above. Price history is
+    # loaded for one selected model so a compromised or very large catalog
+    # cannot fan one page view into dozens of internal requests.
+    try:
+        governed_models = model_admin.safe_governed_models(
+            await _rotator_get("/model-governance/models")
+        )
+        governance_available = True
+        governed_names = {
+            model["gateway_model_name"] for model in governed_models
+        }
+        if selected_price_model not in governed_names:
+            selected_price_model = (
+                governed_models[0]["gateway_model_name"]
+                if governed_models
+                else ""
+            )
+        if selected_price_model:
+            encoded_model = quote(selected_price_model, safe="")
+            governed_prices = model_admin.safe_governed_prices(
+                await _rotator_get(
+                    f"/model-governance/models/{encoded_model}/prices"
+                ),
+                gateway_model_name=selected_price_model,
+            )
+        governance_audit = model_admin.safe_governance_audit(
+            await _rotator_get(
+                f"/model-governance/audit?limit={model_admin.MAX_AUDIT_ROWS}"
+            )
+        )
+    except Exception:  # noqa: BLE001 - never expose controller response detail
+        governance_available = False
+        governed_models = []
+        governed_prices = []
+        governance_audit = []
+        selected_price_model = ""
+        auth.flash(
+            request,
+            "Could not read the governed model catalog. Model and price changes are disabled.",
+            "error",
+        )
+
     return templates.TemplateResponse(
         request,
         "admin.html",
@@ -2278,6 +2811,19 @@ async def admin_page(
             "egress_trust_canary": _egress_trust_canary_snapshot(),
             "policy_models": policy_models,
             "no_models_sentinel": litellm_client.NO_MODELS_SENTINEL,
+            "governance_available": governance_available,
+            "governed_models": governed_models,
+            "governed_prices": governed_prices,
+            "governance_audit": governance_audit,
+            "selected_price_model": selected_price_model,
+            "governance_usage_classes": model_admin.USAGE_CLASSES,
+            "approved_model_providers": sorted(model_admin.APPROVED_PROVIDERS),
+            "governance_price_min": (
+                datetime.now(timezone.utc) + timedelta(minutes=1)
+            ).strftime("%Y-%m-%dT%H:%M"),
+            "governance_backdate_max": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M"
+            ),
             "admin_surface": True,
             "flashes": auth.pop_flash(request),
             "csrf_token": auth.get_csrf_token(request),
@@ -2660,16 +3206,13 @@ async def admin_identity_remove_member(
     )
     mutation_confirmed = False
     try:
-        project_id = await _managed_project_for_group(group_id)
-        # Pre-pass prevents knowingly leaving an existing key active. The
+        # The pre-pass prevents knowingly leaving an existing key active. The
         # post-pass closes a concurrent generation window around the Keycloak
-        # membership mutation. Any ambiguity or LiteLLM failure fails closed.
-        await _deactivate_subject_project_keys(user_id, project_id)
-        await _rotator_delete(
-            f"/identity/groups/{group_id}/members/{user_id}",
-            operation_id=operation_id,
+        # mutation. The helper's admin-process lock also keeps policy cutover
+        # from treating either durable block as a temporary gate.
+        project_id = await _remove_member_and_deactivate_keys(
+            group_id, user_id, operation_id
         )
-        await _deactivate_subject_project_keys(user_id, project_id)
         _audit(
             "identity.member.remove",
             "success",
@@ -2863,6 +3406,29 @@ def _parse_admin_limit_field(field: str, raw: str) -> tuple[bool, Any]:
     return True, number_int
 
 
+async def _admin_update_key_limits(
+    token: str, updates: dict[str, Any]
+) -> dict[str, Any]:
+    """Serialize and verify one key limit edit against policy cutover."""
+
+    async with _admin_key_policy_lock:
+        entry = await litellm_client.admin_key_lookup(token)
+        await litellm_client.key_update(entry["token"], updates)
+        after = await litellm_client.admin_key_lookup(token)
+        for field in ("max_budget", "tpm_limit", "rpm_limit"):
+            if field in updates and after.get(field) != updates[field]:
+                raise litellm_client.LiteLLMError(
+                    "key limits did not verify after update"
+                )
+        if "duration" in updates and not _expiry_matches_duration(
+            after.get("expires"), updates["duration"]
+        ):
+            raise litellm_client.LiteLLMError(
+                "key expiry did not verify after update"
+            )
+        return entry
+
+
 @admin_app.get("/admin/keys", response_class=HTMLResponse)
 async def admin_keys_page(
     request: Request,
@@ -2900,6 +3466,15 @@ async def admin_keys_page(
     )
 
 
+async def _admin_block_key(token: str) -> dict[str, Any]:
+    """Serialize and verify one manual block against policy cutover."""
+
+    async with _admin_key_policy_lock:
+        entry = await litellm_client.admin_key_lookup(token)
+        await _block_key_with_durable_intent(entry)
+        return entry
+
+
 @admin_app.post("/admin/keys/block")
 async def admin_key_block(
     request: Request,
@@ -2913,11 +3488,7 @@ async def admin_key_block(
         auth.flash(request, "Your session expired — please try again.", "error")
         return redirect
     try:
-        entry = await litellm_client.admin_key_lookup(token)
-        await litellm_client.key_update(entry["token"], {"blocked": True})
-        after = await litellm_client.admin_key_lookup(token)
-        if after.get("blocked") is not True:
-            raise litellm_client.LiteLLMError("key remained active after block")
+        entry = await _admin_block_key(token)
         _audit(
             "admin.key.block",
             "success",
@@ -2986,6 +3557,58 @@ async def _require_safe_portal_key_unblock(entry: dict[str, Any]) -> None:
             "Unblock denied: the owner no longer has live membership in "
             f"project '{key_project}'. Restore the membership first."
         )
+    policies = raw.get("policies") if isinstance(raw, dict) else None
+    reconciliation = (
+        raw.get("policy_reconciliation") if isinstance(raw, dict) else None
+    )
+    policy = (
+        _validated_policy_object(policies.get(key_project))
+        if isinstance(policies, dict)
+        else None
+    )
+    policy_state = (
+        reconciliation.get(key_project)
+        if isinstance(reconciliation, dict)
+        else None
+    )
+    if (
+        policy is None
+        or not isinstance(policy_state, dict)
+        or set(policy_state) != {"ready", "revision"}
+        or policy_state.get("ready") is not True
+    ):
+        raise _UnblockDenied(
+            "Unblock denied: the project's current key policy is not ready."
+        )
+    try:
+        expected_revision = litellm_client.project_policy_revision(policy)
+    except litellm_client.LiteLLMError as exc:
+        raise _UnblockDenied(
+            "Unblock denied: the project's current key policy is invalid."
+        ) from exc
+    metadata = _key_metadata(entry)
+    if (
+        not isinstance(policy_state.get("revision"), str)
+        or not hmac.compare_digest(policy_state["revision"], expected_revision)
+        or not hmac.compare_digest(
+            str(metadata.get(litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY) or ""),
+            expected_revision,
+        )
+        or litellm_client.PORTAL_POLICY_GATE_METADATA_KEY in metadata
+    ):
+        raise _UnblockDenied(
+            "Unblock denied: this key has not verified the current project policy."
+        )
+
+
+async def _admin_unblock_key(token: str) -> dict[str, Any]:
+    """Serialize and verify one explicit unblock against policy cutover."""
+
+    async with _admin_key_policy_lock:
+        entry = await litellm_client.admin_key_lookup(token)
+        await _require_safe_portal_key_unblock(entry)
+        await _unblock_key_with_durable_intent(entry)
+        return entry
 
 
 @admin_app.post("/admin/keys/unblock")
@@ -3001,12 +3624,7 @@ async def admin_key_unblock(
         auth.flash(request, "Your session expired — please try again.", "error")
         return redirect
     try:
-        entry = await litellm_client.admin_key_lookup(token)
-        await _require_safe_portal_key_unblock(entry)
-        await litellm_client.key_update(entry["token"], {"blocked": False})
-        after = await litellm_client.admin_key_lookup(token)
-        if after.get("blocked") is True:
-            raise litellm_client.LiteLLMError("key remained blocked after unblock")
+        entry = await _admin_unblock_key(token)
         _audit(
             "admin.key.unblock",
             "success",
@@ -3069,22 +3687,7 @@ async def admin_key_limits(
         return redirect
 
     try:
-        entry = await litellm_client.admin_key_lookup(token)
-        await litellm_client.key_update(entry["token"], updates)
-        after = await litellm_client.admin_key_lookup(token)
-        for field in ("max_budget", "tpm_limit", "rpm_limit"):
-            if field in updates and after.get(field) != updates[field]:
-                raise litellm_client.LiteLLMError(
-                    "key limits did not verify after update"
-                )
-        # Duration is effect-verified like the numeric caps: the property is
-        # that the key now expires ≈ now + duration (format/skew tolerated).
-        if "duration" in updates and not _expiry_matches_duration(
-            after.get("expires"), updates["duration"]
-        ):
-            raise litellm_client.LiteLLMError(
-                "key expiry did not verify after update"
-            )
+        entry = await _admin_update_key_limits(token, updates)
         _audit(
             "admin.key.limits",
             "success",
@@ -3111,7 +3714,10 @@ RETUNE_MAX_PAGES = 40
 
 
 def _retuned_key_metadata(
-    entry: dict[str, Any], policy: dict[str, Any]
+    entry: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    policy_gate: str | None = None,
 ) -> dict[str, Any]:
     """Rebuild one portal key's metadata with exactly the policy's default.
 
@@ -3124,91 +3730,351 @@ def _retuned_key_metadata(
     metadata = {
         name: value
         for name, value in _key_metadata(entry).items()
-        if name != litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY
+        if name
+        not in {
+            litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY,
+            litellm_client.PORTAL_MODEL_LIMITS_METADATA_KEY,
+            litellm_client.PORTAL_POLICY_GATE_METADATA_KEY,
+            litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY,
+        }
     }
     if policy["default_model"] is not None:
         metadata[litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY] = policy[
             "default_model"
         ]
+    if policy["model_limits"]:
+        metadata[litellm_client.PORTAL_MODEL_LIMITS_METADATA_KEY] = (
+            litellm_client.canonical_model_limits(
+                policy["model_limits"], policy["allowed_models"] or []
+            )
+        )
+    revision = policy.get(litellm_client.PROJECT_POLICY_REVISION_FIELD)
+    if (
+        not isinstance(revision, str)
+        or litellm_client.POLICY_REVISION_RE.fullmatch(revision) is None
+    ):
+        raise litellm_client.LiteLLMError("project policy revision is invalid")
+    metadata[litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY] = revision
+    if policy_gate is not None:
+        if (
+            litellm_client.POLICY_REVISION_RE.fullmatch(policy_gate) is None
+            or not hmac.compare_digest(policy_gate, revision)
+        ):
+            raise litellm_client.LiteLLMError(
+                "project policy gate revision is invalid"
+            )
+        metadata[litellm_client.PORTAL_POLICY_GATE_METADATA_KEY] = policy_gate
     return metadata
 
 
-async def _retune_project_keys(
-    project_id: str, policy: dict[str, Any]
-) -> tuple[int, int]:
-    """Retroactively re-tune every portal key in one project to its policy.
+async def _project_key_inventory(project_id: str) -> list[dict[str, Any]]:
+    """Read one counter-stable global inventory and select exact portal keys."""
 
-    Owner decision: a policy change is DYNAMIC — it applies to existing keys,
-    not only new mints. Each key is updated through the same allowlisted
-    /key/update path as manual admin edits and the effect is verified from a
-    fresh exact-hash read. Returns (retuned, failed); the caller reports both
-    and the operation is idempotent, so a partial failure is retried by
-    simply resubmitting the policy.
-    """
+    expected_total: int | None = None
+    expected_pages: int | None = None
+    project_keys: list[dict[str, Any]] = []
+    for page in range(1, RETUNE_MAX_PAGES + 1):
+        listing = await litellm_client.admin_key_list_page(page)
+        total_count = listing.get("total_count")
+        total_pages = listing.get("total_pages")
+        if expected_total is None:
+            expected_total = total_count
+            expected_pages = total_pages
+            if not isinstance(total_pages, int) or total_pages > RETUNE_MAX_PAGES:
+                raise litellm_client.LiteLLMError(
+                    "key inventory exceeded the policy re-tune safety bound"
+                )
+        elif total_count != expected_total or total_pages != expected_pages:
+            raise litellm_client.LiteLLMError(
+                "key inventory changed during policy reconciliation"
+            )
+        for entry in listing["keys"]:
+            if _entry_project_id(entry) == project_id:
+                project_keys.append(entry)
+        if not total_pages or page >= total_pages:
+            return project_keys
+    raise litellm_client.LiteLLMError(
+        "key inventory exceeded the policy re-tune safety bound"
+    )
+
+
+def _desired_project_models(
+    policy: dict[str, Any], configured_models: list[str] | None
+) -> list[str]:
+    models = policy["allowed_models"]
+    desired = models if models is not None else sorted(configured_models or [])
+    if not desired:
+        raise litellm_client.LiteLLMError(
+            "project policy has no explicit runtime model scope"
+        )
+    return sorted(desired)
+
+
+def _project_key_matches_policy(
+    entry: dict[str, Any],
+    project_id: str,
+    policy: dict[str, Any],
+    desired_models: list[str],
+    *,
+    blocked: bool,
+    policy_gate: str | None = None,
+) -> bool:
+    raw_models = entry.get("models")
+    if (
+        not isinstance(raw_models, list)
+        or any(not isinstance(model, str) for model in raw_models)
+        or len(raw_models) != len(desired_models)
+    ):
+        return False
+    expected_limits = (
+        litellm_client.canonical_model_limits(
+            policy["model_limits"], desired_models
+        )
+        if policy["model_limits"]
+        else None
+    )
+    metadata = _key_metadata(entry)
+    return (
+        _entry_project_id(entry) == project_id
+        and entry.get("blocked") is blocked
+        and entry.get("tpm_limit") == policy["tpm_limit"]
+        and entry.get("rpm_limit") == policy["rpm_limit"]
+        and sorted(raw_models) == desired_models
+        and metadata.get(litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY)
+        == policy["default_model"]
+        and metadata.get(litellm_client.PORTAL_MODEL_LIMITS_METADATA_KEY)
+        == expected_limits
+        and metadata.get(litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY)
+        == policy[litellm_client.PROJECT_POLICY_REVISION_FIELD]
+        and (
+            metadata.get(litellm_client.PORTAL_POLICY_GATE_METADATA_KEY)
+            == policy_gate
+            if policy_gate is not None
+            else litellm_client.PORTAL_POLICY_GATE_METADATA_KEY not in metadata
+        )
+    )
+
+
+async def _gate_project_keys(project_id: str, policy_revision: str) -> int:
+    """Block every stale active project key before activating new policy."""
+
+    if litellm_client.POLICY_REVISION_RE.fullmatch(policy_revision) is None:
+        raise litellm_client.LiteLLMError("project policy revision is invalid")
+    gated = 0
+    for _pass in range(2):
+        targets: list[dict[str, Any]] = []
+        for entry in await _project_key_inventory(project_id):
+            metadata = _key_metadata(entry)
+            manually_blocked = (
+                metadata.get(litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY)
+                is True
+            )
+            already_current = (
+                metadata.get(litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY)
+                == policy_revision
+                and litellm_client.PORTAL_POLICY_GATE_METADATA_KEY not in metadata
+                and not manually_blocked
+            )
+            if _is_active_key(entry) and not already_current:
+                targets.append(entry)
+        if not targets:
+            return gated
+        for entry in targets:
+            concrete = _entry_delete_id(entry)
+            if concrete is None:
+                raise litellm_client.LiteLLMError(
+                    "active project key has no concrete identifier"
+                )
+            metadata = dict(_key_metadata(entry))
+            metadata[litellm_client.PORTAL_POLICY_GATE_METADATA_KEY] = (
+                policy_revision
+            )
+            updates: dict[str, Any] = {"blocked": True, "metadata": metadata}
+            if (
+                litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY in metadata
+                or litellm_client.PORTAL_MODEL_LIMITS_METADATA_KEY in metadata
+            ):
+                raw_models = entry.get("models")
+                if not isinstance(raw_models, list) or any(
+                    not isinstance(model, str) for model in raw_models
+                ):
+                    raise litellm_client.LiteLLMError(
+                        "active project key model scope is invalid"
+                    )
+                updates["models"] = sorted(raw_models)
+            try:
+                await litellm_client.key_update(concrete, updates)
+            except litellm_client.LiteLLMError:
+                # A lost response may still have committed. The exact lookup
+                # below is the decision; no key identifier enters a log.
+                pass
+            after = await litellm_client.admin_key_lookup(concrete)
+            after_metadata = _key_metadata(after)
+            if (
+                after.get("blocked") is not True
+                or _entry_project_id(after) != project_id
+                or after_metadata.get(
+                    litellm_client.PORTAL_POLICY_GATE_METADATA_KEY
+                )
+                != policy_revision
+            ):
+                raise litellm_client.LiteLLMError(
+                    "project key policy gate did not verify"
+                )
+            gated += 1
+
+    for entry in await _project_key_inventory(project_id):
+        metadata = _key_metadata(entry)
+        if _is_active_key(entry) and metadata.get(
+            litellm_client.PORTAL_POLICY_REVISION_METADATA_KEY
+        ) != policy_revision:
+            raise litellm_client.LiteLLMError(
+                "an active project key escaped the policy gate"
+            )
+    return gated
+
+
+async def _retune_project_keys(
+    project_id: str,
+    policy: dict[str, Any],
+    configured_models: list[str] | None = None,
+) -> tuple[int, int]:
+    """Apply active policy to every project key and release only gated keys."""
+
+    desired_models = _desired_project_models(policy, configured_models)
     base_updates: dict[str, Any] = {
         "tpm_limit": policy["tpm_limit"],
         "rpm_limit": policy["rpm_limit"],
-        # An unrestricted policy clears the per-key model list ([] means "no
-        # restriction" to LiteLLM).
-        "models": (
-            policy["allowed_models"] if policy["allowed_models"] is not None else []
-        ),
+        "models": desired_models,
     }
     retuned = 0
-    failed = 0
-    page = 1
-    while True:
-        listing = await litellm_client.admin_key_list_page(page)
-        for entry in listing["keys"]:
-            try:
-                entry_project = _entry_project_id(entry)
-            except litellm_client.LiteLLMError:
-                # A key with malformed portal provenance cannot be attributed
-                # to any project; it is surfaced (and manageable) in the key
-                # inventory but deliberately not guessed at here.
-                continue
-            if entry_project != project_id:
-                continue
-            concrete = _entry_delete_id(entry)
-            if concrete is None:
-                failed += 1
-                continue
-            try:
-                updates = dict(base_updates)
-                # The enforced default travels on key metadata (read by the
-                # LiteLLM pre-call hook), so the re-tune re-stamps it in the
-                # same update that re-tunes the model list.
-                updates["metadata"] = _retuned_key_metadata(entry, policy)
-                await litellm_client.key_update(concrete, updates)
-                after = await litellm_client.admin_key_lookup(concrete)
-                if (
-                    after.get("tpm_limit") != updates["tpm_limit"]
-                    or after.get("rpm_limit") != updates["rpm_limit"]
-                    or sorted(
-                        model
-                        for model in (after.get("models") or [])
-                        if isinstance(model, str)
-                    )
-                    != updates["models"]
-                    or _key_metadata(after).get(
-                        litellm_client.PORTAL_DEFAULT_MODEL_METADATA_KEY
-                    )
-                    != policy["default_model"]
-                    or _entry_project_id(after) != project_id
-                ):
-                    raise litellm_client.LiteLLMError(
-                        "key policy re-tune did not verify"
-                    )
-                retuned += 1
-            except litellm_client.LiteLLMError:
-                failed += 1
-        if listing["total_pages"] <= page:
-            return retuned, failed
-        page += 1
-        if page > RETUNE_MAX_PAGES:
-            raise litellm_client.LiteLLMError(
-                "key inventory exceeded the policy re-tune safety bound"
+    for entry in await _project_key_inventory(project_id):
+        metadata = _key_metadata(entry)
+        gated = (
+            metadata.get(litellm_client.PORTAL_POLICY_GATE_METADATA_KEY)
+            == policy[litellm_client.PROJECT_POLICY_REVISION_FIELD]
+            and metadata.get(
+                litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY
             )
+            is not True
+        )
+        desired_blocked = (
+            True
+            if metadata.get(litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY)
+            is True
+            else False if gated else entry.get("blocked") is True
+        )
+        if _is_active_key(entry) and not gated and not _project_key_matches_policy(
+            entry,
+            project_id,
+            policy,
+            desired_models,
+            blocked=False,
+        ):
+            # The pre-activation gate must have caught every stale active key.
+            # Never repair one while it remains usable under the new policy.
+            continue
+        if _project_key_matches_policy(
+            entry,
+            project_id,
+            policy,
+            desired_models,
+            blocked=desired_blocked,
+        ):
+            continue
+        concrete = _entry_delete_id(entry)
+        if concrete is None:
+            continue
+        # Keep a gated key blocked while its policy fields and revision stamp
+        # are written. Only a second, verified update may make it usable again.
+        # This avoids exposing a stale key if LiteLLM accepts `blocked=false`
+        # but silently drops another field from a multi-field update.
+        updates = {
+            **base_updates,
+            "blocked": True,
+            "metadata": _retuned_key_metadata(
+                entry,
+                policy,
+                policy_gate=(
+                    policy[litellm_client.PROJECT_POLICY_REVISION_FIELD]
+                    if gated
+                    else None
+                ),
+            ),
+        }
+        try:
+            await litellm_client.key_update(concrete, updates)
+        except litellm_client.LiteLLMError:
+            pass
+        after = await litellm_client.admin_key_lookup(concrete)
+        if not _project_key_matches_policy(
+            after,
+            project_id,
+            policy,
+            desired_models,
+            blocked=True,
+            policy_gate=(
+                policy[litellm_client.PROJECT_POLICY_REVISION_FIELD]
+                if gated
+                else None
+            ),
+        ):
+            continue
+        if gated:
+            try:
+                await litellm_client.key_update(concrete, {"blocked": False})
+            except litellm_client.LiteLLMError:
+                pass
+            after = await litellm_client.admin_key_lookup(concrete)
+            if not _project_key_matches_policy(
+                after,
+                project_id,
+                policy,
+                desired_models,
+                blocked=False,
+                policy_gate=policy[
+                    litellm_client.PROJECT_POLICY_REVISION_FIELD
+                ],
+            ):
+                continue
+            cleanup_updates = {
+                **base_updates,
+                "metadata": _retuned_key_metadata(after, policy),
+            }
+            try:
+                await litellm_client.key_update(concrete, cleanup_updates)
+            except litellm_client.LiteLLMError:
+                pass
+            after = await litellm_client.admin_key_lookup(concrete)
+            if not _project_key_matches_policy(
+                after, project_id, policy, desired_models, blocked=False
+            ):
+                continue
+        retuned += 1
+
+    failed = 0
+    for entry in await _project_key_inventory(project_id):
+        metadata = _key_metadata(entry)
+        manually_blocked = (
+            metadata.get(litellm_client.PORTAL_MANUAL_BLOCK_METADATA_KEY)
+            is True
+        )
+        expected_blocked = True if manually_blocked else entry.get("blocked") is True
+        if (
+            not manually_blocked
+            and metadata.get(litellm_client.PORTAL_POLICY_GATE_METADATA_KEY)
+            == policy[litellm_client.PROJECT_POLICY_REVISION_FIELD]
+        ):
+            expected_blocked = False
+        if not _project_key_matches_policy(
+            entry,
+            project_id,
+            policy,
+            desired_models,
+            blocked=expected_blocked,
+        ):
+            failed += 1
+    return retuned, failed
 
 
 async def _current_group_policy(group_id: str) -> dict[str, Any] | None:
@@ -3228,6 +4094,112 @@ async def _current_group_policy(group_id: str) -> dict[str, Any] | None:
     return None
 
 
+class _PolicyWriteFailed(Exception):
+    """The controller did not confirm whether the staged write succeeded."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__("project policy write failed")
+        self.error = error
+
+
+class _PolicyStageUnconfirmed(Exception):
+    """The controller response did not prove one valid pending revision."""
+
+
+class _PolicyReconciliationUnconfirmed(Exception):
+    """A staged policy did not complete its key reconciliation."""
+
+    def __init__(self, project_id: str) -> None:
+        super().__init__("project policy reconciliation did not complete")
+        self.project_id = project_id
+
+
+async def _apply_project_policy(
+    group_id: str,
+    payload: dict[str, Any],
+    operation_id: str,
+    available_models: list[str],
+) -> tuple[str, int, int]:
+    """Stage, gate, activate, retune, and complete one policy under one lock."""
+
+    async with _admin_key_policy_lock:
+        try:
+            result = await _rotator_put(
+                f"/identity/groups/{group_id}/policy",
+                payload,
+                operation_id=operation_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - classified by the route
+            raise _PolicyWriteFailed(exc) from exc
+
+        applied = (
+            _validated_policy_object(result.get("policy"))
+            if isinstance(result, dict)
+            else None
+        )
+        project_id = result.get("name") if isinstance(result, dict) else None
+        revision = (
+            result.get("policy_revision") if isinstance(result, dict) else None
+        )
+        try:
+            expected_revision = litellm_client.project_policy_revision(applied)
+        except litellm_client.LiteLLMError:
+            expected_revision = ""
+        if (
+            applied is None
+            or not isinstance(project_id, str)
+            or litellm_client.PROJECT_ID_RE.fullmatch(project_id) is None
+            or not isinstance(revision, str)
+            or litellm_client.POLICY_REVISION_RE.fullmatch(revision) is None
+            or not hmac.compare_digest(revision, expected_revision)
+            or not isinstance(result, dict)
+            or result.get("reconciliation_pending") is not True
+        ):
+            raise _PolicyStageUnconfirmed
+
+        applied[litellm_client.PROJECT_POLICY_REVISION_FIELD] = revision
+        try:
+            gated = await _gate_project_keys(project_id, revision)
+            activated = await _rotator_post(
+                f"/identity/groups/{group_id}/policy/activate",
+                {"policy_revision": revision},
+                operation_id=operation_id,
+            )
+            if (
+                not isinstance(activated, dict)
+                or activated.get("reconciliation_pending") is not True
+                or activated.get("active_policy") != result.get("policy")
+                or activated.get("policy_revision") != revision
+            ):
+                raise litellm_client.LiteLLMError(
+                    "controller did not verify the active project policy"
+                )
+            retuned, failed = await _retune_project_keys(
+                project_id, applied, available_models
+            )
+            if failed:
+                raise litellm_client.LiteLLMError(
+                    "one or more project keys did not verify the active policy"
+                )
+            completed = await _rotator_post(
+                f"/identity/groups/{group_id}/policy/complete",
+                {"policy_revision": revision},
+                operation_id=operation_id,
+            )
+            if (
+                not isinstance(completed, dict)
+                or completed.get("reconciliation_pending") is not False
+                or completed.get("active_policy") != result.get("policy")
+                or completed.get("policy_revision") != revision
+            ):
+                raise litellm_client.LiteLLMError(
+                    "controller did not complete project policy reconciliation"
+                )
+        except Exception as exc:  # noqa: BLE001 - route emits bounded audit
+            raise _PolicyReconciliationUnconfirmed(project_id) from exc
+        return project_id, gated, retuned
+
+
 @admin_app.post("/admin/identity/groups/{group_id}/policy")
 async def admin_identity_set_group_policy(
     request: Request,
@@ -3237,6 +4209,9 @@ async def admin_identity_set_group_policy(
     rpm_limit: str = Form("", max_length=32),
     allowed_models: list[str] = Form(default=[]),
     default_model: str = Form("", max_length=128),
+    limit_models: list[str] = Form(default=[]),
+    max_output_tokens_per_request: list[str] = Form(default=[]),
+    output_tokens_per_utc_minute: list[str] = Form(default=[]),
     remove_model_restrictions: str | None = Form(None),
     deny_all_models: str | None = Form(None),
     csrf_token: str = Form(..., min_length=32, max_length=128),
@@ -3249,8 +4224,8 @@ async def admin_identity_set_group_policy(
         return redirect
 
     # Full-replace form semantics: blank rate limit = unlimited; no checked
-    # model = every configured model (including future ones); a checked
-    # subset is an exact restriction.
+    # model = every public model configured now; a checked subset is an exact
+    # restriction. Portal keys always receive that explicit current set.
     limits: dict[str, int | None] = {}
     for field, raw in (("tpm_limit", tpm_limit), ("rpm_limit", rpm_limit)):
         value = raw.strip()
@@ -3276,6 +4251,13 @@ async def admin_identity_set_group_policy(
             "error",
         )
         return redirect
+    if not available:
+        auth.flash(
+            request,
+            "No public model is configured, so the project policy was not changed.",
+            "error",
+        )
+        return redirect
 
     clear_restrictions = remove_model_restrictions is not None
     deny_all = deny_all_models is not None
@@ -3287,6 +4269,54 @@ async def admin_identity_set_group_policy(
     selected = sorted({model.strip() for model in allowed_models if model.strip()})
     if any(model not in available for model in selected):
         auth.flash(request, "Choose only configured models.", "error")
+        return redirect
+
+    if not (
+        len(limit_models)
+        == len(max_output_tokens_per_request)
+        == len(output_tokens_per_utc_minute)
+        <= litellm_client.MAX_POLICY_MODELS
+    ) or len(set(limit_models)) != len(limit_models):
+        auth.flash(request, "The per-model limit form was invalid.", "error")
+        return redirect
+    model_limits: dict[str, dict[str, int]] = {}
+    for model, raw_request_cap, raw_minute_cap in zip(
+        limit_models,
+        max_output_tokens_per_request,
+        output_tokens_per_utc_minute,
+        strict=True,
+    ):
+        request_cap = raw_request_cap.strip()
+        minute_cap = raw_minute_cap.strip()
+        if not request_cap and not minute_cap:
+            continue
+        if (
+            model not in available
+            or model not in selected
+            or not request_cap.isdigit()
+            or not minute_cap.isdigit()
+        ):
+            auth.flash(
+                request,
+                "Set both output limits only for a checked, configured model.",
+                "error",
+            )
+            return redirect
+        model_limits[model] = {
+            "max_output_tokens_per_request": int(request_cap),
+            "output_tokens_per_utc_minute": int(minute_cap),
+        }
+    try:
+        model_limits = json.loads(
+            litellm_client.canonical_model_limits(model_limits, selected)
+        )
+    except litellm_client.LiteLLMError:
+        auth.flash(
+            request,
+            "Output limits must be positive whole numbers. The request cap "
+            "cannot exceed the minute cap.",
+            "error",
+        )
         return redirect
 
     # Anti-silent-widening guard. The model checkboxes render ONLY from the
@@ -3312,9 +4342,14 @@ async def admin_identity_set_group_policy(
         return redirect
     stored_allowed = stored_policy.get("allowed_models")
     stored_default = stored_policy.get("default_model")
+    stored_limits = stored_policy.get("model_limits")
+    if not isinstance(stored_limits, dict):
+        auth.flash(request, "The stored per-model limits were invalid.", "error")
+        return redirect
     deconfigured = sorted(
         set(stored_allowed or [])
         .union([stored_default] if stored_default else [])
+        .union(stored_limits)
         - set(available)
         - {litellm_client.NO_MODELS_SENTINEL}
     )
@@ -3336,6 +4371,7 @@ async def admin_identity_set_group_policy(
         # Explicit operator decision: drop every model restriction.
         selected = []
         clean_default = None
+        model_limits = {}
     elif deny_all:
         # Explicit operator decision: no model access at all. Scope the group's
         # keys to a reserved sentinel that matches no real model, so LiteLLM
@@ -3343,6 +4379,7 @@ async def admin_identity_set_group_policy(
         # role separately.
         selected = [litellm_client.NO_MODELS_SENTINEL]
         clean_default = None
+        model_limits = {}
     else:
         clean_default = default_model.strip() or None
     if clean_default is not None and clean_default not in (selected or available):
@@ -3358,6 +4395,7 @@ async def admin_identity_set_group_policy(
         "rpm_limit": limits["rpm_limit"],
         "allowed_models": selected or None,
         "default_model": clean_default,
+        "model_limits": model_limits,
     }
     operation_id = str(uuid.uuid4())
     _audit(
@@ -3368,15 +4406,13 @@ async def admin_identity_set_group_policy(
         operation_id=operation_id,
     )
     try:
-        result = await _rotator_put(
-            f"/identity/groups/{group_id}/policy",
-            payload,
-            operation_id=operation_id,
+        project_id, gated, retuned = await _apply_project_policy(
+            group_id, payload, operation_id, available
         )
-    except Exception as exc:  # noqa: BLE001 - upstream detail stays server-side
+    except _PolicyWriteFailed as exc:
         _audit(
             "identity.group.policy",
-            _identity_mutation_result(exc),
+            _identity_mutation_result(exc.error),
             user,
             group=group_id,
             operation_id=operation_id,
@@ -3384,76 +4420,49 @@ async def admin_identity_set_group_policy(
         auth.flash(request, "Could not save the project policy.", "error")
         return redirect
 
-    # Re-tune from the server-normalized policy echoed by the controller, so
-    # existing keys converge on exactly what was persisted and verified.
-    applied = (
-        _validated_policy_object(result.get("policy"))
-        if isinstance(result, dict)
-        else None
+    except _PolicyStageUnconfirmed:
+        _audit(
+            "identity.group.policy",
+            "indeterminate",
+            user,
+            group=group_id,
+            operation_id=operation_id,
+        )
+        auth.flash(
+            request,
+            "The controller did not confirm the staged policy. No policy "
+            "cutover was attempted. Resubmit to retry.",
+            "error",
+        )
+        return redirect
+    except _PolicyReconciliationUnconfirmed as exc:
+        _audit(
+            "identity.group.policy",
+            "indeterminate",
+            user,
+            group=group_id,
+            project=exc.project_id,
+            operation_id=operation_id,
+        )
+        auth.flash(
+            request,
+            "Policy reconciliation is incomplete. Stale keys remain blocked "
+            "or on the previous active policy. Resubmit this same policy to retry.",
+            "error",
+        )
+        return redirect
+    _audit(
+        "identity.group.policy",
+        "success",
+        user,
+        group=group_id,
+        project=project_id,
+        operation_id=operation_id,
     )
-    project_id = result.get("name") if isinstance(result, dict) else None
-    if applied is None or not isinstance(project_id, str) or (
-        litellm_client.PROJECT_ID_RE.fullmatch(project_id) is None
-    ):
-        _audit(
-            "identity.group.policy",
-            "indeterminate",
-            user,
-            group=group_id,
-            operation_id=operation_id,
-        )
-        auth.flash(
-            request,
-            "The controller did not confirm the saved policy; existing keys "
-            "were not re-tuned. Resubmit to retry.",
-            "error",
-        )
-        return redirect
-    try:
-        retuned, failed = await _retune_project_keys(project_id, applied)
-    except Exception:  # noqa: BLE001 - terminal audit must close on every failure
-        _audit(
-            "identity.group.policy",
-            "indeterminate",
-            user,
-            group=group_id,
-            project=project_id,
-            operation_id=operation_id,
-        )
-        auth.flash(
-            request,
-            "Policy saved, but existing project keys could not all be "
-            "re-tuned. Resubmit the policy to retry.",
-            "error",
-        )
-        return redirect
-    if failed:
-        _audit(
-            "identity.group.policy",
-            "indeterminate",
-            user,
-            group=group_id,
-            project=project_id,
-            operation_id=operation_id,
-        )
-        auth.flash(
-            request,
-            f"Policy saved; {retuned} existing keys re-tuned, {failed} could "
-            "not be verified. Resubmit the policy to retry the remainder.",
-            "error",
-        )
-    else:
-        _audit(
-            "identity.group.policy",
-            "success",
-            user,
-            group=group_id,
-            project=project_id,
-            operation_id=operation_id,
-        )
-        auth.flash(
-            request,
-            f"Project policy saved; {retuned} existing keys re-tuned.",
-            "success",
-        )
+    auth.flash(
+        request,
+        f"Project policy saved; {gated} active keys gated and {retuned} keys "
+        "reconciled.",
+        "success",
+    )
     return redirect

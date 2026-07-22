@@ -30,6 +30,8 @@ _LDAP_FQDN_RE = re.compile(
     r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 )
 _IPV4_LITERAL_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_PROVIDER_POLICY_RECEIPT_PATH = "/run/secrets/provider_policy_receipt.json"
 
 
 def _validate_ldaps_origin(value: str, field_name: str) -> str:
@@ -367,6 +369,17 @@ class Settings(BaseSettings):
     # reviewed path mapping on this base URL; see anthropic_base below.
     egress_base: str = Field(default="http://envoy-egress:8080", alias="EGRESS_BASE")
 
+    # The receipt comes from the exact Envoy image selected by the schema-v2
+    # offline-seed manifest. The digest is rendered separately from that
+    # already-validated manifest. Both must be present, or both must be absent
+    # for source-mode development where model governance remains unavailable.
+    provider_policy_receipt_file: str = Field(
+        default="", alias="PROVIDER_POLICY_RECEIPT_FILE"
+    )
+    aigw_egress_policy_sha256: str = Field(
+        default="", alias="AIGW_EGRESS_POLICY_SHA256"
+    )
+
     # REQUIRED shared-secret header check (X-Internal-Auth). The service
     # fails closed: startup refuses to schedule anything and every request
     # (except /healthz) is rejected while this is unset or an obvious
@@ -393,6 +406,25 @@ class Settings(BaseSettings):
         # paths appended by this service. Reject ambiguous URL forms early.
         _parse_service_url(value, field_name=info.field_name, base_only=True)
         return value.rstrip("/")
+
+    @model_validator(mode="after")
+    def validate_provider_policy_receipt_boundary(self) -> "Settings":
+        configured_path = bool(self.provider_policy_receipt_file)
+        configured_digest = bool(self.aigw_egress_policy_sha256)
+        if configured_path != configured_digest:
+            raise ValueError(
+                "PROVIDER_POLICY_RECEIPT_FILE and AIGW_EGRESS_POLICY_SHA256 "
+                "must be configured together"
+            )
+        if not configured_path:
+            return self
+        if self.provider_policy_receipt_file != _PROVIDER_POLICY_RECEIPT_PATH:
+            raise ValueError(
+                "PROVIDER_POLICY_RECEIPT_FILE must use the fixed deployment path"
+            )
+        if _SHA256_RE.fullmatch(self.aigw_egress_policy_sha256) is None:
+            raise ValueError("AIGW_EGRESS_POLICY_SHA256 must be lowercase SHA-256")
+        return self
 
     @field_validator(
         "keycloak_bootstrap_admin_client_id",

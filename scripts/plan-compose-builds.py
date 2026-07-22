@@ -103,6 +103,7 @@ DOCKERIGNORE_RULES = {
     "dhi-health-probe": (
         "*",
         "!Dockerfile",
+        "!Dockerfile.litellm",
         "!Dockerfile.open-webui",
         "!Dockerfile.grafana",
         "!go.mod",
@@ -125,6 +126,10 @@ DOCKERIGNORE_RULES = {
         "!openwebui-wheels/arm64/*.whl",
         "!openwebui-wheels/any/",
         "!openwebui-wheels/any/*.whl",
+        "!runtime-security-wheels/",
+        "!runtime-security-wheels/SHA256SUMS",
+        "!runtime-security-wheels/README.md",
+        "!runtime-security-wheels/*.whl",
     ),
     "egress-proxy": (
         "*",

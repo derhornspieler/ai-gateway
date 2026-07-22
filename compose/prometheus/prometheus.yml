@@ -1,53 +1,48 @@
-# Prometheus scrape config — solution-map §1.8.
-# Only endpoints reachable on the dedicated metrics/observability planes are
-# scraped. Data services stay isolated until a least-privilege exporter can be
-# added without exposing their native administration protocols.
+# Prometheus stores Alloy's remote-write stream and evaluates local rules.
+# Alloy owns the exact scrape graph so every admitted metric is fanned out to
+# both this local store and Cribl through one collector boundary.
 global:
   scrape_interval: 15s
+  evaluation_interval: 15s
 
 rule_files:
   - /etc/prometheus/rules.yml
 
-scrape_configs:
-  - job_name: traefik
-    static_configs:
-      - targets: ["traefik-int:9100", "traefik-adm:9100"]
+alerting:
+  alertmanagers:
+    - scheme: http
+      api_version: v2
+      timeout: 10s
+      static_configs:
+        - targets: [alertmanager:9093]
 
-  - job_name: envoy-egress          # read-only stats facade; admin stays loopback-only
-    metrics_path: /stats/prometheus
-    static_configs:
-      - targets: ["envoy-egress:9902"]
+# Return only Prometheus-generated alert lifecycle state to Alloy. The mTLS
+# endpoint is private to net-observability. Alloy forwards this narrow branch
+# to Cribl and never writes it back here, which prevents an alert-state loop.
+remote_write:
+  - url: https://alloy-alert-state:12346/api/v1/metrics/write
+    remote_timeout: 10s
+    tls_config:
+      ca_file: /run/secrets/alert_state_ca.pem
+      cert_file: /run/secrets/alert_state_prometheus.crt
+      key_file: /run/secrets/alert_state_prometheus.key
+      server_name: alloy-alert-state
+      min_version: TLS13
+      insecure_skip_verify: false
+    queue_config:
+      capacity: 1000
+      min_shards: 1
+      max_shards: 1
+      max_samples_per_send: 200
+      batch_send_deadline: 5s
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: ALERTS|ALERTS_FOR_STATE
+        action: keep
+      - source_labels: [alertname]
+        regex: AIGatewayWatchdog|AIGatewayScrapeTargetDown|AIGatewayAlertmanagerUnavailable|AIGatewayAlertmanagerDeliveryFailures|AIGatewayAlloyExporterSendFailures|AIGatewayAlloyExporterEnqueueFailures|AIGatewayAlloyExporterQueueSaturation|AIGatewayLokiWriteDrops|AIGatewayLokiWriteRetriesHigh|AIGatewayPrometheusRemoteWriteFailures|AIGatewayPrometheusRemoteWriteBacklog|AIGatewayHostCPUHigh|AIGatewayHostCPUCritical|AIGatewayHostLoadHigh|AIGatewayHostLoadCritical|AIGatewayHostMemoryLow|AIGatewayHostMemoryCritical|AIGatewayHostSwapHigh|AIGatewayHostOOMKill|AIGatewayFilesystemSpaceLow|AIGatewayFilesystemSpaceCritical|AIGatewayFilesystemPredictedFull|AIGatewayFilesystemInodesLow|AIGatewayFilesystemInodesCritical|AIGatewayHostDiskLatencyHigh|AIGatewayHostDiskIOSaturation|AIGatewayHostFileDescriptorsHigh|AIGatewayHostFileDescriptorsCritical|AIGatewayServiceLatencyHigh|AIGatewayServiceLatencyCritical|AIGatewayServiceErrorRateHigh|AIGatewayServiceErrorRateCritical|AIGatewayCertificateExpiresSoon|AIGatewayCertificateExpiryCritical
+        action: keep
+      - regex: __name__|alertname|alertstate|severity|owner|alert_class|instance|job|device|mountpoint|service|component_id|remote_name
+        action: labelkeep
 
-  - job_name: keycloak
-    metrics_path: /metrics
-    static_configs:
-      - targets: ["keycloak:9000"]   # KC management port (metrics-enabled)
-
-  - job_name: alloy
-    static_configs:
-      - targets: ["alloy:12345"]
-
-  - job_name: grafana
-    static_configs:
-      - targets: ["grafana:3000"]
-
-  - job_name: prometheus
-    static_configs:
-      # Prometheus binds only its fixed net-observability address, so use its
-      # observability-only alias instead of its ambiguous dual-plane service
-      # name or loopback for the self-scrape.
-      - targets: ["prometheus-observability:9090"]
-
-  - job_name: loki
-    static_configs:
-      - targets: ["loki:3100"]
-
-  - job_name: node-exporter
-    static_configs:
-      - targets: ["node-exporter:9100"]
-
-  # Vault telemetry requires either a scoped scrape token or
-  # unauthenticated_metrics_access. Vault is intentionally absent from both
-  # Prometheus networks, so do not weaken that boundary merely to add a target.
-  # PostgreSQL and Redis likewise need dedicated exporters; LiteLLM exposes no
-  # reviewed unauthenticated private metrics endpoint in this deployment.
+scrape_configs: []

@@ -7,8 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -125,5 +128,49 @@ func TestProviderTokensAreRandomRotatedAndExpired(t *testing.T) {
 	}
 	if store.valid("", now) || store.valid("wrong", now) {
 		t.Fatal("an invalid provider token was accepted")
+	}
+}
+
+func TestRetryMarkerFailsOnlyTheFirstAttemptForEachModel(t *testing.T) {
+	state := &messageTestState{retriedModels: make(map[string]bool)}
+	if !state.firstAttempt("claude-preprod-a") {
+		t.Fatal("first attempt was not selected for the planned retry")
+	}
+	if state.firstAttempt("claude-preprod-a") {
+		t.Fatal("second attempt was selected for another planned retry")
+	}
+	if !state.firstAttempt("claude-preprod-b") {
+		t.Fatal("a different model did not get its own planned retry")
+	}
+}
+
+func TestMessageStreamHasBoundedAnthropicFramesAndFinalUsage(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	usage := map[string]any{
+		"input_tokens":  10,
+		"output_tokens": 50,
+	}
+
+	writeMessageStream(recorder, "claude-preprod", usage)
+
+	result := recorder.Result()
+	defer result.Body.Close()
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("stream returned HTTP %d", result.StatusCode)
+	}
+	if result.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatal("stream did not use the event-stream content type")
+	}
+	body := recorder.Body.String()
+	for _, marker := range []string{
+		"event: message_start",
+		`"text":"pong"`,
+		`"input_tokens":10`,
+		`"output_tokens":50`,
+		"event: message_stop",
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("stream omitted %q", marker)
+		}
 	}
 }

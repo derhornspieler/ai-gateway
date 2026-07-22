@@ -77,7 +77,9 @@ class AdminSurfaceContractTests(unittest.TestCase):
         self.assertIn("${TRAEFIK_INT_CHAT_IP:", self.compose)
 
     def test_litellm_schema_surfaces_are_exactly_denied_before_oauth(self) -> None:
-        denied = self._router("litellm-admin-docs-deny", "litellm-admin-root")
+        denied = self._router(
+            "litellm-admin-docs-deny", "litellm-admin-model-mutation-deny"
+        )
         for path in (
             "/openapi.json",
             "/openapi.json/",
@@ -101,6 +103,16 @@ class AdminSurfaceContractTests(unittest.TestCase):
         self.assertIn("Path(`/v1/chat/completions`)", self.internal_traefik)
         self.assertIn("api-deny:", self.internal_traefik)
         self.assertNotIn("Path(`/openapi.json`)", self.internal_traefik)
+
+    def test_native_litellm_model_mutations_are_denied_before_oauth(self) -> None:
+        denied = self._router(
+            "litellm-admin-model-mutation-deny", "litellm-admin-root"
+        )
+        self.assertIn("PathPrefix(`/model/`)", denied)
+        self.assertIn("PathPrefix(`/model_group/`)", denied)
+        self.assertIn("Path(`/config/field/update`)", denied)
+        self.assertIn("priority: 125", denied)
+        self.assertIn("middlewares: [deny-all]", denied)
 
     def test_each_oauth_gate_has_an_isolated_cookie_key_and_path_free_logs(self) -> None:
         expected = {

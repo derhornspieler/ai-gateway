@@ -25,6 +25,15 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.config import Settings
+from app.governance_schema import GOVERNANCE_SCHEMA_RECEIPT_SQL
+from app.governance_store import (
+    GovernanceConflict,
+    GovernanceNotFound,
+    GovernanceStoreMixin,
+)
+from app.usage_schema import USAGE_SCHEMA_RECEIPT_SQL
+
+__all__ = ("Database", "GovernanceConflict", "GovernanceNotFound")
 
 logger = logging.getLogger("key_rotator.db")
 
@@ -66,7 +75,7 @@ DEFAULT_SETTINGS: list[tuple[str, bool, int, int, dict[str, Any]]] = [
 RETIRED_SETTINGS_VENDORS = ("openai", "static-openai")
 
 
-class Database:
+class Database(GovernanceStoreMixin):
     """Thin async wrapper around a single psycopg3 AsyncConnection.
 
     A single shared connection + asyncio.Lock is sufficient here: rotation
@@ -192,8 +201,30 @@ class Database:
         async with self._conn.cursor() as cur:
             await cur.execute(CREATE_SETTINGS_SQL)
             await cur.execute(CREATE_HISTORY_SQL)
+            await cur.execute(GOVERNANCE_SCHEMA_RECEIPT_SQL)
+            receipt = await cur.fetchone()
+            if not receipt or receipt.get("valid") is not True:
+                raise RuntimeError(
+                    "governance schema is missing or has unsafe ownership"
+                )
+            await cur.execute(USAGE_SCHEMA_RECEIPT_SQL)
+            receipt = await cur.fetchone()
+            if not receipt or receipt.get("valid") is not True:
+                raise RuntimeError(
+                    "usage accounting schema is missing or has unsafe ownership"
+                )
         await self._seed_defaults()
         await self._disable_retired_settings()
+
+    @asynccontextmanager
+    async def transaction_cursor(self) -> AsyncIterator[Any]:
+        """Yield one cursor inside the service's serialized transaction."""
+
+        conn = await self._ensure_conn()
+        async with self._lock:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    yield cursor
 
     async def _seed_defaults(self) -> None:
         if self._conn is None:

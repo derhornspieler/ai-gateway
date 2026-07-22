@@ -309,7 +309,7 @@ class IdentityLdapSecretBoundaryTests(unittest.TestCase):
         self.assertEqual(
             manifest["identity_ldap"],
             {
-                "keycloak": ["keycloak/identity-ldap-ca.pem", "keycloak/realms"],
+                "keycloak": ["keycloak/identity-ldap-ca.pem"],
                 "key-rotator": ["secrets/identity_ldap_bind_password"],
             },
         )

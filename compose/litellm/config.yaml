@@ -75,9 +75,12 @@ litellm_settings:
   # allowlist (or the all-proxy-models wildcard) -- LiteLLM's own auth
   # layer rejects an explicit "aigw-default" string on a restricted key
   # before this hook runs. Callers should OMIT `model` to get the project
-  # default; that path is enforced here for every key. The module is
-  # bind-mounted next to this file and resolved relative to it.
-  callbacks: ["aigw_otel_callback.aigw_otel", "aigw_default_model_hook.aigw_default_model_enforcer"]
+  # default; that path is enforced here for every key. The same hook caps and
+  # atomically reserves project/model output before dispatch. Redis errors and
+  # mid-minute restarts deny; v1.93.0 reservations stay charged until the UTC
+  # minute ends because retry/stream settlement is not reliable. The module
+  # is bind-mounted next to this file and resolved relative to it.
+  callbacks: ["aigw_otel_callback.aigw_otel", "aigw_usage_callback.aigw_usage", "aigw_default_model_hook.aigw_default_model_enforcer"]
   drop_params: true
   num_retries: 2
   request_timeout: 600
@@ -92,7 +95,10 @@ general_settings:
   # Direct API callers cannot forge that assertion. Authorization continues to
   # use the authenticated gateway key.
   user_header_name: X-OpenWebUI-User-Email
-  store_model_in_db: false     # models are reviewed config; creds rotate via /credentials
+  # Dynamic rows are allowed only for key-rotator's append-only governance
+  # workflow. Traefik blocks native browser mutation APIs, and startup
+  # reconciliation fails readiness on any unmanaged or changed DB row.
+  store_model_in_db: true
   # Prompt/completion content belongs only in the access-controlled OTel trace
   # path.  Pin this false instead of relying on LiteLLM's current default so a
   # future image upgrade cannot silently create a second plaintext copy in

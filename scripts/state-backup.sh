@@ -296,7 +296,7 @@ pg_next_xid="$("${compose[@]}" exec -T postgres psql -U postgres -d postgres -At
 
 allowed_volumes=(
   pg_data openwebui_data vault_data vault_audit alloy_data prom_data
-  loki_data grafana_data
+  alertmanager_data loki_data grafana_data
 )
 archived_volumes=()
 for logical in "${allowed_volumes[@]}"; do
@@ -327,7 +327,7 @@ done
   echo "move/delete secrets/vault-init.json before backup; do not co-locate unseal material with Vault state" >&2
   exit 1
 }
-config_items=(docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml bind-source-digest-inputs.json .env alloy cribl-mock grafana keycloak litellm loki postgres prometheus traefik services scripts certs)
+config_items=(docker-compose.yml docker-compose.dns.yml docker-compose.platform-dns.yml bind-source-digest-inputs.json .env alertmanager alloy cribl-mock grafana keycloak litellm loki postgres prometheus traefik services scripts certs)
 [[ ! -d secrets ]] || config_items+=(secrets)
 tar --numeric-owner --exclude='.state' --exclude='.state-backup.*' \
   -czf "$staging/stack-config.tar.gz" "${config_items[@]}"

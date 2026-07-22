@@ -16,7 +16,7 @@ compose=("$STACK_DIR/scripts/aigw-compose.sh")
 }
 
 stateful=(
-  postgres keycloak litellm open-webui vault alloy prometheus loki grafana
+  postgres keycloak litellm open-webui vault alloy prometheus alertmanager loki grafana
   samba-ad
 )
 existing_stateful=()

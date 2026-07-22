@@ -1,0 +1,57 @@
+{
+  "fixture_schema": 1,
+  "source": {
+    "litellm_commit": "052b5a2169d8d3082e1d66e69f200a72b0c1e274",
+    "litellm_tag": "v1.93.0",
+    "litellm_standard_payload_url": "https://docs.litellm.ai/docs/proxy/logging_spec",
+    "litellm_payload_source_url": "https://github.com/BerriAI/litellm/blob/052b5a2169d8d3082e1d66e69f200a72b0c1e274/litellm/types/utils.py#L2875-L2914",
+    "litellm_anthropic_source_url": "https://github.com/BerriAI/litellm/blob/052b5a2169d8d3082e1d66e69f200a72b0c1e274/litellm/llms/anthropic/chat/transformation.py#L2070-L2165",
+    "anthropic_prompt_caching_url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+    "anthropic_pricing_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "captured_on": "2026-07-22"
+  },
+  "kwargs": {
+    "model": "claude-sonnet-4-5",
+    "stream": false,
+    "standard_logging_object": {
+      "id": "msg-123",
+      "litellm_call_id": "call-123",
+      "trace_id": "trace-123",
+      "stream": null,
+      "status": "success",
+      "custom_llm_provider": "anthropic",
+      "model": "anthropic/claude-sonnet-4-5-20250929",
+      "model_group": "claude-sonnet-4-5",
+      "response_cost": 0.00123,
+      "endTime": 1784721600.0,
+      "metadata": {
+        "user_api_key_project_id": null,
+        "user_api_key_user_id": "keycloak-subject-1",
+        "user_api_key_auth_metadata": {
+          "aigw_project_id": "project-blue",
+          "created_via": "dev-portal"
+        },
+        "usage_object": {
+          "prompt_tokens": 100,
+          "completion_tokens": 50,
+          "total_tokens": 150,
+          "prompt_tokens_details": {
+            "text_tokens": 10,
+            "cached_tokens": 40,
+            "cache_creation_tokens": 50,
+            "cache_creation_token_details": {
+              "ephemeral_5m_input_tokens": 20,
+              "ephemeral_1h_input_tokens": 30
+            }
+          }
+        }
+      },
+      "hidden_params": {
+        "litellm_model_name": "claude-sonnet-4-5-20250929",
+        "additional_headers": {
+          "x-litellm-attempted-retries": "2"
+        }
+      }
+    }
+  }
+}

@@ -5,7 +5,7 @@
 # DHI runtime images intentionally have no shell or package manager. Resolve
 # Python wheels in the matching dev image, then copy only the virtualenv into
 # the non-root runtime image.
-FROM dhi.io/python:3.14.6-dev@sha256:9b72c38a520f44fafa1c4a3026e9b390eb3b4967c62d38be01400ecbb0232b65 AS python-builder
+FROM dhi.io/python:3.14.6-dev@sha256:1df3badfd28c3fd54fb8371d55a4a050c4051b8a808f8367f7241442a334928b AS python-builder
 WORKDIR /build
 COPY requirements.txt requirements.lock ./
 RUN python3 -m venv /opt/venv \
@@ -17,7 +17,7 @@ RUN python3 -m venv /opt/venv \
         --require-hashes \
         -r requirements.lock
 
-FROM dhi.io/python:3.14.6@sha256:c82da5a1a30a6214f45c42def5b6f5b85981c7dc7a1802015a6ebf264675436d
+FROM dhi.io/python:3.14.6@sha256:c43e37b1d2c740bf924149f7ce015a79636a084a3fd755ac8c5ffc2f4a850b3e
 
 ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONDONTWRITEBYTECODE=1 \

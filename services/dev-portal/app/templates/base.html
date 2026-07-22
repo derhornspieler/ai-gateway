@@ -292,6 +292,7 @@
   .trustbox.warn { border-color: rgba(240,180,41,.42); background: rgba(240,180,41,.07); }
 
   /* one-time key reveal + connect-a-tool */
+  [data-one-time-secret][hidden] { display: none !important; }
   .reveal { border-color: rgba(53,201,143,.5); background: rgba(53,201,143,.06); }
   .keyrow {
     display: flex; align-items: center; gap: 10px;
@@ -371,8 +372,33 @@ document.addEventListener("click", function (event) {
 
 document.addEventListener("submit", function (event) {
   var message = event.target.getAttribute("data-confirm");
-  if (message && !window.confirm(message)) event.preventDefault();
+  if (message && !window.confirm(message)) {
+    event.preventDefault();
+    return;
+  }
+  consumeOneTimeSecret();
 });
+
+function consumeOneTimeSecret() {
+  var reveal = document.querySelector("[data-one-time-secret]");
+  if (!reveal) return;
+  reveal.querySelectorAll("[data-sensitive-value]").forEach(function (el) {
+    if ("value" in el) el.value = "";
+    el.textContent = "";
+  });
+  reveal.remove();
+  window.history.replaceState(
+    { aigwOneTimeSecretConsumed: true },
+    "",
+    window.location.href
+  );
+}
+
+function restoredFromBrowserHistory() {
+  if (!window.performance || !window.performance.getEntriesByType) return false;
+  var entries = window.performance.getEntriesByType("navigation");
+  return entries.length > 0 && entries[0].type === "back_forward";
+}
 
 // Accessible client-side tabs. Panels are server-rendered <section class="panel">
 // elements; buttons switch panels in place, anchor "tabs" navigate to their own
@@ -392,6 +418,7 @@ document.addEventListener("submit", function (event) {
   function activateTab(name, updateHash) {
     var panel = document.getElementById("tab-" + name);
     if (!panel) return false;
+    if (name !== "keys") consumeOneTimeSecret();
     tabButtons.forEach(function (btn) {
       var selected = btn.getAttribute("data-tab") === name;
       btn.setAttribute("aria-selected", selected ? "true" : "false");
@@ -400,7 +427,9 @@ document.addEventListener("submit", function (event) {
     panels.forEach(function (p) {
       p.classList.toggle("active", p === panel);
     });
-    if (updateHash) window.history.replaceState(null, "", "#tab-" + name);
+    if (updateHash) {
+      window.history.replaceState(window.history.state, "", "#tab-" + name);
+    }
     return true;
   }
 
@@ -472,23 +501,58 @@ document.addEventListener("submit", function (event) {
   timer = window.setInterval(render, 1000);
 })();
 
-function clearSensitiveValues() {
-  document.querySelectorAll("[data-sensitive-value]").forEach(function (el) {
-    if ("value" in el) el.value = "";
-    el.textContent = "";
-  });
-}
+// A generated key exists only in the immediate POST document. A changed URL
+// does not remove that document from browser history, so mark it consumed and
+// remove the whole reveal before any navigation can preserve it. A normal link
+// uses location.replace so Back skips the secret-bearing history entry.
+(function () {
+  if (!document.querySelector("[data-one-time-secret]")) return;
 
-// A generated key exists only in the immediate POST document. Replace the
-// POST history entry so refresh/back navigation performs GET /, and scrub the
-// DOM before the document can enter the back-forward cache.
-if (document.querySelector("[data-one-time-secret]")) {
-  window.history.replaceState(null, "", "/");
-  window.addEventListener("pagehide", clearSensitiveValues, { once: true });
+  var state = window.history.state;
+  var alreadyConsumed = state && state.aigwOneTimeSecretConsumed === true;
+  if (alreadyConsumed || restoredFromBrowserHistory()) {
+    consumeOneTimeSecret();
+    return;
+  }
+
+  window.history.replaceState({ aigwOneTimeSecretConsumed: false }, "", "/");
+
+  window.addEventListener("pagehide", consumeOneTimeSecret);
+  window.addEventListener("popstate", consumeOneTimeSecret);
   window.addEventListener("pageshow", function (event) {
-    if (event.persisted) clearSensitiveValues();
+    var current = window.history.state;
+    if (
+      event.persisted ||
+      restoredFromBrowserHistory() ||
+      (current && current.aigwOneTimeSecretConsumed === true)
+    ) {
+      consumeOneTimeSecret();
+    }
   });
-}
+
+  document.addEventListener("click", function (event) {
+    var link = event.target.closest("a[href]");
+    if (
+      !link || event.defaultPrevented || event.button !== 0 ||
+      event.metaKey || event.ctrlKey || event.shiftKey || event.altKey ||
+      link.hasAttribute("download") ||
+      (link.target && link.target !== "_self")
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    var destination = link.href;
+    consumeOneTimeSecret();
+    window.location.replace(destination);
+  });
+
+  // Keep the plaintext out of the first paint until every exit guard above is
+  // active. If the script is blocked, the secret stays hidden.
+  document.querySelectorAll("[data-one-time-secret]").forEach(function (reveal) {
+    reveal.hidden = false;
+  });
+})();
 </script>
 </body>
 </html>

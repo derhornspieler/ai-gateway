@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.model_projection import MODEL_ID_RE
 from app.security import path_segment
 from app.vault_client import mask_secret
 
@@ -43,6 +44,9 @@ KEY_LIST_PAGE_SIZE = 100
 KEY_LIST_MAX_PAGES = 10
 MAX_KEY_METADATA_BYTES = 64 * 1024
 MAX_KEY_IDENTIFIER_BYTES = 2048
+MODEL_INVENTORY_PAGE_SIZE = 500
+MODEL_INVENTORY_MAX_PAGES = 21
+MODEL_INVENTORY_MAX_ROWS = 10_200
 
 
 @dataclass(frozen=True)
@@ -264,6 +268,121 @@ class LiteLLMClient:
             for item in raw
             if isinstance(item, dict) and isinstance(item.get("credential_name"), str)
         }
+
+    async def list_model_deployments(self) -> list[dict[str, Any]]:
+        """Read one counter-checked inventory from `/v2/model/info`."""
+
+        base = self._settings.litellm_url.rstrip("/")
+        rows: list[dict[str, Any]] = []
+        expected_total: int | None = None
+        expected_pages: int | None = None
+        async with httpx.AsyncClient(**self._client_kwargs()) as client:
+            for page in range(1, MODEL_INVENTORY_MAX_PAGES + 1):
+                try:
+                    response = await client.get(
+                        f"{base}/v2/model/info",
+                        params={"page": page, "size": MODEL_INVENTORY_PAGE_SIZE},
+                        headers=self._headers(),
+                    )
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    raise LiteLLMError("LiteLLM model inventory failed") from exc
+                payload = self._json_object(response)
+                data = payload.get("data")
+                total = payload.get("total_count")
+                total_pages = payload.get("total_pages")
+                current_page = payload.get("current_page")
+                size = payload.get("size")
+                if (
+                    not isinstance(data, list)
+                    or type(total) is not int
+                    or type(total_pages) is not int
+                    or type(current_page) is not int
+                    or type(size) is not int
+                    or total < 0
+                    or total > MODEL_INVENTORY_MAX_ROWS
+                    or total_pages < 0
+                    or total_pages > MODEL_INVENTORY_MAX_PAGES
+                    or current_page != page
+                    or size != MODEL_INVENTORY_PAGE_SIZE
+                ):
+                    raise LiteLLMError("LiteLLM model inventory shape is invalid")
+                if expected_total is None:
+                    expected_total = total
+                    expected_pages = total_pages
+                    calculated_pages = (
+                        (total + MODEL_INVENTORY_PAGE_SIZE - 1)
+                        // MODEL_INVENTORY_PAGE_SIZE
+                    )
+                    if total_pages != calculated_pages:
+                        raise LiteLLMError(
+                            "LiteLLM model inventory counters disagree"
+                        )
+                elif total != expected_total or total_pages != expected_pages:
+                    raise LiteLLMError("LiteLLM model inventory changed during scan")
+                if len(data) > MODEL_INVENTORY_PAGE_SIZE:
+                    raise LiteLLMError("LiteLLM model inventory page is too large")
+                for row in data:
+                    if not isinstance(row, dict):
+                        raise LiteLLMError(
+                            "LiteLLM model inventory row is invalid"
+                        )
+                    rows.append(row)
+                if total_pages == 0:
+                    if data or total != 0:
+                        raise LiteLLMError(
+                            "LiteLLM model inventory counters disagree"
+                        )
+                    break
+                if page == total_pages:
+                    break
+                if len(data) != MODEL_INVENTORY_PAGE_SIZE:
+                    raise LiteLLMError(
+                        "LiteLLM model inventory ended before its final page"
+                    )
+            else:
+                raise LiteLLMError("LiteLLM model inventory exceeded its page bound")
+
+        if expected_total is None or len(rows) != expected_total:
+            raise LiteLLMError("LiteLLM model inventory counters disagree")
+        return rows
+
+    async def create_model_deployment(self, deployment: dict[str, Any]) -> None:
+        """Create one already-canonical governed DB model."""
+
+        base = self._settings.litellm_url.rstrip("/")
+        async with httpx.AsyncClient(**self._client_kwargs()) as client:
+            try:
+                response = await client.post(
+                    f"{base}/model/new",
+                    json=deployment,
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise LiteLLMError("LiteLLM model creation failed") from exc
+            payload = self._json_object(response)
+            expected_id = deployment.get("model_info", {}).get("id")
+            returned_id = payload.get("model_id")
+            if returned_id not in (None, expected_id):
+                raise LiteLLMError("LiteLLM returned an unexpected model ID")
+
+    async def delete_model_deployment(self, deployment_id: str) -> None:
+        """Delete one governed DB model by its immutable operation UUID."""
+
+        if MODEL_ID_RE.fullmatch(deployment_id) is None:
+            raise LiteLLMError("LiteLLM model ID is invalid")
+        base = self._settings.litellm_url.rstrip("/")
+        async with httpx.AsyncClient(**self._client_kwargs()) as client:
+            try:
+                response = await client.post(
+                    f"{base}/model/delete",
+                    json={"id": deployment_id},
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise LiteLLMError("LiteLLM model deletion failed") from exc
 
     @staticmethod
     def _key_metadata(entry: dict[str, Any]) -> dict[str, Any]:

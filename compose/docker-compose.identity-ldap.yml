@@ -52,6 +52,3 @@ services:
       # component. Private mount => Z. Never a Compose environment value, an
       # argv element, a log line, or an API response.
       - ./secrets/identity_ldap_bind_password:/run/secrets/identity_ldap_bind_password:ro,Z
-    labels:
-      com.aigw.contract.selinux-generation: "1"
-      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP:?AIGW_BIND_DIGEST_KEY_ROTATOR_LDAP must be set}

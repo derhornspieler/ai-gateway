@@ -10,6 +10,8 @@ Compose command by hand.
 | App-only deploy on a prepared host | `ansible/deploy-stack-only.yml` |
 | Vault unlock after reboot | [Vault unseal SOP](sop/vault-unseal-after-reboot.md) |
 | Image update | [Image update workflow](image-update-workflow.md) |
+| Add, hide, or retire a model | [Model lifecycle SOP](sop/model-lifecycle.md) |
+| Alerts, dashboards, and telemetry | [Observability operations](observability-operations.md) |
 | New production install | [Deployment runbook](deploy-runbook.md) |
 | Local release test | [Local preprod](preprod.md) |
 
@@ -38,6 +40,12 @@ sudo scripts/aigw-compose.sh ps
 
 Each required long-running service must be running and healthy. The
 `volume-init` one-shot must show a successful exit.
+
+Open Grafana's **AI Gateway Alerts and Capacity** dashboard. The watchdog must
+be firing, no unexplained critical alert may be active, and recently resolved
+alerts must match known work. Alertmanager stays private and has no FQDN. Use
+the [alert response runbooks](observability-operations.md#alert-response-runbooks)
+for the next check.
 
 Vault seals after a VM restart. Follow the
 [Vault unseal SOP](sop/vault-unseal-after-reboot.md). A normal Ansible run
@@ -117,7 +125,7 @@ with the real hostname and customer Root CA. A test that works only when
 certificate checks are off does not pass.
 
 For the optional Cribl TLS setup, follow the
-[Cribl logging-team handoff](cribl-soc-handoff.md).
+[Cribl telemetry-team handoff](cribl-soc-handoff.md).
 
 ## Backup and restore
 

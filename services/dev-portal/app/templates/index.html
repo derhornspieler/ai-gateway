@@ -54,10 +54,10 @@
 </div>
 
 {% if new_key %}
-<div class="card reveal" data-one-time-secret>
+<div class="card reveal" data-one-time-secret hidden>
   <div style="display: flex; align-items: center; gap: 9px; margin-bottom: 6px; flex-wrap: wrap;">
     <span class="pill ok"><span class="dot"></span>Key created</span>
-    <span class="note">This POST response is the only time the full key will be shown — copy it now. Later pages use a placeholder.</span>
+    <span class="note">This is the only time the full key will be shown. Copy it now. Leaving this tab or page removes it for good.</span>
   </div>
   <div class="keyrow">
     <code id="new-key-value" data-sensitive-value>{{ new_key }}</code>
@@ -93,6 +93,9 @@
     <span class="muted">No model access for API/tooling (chat, if enabled, is separate).</span>
     {% elif project_models %}
     <div class="mtags">{% for model in project_models | sort %}<span class="mtag">{{ model }}</span>{% if policy.default_model == model %}<span class="badge">default</span> {% endif %}{% endfor %}</div>
+    {% if policy.model_limits %}
+    <div class="note">Per-model output limits: {% for model, limits in policy.model_limits | dictsort %}<span class="mtag">{{ model }}</span> {{ limits.max_output_tokens_per_request }} per request / {{ limits.output_tokens_per_utc_minute }} per UTC minute{% if not loop.last %}; {% endif %}{% endfor %}</div>
+    {% endif %}
     {% else %}all configured models{% endif %}
     {% if policy.default_model %}<span class="note">Requests that omit a model are served with the project default.</span>{% endif %}
     {% else %}

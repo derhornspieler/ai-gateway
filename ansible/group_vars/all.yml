@@ -263,6 +263,10 @@ oauth2_proxy_grafana_ip: 172.28.6.3
 alloy_telemetry_ip: 172.28.13.2
 alloy_observability_ip: 172.28.15.2
 prometheus_observability_ip: 172.28.15.3
+alertmanager_observability_ip: 172.28.15.4
+# Prometheus stops at 30 days or this local size cap, whichever comes first.
+# Size this for the target VM before production. Use whole MB, GB, or TB units.
+prometheus_retention_size: 5GB
 platform_dns_ip: 172.28.18.2
 
 # ── firewalld ───────────────────────────────────────────────────────────

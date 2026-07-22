@@ -24,7 +24,7 @@ exec "${docker_cmd[@]}" run --rm -i \
   --security-opt no-new-privileges:true \
   --log-driver none \
   --entrypoint /usr/bin/python3 \
-  'dhi.io/python:3.14.6@sha256:c82da5a1a30a6214f45c42def5b6f5b85981c7dc7a1802015a6ebf264675436d' \
+  'dhi.io/python:3.14.6@sha256:c43e37b1d2c740bf924149f7ce015a79636a084a3fd755ac8c5ffc2f4a850b3e' \
   -c '
 import json
 import re

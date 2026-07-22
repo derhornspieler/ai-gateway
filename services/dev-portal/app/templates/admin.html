@@ -4,6 +4,7 @@
 <nav class="tabs" role="tablist" aria-label="Admin console sections">
   <button type="button" role="tab" id="tabbtn-identity" data-tab="identity" aria-controls="tab-identity" aria-selected="true">Identity &amp; Access{% if identity_groups %} <span class="count">{{ identity_groups | length }}</span>{% endif %}</button>
   <a role="tab" href="/admin/keys" aria-selected="false">API Keys</a>
+  <button type="button" role="tab" id="tabbtn-models" data-tab="models" aria-controls="tab-models" aria-selected="false">Models &amp; Pricing{% if governed_models %} <span class="count">{{ governed_models | length }}</span>{% endif %}</button>
   <button type="button" role="tab" id="tabbtn-providers" data-tab="providers" aria-controls="tab-providers" aria-selected="false">Providers &amp; JWT{% if anthropic_provider and anthropic_provider.state != 'configured' %} <span class="pipdot warn" aria-hidden="true"></span>{% endif %}</button>
   <button type="button" role="tab" id="tabbtn-rotation" data-tab="rotation" aria-controls="tab-rotation" aria-selected="false">Key Rotation</button>
   <button type="button" role="tab" id="tabbtn-audit" data-tab="audit" aria-controls="tab-audit" aria-selected="false">Audit</button>
@@ -14,7 +15,7 @@
 {% if not identity_step_up_recent %}
 <div class="card">
   <h3>Fresh authentication required for changes</h3>
-  <p class="muted">Viewing status is allowed with your current admin session. Identity, provider, and policy mutations require a new Keycloak login and remain unlocked for five minutes.</p>
+  <p class="muted">Viewing status is allowed with your current admin session. Identity, model, price, provider, and policy changes require a new Keycloak login and remain unlocked for five minutes.</p>
   <a class="btn" href="/admin/reauth">Reauthenticate with Keycloak</a>
 </div>
 {% endif %}
@@ -87,6 +88,9 @@
   <div>
     {% if selected_group %}
     <div class="eyebrow" style="margin-top: 0;">Project policy — <span style="color: var(--text);">{{ selected_group.name }}</span></div>
+      {% if not selected_group.policy_reconciliation.ready %}
+      <div class="flash error">This policy change is incomplete. Existing keys stay blocked or on the previous policy until you save this same policy again. Gateway readiness remains red until reconciliation finishes.</div>
+      {% endif %}
     <div class="card">
       <p class="muted" style="margin-top: 0;">Rate limit:
         {% if selected_group.policy.tpm_limit or selected_group.policy.rpm_limit %}{{ selected_group.policy.tpm_limit or "unlimited" }} TPM &middot; {{ selected_group.policy.rpm_limit or "unlimited" }} RPM{% else %}Unlimited (default){% endif %};
@@ -104,7 +108,7 @@
           </div>
           {% set no_models = selected_group.policy.allowed_models == [no_models_sentinel] %}
           <div>
-            <label class="fld" style="margin-top: 0;">Allowed models (none checked = all configured models, including future ones)</label>
+            <label class="fld" style="margin-top: 0;">Allowed models (none checked = all public models configured now)</label>
             {% for model in policy_models %}
             <label class="check"><input type="checkbox" name="allowed_models" value="{{ model }}"{% if not no_models and selected_group.policy.allowed_models and model in selected_group.policy.allowed_models %} checked{% endif %}> {{ model }}</label>
             {% endfor %}
@@ -116,6 +120,21 @@
               <option value="{{ model }}"{% if selected_group.policy.default_model == model %} selected{% endif %}>{{ model }}</option>
               {% endfor %}
             </select>
+            <label class="fld">Per-model output limits</label>
+            <p class="note">Set both values for a checked model. Blank means no per-model output limit. Reservations use a fixed UTC minute and stay charged until that minute ends.</p>
+            {% for model in policy_models %}
+            {% set model_limit = selected_group.policy.model_limits.get(model, {}) %}
+            <input type="hidden" name="limit_models" value="{{ model }}">
+            <div style="display: grid; grid-template-columns: minmax(150px, 1fr) 150px 170px; gap: 8px; align-items: end; margin-top: 8px;">
+              <span class="mtag">{{ model }}</span>
+              <label class="note">Max output/request
+                <input type="text" name="max_output_tokens_per_request" value="{{ model_limit.get('max_output_tokens_per_request', '') }}" maxlength="32" inputmode="numeric" autocomplete="off">
+              </label>
+              <label class="note">Output/minute (UTC)
+                <input type="text" name="output_tokens_per_utc_minute" value="{{ model_limit.get('output_tokens_per_utc_minute', '') }}" maxlength="32" inputmode="numeric" autocomplete="off">
+              </label>
+            </div>
+            {% endfor %}
           </div>
         </div>
         {% set stored_models = (selected_group.policy.allowed_models or []) + ([selected_group.policy.default_model] if selected_group.policy.default_model else []) %}
@@ -234,6 +253,197 @@
 </div>
 {% else %}
 <p class="muted">Identity-controller status is unavailable.</p>
+{% endif %}
+</section>
+
+<!-- ===================== MODELS & PRICING ===================== -->
+<section class="panel" id="tab-models" role="tabpanel" aria-labelledby="tabbtn-models">
+<h1 class="page">Models &amp; pricing</h1>
+<p class="sub">Create reviewed model and price versions. Records are append-only. New models stay hidden from users until a later activation workflow approves them.</p>
+
+{% if governance_available %}
+<div class="trustbox ok">
+  <strong>Provider policy is locked to this release.</strong>
+  <p class="note" style="margin: 5px 0 0;">The portal accepts only approved provider names and model IDs. Hostnames, CA files, credentials, and provider URLs cannot be entered here.</p>
+</div>
+
+<div class="grid2" style="margin-top: 18px;">
+  <div>
+    <div class="eyebrow" style="margin-top: 0;">Governed models</div>
+    {% if governed_models %}
+    <div class="glist">
+      {% for model in governed_models %}
+      <a class="grow" href="/admin?price_model={{ model.gateway_model_name | urlencode }}#tab-models" aria-current="{{ 'true' if model.gateway_model_name == selected_price_model else 'false' }}">
+        <span class="gname">{{ model.gateway_model_name }} <span class="pill {{ 'ok' if model.visible_in_discovery else 'off' }}">{% if model.lifecycle_state == 'retired' %}retired{% elif model.lifecycle_state == 'draft' %}draft{% elif model.visible_in_discovery %}active · visible{% else %}active · hidden{% endif %}</span></span>
+        <span class="gmeta">
+          <span class="chip cap">{{ model.provider_name }}</span>
+          <span class="chip">{{ model.provider_model_id }}</span>
+        </span>
+      </a>
+      {% if identity_step_up_recent and model.lifecycle_state != 'retired' %}
+      <form method="post" action="/admin/model-governance/lifecycle" class="actions">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="gateway_model_name" value="{{ model.gateway_model_name }}">
+        {% if model.lifecycle_state == 'draft' %}
+        <button type="submit" name="action" value="activate">Activate</button>
+        {% elif model.visible_in_discovery %}
+        <button type="submit" name="action" value="hide">Hide</button>
+        <button type="submit" name="action" value="retire">Retire</button>
+        {% else %}
+        <button type="submit" name="action" value="show">Show</button>
+        <button type="submit" name="action" value="retire">Retire</button>
+        {% endif %}
+      </form>
+      {% endif %}
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="card"><p class="muted" style="margin: 0;">No governed models exist yet. Create the first hidden model below.</p></div>
+    {% endif %}
+
+    {% if identity_step_up_recent %}
+    <details class="adv">
+      <summary>Create a hidden model</summary>
+      <div class="advbody">
+        <form method="post" action="/admin/model-governance/models">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label class="fld" for="governed-model-name">Gateway model name</label>
+          <input type="text" id="governed-model-name" name="gateway_model_name" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}" autocomplete="off" placeholder="claude-sonnet-4-5">
+          <label class="fld" for="governed-provider">Approved provider</label>
+          <select id="governed-provider" name="provider_name" required>
+            {% for provider_name in approved_model_providers %}<option value="{{ provider_name }}">{{ provider_name }}</option>{% endfor %}
+          </select>
+          <label class="fld" for="governed-provider-model">Provider model ID</label>
+          <input type="text" id="governed-provider-model" name="provider_model_id" required maxlength="128" pattern="[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?" autocomplete="off" placeholder="claude-sonnet-4-5">
+          <label class="fld" for="governed-model-source">Reviewed source reference</label>
+          <input type="text" id="governed-model-source" name="source_reference" required maxlength="256" autocomplete="off" placeholder="anthropic-model-catalog-2026-07-22">
+          <p class="note" style="margin: 5px 0 0;">Enter a review record ID, not a URL.</p>
+          <label class="fld" for="governed-model-note">Review note</label>
+          <input type="text" id="governed-model-note" name="review_note" required minlength="8" maxlength="500" autocomplete="off" placeholder="Reviewed against the approved provider catalog.">
+          <div style="margin-top: 14px;"><button type="submit">Create hidden model</button></div>
+        </form>
+      </div>
+    </details>
+    {% endif %}
+  </div>
+
+  <div>
+    {% if selected_price_model %}
+    <div class="eyebrow" style="margin-top: 0;">Price history — <span style="color: var(--text);">{{ selected_price_model }}</span></div>
+    {% if governed_prices %}
+    <div class="card" style="padding: 0; overflow: hidden;">
+      <div class="tblwrap">
+        <table class="keys compact">
+          <thead><tr><th>Effective (UTC)</th><th>Usage</th><th>USD price</th><th>Source</th></tr></thead>
+          <tbody>
+            {% for price in governed_prices %}
+            <tr>
+              <td class="muted mono tnum">{{ price.effective_at }}</td>
+              <td>{{ price.usage_class_label }}</td>
+              <td><strong>${{ price.amount }}</strong> / {{ "{:,}".format(price.token_unit) }} token{{ '' if price.token_unit == 1 else 's' }}{% if price.explicit_free %} <span class="pill ok">free</span>{% endif %}</td>
+              <td><span class="trunc wide" title="{{ price.review_note }}">{{ price.source_reference }}</span></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% else %}
+    <div class="card"><p class="muted" style="margin: 0;">This model has no price versions yet. Missing price data means unknown, not free.</p></div>
+    {% endif %}
+
+    {% if identity_step_up_recent %}
+    <details class="adv" open>
+      <summary>Create a future USD price</summary>
+      <div class="advbody">
+        <form method="post" action="/admin/model-governance/prices">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label class="fld" for="price-model">Model</label>
+          <select id="price-model" name="gateway_model_name" required>
+            {% for model in governed_models %}<option value="{{ model.gateway_model_name }}"{% if model.gateway_model_name == selected_price_model %} selected{% endif %}>{{ model.gateway_model_name }}</option>{% endfor %}
+          </select>
+          <label class="fld" for="price-usage-class">Token usage class</label>
+          <select id="price-usage-class" name="usage_class" required>
+            {% for value, label in governance_usage_classes %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+          </select>
+          <div class="addrow">
+            <div>
+              <label class="fld" for="price-token-unit">Token quantity</label>
+              <input type="number" id="price-token-unit" name="token_unit" required min="1" max="1000000000" value="1000000">
+            </div>
+            <div>
+              <label class="fld" for="price-amount">USD for that quantity</label>
+              <input type="text" id="price-amount" name="amount" required maxlength="64" inputmode="decimal" autocomplete="off" placeholder="30">
+            </div>
+          </div>
+          <label class="check"><input type="checkbox" name="explicit_free" value="1"> This usage class is intentionally free (amount must be 0)</label>
+          <label class="fld" for="price-effective">Effective time (UTC)</label>
+          <input type="datetime-local" id="price-effective" name="effective_at_utc" required min="{{ governance_price_min }}" style="width: 100%; max-width: 380px; background: var(--bg-2); border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 8px 11px; font: inherit;">
+          <label class="fld" for="price-source">Reviewed source reference</label>
+          <input type="text" id="price-source" name="source_reference" required maxlength="256" autocomplete="off" placeholder="anthropic-pricing-2026-07-22">
+          <label class="fld" for="price-note">Review note</label>
+          <input type="text" id="price-note" name="review_note" required minlength="8" maxlength="500" autocomplete="off" placeholder="Reviewed by the platform pricing owner.">
+          <p class="note">Example: enter <strong>1,000,000</strong> tokens and <strong>30</strong> USD. The portal creates an immutable version ID and audit operation ID.</p>
+          <div style="margin-top: 14px;"><button type="submit">Create future price</button></div>
+        </form>
+      </div>
+    </details>
+
+    <details class="adv">
+      <summary>Preview a backdated USD price</summary>
+      <div class="advbody">
+        <p class="note">Use this only to correct an older price. The preview is saved, shows the affected usage rows, and changes nothing.</p>
+        <form method="post" action="/admin/model-governance/prices/backdate/preview">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label class="fld" for="backdate-price-model">Model</label>
+          <select id="backdate-price-model" name="gateway_model_name" required>
+            {% for model in governed_models %}<option value="{{ model.gateway_model_name }}"{% if model.gateway_model_name == selected_price_model %} selected{% endif %}>{{ model.gateway_model_name }}</option>{% endfor %}
+          </select>
+          <label class="fld" for="backdate-price-usage-class">Token usage class</label>
+          <select id="backdate-price-usage-class" name="usage_class" required>
+            {% for value, label in governance_usage_classes %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+          </select>
+          <div class="addrow">
+            <div>
+              <label class="fld" for="backdate-price-token-unit">Token quantity</label>
+              <input type="number" id="backdate-price-token-unit" name="token_unit" required min="1" max="1000000000" value="1000000">
+            </div>
+            <div>
+              <label class="fld" for="backdate-price-amount">USD for that quantity</label>
+              <input type="text" id="backdate-price-amount" name="amount" required maxlength="64" inputmode="decimal" autocomplete="off" placeholder="30">
+            </div>
+          </div>
+          <label class="check"><input type="checkbox" name="explicit_free" value="1"> This usage class is intentionally free (amount must be 0)</label>
+          <label class="fld" for="backdate-price-effective">Past effective time (UTC)</label>
+          <input type="datetime-local" id="backdate-price-effective" name="effective_at_utc" required max="{{ governance_backdate_max }}" style="width: 100%; max-width: 380px; background: var(--bg-2); border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 8px 11px; font: inherit;">
+          <label class="fld" for="backdate-price-source">Reviewed source reference</label>
+          <input type="text" id="backdate-price-source" name="source_reference" required maxlength="256" autocomplete="off" placeholder="anthropic-pricing-correction-2026-07-22">
+          <label class="fld" for="backdate-price-note">Reason for the correction</label>
+          <input type="text" id="backdate-price-note" name="review_note" required minlength="8" maxlength="500" autocomplete="off" placeholder="Corrects the reviewed price effective on this date.">
+          <p class="note">A second recent-login check and the exact phrase <strong>CONFIRM BACKDATED PRICE</strong> are required after you review the stored impact.</p>
+          <div style="margin-top: 14px;"><button type="submit">Preview affected usage</button></div>
+        </form>
+      </div>
+    </details>
+    {% endif %}
+    {% else %}
+    <div class="card">
+      <h3>Add a model first</h3>
+      <p class="muted">A price must belong to a reviewed model version.</p>
+    </div>
+    {% endif %}
+
+    <div class="trustbox warn">
+      <strong>Backdating never rewrites history.</strong>
+      <p class="note" style="margin: 5px 0 0;">A stored preview shows the affected rows and exact cost change. Confirmation appends a price version and adjustment records. If the preview is stale, confirmation fails.</p>
+    </div>
+  </div>
+</div>
+{% else %}
+<div class="card">
+  <h3>Model governance is unavailable</h3>
+  <p class="muted">The deployed provider-policy receipt or key-rotator data could not be verified. No model or price control is shown, and no change is allowed.</p>
+</div>
 {% endif %}
 </section>
 
@@ -530,7 +740,8 @@
 <!-- ===================== AUDIT ===================== -->
 <section class="panel" id="tab-audit" role="tabpanel" aria-labelledby="tabbtn-audit">
 <h1 class="page">Audit</h1>
-<p class="sub">Identity and rotation events recorded by the key-rotator, newest first.</p>
+<p class="sub">Identity, rotation, model, and price events recorded by the key-rotator, newest first.</p>
+<div class="eyebrow" style="margin-top: 0;">Rotation history</div>
 {% if history %}
 <div class="card" style="padding: 0; overflow: hidden;">
   <div class="tblwrap">
@@ -552,6 +763,30 @@
 </div>
 {% else %}
 <p class="muted">No rotation history available.</p>
+{% endif %}
+
+<div class="eyebrow">Model and price history</div>
+{% if governance_audit %}
+<div class="card" style="padding: 0; overflow: hidden;">
+  <div class="tblwrap">
+    <table class="keys compact">
+      <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Resource</th><th>Proof</th></tr></thead>
+      <tbody>
+        {% for event in governance_audit %}
+        <tr>
+          <td class="muted mono tnum">{{ event.created_at }}</td>
+          <td><span class="trunc" title="{{ event.actor }}">{{ event.actor }}</span></td>
+          <td>{{ event.action }}</td>
+          <td>{{ event.resource_type }}<br><span class="muted mono">{{ event.resource_id }}</span></td>
+          <td><code class="hash trunc" title="{{ event.document_sha256 }}">{{ event.document_sha256 }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<p class="muted">No model or price audit records are available.</p>
 {% endif %}
 </section>
 {% endblock %}

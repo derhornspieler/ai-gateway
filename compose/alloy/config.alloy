@@ -6,10 +6,11 @@
 //   Port 4319 accepts LiteLLM traces only after bearer authentication. Attaching
 //   Alloy to storage/export networks must never expose either receiver or its
 //   HTTP UI on those networks.
-// - Full prompt/completion bodies are deliberate span attributes (§9.7). Only
-//   the exact sanitized litellm_request span is converted to a log for the
-//   customer Cribl security feed and the local per-request Loki stream
-//   (service_name="aigw-requests"). Raw traces and metrics never leave.
+// - Every signal that passes the source and credential gates is mirrored to
+//   Cribl. The same sanitized logs and metrics still reach Loki and Prometheus.
+//   Cribl is the trace store; this release has no local trace database.
+// - Full prompt/completion bodies are deliberate span attributes (§9.7).
+//   Credential-shaped values are removed before either local or Cribl output.
 // - Docker logs are read from the host's json-file directory, read-only. The
 //   Docker API socket is intentionally not mounted.
 
@@ -140,7 +141,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "resource"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -152,7 +153,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "scope"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -207,7 +208,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
       `delete_matching_keys(attributes, "(?i)^metadata\\.(?:headers?|request[_-]?headers?)$")`,
       `delete_matching_keys(attributes, "(?i)^(?:jwt|user[_-]?jwt|openwebui[_-]?user[_-]?jwt|x[_-]?openwebui[_-]?user[_-]?jwt|request[_-]?headers?)$")`,
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -219,7 +220,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "spanevent"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -231,7 +232,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "resource"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -243,7 +244,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "scope"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -255,7 +256,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "datapoint"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -267,7 +268,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "resource"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -279,7 +280,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "scope"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -291,7 +292,7 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
     context = "log"
     statements = [
       `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
-      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:(?:.*[._-])?(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*|session[._ -]?(?:id|token|secret|key|cookie)|vault[._ -]?(?:token|unseal[._ -]?(?:key|share|token)|recovery[._ -]?(?:key|share|token))|client[._ -]?assertion|id[._-]?token|jwt|token|private[._-]?key(?:[._-]?pem)?)|metadata\\.(?:requester_.*|spend_logs_metadata|prompt_management_metadata))$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.request\\.header\\..*$")`,
       `delete_matching_keys(attributes, "(?i)^http\\.response\\.header\\.set[-_]?cookie$")`,
       `delete_matching_keys(attributes, "(?i)^(?:client|server|network\\.peer|net\\.peer)\\.(?:address|port|ip|name)$")`,
@@ -303,16 +304,95 @@ otelcol.processor.transform "aigw_sensitive_attributes" {
       `replace_pattern(body, "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(body)`,
       `replace_pattern(body, "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(body)`,
       `replace_pattern(body, "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(body)`,
+      `replace_pattern(body, "(?i)(?:session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(body)`,
+      `replace_pattern(body, "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b", "<redacted-jwt>") where IsString(body)`,
+      `replace_pattern(body, "\\b(?:hvs|hvb|hvr|s|b)\\.[A-Za-z0-9_-]{16,}\\b", "<redacted-vault-token>") where IsString(body)`,
+      `replace_pattern(body, "(?s)-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----.*?(?:-----END (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----|$)", "<redacted-private-key>") where IsString(body)`,
     ]
   }
 
+  output {
+    traces  = [otelcol.processor.transform.aigw_signal_context.input]
+    logs    = [otelcol.processor.transform.aigw_signal_context.input]
+    metrics = [otelcol.processor.transform.aigw_signal_context.input]
+  }
+}
+// END AIGW MANAGED SENSITIVE ATTRIBUTE FILTER
+
+// The deployment label is server-owned on every signal. An OTLP peer may set
+// a service identity, but it cannot make preprod data look like production or
+// vice versa at either the local store or Cribl.
+otelcol.processor.transform "aigw_signal_context" {
+  error_mode = "propagate"
+  trace_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["deployment.environment"], "` + sys.env("AIGW_DEPLOYMENT_ENVIRONMENT") + `")`,
+      `delete_matching_keys(attributes, "^aigw\\.security\\.(?:event_class|producer|schema_version)$")`,
+    ]
+  }
+  trace_statements {
+    context = "scope"
+    statements = [
+      `delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.(?:event_class|producer|schema_version))$")`,
+    ]
+  }
+  trace_statements {
+    context = "span"
+    statements = [
+      `delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.(?:event_class|producer|schema_version))$")`,
+    ]
+  }
+  trace_statements {
+    context = "spanevent"
+    statements = [
+      `delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.(?:event_class|producer|schema_version))$")`,
+    ]
+  }
+  metric_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["deployment.environment"], "` + sys.env("AIGW_DEPLOYMENT_ENVIRONMENT") + `")`,
+      `delete_matching_keys(attributes, "^aigw\\.security\\.(?:event_class|producer|schema_version)$")`,
+    ]
+  }
+  metric_statements {
+    context = "scope"
+    statements = [
+      `delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.(?:event_class|producer|schema_version))$")`,
+    ]
+  }
+  metric_statements {
+    context = "datapoint"
+    statements = [
+      `delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.(?:event_class|producer|schema_version))$")`,
+    ]
+  }
+  log_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["deployment.environment"], "` + sys.env("AIGW_DEPLOYMENT_ENVIRONMENT") + `")`,
+      `delete_matching_keys(attributes, "^aigw\\.security\\.(?:event_class|producer|schema_version)$")`,
+    ]
+  }
+  log_statements {
+    context = "scope"
+    statements = [
+      `delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.(?:event_class|producer|schema_version))$")`,
+    ]
+  }
+  log_statements {
+    context = "log"
+    statements = [
+      `delete_matching_keys(attributes, "^(?:deployment\\.environment|service\\.name|aigw\\.security\\.(?:event_class|producer|schema_version))$")`,
+    ]
+  }
   output {
     traces  = [otelcol.processor.batch.default.input]
     logs    = [otelcol.processor.batch.default.input]
     metrics = [otelcol.processor.batch.default.input]
   }
 }
-// END AIGW MANAGED SENSITIVE ATTRIBUTE FILTER
 
 otelcol.processor.batch "default" {
   timeout             = "1s"
@@ -322,12 +402,15 @@ otelcol.processor.batch "default" {
     traces = [
       otelcol.connector.spanmetrics.default.input,
       otelcol.processor.filter.aigw_request_spans.input,
+      otelcol.processor.batch.cribl_traces.input,
     ]
     logs = [
       otelcol.exporter.loki.local.input,
+      otelcol.processor.batch.cribl_logs.input,
     ]
     metrics = [
       otelcol.exporter.prometheus.local.input,
+      otelcol.processor.batch.cribl_metrics.input,
     ]
   }
 }
@@ -340,7 +423,10 @@ otelcol.connector.spanmetrics "default" {
   histogram { explicit {} }
   dimension { name = "gen_ai.request.model" }
   output {
-    metrics = [otelcol.exporter.prometheus.local.input]
+    metrics = [
+      otelcol.exporter.prometheus.local.input,
+      otelcol.processor.batch.cribl_metrics.input,
+    ]
   }
 }
 
@@ -351,7 +437,8 @@ otelcol.connector.spanmetrics "default" {
 // and raw-identity source before this branch; prompt bodies are deliberately
 // retained here, in this stream only. Sibling spans (raw_gen_ai_request,
 // Received Proxy Server Request), a look-alike span from another service, and
-// every malformed record fail closed before the external queue.
+// every malformed record cannot become a normalized request-audit log. Their
+// already-sanitized source traces still follow the general Cribl trace path.
 otelcol.processor.filter "aigw_request_spans" {
   error_mode = "propagate"
   traces {
@@ -501,7 +588,7 @@ otelcol.processor.attributes "aigw_request_stream_labels" {
 // regardless of whether it began as a request spanlog or a classified Docker
 // record. Clear ambiguous caller fields first, then assign one literal producer
 // and service identity from the reviewed event class. The structured-security
-// path may use only the four service names its earlier classifier admitted.
+// path may use only the five service names its earlier classifier admitted.
 // A transform failure propagates and therefore cannot bypass this boundary.
 otelcol.processor.transform "cribl_security_contract" {
   error_mode = "propagate"
@@ -530,6 +617,8 @@ otelcol.processor.transform "cribl_security_contract" {
       `set(resource.attributes["service.name"], "key-rotator") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "key-rotator"`,
       `set(attributes["aigw.security.producer"], "envoy-egress") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "envoy-egress"`,
       `set(resource.attributes["service.name"], "envoy-egress") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "envoy-egress"`,
+      `set(attributes["aigw.security.producer"], "litellm") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "litellm"`,
+      `set(resource.attributes["service.name"], "litellm") where attributes["aigw.security.event_class"] == "security_event" and attributes["service"] == "litellm"`,
       `set(attributes["aigw.security.producer"], "controller") where attributes["aigw.security.event_class"] == "controller_lifecycle"`,
       `set(resource.attributes["service.name"], "controller") where attributes["aigw.security.event_class"] == "controller_lifecycle"`,
     ]
@@ -543,7 +632,7 @@ otelcol.processor.transform "cribl_security_contract" {
 // the approved 24-hour delivery window at queue ingress and one minute of
 // forward clock skew. This keeps a host reboot or collector restart from
 // discarding unread records; queue delay happens after this gate. Zero, stale,
-// future, or unclassified records are removed before the only Cribl batch.
+// future, or unclassified records are removed before the Cribl log batch.
 // error_mode=propagate makes an evaluation error fail closed too.
 otelcol.processor.filter "cribl_common_record" {
   error_mode = "propagate"
@@ -557,7 +646,7 @@ otelcol.processor.filter "cribl_common_record" {
       `attributes["aigw.security.event_class"] == "keycloak_event" and attributes["aigw.security.producer"] != "keycloak"`,
       `attributes["aigw.security.event_class"] == "egress_tls" and attributes["aigw.security.producer"] != "envoy-egress"`,
       `attributes["aigw.security.event_class"] == "vault_audit" and attributes["aigw.security.producer"] != "vault"`,
-      `attributes["aigw.security.event_class"] == "security_event" and attributes["aigw.security.producer"] != "dev-portal" and attributes["aigw.security.producer"] != "admin-portal" and attributes["aigw.security.producer"] != "key-rotator" and attributes["aigw.security.producer"] != "envoy-egress"`,
+      `attributes["aigw.security.event_class"] == "security_event" and attributes["aigw.security.producer"] != "dev-portal" and attributes["aigw.security.producer"] != "admin-portal" and attributes["aigw.security.producer"] != "key-rotator" and attributes["aigw.security.producer"] != "envoy-egress" and attributes["aigw.security.producer"] != "litellm"`,
       `attributes["aigw.security.event_class"] == "controller_lifecycle" and attributes["aigw.security.producer"] != "controller"`,
       `attributes["aigw.security.event_class"] != "ai_request_audit" and attributes["aigw.security.event_class"] != "keycloak_event" and attributes["aigw.security.event_class"] != "egress_tls" and attributes["aigw.security.event_class"] != "vault_audit" and attributes["aigw.security.event_class"] != "security_event" and attributes["aigw.security.event_class"] != "controller_lifecycle"`,
       `time_unix_nano == 0`,
@@ -566,19 +655,37 @@ otelcol.processor.filter "cribl_common_record" {
     ]
   }
   output {
-    logs = [otelcol.processor.batch.cribl_security.input]
+    logs = [otelcol.processor.batch.cribl_logs.input]
   }
 }
 
-// This is the only queue ingress for the customer security feed. Every input
-// is already reduced to a reviewed log schema. Do not connect a raw receiver,
-// trace, metric, ordinary service log, raw Vault audit file, or Alloy's own logs.
-otelcol.processor.batch "cribl_security" {
+// Keep the three signal batches independent before the shared durable queue.
+// A burst of metrics must not prevent a ready log or trace batch from flushing.
+// The exporter remains non-blocking, so a Cribl outage cannot stop inference.
+otelcol.processor.batch "cribl_logs" {
   timeout             = "1s"
   send_batch_size     = 512
   send_batch_max_size = 1024
   output {
     logs = [otelcol.exporter.otlp.cribl.input]
+  }
+}
+
+otelcol.processor.batch "cribl_metrics" {
+  timeout             = "1s"
+  send_batch_size     = 512
+  send_batch_max_size = 1024
+  output {
+    metrics = [otelcol.exporter.otlp.cribl.input]
+  }
+}
+
+otelcol.processor.batch "cribl_traces" {
+  timeout             = "1s"
+  send_batch_size     = 512
+  send_batch_max_size = 1024
+  output {
+    traces = [otelcol.exporter.otlp.cribl.input]
   }
 }
 
@@ -588,6 +695,100 @@ otelcol.exporter.prometheus "local" {
 
 prometheus.remote_write "local" {
   endpoint { url = "http://prometheus:9090/api/v1/write" }
+}
+
+// Prometheus is the sole alert evaluator. It returns only its two generated
+// alert-state series over a dedicated mTLS listener on net-observability.
+// This branch goes to Cribl only. It must never feed the local Prometheus
+// writer, or one alert sample could create a telemetry loop.
+prometheus.receive_http "alert_state" {
+  http {
+    listen_address       = sys.env("ALLOY_OBSERVABILITY_IP")
+    listen_port          = 12346
+    server_read_timeout  = "10s"
+    server_write_timeout = "10s"
+    tls {
+      cert_file        = "/run/secrets/alert_state_alloy.crt"
+      key_file         = "/run/secrets/alert_state_alloy.key"
+      client_auth_type = "RequireAndVerifyClientCert"
+      client_ca_file   = "/run/secrets/alert_state_ca.pem"
+      min_version      = "TLS13"
+    }
+  }
+  forward_to = [prometheus.relabel.alert_state.receiver]
+}
+
+prometheus.relabel "alert_state" {
+  max_cache_size = 128
+  forward_to     = [otelcol.receiver.prometheus.alert_state.receiver]
+
+  rule {
+    source_labels = ["__name__"]
+    regex         = "ALERTS|ALERTS_FOR_STATE"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["alertname"]
+    regex         = "AIGatewayWatchdog|AIGatewayScrapeTargetDown|AIGatewayAlertmanagerUnavailable|AIGatewayAlertmanagerDeliveryFailures|AIGatewayAlloyExporterSendFailures|AIGatewayAlloyExporterEnqueueFailures|AIGatewayAlloyExporterQueueSaturation|AIGatewayLokiWriteDrops|AIGatewayLokiWriteRetriesHigh|AIGatewayPrometheusRemoteWriteFailures|AIGatewayPrometheusRemoteWriteBacklog|AIGatewayHostCPUHigh|AIGatewayHostCPUCritical|AIGatewayHostLoadHigh|AIGatewayHostLoadCritical|AIGatewayHostMemoryLow|AIGatewayHostMemoryCritical|AIGatewayHostSwapHigh|AIGatewayHostOOMKill|AIGatewayFilesystemSpaceLow|AIGatewayFilesystemSpaceCritical|AIGatewayFilesystemPredictedFull|AIGatewayFilesystemInodesLow|AIGatewayFilesystemInodesCritical|AIGatewayHostDiskLatencyHigh|AIGatewayHostDiskIOSaturation|AIGatewayHostFileDescriptorsHigh|AIGatewayHostFileDescriptorsCritical|AIGatewayServiceLatencyHigh|AIGatewayServiceLatencyCritical|AIGatewayServiceErrorRateHigh|AIGatewayServiceErrorRateCritical|AIGatewayCertificateExpiresSoon|AIGatewayCertificateExpiryCritical"
+    action        = "keep"
+  }
+  rule {
+    regex  = "__name__|alertname|alertstate|severity|owner|alert_class|instance|job|device|mountpoint|service|component_id|remote_name"
+    action = "labelkeep"
+  }
+  rule {
+    target_label = "deployment_environment"
+    replacement  = sys.env("AIGW_DEPLOYMENT_ENVIRONMENT")
+    action       = "replace"
+  }
+  rule {
+    target_label = "aigw_signal"
+    replacement  = "alert-state"
+    action       = "replace"
+  }
+}
+
+otelcol.receiver.prometheus "alert_state" {
+  output {
+    metrics = [otelcol.processor.memory_limiter.alert_state.input]
+  }
+}
+
+otelcol.processor.memory_limiter "alert_state" {
+  check_interval = "1s"
+  limit          = "32MiB"
+  spike_limit    = "8MiB"
+  output {
+    metrics = [otelcol.processor.batch.cribl_metrics.input]
+  }
+}
+
+// Alloy owns the only scrape graph. Prometheus receives the resulting samples
+// over its private remote-write endpoint and evaluates the committed rules.
+// This makes Alloy the one local and Cribl fan-out point for every metric.
+prometheus.scrape "gateway" {
+  scrape_interval = "15s"
+  targets = [
+    { "__address__" = "traefik-int:9100", "job" = "traefik" },
+    { "__address__" = "traefik-adm:9100", "job" = "traefik" },
+    { "__address__" = "envoy-egress:9902", "__metrics_path__" = "/stats/prometheus", "job" = "envoy-egress" },
+    { "__address__" = "keycloak:9000", "__metrics_path__" = "/metrics", "job" = "keycloak" },
+    { "__address__" = sys.env("ALLOY_OBSERVABILITY_IP") + ":12345", "job" = "alloy" },
+    { "__address__" = "grafana:3000", "job" = "grafana" },
+    { "__address__" = "prometheus-observability:9090", "job" = "prometheus" },
+    { "__address__" = "alertmanager:9093", "job" = "alertmanager" },
+    { "__address__" = "loki:3100", "job" = "loki" },
+    { "__address__" = "node-exporter:9100", "job" = "node-exporter" },
+    // BEGIN AIGW PREPROD ALERT FIXTURE
+    // END AIGW PREPROD ALERT FIXTURE
+  ]
+  forward_to = [otelcol.receiver.prometheus.gateway.receiver]
+}
+
+otelcol.receiver.prometheus "gateway" {
+  output {
+    metrics = [otelcol.processor.memory_limiter.default.input]
+  }
 }
 
 otelcol.exporter.loki "local" {
@@ -607,7 +808,7 @@ loki.write "local" {
 
 // Persistent exporter queue survives Alloy restarts and endpoint outages.
 // queue_size remains byte-bounded at the exporter; fsync trades a small
-// amount of throughput for a durable customer audit trail. Alloy has no
+// amount of throughput for a durable telemetry backlog. Alloy has no
 // per-record queue TTL. The 24-hour retry limit is the strongest supported
 // time bound; the byte cap may shorten it during a high-volume outage.
 otelcol.storage.file "cribl_queue" {
@@ -625,9 +826,11 @@ otelcol.storage.file "cribl_queue" {
   }
 }
 
-// Customer Cribl (or the cribl-mock stand-in). The queue is byte-bounded so
-// one endpoint outage cannot consume all collector memory. Plaintext remains
-// an explicit test-only switch enforced by Ansible.
+// Customer Cribl (or the cribl-mock stand-in). This is the only outbound
+// telemetry exporter. It carries admitted logs, metrics, and traces over
+// native OTLP/gRPC. The queue is byte-bounded so one endpoint outage cannot
+// consume all collector memory. Plaintext remains an explicit test-only switch
+// enforced by Ansible.
 otelcol.exporter.otlp "cribl" {
   client {
     endpoint = sys.env("CRIBL_OTLP_ENDPOINT")
@@ -717,13 +920,84 @@ loki.process "docker" {
     expression = `(\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b)`
     replace    = `<redacted-vendor-key>`
   }
+  stage.replace {
+    expression = `(?i)"?(?:session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)"?\s*[:=]\s*["']?([^"'\s,}]{8,})`
+    replace    = `<redacted-credential>`
+  }
+  stage.replace {
+    expression = `(\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)`
+    replace    = `<redacted-jwt>`
+  }
+  stage.replace {
+    expression = `(\b(?:hvs|hvb|hvr|s|b)\.[A-Za-z0-9_-]{16,}\b)`
+    replace    = `<redacted-vault-token>`
+  }
+  stage.replace {
+    expression = `(?s)(-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----.*?(?:-----END (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----|$))`
+    replace    = `<redacted-private-key>`
+  }
   stage.label_drop { values = ["filename"] }
   forward_to = [
     loki.write.local.receiver,
+    loki.process.cribl_admitted_docker.receiver,
     loki.process.cribl_keycloak_auth.receiver,
     loki.process.cribl_envoy_tls.receiver,
     loki.process.cribl_structured_security.receiver,
   ]
+}
+
+// Mirror ordinary Docker logs after the shared source-side redaction above.
+// Security producers often include extra fields that must not leave the host.
+// Their raw records are excluded here and their reviewed projections follow
+// the existing structured branches below instead. Raw Vault audit records use
+// a separate file source and likewise never enter this generic branch.
+loki.process "cribl_admitted_docker" {
+  stage.regex {
+    expression = `(?P<aigw_normalized_security_source>AIGW_SECURITY_EVENT|"log\.logger":"org\.keycloak\.events"|"upstream_transport_failure_reason":)`
+  }
+  stage.labels {
+    values = {
+      aigw_normalized_security_source = "",
+    }
+  }
+  stage.match {
+    selector            = "{aigw_normalized_security_source!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "raw_security_record_requires_projection"
+  }
+  stage.label_drop { values = ["aigw_normalized_security_source"] }
+  forward_to = [otelcol.receiver.loki.cribl_admitted_logs.receiver]
+}
+
+// Loki stages already removed credential-shaped values from the message. The
+// OTLP bridge repeats the fail-closed sanitizer for defense in depth, stamps
+// the server-owned environment, and sends only to the external log batch.
+otelcol.receiver.loki "cribl_admitted_logs" {
+  output {
+    logs = [otelcol.processor.transform.cribl_admitted_logs.input]
+  }
+}
+
+otelcol.processor.transform "cribl_admitted_logs" {
+  error_mode = "propagate"
+  log_statements {
+    context = "log"
+    statements = [
+      `set(resource.attributes["deployment.environment"], "` + sys.env("AIGW_DEPLOYMENT_ENVIRONMENT") + `")`,
+      `set(resource.attributes["service.name"], attributes["service"]) where IsString(attributes["service"])`,
+      `delete_matching_keys(attributes, "(?i)^metadata\\.user_api_key_.*$")`,
+      `delete_matching_keys(attributes, "(?i)^(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|headers?|hidden_params|proxy_server_request|requester_.*)$")`,
+      `replace_pattern(body, "(?i)(?:authorization|api[_-]?key|x[_-]?api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|session[ _-]?(?:id|token|secret|key|cookie)|vault[ _-]?(?:token|unseal[ _-]?(?:key|share|token)|recovery[ _-]?(?:key|share|token))|client[ _-]?assertion)[\\\"']?[[:space:]]*[:=][[:space:]]*[\\\"']?(?:(?:bearer|basic)[[:space:]]+)?[^\\\"'[:space:],}]+", "<redacted-credential>") where IsString(body)`,
+      `replace_pattern(body, "(?i)\\b(?:bearer|basic)[[:space:]]+[A-Za-z0-9._~+/-]{8,}", "<redacted-authorization>") where IsString(body)`,
+      `replace_pattern(body, "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b", "<redacted-vendor-key>") where IsString(body)`,
+      `replace_pattern(body, "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b", "<redacted-jwt>") where IsString(body)`,
+      `replace_pattern(body, "\\b(?:hvs|hvb|hvr|s|b)\\.[A-Za-z0-9_-]{16,}\\b", "<redacted-vault-token>") where IsString(body)`,
+      `replace_pattern(body, "(?s)-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----.*?(?:-----END (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|ENCRYPTED PRIVATE KEY|OPENSSH PRIVATE KEY)-----|$)", "<redacted-private-key>") where IsString(body)`,
+    ]
+  }
+  output {
+    logs = [otelcol.processor.batch.cribl_logs.input]
+  }
 }
 
 // Keycloak authentication events are emitted by its reviewed jboss-logging
@@ -892,7 +1166,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "unapproved_project"
   }
   stage.match {
-    selector            = "{service!~\"dev-portal|admin-portal|key-rotator|envoy-egress\"}"
+    selector            = "{service!~\"dev-portal|admin-portal|key-rotator|envoy-egress|litellm\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_security_service"
   }
@@ -903,31 +1177,46 @@ loki.process "cribl_structured_security" {
     source = "aigw_security_json"
     expressions = {
       security_action                  = "action",
+      security_amount_usd              = "amount_usd",
       security_attempt_present         = "contains(keys(@), 'attempt')",
       security_ca_fingerprints         = "ca_sha256_fingerprints",
       security_changed                 = "changed",
       security_changed_present         = "contains(keys(@), 'changed')",
       security_changed_type            = "type(changed)",
       security_change_kind             = "change_kind",
+      security_completeness            = "completeness",
+      security_control                 = "control",
       security_error_type              = "error_type",
       security_event                   = "event",
+      security_event_id                = "event_id",
+      security_effective_at            = "effective_at",
       security_exact_sans              = "exact_sans",
+      security_field_count             = "length(keys(@))",
       security_group                   = "group",
       security_ldap_provider           = "ldap_provider",
+      security_model                   = "model",
       security_outcome                 = "outcome",
       security_operation_id            = "operation_id",
       security_policy_sha256            = "policy_sha256",
+      security_old_policy_sha256        = "old_policy_sha256",
+      security_provider                = "provider",
       security_project                 = "project",
       security_providers               = "providers",
       security_purpose                 = "purpose",
       security_reason                  = "reason",
+      security_request_id              = "request_id",
+      security_review_note_sha256       = "review_note_sha256",
       security_rotation_id             = "rotation_id",
       security_rotation_status         = "rotation_status",
       security_schema                  = "schema_version",
+      security_source_reference        = "source_reference",
       security_sni                     = "sni",
       security_state                   = "state",
       security_subject                 = "subject",
       security_target_subject          = "target_subject",
+      security_token_unit              = "token_unit",
+      security_usage_class             = "usage_class",
+      security_candidate_sha256        = "candidate_sha256",
       security_vendor                  = "vendor",
     }
   }
@@ -941,6 +1230,10 @@ loki.process "cribl_structured_security" {
   stage.template {
     source   = "security_changed"
     template = `{{ if and (eq .security_changed_type "boolean") (eq .Value "true") }}true{{ else if and (eq .security_changed_type "boolean") (eq .Value "false") }}false{{ end }}`
+  }
+  stage.template {
+    source   = "security_field_count"
+    template = "{{ .Value }}"
   }
   stage.template {
     source   = "security_changed_present"
@@ -1025,16 +1318,39 @@ loki.process "cribl_structured_security" {
     source   = "security_detail_except_managed_change"
     template = `{{ if or .security_attempt .security_ca_fingerprints .security_error_type .security_exact_sans .security_group .security_ldap_provider .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
   }
+  stage.template {
+    source   = "security_detail_except_operation"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_group .security_ldap_provider .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_model_limit"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_error_type .security_exact_sans .security_group .security_ldap_provider .security_operation_id .security_policy_sha256 .security_provider .security_providers .security_purpose .security_rotation_id .security_rotation_status .security_sni .security_state .security_subject .security_target_subject .security_usage_class .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_usage"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_control .security_error_type .security_exact_sans .security_group .security_ldap_provider .security_operation_id .security_policy_sha256 .security_providers .security_purpose .security_reason .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_usage_class .security_vendor }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_price_detail"
+    template = `{{ if or .security_amount_usd .security_candidate_sha256 .security_effective_at .security_old_policy_sha256 .security_review_note_sha256 .security_source_reference .security_token_unit }}present{{ end }}`
+  }
+  stage.template {
+    source   = "security_detail_except_price"
+    template = `{{ if or .security_attempt .security_ca_fingerprints .security_changed .security_change_kind .security_completeness .security_control .security_error_type .security_event_id .security_exact_sans .security_group .security_ldap_provider .security_policy_sha256 .security_project .security_providers .security_purpose .security_reason .security_request_id .security_rotation_id .security_rotation_status .security_sni .security_state .security_target_subject .security_vendor }}present{{ end }}`
+  }
   stage.labels {
     values = {
       aigw_security_schema      = "security_schema",
       security_action           = "",
+      security_amount_usd       = "",
       security_attempt          = "",
       security_attempt_present  = "",
       security_ca_fingerprints  = "",
       security_changed          = "",
       security_changed_present  = "",
       security_change_kind      = "",
+      security_completeness     = "",
+      security_control          = "",
       security_detail_any       = "",
       security_detail_except_changed = "",
       security_detail_except_error = "",
@@ -1049,26 +1365,43 @@ loki.process "cribl_structured_security" {
       security_detail_except_ldap_operation = "",
       security_detail_except_ldap_error = "",
       security_detail_except_managed_change = "",
+      security_detail_except_model_limit = "",
+      security_detail_except_price = "",
+      security_detail_except_usage = "",
+      security_detail_except_operation = "",
       security_detail_except_project_operation = "",
       security_detail_except_error_operation = "",
       security_error_type       = "",
       security_event            = "",
+      security_event_id         = "",
+      security_effective_at     = "",
       security_exact_sans       = "",
+      security_field_count      = "",
       security_group            = "",
       security_ldap_provider    = "",
+      security_model            = "",
       security_outcome          = "",
       security_operation_id     = "",
+      security_old_policy_sha256 = "",
       security_policy_sha256    = "",
+      security_price_detail     = "",
+      security_provider         = "",
       security_project          = "",
       security_providers        = "",
       security_purpose          = "",
       security_reason           = "",
+      security_request_id       = "",
+      security_review_note_sha256 = "",
       security_rotation_id      = "",
       security_rotation_status  = "",
       security_sni              = "",
+      security_source_reference = "",
       security_state            = "",
       security_subject          = "",
       security_target_subject   = "",
+      security_token_unit       = "",
+      security_usage_class      = "",
+      security_candidate_sha256 = "",
       security_vendor           = "",
     }
   }
@@ -1088,7 +1421,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "mismatched_security_emitter"
   }
   stage.match {
-    selector            = "{service=\"key-rotator\",security_event!~\"aigw[.]identity[.]audit|aigw[.]provider[.]rotation|aigw[.]vault[.]state\"}"
+    selector            = "{service=\"key-rotator\",security_event!~\"aigw[.]identity[.]audit|aigw[.]price[.]audit|aigw[.]provider[.]rotation|aigw[.]usage[.]audit|aigw[.]vault[.]state\"}"
     action              = "drop"
     drop_counter_reason = "mismatched_security_emitter"
   }
@@ -1098,7 +1431,177 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "mismatched_security_emitter"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"key[.]generate|key[.]deactivate|egress[.]trust[.]verify|rotation[.]settings[.]update|rotation[.]trigger|provider[.]anthropic[.](configure|disable|delete)|identity[.]member[.]remove|identity[.]group[.]policy|identity[.]group[.](create|delete)|identity[.]member[.]add|authorization[.](role[.]denied|step_up[.]required)|admin[.]key[.](block|unblock|limits)\"}"
+    selector            = "{service=\"litellm\",security_event!~\"aigw[.]model[.]limit|aigw[.]usage[.]audit\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_security_emitter"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",service!=\"key-rotator\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_price_emitter"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_action!~\"create|backdate_preview|backdate_confirm\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_price_action"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_price_result"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_field_count!=\"16\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_price_field_shape"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_detail_except_price!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_price_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_subject=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_price_subject"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_model=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_price_model"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_provider!=\"anthropic\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_price_provider"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_usage_class=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_price_usage_class"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_operation_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_price_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_amount_usd!~\"(?:0|[1-9][0-9]*)(?:[.][0-9]{1,12})?\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_price_amount"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_token_unit!~\"[1-9][0-9]{0,8}|1000000000\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_price_token_unit"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_effective_at!~\"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?Z\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_price_effective_at"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_source_reference!~\"[A-Za-z0-9][A-Za-z0-9_./:#-]{0,255}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_price_source_reference"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_review_note_sha256!~\"[0-9a-f]{64}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_price_review_digest"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_old_policy_sha256!~\"[0-9a-f]{64}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_old_price_policy_digest"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.price.audit\",security_candidate_sha256!~\"[0-9a-f]{64}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_price_candidate_digest"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.price.audit\",security_price_detail!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_price_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_action!~\"record|replay|write_failed|conflict|delivery_failure\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_usage_action"
+  }
+  stage.match {
+    selector            = "{service=\"key-rotator\",security_event=\"aigw.usage.audit\",security_action!~\"record|replay|write_failed|conflict\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_usage_emitter"
+  }
+  stage.match {
+    selector            = "{service=\"litellm\",security_event=\"aigw.usage.audit\",security_action!=\"delivery_failure\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_usage_emitter"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_action=~\"record|replay\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_usage_result"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_action=~\"write_failed|conflict|delivery_failure\",security_outcome!=\"failure\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_usage_result"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_field_count!=\"11\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_usage_field_shape"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_detail_except_usage!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_usage_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_event_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_usage_event_id"
+  }
+  stage.match {
+    selector            = "{service=\"key-rotator\",security_event=\"aigw.usage.audit\",security_event_id=\"unattributed\"}"
+    action              = "drop"
+    drop_counter_reason = "unattributed_recorded_usage"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_request_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_usage_request_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_provider=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_usage_provider"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_model=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_usage_model"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_project=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_usage_project"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_subject=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_usage_subject"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.usage.audit\",security_completeness=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_usage_completeness"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"key[.]generate|key[.]deactivate|egress[.]trust[.]verify|rotation[.]settings[.]update|rotation[.]trigger|provider[.]anthropic[.](configure|disable|delete)|model[.]governance[.](create|activate|show|hide|retire)|model[.]price[.](create|backdate[.](preview|confirm))|identity[.]member[.]remove|identity[.]group[.]policy|identity[.]group[.](create|delete)|identity[.]member[.]add|authorization[.](role[.]denied|step_up[.]required)|admin[.]key[.](block|unblock|limits)\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_portal_action"
   }
@@ -1106,6 +1609,146 @@ loki.process "cribl_structured_security" {
     selector            = "{security_event=\"aigw.identity.audit\",security_action!~\"bootstrap|bootstrap_cleanup|break_glass_activate|break_glass_disable|break_glass_use|deployment_converge|group_policy_update|group_create|group_delete|group_member_add|group_member_remove|ldap_check|ldap_drift_detected|ldap_recovery|managed_identity_change_applied|managed_identity_change_planned|managed_identity_drift_detected|managed_identity_recovery\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_identity_action"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action!~\"reserve|deny|fail_closed\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_model_limit_action"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_outcome!~\"success|denied|failure\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_model_limit_outcome"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"reserve\",security_outcome!=\"success\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_result"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"deny\",security_outcome!=\"denied\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_result"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"fail_closed\",security_outcome!=\"failure\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_result"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_model=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_model_limit_model"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_project=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_model_limit_project"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_control=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_model_limit_control"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_detail_except_model_limit!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_model_limit_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_field_count!=\"8\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_model_limit_field_shape"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"reserve\",security_reason!=\"capacity_reserved\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_reason"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"reserve\",security_control!=\"output_tokens_per_utc_minute\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_control"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"deny\",security_control=\"max_output_per_request\",security_reason!=\"request_cap_exceeded\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_reason"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"deny\",security_control=\"output_tokens_per_utc_minute\",security_reason!=\"minute_quota_exceeded\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_reason"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"fail_closed\",security_control=\"max_output_per_request\",security_reason!=\"policy_invalid\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_reason"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.model.limit\",security_action=\"fail_closed\",security_control=\"output_tokens_per_utc_minute\",security_reason!=\"redis_unavailable\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_model_limit_reason"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"model[.]governance[.](create|activate|show|hide|retire)|model[.]price[.](create|backdate[.](preview|confirm))\",security_outcome!~\"intent|success|failure|indeterminate\"}"
+    action              = "drop"
+    drop_counter_reason = "mismatched_portal_model_event_schema"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"model[.]governance[.](create|activate|show|hide|retire)|model[.]price[.](create|backdate[.](preview|confirm))\",security_operation_id=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_model_operation_id"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"model[.]governance[.](create|activate|show|hide|retire)|model[.]price[.](create|backdate[.]preview)\",security_model=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_model_name"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"model.price.backdate.confirm\",security_outcome=\"success\",security_model=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_model_name"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"model.governance.create\",security_provider=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_model_provider"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"model[.]price[.](create|backdate[.]preview)\",security_usage_class=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_model_usage_class"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"model.price.backdate.confirm\",security_outcome=\"success\",security_usage_class=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "missing_portal_model_usage_class"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"model[.]governance[.](create|activate|show|hide|retire)|model[.]price[.](create|backdate[.](preview|confirm))\",security_detail_except_operation!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_model_event_detail"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"model[.]governance[.]create|model[.]price[.](create|backdate[.]preview)\",security_field_count!=\"8\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_model_event_field_shape"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"model.price.backdate.confirm\",security_outcome=\"success\",security_field_count!=\"8\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_model_event_field_shape"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=\"model.price.backdate.confirm\",security_outcome!=\"success\",security_field_count!=\"6\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_model_event_field_shape"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"model[.]governance[.](activate|show|hide|retire)\",security_field_count!=\"7\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_portal_model_event_field_shape"
   }
   stage.match {
     selector            = "{security_event=\"aigw.portal.audit\",security_action=~\"authorization[.](role[.]denied|step_up[.]required)\",security_outcome!=\"failure\"}"
@@ -1503,7 +2146,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "unapproved_egress_action"
   }
   stage.match {
-    selector            = "{security_outcome!~\"intent|success|failure|failed|indeterminate|mismatch|denied-active-key|denied-membership|denied-ownership\"}"
+    selector            = "{security_outcome!~\"intent|success|failure|failed|indeterminate|mismatch|denied|denied-active-key|denied-membership|denied-ownership\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_security_outcome"
   }
@@ -1511,9 +2154,89 @@ loki.process "cribl_structured_security" {
   // A malformed value drops the whole outbound copy. The original local log
   // remains in Loki for the operator.
   stage.match {
-    selector            = "{security_subject!~\"|[A-Za-z0-9][A-Za-z0-9_.:@-]{0,254}\"}"
+    selector            = "{security_subject!~\"|[A-Za-z0-9][A-Za-z0-9_.:@/+-]{0,255}\"}"
     action              = "drop"
     drop_counter_reason = "malformed_security_subject"
+  }
+  stage.match {
+    selector            = "{security_model!~\"|[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_model"
+  }
+  stage.match {
+    selector            = "{security_provider!~\"|anthropic|unattributed\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_provider"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.usage.audit\",security_provider=\"unattributed\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_unattributed_provider"
+  }
+  stage.match {
+    selector            = "{security_event_id!~\"|unattributed|[0-9a-f]{64}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_usage_event_id"
+  }
+  stage.match {
+    selector            = "{security_request_id!~\"|[A-Za-z0-9][A-Za-z0-9_.:@/+-]{0,255}\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_usage_request_id"
+  }
+  stage.match {
+    selector            = "{security_completeness!~\"|complete|partial|unknown|not_applicable\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_usage_completeness"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.usage.audit\",security_event_id!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_usage_event_id"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.usage.audit\",security_request_id!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_usage_request_id"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.usage.audit\",security_completeness!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_usage_completeness"
+  }
+  stage.match {
+    selector            = "{security_usage_class!~\"|normal_input|cache_creation_5m|cache_creation_1h|cache_read|output\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_usage_class"
+  }
+  stage.match {
+    selector            = "{security_control!~\"|max_output_per_request|output_tokens_per_utc_minute\"}"
+    action              = "drop"
+    drop_counter_reason = "unapproved_security_control"
+  }
+  stage.match {
+    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"model[.]governance[.](create|activate|show|hide|retire)|model[.]price[.](create|backdate[.](preview|confirm))\",security_model!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_security_model"
+  }
+  stage.match {
+    selector            = "{security_event!~\"aigw[.]portal[.]audit|aigw[.]model[.]limit|aigw[.]price[.]audit|aigw[.]usage[.]audit\",security_model!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_security_model"
+  }
+  stage.match {
+    selector            = "{security_event!~\"aigw[.]price[.]audit|aigw[.]usage[.]audit\",security_action!=\"model.governance.create\",security_provider!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_security_provider"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.price.audit\",security_action!~\"model[.]price[.](create|backdate[.](preview|confirm))\",security_usage_class!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_security_usage_class"
+  }
+  stage.match {
+    selector            = "{security_event!=\"aigw.model.limit\",security_control!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_security_control"
   }
   stage.match {
     selector            = "{security_group!~\"|[A-Za-z0-9][A-Za-z0-9._-]{0,127}\"}"
@@ -1551,7 +2274,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "malformed_identity_operation_id"
   }
   stage.match {
-    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"identity[.]group[.](create|delete|policy)|identity[.]member[.](add|remove)\",security_operation_id!=\"\"}"
+    selector            = "{security_event=\"aigw.portal.audit\",security_action!~\"identity[.]group[.](create|delete|policy)|identity[.]member[.](add|remove)|model[.]governance[.](create|activate|show|hide|retire)|model[.]price[.](create|backdate[.](preview|confirm))\",security_operation_id!=\"\"}"
     action              = "drop"
     drop_counter_reason = "unexpected_identity_operation_id"
   }
@@ -1561,7 +2284,7 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "unexpected_identity_operation_id"
   }
   stage.match {
-    selector            = "{security_event!~\"aigw[.]portal[.]audit|aigw[.]identity[.]audit\",security_operation_id!=\"\"}"
+    selector            = "{security_event!~\"aigw[.]portal[.]audit|aigw[.]identity[.]audit|aigw[.]price[.]audit\",security_operation_id!=\"\"}"
     action              = "drop"
     drop_counter_reason = "unexpected_identity_operation_id"
   }
@@ -1626,9 +2349,14 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "unapproved_egress_ca_fingerprints"
   }
   stage.match {
-    selector            = "{security_reason!~\"|config_override_rejected|ca_not_yet_valid|ca_expired|ca_fingerprint_mismatch|sni_policy_invalid|san_policy_invalid|ca_material_invalid|policy_digest_mismatch|immutable_policy_validation_failed\"}"
+    selector            = "{security_reason!~\"|config_override_rejected|ca_not_yet_valid|ca_expired|ca_fingerprint_mismatch|sni_policy_invalid|san_policy_invalid|ca_material_invalid|policy_digest_mismatch|immutable_policy_validation_failed|capacity_reserved|request_cap_exceeded|minute_quota_exceeded|policy_invalid|redis_unavailable\"}"
     action              = "drop"
     drop_counter_reason = "unapproved_security_reason"
+  }
+  stage.match {
+    selector            = "{security_event!~\"aigw[.]egress[.]trust|aigw[.]model[.]limit\",security_reason!=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "unexpected_security_reason"
   }
   // Required fields vary by event. These checks make missing evidence fail
   // closed instead of exporting an ambiguous record.
@@ -1699,18 +2427,21 @@ loki.process "cribl_structured_security" {
   }
   stage.template {
     source = "aigw_security_line"
-    template = `schema_version=1 event={{ .security_event }} action={{ .security_action }} outcome={{ .security_outcome }}{{ if .security_subject }} subject={{ .security_subject }}{{ end }}{{ if .security_group }} group={{ .security_group }}{{ end }}{{ if .security_target_subject }} target_subject={{ .security_target_subject }}{{ end }}{{ if .security_project }} project={{ .security_project }}{{ end }}{{ if .security_changed }} changed={{ .security_changed }}{{ end }}{{ if .security_change_kind }} change_kind={{ .security_change_kind }}{{ end }}{{ if .security_operation_id }} operation_id={{ .security_operation_id }}{{ end }}{{ if .security_error_type }} error_type={{ .security_error_type }}{{ end }}{{ if .security_ldap_provider }} ldap_provider={{ .security_ldap_provider }}{{ end }}{{ if .security_purpose }} purpose={{ .security_purpose }}{{ end }}{{ if .security_vendor }} vendor={{ .security_vendor }}{{ end }}{{ if .security_rotation_id }} rotation_id={{ .security_rotation_id }}{{ end }}{{ if .security_attempt }} attempt={{ .security_attempt }}{{ end }}{{ if .security_rotation_status }} rotation_status={{ .security_rotation_status }}{{ end }}{{ if .security_state }} state={{ .security_state }}{{ end }}{{ if .security_policy_sha256 }} policy_sha256={{ .security_policy_sha256 }}{{ end }}{{ if .security_providers }} providers={{ .security_providers }}{{ end }}{{ if .security_sni }} sni={{ .security_sni }}{{ end }}{{ if .security_exact_sans }} exact_sans={{ .security_exact_sans }}{{ end }}{{ if .security_ca_fingerprints }} ca_sha256_fingerprints={{ .security_ca_fingerprints }}{{ end }}{{ if .security_reason }} reason={{ .security_reason }}{{ end }}`
+    template = `schema_version=1 event={{ .security_event }} action={{ .security_action }} outcome={{ .security_outcome }}{{ if .security_event_id }} event_id={{ .security_event_id }}{{ end }}{{ if .security_request_id }} request_id={{ .security_request_id }}{{ end }}{{ if .security_subject }} subject={{ .security_subject }}{{ end }}{{ if .security_model }} model={{ .security_model }}{{ end }}{{ if .security_control }} control={{ .security_control }}{{ end }}{{ if .security_provider }} provider={{ .security_provider }}{{ end }}{{ if .security_usage_class }} usage_class={{ .security_usage_class }}{{ end }}{{ if .security_amount_usd }} amount_usd={{ .security_amount_usd }}{{ end }}{{ if .security_token_unit }} token_unit={{ .security_token_unit }}{{ end }}{{ if .security_effective_at }} effective_at={{ .security_effective_at }}{{ end }}{{ if .security_source_reference }} source_reference={{ .security_source_reference }}{{ end }}{{ if .security_review_note_sha256 }} review_note_sha256={{ .security_review_note_sha256 }}{{ end }}{{ if .security_old_policy_sha256 }} old_policy_sha256={{ .security_old_policy_sha256 }}{{ end }}{{ if .security_candidate_sha256 }} candidate_sha256={{ .security_candidate_sha256 }}{{ end }}{{ if .security_completeness }} completeness={{ .security_completeness }}{{ end }}{{ if .security_group }} group={{ .security_group }}{{ end }}{{ if .security_target_subject }} target_subject={{ .security_target_subject }}{{ end }}{{ if .security_project }} project={{ .security_project }}{{ end }}{{ if .security_changed }} changed={{ .security_changed }}{{ end }}{{ if .security_change_kind }} change_kind={{ .security_change_kind }}{{ end }}{{ if .security_operation_id }} operation_id={{ .security_operation_id }}{{ end }}{{ if .security_error_type }} error_type={{ .security_error_type }}{{ end }}{{ if .security_ldap_provider }} ldap_provider={{ .security_ldap_provider }}{{ end }}{{ if .security_purpose }} purpose={{ .security_purpose }}{{ end }}{{ if .security_vendor }} vendor={{ .security_vendor }}{{ end }}{{ if .security_rotation_id }} rotation_id={{ .security_rotation_id }}{{ end }}{{ if .security_attempt }} attempt={{ .security_attempt }}{{ end }}{{ if .security_rotation_status }} rotation_status={{ .security_rotation_status }}{{ end }}{{ if .security_state }} state={{ .security_state }}{{ end }}{{ if .security_policy_sha256 }} policy_sha256={{ .security_policy_sha256 }}{{ end }}{{ if .security_providers }} providers={{ .security_providers }}{{ end }}{{ if .security_sni }} sni={{ .security_sni }}{{ end }}{{ if .security_exact_sans }} exact_sans={{ .security_exact_sans }}{{ end }}{{ if .security_ca_fingerprints }} ca_sha256_fingerprints={{ .security_ca_fingerprints }}{{ end }}{{ if .security_reason }} reason={{ .security_reason }}{{ end }}`
   }
   stage.output { source = "aigw_security_line" }
   stage.label_drop {
     values = [
       "security_action",
+      "security_amount_usd",
       "security_attempt",
       "security_attempt_present",
       "security_ca_fingerprints",
       "security_changed",
       "security_changed_present",
       "security_change_kind",
+      "security_completeness",
+      "security_control",
       "security_detail_any",
       "security_detail_except_changed",
       "security_detail_except_error",
@@ -1726,25 +2457,42 @@ loki.process "cribl_structured_security" {
       "security_detail_except_ldap_operation",
       "security_detail_except_ldap_error",
       "security_detail_except_managed_change",
+      "security_detail_except_model_limit",
+      "security_detail_except_price",
+      "security_detail_except_usage",
+      "security_detail_except_operation",
       "security_detail_except_project_operation",
       "security_error_type",
       "security_event",
+      "security_event_id",
+      "security_effective_at",
       "security_exact_sans",
+      "security_field_count",
       "security_group",
       "security_ldap_provider",
+      "security_model",
       "security_outcome",
       "security_operation_id",
+      "security_old_policy_sha256",
       "security_policy_sha256",
+      "security_price_detail",
+      "security_provider",
       "security_project",
       "security_providers",
       "security_purpose",
       "security_reason",
+      "security_request_id",
+      "security_review_note_sha256",
       "security_rotation_id",
       "security_rotation_status",
       "security_sni",
+      "security_source_reference",
       "security_state",
       "security_subject",
       "security_target_subject",
+      "security_token_unit",
+      "security_usage_class",
+      "security_candidate_sha256",
       "security_vendor",
     ]
   }

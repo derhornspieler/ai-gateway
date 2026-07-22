@@ -213,7 +213,7 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         )
         self.assertNotIn("--storage.tsdb.retention.time=7d", prometheus)
 
-    def test_seeded_preprod_has_record_level_allow_deny_and_recovery_proof(self) -> None:
+    def test_seeded_preprod_has_all_signal_scope_redaction_and_recovery_proof(self) -> None:
         self.assertIn("preprod_empty_docker_logs:", PREPROD_OVERLAY)
         self.assertIn(
             "preprod_empty_docker_logs:/var/lib/docker/containers:ro",
@@ -231,8 +231,8 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             "LITELLM_REAL_REQUEST_ACCEPTED",
             "OPENWEBUI_HEADER_RUNTIME_REQUEST_ACCEPTED",
             "OPENWEBUI_INVALID_IDENTITY_REQUESTS_REJECTED",
-            "DENIED_RAW_TRACE_",
-            "DENIED_UNATTRIBUTED_TRACE_",
+            "ADMITTED_SANITIZED_TRACE_",
+            "ADMITTED_UNATTRIBUTED_TRACE_",
             "DENIED_UNTRUSTED_SOURCE_",
             "REJECTED_OPENWEBUI_MISSING_JWT_",
             "REJECTED_OPENWEBUI_INVALID_JWT_",
@@ -282,9 +282,16 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             "SAFE_PRIVATE_KEY_WORDS_",
             "SAFE_PASSWORD_POLICY_",
             "SAFE_VAULT_WORDS_",
-            "denied_raw_metric_",
-            "DENIED_RAW_LOG_",
-            "DENIED_ORDINARY_LOG_",
+            "admitted_metric_",
+            "ADMITTED_LOG_",
+            "FORGED_METRIC_ENV_",
+            "METRIC_RESOURCE_SECRET_",
+            "METRIC_SCOPE_SECRET_",
+            "METRIC_POINT_SECRET_",
+            "FORGED_OTLP_LOG_ENV_",
+            "OTLP_LOG_RESOURCE_SECRET_",
+            "OTLP_LOG_BODY_SECRET_",
+            "ADMITTED_ORDINARY_LOG_",
             "DENIED_SCHEMA_",
             "DENIED_ACTION_",
             "DENIED_VENDOR_",
@@ -299,6 +306,8 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             '"action":"break_glass_use"',
             "UNAPPROVED_FIELD_",
             "NESTED_SECRET_",
+            "DOCKER_SESSION_SECRET_",
+            "DOCKER_PEM_SECRET_",
             "<redacted-credential>",
             "<redacted-authorization>",
             "<redacted-vendor-key>",
@@ -321,7 +330,10 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             "exercise_tls_server_name_failure(preprod, model, tls_token)",
             "Alloy accepted a Cribl certificate with the wrong server name",
             'preprod.docker("restart", "--time", "10", alloy)',
-            "PREPROD_CRIBL_SECURITY_FEED_PASSED",
+            "cribl_queue_sizes",
+            'for candidate in ("logs", "metrics", "traces")',
+            "if f'data_type=\"{candidate}\"' in labels",
+            "PREPROD_CRIBL_TELEMETRY_PASSED",
         ):
             self.assertIn(marker, PREPROD_RECEIPT)
 
@@ -364,7 +376,7 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             PREPROD_RECEIPT,
         )
         self.assertIn(
-            "Prove the curated Cribl security feed and persistent recovery queue",
+            "Prove the full Cribl telemetry mirror and persistent recovery queue",
             PREPROD_TASKS,
         )
         self.assertIn("scripts/test-preprod-cribl-security.py", PREPROD_TASKS)
@@ -378,7 +390,7 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         )
         self.assertLess(
             main.index("finally:\n        empty_controller_lifecycle_fixtures()"),
-            main.index('print("PREPROD_CRIBL_SECURITY_FEED_PASSED")'),
+            main.index('print("PREPROD_CRIBL_TELEMETRY_PASSED")'),
         )
 
     def test_keycloak_projection_requires_complete_attribution(self) -> None:
@@ -637,6 +649,178 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, PREPROD_RECEIPT)
 
+    def test_model_governance_events_have_a_fixed_cribl_projection(self) -> None:
+        structured = ALLOY.split(
+            'loki.process "cribl_structured_security"', 1
+        )[1].split('loki.source.file "controller_lifecycle"', 1)[0]
+        for required in (
+            'security_model                   = "model"',
+            'security_provider                = "provider"',
+            'security_usage_class             = "usage_class"',
+            'model[.]governance[.](create|activate|show|hide|retire)',
+            'model[.]price[.](create|backdate[.](preview|confirm))',
+            'security_outcome!~\\"intent|success|failure|indeterminate\\"',
+            'security_model=\\"\\"',
+            'security_provider=\\"\\"',
+            'security_usage_class=\\"\\"',
+            'security_detail_except_operation!=\\"\\"',
+            'security_action=~\\"model[.]governance[.]create|model[.]price[.](create|backdate[.]preview)\\",security_field_count!=\\"8\\"',
+            'security_action=\\"model.price.backdate.confirm\\",security_outcome=\\"success\\",security_field_count!=\\"8\\"',
+            'security_action=\\"model.price.backdate.confirm\\",security_outcome!=\\"success\\",security_field_count!=\\"6\\"',
+            'security_action=~\\"model[.]governance[.](activate|show|hide|retire)\\",security_field_count!=\\"7\\"',
+            'security_model!~\\"|[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}\\"',
+            'security_provider!~\\"|anthropic|unattributed\\"',
+            'security_event!=\\"aigw.usage.audit\\",security_provider=\\"unattributed\\"',
+            'security_usage_class!~\\"|normal_input|cache_creation_5m|cache_creation_1h|cache_read|output\\"',
+            'model={{ .security_model }}',
+            'provider={{ .security_provider }}',
+            'usage_class={{ .security_usage_class }}',
+            '"security_model",',
+            '"security_provider",',
+            '"security_usage_class",',
+        ):
+            self.assertIn(required, structured)
+
+        for marker in (
+            '"action":"model.governance.create","outcome":"intent"',
+            '"action":"model.governance.create","outcome":"success"',
+            '"action":"model.governance.activate","outcome":"intent"',
+            '"action":"model.governance.activate","outcome":"success"',
+            '"action":"model.price.create","outcome":"intent"',
+            '"action":"model.price.create","outcome":"success"',
+            '"action":"model.price.backdate.preview","outcome":"intent"',
+            '"action":"model.price.backdate.preview","outcome":"success"',
+            '"action":"model.price.backdate.confirm","outcome":"intent"',
+            '"action":"model.price.backdate.confirm","outcome":"success"',
+            "DENIED_MODEL_PROVIDER_",
+            "DENIED_MODEL_USAGE_CLASS_",
+            "DENIED_UNEXPECTED_MODEL_",
+            "event=aigw.portal.audit action=model.governance.create",
+            "event=aigw.portal.audit action=model.governance.activate",
+            "event=aigw.portal.audit action=model.price.create",
+            "event=aigw.portal.audit action=model.price.backdate.preview",
+            "event=aigw.portal.audit action=model.price.backdate.confirm",
+        ):
+            self.assertIn(marker, PREPROD_RECEIPT)
+
+    def test_backend_price_events_have_a_fixed_cribl_projection(self) -> None:
+        structured = ALLOY.split(
+            'loki.process "cribl_structured_security"', 1
+        )[1].split('loki.source.file "controller_lifecycle"', 1)[0]
+        for required in (
+            'aigw[.]price[.]audit',
+            'security_action!~\\"create|backdate_preview|backdate_confirm\\"',
+            'security_event=\\"aigw.price.audit\\",security_outcome!=\\"success\\"',
+            'security_event=\\"aigw.price.audit\\",security_field_count!=\\"16\\"',
+            'security_detail_except_price!=\\"\\"',
+            'security_event!=\\"aigw.price.audit\\",security_price_detail!=\\"\\"',
+            'security_amount_usd              = "amount_usd"',
+            'security_token_unit              = "token_unit"',
+            'security_effective_at            = "effective_at"',
+            'security_source_reference        = "source_reference"',
+            'security_review_note_sha256       = "review_note_sha256"',
+            'security_old_policy_sha256        = "old_policy_sha256"',
+            'security_candidate_sha256        = "candidate_sha256"',
+            'amount_usd={{ .security_amount_usd }}',
+            'token_unit={{ .security_token_unit }}',
+            'effective_at={{ .security_effective_at }}',
+            'source_reference={{ .security_source_reference }}',
+            'review_note_sha256={{ .security_review_note_sha256 }}',
+            'old_policy_sha256={{ .security_old_policy_sha256 }}',
+            'candidate_sha256={{ .security_candidate_sha256 }}',
+            'security_review_note_sha256!~\\"[0-9a-f]{64}\\"',
+            'security_old_policy_sha256!~\\"[0-9a-f]{64}\\"',
+            'security_candidate_sha256!~\\"[0-9a-f]{64}\\"',
+        ):
+            self.assertIn(required, structured)
+
+        label_drop = structured.rsplit("stage.label_drop {", 1)[1]
+        for field in (
+            "security_amount_usd",
+            "security_token_unit",
+            "security_effective_at",
+            "security_source_reference",
+            "security_review_note_sha256",
+            "security_old_policy_sha256",
+            "security_candidate_sha256",
+        ):
+            self.assertIn(f'"{field}",', label_drop)
+
+        # Free-form review text stays in PostgreSQL. Only its integrity digest
+        # is allowed into the outbound SOC record.
+        output = structured.split('source = "aigw_security_line"', 1)[1]
+        self.assertNotIn("{{ .security_review_note }}", output)
+
+    def test_litellm_model_limit_events_have_a_fixed_cribl_projection(self) -> None:
+        structured = ALLOY.split(
+            'loki.process "cribl_structured_security"', 1
+        )[1].split('loki.source.file "controller_lifecycle"', 1)[0]
+        for required in (
+            'security_control                 = "control"',
+            'service=\\"litellm\\",security_event!~\\"aigw[.]model[.]limit|aigw[.]usage[.]audit\\"',
+            'security_action!~\\"reserve|deny|fail_closed\\"',
+            'security_outcome!~\\"success|denied|failure\\"',
+            'security_control!~\\"|max_output_per_request|output_tokens_per_utc_minute\\"',
+            'security_reason!~\\"|config_override_rejected|',
+            'capacity_reserved|request_cap_exceeded|minute_quota_exceeded|policy_invalid|redis_unavailable',
+            'security_detail_except_model_limit!=\\"\\"',
+            'security_event=\\"aigw.model.limit\\",security_field_count!=\\"8\\"',
+            'security_action=\\"reserve\\",security_reason!=\\"capacity_reserved\\"',
+            'security_action=\\"reserve\\",security_control!=\\"output_tokens_per_utc_minute\\"',
+            'security_action=\\"fail_closed\\",security_control=\\"max_output_per_request\\",security_reason!=\\"policy_invalid\\"',
+            'security_action=\\"fail_closed\\",security_control=\\"output_tokens_per_utc_minute\\",security_reason!=\\"redis_unavailable\\"',
+            'control={{ .security_control }}',
+            '"security_control",',
+            '"security_detail_except_model_limit",',
+        ):
+            self.assertIn(required, structured)
+
+        for marker in (
+            '"event":"aigw.model.limit"',
+            '"action":"reserve","outcome":"success"',
+            '"action":"deny","outcome":"denied"',
+            '"action":"fail_closed","outcome":"failure"',
+            "MODEL_LIMIT_PROMPT_SECRET_",
+            "DENIED_MODEL_LIMIT_EXTRA_",
+            "DENIED_MODEL_LIMIT_OUTCOME_",
+            "event=aigw.model.limit action=reserve outcome=success",
+            "reason=capacity_reserved",
+            "event=aigw.model.limit action=deny outcome=denied",
+            "event=aigw.model.limit action=fail_closed outcome=failure",
+        ):
+            self.assertIn(marker, PREPROD_RECEIPT)
+
+    def test_usage_events_have_a_fixed_prompt_free_cribl_projection(self) -> None:
+        structured = ALLOY.split(
+            'loki.process "cribl_structured_security"', 1
+        )[1].split('loki.source.file "controller_lifecycle"', 1)[0]
+        for required in (
+            'security_completeness            = "completeness"',
+            'security_event_id                = "event_id"',
+            'security_request_id              = "request_id"',
+            'aigw[.]usage[.]audit',
+            'security_action!~\\"record|replay|write_failed|conflict|delivery_failure\\"',
+            'security_action=~\\"record|replay\\",security_outcome!=\\"success\\"',
+            'security_action=~\\"write_failed|conflict|delivery_failure\\",security_outcome!=\\"failure\\"',
+            'security_field_count!=\\"11\\"',
+            'security_detail_except_usage!=\\"\\"',
+            'security_event_id!~\\"|unattributed|[0-9a-f]{64}\\"',
+            'security_request_id!~\\"|[A-Za-z0-9][A-Za-z0-9_.:@/+-]{0,255}\\"',
+            'security_completeness!~\\"|complete|partial|unknown|not_applicable\\"',
+            'event_id={{ .security_event_id }}',
+            'request_id={{ .security_request_id }}',
+            'completeness={{ .security_completeness }}',
+            '"security_event_id",',
+            '"security_request_id",',
+            '"security_completeness",',
+        ):
+            self.assertIn(required, structured)
+
+        # Join identifiers are body fields only, never Loki labels.
+        label_drop = structured.rsplit("stage.label_drop {", 1)[1]
+        self.assertIn('"security_event_id",', label_drop)
+        self.assertIn('"security_request_id",', label_drop)
+
     def test_request_span_source_time_is_restored_before_the_common_gate(self) -> None:
         request_filter = ALLOY.split(
             'otelcol.processor.filter "aigw_request_spans"', 1
@@ -704,7 +888,7 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         )
         self.assertEqual(scrub_pattern.sub(r"\1", prompt_evidence), prompt_evidence)
 
-    def test_common_record_fields_are_server_owned_before_the_only_batch(self) -> None:
+    def test_common_security_record_fields_are_server_owned_before_log_batch(self) -> None:
         alloy = COMPOSE.split("  alloy:\n", 1)[1].split("\n  prometheus:", 1)[0]
         preprod_alloy = PREPROD_OVERLAY.split("  alloy:\n", 1)[1].split(
             "\n  prometheus:", 1
@@ -751,6 +935,7 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             "admin-portal",
             "key-rotator",
             "envoy-egress",
+            "litellm",
         ):
             condition = (
                 'attributes["aigw.security.event_class"] == "security_event" '
@@ -768,16 +953,19 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         self.assertIn(
             "logs = [otelcol.processor.filter.cribl_common_record.input]", contract
         )
-        self.assertEqual(ALLOY.count('otelcol.processor.batch "cribl_security"'), 1)
+        for signal in ("logs", "metrics", "traces"):
+            self.assertEqual(
+                ALLOY.count(f'otelcol.processor.batch "cribl_{signal}"'), 1
+            )
         self.assertEqual(
-            ALLOY.count("logs = [otelcol.processor.batch.cribl_security.input]"), 1
+            ALLOY.count("logs = [otelcol.processor.batch.cribl_logs.input]"), 2
         )
-        self.assertEqual(ALLOY.count("logs = [otelcol.exporter.otlp.cribl.input]"), 1)
+        self.assertEqual(ALLOY.count("otelcol.exporter.otlp.cribl.input"), 3)
 
     def test_common_record_gate_rejects_bad_identity_and_event_time(self) -> None:
         gate = ALLOY.split(
             'otelcol.processor.filter "cribl_common_record"', 1
-        )[1].split('otelcol.processor.batch "cribl_security"', 1)[0]
+        )[1].split('otelcol.processor.batch "cribl_logs"', 1)[0]
         for required in (
             'error_mode = "propagate"',
             'attributes["aigw.security.schema_version"] != 1',
@@ -788,7 +976,7 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             'time_unix_nano == 0',
             'time_unix_nano < UnixNano(Now()) - 86400000000000',
             'time_unix_nano > UnixNano(Now()) + 60000000000',
-            "logs = [otelcol.processor.batch.cribl_security.input]",
+            "logs = [otelcol.processor.batch.cribl_logs.input]",
         ):
             self.assertIn(required, gate)
         for event_class in (

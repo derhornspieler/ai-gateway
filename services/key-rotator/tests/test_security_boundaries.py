@@ -49,6 +49,14 @@ class ReadinessVault:
         return self.value
 
 
+class ReadinessIdentity:
+    def __init__(self, value: bool):
+        self.value = value
+
+    async def project_policy_reconciliation_ready(self) -> bool:
+        return self.value
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("database_ready", "vault_ready", "expected"),
@@ -59,8 +67,20 @@ async def test_readyz_requires_database_and_authenticated_unsealed_vault(
 ) -> None:
     monkeypatch.setitem(state, "db", ReadinessDB(database_ready))
     monkeypatch.setitem(state, "vault", ReadinessVault(vault_ready))
+    monkeypatch.setitem(state, "identity", ReadinessIdentity(True))
     response = await readyz()
     assert response.status_code == expected
+
+
+@pytest.mark.asyncio
+async def test_readyz_fails_while_project_policy_reconciliation_is_pending(
+    monkeypatch,
+) -> None:
+    monkeypatch.setitem(state, "db", ReadinessDB(True))
+    monkeypatch.setitem(state, "vault", ReadinessVault(True))
+    monkeypatch.setitem(state, "identity", ReadinessIdentity(False))
+    response = await readyz()
+    assert response.status_code == 503
 
 
 def settings(**overrides) -> Settings:
@@ -81,6 +101,33 @@ def test_service_urls_reject_ambiguous_or_credentialed_values() -> None:
         settings(LITELLM_URL="http://user:password@litellm:4000")
     with pytest.raises(ValidationError):
         settings(VAULT_ADDR="file:///tmp/vault.sock")
+
+
+def test_provider_policy_receipt_configuration_is_atomic_and_fixed_path() -> None:
+    digest = "1" * 64
+    path = "/run/secrets/provider_policy_receipt.json"
+
+    configured = settings(
+        PROVIDER_POLICY_RECEIPT_FILE=path,
+        AIGW_EGRESS_POLICY_SHA256=digest,
+    )
+    assert configured.provider_policy_receipt_file == path
+    assert configured.aigw_egress_policy_sha256 == digest
+
+    for invalid in (
+        {"PROVIDER_POLICY_RECEIPT_FILE": path},
+        {"AIGW_EGRESS_POLICY_SHA256": digest},
+        {
+            "PROVIDER_POLICY_RECEIPT_FILE": "/tmp/substituted.json",
+            "AIGW_EGRESS_POLICY_SHA256": digest,
+        },
+        {
+            "PROVIDER_POLICY_RECEIPT_FILE": path,
+            "AIGW_EGRESS_POLICY_SHA256": "A" * 64,
+        },
+    ):
+        with pytest.raises(ValidationError):
+            settings(**invalid)
 
 
 def test_keycloak_bootstrap_url_is_same_origin_and_canonical() -> None:
@@ -387,6 +434,7 @@ async def test_portal_token_is_limited_to_exact_project_membership_reads() -> No
                 "rpm_limit": None,
                 "allowed_models": None,
                 "default_model": None,
+                "model_limits": {},
             }
         },
     }

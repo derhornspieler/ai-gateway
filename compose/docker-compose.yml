@@ -103,6 +103,7 @@ services:
         chown 1000:473 /state/vault-audit && chmod 2750 /state/vault-audit
         chown 473:473 /state/alloy && chmod 0700 /state/alloy
         chown 65532:65532 /state/prometheus && chmod 0700 /state/prometheus
+        chown 65532:65532 /state/alertmanager && chmod 0700 /state/alertmanager
         chown 65532:65532 /state/loki && chmod 0700 /state/loki
         chown 65532:65532 /state/grafana && chmod 0700 /state/grafana
     volumes:
@@ -112,6 +113,7 @@ services:
       - vault_audit:/state/vault-audit
       - alloy_data:/state/alloy
       - prom_data:/state/prometheus
+      - alertmanager_data:/state/alertmanager
       - loki_data:/state/loki
       - grafana_data:/state/grafana
 
@@ -490,13 +492,22 @@ services:
   # ── core ────────────────────────────────────────────────────────────
   litellm:
     <<: *hardening
+    # The separate usage token is root:65532 on the host. This group grants
+    # read access to that one bind-mounted file, not rotator admin access.
+    group_add: ["65532"]
     labels:
       <<: *selinux-labels
       com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_LITELLM:?AIGW_BIND_DIGEST_LITELLM must be set}
     # v1.74.0 is affected by critical auth bypasses (including
-    # GHSA-4xpc-pv4p-pm3w). This signed stable release was independently
-    # resolved to the immutable multi-arch index below.
-    image: ghcr.io/berriai/litellm:v1.93.0@sha256:a1745e629abfb17d434426ff48b115f54f4f4c4a0f5af241de569e93c63c411e
+    # GHSA-4xpc-pv4p-pm3w). The small offline derivative keeps the exact
+    # v1.93.0 release and replaces only vulnerable pyasn1 0.6.3.
+    build:
+      context: ./services/dhi-health-probe
+      dockerfile: Dockerfile.litellm
+      network: none
+      args:
+        BASE_IMAGE: ghcr.io/berriai/litellm:v1.93.0@sha256:a1745e629abfb17d434426ff48b115f54f4f4c4a0f5af241de569e93c63c411e
+    image: ai-gateway/litellm:1.93.0-aigw1
     # read_only intentionally NOT set: the image runs prisma generate /
     # schema migrations and writes caches under /app and $HOME at startup;
     # the write set isn't stable across releases.
@@ -542,11 +553,14 @@ services:
       # Per-project default-model pre-call hook, registered in config.yaml's
       # litellm_settings.callbacks and resolved relative to /app/config.yaml.
       - ./litellm/aigw_default_model_hook.py:/app/aigw_default_model_hook.py:ro,Z
+      - ./litellm/aigw_model_limits.py:/app/aigw_model_limits.py:ro,Z
       - ./litellm/aigw_openwebui_identity.py:/app/aigw_openwebui_identity.py:ro,Z
       - ./litellm/aigw_otel_callback.py:/app/aigw_otel_callback.py:ro,Z
+      - ./litellm/aigw_usage_callback.py:/app/aigw_usage_callback.py:ro,Z
       # Shared with Alloy only. `z` is required because two containers read
       # the same host inode; `Z` would let the last container steal its label.
       - ./secrets/litellm_otel_token:/run/secrets/litellm_otel_token:ro,z
+      - ./secrets/litellm_usage_token:/run/secrets/litellm_usage_token:ro,z
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     networks:
       [net-chat, net-portal, net-admin-app, net-vendor, net-db-litellm,
@@ -988,9 +1002,17 @@ services:
 
   key-rotator:
     <<: *hardening
+    labels:
+      <<: *selinux-labels
+      # The provider-policy receipt is non-secret, but it is still a
+      # release-bound input. Its keyed content marker forces recreation when
+      # a different verified seed policy is activated (or when source mode
+      # clears a prior seed receipt).
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_KEY_ROTATOR:?AIGW_BIND_DIGEST_KEY_ROTATOR must be set}
     build:
       context: ./services/key-rotator
       network: host
+    image: ai-gateway/key-rotator:1
     read_only: true
     tmpfs: [/tmp]
     deploy:
@@ -1006,6 +1028,11 @@ services:
       KEYCLOAK_PUBLIC_URL: "https://auth.${DOMAIN:?DOMAIN must be set}"
       WIF_KEYCLOAK_PUBLIC_URL: "https://idp.wif.${DOMAIN:?DOMAIN must be set}"
       EGRESS_BASE: http://envoy-egress:8080
+      # Governance is enabled only when deployment supplies BOTH values from
+      # one verified schema-v2 seed. Source builds render both as empty and the
+      # mounted file below as zero bytes, so stale release trust fails closed.
+      PROVIDER_POLICY_RECEIPT_FILE: ${KEY_ROTATOR_PROVIDER_POLICY_RECEIPT_FILE:-}
+      AIGW_EGRESS_POLICY_SHA256: ${KEY_ROTATOR_EGRESS_POLICY_SHA256:-}
       ROTATOR_INTERNAL_TOKEN: ${ROTATOR_INTERNAL_TOKEN:?ROTATOR_INTERNAL_TOKEN must be set}
       PORTAL_IDENTITY_TOKEN: ${PORTAL_IDENTITY_TOKEN:?PORTAL_IDENTITY_TOKEN must be set}
       # The portal invokes the rotator's constrained setup controller. The
@@ -1035,6 +1062,9 @@ services:
       KC_CLIENT_ASSERTION_KEY_VAULT_PATH: ${KC_CLIENT_ASSERTION_KEY_VAULT_PATH:-ai-gateway/anthropic-wif-client-key}
       ANTHROPIC_WIF_ALLOW_INSECURE_CLIENT_SECRET: "false"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+    volumes:
+      - ./secrets/provider_policy_receipt.json:/run/secrets/provider_policy_receipt.json:ro,Z
+      - ./secrets/litellm_usage_token:/run/secrets/litellm_usage_token:ro,z
     networks: [net-portal, net-admin-app, net-vendor, net-vault, net-db-rotator, net-telemetry]
     healthcheck:
       # Docker health is process liveness, not dependency readiness. A sealed
@@ -1104,7 +1134,7 @@ services:
       context: ./services/dhi-health-probe
       network: none
       args:
-        BASE_IMAGE: dhi.io/vault:2.0.3@sha256:2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e
+        BASE_IMAGE: dhi.io/vault:2.0.3@sha256:754dc49e181b867bc58aa44694507ff7c0ffa178db8778333700062c85e09726
     image: ai-gateway/dhi-vault:2.0.3-probe
     cap_add: [IPC_LOCK]
     # CAP_IPC_LOCK alone is insufficient when Docker leaves RLIMIT_MEMLOCK at
@@ -1255,7 +1285,7 @@ services:
       context: ./services/dhi-health-probe
       network: none
       args:
-        BASE_IMAGE: dhi.io/alloy:1.17.1@sha256:52060718ec1670736178717a0ef2e66aa9f87eb1d515d9c49aacf4300bc1bfb1
+        BASE_IMAGE: dhi.io/alloy:1.17.1@sha256:612d798294d597f52a73f6b652a2992251ebe6f80521d9517fbc004932055f44
     image: ai-gateway/dhi-alloy:1.17.1-probe
     # Narrow exception: Alloy must tail Docker's runtime-owned json logs.
     # Relabeling Docker's data root is forbidden, so this one non-root, capless,
@@ -1282,6 +1312,7 @@ services:
       # overlay replaces it with its own literal; shell input cannot choose it.
       AIGW_DEPLOYMENT_ENVIRONMENT: production
       ALLOY_TELEMETRY_IP: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}
+      ALLOY_OBSERVABILITY_IP: ${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}
       CRIBL_OTLP_ENDPOINT: ${CRIBL_OTLP_ENDPOINT:?CRIBL_OTLP_ENDPOINT must be set}
       CRIBL_OTLP_INSECURE: ${CRIBL_OTLP_INSECURE:-false}
       CRIBL_OTLP_CA_FILE: ${CRIBL_OTLP_CA_FILE:-/etc/ssl/certs/aigw-cribl-ca.pem}
@@ -1296,6 +1327,9 @@ services:
       # can read Docker's log tree. Do not ask Docker to relabel this mount;
       # LiteLLM's shared `z` mount owns that exact host-file relabel contract.
       - ./secrets/litellm_otel_token:/run/secrets/litellm_otel_token:ro
+      - ./secrets/alert_state_ca.pem:/run/secrets/alert_state_ca.pem:ro
+      - ./secrets/alert_state_alloy.crt:/run/secrets/alert_state_alloy.crt:ro
+      - ./secrets/alert_state_alloy.key:/run/secrets/alert_state_alloy.key:ro
       - alloy_data:/var/lib/alloy
       # Read-only Docker json-file ingestion; never mount /var/run/docker.sock.
       - ${DOCKER_DATA_ROOT:?DOCKER_DATA_ROOT must be set}/containers:/var/lib/docker/containers:ro
@@ -1307,6 +1341,9 @@ services:
         ipv4_address: ${ALLOY_TELEMETRY_IP:?ALLOY_TELEMETRY_IP must be set}
       net-observability:
         ipv4_address: ${ALLOY_OBSERVABILITY_IP:?ALLOY_OBSERVABILITY_IP must be set}
+        aliases: [alloy-alert-state]
+      # Alloy, not Prometheus, owns the exact service/host scrape graph.
+      net-metrics: {}
       # Fixed source identity for an explicitly enabled external Cribl export.
       # The in-stack mock remains reachable without a physical-NIC exception.
       net-internal:
@@ -1349,9 +1386,8 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --web.enable-remote-write-receiver
-      # Listen only on the observability bridge. Prometheus can still initiate
-      # scrapes over net-metrics, but compromised scrape targets cannot query or
-      # inject remote-write series into its unauthenticated web API.
+      # Listen only on the observability bridge. Alloy is the only writer and
+      # collector; scrape targets cannot query or inject into this API.
       - --web.listen-address=${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}:9090
       - --storage.tsdb.path=/var/prometheus
       # Keep local metrics for up to 30 days. Prometheus enforces time and size
@@ -1361,16 +1397,15 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
       - ./prometheus/rules.yml:/etc/prometheus/rules.yml:ro,Z
+      - ./secrets/alert_state_ca.pem:/run/secrets/alert_state_ca.pem:ro,z
+      - ./secrets/alert_state_prometheus.crt:/run/secrets/alert_state_prometheus.crt:ro,Z
+      - ./secrets/alert_state_prometheus.key:/run/secrets/alert_state_prometheus.key:ro,Z
       - prom_data:/var/prometheus
     networks:
       net-observability:
         ipv4_address: ${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}
-        # Prometheus is also attached to net-metrics. Its ordinary service
-        # name is therefore ambiguous from inside the container itself and
-        # can resolve to the non-listening metrics-plane address. Self-scrape
-        # through an alias that exists only on the observability plane.
+        # Alloy uses this observability-only alias for Prometheus metrics.
         aliases: [prometheus-observability]
-      net-metrics: {}
     healthcheck:
       test:
         - CMD
@@ -1378,6 +1413,54 @@ services:
         - http
         - --url
         - "http://${PROMETHEUS_OBSERVABILITY_IP:?PROMETHEUS_OBSERVABILITY_IP must be set}:9090/-/ready"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      alertmanager: { condition: service_healthy }
+      volume-init: { condition: service_completed_successfully }
+
+  alertmanager:
+    <<: *hardening
+    labels:
+      <<: *selinux-labels
+      com.aigw.contract.bind-source-digest: ${AIGW_BIND_DIGEST_ALERTMANAGER:?AIGW_BIND_DIGEST_ALERTMANAGER must be set}
+    build:
+      context: ./services/dhi-health-probe
+      network: none
+      args:
+        BASE_IMAGE: dhi.io/alertmanager:0.33.1@sha256:137ab07843ffd9879e904c8eb0d8cca0a147c6232ed401802e5d7cf03a926c47
+    image: ai-gateway/dhi-alertmanager:0.33.1-probe
+    user: "65532:65532"
+    read_only: true
+    tmpfs: [/tmp]
+    pids_limit: 256
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: "0.5", pids: 256 }
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --data.retention=120h
+      # One local instance: disable the otherwise separate gossip listener.
+      - --cluster.listen-address=
+      # The API is reachable only by private observability-network peers. It
+      # has no host port, Traefik route, FQDN, or external receiver.
+      - --web.listen-address=${ALERTMANAGER_OBSERVABILITY_IP:?ALERTMANAGER_OBSERVABILITY_IP must be set}:9093
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro,Z
+      - alertmanager_data:/alertmanager
+    networks:
+      net-observability:
+        ipv4_address: ${ALERTMANAGER_OBSERVABILITY_IP:?ALERTMANAGER_OBSERVABILITY_IP must be set}
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/aigw-health-probe
+        - http
+        - --url
+        - "http://${ALERTMANAGER_OBSERVABILITY_IP:?ALERTMANAGER_OBSERVABILITY_IP must be set}:9093/-/ready"
       interval: 10s
       timeout: 5s
       retries: 12
@@ -1410,6 +1493,10 @@ services:
         limits: { memory: 128M, cpus: "0.25", pids: 256 }
     command:
       - --path.rootfs=/host
+      # CPU, memory, swap, OOM, load, disk, and sysfs collectors must read the
+      # Rocky host views, not the exporter container's namespace.
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
       # Keep the Docker-root mount itself visible while excluding its many
       # per-container overlay mounts from metric cardinality. /run is excluded
       # because the docker.sock-masking tmpfs above and the host's own /run
@@ -1482,7 +1569,7 @@ services:
       dockerfile: Dockerfile.grafana
       network: none
       args:
-        BASE_IMAGE: dhi.io/grafana:13.1.0@sha256:0cdd92e5aac28a11796f48765cf96a13098db83b45e216b57013324182453441
+        BASE_IMAGE: dhi.io/grafana:13.1.0@sha256:23e1feecdf6c3895cc1c185d86ecfbe8be44d4e254695d1a04891d599edea442
     image: ai-gateway/dhi-grafana:13.1.0-aigw1
     read_only: true
     # Grafana probes its plugin path even when installation is disabled. Keep
@@ -1512,6 +1599,10 @@ services:
       GF_USERS_AUTO_ASSIGN_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_AUTH_BASIC_ENABLED: "false"
+      # Prometheus is the one alert evaluator. Grafana reads its alert series
+      # and the private Alertmanager datasource but must not evaluate a second,
+      # independent set of rules.
+      GF_UNIFIED_ALERTING_ENABLED: "false"
       # Grafana's sign-out otherwise only clears its own session and the
       # surviving oauth2-proxy cookie silently re-authenticates the browser.
       # Chain instead through the proxy's /oauth2/sign_out (clears the edge
@@ -1560,6 +1651,7 @@ services:
       start_period: 30s
     depends_on:
       prometheus: { condition: service_healthy }
+      alertmanager: { condition: service_healthy }
       loki: { condition: service_started }
       volume-init: { condition: service_completed_successfully }
 
@@ -1606,5 +1698,6 @@ volumes:
   vault_audit:
   alloy_data:
   prom_data:
+  alertmanager_data:
   loki_data:
   grafana_data:

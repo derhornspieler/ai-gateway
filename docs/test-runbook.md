@@ -201,26 +201,26 @@ Use `linux/arm64` for an ARM64 target. Use a new dated path for every build.
 ### Step 1 — Build both pairs
 
 ```bash
-install -d -m 0700 /absolute/private/path/2026-07-21-linux-amd64
+install -d -m 0700 /absolute/private/path/2026-07-22-linux-amd64
 python3 -I scripts/update-images.py prepare \
   --provider anthropic \
   --platform linux/amd64 \
-  --archive /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst \
-  --manifest /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json
+  --archive /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.docker.tar.zst \
+  --manifest /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.manifest.json
 ```
 
 The command writes:
 
 ```text
-aigw-2026-07-21-linux-amd64.docker.tar.zst
-aigw-2026-07-21-linux-amd64.manifest.json
-aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
-aigw-2026-07-21-linux-amd64.preprod.manifest.json
+aigw-2026-07-22-linux-amd64.docker.tar.zst
+aigw-2026-07-22-linux-amd64.manifest.json
+aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst
+aigw-2026-07-22-linux-amd64.preprod.manifest.json
 ```
 
-At this source revision, production has 23 external and 17 custom image
-references, for 40 total. Preprod has 25 external and 19 custom image
-references, for 44 total. The two preprod-only custom services are Samba AD
+At this source revision, production has 24 external and 19 custom image
+references, for 43 total. Preprod has 26 external and 21 custom image
+references, for 47 total. The two preprod-only custom services are Samba AD
 and the WIF provider mock. Their Debian 13.6-slim base and the archive-only
 PostgreSQL 16 migration source are the two extra external references. None of
 these four PreProd-only references belongs in the production archive.
@@ -229,10 +229,10 @@ Record all four SHA-256 values:
 
 ```bash
 # macOS
-shasum -a 256 /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64*
+shasum -a 256 /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64*
 
 # Linux
-sha256sum /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64*
+sha256sum /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64*
 ```
 
 Run the command for your operating system.
@@ -241,8 +241,8 @@ Run the command for your operating system.
 
 ```bash
 python3 -I scripts/update-images.py test-preprod \
-  --archive /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
-  --manifest /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  --archive /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst \
+  --manifest /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.preprod.manifest.json \
   --load-archive \
   --become-password-file "$HOME/.ssh/become"
 ```
@@ -279,6 +279,34 @@ A pass includes these markers:
 
 ```text
 PREPROD_CLEAN_ROOM_OK ...
+PREPROD_AUTO_ROUTER_DENIAL_PASSED
+PREPROD_MODEL_REQUEST_CAP_PASSED
+PREPROD_MODEL_MINUTE_RESERVATION_PASSED
+PREPROD_MODEL_REDIS_FAILURE_PASSED
+PREPROD_MODEL_LIMITS_PASSED
+PREPROD_MODEL_DRAFT_HIDDEN_PASSED
+PREPROD_MODEL_HIDDEN_CALL_PASSED
+PREPROD_MODEL_DISCOVERY_PASSED
+PREPROD_MODEL_ASSIGNMENT_GATE_PASSED
+PREPROD_MODEL_RETIREMENT_PASSED
+PREPROD_MODEL_LIFECYCLE_PASSED
+PREPROD_USAGE_REPLAY_GUARD_PASSED
+PREPROD_USAGE_UNKNOWN_PASSED
+PREPROD_USAGE_BACKDATE_PASSED
+PREPROD_USAGE_REPORTING_PASSED
+PREPROD_USAGE_APPEND_ONLY_PASSED
+PREPROD_USAGE_REAL_REQUEST_PASSED
+PREPROD_USAGE_STREAM_PASSED
+PREPROD_USAGE_RETRY_PASSED
+PREPROD_USAGE_FAILURE_PASSED
+PREPROD_USAGE_AUDIT_EXPORT_PASSED
+PREPROD_USAGE_DELIVERY_GAP_PASSED
+PREPROD_USAGE_ACCOUNTING_PASSED
+PREPROD_ALERT_RULE_UNIT_TEST_PASS
+PREPROD_ALERTING_GRAPH_PASS
+PREPROD_ALERT_LIVE_FIRING_PASS
+PREPROD_ALERT_CRIBL_EXPORT_PASS
+PREPROD_ALERT_LIVE_RESOLVED_PASS
 PREPROD_E2E_PASSED
 SEEDED_PREPROD_E2E_PASSED
 ```
@@ -306,10 +334,62 @@ The run must prove:
   duplicate assertions stopped before the mock provider;
 - WIF checks a real Keycloak JWT;
 - LiteLLM gets `pong` through the preprod-only TLS Envoy;
+- the reserved `aigw-auto` model returns HTTP 400 before provider dispatch;
+- a temporary model stays inert as a draft, works by exact name while hidden,
+  follows filtered discovery, refuses retirement while a temporary project
+  assigns it, then removes its test state and retires cleanly;
+- fixed alert faults activate and recover in the committed Prometheus rules,
+  including a filesystem-space case;
+- the firing watchdog reaches private Alertmanager and the provisioned Grafana
+  dashboard can read its lifecycle state;
+- a bounded, label-free test metric fires one non-watchdog alert, reaches
+  Prometheus, Alertmanager, the Grafana dashboard query, and Cribl through
+  Alloy, then resolves after the fixture is reset;
 - LiteLLM audit spans enter Alloy only through the bearer-authenticated
   receiver, while a missing token, wrong token, or forged source marker fails;
 - the exact production Envoy passes its immutable policy and CA startup gate; and
-- the approved SOC test logs reach the Cribl mock without secret fields.
+- admitted logs, metrics, and traces reach the Cribl mock without secret
+  fields, while rejected structured records stay out.
+
+### Usage and cost acceptance
+
+The seed-only `scripts/test-preprod-usage-accounting.py` gate runs from the
+main PreProd E2E test. It uses the seeded provider mock and proves all of these
+cases:
+
+1. normal success, final streaming success, an internal retry, and a provider
+   failure;
+2. missing usage, missing price, and a callback delivery gap stay unknown and
+   never become zero;
+3. an exact callback replay returns the saved receipt, while changed replay
+   data is rejected;
+4. a backdate preview reports the exact half-open window, row count, totals,
+   and digest;
+5. a stale preview, wrong confirmation phrase, old login, changed digest, and
+   conflicting operation ID all fail closed;
+6. a valid confirmation appends the price and adjustments without changing
+   old usage or cost rows;
+7. the real `grafana_ro` login reads exact totals from both dashboard views
+   and is denied access to the private usage table, while request IDs remain
+   fields instead of labels;
+8. trusted backend price records, usage records, and delivery-gap records pass
+   through Alloy to Loki and the Cribl mock without prompts, replies, headers,
+   keys, raw review notes, or raw errors; and
+9. the evidence survives restart, backup and restore, release upgrade, and
+   application rollback.
+
+PreProd Alloy reads an owned empty-log volume. It never mounts the workstation's
+real Docker log directory. The test selects only fresh, exact records from the
+real `key-rotator` and LiteLLM producers. It keeps their original timestamp and
+stream in Docker's JSON format, writes them through a no-network helper, waits
+for the Cribl receipt, and removes the file. This tests the production Alloy
+path without exposing another local project's logs.
+
+The gate prints `PREPROD_USAGE_ACCOUNTING_PASSED` only after every check
+passes. Keep the feature release-open until the command above produces that
+marker from a newly built schema-v2 seed with pulls and source builds disabled.
+See [Usage and cost accounting](usage-and-cost-accounting.md) for the data and
+security rules.
 
 See [Local preprod](preprod.md) for the users and network model.
 
@@ -328,8 +408,8 @@ boundary, not proof that the Linux-only commands ran.
 
 ```bash
 python3 -I scripts/update-images.py test-postgres18-preprod \
-  --archive /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
-  --manifest /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  --archive /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst \
+  --manifest /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.preprod.manifest.json \
   --become-password-file "$HOME/.ssh/become"
 ```
 
@@ -413,6 +493,8 @@ Pass only if:
 - the admin reaches admin and chat pages;
 - the developer reaches the developer portal and chat, but not admin pages;
 - the user reaches chat, but not portal or admin pages;
+- the developer creates a temporary key, leaves the key page, then uses Back
+  and Forward; the plaintext key and its tool snippets never appear again;
 - every cookie is `Secure` and limited to the right host and path;
 - application session and Keycloak identity cookies are `HttpOnly`;
 - logout clears the app and Keycloak sessions; and
@@ -427,7 +509,8 @@ format in its
 
 Remove the Root CA from the browser profile. The exact-manifest teardown in the
 next section removes the preprod hosts block. Do not save cookie values in the
-test record.
+test record. Revoke the temporary browser-test key before teardown. Record only
+that the one-time display test passed; never record the key value.
 
 ## 5. Clean up and handle a failure
 

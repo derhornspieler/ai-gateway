@@ -1,8 +1,8 @@
 {
   "author": "AI Gateway platform security <security@aigw.internal>",
   "build_files": {
-    "compose/docker-compose.yml": "5987f4ae3f9f8c4b8cdd5792d9894060002467ea7eb6de2e490549a29ea9883a",
-    "services/dhi-health-probe/Dockerfile.open-webui": "402baa35b1b5d32d6fc4088aea4e75e0f8e225dcb8946218b7f1123b7d840a99",
+    "compose/docker-compose.yml": "3ee307f4a96f7196d36b4cb2edfd05f85c32539ed5beceed02de51a70aa81ac8",
+    "services/dhi-health-probe/Dockerfile.open-webui": "cf0d9e72f74aeb04e9ad4f1e41ee0c851700ad39b02c536d604fe03eb3f76d02",
     "services/dhi-health-probe/patch_openwebui_chroma.py": "6d75b29814e78ec990af891b7cd48b4c5afae2ce82401d10d7fc7c1b04102638",
     "services/dhi-health-probe/verify_openwebui_chroma.py": "782f7140dcc349bd099810a5593c1049dbb04519ddf9551b228d2cbc6c11e003"
   },
@@ -14,7 +14,7 @@
     "expires_on": "2026-10-19",
     "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
     "package": "pkg:pypi/chromadb@1.5.9",
-    "reviewed_on": "2026-07-21",
+    "reviewed_on": "2026-07-22",
     "vulnerability": "CVE-2026-45829"
   },
   "schema": 1,

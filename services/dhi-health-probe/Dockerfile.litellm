@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.25.0@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
+
+ARG BASE_IMAGE
+
+FROM ${BASE_IMAGE}
+
+# The upstream image deliberately omits pip. Replace the exact old pyasn1
+# package with the contents of one reviewed pure-Python wheel. The build stays
+# offline and fails if the base layout, wheel hash, or installed version drifts.
+RUN --network=none \
+    --mount=type=bind,source=runtime-security-wheels,target=/tmp/aigw-wheels,readonly \
+    cd /tmp/aigw-wheels \
+    && sha256sum -c SHA256SUMS \
+    && test -d /app/.venv/lib/python3.13/site-packages/pyasn1 \
+    && test -d /app/.venv/lib/python3.13/site-packages/pyasn1-0.6.3.dist-info \
+    && rm -rf \
+      /app/.venv/lib/python3.13/site-packages/pyasn1 \
+      /app/.venv/lib/python3.13/site-packages/pyasn1-0.6.3.dist-info \
+    && /app/.venv/bin/python -I -m zipfile -e \
+      pyasn1-0.6.4-py3-none-any.whl \
+      /app/.venv/lib/python3.13/site-packages \
+    && /app/.venv/bin/python -I -c \
+      "import importlib.metadata,pyasn1; assert importlib.metadata.version('pyasn1') == '0.6.4'; assert pyasn1.__version__ == '0.6.4'"
+
+# Production Compose already runs this identity. Pin it in the image too so a
+# direct run cannot silently fall back to the upstream root user.
+USER 65532:65532

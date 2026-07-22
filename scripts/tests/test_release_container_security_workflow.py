@@ -41,6 +41,10 @@ PLAN = load(
     ".github/scripts/plan-release-container-security.py",
     "_test_release_container_plan",
 )
+BUILD = load(
+    ".github/scripts/build-release-image.py",
+    "_test_release_container_build",
+)
 WAIVERS = load(
     ".github/scripts/validate-trivy-waivers.py",
     "_test_trivy_waivers",
@@ -124,6 +128,45 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
         self.assertIn("--expected-image-id", WORKFLOW)
         self.assertIn("expected_build_id_matches", PROVENANCE_SOURCE)
 
+    def test_implicit_compose_image_uses_the_authoritative_planner_name(self) -> None:
+        digest = "a" * 64
+        # key-rotator intentionally relies on Compose's canonical
+        # <project>-<service> image name instead of repeating an image field.
+        BUILD.require_build_recipe(
+            "key-rotator",
+            {"build": {"context": "services/key-rotator"}, "image": None},
+        )
+        BUILD.require_planned_build(
+            "key-rotator",
+            {"image": "ai-gateway-key-rotator", "digest": digest},
+            "ai-gateway-key-rotator",
+            digest,
+        )
+
+    def test_custom_build_matrix_still_rejects_every_real_drift(self) -> None:
+        digest = "a" * 64
+        with self.assertRaises(BUILD.ReleaseSecurityError):
+            BUILD.require_build_recipe("missing", None)
+        with self.assertRaises(BUILD.ReleaseSecurityError):
+            BUILD.require_build_recipe("not-built", {"image": "example:1"})
+        with self.assertRaises(BUILD.ReleaseSecurityError):
+            BUILD.require_planned_build(
+                "key-rotator",
+                {"image": "wrong:1", "digest": digest},
+                "ai-gateway-key-rotator",
+                digest,
+            )
+        with self.assertRaises(BUILD.ReleaseSecurityError):
+            BUILD.require_planned_build(
+                "key-rotator",
+                {
+                    "image": "ai-gateway-key-rotator",
+                    "digest": "b" * 64,
+                },
+                "ai-gateway-key-rotator",
+                digest,
+            )
+
     def test_missing_dhi_credentials_fail_instead_of_skipping(self) -> None:
         self.assertIn(
             "DHI_USERNAME and DHI_PASSWORD are required for every main release scan",
@@ -186,8 +229,8 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
             len(scopes[SEED.RELEASE_SCOPE_PREPROD]),
             len(scopes[SEED.RELEASE_SCOPE_PRODUCTION]),
         )
-        self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PRODUCTION]), 23)
-        self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PREPROD]), 25)
+        self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PRODUCTION]), 24)
+        self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PREPROD]), 26)
         for required in (
             "plan_egress_policy",
             "render_deployable_compose_model",
@@ -398,7 +441,7 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
     def test_vex_selector_rejects_unknown_and_copies_only_requested_base(self) -> None:
         reference = (
             "dhi.io/python:3.14.6@sha256:"
-            "c82da5a1a30a6214f45c42def5b6f5b85981c7dc7a1802015a6ebf264675436d"
+            "c43e37b1d2c740bf924149f7ce015a79636a084a3fd755ac8c5ffc2f4a850b3e"
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

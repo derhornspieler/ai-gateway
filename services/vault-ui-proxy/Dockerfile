@@ -59,7 +59,7 @@ RUN --network=none set -eu; \
 # intact but the direct proxy entrypoint and startup process assertion prove it
 # is dormant. The upstream extraction binary, extractor, source-image layers,
 # build shell, and package tools do not cross this stage.
-FROM dhi.io/vault:2.0.3@sha256:2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e
+FROM dhi.io/vault:2.0.3@sha256:754dc49e181b867bc58aa44694507ff7c0ffa178db8778333700062c85e09726
 
 COPY --from=builder --chown=0:0 --chmod=0555 /out/vault-ui-proxy /usr/local/bin/vault-ui-proxy
 COPY --from=builder --chown=0:0 /vault-ui /opt/vault-ui

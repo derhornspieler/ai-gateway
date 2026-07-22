@@ -16,7 +16,7 @@ AI Gateway is a self-hosted, security-focused AI access platform. Production
 runs on an existing Rocky Linux 9 VM. Local release tests run in Docker
 preprod. The stack provides compatible API endpoints, browser chat, user keys,
 Keycloak login, Vault-backed provider access, local monitoring, and an optional
-Cribl SOC log feed.
+Cribl SOC telemetry feed.
 
 Anthropic is the only approved egress provider today. API compatibility does
 not mean another provider is enabled.
@@ -64,9 +64,9 @@ flowchart LR
 ```
 
 The full component, network, and trust-boundary detail lives in the
-[solution map](docs/solution-map.md); the complete diagram set (network,
-authentication, key-lifecycle, rotation, telemetry, and converge flows) is in
-[technical diagrams](docs/architecture-diagrams.md).
+[solution map](docs/solution-map.md). The [technical diagrams](docs/architecture-diagrams.md)
+show network, authentication, key lifecycle, rotation, provider, model,
+usage, telemetry, and deployment flows.
 
 ## Host interfaces
 
@@ -75,7 +75,7 @@ have their IP settings:
 
 - **egress:** the only default route; it has no gateway listener.
 - **ADM:** SSH and admin HTTPS for the approved VPN range.
-- **internal:** user HTTPS and the optional Cribl log feed.
+- **internal:** user HTTPS and the optional Cribl telemetry feed.
 
 ## Status
 
@@ -148,9 +148,13 @@ bash scripts/validate-compose.sh
   [OS security](docs/os-security.md), and
   [container security](docs/docker-security.md)
 - Monitoring and logs: [observability](docs/observability-operations.md) and
-  [Cribl SOC handoff](docs/cribl-soc-handoff.md)
+  [Cribl telemetry handoff](docs/cribl-soc-handoff.md)
 - Current work: [project status](docs/project-status.md) and
   [TASKS.md](TASKS.md)
+- Model governance and accounting: [model lifecycle SOP](docs/sop/model-lifecycle.md),
+  [implementation plan](docs/model-governance-plan.md),
+  [usage and cost accounting](docs/usage-and-cost-accounting.md), and
+  [automatic routing ADR](docs/automatic-model-routing-adr.md)
 
 ## Repository layout
 
@@ -168,7 +172,7 @@ compose/
   .env.example             fail-closed variable contract templated by Ansible
   traefik/                 separate internal and ADM routing
   keycloak/ litellm/ postgres/ vault/
-  alloy/ prometheus/ loki/ grafana/ cribl-mock/
+  alloy/ prometheus/ alertmanager/ loki/ grafana/ cribl-mock/
 services/
   egress-proxy/            immutable catalog-selected Envoy egress policy
   key-rotator/             rotation engine and Keycloak identity controller
@@ -201,7 +205,8 @@ docs/                      current operator and architecture documentation
 - Keycloak roles protect chat, developer, and admin access.
 - Vault holds provider and signing secrets.
 - SELinux, firewall rules, and Ansible checks fail closed.
-- Cribl gets only the approved SOC log set. Metrics and alerts stay local.
+- Alloy keeps local telemetry and mirrors every admitted metric, log, and trace
+  to Cribl over verified OTLP/gRPC TLS. Rejected secrets are never collected.
 - Restore keeps the stack stopped until Ansible checks it.
 
 Read the [security model](docs/security-model.md) for the full controls and

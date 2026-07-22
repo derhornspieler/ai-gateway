@@ -27,6 +27,7 @@ BASE_VOLUMES = frozenset(
         "vault_audit",
         "alloy_data",
         "prom_data",
+        "alertmanager_data",
         "loki_data",
         "grafana_data",
     }
@@ -45,6 +46,7 @@ STACK_REQUIRED_ROOTS = frozenset(
         "docker-compose.dns.yml",
         "docker-compose.platform-dns.yml",
         ".env",
+        "alertmanager",
         "alloy",
         "cribl-mock",
         "grafana",

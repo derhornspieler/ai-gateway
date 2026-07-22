@@ -77,6 +77,7 @@ UNLIMITED_POLICY: dict[str, Any] = {
     "rpm_limit": None,
     "allowed_models": None,
     "default_model": None,
+    "model_limits": {},
 }
 
 

@@ -1,5 +1,6 @@
 # cribl-mock — OTLP sink standing in for the customer's Cribl Stream on the
-# internal network. Logs everything it receives so the export leg is testable.
+# internal network. It accepts logs, metrics, and traces and prints every
+# received record so the full export leg is testable.
 receivers:
   otlp:
     protocols:
@@ -16,9 +17,9 @@ extensions:
 
 exporters:
   debug:
-    # Preprod acceptance reads the exact record body and attributes from this
-    # disposable sink. Detailed output is required to prove both the allow-list
-    # and redaction rules; a healthy listener or aggregate count is not enough.
+    # Preprod acceptance reads exact bodies, attributes, metric names, and span
+    # markers from this disposable sink. Detailed output proves signal scope
+    # and redaction; a healthy listener or aggregate count is not enough.
     verbosity: detailed
 
 service:

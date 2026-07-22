@@ -360,7 +360,7 @@ class VaultUIProxyContractTests(unittest.TestCase):
         )
         self.assertIn(
             "FROM dhi.io/vault:2.0.3@sha256:"
-            "2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e",
+            "754dc49e181b867bc58aa44694507ff7c0ffa178db8778333700062c85e09726",
             dockerfile,
         )
         self.assertIn(
@@ -412,7 +412,7 @@ class VaultUIProxyContractTests(unittest.TestCase):
         vault = service_block("vault", "postgres")
         self.assertIn(
             "BASE_IMAGE: dhi.io/vault:2.0.3@sha256:"
-            "2c0ef85b70b3b643d71593ecfcb4a5292a51b25b69c52c4457962762f2152f0e",
+            "754dc49e181b867bc58aa44694507ff7c0ffa178db8778333700062c85e09726",
             vault,
         )
         self.assertIn("vault_data:/vault/data", vault)

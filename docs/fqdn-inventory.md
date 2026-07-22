@@ -29,9 +29,9 @@ The VM hostname does not need a platform DNS record. Do not use
 
 Every other service stays private. This includes PostgreSQL, Redis, Vault's
 internal API, Envoy, key-rotator, the OAuth2 Proxy gates, Alloy, Loki,
-node-exporter, the Cribl mock, Samba AD, and both Traefik edges. They use
-private Docker names on isolated networks. A physical network cannot reach
-them directly.
+Alertmanager, node-exporter, the Cribl mock, Samba AD, and both Traefik edges.
+They use private Docker names on isolated networks. A physical network cannot
+reach them directly.
 
 ## DNS resolution design
 

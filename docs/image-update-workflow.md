@@ -11,9 +11,9 @@ One build makes two file pairs:
 
 Never send the preprod pair to production.
 
-At this source revision, production has 23 external and 17 custom image
-references, for 40 total. Preprod has 25 external and 19 custom references,
-for 44 total. Two custom services are preprod-only: Samba AD and the WIF
+At this source revision, production has 24 external and 19 custom image
+references, for 43 total. Preprod has 26 external and 21 custom references,
+for 47 total. Two custom services are preprod-only: Samba AD and the WIF
 provider mock. Their Debian 13.6-slim build base is also preprod-only. The
 fourth extra reference is the archive-only PostgreSQL 16 source used to test
 the PostgreSQL 18 migration. Compose never starts that source image during an
@@ -52,12 +52,12 @@ CA work is covered in the
 Make a new private directory. Put the date and platform in its name:
 
 ```bash
-install -d -m 0700 /srv/ai-gateway-releases/2026-07-21-linux-amd64
+install -d -m 0700 /srv/ai-gateway-releases/2026-07-22-linux-amd64
 python3 -I scripts/update-images.py prepare \
   --provider anthropic \
   --platform linux/amd64 \
-  --archive /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst \
-  --manifest /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json
+  --archive /srv/ai-gateway-releases/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.docker.tar.zst \
+  --manifest /srv/ai-gateway-releases/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.manifest.json
 ```
 
 Use `linux/arm64` for an ARM64 host. Anthropic is the only approved provider
@@ -67,10 +67,10 @@ accept a custom provider host or CA file.
 The command writes:
 
 ```text
-aigw-2026-07-21-linux-amd64.docker.tar.zst
-aigw-2026-07-21-linux-amd64.manifest.json
-aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
-aigw-2026-07-21-linux-amd64.preprod.manifest.json
+aigw-2026-07-22-linux-amd64.docker.tar.zst
+aigw-2026-07-22-linux-amd64.manifest.json
+aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst
+aigw-2026-07-22-linux-amd64.preprod.manifest.json
 ```
 
 Use `--preprod-archive` and `--preprod-manifest` together when you need other
@@ -108,6 +108,10 @@ DHI_PASSWORD
 
 Limit that environment to protected `main`. Missing secrets fail the job. The
 job also fails for a pull, build, scan, SBOM, provenance, or upload error.
+The workflow uses the same protected account for the DHI registry and Docker
+Scout's signed-VEX service. The login step uses step-scoped environment
+variables. Scout receives protected action inputs. Neither path puts the
+password in a command argument.
 
 Trivy saves the raw `HIGH` and `CRITICAL` JSON without VEX filtering. Docker
 Scout 1.23.1 is the blocking VEX-aware gate. For an exact DHI base, CI fetches
@@ -134,6 +138,14 @@ services, use Python 3.14.6, validate the direct pins, rebuild the hash-locked
 dependency graph for Python 3.14, and run the clean temporary-environment steps
 in the [test runbook](test-runbook.md#python-services). CI currently pins
 ansible-core 2.21.2 and yamllint 1.38.0.
+
+Some upstream application images need a narrow security update before release.
+Build that derivative from the exact reviewed base. Store each replacement
+wheel and SHA-256 hash in the repository, keep the Docker build offline, and
+fail if the old package layout has changed. The current LiteLLM derivative
+replaces only `pyasn1` `0.6.3` with `0.6.4`. The Open WebUI derivative installs
+reviewed `pyasn1` `0.6.4` and `GitPython` `3.1.54` wheels with its other runtime
+updates. Test both supported platforms and then test the exact seed.
 
 Regenerate each Python lock from its service directory with the reviewed tool:
 
@@ -170,8 +182,8 @@ To build both pairs and run the release-grade preprod test in one command, add
 python3 -I scripts/update-images.py prepare \
   --provider anthropic \
   --platform linux/amd64 \
-  --archive /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst \
-  --manifest /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json \
+  --archive /srv/ai-gateway-releases/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.docker.tar.zst \
+  --manifest /srv/ai-gateway-releases/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.manifest.json \
   --test-preprod \
   --become-password-file "$HOME/.ssh/become"
 ```
@@ -185,8 +197,8 @@ You can run the same release-grade test later from a copied preprod pair:
 
 ```bash
 python3 -I scripts/update-images.py test-preprod \
-  --archive /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \
-  --manifest /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.manifest.json \
+  --archive /srv/ai-gateway-releases/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst \
+  --manifest /srv/ai-gateway-releases/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.preprod.manifest.json \
   --load-archive \
   --become-password-file "$HOME/.ssh/become"
 ```
@@ -219,10 +231,15 @@ A clean-room failure stops before staging and deploy. A load, deploy,
 acceptance, or staging-cleanup failure fails the test.
 
 The test covers Samba LDAPS, the local Root CA, Vault, automatic Keycloak
-setup, domain-based redirects, static users, roles, WIF, LiteLLM, the exact
+setup, domain-based redirects, fixed test usernames with private passwords,
+roles, WIF, LiteLLM, the exact
 production Envoy startup gate, and inference through the preprod-only TLS
 Envoy and provider mock. It also proves that only the bearer-authenticated
-LiteLLM receiver can create an AI request audit record.
+LiteLLM receiver can create an AI request audit record. The same run checks the
+model-limit denial path; draft, hidden, discovery, and retirement behavior;
+Prometheus rule fault and recovery cases; the private
+Prometheus-to-Alertmanager-to-Grafana watchdog path; and the admitted log,
+metric, and trace mirror to the Cribl mock.
 
 Keep the release only when the clean test passes. Follow the exact order in
 the [acceptance test runbook](test-runbook.md#2-build-and-test-the-offline-release).
@@ -270,8 +287,8 @@ Replace every sample value below:
 
 ```bash
 python3 -I scripts/update-images.py upgrade \
-  --archive /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.docker.tar.zst \
-  --manifest /srv/ai-gateway-releases/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.manifest.json \
+  --archive /srv/ai-gateway-releases/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.docker.tar.zst \
+  --manifest /srv/ai-gateway-releases/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.manifest.json \
   --previous-archive /srv/ai-gateway-releases/previous/aigw-previous.docker.tar.zst \
   --previous-manifest /srv/ai-gateway-releases/previous/aigw-previous.manifest.json \
   --previous-release-dir /srv/ai-gateway-releases/previous-source \

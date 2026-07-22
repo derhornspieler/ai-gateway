@@ -8,7 +8,7 @@
 # that boundary is enforced by Docker network placement + firewalld/
 # DOCKER-USER rules at the compose/ansible layer, not here.
 
-FROM dhi.io/python:3.14.6-dev@sha256:9b72c38a520f44fafa1c4a3026e9b390eb3b4967c62d38be01400ecbb0232b65 AS python-builder
+FROM dhi.io/python:3.14.6-dev@sha256:1df3badfd28c3fd54fb8371d55a4a050c4051b8a808f8367f7241442a334928b AS python-builder
 WORKDIR /build
 COPY requirements.txt requirements.lock ./
 RUN python3 -m venv /opt/venv \
@@ -20,7 +20,7 @@ RUN python3 -m venv /opt/venv \
         --require-hashes \
         -r requirements.lock
 
-FROM dhi.io/python:3.14.6@sha256:c82da5a1a30a6214f45c42def5b6f5b85981c7dc7a1802015a6ebf264675436d
+FROM dhi.io/python:3.14.6@sha256:c43e37b1d2c740bf924149f7ce015a79636a084a3fd755ac8c5ffc2f4a850b3e
 
 WORKDIR /app
 COPY --from=python-builder /opt/venv /opt/venv
@@ -41,6 +41,7 @@ USER 65532:65532
 # Build-time regression: every nested package must be importable by the final
 # non-root runtime identity, not merely present in a root-owned image layer.
 RUN ["/opt/venv/bin/python", "-c", "from pathlib import Path; assert Path('/app/app/drivers/anthropic_wif.py').is_file(); import app.drivers.anthropic_wif"]
+RUN ["/opt/venv/bin/python", "-c", "import app.model_catalog; import app.pricing; import app.usage_api; import app.usage_store"]
 
 EXPOSE 8080
 

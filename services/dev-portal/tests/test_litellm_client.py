@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from app import litellm_client
+from app import litellm_client, model_discovery
 
 # Captured before the conftest autouse fixture stubs it for route tests,
 # so the direct client tests below exercise the real implementation.
@@ -228,6 +228,12 @@ async def test_key_generate_applies_the_runtime_project_policy(monkeypatch):
             "rpm_limit": 30,
             "allowed_models": ["claude-sonnet", "claude-haiku"],
             "default_model": "claude-haiku",
+            "model_limits": {
+                "claude-haiku": {
+                    "max_output_tokens_per_request": 4096,
+                    "output_tokens_per_utc_minute": 100000,
+                }
+            },
         },
     )
 
@@ -237,6 +243,10 @@ async def test_key_generate_applies_the_runtime_project_policy(monkeypatch):
     # The enforced default travels on key metadata, where the LiteLLM
     # pre-call hook reads it — never as a native key field.
     assert body["metadata"]["aigw_default_model"] == "claude-haiku"
+    assert body["metadata"]["aigw_model_limits_v1"] == (
+        '{"claude-haiku":{"max_output_tokens_per_request":4096,'
+        '"output_tokens_per_utc_minute":100000}}'
+    )
     assert "default_model" not in body
     assert "max_budget" not in body
 
@@ -262,6 +272,33 @@ async def test_key_generate_rejects_malformed_runtime_policy(monkeypatch):
         {"default_model": "bad model"},
         {"default_model": 7},
         {"allowed_models": ["claude-sonnet"], "default_model": "claude-opus"},
+        {
+            "allowed_models": None,
+            "model_limits": {
+                "claude-haiku": {
+                    "max_output_tokens_per_request": 10,
+                    "output_tokens_per_utc_minute": 100,
+                }
+            },
+        },
+        {
+            "allowed_models": ["claude-haiku"],
+            "model_limits": {
+                "claude-opus": {
+                    "max_output_tokens_per_request": 10,
+                    "output_tokens_per_utc_minute": 100,
+                }
+            },
+        },
+        {
+            "allowed_models": ["claude-haiku"],
+            "model_limits": {
+                "claude-haiku": {
+                    "max_output_tokens_per_request": 101,
+                    "output_tokens_per_utc_minute": 100,
+                }
+            },
+        },
         "restricted",
     ):
         with pytest.raises(litellm_client.LiteLLMError):
@@ -436,6 +473,8 @@ async def test_key_update_allows_only_reviewed_fields_and_bounded_values(
     for updates in (
         {},
         {"models": "all"},
+        {"models": []},
+        {"models": [litellm_client.ALL_PROXY_MODELS]},
         {"models": ["bad model"]},
         # Metadata replacement is only legal when it provably preserves the
         # portal's provenance fields and every reviewed bound.
@@ -457,6 +496,20 @@ async def test_key_update_allows_only_reviewed_fields_and_bounded_values(
         {
             "models": ["claude-haiku"],
             "metadata": {**provenance, "aigw_default_model": "bad model"},
+        },
+        {
+            "models": ["claude-haiku"],
+            "metadata": {**provenance, "aigw_model_limits_v1": "not-json"},
+        },
+        {
+            "models": ["claude-haiku"],
+            "metadata": {
+                **provenance,
+                "aigw_model_limits_v1": (
+                    '{ "claude-haiku": {"max_output_tokens_per_request":10,'
+                    '"output_tokens_per_utc_minute":100}}'
+                ),
+            },
         },
         {"user_id": "someone-else"},
         {"blocked": "true"},
@@ -526,17 +579,45 @@ async def test_key_update_sends_provenance_preserving_default_restamp(
         "metadata": metadata,
     }
 
-    # An unrestricted re-tune ([] = no model restriction) may still stamp a
-    # default, and clearing the default keeps the provenance untouched.
-    await litellm_client.key_update(
-        "hash-abc", {"models": [], "metadata": dict(metadata)}
-    )
-    assert body["models"] == [] and body["metadata"] == metadata
+    # Clearing the default keeps provenance while the key remains explicitly
+    # scoped. Empty lists are forbidden because LiteLLM treats them as a
+    # wildcard over current and future models.
     cleared = {"created_via": "dev-portal", "aigw_project_id": "ai-gateway"}
     await litellm_client.key_update(
-        "hash-abc", {"models": [], "metadata": dict(cleared)}
+        "hash-abc",
+        {"models": ["claude-haiku"], "metadata": dict(cleared)},
     )
-    assert body["metadata"] == cleared
+    assert body["models"] == ["claude-haiku"] and body["metadata"] == cleared
+
+
+@pytest.mark.asyncio
+async def test_key_update_stamps_only_canonical_model_limit_metadata(monkeypatch):
+    body = None
+
+    def handler(request: httpx.Request):
+        nonlocal body
+        body = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    _mock_client(monkeypatch, handler)
+    encoded = (
+        '{"claude-haiku":{"max_output_tokens_per_request":4096,'
+        '"output_tokens_per_utc_minute":100000}}'
+    )
+    metadata = {
+        "created_via": "dev-portal",
+        "aigw_project_id": "ai-gateway",
+        "aigw_model_limits_v1": encoded,
+    }
+    await litellm_client.key_update(
+        "hash-abc",
+        {"models": ["claude-haiku"], "metadata": metadata},
+    )
+    assert body == {
+        "key": "hash-abc",
+        "models": ["claude-haiku"],
+        "metadata": metadata,
+    }
 
 
 def test_settings_fail_closed_on_malformed_key_guardrails():
@@ -579,20 +660,13 @@ def test_settings_default_to_unlimited_and_merge_static_overrides():
 async def test_model_names_returns_bounded_validated_ids(monkeypatch):
     monkeypatch.setattr(litellm_client, "model_names", REAL_MODEL_NAMES)
 
-    def handler(request: httpx.Request):
-        assert request.url.path == "/v1/models"
-        return httpx.Response(
-            200,
-            json={
-                "data": [
-                    {"id": "claude-sonnet"},
-                    {"id": "claude-haiku"},
-                    {"id": "claude-sonnet"},
-                ]
-            },
-        )
+    async def filtered(_credential):
+        return {
+            "object": "list",
+            "data": [{"id": "claude-sonnet"}, {"id": "claude-haiku"}],
+        }
 
-    _mock_client(monkeypatch, handler)
+    monkeypatch.setattr(model_discovery, "filtered_model_document", filtered)
 
     assert await litellm_client.model_names() == ["claude-haiku", "claude-sonnet"]
 
@@ -600,19 +674,10 @@ async def test_model_names_returns_bounded_validated_ids(monkeypatch):
 @pytest.mark.asyncio
 async def test_model_names_fails_closed_on_malformed_entries(monkeypatch):
     monkeypatch.setattr(litellm_client, "model_names", REAL_MODEL_NAMES)
-    current: list = [{}]
 
-    def handler(request: httpx.Request):
-        return httpx.Response(200, json=current[0])
+    async def failed(_credential):
+        raise model_discovery.DiscoveryError("malformed")
 
-    _mock_client(monkeypatch, handler)
-
-    for payload in (
-        {"data": [{"id": "bad model"}]},
-        {"data": [{"id": 42}]},
-        {"data": "claude-sonnet"},
-        [],
-    ):
-        current[0] = payload
-        with pytest.raises(litellm_client.LiteLLMError):
-            await litellm_client.model_names()
+    monkeypatch.setattr(model_discovery, "filtered_model_document", failed)
+    with pytest.raises(litellm_client.LiteLLMError):
+        await litellm_client.model_names()

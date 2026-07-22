@@ -203,7 +203,7 @@ class EdgeTlsContractTests(unittest.TestCase):
         self.assertIn("validate-ca-bundle", source)
         self.assertIn("certs/cribl-ca.pem", source)
 
-    def test_compose_gives_alloy_only_the_dedicated_cribl_ca(self) -> None:
+    def test_compose_gives_alloy_only_dedicated_telemetry_trust(self) -> None:
         compose = COMPOSE.read_text(encoding="utf-8")
         self.assertIn("./certs/cribl-ca.pem:/etc/ssl/certs/aigw-cribl-ca.pem:ro", compose)
         self.assertIn(
@@ -216,6 +216,9 @@ class EdgeTlsContractTests(unittest.TestCase):
                 "alloy/config.alloy",
                 "certs/cribl-ca.pem",
                 "secrets/litellm_otel_token",
+                "secrets/alert_state_ca.pem",
+                "secrets/alert_state_alloy.crt",
+                "secrets/alert_state_alloy.key",
             ],
         )
 

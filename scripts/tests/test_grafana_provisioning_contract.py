@@ -54,7 +54,9 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in self.dashboard_files},
             {
+                "ai-gateway-alerts-capacity.json",
                 "ai-gateway-live-logs.json",
+                "ai-gateway-model-usage.json",
                 "ai-gateway-overview.json",
                 "ai-gateway-request-audit.json",
                 "ai-gateway-top-projects.json",
@@ -64,13 +66,15 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
                 "rocky9-host.json",
             },
         )
-        self.assertEqual(len(self.dashboards), 8)
+        self.assertEqual(len(self.dashboards), 10)
 
     def test_exact_dashboard_inventory_is_deterministic(self) -> None:
         self.assertEqual(
             {dashboard["uid"]: dashboard["title"] for dashboard in self.dashboards},
             {
+                "aigw-alerts-capacity": "AI Gateway Alerts and Capacity",
                 "aigw-live-logs": "AI Gateway Live Logs",
+                "aigw-model-usage": "AI Gateway Model Usage and Cost",
                 "aigw-overview": "AI Gateway Overview",
                 "aigw-request-audit": "AI Gateway Request Audit",
                 "aigw-top-projects": "AI Gateway Top Projects",
@@ -91,6 +95,8 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             ("loki", "loki"),
             # Owner-approved read-only LiteLLM spend datasource (grafana_ro).
             ("grafana-postgresql-datasource", "litellm-spend"),
+            # Append-only gateway usage report views (same read-only role).
+            ("grafana-postgresql-datasource", "aigw-usage"),
         }
         observed: set[tuple[str, str]] = set()
         for dashboard in self.dashboards:
@@ -112,6 +118,7 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertIn(("prometheus", "prometheus"), observed)
         self.assertIn(("loki", "loki"), observed)
         self.assertIn(("grafana-postgresql-datasource", "litellm-spend"), observed)
+        self.assertIn(("grafana-postgresql-datasource", "aigw-usage"), observed)
 
     def test_request_audit_reads_the_dedicated_loki_request_stream(self) -> None:
         """The audit surface is the Loki stream Alloy derives from
@@ -293,7 +300,9 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         expected = {
             "grafana/provisioning/alerting/empty.yml",
             "grafana/provisioning/dashboards/dashboards.yml",
+            "grafana/provisioning/dashboards/json/ai-gateway-alerts-capacity.json",
             "grafana/provisioning/dashboards/json/ai-gateway-live-logs.json",
+            "grafana/provisioning/dashboards/json/ai-gateway-model-usage.json",
             "grafana/provisioning/dashboards/json/ai-gateway-overview.json",
             "grafana/provisioning/dashboards/json/ai-gateway-request-audit.json",
             "grafana/provisioning/dashboards/json/ai-gateway-top-projects.json",
@@ -308,8 +317,10 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             self.assertIn(relative, self.stack)
             self.assertIn(relative, self.verify)
         for uid in (
+            "aigw-alerts-capacity",
             "aigw-overview",
             "aigw-live-logs",
+            "aigw-model-usage",
             "aigw-request-audit",
             "aigw-top-projects",
             "aigw-top-users",
@@ -335,7 +346,9 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertIn("not (item.isreg | default(false) | bool)", cleanup)
         self.assertIn("(item.path | basename) not in", cleanup)
         for name in (
+            "ai-gateway-alerts-capacity.json",
             "ai-gateway-live-logs.json",
+            "ai-gateway-model-usage.json",
             "ai-gateway-overview.json",
             "ai-gateway-request-audit.json",
             "ai-gateway-top-projects.json",
@@ -426,7 +439,7 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertIn("plugin_setting", self.verify)
         self.assertIn("grafana-lokiexplore-app", self.verify)
 
-    def test_spend_datasource_is_readonly_env_credential_and_pinned(self) -> None:
+    def test_postgres_datasources_are_readonly_env_credential_and_pinned(self) -> None:
         datasources = (
             ROOT / "compose/grafana/provisioning/datasources/datasources.yml"
         ).read_text()
@@ -439,12 +452,15 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             "database: litellm",
             "postgresVersion: 1800",
             "password: $__env{AIGW_PG_GRAFANA_RO_PASSWORD}",
+            "name: AI Gateway Usage",
+            "uid: aigw-usage",
+            "database: rotator",
         ):
             self.assertIn(required, datasources)
         # The credential reaches Grafana only through the environment; the
         # provisioning file must never carry a literal secret, and every
         # provisioned datasource stays UI-immutable.
-        self.assertEqual(datasources.count("password:"), 1)
+        self.assertEqual(datasources.count("password:"), 2)
         self.assertEqual(
             datasources.count("editable: false"), datasources.count("- name: ")
         )
@@ -515,24 +531,104 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertIn("cache_read_input_tokens", cache_queries)
         self.assertIn("cache_creation_input_tokens", cache_queries)
 
+    def test_model_usage_dashboard_reads_only_governance_report_views(self) -> None:
+        """Usage reports preserve unknowns and never read evidence tables."""
+        dashboard = next(
+            item for item in self.dashboards if item["uid"] == "aigw-model-usage"
+        )
+        self.assertIn("Unknown values stay unknown", dashboard["description"])
+        queries = [
+            target["rawSql"]
+            for panel in panels(dashboard)
+            for target in panel.get("targets", [])
+            if "rawSql" in target
+        ]
+        self.assertEqual(len(queries), 8)
+        for query in queries:
+            self.assertTrue(query.startswith("SELECT"), query)
+            self.assertIn("$__timeFilter(occurred_at)", query)
+            self.assertRegex(
+                query,
+                r"aigw_governance[.](?:usage_reporting|usage_component_reporting)",
+            )
+            upper = query.upper()
+            for forbidden in (
+                "INSERT", "UPDATE ", "DELETE", "DROP", "ALTER", "GRANT",
+                "CREATE ", "TRUNCATE", "COPY ",
+            ):
+                self.assertNotIn(forbidden, upper, query)
+            for secret_bearing in ("prompt", "messages", "api_key", "headers"):
+                self.assertNotIn(secret_bearing, query)
+
+        rendered = "\n".join(queries)
+        for column in (
+            "requested_model",
+            "actual_model",
+            "stable_user_id",
+            "project_id",
+            "normal_input_tokens",
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "cache_read_tokens",
+            "output_tokens",
+            "litellm_cost_usd",
+            "provider_cost_usd",
+            "booked_configured_total_cost_usd",
+            "current_configured_total_cost_usd",
+            "adjustment_count",
+            "usage_completeness",
+        ):
+            self.assertIn(column, rendered)
+        self.assertEqual(len(re.findall(r"LIMIT 10(?:\D|$)", rendered)), 1)
+        self.assertEqual(len(re.findall(r"LIMIT 20(?:\D|$)", rendered)), 2)
+        self.assertEqual(len(re.findall(r"LIMIT 100(?:\D|$)", rendered)), 1)
+        self.assertIn('AS "failed_requests"', rendered)
+        self.assertNotIn("* 0.", rendered)
+        self.assertNotIn("LiteLLM_", rendered)
+        self.assertNotIn("aigw_governance.usage_events", rendered)
+        self.assertNotIn("aigw_governance.usage_cost_adjustments", rendered)
+        loki_targets = [
+            target
+            for panel in panels(dashboard)
+            for target in panel.get("targets", [])
+            if "expr" in target
+        ]
+        self.assertEqual(len(loki_targets), 1)
+        self.assertIn('service="litellm"', loki_targets[0]["expr"])
+        self.assertIn('\\"event\\":\\"aigw.usage.audit\\"', loki_targets[0]["expr"])
+        self.assertIn('\\"action\\":\\"delivery_failure\\"', loki_targets[0]["expr"])
+        for panel in panels(dashboard):
+            self.assertEqual(
+                panel.get("fieldConfig", {}).get("defaults", {}).get("noValue"),
+                "No data",
+            )
+        model_url = "/d/aigw-model-usage/ai-gateway-model-usage-and-cost"
+        for source_uid in ("aigw-top-projects", "aigw-top-users"):
+            source = next(
+                item for item in self.dashboards if item["uid"] == source_uid
+            )
+            self.assertIn(model_url, {link["url"] for link in source["links"]})
+
     def test_postgres_reporting_role_is_least_privilege_and_matrix_pinned(self) -> None:
         init = (ROOT / "compose/postgres/init/01-init-databases.sh").read_text()
         for required in (
             "SELECT 'CREATE USER grafana_ro'",
             "ALTER ROLE grafana_ro WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE",
             "GRANT CONNECT ON DATABASE litellm TO grafana_ro;",
+            "GRANT CONNECT ON DATABASE rotator TO grafana_ro;",
             "'LiteLLM_SpendLogs','LiteLLM_VerificationToken',",
             "'LiteLLM_UserTable','LiteLLM_DailyUserSpend'",
         ):
             self.assertIn(required, init)
-        # Column-level SELECT only: the exact per-table allowlists the eight
+        # Column-level SELECT only: the exact per-table allowlists the nine
         # provisioned dashboards query, pinned character-for-character. Each
         # list is intentionally complete — a missing column breaks a panel,
         # an extra column widens the reporting surface.
         expected_grants = {
             "LiteLLM_SpendLogs": (
-                'GRANT SELECT ("api_key", "completion_tokens", "prompt_tokens", '
-                '"spend", "startTime", "total_tokens", "user") '
+                'GRANT SELECT ("api_key", "completion_tokens", "model", '
+                '"prompt_tokens", "spend", "startTime", "status", '
+                '"total_tokens", "user") '
                 'ON TABLE public."LiteLLM_SpendLogs" TO grafana_ro'
             ),
             "LiteLLM_VerificationToken": (
@@ -544,8 +640,10 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
                 'ON TABLE public."LiteLLM_UserTable" TO grafana_ro'
             ),
             "LiteLLM_DailyUserSpend": (
-                'GRANT SELECT ("cache_creation_input_tokens", '
-                '"cache_read_input_tokens", "date", "prompt_tokens") '
+                'GRANT SELECT ("api_requests", "cache_creation_input_tokens", '
+                '"cache_read_input_tokens", "completion_tokens", "date", '
+                '"failed_requests", "model", "prompt_tokens", "spend", '
+                '"successful_requests") '
                 'ON TABLE public."LiteLLM_DailyUserSpend" TO grafana_ro'
             ),
         }
@@ -553,17 +651,20 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
             self.assertIn(grant, init)
         # An already-initialized nonproduction DB carrying the retired whole-table grant
         # must be demoted, not left in place: the fixer actively revokes the
-        # table-wide SELECT and the three prompt-bearing columns before it
-        # re-grants at column level.
+        # table-wide SELECT and every existing column privilege before it
+        # re-grants the exact allowlist at column level.
         self.assertNotIn("GRANT SELECT ON TABLE public.%I TO grafana_ro", init)
         self.assertIn(
             "REVOKE SELECT ON TABLE public.%I FROM grafana_ro", init
         )
         self.assertIn(
-            'REVOKE SELECT ("messages", "proxy_server_request", "response") '
-            'ON TABLE public."LiteLLM_SpendLogs" FROM grafana_ro',
+            "'REVOKE ALL PRIVILEGES (%I) ON TABLE public.%I FROM grafana_ro'",
             init,
         )
+        self.assertIn("FROM information_schema.columns", init)
+        self.assertIn("FROM information_schema.column_privileges AS privilege", init)
+        self.assertIn("privilege.privilege_type <> 'SELECT'", init)
+        self.assertIn("NOT privilege.column_name = ANY(reviewed.cols)", init)
         # The three prompt-bearing columns must never appear inside any GRANT —
         # not in a column list, not anywhere on a granting statement. Sweep
         # every GRANT SELECT (...) column list and assert they are absent.
@@ -578,13 +679,12 @@ class GrafanaProvisioningContractTests(unittest.TestCase):
         self.assertNotIn("GRANT ALL", init)
         self.assertNotIn("ALTER DEFAULT PRIVILEGES", init)
         self.assertNotIn("GRANT CONNECT ON DATABASE keycloak TO grafana_ro", init)
-        self.assertNotIn("GRANT CONNECT ON DATABASE rotator TO grafana_ro", init)
         self.assertNotIn("GRANT CONNECT ON DATABASE postgres TO grafana_ro", init)
         for expected_row in (
             "- grafana_ro|keycloak|false",
             "- grafana_ro|litellm|true",
             "- grafana_ro|postgres|false",
-            "- grafana_ro|rotator|false",
+            "- grafana_ro|rotator|true",
             "- role|grafana_ro|true",
         ):
             self.assertIn(expected_row, self.stack)

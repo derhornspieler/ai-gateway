@@ -1,14 +1,16 @@
 {
   "base": {
-    "alloy": ["alloy/config.alloy", "certs/cribl-ca.pem", "secrets/litellm_otel_token"],
+    "alertmanager": ["alertmanager/alertmanager.yml"],
+    "alloy": ["alloy/config.alloy", "certs/cribl-ca.pem", "secrets/litellm_otel_token", "secrets/alert_state_ca.pem", "secrets/alert_state_alloy.crt", "secrets/alert_state_alloy.key"],
     "cribl-mock": ["cribl-mock/config.yaml"],
     "grafana": ["grafana/provisioning"],
+    "key-rotator": ["secrets/provider_policy_receipt.json", "secrets/litellm_usage_token"],
     "keycloak": ["keycloak/realms"],
-    "litellm": ["litellm/config.yaml", "litellm/aigw_default_model_hook.py", "litellm/aigw_openwebui_identity.py", "litellm/aigw_otel_callback.py", "secrets/litellm_otel_token"],
+    "litellm": ["litellm/config.yaml", "litellm/aigw_default_model_hook.py", "litellm/aigw_model_limits.py", "litellm/aigw_openwebui_identity.py", "litellm/aigw_otel_callback.py", "litellm/aigw_usage_callback.py", "secrets/litellm_otel_token", "secrets/litellm_usage_token"],
     "loki": ["loki/config.yml"],
     "open-webui": ["certs/ca.pem"],
     "postgres": ["postgres/init"],
-    "prometheus": ["prometheus/prometheus.yml", "prometheus/rules.yml"],
+    "prometheus": ["prometheus/prometheus.yml", "prometheus/rules.yml", "secrets/alert_state_ca.pem", "secrets/alert_state_prometheus.crt", "secrets/alert_state_prometheus.key"],
     "redis": ["secrets/redis_users.acl", "secrets/redis_password"],
     "traefik-adm": ["traefik/traefik-adm.yml", "traefik/dynamic-adm.yml", "certs"],
     "traefik-int": ["traefik/traefik-int.yml", "traefik/dynamic-int.yml", "certs"],
@@ -22,7 +24,7 @@
     ]
   },
   "identity_ldap": {
-    "keycloak": ["keycloak/identity-ldap-ca.pem", "keycloak/realms"],
+    "keycloak": ["keycloak/identity-ldap-ca.pem"],
     "key-rotator": ["secrets/identity_ldap_bind_password"]
   }
 }

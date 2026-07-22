@@ -165,7 +165,7 @@ if [[ "$runtime_reconcile" == true ]]; then
                           THEN 'true' ELSE 'false' END;")"
         expected_matrix="$(printf '%s\n' \
             'grafana_ro|keycloak|false' 'grafana_ro|litellm|true' \
-            'grafana_ro|postgres|false' 'grafana_ro|rotator|false' \
+            'grafana_ro|postgres|false' 'grafana_ro|rotator|true' \
             'keycloak|keycloak|true' 'keycloak|litellm|false' \
             'keycloak|postgres|false' 'keycloak|rotator|false' \
             'litellm|keycloak|false' 'litellm|litellm|true' \
@@ -185,18 +185,17 @@ if [[ "$runtime_reconcile" == true ]]; then
     # section below correctly performs no writes. Owner decision: Grafana's
     # read-only spend datasource reads exactly the reviewed dashboard columns
     # of these four tables — column-level grants only, never table-wide, and
-    # never the prompt-bearing SpendLogs columns (messages, response,
-    # proxy_server_request). Drift is any missing allowed-column grant, any
-    # table-wide grant, or any readable prompt-bearing column.
+    # never an unreviewed column. Drift is any missing allowed-column grant,
+    # any table-wide grant, or any column grant outside the exact allowlist.
     grafana_grants_ok="$(psql --username "$POSTGRES_USER" --dbname litellm \
         --tuples-only --no-align --command "
           SELECT count(*) = 0 FROM (
             SELECT reviewed.tab
               FROM (VALUES
-                     ('LiteLLM_SpendLogs', ARRAY['api_key','completion_tokens','prompt_tokens','spend','startTime','total_tokens','user']),
+                     ('LiteLLM_SpendLogs', ARRAY['api_key','completion_tokens','model','prompt_tokens','spend','startTime','status','total_tokens','user']),
                      ('LiteLLM_VerificationToken', ARRAY['metadata','token']),
                      ('LiteLLM_UserTable', ARRAY['user_alias','user_id']),
-                     ('LiteLLM_DailyUserSpend', ARRAY['cache_creation_input_tokens','cache_read_input_tokens','date','prompt_tokens'])
+                     ('LiteLLM_DailyUserSpend', ARRAY['api_requests','cache_creation_input_tokens','cache_read_input_tokens','completion_tokens','date','failed_requests','model','prompt_tokens','spend','successful_requests'])
                    ) AS reviewed(tab, cols)
              CROSS JOIN LATERAL unnest(reviewed.cols) AS col
              WHERE to_regclass(format('public.%I', reviewed.tab)) IS NOT NULL
@@ -212,11 +211,30 @@ if [[ "$runtime_reconcile" == true ]]; then
                AND has_table_privilege('grafana_ro',
                      to_regclass(format('public.%I', tab)), 'SELECT')
             UNION ALL
-            SELECT col
-              FROM unnest(ARRAY['messages','proxy_server_request','response']) AS col
-             WHERE to_regclass(format('public.%I', 'LiteLLM_SpendLogs')) IS NOT NULL
-               AND has_column_privilege('grafana_ro',
-                     to_regclass(format('public.%I', 'LiteLLM_SpendLogs')), col, 'SELECT')
+            SELECT privilege.table_name
+              FROM information_schema.role_table_grants AS privilege
+             WHERE privilege.grantee = 'grafana_ro'
+               AND privilege.table_schema = 'public'
+               AND privilege.table_name = ANY(ARRAY[
+                     'LiteLLM_SpendLogs','LiteLLM_VerificationToken',
+                     'LiteLLM_UserTable','LiteLLM_DailyUserSpend'
+                   ])
+            UNION ALL
+            SELECT privilege.table_name
+              FROM information_schema.column_privileges AS privilege
+              JOIN (VALUES
+                     ('LiteLLM_SpendLogs', ARRAY['api_key','completion_tokens','model','prompt_tokens','spend','startTime','status','total_tokens','user']),
+                     ('LiteLLM_VerificationToken', ARRAY['metadata','token']),
+                     ('LiteLLM_UserTable', ARRAY['user_alias','user_id']),
+                     ('LiteLLM_DailyUserSpend', ARRAY['api_requests','cache_creation_input_tokens','cache_read_input_tokens','completion_tokens','date','failed_requests','model','prompt_tokens','spend','successful_requests'])
+                   ) AS reviewed(tab, cols)
+                ON reviewed.tab = privilege.table_name
+             WHERE privilege.grantee = 'grafana_ro'
+               AND privilege.table_schema = 'public'
+               AND (
+                   privilege.privilege_type <> 'SELECT'
+                   OR NOT privilege.column_name = ANY(reviewed.cols)
+               )
           ) AS drift;")" \
         || grafana_grants_ok=f
     if [[ "$grafana_grants_ok" == t ]]; then
@@ -306,8 +324,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" \
 
     -- Read-only reporting identity for Grafana's provisioned LiteLLM spend
     -- datasource (owner-approved admin observability). It owns no database:
-    -- it may CONNECT only to litellm and SELECT only the reviewed columns
-    -- granted below after LiteLLM's own migrations create them.
+    -- it may CONNECT only to litellm and rotator. It reads reviewed LiteLLM
+    -- columns below and reviewed usage views created by 03-usage-accounting.
     SELECT 'CREATE USER grafana_ro'
         WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'grafana_ro') \gexec
     \if :fix_grafana_ro_role
@@ -341,18 +359,18 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" \
     GRANT CONNECT ON DATABASE litellm TO grafana_ro;
     GRANT CONNECT ON DATABASE keycloak TO keycloak;
     GRANT CONNECT ON DATABASE rotator TO rotator;
+    GRANT CONNECT ON DATABASE rotator TO grafana_ro;
     GRANT CONNECT ON DATABASE postgres TO postgres;
     \endif
 
     -- Least-privilege reporting grants: column-level SELECT on exactly the
-    -- columns the eight provisioned dashboards query across the reviewed
+    -- columns the nine provisioned dashboards query across the reviewed
     -- spend, token, user, and daily-aggregate tables — never a whole-table,
     -- schema-wide, or default-privilege grant (the daily aggregate carries
     -- the prompt-cache read/creation token split that the cache-utilization
-    -- panels surface). The prompt-bearing SpendLogs columns (messages,
-    -- response, proxy_server_request) are deliberately excluded and actively
-    -- revoked, so grafana_ro can never read a prompt body even if a future
-    -- LiteLLM release sets store_prompts_in_spend_logs true. LiteLLM's
+    -- panels surface). Every existing column privilege is revoked before the
+    -- exact allowlist is restored. This removes prompt fields and future
+    -- columns even if an earlier manual grant widened access. LiteLLM's
     -- migrations create these tables on its first start, so a first converge
     -- legitimately grants nothing here and the second pass (or any later
     -- converge) converges the grants; the leading REVOKEs demote any
@@ -366,19 +384,53 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" \
            ]) AS tab
      WHERE to_regclass(format('public.%I', tab)) IS NOT NULL
      ORDER BY tab \gexec
-    SELECT 'REVOKE SELECT ("messages", "proxy_server_request", "response") ON TABLE public."LiteLLM_SpendLogs" FROM grafana_ro'
-     WHERE to_regclass('public."LiteLLM_SpendLogs"') IS NOT NULL \gexec
-    SELECT 'GRANT SELECT ("api_key", "completion_tokens", "prompt_tokens", "spend", "startTime", "total_tokens", "user") ON TABLE public."LiteLLM_SpendLogs" TO grafana_ro'
+    SELECT format(
+             'REVOKE ALL PRIVILEGES (%I) ON TABLE public.%I FROM grafana_ro',
+             column_name,
+             table_name
+           )
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = ANY(ARRAY[
+             'LiteLLM_SpendLogs','LiteLLM_VerificationToken',
+             'LiteLLM_UserTable','LiteLLM_DailyUserSpend'
+           ])
+     ORDER BY table_name, ordinal_position \gexec
+    SELECT 'GRANT SELECT ("api_key", "completion_tokens", "model", "prompt_tokens", "spend", "startTime", "status", "total_tokens", "user") ON TABLE public."LiteLLM_SpendLogs" TO grafana_ro'
      WHERE to_regclass('public."LiteLLM_SpendLogs"') IS NOT NULL \gexec
     SELECT 'GRANT SELECT ("metadata", "token") ON TABLE public."LiteLLM_VerificationToken" TO grafana_ro'
      WHERE to_regclass('public."LiteLLM_VerificationToken"') IS NOT NULL \gexec
     SELECT 'GRANT SELECT ("user_alias", "user_id") ON TABLE public."LiteLLM_UserTable" TO grafana_ro'
      WHERE to_regclass('public."LiteLLM_UserTable"') IS NOT NULL \gexec
-    SELECT 'GRANT SELECT ("cache_creation_input_tokens", "cache_read_input_tokens", "date", "prompt_tokens") ON TABLE public."LiteLLM_DailyUserSpend" TO grafana_ro'
+    SELECT 'GRANT SELECT ("api_requests", "cache_creation_input_tokens", "cache_read_input_tokens", "completion_tokens", "date", "failed_requests", "model", "prompt_tokens", "spend", "successful_requests") ON TABLE public."LiteLLM_DailyUserSpend" TO grafana_ro'
      WHERE to_regclass('public."LiteLLM_DailyUserSpend"') IS NOT NULL \gexec
     \connect postgres
     \endif
 EOSQL
+
+# The application login must never own its append-only governance evidence.
+# Run the migration as the cluster administrator on both first boot and the
+# Ansible reconciliation path. The official entrypoint may run the .sql file
+# once more during first boot; every statement is deliberately idempotent.
+governance_schema_receipt="$(
+    psql -X --quiet --tuples-only --no-align -v ON_ERROR_STOP=1 \
+        --username "$POSTGRES_USER" --dbname postgres \
+        --file /docker-entrypoint-initdb.d/02-governance.sql
+)"
+if [[ "$governance_schema_receipt" != "AIGW_GOVERNANCE_SCHEMA_V1" ]]; then
+    echo "PostgreSQL governance schema receipt did not validate" >&2
+    exit 1
+fi
+
+usage_schema_receipt="$(
+    psql -X --quiet --tuples-only --no-align -v ON_ERROR_STOP=1 \
+        --username "$POSTGRES_USER" --dbname postgres \
+        --file /docker-entrypoint-initdb.d/03-usage-accounting.sql
+)"
+if [[ "$usage_schema_receipt" != "AIGW_USAGE_ACCOUNTING_SCHEMA_V1" ]]; then
+    echo "PostgreSQL usage-accounting schema receipt did not validate" >&2
+    exit 1
+fi
 
 if [[ "$state_changed" == true ]]; then
     echo AIGW_POSTGRES_CHANGED

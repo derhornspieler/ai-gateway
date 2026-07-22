@@ -6,6 +6,8 @@ key or any generated virtual key value.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from typing import Any
 
@@ -38,8 +40,18 @@ PORTAL_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$")
 # LiteLLM pre-call hook (compose/litellm/aigw_default_model_hook.py) reads it
 # to resolve requests that omit a model. Kept textually identical there.
 PORTAL_DEFAULT_MODEL_METADATA_KEY = "aigw_default_model"
+PORTAL_MODEL_LIMITS_METADATA_KEY = "aigw_model_limits_v1"
+PORTAL_POLICY_REVISION_METADATA_KEY = "aigw_policy_revision_v1"
+PORTAL_POLICY_GATE_METADATA_KEY = "aigw_policy_gate_v1"
+# A durable operator/user block is different from the temporary block used
+# during policy cutover. Policy retries preserve this marker and never turn
+# the key back on. An approved admin unblock removes it explicitly.
+PORTAL_MANUAL_BLOCK_METADATA_KEY = "aigw_manual_block_v1"
+PROJECT_POLICY_REVISION_FIELD = "_aigw_policy_revision"
+POLICY_REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_KEY_METADATA_FIELDS = 32
 MAX_KEY_METADATA_STRING_LENGTH = 512
+MAX_MODEL_LIMITS_JSON_BYTES = 8192
 MAX_KEY_METADATA_LIST_ITEMS = 32
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 # LiteLLM key-lifetime grammar (e.g. 30d, 12h). Kept textually identical to
@@ -54,8 +66,13 @@ MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")
 # denies every real model. This is the deny-all-tooling state, distinct from an
 # unset policy (all models). Chat access stays governed by the aigw-chat role.
 NO_MODELS_SENTINEL = "aigw-no-models"
+ALL_PROXY_MODELS = "all-proxy-models"
 MAX_POLICY_MODELS = 32
 RATE_LIMIT_MAX = 1_000_000_000
+MODEL_REQUEST_OUTPUT_MAX = 1_000_000
+MODEL_LIMIT_FIELDS = frozenset(
+    {"max_output_tokens_per_request", "output_tokens_per_utc_minute"}
+)
 # The only /key/update fields this portal may ever send. Everything else on
 # that endpoint (owner, team, aliases, rotation) is reserved for the operator
 # path; widening this set is a reviewed security decision.
@@ -93,7 +110,12 @@ def _validated_retune_metadata(metadata: Any, updates: dict[str, Any]) -> None:
         if not isinstance(name, str) or not 1 <= len(name) <= 128:
             raise LiteLLMError("key metadata update is invalid")
         if isinstance(value, str):
-            if len(value) > MAX_KEY_METADATA_STRING_LENGTH:
+            max_length = (
+                MAX_MODEL_LIMITS_JSON_BYTES
+                if name == PORTAL_MODEL_LIMITS_METADATA_KEY
+                else MAX_KEY_METADATA_STRING_LENGTH
+            )
+            if len(value.encode("utf-8")) > max_length:
                 raise LiteLLMError("key metadata update is invalid")
         elif isinstance(value, list):
             if len(value) > MAX_KEY_METADATA_LIST_ITEMS or any(
@@ -123,6 +145,38 @@ def _validated_retune_metadata(metadata: Any, updates: dict[str, Any]) -> None:
             raise LiteLLMError(
                 "key default model is outside the updated model allowlist"
             )
+    if PORTAL_MODEL_LIMITS_METADATA_KEY in metadata:
+        models = updates.get("models")
+        if (
+            "models" not in updates
+            or not isinstance(models, list)
+            or not models
+            or ALL_PROXY_MODELS in models
+        ):
+            raise LiteLLMError(
+                "per-model limits require the same update's explicit model list"
+            )
+        raw_limits = metadata[PORTAL_MODEL_LIMITS_METADATA_KEY]
+        try:
+            decoded = json.loads(raw_limits)
+        except (TypeError, ValueError) as exc:
+            raise LiteLLMError("key metadata model limits are invalid") from exc
+        canonical = canonical_model_limits(decoded, models)
+        if raw_limits != canonical:
+            raise LiteLLMError("key metadata model limits are not canonical")
+    revision = metadata.get(PORTAL_POLICY_REVISION_METADATA_KEY)
+    if revision is not None and (
+        not isinstance(revision, str)
+        or POLICY_REVISION_RE.fullmatch(revision) is None
+    ):
+        raise LiteLLMError("key metadata policy revision is invalid")
+    gate_revision = metadata.get(PORTAL_POLICY_GATE_METADATA_KEY)
+    if gate_revision is not None and (
+        not isinstance(gate_revision, str)
+        or POLICY_REVISION_RE.fullmatch(gate_revision) is None
+        or updates.get("blocked") is not True
+    ):
+        raise LiteLLMError("key metadata policy gate is invalid")
 
 
 def _validated_model_list(models: Any, *, allow_empty: bool) -> list[str]:
@@ -139,6 +193,109 @@ def _validated_model_list(models: Any, *, allow_empty: bool) -> list[str]:
     ):
         raise LiteLLMError("model list is invalid")
     return sorted(models)
+
+
+def canonical_model_limits(model_limits: Any, allowed_models: Any) -> str:
+    """Validate and canonically encode the two supported per-model limits."""
+
+    if (
+        not isinstance(model_limits, dict)
+        or len(model_limits) > MAX_POLICY_MODELS
+        or not isinstance(allowed_models, list)
+        or (model_limits and not allowed_models)
+    ):
+        raise LiteLLMError("per-model limit policy is invalid")
+    allowed = set(_validated_model_list(allowed_models, allow_empty=True))
+    normalized: dict[str, dict[str, int]] = {}
+    for model, limits in model_limits.items():
+        if (
+            not isinstance(model, str)
+            or MODEL_NAME_RE.fullmatch(model) is None
+            or model not in allowed
+            or not isinstance(limits, dict)
+            or set(limits) != MODEL_LIMIT_FIELDS
+        ):
+            raise LiteLLMError("per-model limit policy is invalid")
+        request_cap = limits["max_output_tokens_per_request"]
+        minute_cap = limits["output_tokens_per_utc_minute"]
+        if (
+            isinstance(request_cap, bool)
+            or not isinstance(request_cap, int)
+            or not 1 <= request_cap <= MODEL_REQUEST_OUTPUT_MAX
+            or isinstance(minute_cap, bool)
+            or not isinstance(minute_cap, int)
+            or not 1 <= minute_cap <= RATE_LIMIT_MAX
+            or request_cap > minute_cap
+        ):
+            raise LiteLLMError("per-model limit policy is invalid")
+        normalized[model] = {
+            "max_output_tokens_per_request": request_cap,
+            "output_tokens_per_utc_minute": minute_cap,
+        }
+    encoded = json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    if len(encoded.encode("ascii")) > MAX_MODEL_LIMITS_JSON_BYTES:
+        raise LiteLLMError("per-model limit policy is too large")
+    return encoded
+
+
+def project_policy_revision(policy: Any) -> str:
+    """Hash one canonical intended policy without its internal revision hint."""
+
+    if not isinstance(policy, dict):
+        raise LiteLLMError("project policy is invalid")
+    candidate = {
+        name: value
+        for name, value in policy.items()
+        if name != PROJECT_POLICY_REVISION_FIELD
+    }
+    if (
+        not {"tpm_limit", "rpm_limit", "allowed_models"} <= set(candidate)
+        or not set(candidate)
+        <= {
+            "tpm_limit",
+            "rpm_limit",
+            "allowed_models",
+            "default_model",
+            "model_limits",
+        }
+    ):
+        raise LiteLLMError("project policy is invalid")
+    normalized: dict[str, Any] = {}
+    for knob in ("tpm_limit", "rpm_limit"):
+        value = candidate[knob]
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 < value <= RATE_LIMIT_MAX
+        ):
+            raise LiteLLMError("project policy is invalid")
+        normalized[knob] = value
+    models = candidate["allowed_models"]
+    if models is not None:
+        models = _validated_model_list(models, allow_empty=False)
+    normalized["allowed_models"] = models
+    default_model = candidate.get("default_model")
+    if default_model is not None and (
+        not isinstance(default_model, str)
+        or MODEL_NAME_RE.fullmatch(default_model) is None
+        or (models is not None and default_model not in models)
+    ):
+        raise LiteLLMError("project policy is invalid")
+    normalized["default_model"] = default_model
+    limits = candidate.get("model_limits", {})
+    normalized["model_limits"] = json.loads(
+        canonical_model_limits(limits, models or [])
+    )
+    encoded = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(b"aigw-project-policy-v1\0" + encoded).hexdigest()
 
 
 def _headers() -> dict[str, str]:
@@ -353,6 +510,15 @@ async def key_generate(
     if project_policy is not None:
         if not isinstance(project_policy, dict):
             raise LiteLLMError("project policy is invalid")
+        revision = project_policy.get(PROJECT_POLICY_REVISION_FIELD)
+        if revision is None:
+            revision = project_policy_revision(project_policy)
+        if (
+            not isinstance(revision, str)
+            or POLICY_REVISION_RE.fullmatch(revision) is None
+        ):
+            raise LiteLLMError("project policy revision is invalid")
+        payload["metadata"][PORTAL_POLICY_REVISION_METADATA_KEY] = revision
         for knob in ("tpm_limit", "rpm_limit"):
             value = project_policy.get(knob)
             if value is None:
@@ -383,6 +549,22 @@ async def key_generate(
                     "project default model is outside its allowed models"
                 )
             payload["metadata"][PORTAL_DEFAULT_MODEL_METADATA_KEY] = default_model
+        model_limits = project_policy.get("model_limits", {})
+        if not isinstance(model_limits, dict):
+            raise LiteLLMError("project per-model limit policy is invalid")
+        if model_limits:
+            models = limits.get("models")
+            if (
+                not isinstance(models, list)
+                or not models
+                or ALL_PROXY_MODELS in models
+            ):
+                raise LiteLLMError(
+                    "per-model limits require an explicit model allowlist"
+                )
+            payload["metadata"][PORTAL_MODEL_LIMITS_METADATA_KEY] = (
+                canonical_model_limits(model_limits, models)
+            )
     payload.update(limits)
     try:
         async with httpx.AsyncClient(
@@ -585,10 +767,12 @@ async def key_update(key: str, updates: dict[str, Any]) -> dict[str, Any]:
             ):
                 raise LiteLLMError("max_budget is invalid")
         elif field == "models":
-            # An empty list is LiteLLM's "no model restriction" and is the
-            # deliberate re-tune value when a project policy clears its
-            # allowed-models set.
-            _validated_model_list(value, allow_empty=True)
+            # LiteLLM treats an empty list as every current and future model.
+            # Portal policy re-tunes always expand "all" to the exact current
+            # public set, so an empty/wildcard update is never safe here.
+            models = _validated_model_list(value, allow_empty=False)
+            if ALL_PROXY_MODELS in models:
+                raise LiteLLMError("model list cannot use the proxy wildcard")
         elif field == "metadata":
             _validated_retune_metadata(value, updates)
         else:  # tpm_limit / rpm_limit
@@ -619,31 +803,12 @@ async def key_update(key: str, updates: dict[str, Any]) -> dict[str, Any]:
 
 
 async def model_names() -> list[str]:
-    """List the gateway's configured model names from LiteLLM.
+    """Return the same filtered model snapshot exposed on the API edge."""
 
-    Server-side only (master key). Used to render and validate the
-    per-project policy forms and to show developers which models exist when
-    a project carries no restriction. Response entries are strictly bounded
-    so a compromised upstream cannot inject markup or unbounded data.
-    """
-    url = settings.litellm_url.rstrip("/") + "/v1/models"
+    from .model_discovery import DiscoveryError, filtered_model_document
+
     try:
-        async with httpx.AsyncClient(
-            timeout=10, trust_env=False, follow_redirects=False
-        ) as client:
-            resp = await client.get(url, headers=_headers())
-    except httpx.HTTPError as exc:
-        raise LiteLLMError(f"could not reach LiteLLM: {exc}") from exc
-    if resp.status_code >= 400:
-        raise LiteLLMError(f"v1/models failed: HTTP {resp.status_code}")
-    data = _response_json(resp, "v1/models")
-    rows = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(rows, list) or len(rows) > 256:
-        raise LiteLLMError("v1/models returned an invalid response shape")
-    names: set[str] = set()
-    for row in rows:
-        name = row.get("id") if isinstance(row, dict) else None
-        if not isinstance(name, str) or MODEL_NAME_RE.fullmatch(name) is None:
-            raise LiteLLMError("v1/models returned an invalid model name")
-        names.add(name)
-    return sorted(names)
+        document = await filtered_model_document(settings.litellm_master_key)
+    except DiscoveryError as exc:
+        raise LiteLLMError("filtered model discovery failed") from exc
+    return sorted(row["id"] for row in document["data"])
