@@ -127,6 +127,32 @@ class PostgresMigrationUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(migration.MigrationError, "unsupported"):
                 migration.host_platform()
 
+    def test_final_checkpoint_uses_psql_error_stop(self) -> None:
+        with mock.patch.object(migration, "docker") as docker:
+            migration.force_checkpoint("a" * 64)
+        docker.assert_called_once_with(
+            "exec",
+            "a" * 64,
+            "psql",
+            "--username",
+            "postgres",
+            "--dbname",
+            "postgres",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--command",
+            "CHECKPOINT;",
+        )
+
+    def test_legacy_or_malformed_backup_barrier_is_rejected(self) -> None:
+        migration.require_backup_write_barrier(
+            {"postgres_write_barrier": migration.BACKUP_WRITE_BARRIER}
+        )
+        for manifest in ({}, {"postgres_write_barrier": "older-contract"}):
+            with self.subTest(manifest=manifest):
+                with self.assertRaisesRegex(migration.MigrationError, "checkpoint barrier"):
+                    migration.require_backup_write_barrier(manifest)
+
     def test_rollback_restarts_only_the_receipted_container_inventory(self) -> None:
         receipt = {
             "format": migration.RECEIPT_FORMAT,
@@ -199,14 +225,17 @@ class PostgresMigrationRepositoryContracts(unittest.TestCase):
         writer_stop = source.index(
             'docker("stop", "--time", "60", *writer_ids)'
         )
+        forced_checkpoint = source.index("force_checkpoint(postgres_id)", writer_stop)
         final_checkpoint = source.index(
-            'postgres_id, "SELECT next_xid FROM pg_control_checkpoint();"', writer_stop
+            'postgres_id, "SELECT next_xid FROM pg_control_checkpoint();"',
+            forced_checkpoint,
         )
         postgres_stop = source.index(
             'docker("stop", "--time", "60", postgres_id)', final_checkpoint
         )
         restore = source.index('"pg_restore",', postgres_stop)
-        self.assertLess(writer_stop, final_checkpoint)
+        self.assertLess(writer_stop, forced_checkpoint)
+        self.assertLess(forced_checkpoint, final_checkpoint)
         self.assertLess(final_checkpoint, postgres_stop)
         self.assertLess(postgres_stop, restore)
         self.assertIn('plan["source_running_container_ids"] = sorted(running_ids)', source)
@@ -245,6 +274,13 @@ class PostgresMigrationRepositoryContracts(unittest.TestCase):
         restore = (ROOT / "scripts/state-restore.sh").read_text(encoding="utf-8")
         self.assertIn("SELECT next_xid FROM pg_control_checkpoint()", backup)
         self.assertIn('"postgres_next_xid":', backup)
+        self.assertIn('"postgres_write_barrier":', backup)
+        self.assertIn(migration.BACKUP_WRITE_BARRIER, backup)
+        dumps_end = backup.index("done\n# Flush the post-dump transaction state")
+        final_checkpoint = backup.index("-c CHECKPOINT", dumps_end)
+        checkpoint_read = backup.index("SELECT next_xid FROM pg_control_checkpoint()")
+        self.assertLess(dumps_end, final_checkpoint)
+        self.assertLess(final_checkpoint, checkpoint_read)
         self.assertIn("PG_DATA_VOLUME_NAME=", restore)
         self.assertIn('volume_name="$restored_pg_volume"', restore)
 

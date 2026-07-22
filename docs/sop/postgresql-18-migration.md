@@ -93,15 +93,23 @@ sudo /opt/ai-gateway/scripts/state-backup.sh \
   --output /mnt/aigw-backups/gateway01-pg16-final.tar.gz.age
 ```
 
-The backup stops writers, creates custom-format logical dumps, records the
-PostgreSQL checkpoint ID, encrypts the result, and restarts the same
-containers. It also seals Vault because Vault was restarted. Perform the
-normal Vault unseal procedure if you need the live system before cutover.
+The backup stops writers and creates custom-format logical dumps. It then
+forces a PostgreSQL checkpoint and records the checkpoint ID. This last step
+makes PostgreSQL flush accepted transaction state before it records the ID.
+The script encrypts the result and restarts the same containers. It also seals
+Vault because Vault was restarted. Perform the normal Vault unseal procedure
+if you need the live system before cutover.
 
 Copy the SHA-256 shown by the command into the next step. The migration accepts
 backups that are no more than 30 minutes old. It also compares the saved
-PostgreSQL checkpoint ID with the live server. If any database write happened
-after the backup, the migration stops and asks for a new backup.
+PostgreSQL checkpoint ID with the live server. After it stops all writers, it
+forces another checkpoint before reading the live ID. If a database write
+happened after the backup, the IDs differ and the migration asks for a new
+backup.
+
+The migration rejects backups made by an older script that did not record the
+post-dump checkpoint barrier. Stage the current scripts and take a new backup.
+Do not reuse an older PostgreSQL 16 backup for this migration.
 
 ## 3. Place the temporary age identity on the Docker host
 
@@ -140,8 +148,8 @@ ansible-playbook \
 
 The playbook performs these steps:
 
-1. Check the backup hash, age envelope, manifest, PostgreSQL version, and
-   checkpoint ID.
+1. Check the backup hash, age envelope, manifest, PostgreSQL version,
+   post-dump checkpoint barrier, and checkpoint ID.
 2. Check the exact PostgreSQL 18.4 image metadata.
 3. Stop the exact running AI Gateway containers.
 4. Create `ai-gateway_pg18_data` as a fresh volume.
@@ -204,6 +212,10 @@ database checks, and application acceptance evidence.
 
 `PostgreSQL changed after the backup` means at least one transaction advanced
 the source checkpoint. Take a new backup and retry.
+
+`backup lacks the forced post-dump PostgreSQL checkpoint barrier` means the
+backup came from an older script or its manifest changed. Stage the current
+scripts, take a new backup, and retry. Do not bypass this check.
 
 `target PostgreSQL 18 volume already exists` means an earlier attempt left
 state behind or the selected volume name is not fresh. Inspect the migration

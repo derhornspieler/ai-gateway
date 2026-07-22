@@ -35,6 +35,7 @@ POSTGRES_IMAGE_USER = "70"
 SOURCE_MAJOR = "16"
 TARGET_MAJOR = "18"
 RECEIPT_FORMAT = "aigw-postgres-major-migration-v1"
+BACKUP_WRITE_BARRIER = "forced-checkpoint-after-logical-dumps-v1"
 EXPECTED_ROLES = frozenset({"postgres", "litellm", "keycloak", "rotator", "grafana_ro"})
 EXPECTED_DATABASES = ("litellm", "keycloak", "rotator")
 SECRET_KEYS = (
@@ -306,6 +307,33 @@ def postgres_scalar(container_id: str, sql: str) -> str:
     return result.stdout.decode("utf-8", "strict").strip()
 
 
+def force_checkpoint(container_id: str) -> None:
+    """Flush accepted source writes into pg_control before the final proof."""
+
+    docker(
+        "exec",
+        container_id,
+        "psql",
+        "--username",
+        "postgres",
+        "--dbname",
+        "postgres",
+        "--set",
+        "ON_ERROR_STOP=1",
+        "--command",
+        "CHECKPOINT;",
+    )
+
+
+def require_backup_write_barrier(manifest: dict[str, object]) -> None:
+    """Reject backups made before the post-dump checkpoint contract."""
+
+    if manifest.get("postgres_write_barrier") != BACKUP_WRITE_BARRIER:
+        raise MigrationError(
+            "backup lacks the forced post-dump PostgreSQL checkpoint barrier"
+        )
+
+
 def validate_backup_inputs(args: argparse.Namespace, staging: Path) -> tuple[dict[str, object], Path]:
     backup = Path(args.input)
     identity = Path(args.identity)
@@ -409,6 +437,7 @@ def validate_plan_inputs(args: argparse.Namespace) -> tuple[dict[str, object], d
         manifest, extracted = validate_backup_inputs(args, Path(temporary))
         backup_version = str(manifest.get("postgres_version", ""))
         backup_next_xid = str(manifest.get("postgres_next_xid", ""))
+        require_backup_write_barrier(manifest)
         if not backup_version.startswith(SOURCE_MAJOR + "."):
             raise MigrationError("backup was not created by PostgreSQL 16")
         if backup_version != live_version:
@@ -669,9 +698,10 @@ def command_migrate(args: argparse.Namespace) -> None:
     if writer_ids:
         docker("stop", "--time", "60", *writer_ids)
     # Close the only race left after the read-only plan. All application
-    # writers are stopped, while PostgreSQL is still available to prove that
-    # its checkpoint did not advance after the encrypted backup.
+    # writers are stopped. Force a new checkpoint before reading pg_control so
+    # accepted writes cannot remain hidden behind the earlier checkpoint.
     stopped_source_version = postgres_scalar(postgres_id, "SHOW server_version;")
+    force_checkpoint(postgres_id)
     stopped_source_next_xid = postgres_scalar(
         postgres_id, "SELECT next_xid FROM pg_control_checkpoint();"
     )

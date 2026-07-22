@@ -124,6 +124,10 @@ for database in litellm keycloak rotator; do
   "${compose[@]}" exec -T postgres pg_restore --list \
     < "$staging/postgres/${database}.dump" >/dev/null
 done
+# Flush the post-dump transaction state into pg_control before recording the
+# migration barrier. Without this checkpoint, a later comparison can read the
+# same old checkpoint even when PostgreSQL accepted writes after the backup.
+"${compose[@]}" exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d postgres -c CHECKPOINT >/dev/null
 pg_version="$("${compose[@]}" exec -T postgres psql -U postgres -d postgres -Atqc 'show server_version')"
 # This value does not reveal application data. The PostgreSQL 18 migration
 # compares it after stopping writers. A mismatch means the source changed
@@ -178,6 +182,7 @@ tar -tzf "$staging/stack-config.tar.gz" >/dev/null
 export AIGW_BACKUP_STAGING="$staging" AIGW_BACKUP_PROJECT="$PROJECT"
 export AIGW_BACKUP_PG_VERSION="$pg_version"
 export AIGW_BACKUP_PG_NEXT_XID="$pg_next_xid"
+export AIGW_BACKUP_PG_WRITE_BARRIER="forced-checkpoint-after-logical-dumps-v1"
 AIGW_BACKUP_VOLUMES="$(printf '%s\n' "${archived_volumes[@]}")"
 export AIGW_BACKUP_VOLUMES
 export AIGW_BACKUP_DEPLOYMENT_PROFILE="$deployment_profile"
@@ -194,6 +199,7 @@ manifest = {
     "deployment_profile": os.environ["AIGW_BACKUP_DEPLOYMENT_PROFILE"],
     "postgres_version": os.environ["AIGW_BACKUP_PG_VERSION"],
     "postgres_next_xid": os.environ["AIGW_BACKUP_PG_NEXT_XID"],
+    "postgres_write_barrier": os.environ["AIGW_BACKUP_PG_WRITE_BARRIER"],
     "volumes": [v for v in os.environ.get("AIGW_BACKUP_VOLUMES", "").splitlines() if v],
     "running_services": (root / "running-services.txt").read_text().splitlines(),
     "images": subprocess.run(
