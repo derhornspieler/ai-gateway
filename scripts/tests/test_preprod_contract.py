@@ -3070,8 +3070,8 @@ class PreprodContractTests(unittest.TestCase):
         def wait(_args, service, wanted, timeout):
             events.append(("wait", (service, wanted, timeout)))
 
-        def verify_edge(_args):
-            events.append(("edge", ()))
+        def verify_edge(_args, *, repair_transport=False):
+            events.append(("edge", (repair_transport,)))
 
         with (
             mock.patch.object(module, "check_context"),
@@ -3130,7 +3130,7 @@ class PreprodContractTests(unittest.TestCase):
         )
         litellm_ready = events.index(("wait", ("litellm", "healthy", 600)))
         keycloak_ready = events.index(("wait", ("keycloak", "healthy", 600)))
-        edge_verified = events.index(("edge", ()))
+        edge_verified = events.index(("edge", (True,)))
         self.assertEqual(len(reconciles), 2)
         self.assertLess(stop, postgres_up)
         self.assertLess(postgres_up, postgres_ready)
@@ -3316,7 +3316,11 @@ class PreprodContractTests(unittest.TestCase):
         )
         with (
             mock.patch.object(module, "local_curl", return_value="/usr/bin/curl"),
-            mock.patch.object(module, "run", side_effect=[healthy, discovery]) as run,
+            mock.patch.object(
+                module.subprocess,
+                "run",
+                side_effect=[healthy, discovery],
+            ) as run,
             mock.patch("sys.stdout", new_callable=io.StringIO),
         ):
             module.verify_edge_routes(mock.Mock())
@@ -3349,7 +3353,7 @@ class PreprodContractTests(unittest.TestCase):
         malformed = subprocess.CompletedProcess([], 0, "not-json", "")
         with (
             mock.patch.object(module, "local_curl", return_value="/usr/bin/curl"),
-            mock.patch.object(module, "run", return_value=malformed),
+            mock.patch.object(module.subprocess, "run", return_value=malformed),
         ):
             with self.assertRaisesRegex(SystemExit, "returned invalid JSON"):
                 module.edge_json(
@@ -3367,9 +3371,88 @@ class PreprodContractTests(unittest.TestCase):
             mock.patch("sys.stdout", new_callable=io.StringIO) as output,
             mock.patch("sys.stderr", new_callable=io.StringIO),
         ):
-            with self.assertRaisesRegex(SystemExit, "exit code 35"):
+            with self.assertRaisesRegex(SystemExit, "curl exit code 35"):
                 module.verify_edge_routes(mock.Mock())
         self.assertNotIn("PREPROD_EDGE_ROUTES_VERIFIED", output.getvalue())
+
+        transport_reset = subprocess.CompletedProcess(
+            ["/usr/bin/curl"], 56, "", "curl: (56) connection reset\n"
+        )
+        with (
+            mock.patch.object(module, "local_curl", return_value="/usr/bin/curl"),
+            mock.patch.object(
+                module.subprocess,
+                "run",
+                side_effect=[healthy, transport_reset, healthy, discovery],
+            ) as repaired_run,
+            mock.patch.object(module, "compose") as compose,
+            mock.patch.object(module, "wait_for_container") as wait,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as repaired_output,
+        ):
+            module.verify_edge_routes(mock.Mock(), repair_transport=True)
+        self.assertEqual(repaired_run.call_count, 4)
+        compose.assert_called_once_with(
+            mock.ANY,
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            "preprod-edge-forwarder",
+            "preprod-edge-forwarder-adm",
+        )
+        self.assertEqual(
+            [call.args[1:] for call in wait.call_args_list],
+            [
+                ("preprod-edge-forwarder", "healthy", 120),
+                ("preprod-edge-forwarder-adm", "healthy", 120),
+            ],
+        )
+        self.assertIn(
+            "PREPROD_EDGE_FORWARDERS_REPAIRED attempt=1",
+            repaired_output.getvalue(),
+        )
+        self.assertIn("PREPROD_EDGE_ROUTES_VERIFIED", repaired_output.getvalue())
+
+        with (
+            mock.patch.object(module, "local_curl", return_value="/usr/bin/curl"),
+            mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=transport_reset,
+            ) as exhausted_run,
+            mock.patch.object(module, "compose") as exhausted_repair,
+            mock.patch.object(module, "wait_for_container"),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            with self.assertRaisesRegex(SystemExit, "after bounded repair"):
+                module.verify_edge_routes(mock.Mock(), repair_transport=True)
+        self.assertEqual(
+            exhausted_run.call_count,
+            module.EDGE_FORWARDER_REPAIR_ATTEMPTS + 1,
+        )
+        self.assertEqual(
+            exhausted_repair.call_count,
+            module.EDGE_FORWARDER_REPAIR_ATTEMPTS,
+        )
+
+        bad_certificate = subprocess.CompletedProcess(
+            ["/usr/bin/curl"], 60, "", "certificate verification failed\n"
+        )
+        with (
+            mock.patch.object(module, "local_curl", return_value="/usr/bin/curl"),
+            mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=bad_certificate,
+            ),
+            mock.patch.object(module, "compose") as forbidden_repair,
+            mock.patch("sys.stderr", new_callable=io.StringIO),
+        ):
+            with self.assertRaisesRegex(
+                SystemExit, "edge curl failed with exit code 60"
+            ):
+                module.verify_edge_routes(mock.Mock(), repair_transport=True)
+        forbidden_repair.assert_not_called()
 
     def test_edge_route_verifier_requires_a_supported_curl(self) -> None:
         module = load_preprod_module()

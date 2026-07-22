@@ -117,7 +117,9 @@ Preprod adds these test-only services:
 - `preprod-edge-forwarder` publishes the internal test plane.
 - `preprod-edge-forwarder-adm` publishes the admin test plane. Separate
   publishers avoid a Docker Desktop bug that can misroute two loopback ports
-  from one container.
+  from one container. If Docker Desktop leaves a stale port forward, the test
+  may recreate only these two publishers twice. It then tests both TLS routes
+  again. Certificate, HTTP, or response errors still stop the deployment.
 - `samba-ad` provides the local LDAPS directory.
 - `wif-egress-mock` stands in for the provider token path.
 - `wif-provider-mock` stands in for the provider control plane.

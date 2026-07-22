@@ -91,6 +91,8 @@ POSTGRES_RECONCILE_RESULTS = frozenset(
     {"AIGW_POSTGRES_CHANGED", "AIGW_POSTGRES_OK"}
 )
 EDGE_RESPONSE_MAX_BYTES = 64 * 1024
+EDGE_FORWARDER_REPAIR_ATTEMPTS = 2
+EDGE_RETRYABLE_CURL_CODES = frozenset({7, 28, 35, 52, 56})
 SEED_POLICY_ENVIRONMENT_NAMES = (
     "AIGW_EGRESS_SOURCE_DATE_EPOCH",
     "AIGW_EGRESS_PROVIDERS",
@@ -3370,7 +3372,7 @@ def start(args: argparse.Namespace) -> None:
     wait_for_container(args, "samba-ad", "healthy", 300)
     wait_for_container(args, "litellm", "healthy", 600)
     wait_for_container(args, "keycloak", "healthy", 600)
-    verify_edge_routes(args)
+    verify_edge_routes(args, repair_transport=True)
     wait_for_container(args, "key-rotator", "running", 300)
     # LiteLLM creates its reporting tables during startup. A second idempotent
     # pass installs the reviewed column-only Grafana grants on a clean stack.
@@ -3940,6 +3942,36 @@ def wait_for_container(args: argparse.Namespace, service: str, wanted: str, time
     fail(f"timed out waiting for preprod service {service} to become {wanted}")
 
 
+class EdgeTransportError(RuntimeError):
+    """A short-lived host-to-container transport failure."""
+
+    def __init__(self, returncode: int) -> None:
+        super().__init__(f"edge curl transport failure {returncode}")
+        self.returncode = returncode
+
+
+def run_edge_curl(command: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run one fixed edge request and classify only transport failures."""
+
+    result = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=clean_environment(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode in EDGE_RETRYABLE_CURL_CODES:
+        raise EdgeTransportError(result.returncode)
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, end="", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        fail(f"edge curl failed with exit code {result.returncode}")
+    return result
+
+
 def edge_json(hostname: str, address: str, path: str) -> object:
     """Read one fixed preprod TLS route without using local curl settings."""
 
@@ -3953,7 +3985,7 @@ def edge_json(hostname: str, address: str, path: str) -> object:
     }
     if (hostname, address, path) not in approved:
         fail("the preprod edge verifier received an unapproved route")
-    result = run(
+    result = run_edge_curl(
         [
             local_curl(),
             "--disable",
@@ -3978,8 +4010,7 @@ def edge_json(hostname: str, address: str, path: str) -> object:
             "--resolve",
             f"{hostname}:443:{address}",
             f"https://{hostname}{path}",
-        ],
-        capture=True,
+        ]
     )
     response_size = len(result.stdout.encode("utf-8"))
     if not result.stdout or response_size > EDGE_RESPONSE_MAX_BYTES:
@@ -3990,24 +4021,52 @@ def edge_json(hostname: str, address: str, path: str) -> object:
         fail(f"{hostname}{path} returned invalid JSON")
 
 
-def verify_edge_routes(_: argparse.Namespace) -> None:
-    """Prove that both loopback planes reach the intended TLS services."""
+def verify_edge_routes(
+    args: argparse.Namespace, *, repair_transport: bool = False
+) -> None:
+    """Prove both TLS routes, repairing only stale Desktop port forwards."""
 
-    api_health = edge_json(
-        "api.aigw.internal", "127.0.2.1", "/health/liveliness"
-    )
-    if api_health != "I'm alive!":
-        fail("the preprod API edge returned the wrong health response")
-    discovery = edge_json(
-        "auth.aigw.internal",
-        "127.0.3.1",
-        "/realms/aigw/.well-known/openid-configuration",
-    )
-    if not isinstance(discovery, dict) or discovery.get("issuer") != (
-        "https://auth.aigw.internal/realms/aigw"
-    ):
-        fail("the preprod identity edge returned the wrong issuer")
-    print("PREPROD_EDGE_ROUTES_VERIFIED")
+    repair_limit = EDGE_FORWARDER_REPAIR_ATTEMPTS if repair_transport else 0
+    for attempt in range(repair_limit + 1):
+        try:
+            api_health = edge_json(
+                "api.aigw.internal", "127.0.2.1", "/health/liveliness"
+            )
+            if api_health != "I'm alive!":
+                fail("the preprod API edge returned the wrong health response")
+            discovery = edge_json(
+                "auth.aigw.internal",
+                "127.0.3.1",
+                "/realms/aigw/.well-known/openid-configuration",
+            )
+            if not isinstance(discovery, dict) or discovery.get("issuer") != (
+                "https://auth.aigw.internal/realms/aigw"
+            ):
+                fail("the preprod identity edge returned the wrong issuer")
+        except EdgeTransportError as exc:
+            if attempt == repair_limit:
+                fail(
+                    "the preprod edge transport failed after bounded repair "
+                    f"with curl exit code {exc.returncode}"
+                )
+            compose(
+                args,
+                "up",
+                "-d",
+                "--no-deps",
+                "--force-recreate",
+                "preprod-edge-forwarder",
+                "preprod-edge-forwarder-adm",
+            )
+            wait_for_container(args, "preprod-edge-forwarder", "healthy", 120)
+            wait_for_container(
+                args, "preprod-edge-forwarder-adm", "healthy", 120
+            )
+            print(f"PREPROD_EDGE_FORWARDERS_REPAIRED attempt={attempt + 1}")
+            continue
+        print("PREPROD_EDGE_ROUTES_VERIFIED")
+        return
+    raise AssertionError("the bounded edge verification loop did not return")
 
 
 def vault_call(
