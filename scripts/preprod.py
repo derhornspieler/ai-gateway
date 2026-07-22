@@ -154,6 +154,7 @@ PREPROD_BIND_SOURCES = (
     "cribl-mock/config.preprod-tls.yaml",
     "grafana/provisioning",
     "litellm/aigw_default_model_hook.py",
+    "litellm/aigw_otel_callback.py",
     "loki/config.yml",
     "postgres/init",
     "prometheus/prometheus.yml",
@@ -174,6 +175,7 @@ PREPROD_BIND_SOURCES = (
     "secrets/preprod-wif-jwks.json",
     "secrets/preprod-wif.crt",
     "secrets/preprod-wif.key",
+    "secrets/litellm_otel_token",
     "secrets/redis_password",
     "secrets/redis_users.acl",
     "secrets/samba_user_preprod-admin_password",
@@ -1882,6 +1884,13 @@ def prepare(args: argparse.Namespace) -> None:
         f"user default reset on #{redis_password_hash} ~* &* +@all\n",
         0o600,
     )
+    # Stable local-only source credential for LiteLLM's authenticated Alloy
+    # receiver. Production generates its own token once on the target host.
+    write_file(
+        SECRETS_DIR / "litellm_otel_token",
+        static_hex("litellm-otel", 64),
+        0o600,
+    )
     jwks_path = SECRETS_DIR / "preprod-wif-jwks.json"
     if not jwks_path.exists():
         write_file(jwks_path, '{"keys":[]}\n', 0o600)
@@ -2055,7 +2064,10 @@ def rendered_compose_model(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def verify_rendered_resource_ownership(
-    args: argparse.Namespace, model: dict[str, Any]
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    *,
+    allow_missing_bind_sources: bool = False,
 ) -> set[str]:
     """Require the rendered model to keep every mutable resource in preprod."""
 
@@ -2118,10 +2130,22 @@ def verify_rendered_resource_ownership(
             bind_consumers.setdefault(source, set()).add(service_name)
             bind_mounts.append((service_name, mount))
 
-    expected_bind_sources = {
-        str((COMPOSE_DIR / relative).resolve(strict=True))
-        for relative in PREPROD_BIND_SOURCES
-    }
+    expected_bind_sources: set[str] = set()
+    for relative in PREPROD_BIND_SOURCES:
+        source_path = COMPOSE_DIR / relative
+        try:
+            source_path.lstat()
+        except FileNotFoundError:
+            if not allow_missing_bind_sources:
+                fail(f"required preprod bind source is missing: {relative}")
+            # Teardown must remain possible after a checkout adds a new bind
+            # that the older running deployment never had. Resolve the
+            # existing parent strictly, but do not create or read the leaf.
+            resolved_parent = source_path.parent.resolve(strict=True)
+            resolved = resolved_parent / source_path.name
+        else:
+            resolved = source_path.resolve(strict=True)
+        expected_bind_sources.add(str(resolved))
     if set(bind_consumers) != expected_bind_sources:
         fail("the rendered bind sources differ from the complete preprod digest inventory")
     for service_name, mount in bind_mounts:
@@ -3301,7 +3325,9 @@ def preflight_clean_room_resources(
     expected_volumes: set[str] = set()
     if ENV_FILE.exists():
         model = rendered_compose_model(source_args)
-        expected_volumes = verify_rendered_resource_ownership(source_args, model)
+        expected_volumes = verify_rendered_resource_ownership(
+            source_args, model, allow_missing_bind_sources=True
+        )
         verify_existing_project_boundary(source_args, expected_volumes)
 
     owned_container_ids: set[str] = set()
@@ -3512,7 +3538,9 @@ def _destroy_project_resources(
         validate_local_docker_context()
     if ENV_FILE.exists():
         model = rendered_compose_model(args)
-        expected_volume_names = verify_rendered_resource_ownership(args, model)
+        expected_volume_names = verify_rendered_resource_ownership(
+            args, model, allow_missing_bind_sources=True
+        )
         verify_existing_project_boundary(args, expected_volume_names)
         compose(
             args,

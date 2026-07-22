@@ -516,9 +516,15 @@ services:
       UI_PASSWORD: ${LITELLM_UI_BREAKGLASS_PASSWORD:?LITELLM_UI_BREAKGLASS_PASSWORD must be set}
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      OTEL_SERVICE_NAME: litellm
+      # The custom callback reads its bearer token from a private file and
+      # sends only traces to Alloy's authenticated receiver. The token never
+      # enters Docker Config.Env or LiteLLM's printable OTEL header setting.
+      AIGW_DEPLOYMENT_ENVIRONMENT: ${AIGW_DEPLOYMENT_ENVIRONMENT:-production}
+      DEBUG_OTEL: "false"
+      # LiteLLM 1.81+ no longer emits the request-level span by default. The
+      # reviewed Alloy allow-list, dashboards, and Cribl audit feed all key on
+      # this exact server-generated span name.
+      USE_OTEL_LITELLM_REQUEST_SPAN: "true"
       # Preserve HTTPS absolute redirects through the two reviewed proxy hops
       # only. In particular, LiteLLM's /ui -> /ui/ redirect must not downgrade
       # a completed oauth2-proxy callback to http://.
@@ -532,6 +538,10 @@ services:
       # Per-project default-model pre-call hook, registered in config.yaml's
       # litellm_settings.callbacks and resolved relative to /app/config.yaml.
       - ./litellm/aigw_default_model_hook.py:/app/aigw_default_model_hook.py:ro,Z
+      - ./litellm/aigw_otel_callback.py:/app/aigw_otel_callback.py:ro,Z
+      # Shared with Alloy only. `z` is required because two containers read
+      # the same host inode; `Z` would let the last container steal its label.
+      - ./secrets/litellm_otel_token:/run/secrets/litellm_otel_token:ro,z
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     networks:
       [net-chat, net-portal, net-admin-app, net-vendor, net-db-litellm,
@@ -1274,6 +1284,10 @@ services:
       # edge CA: the authority that signs this gateway's edge certificate has no
       # business vouching for the customer's telemetry endpoint.
       - ./certs/cribl-ca.pem:/etc/ssl/certs/aigw-cribl-ca.pem:ro
+      # Alloy intentionally runs with its SELinux process label disabled so it
+      # can read Docker's log tree. Do not ask Docker to relabel this mount;
+      # LiteLLM's shared `z` mount owns that exact host-file relabel contract.
+      - ./secrets/litellm_otel_token:/run/secrets/litellm_otel_token:ro
       - alloy_data:/var/lib/alloy
       # Read-only Docker json-file ingestion; never mount /var/run/docker.sock.
       - ${DOCKER_DATA_ROOT:?DOCKER_DATA_ROOT must be set}/containers:/var/lib/docker/containers:ro

@@ -77,7 +77,7 @@ litellm_settings:
   # before this hook runs. Callers should OMIT `model` to get the project
   # default; that path is enforced here for every key. The module is
   # bind-mounted next to this file and resolved relative to it.
-  callbacks: ["otel", "aigw_default_model_hook.aigw_default_model_enforcer"]
+  callbacks: ["aigw_otel_callback.aigw_otel", "aigw_default_model_hook.aigw_default_model_enforcer"]
   drop_params: true
   num_retries: 2
   request_timeout: 600

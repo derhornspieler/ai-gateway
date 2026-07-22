@@ -330,6 +330,67 @@ class PreprodContractTests(unittest.TestCase):
             {"aigw-preprod_pg18_data", "aigw-preprod_vault_data"},
         )
 
+    def test_teardown_tolerates_only_a_missing_new_bind_leaf(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(project="aigw-preprod")
+        labels = {
+            "com.aigw.preprod.project": args.project,
+            "com.aigw.preprod.config-digest": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            compose_root = Path(directory).resolve()
+            missing = compose_root / "secrets/new-token"
+            missing.parent.mkdir()
+            model = {
+                "services": {
+                    "alloy": {
+                        "labels": labels,
+                        "volumes": [
+                            {
+                                "type": "volume",
+                                "source": "preprod_empty_docker_logs",
+                                "target": "/var/lib/docker/containers",
+                                "read_only": True,
+                            },
+                            {
+                                "type": "bind",
+                                "source": str(missing),
+                                "target": "/run/secrets/new-token",
+                                "read_only": True,
+                                "bind": {"selinux": "Z"},
+                            },
+                        ],
+                    }
+                },
+                "networks": {},
+                "volumes": {
+                    "vault_data": {
+                        "name": "aigw-preprod_vault_data",
+                        "labels": labels,
+                    }
+                },
+            }
+            with (
+                mock.patch.object(module, "COMPOSE_DIR", compose_root),
+                mock.patch.object(
+                    module, "PREPROD_BIND_SOURCES", ("secrets/new-token",)
+                ),
+                mock.patch.object(module, "desired_networks", return_value={}),
+                mock.patch.object(
+                    module,
+                    "preprod_env_value",
+                    return_value="a" * 64,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    SystemExit, "required preprod bind source is missing"
+                ):
+                    module.verify_rendered_resource_ownership(args, model)
+                names = module.verify_rendered_resource_ownership(
+                    args, model, allow_missing_bind_sources=True
+                )
+            self.assertEqual(names, {"aigw-preprod_vault_data"})
+
     def test_macos_seed_loader_runs_as_the_recorded_docker_user(self) -> None:
         module = load_preprod_module()
         args = types.SimpleNamespace(

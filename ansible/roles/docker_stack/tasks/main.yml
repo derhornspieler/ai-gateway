@@ -451,6 +451,7 @@
     - grafana/provisioning/plugins/loki-drilldown.yml
     - litellm/config.yaml
     - litellm/aigw_default_model_hook.py
+    - litellm/aigw_otel_callback.py
     - loki/config.yml
     - postgres/init/01-init-databases.sh
     - prometheus/prometheus.yml
@@ -1241,6 +1242,108 @@
     group: root
     mode: "0700"
 
+# LiteLLM authenticates to Alloy with one stable, target-local token. Generate
+# it once instead of putting it in inventory, Compose environment metadata, or
+# a command argument. Both readers get only group-read access to this file.
+- name: Inspect the stable LiteLLM telemetry token without following links
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/secrets/litellm_otel_token"
+    follow: false
+    get_checksum: false
+  register: litellm_otel_token_before
+  no_log: true
+
+- name: Reject an unsafe pre-existing LiteLLM telemetry token
+  ansible.builtin.assert:
+    that:
+      - not (litellm_otel_token_before.stat.islnk | default(false))
+      - litellm_otel_token_before.stat.isreg | default(false)
+      - litellm_otel_token_before.stat.uid == 0
+      - litellm_otel_token_before.stat.gid == 473
+      - litellm_otel_token_before.stat.mode == '0440'
+      - (litellm_otel_token_before.stat.nlink | int) == 1
+      - (litellm_otel_token_before.stat.size | int) == 64
+    quiet: true
+    fail_msg: Existing LiteLLM telemetry token has an unsafe object, owner, or mode.
+  when: litellm_otel_token_before.stat.exists
+  no_log: true
+
+- name: Create the stable LiteLLM telemetry token once
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import secrets
+        import sys
+
+        path = sys.argv[1]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o440)
+        try:
+            os.fchown(descriptor, 0, 473)
+            os.fchmod(descriptor, 0o440)
+            payload = secrets.token_hex(32).encode("ascii")
+            while payload:
+                written = os.write(descriptor, payload)
+                if written <= 0:
+                    raise OSError("short write creating LiteLLM telemetry token")
+                payload = payload[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+      - "{{ stack_dir }}/secrets/litellm_otel_token"
+  when: not litellm_otel_token_before.stat.exists
+  no_log: true
+
+- name: Validate the stable LiteLLM telemetry token content
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import os
+        import re
+        import sys
+
+        path = sys.argv[1]
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            payload = os.read(descriptor, 65)
+        finally:
+            os.close(descriptor)
+        if re.fullmatch(rb"[0-9a-f]{64}", payload) is None:
+            raise SystemExit("malformed LiteLLM telemetry token")
+      - "{{ stack_dir }}/secrets/litellm_otel_token"
+  changed_when: false
+  no_log: true
+
+- name: Require the exact stable LiteLLM telemetry token boundary
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/secrets/litellm_otel_token"
+    follow: false
+    get_checksum: false
+  register: litellm_otel_token_after
+  no_log: true
+
+- name: Verify the exact stable LiteLLM telemetry token boundary
+  ansible.builtin.assert:
+    that:
+      - litellm_otel_token_after.stat.isreg | default(false)
+      - not (litellm_otel_token_after.stat.islnk | default(false))
+      - litellm_otel_token_after.stat.uid == 0
+      - litellm_otel_token_after.stat.gid == 473
+      - litellm_otel_token_after.stat.mode == '0440'
+      - (litellm_otel_token_after.stat.nlink | int) == 1
+      - (litellm_otel_token_after.stat.size | int) == 64
+    quiet: true
+    fail_msg: LiteLLM telemetry token creation did not produce the exact boundary.
+  no_log: true
+
 - name: Materialize Redis authentication files outside command and environment metadata
   ansible.builtin.copy:
     content: "{{ item.content }}\n"
@@ -1944,6 +2047,7 @@
           {'path': stack_dir ~ '/grafana/provisioning', 'recursive': true},
           {'path': stack_dir ~ '/keycloak/realms', 'recursive': true},
           {'path': stack_dir ~ '/litellm/aigw_default_model_hook.py', 'recursive': false},
+          {'path': stack_dir ~ '/litellm/aigw_otel_callback.py', 'recursive': false},
           {'path': stack_dir ~ '/litellm/config.yaml', 'recursive': false},
           {'path': stack_dir ~ '/loki/config.yml', 'recursive': false},
           {'path': stack_dir ~ '/postgres/init', 'recursive': true},
@@ -1951,6 +2055,7 @@
           {'path': stack_dir ~ '/prometheus/rules.yml', 'recursive': false},
           {'path': stack_dir ~ '/secrets/redis_password', 'recursive': false},
           {'path': stack_dir ~ '/secrets/redis_users.acl', 'recursive': false},
+          {'path': stack_dir ~ '/secrets/litellm_otel_token', 'recursive': false},
           {'path': stack_dir ~ '/traefik/dynamic-adm.yml', 'recursive': false},
           {'path': stack_dir ~ '/traefik/dynamic-int.yml', 'recursive': false},
           {'path': stack_dir ~ '/traefik/traefik-adm.yml', 'recursive': false},

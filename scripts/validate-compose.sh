@@ -1949,7 +1949,7 @@ assert len(re.findall(
 # beside it) would silently disable a reviewed policy control, so pin the
 # exact callback list.
 assert len(re.findall(
-    r'(?m)^  callbacks: \["otel", '
+    r'(?m)^  callbacks: \["aigw_otel_callback\.aigw_otel", '
     r'"aigw_default_model_hook\.aigw_default_model_enforcer"\]$',
     text,
 )) == 1
@@ -1973,6 +1973,27 @@ for required in (
     assert required in hook_source, required
 for forbidden in ("subprocess", "socket", "urllib", "requests", "http.client"):
     assert f"import {forbidden}" not in hook_source, forbidden
+
+# LiteLLM's dedicated OTLP callback keeps the source-authentication token out
+# of Compose environment metadata and LiteLLM's printable OTEL header setting.
+otel = Path(sys.argv[1]).parent / "aigw_otel_callback.py"
+otel_source = otel.read_text()
+compile(otel_source, str(otel), "exec")
+for required in (
+    'TOKEN_PATH = "/run/secrets/litellm_otel_token"',
+    'ALLOY_TRACES_URL = "http://alloy:4319/v1/traces"',
+    'getattr(os, "O_NOFOLLOW", 0)',
+    "stat.S_ISREG(details.st_mode)",
+    "details.st_nlink != 1",
+    "os.read(descriptor, 65)",
+    'headers={"Authorization": f"Bearer {token}"}',
+    "return BatchSpanProcessor(self._aigw_exporter)",
+    'environment not in {"preprod", "production"}',
+    'raise RuntimeError("dynamic OTLP headers are not allowed")',
+):
+    assert required in otel_source, required
+for forbidden in ("subprocess", "socket", "urllib", "requests", "http.client"):
+    assert f"import {forbidden}" not in otel_source, forbidden
 PY
 
 python3 -I - "$COMPOSE_DIR/alloy/config.alloy" <<'PY'
@@ -1981,6 +2002,22 @@ import re
 import sys
 
 text = Path(sys.argv[1]).read_text()
+for required in (
+    'local.file "litellm_otel_token"',
+    'filename  = "/run/secrets/litellm_otel_token"',
+    "is_secret = true",
+    'otelcol.auth.bearer "litellm"',
+    'otelcol.receiver.otlp "litellm"',
+    'sys.env("ALLOY_TELEMETRY_IP") + ":4319"',
+    "auth     = otelcol.auth.bearer.litellm.handler",
+    'otelcol.processor.attributes "untrusted_source"',
+    'otelcol.processor.filter "untrusted_source"',
+    '`resource.attributes["service.name"] == "litellm"`',
+    'otelcol.processor.attributes "authenticated_litellm"',
+    'value  = "litellm_bearer_v1"',
+    '`attributes["aigw.security.source_authenticated"] != "litellm_bearer_v1"`',
+):
+    assert required in text, required
 begin = "// BEGIN AIGW MANAGED CRIBL TLS"
 end = "// END AIGW MANAGED CRIBL TLS"
 assert text.count(begin) == text.count(end) == 1

@@ -42,12 +42,24 @@ ANTHROPIC_CA_FINGERPRINTS = (
 OTLP_FIXTURE_HELPER = r"""
 import http.client
 import json
+import os
 import sys
 import time
 
 test = json.load(sys.stdin)
 token = test["token"]
 now = str(time.time_ns())
+
+descriptor = os.open(
+    "/run/secrets/litellm_otel_token",
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    otlp_token = os.read(descriptor, 65).decode("ascii")
+finally:
+    os.close(descriptor)
+if len(otlp_token) != 64 or any(character not in "0123456789abcdef" for character in otlp_token):
+    raise SystemExit("LiteLLM OTLP token is malformed")
 
 def text(key, value):
     return {"key": key, "value": {"stringValue": value}}
@@ -71,12 +83,14 @@ def nested_string(key, value):
         },
     }
 
-def post(path, document):
+def post(path, document, authenticated=False):
     body = json.dumps(document, separators=(",", ":"))
-    connection = http.client.HTTPConnection("alloy", 4318, timeout=10)
-    connection.request(
-        "POST", path, body=body, headers={"Content-Type": "application/json"}
-    )
+    port = 4319 if authenticated else 4318
+    headers = {"Content-Type": "application/json"}
+    if authenticated:
+        headers["Authorization"] = "Bearer " + otlp_token
+    connection = http.client.HTTPConnection("alloy", port, timeout=10)
+    connection.request("POST", path, body=body, headers=headers)
     response = connection.getresponse()
     response.read(1048577)
     connection.close()
@@ -178,6 +192,7 @@ post(
             }],
         }]
     },
+    authenticated=True,
 )
 post(
     "/v1/metrics",
@@ -217,11 +232,23 @@ print("OTLP_FIXTURES_ACCEPTED")
 OTLP_OUTAGE_HELPER = r"""
 import http.client
 import json
+import os
 import sys
 import time
 
 test = json.load(sys.stdin)
 token = test["token"]
+
+descriptor = os.open(
+    "/run/secrets/litellm_otel_token",
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    otlp_token = os.read(descriptor, 65).decode("ascii")
+finally:
+    os.close(descriptor)
+if len(otlp_token) != 64 or any(character not in "0123456789abcdef" for character in otlp_token):
+    raise SystemExit("LiteLLM OTLP token is malformed")
 
 def text(key, value):
     return {"key": key, "value": {"stringValue": value}}
@@ -255,11 +282,14 @@ for sequence in range(6):
             }],
         }]
     }
-    connection = http.client.HTTPConnection("alloy", 4318, timeout=10)
+    connection = http.client.HTTPConnection("alloy", 4319, timeout=10)
     body = json.dumps(document, separators=(",", ":"))
     connection.request(
         "POST", "/v1/traces", body=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + otlp_token,
+        },
     )
     response = connection.getresponse()
     response.read(1048577)
@@ -268,6 +298,156 @@ for sequence in range(6):
         raise SystemExit("OTLP receiver rejected an outage fixture")
     time.sleep(1.2)
 print("OTLP_OUTAGE_FIXTURES_ACCEPTED")
+""".strip()
+
+
+OTLP_SPOOF_HELPER = r"""
+import http.client
+import json
+import sys
+import time
+
+test = json.load(sys.stdin)
+token = test["token"]
+now = str(time.time_ns())
+
+def text(key, value):
+    return {"key": key, "value": {"stringValue": value}}
+
+document = {
+    "resourceSpans": [{
+        "resource": {"attributes": [text("service.name", "litellm")]},
+        "scopeSpans": [{
+            "scope": {"name": "aigw.preprod.untrusted"},
+            "spans": [{
+                "traceId": token * 2,
+                "spanId": token,
+                "name": "litellm_request",
+                "kind": 2,
+                "startTimeUnixNano": now,
+                "endTimeUnixNano": str(int(now) + 1000),
+                "attributes": [
+                    text("aigw.security.source_authenticated", "FORGED_AUTH_MARKER_" + token),
+                    text("metadata.user_api_key_user_id", "spoof-user-" + token),
+                    text("metadata.user_api_key_hash", "d" * 64),
+                    text("metadata.user_api_key_project_id", "receipt-project"),
+                    text("metadata.user_api_key_end_user_id", "spoof-user-" + token),
+                    text("litellm.call_id", "untrusted-call-" + token),
+                    text("gen_ai.request.model", "receipt-model"),
+                    text("gen_ai.input.messages", "DENIED_UNTRUSTED_SOURCE_" + token),
+                ],
+            }],
+        }],
+    }]
+}
+body = json.dumps(document, separators=(",", ":"))
+
+def post(port, authorization=None):
+    headers = {"Content-Type": "application/json"}
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    connection = http.client.HTTPConnection("alloy", port, timeout=10)
+    connection.request("POST", "/v1/traces", body=body, headers=headers)
+    response = connection.getresponse()
+    response.read(1048577)
+    connection.close()
+    return response.status
+
+if post(4318) != 200:
+    raise SystemExit("open OTLP receiver rejected the untrusted fixture")
+for authorization in (None, "Bearer " + "0" * 64):
+    if post(4319, authorization) not in {401, 403}:
+        raise SystemExit("authenticated OTLP receiver accepted a bad credential")
+print("OTLP_SPOOF_REJECTED")
+""".strip()
+
+
+LITELLM_REAL_REQUEST_HELPER = r"""
+import http.client
+import json
+import sys
+
+test = json.load(sys.stdin)
+marker = test["marker"]
+master_key = test["master_key"]
+virtual_key = test["virtual_key"]
+username = "receipt-user-" + marker
+
+def request(path, bearer, document, *, user=None):
+    headers = {
+        "Authorization": "Bearer " + bearer,
+        "Content-Type": "application/json",
+    }
+    if user is not None:
+        headers["X-OpenWebUI-User-Email"] = user
+    body = json.dumps(document, separators=(",", ":"))
+    connection = http.client.HTTPConnection("litellm", 4000, timeout=30)
+    connection.request("POST", path, body=body, headers=headers)
+    response = connection.getresponse()
+    raw = response.read(1048577)
+    connection.close()
+    if len(raw) > 1048576:
+        raise SystemExit("LiteLLM returned an oversized response")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise SystemExit("LiteLLM returned invalid JSON")
+    return response.status, parsed
+
+created = False
+problem = None
+try:
+    status, generated = request(
+        "/key/generate",
+        master_key,
+        {
+            "key": virtual_key,
+            "key_alias": "receipt-" + marker,
+            "user_id": "default_user_id",
+            "models": ["claude-sonnet-4-5"],
+            "allowed_routes": ["/v1/chat/completions"],
+            "metadata": {
+                "aigw_project_id": "receipt-project",
+                "aigw_username": username,
+            },
+            "permissions": {},
+            "blocked": False,
+        },
+    )
+    if status != 200 or generated.get("key") != virtual_key:
+        raise RuntimeError("LiteLLM did not create the exact receipt key")
+    created = True
+    status, inference = request(
+        "/v1/chat/completions",
+        virtual_key,
+        {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "real-ai-input-" + marker}],
+        },
+        user=username,
+    )
+    choices = inference.get("choices")
+    reply = ""
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            reply = message.get("content", "")
+    if status != 200 or reply.strip() != "pong":
+        raise RuntimeError("the real LiteLLM request did not return pong")
+except Exception as error:
+    problem = str(error)
+finally:
+    if created:
+        delete_status, _ = request(
+            "/key/delete", master_key, {"keys": [virtual_key]}
+        )
+        if delete_status != 200 and problem is None:
+            problem = "LiteLLM did not delete the receipt key"
+
+if problem is not None:
+    raise SystemExit(problem)
+print("LITELLM_REAL_REQUEST_ACCEPTED")
 """.strip()
 
 
@@ -647,12 +827,19 @@ def write_log_fixtures(preprod: Preprod, model: dict[str, Any], token: str) -> N
     )
 
 
-def send_otlp_fixtures(preprod: Preprod, helper: str, token: str, marker: str) -> None:
+def send_otlp_fixtures(
+    preprod: Preprod,
+    helper: str,
+    token: str,
+    marker: str,
+    *,
+    service: str = "litellm",
+) -> None:
     output = preprod.compose(
         "exec",
         "-T",
-        "key-rotator",
-        "/opt/venv/bin/python",
+        service,
+        "python3",
         "-c",
         helper,
         input_text=json.dumps({"token": token}, separators=(",", ":")),
@@ -660,6 +847,65 @@ def send_otlp_fixtures(preprod: Preprod, helper: str, token: str, marker: str) -
     )
     if output.strip() != marker:
         fail("the OTLP fixture helper returned an invalid receipt")
+
+
+def send_real_litellm_request(preprod: Preprod, token: str) -> None:
+    values = env_values()
+    master_key = values.get("LITELLM_MASTER_KEY")
+    if not master_key:
+        fail("the generated preprod environment has no LiteLLM master key")
+    output = preprod.compose(
+        "exec",
+        "-T",
+        "key-rotator",
+        "/opt/venv/bin/python",
+        "-c",
+        LITELLM_REAL_REQUEST_HELPER,
+        input_text=json.dumps(
+            {
+                "marker": token,
+                "master_key": master_key,
+                "virtual_key": "sk-" + secrets.token_hex(24),
+            },
+            separators=(",", ":"),
+        ),
+        sensitive=True,
+    )
+    if output.strip() != "LITELLM_REAL_REQUEST_ACCEPTED":
+        fail("the real LiteLLM request helper returned an invalid receipt")
+
+
+def assert_otel_token_is_file_only(preprod: Preprod) -> None:
+    path = COMPOSE_DIR / "secrets/litellm_otel_token"
+    try:
+        metadata = path.lstat()
+        token = path.read_text(encoding="ascii")
+    except OSError:
+        fail("the generated LiteLLM OTLP token is unreadable")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or re.fullmatch(r"[0-9a-f]{64}", token) is None
+    ):
+        fail("the generated LiteLLM OTLP token boundary is invalid")
+
+    if token in ENV_FILE.read_text(encoding="utf-8"):
+        fail("the LiteLLM OTLP token entered the preprod environment file")
+    for service in ("litellm", "alloy"):
+        identifier = preprod.container_id(service)
+        document = json.loads(preprod.docker("inspect", identifier))[0]
+        config = document.get("Config") or {}
+        metadata_text = json.dumps(
+            {"Env": config.get("Env"), "Cmd": config.get("Cmd")},
+            separators=(",", ":"),
+        )
+        if token in metadata_text:
+            fail("the LiteLLM OTLP token entered Docker configuration metadata")
+        logs = preprod.docker("logs", identifier, include_stderr=True)
+        if token in logs:
+            fail("the LiteLLM OTLP token entered container logs")
 
 
 def log_cursor() -> str:
@@ -737,6 +983,9 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"DENIED_MALFORMED_{token}",
         f"DENIED_RAW_TRACE_{token}",
         f"DENIED_UNATTRIBUTED_TRACE_{token}",
+        f"DENIED_UNTRUSTED_SOURCE_{token}",
+        f"FORGED_AUTH_MARKER_{token}",
+        f"untrusted-call-{token}",
         f"DENIED_KEYCLOAK_MISSING_USER_{token}",
         f"denied_raw_metric_{token}",
         f"DENIED_RAW_LOG_{token}",
@@ -972,6 +1221,7 @@ def main() -> int:
     model = preprod.model()
     preprod.wait_healthy("alloy")
     preprod.wait_healthy("cribl-mock")
+    assert_otel_token_is_file_only(preprod)
 
     receipt_since = log_cursor()
     # Generate a fresh, real Vault audit record after the Docker log cursor.
@@ -990,10 +1240,19 @@ def main() -> int:
         fail("the live Vault audit receipt could not be generated")
     write_log_fixtures(preprod, model, token)
     send_otlp_fixtures(preprod, OTLP_FIXTURE_HELPER, token, "OTLP_FIXTURES_ACCEPTED")
+    send_otlp_fixtures(
+        preprod,
+        OTLP_SPOOF_HELPER,
+        token,
+        "OTLP_SPOOF_REJECTED",
+        service="key-rotator",
+    )
+    send_real_litellm_request(preprod, token)
     logs = wait_for_receipts(
         preprod,
         (
             f"allowed-ai-input-{token}",
+            f"real-ai-input-{token}",
             f"nested-call-{token}",
             f"event_type=LOGIN realm_id=aigw client_id=portal user_id=receipt-{token}",
             f"event=aigw.portal.audit action=rotation.trigger outcome=success subject=receipt-{token}",

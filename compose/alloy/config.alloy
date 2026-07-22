@@ -1,9 +1,11 @@
 // Grafana Alloy — observability fan-out (solution-map §1.8).
 //
 // Trust boundaries:
-// - OTLP listens only on Alloy's fixed net-telemetry address. Attaching Alloy
-//   to storage/export networks must never expose its unauthenticated receiver
-//   or HTTP UI on those networks.
+// - OTLP listens only on Alloy's fixed net-telemetry address. Port 4318 accepts
+//   ordinary internal telemetry but strips the server-owned LiteLLM marker.
+//   Port 4319 accepts LiteLLM traces only after bearer authentication. Attaching
+//   Alloy to storage/export networks must never expose either receiver or its
+//   HTTP UI on those networks.
 // - Full prompt/completion bodies are deliberate span attributes (§9.7). Only
 //   the exact sanitized litellm_request span is converted to a log for the
 //   customer Cribl security feed and the local per-request Loki stream
@@ -11,13 +13,70 @@
 // - Docker logs are read from the host's json-file directory, read-only. The
 //   Docker API socket is intentionally not mounted.
 
+local.file "litellm_otel_token" {
+  filename  = "/run/secrets/litellm_otel_token"
+  is_secret = true
+}
+
+otelcol.auth.bearer "litellm" {
+  token = local.file.litellm_otel_token.content
+}
+
 otelcol.receiver.otlp "default" {
   grpc { endpoint = sys.env("ALLOY_TELEMETRY_IP") + ":4317" }
   http { endpoint = sys.env("ALLOY_TELEMETRY_IP") + ":4318" }
   output {
-    traces  = [otelcol.processor.memory_limiter.default.input]
+    traces  = [otelcol.processor.attributes.untrusted_source.input]
     logs    = [otelcol.processor.memory_limiter.default.input]
     metrics = [otelcol.processor.memory_limiter.default.input]
+  }
+}
+
+otelcol.receiver.otlp "litellm" {
+  http {
+    endpoint = sys.env("ALLOY_TELEMETRY_IP") + ":4319"
+    auth     = otelcol.auth.bearer.litellm.handler
+  }
+  output {
+    traces = [otelcol.processor.attributes.authenticated_litellm.input]
+  }
+}
+
+// A caller cannot self-assert this marker. The open receiver deletes it, and
+// the authenticated receiver overwrites it after checking the shared token.
+otelcol.processor.attributes "untrusted_source" {
+  action {
+    key    = "aigw.security.source_authenticated"
+    action = "delete"
+  }
+  output {
+    traces = [otelcol.processor.filter.untrusted_source.input]
+  }
+}
+
+// The open receiver is for ordinary internal telemetry, such as key-rotator.
+// A peer may claim any resource name in its payload, so reject every LiteLLM
+// claim here. Only the authenticated receiver below may admit that source.
+otelcol.processor.filter "untrusted_source" {
+  error_mode = "propagate"
+  traces {
+    span = [
+      `resource.attributes["service.name"] == "litellm"`,
+    ]
+  }
+  output {
+    traces = [otelcol.processor.memory_limiter.default.input]
+  }
+}
+
+otelcol.processor.attributes "authenticated_litellm" {
+  action {
+    key    = "aigw.security.source_authenticated"
+    action = "upsert"
+    value  = "litellm_bearer_v1"
+  }
+  output {
+    traces = [otelcol.processor.memory_limiter.default.input]
   }
 }
 
@@ -291,6 +350,7 @@ otelcol.processor.filter "aigw_request_spans" {
   error_mode = "propagate"
   traces {
     span = [
+      `attributes["aigw.security.source_authenticated"] != "litellm_bearer_v1"`,
       `resource.attributes["service.name"] != "litellm" or name != "litellm_request"`,
       `not IsString(attributes["aigw.user.id"]) or not IsMatch(attributes["aigw.user.id"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,
       `not IsString(attributes["aigw.user.name"]) or not IsMatch(attributes["aigw.user.name"], "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")`,

@@ -125,7 +125,7 @@ class DefaultModelHookWiringContract(unittest.TestCase):
         self.assertEqual(
             len(
                 re.findall(
-                    r"(?m)^  callbacks: \[\"otel\", "
+                    r"(?m)^  callbacks: \[\"aigw_otel_callback\.aigw_otel\", "
                     r"\"aigw_default_model_hook\."
                     r"aigw_default_model_enforcer\"\]$",
                     config,
@@ -138,7 +138,12 @@ class DefaultModelHookWiringContract(unittest.TestCase):
         manifest = json.loads(DIGEST_INPUTS.read_text(encoding="utf-8"))
         self.assertEqual(
             manifest["base"]["litellm"],
-            ["litellm/config.yaml", "litellm/aigw_default_model_hook.py"],
+            [
+                "litellm/config.yaml",
+                "litellm/aigw_default_model_hook.py",
+                "litellm/aigw_otel_callback.py",
+                "secrets/litellm_otel_token",
+            ],
         )
 
     def test_hook_ships_via_sync_allowlist_and_selinux_boundary(self) -> None:
@@ -147,11 +152,22 @@ class DefaultModelHookWiringContract(unittest.TestCase):
             "- name: Sync allow-listed compose configuration files", 1
         )[1].split("- name: Render plane-specific container resolver lists", 1)[0]
         self.assertIn("- litellm/aigw_default_model_hook.py", sync)
+        self.assertIn("- litellm/aigw_otel_callback.py", sync)
         boundary = source.split(
             "- name: Define the exact SELinux read-only bind-source boundary", 1
         )[1]
         self.assertIn(
             "{'path': stack_dir ~ '/litellm/aigw_default_model_hook.py', "
+            "'recursive': false},",
+            boundary,
+        )
+        self.assertIn(
+            "{'path': stack_dir ~ '/litellm/aigw_otel_callback.py', "
+            "'recursive': false},",
+            boundary,
+        )
+        self.assertIn(
+            "{'path': stack_dir ~ '/secrets/litellm_otel_token', "
             "'recursive': false},",
             boundary,
         )

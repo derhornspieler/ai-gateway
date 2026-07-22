@@ -210,7 +210,14 @@ class EdgeTlsContractTests(unittest.TestCase):
             "CRIBL_OTLP_CA_FILE: ${CRIBL_OTLP_CA_FILE:-/etc/ssl/certs/aigw-cribl-ca.pem}", compose
         )
         digest = json.loads(DIGEST_INPUTS.read_text(encoding="utf-8"))
-        self.assertEqual(digest["base"]["alloy"], ["alloy/config.alloy", "certs/cribl-ca.pem"])
+        self.assertEqual(
+            digest["base"]["alloy"],
+            [
+                "alloy/config.alloy",
+                "certs/cribl-ca.pem",
+                "secrets/litellm_otel_token",
+            ],
+        )
 
     def test_verify_rejects_placeholder_on_real_ca_profiles(self) -> None:
         verify = VERIFY.read_text(encoding="utf-8")

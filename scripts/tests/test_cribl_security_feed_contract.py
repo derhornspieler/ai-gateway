@@ -140,8 +140,13 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         )
         for marker in (
             "OTLP_FIXTURES_ACCEPTED",
+            "OTLP_SPOOF_REJECTED",
+            "LITELLM_REAL_REQUEST_ACCEPTED",
             "DENIED_RAW_TRACE_",
             "DENIED_UNATTRIBUTED_TRACE_",
+            "DENIED_UNTRUSTED_SOURCE_",
+            "FORGED_AUTH_MARKER_",
+            "real-ai-input-",
             "DENIED_KEYCLOAK_MISSING_USER_",
             "PROMPT_PASSWORD_",
             "PROMPT_BEARER_",
@@ -169,6 +174,8 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             '"verify",',
             "the live Vault audit receipt could not be generated",
             "wait_for_queue(preprod, model, populated=True)",
+            "assert_otel_token_is_file_only(preprod)",
+            "send_real_litellm_request(preprod, token)",
             "exercise_tls_server_name_failure(preprod, model, tls_token)",
             "Alloy accepted a Cribl certificate with the wrong server name",
             'preprod.docker("restart", "--time", "10", alloy)',
