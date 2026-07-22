@@ -331,7 +331,7 @@ opaque `invalid_grant`. Do this with **zero exchange outage** by overlapping key
 
 - [anthropic-wif-bootstrap.md](../anthropic-wif-bootstrap.md) — the implemented
   runbook this SOP condenses (authoritative for edge cases).
-- [Acceptance test record](../test-runbook.md#6-record-the-result) — where to
+- [Acceptance test record](../test-runbook.md#7-record-the-result) — where to
   record the real canary result without saving a key or token.
 - [identity-operations.md](../identity-operations.md) — Keycloak controller and
   identity recovery.

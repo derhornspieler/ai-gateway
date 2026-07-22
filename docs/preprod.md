@@ -22,7 +22,7 @@ the Rocky Linux host roles. It does not change a production project.
 | --- | --- |
 | Quick source check | [Start from source](#start-from-source) |
 | Final release test | [Test an offline seed](#test-an-offline-seed) |
-| Manual browser test | [Local names](#local-names), then the [browser checks](test-runbook.md#3-run-the-real-browser-check) |
+| Manual browser test | [Local names](#local-names), then the [browser checks](test-runbook.md#4-run-the-real-browser-check) |
 | Final release teardown | [Finish with exact-manifest teardown](#finish-with-exact-manifest-teardown) |
 | Quick development cleanup | [Remove a development stack](#remove-a-development-stack) |
 

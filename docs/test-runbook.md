@@ -39,12 +39,14 @@ Run these steps in order:
 6. Let Ansible start seed mode once, with no pull or build.
 7. Pass service, LDAPS, Root CA, Vault, WIF, OIDC, role, logout, and inference
    checks.
-8. Pass the real-browser checks.
-9. Run the exact-manifest clean-room teardown. Prove every owned resource and
+8. Restart Vault. Prove it seals, then let Ansible unseal it and pass the same
+   exact-seed checks again.
+9. Pass the real-browser checks.
+10. Run the exact-manifest clean-room teardown. Prove every owned resource and
    release image is absent and unrelated image IDs are unchanged.
-10. Push the exact tested commit to `main`.
-11. Wait for every required GitHub job, including the release container scan.
-12. Save the final non-secret release record.
+11. Push the exact tested commit to `main`.
+12. Wait for every required GitHub job, including the release container scan.
+13. Save the final non-secret release record.
 
 The automated test uses real TLS, Samba AD, Keycloak, and web sessions. It does
 not launch a browser. The browser step is separate.
@@ -311,7 +313,56 @@ The run must prove:
 
 See [Local preprod](preprod.md) for the users and network model.
 
-## 3. Run the real-browser check
+## 3. Prove Vault restart recovery
+
+Keep the exact seeded preprod deployment running. This test proves the normal
+Vault restart and Ansible recovery path. It does not create or reboot a VM.
+
+Restart only the preprod Vault container:
+
+```bash
+docker restart --time 30 aigw-preprod-vault-1
+```
+
+Check Vault from inside that container:
+
+```bash
+docker exec -e VAULT_ADDR=http://127.0.0.1:8200 \
+  aigw-preprod-vault-1 vault status -format=json
+```
+
+Exit code `2` is expected while Vault is sealed. The JSON must say
+`"initialized": true` and `"sealed": true`. The health probe must fail with
+HTTP 503:
+
+```bash
+docker exec aigw-preprod-vault-1 \
+  /usr/local/bin/aigw-health-probe http \
+  --url 'http://127.0.0.1:8200/v1/sys/health?standbyok=true'
+```
+
+Rerun the exact preprod pair without `--load-archive`. The archive was already
+loaded. This second run asks Ansible to unseal Vault and recheck the whole
+deployment:
+
+```bash
+python3 -I scripts/update-images.py test-preprod \
+  --archive /absolute/private/path/aigw-YYYY-MM-DD.preprod.docker.tar.zst \
+  --manifest /absolute/private/path/aigw-YYYY-MM-DD.preprod.manifest.json \
+  --become-password-file "$HOME/.ssh/become"
+```
+
+Use `--ask-become-pass` instead when needed. A pass prints
+`PREPROD_E2E_PASSED` and `SEEDED_PREPROD_E2E_PASSED` again. Check Vault one
+more time with the same `vault status` command. It must now exit `0` and say
+`"initialized": true` and `"sealed": false`. The same health probe must also
+exit `0`.
+
+Never put the Vault share on the command line, in an environment variable, or
+in the test record. Ansible reads the encrypted controller value and sends the
+share on standard input.
+
+## 4. Run the real-browser check
 
 Keep seeded preprod running. Use a new browser profile with no old cookies.
 The Ansible deploy already installed the marker-bounded preprod block in
@@ -343,7 +394,7 @@ Remove the Root CA from the browser profile. The exact-manifest teardown in the
 next section removes the preprod hosts block. Do not save cookie values in the
 test record.
 
-## 4. Clean up and handle a failure
+## 5. Clean up and handle a failure
 
 After a release pass or failure, run the clean-room play with the exact tested
 preprod paths and hashes:
@@ -384,7 +435,7 @@ If a required check fails:
 
 Do not edit a manifest. Do not weaken an ownership check.
 
-## 5. Understand the production boundary
+## 6. Understand the production boundary
 
 Local preprod does not prove production NICs, routes, SELinux, disk encryption,
 customer PKI, firewall rules, or the customer directory. Production Ansible
@@ -401,7 +452,7 @@ approved maintenance window.
 PostgreSQL major changes use the
 [PostgreSQL 18 migration SOP](sop/postgresql-18-migration.md).
 
-## 6. Record the result
+## 7. Record the result
 
 Record:
 
