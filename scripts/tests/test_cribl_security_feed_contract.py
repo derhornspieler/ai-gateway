@@ -252,6 +252,9 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             "DENIED_FUTURE_TIMESTAMP_",
             "ALLOWED_RECENT_PAST_TIMESTAMP_",
             "ALLOWED_CLOCK_SKEW_TIMESTAMP_",
+            "denied-changed-string-",
+            "denied-changed-null-",
+            "denied-changed-number-",
             "real-ai-input-",
             "runtime-openwebui-ai-input-",
             "DENIED_KEYCLOAK_MISSING_USER_",
@@ -414,6 +417,11 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
             structured,
         )
         self.assertIn(
+            'security_changed_present         = '
+            '"contains(keys(@), \'changed\')"',
+            structured,
+        )
+        self.assertIn(
             'template = `{{ if and (eq .security_changed_type "boolean") '
             '(eq .Value "true") }}true{{ else if and '
             '(eq .security_changed_type "boolean") (eq .Value "false") '
@@ -422,6 +430,17 @@ class CriblSecurityFeedContractTests(unittest.TestCase):
         )
         self.assertNotIn("eq .Value true", structured)
         self.assertNotIn("eq .Value false", structured)
+        self.assertIn(
+            'source   = "security_changed_present"\n'
+            '    template = `{{ if eq .Value "true" }}present{{ end }}`',
+            structured,
+        )
+        self.assertIn(
+            'selector            = '
+            '"{security_changed_present!=\\"\\",security_changed=\\"\\"}"',
+            structured,
+        )
+        self.assertIn('"security_changed_present",', structured)
         for raw_value, expected in (("true", True), ("false", False)):
             document = json.loads('{"changed":' + raw_value + "}")
             self.assertIs(type(document["changed"]), bool)

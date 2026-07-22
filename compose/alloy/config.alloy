@@ -906,6 +906,7 @@ loki.process "cribl_structured_security" {
       security_attempt_present         = "contains(keys(@), 'attempt')",
       security_ca_fingerprints         = "ca_sha256_fingerprints",
       security_changed                 = "changed",
+      security_changed_present         = "contains(keys(@), 'changed')",
       security_changed_type            = "type(changed)",
       security_change_kind             = "change_kind",
       security_error_type              = "error_type",
@@ -940,6 +941,10 @@ loki.process "cribl_structured_security" {
   stage.template {
     source   = "security_changed"
     template = `{{ if and (eq .security_changed_type "boolean") (eq .Value "true") }}true{{ else if and (eq .security_changed_type "boolean") (eq .Value "false") }}false{{ end }}`
+  }
+  stage.template {
+    source   = "security_changed_present"
+    template = `{{ if eq .Value "true" }}present{{ end }}`
   }
   // Alloy stringifies extracted template values, so templates cannot tell a
   // JSON number from a quoted look-alike. JMESPath checks only root object keys,
@@ -1028,6 +1033,7 @@ loki.process "cribl_structured_security" {
       security_attempt_present  = "",
       security_ca_fingerprints  = "",
       security_changed          = "",
+      security_changed_present  = "",
       security_change_kind      = "",
       security_detail_any       = "",
       security_detail_except_changed = "",
@@ -1525,6 +1531,11 @@ loki.process "cribl_structured_security" {
     drop_counter_reason = "malformed_security_project"
   }
   stage.match {
+    selector            = "{security_changed_present!=\"\",security_changed=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "malformed_security_changed"
+  }
+  stage.match {
     selector            = "{security_changed!~\"|true|false\"}"
     action              = "drop"
     drop_counter_reason = "malformed_security_changed"
@@ -1698,6 +1709,7 @@ loki.process "cribl_structured_security" {
       "security_attempt_present",
       "security_ca_fingerprints",
       "security_changed",
+      "security_changed_present",
       "security_change_kind",
       "security_detail_any",
       "security_detail_except_changed",

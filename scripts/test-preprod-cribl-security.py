@@ -1374,23 +1374,20 @@ def fixture_lines(token: str) -> str:
         (
             "key-rotator",
             'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
-            '"action":"managed_identity_change_planned","outcome":"success",'
-            '"changed":"true","change_kind":"planned_change",'
-            '"operation_id":"123e4567-e89b-42d3-a456-426614174030"}',
+            '"action":"deployment_converge","outcome":"success",'
+            f'"changed":"true","project":"denied-changed-string-{token}"}}',
         ),
         (
             "key-rotator",
             'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
-            '"action":"managed_identity_change_planned","outcome":"success",'
-            '"changed":null,"change_kind":"planned_change",'
-            '"operation_id":"123e4567-e89b-42d3-a456-426614174031"}',
+            '"action":"deployment_converge","outcome":"success",'
+            f'"changed":null,"project":"denied-changed-null-{token}"}}',
         ),
         (
             "key-rotator",
             'AIGW_SECURITY_EVENT {"schema_version":1,"event":"aigw.identity.audit",'
-            '"action":"managed_identity_change_planned","outcome":"success",'
-            '"changed":1,"change_kind":"planned_change",'
-            '"operation_id":"123e4567-e89b-42d3-a456-426614174032"}',
+            '"action":"deployment_converge","outcome":"success",'
+            f'"changed":1,"project":"denied-changed-number-{token}"}}',
         ),
         (
             "key-rotator",
@@ -2352,9 +2349,9 @@ def assert_initial_receipts(logs: str, token: str) -> None:
         f"DENIED_STALE_TIMESTAMP_{token}",
         f"DENIED_FUTURE_TIMESTAMP_{token}",
         "aigw.security.source_time_unix_nano",
-        "123e4567-e89b-42d3-a456-426614174030",
-        "123e4567-e89b-42d3-a456-426614174031",
-        "123e4567-e89b-42d3-a456-426614174032",
+        f"denied-changed-string-{token}",
+        f"denied-changed-null-{token}",
+        f"denied-changed-number-{token}",
         f"untrusted-call-{token}",
         f"DENIED_KEYCLOAK_MISSING_USER_{token}",
         f"denied_raw_metric_{token}",
