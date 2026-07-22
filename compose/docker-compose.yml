@@ -1285,8 +1285,8 @@ services:
       context: ./services/dhi-health-probe
       network: none
       args:
-        BASE_IMAGE: dhi.io/alloy:1.17.1@sha256:612d798294d597f52a73f6b652a2992251ebe6f80521d9517fbc004932055f44
-    image: ai-gateway/dhi-alloy:1.17.1-probe
+        BASE_IMAGE: dhi.io/alloy:1.18.0@sha256:612d798294d597f52a73f6b652a2992251ebe6f80521d9517fbc004932055f44
+    image: ai-gateway/dhi-alloy:1.18.0-probe
     # Narrow exception: Alloy must tail Docker's runtime-owned json logs.
     # Relabeling Docker's data root is forbidden, so this one non-root, capless,
     # read-only service disables only its SELinux process label. Host ACLs and

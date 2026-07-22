@@ -264,7 +264,7 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "listen_port          = 12346",
             'client_auth_type = "RequireAndVerifyClientCert"',
             'client_ca_file   = "/run/secrets/alert_state_ca.pem"',
-            'min_version      = "TLS13"',
+            'min_version      = "VersionTLS13"',
             'regex         = "ALERTS|ALERTS_FOR_STATE"',
             'regex  = "__name__|alertname|alertstate|severity|owner|alert_class|instance|job|device|mountpoint|service|component_id|remote_name"',
             'replacement  = "alert-state"',

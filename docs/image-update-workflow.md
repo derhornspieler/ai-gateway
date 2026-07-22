@@ -164,7 +164,6 @@ the current reviewed holds:
 | Component | Reviewed choice | Why |
 | --- | --- | --- |
 | Traefik | Upstream 3.7.8 binary on DHI 3.7.6 | DHI 3.7.7 and 3.7.8 were not available |
-| Alloy | DHI 1.17.1 | DHI 1.17.2 and upstream 1.18.0 were not available in DHI |
 | Grafana | DHI 13.1.0 | Upstream 13.1.1 was not available in DHI |
 | OpenTelemetry Collector | DHI 0.156.0-contrib | Upstream 0.157.0 was not available in DHI |
 

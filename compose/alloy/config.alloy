@@ -712,7 +712,7 @@ prometheus.receive_http "alert_state" {
       key_file         = "/run/secrets/alert_state_alloy.key"
       client_auth_type = "RequireAndVerifyClientCert"
       client_ca_file   = "/run/secrets/alert_state_ca.pem"
-      min_version      = "TLS13"
+      min_version      = "VersionTLS13"
     }
   }
   forward_to = [prometheus.relabel.alert_state.receiver]
@@ -837,7 +837,7 @@ otelcol.exporter.otlp "cribl" {
     // Pure Compose is a development profile pointed only at cribl-mock.
     // Ansible replaces this entire marked block with either this plaintext
     // form or a verified customer TLS form. Do not mix TLS-only arguments
-    // into the insecure block: Alloy 1.17.1 then attempts a TLS handshake.
+    // into the insecure block: Alloy 1.18.0 then attempts a TLS handshake.
     // BEGIN AIGW MANAGED CRIBL TLS
     tls {
       insecure = true

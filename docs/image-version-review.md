@@ -12,6 +12,10 @@ The final 2026-07-22 check found newer registry digests for the same Grafana
 those newer digests. The committed digest still cannot move after release.
 The next release must repeat this check before it accepts a rebuilt tag.
 
+The same check found that the Alloy pin used the `1.18.0` digest but called it
+`1.17.1`. The image bytes were current, but the label was wrong. The source now
+uses the truthful `1.18.0` tag with that same fixed digest.
+
 ## Result
 
 The current source selects the newest stable and compatible version available
@@ -24,15 +28,14 @@ Ansible test, the PostgreSQL 16-to-18 move, rollback, downgrade refusal,
 physical restore, and final cleanup. That result is historical evidence, not a
 pass for the new image digests and feature changes.
 
-Two projects published a newer upstream release after their matching Docker
+One project published a newer upstream release after its matching Docker
 Hardened Image (DHI):
 
-- Grafana Alloy upstream is `1.18.0`; DHI offers `1.17.1`.
 - Grafana upstream is `13.1.1`; DHI offers `13.1.0`.
 
-Do not swap those two images to another registry without a new review. Their
-selected DHI versions are the newest DHI tags. The current exact-seed gate must
-test them with the rest of this source candidate.
+Do not swap that image to another registry without a new review. Its selected
+DHI version is the newest DHI tag. The current exact-seed gate must test it
+with the rest of this source candidate.
 
 ## DHI release images
 
@@ -43,7 +46,7 @@ version and image variant.
 | Component | Selected DHI tag | Decision |
 | --- | --- | --- |
 | Alertmanager | `0.33.1` | Current stable release; open DHI security finding below |
-| Alloy | `1.17.1` | Newest DHI; upstream `1.18.0` is not in DHI yet |
+| Alloy | `1.18.0` | Current |
 | BusyBox | `1.38.0-alpine` | Current |
 | CoreDNS | `1.14.6` | Current |
 | Envoy | `1.39.0` | Current |
@@ -63,10 +66,10 @@ version and image variant.
 | Traefik runtime base | `3.7.6` | Newest DHI; final image carries reviewed Traefik `3.7.8` |
 | Vault runtime | `2.0.3` | Current |
 
-The catalog did not contain DHI tags for Alloy `1.18.0`, Grafana `13.1.1`, or
-Traefik `3.7.8` at review time. The Traefik Dockerfile copies the current
-signed `3.7.8` binary into the newest DHI Traefik runtime. Contract tests check
-the binary version and both digests.
+The catalog did not contain DHI tags for Grafana `13.1.1` or Traefik `3.7.8`
+at review time. The Traefik Dockerfile copies the current signed `3.7.8`
+binary into the newest DHI Traefik runtime. Contract tests check the binary
+version and both digests.
 
 ## Other release images
 
