@@ -28,13 +28,12 @@ startup, key-rotator database work, Grafana read-only access, PostgreSQL 16
 logical restore, and same-major physical restore. PostgreSQL 18 also has a
 longer support window and enables data checksums by default on a new cluster.
 
-Those checks do not replace the production-sized migration rehearsal. Run
-that test in local Docker preprod from the exact current offline seed. Use
-synthetic production-sized PostgreSQL 16 data, force both rollback boundaries,
-test every database client, and finish with exact-manifest clean-room teardown.
-Do not create a Rocky or Parallels test VM, and do not force a failure on the
-production host. This test harness remains an open item in
-[TASKS.md](../../TASKS.md).
+The exact-seed local Docker PreProd rehearsal also passed. It used more than
+128 MiB of fixed PostgreSQL 16 data in each application database. It tested
+rollback, service access, PostgreSQL 18 restore, downgrade refusal, physical
+restore, and exact-manifest cleanup. Do not create a Rocky or Parallels test
+VM, and do not force a failure on the production host. See the completed test
+evidence in [TASKS.md](../../TASKS.md#done).
 
 The repository has no recorded technical reason for starting on PostgreSQL
 16. A conservative first choice is possible, but that is an inference, not a

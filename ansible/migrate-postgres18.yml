@@ -42,26 +42,25 @@
         - state-backup.sh
       tags: [postgres_migration_stage]
 
-    - name: Validate operator-supplied PostgreSQL migration inputs
-      ansible.builtin.assert:
-        that:
-          - postgres_migration_backup_path is string
-          - postgres_migration_backup_path is match('^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){1,15}\\.age$')
-          - postgres_migration_age_identity_path is string
-          - postgres_migration_age_identity_path is match('^/run/ai-gateway-postgres18/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
-          - postgres_migration_backup_sha256 is match('^[0-9a-f]{64}$')
-          - postgres_migration_confirm == 'MIGRATE_POSTGRES_16_TO_18'
-          - pg_data_volume_name is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
-          - pg_data_volume_name != compose_project_name ~ '_pg_data'
-        quiet: true
-        fail_msg: >-
-          Supply canonical target-host backup/identity paths, the authenticated
-          backup SHA-256, and postgres_migration_confirm=MIGRATE_POSTGRES_16_TO_18.
-      no_log: true
-      tags: [postgres_migration_run]
-
     - name: Plan and run the bounded PostgreSQL 18 migration
       block:
+        - name: Validate operator-supplied PostgreSQL migration inputs
+          ansible.builtin.assert:
+            that:
+              - postgres_migration_backup_path is string
+              - postgres_migration_backup_path is match('^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){1,15}\\.age$')
+              - postgres_migration_age_identity_path is string
+              - postgres_migration_age_identity_path is match('^/run/ai-gateway-postgres18/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+              - postgres_migration_backup_sha256 is match('^[0-9a-f]{64}$')
+              - postgres_migration_confirm == 'MIGRATE_POSTGRES_16_TO_18'
+              - pg_data_volume_name is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
+              - pg_data_volume_name != compose_project_name ~ '_pg_data'
+            quiet: true
+            fail_msg: >-
+              Supply canonical target-host backup/identity paths, the authenticated
+              backup SHA-256, and postgres_migration_confirm=MIGRATE_POSTGRES_16_TO_18.
+          no_log: true
+
         - name: Plan the PostgreSQL 18 migration without changing Docker state
           ansible.builtin.command:
             argv:
@@ -165,8 +164,14 @@
       always:
         - name: Remove the temporary PostgreSQL migration age identity
           ansible.builtin.file:
-            path: "{{ postgres_migration_age_identity_path }}"
+            path: >-
+              {{ postgres_migration_age_identity_path |
+                 default('/run/ai-gateway-postgres18/.invalid') }}
             state: absent
+          when: >-
+            (postgres_migration_age_identity_path | default('')) is match(
+              '^/run/ai-gateway-postgres18/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+            )
       tags: [postgres_migration_run]
 
 - import_playbook: deploy-stack-only.yml

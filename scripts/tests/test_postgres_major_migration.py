@@ -564,6 +564,29 @@ class PostgresMigrationRepositoryContracts(unittest.TestCase):
         self.assertLess(bounded.index("- migrate"), bounded.index("always:"))
         self.assertIn("Remove the temporary PostgreSQL migration age identity", bounded)
 
+    def test_age_identity_cleanup_wraps_early_input_validation(self) -> None:
+        playbook = (ROOT / "ansible/migrate-postgres18.yml").read_text(encoding="utf-8")
+        bounded = playbook.split(
+            "- name: Plan and run the bounded PostgreSQL 18 migration", 1
+        )[1].split("- import_playbook: deploy-stack-only.yml", 1)[0]
+        validation = bounded.index(
+            "- name: Validate operator-supplied PostgreSQL migration inputs"
+        )
+        plan = bounded.index(
+            "- name: Plan the PostgreSQL 18 migration without changing Docker state"
+        )
+        always = bounded.index("always:")
+        cleanup = bounded.index(
+            "- name: Remove the temporary PostgreSQL migration age identity"
+        )
+        self.assertLess(validation, plan)
+        self.assertLess(validation, always)
+        self.assertGreater(cleanup, always)
+        self.assertIn(
+            "postgres_migration_age_identity_path | default('')", bounded[cleanup:]
+        )
+        self.assertIn("^/run/ai-gateway-postgres18/", bounded[cleanup:])
+
     def test_ordinary_image_update_refuses_postgres_major_change(self) -> None:
         updater = (ROOT / "scripts/update-images.py").read_text(encoding="utf-8")
         self.assertIn("if postgres_major(ROOT) != postgres_major(previous_root):", updater)
