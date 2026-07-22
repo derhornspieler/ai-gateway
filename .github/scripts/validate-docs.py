@@ -59,6 +59,11 @@ MERMAID_ARROW_PATTERNS = (
     r"--[xo]",
 )
 MERMAID_ARROW_RE = re.compile("|".join(MERMAID_ARROW_PATTERNS))
+OWNER_NEUTRAL_WORKFLOW_RE = re.compile(
+    r"^\.\./\.\./actions/workflows/"
+    r"([A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml)"
+    r"(?:/badge\.svg\?branch=main)?$"
+)
 
 
 class Issue(NamedTuple):
@@ -611,6 +616,23 @@ def read_document(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="strict")
 
 
+def is_owner_neutral_workflow_reference(
+    root: Path, source: Path, target: str
+) -> bool:
+    """Accept GitHub's relative badge form only for a real root workflow.
+
+    GitHub renders ``../../actions/workflows/...`` against the current
+    repository. This keeps a reusable README free of a personal account name.
+    """
+
+    if source != (root / "README.md"):
+        return False
+    match = OWNER_NEUTRAL_WORKFLOW_RE.fullmatch(target.strip())
+    if match is None:
+        return False
+    return (root / ".github" / "workflows" / match.group(1)).is_file()
+
+
 def validate(root: Path) -> tuple[list[Path], list[Issue]]:
     """Validate active docs and return both the file list and exact issues."""
 
@@ -634,6 +656,10 @@ def validate(root: Path) -> tuple[list[Path], list[Issue]]:
     }
     for source_path, result in scans.items():
         for link in result.links:
+            if is_owner_neutral_workflow_reference(
+                root, source_path, link.target
+            ):
+                continue
             resolved = resolved_local_target(root, source_path, link.target)
             if resolved is None:
                 continue

@@ -127,9 +127,10 @@ imports only when its database is empty.
 
 ## Local preprod
 
-Preprod uses static test users and Samba AD over LDAPS. Ansible performs the
-same automatic Keycloak setup and domain-based redirect checks. A successful
-run prints `PREPROD_E2E_PASSED`.
+Preprod uses fixed test usernames and private, controller-generated passwords
+with Samba AD over LDAPS. Ansible performs the same automatic Keycloak setup
+and domain-based redirect checks. A successful run prints
+`PREPROD_E2E_PASSED`.
 
 See [Local preprod](preprod.md) and the
 [acceptance test runbook](test-runbook.md).

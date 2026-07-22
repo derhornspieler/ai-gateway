@@ -404,7 +404,7 @@ The Ansible deploy already installed the marker-bounded preprod block in
 `/etc/hosts`. Do not add unbounded or Docker bridge addresses by hand.
 
 Import `compose/secrets/preprod-root-ca.pem` into that test profile only. Use
-the accounts in [Local preprod](preprod.md#static-test-users).
+the accounts in [Local preprod](preprod.md#private-test-users).
 
 Pass only if:
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -14,6 +16,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = ROOT / "compose/secrets/preprod.env"
 CA_FILE = ROOT / "compose/secrets/preprod-root-ca.pem"
+PASSWORD_DIR = ROOT / "compose/secrets"
 ENABLED_ADM_OIDC_TARGETS = ("litellm-admin", "grafana", "prometheus")
 
 
@@ -32,6 +35,41 @@ def env_value(name: str) -> str:
     if len(matches) != 1 or not matches[0]:
         fail(f"the generated preprod environment has no unique {name}")
     return matches[0]
+
+
+def directory_password(username: str) -> str:
+    """Read one generated test password without following links."""
+
+    if username not in {"preprod-admin", "preprod-developer", "preprod-user"}:
+        fail("the requested preprod username is not allowed")
+    path = PASSWORD_DIR / f"samba_user_{username}_password"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        fail(f"the generated password file is missing for {username}")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != os.getegid()
+        ):
+            fail(f"the generated password file is unsafe for {username}")
+        raw = os.read(descriptor, 514)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 513:
+        fail(f"the generated password is too long for {username}")
+    try:
+        password = raw.strip().decode("utf-8")
+    except UnicodeDecodeError:
+        fail(f"the generated password is invalid for {username}")
+    if not 16 <= len(password) <= 512:
+        fail(f"the generated password length is invalid for {username}")
+    return password
 
 
 def run(command: list[str], *, body: str | None = None) -> str:
@@ -131,27 +169,25 @@ def main() -> int:
     fixtures = (
         (
             "preprod-admin",
-            "OnlyForTesting1!PreprodAdmin",
             "/",
             "/admin",
             "PORTAL_DIRECTORY_ADMIN_PASS",
         ),
         (
             "preprod-developer",
-            "OnlyForTesting1!PreprodDeveloper",
             "/",
             "forbidden",
             "PORTAL_DIRECTORY_ADMIN_DENIED_PASS",
         ),
         (
             "preprod-user",
-            "OnlyForTesting1!PreprodUser",
             "forbidden",
             "forbidden",
             "PORTAL_DIRECTORY_ADMIN_DENIED_PASS",
         ),
     )
-    for username, password, portal_path, admin_path, admin_marker in fixtures:
+    for username, portal_path, admin_path, admin_marker in fixtures:
+        password = directory_password(username)
         portal_acceptance = run(
             [
                 sys.executable,

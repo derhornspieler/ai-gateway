@@ -95,3 +95,35 @@ func TestVerifyJWTRejectsExpiredToken(t *testing.T) {
 		t.Fatal("expired token was accepted")
 	}
 }
+
+func TestProviderTokensAreRandomRotatedAndExpired(t *testing.T) {
+	store := &tokenStore{}
+	now := time.Now()
+	first, err := store.issue(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !store.valid(first, now.Add(time.Minute)) {
+		t.Fatal("fresh provider token was rejected")
+	}
+
+	second, err := store.issue(now.Add(2 * time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("two token exchanges returned the same token")
+	}
+	if store.valid(first, now.Add(3*time.Minute)) {
+		t.Fatal("the previous provider token survived rotation")
+	}
+	if !store.valid(second, now.Add(3*time.Minute)) {
+		t.Fatal("the current provider token was rejected")
+	}
+	if store.valid(second, now.Add(12*time.Minute)) {
+		t.Fatal("an expired provider token was accepted")
+	}
+	if store.valid("", now) || store.valid("wrong", now) {
+		t.Fatal("an invalid provider token was accepted")
+	}
+}

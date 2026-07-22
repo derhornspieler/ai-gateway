@@ -1,10 +1,16 @@
 # AI Gateway
 
-Checks: [infrastructure](.github/workflows/infrastructure-ci.yml),
-[Python](.github/workflows/python-ci.yml),
-[secret scanning](.github/workflows/secret-scanning.yml),
-[filesystem and IaC](.github/workflows/trivy.yml), and
-[GitHub Actions policy](.github/workflows/actions-security.yml).
+[![Infrastructure validation](../../actions/workflows/infrastructure-ci.yml/badge.svg?branch=main)](../../actions/workflows/infrastructure-ci.yml)
+[![Python quality and security](../../actions/workflows/python-ci.yml/badge.svg?branch=main)](../../actions/workflows/python-ci.yml)
+[![Go quality and final-image security](../../actions/workflows/go-security.yml/badge.svg?branch=main)](../../actions/workflows/go-security.yml)
+[![Repository and release container security](../../actions/workflows/trivy.yml/badge.svg?branch=main)](../../actions/workflows/trivy.yml)
+[![Secret scanning](../../actions/workflows/secret-scanning.yml/badge.svg?branch=main)](../../actions/workflows/secret-scanning.yml)
+[![CodeQL](../../actions/workflows/codeql.yml/badge.svg?branch=main)](../../actions/workflows/codeql.yml)
+[![GitHub Actions policy](../../actions/workflows/actions-security.yml/badge.svg?branch=main)](../../actions/workflows/actions-security.yml)
+[![Repository hygiene](../../actions/workflows/repo-hygiene.yml/badge.svg?branch=main)](../../actions/workflows/repo-hygiene.yml)
+[![Dependency review](../../actions/workflows/dependency-review.yml/badge.svg?branch=main)](../../actions/workflows/dependency-review.yml)
+[![Docker and Compose runtime skew](../../actions/workflows/runtime-skew.yml/badge.svg?branch=main)](../../actions/workflows/runtime-skew.yml)
+[![OpenSSF Scorecard](../../actions/workflows/scorecard.yml/badge.svg?branch=main)](../../actions/workflows/scorecard.yml)
 
 AI Gateway is a self-hosted, security-focused AI access platform. Production
 runs on an existing Rocky Linux 9 VM. Local release tests run in Docker

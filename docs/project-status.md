@@ -90,21 +90,22 @@ portal tests passed, but they do not replace a new visual browser pass.
 
 The [dated version review](image-version-review.md) found that every selected
 image and direct library is current for its reviewed source. The reusable
-local Root CA, leaf keys, static test credentials, and rendered inputs remain
-after cleanup by design. They keep PreProd identities stable across fresh
-deployments; they are not running deployment state.
+local Root CA, leaf keys, private credential seed, and rendered inputs remain
+after cleanup by design. The seed keeps PreProd identities stable on one
+controller without publishing the passwords. These files are not running
+deployment state.
 
 ## Gates that remain open
 
 - **Current-candidate browser check:** the exact seed and automated checks are
   complete. Run the visual browser checklist when a browser backend is
   available. Do not create a rehearsal VM for this check.
-- **Credential-gated security audit:** credential-independent GitHub jobs are
-  green. The DHI image jobs stop at their required credential gate because the
-  `release-container-security` environment has no DHI secrets. Add approved
-  credentials and rerun the exact release. Review the source and every image,
-  raw Trivy JSON, blocking VEX-aware Scout result, SBOM, provenance record,
-  waiver, and remaining risk before release.
+- **Credential-gated security audit:** the protected DHI credentials were added
+  on 2026-07-22 and authentication now passes. The first rerun exposed one
+  Buildx exporter defect and one missing Docker Scout backend-auth mapping.
+  Both fixes pass local reproduction. Push them, rerun every exact image job,
+  and review the raw Trivy JSON, blocking VEX-aware Scout result, SBOM,
+  provenance record, waiver, and remaining risk before release.
 - **Production ceremonies:** customer TLS, external LDAPS, Vault key custody,
   Anthropic enrollment, production backups, the real Cribl endpoint, and final
   access approval need customer operators. This is operator-owned work.

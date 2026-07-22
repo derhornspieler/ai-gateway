@@ -254,7 +254,7 @@ class OidcCallbackAcceptanceContractTests(unittest.TestCase):
         self.assertNotIn('add_argument("--host"', source)
         self.assertNotIn('add_argument("--origin"', source)
         self.assertNotIn('add_argument("--redirect', source)
-        self.assertIn("pipe the static preprod password on stdin", source)
+        self.assertIn("pipe the private preprod password on stdin", source)
         self.assertIn("ProxyHandler({})", source)
         self.assertIn("OIDC_CALLBACK_FAIL target={target.name}", source)
 

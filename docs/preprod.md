@@ -10,7 +10,7 @@ Preprod is for release tests. It is not production. It uses:
 - three host-facing planes plus separate service networks;
 - a local test Root CA;
 - Samba AD over LDAPS;
-- static test users; and
+- fixed test usernames with private local passwords; and
 - local WIF and provider mocks.
 
 Ansible refuses a remote inventory or remote Docker context. It does not run
@@ -163,15 +163,48 @@ The test Root CA is `compose/secrets/preprod-root-ca.pem`. Ansible does not add
 it to the operating system trust store. Add it only to a test browser profile,
 then remove it when browser testing is done.
 
-## Static test users
+## Private test users
 
-These are public test values. Use them only in local preprod.
+The usernames are the same on every PreProd install. The passwords are not in
+Git. Ansible creates them from a private seed in
+`compose/secrets/preprod-credential-seed-v1`.
 
-| Username | Password | Access |
+| Username | Private password file | Access |
 | --- | --- | --- |
-| `preprod-admin` | `OnlyForTesting1!PreprodAdmin` | admin and chat |
-| `preprod-developer` | `OnlyForTesting1!PreprodDeveloper` | developer portal and chat |
-| `preprod-user` | `OnlyForTesting1!PreprodUser` | chat |
+| `preprod-admin` | `compose/secrets/samba_user_preprod-admin_password` | admin and chat |
+| `preprod-developer` | `compose/secrets/samba_user_preprod-developer_password` | developer portal and chat |
+| `preprod-user` | `compose/secrets/samba_user_preprod-user_password` | chat |
+
+To view a password for a browser test, open only its local file. For example:
+
+```bash
+less compose/secrets/samba_user_preprod-admin_password
+```
+
+Press `q` to close `less`. Do not paste the password into Git, chat, a ticket,
+or a command argument.
+
+The seed and generated files use mode `0600`. Git ignores the whole
+`compose/secrets/` directory. The same checkout keeps the same passwords after
+destroy and redeploy. A different checkout gets different passwords.
+
+To rotate all local PreProd passwords:
+
+1. Run the [development destroy](#remove-a-development-stack). This removes
+   the PreProd containers and volumes.
+2. Delete only `compose/secrets/preprod-credential-seed-v1`.
+3. Run the Ansible deployment again. It creates a new seed and replaces every
+   generated password.
+
+Preparation stops if the seed is missing while PreProd containers or volumes
+still exist. This prevents a silent password change from breaking a running
+stack. The test Root CA is not rotated with the passwords.
+
+An earlier release put disposable PreProd passwords and a predictable password
+recipe in Git. Treat every old PreProd password as permanently compromised and
+never reuse it. An exact history audit found no match for the current sudo,
+DHI, Docker Hub, or generated private-key values. Rewriting shared Git history
+is a separate, disruptive operation and requires explicit owner approval.
 
 Samba serves LDAPS at `samba-ad.aigw.internal:636`. The test Root CA signs its
 certificate, the edge certificate, and the WIF mock certificate.

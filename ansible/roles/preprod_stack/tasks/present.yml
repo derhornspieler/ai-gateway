@@ -42,7 +42,7 @@
       - check-context
   changed_when: false
 
-- name: Generate persistent test PKI, static test credentials, and domain-rendered realms
+- name: Generate persistent test PKI, private test credentials, and domain-rendered realms
   ansible.builtin.command:
     argv:
       - python3

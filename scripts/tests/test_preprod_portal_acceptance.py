@@ -54,7 +54,7 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         with self.assertRaises(socket.gaierror):
             module.preprod_getaddrinfo("unreviewed.aigw.internal", 443)
 
-    def test_e2e_proves_each_static_users_authorization_boundary(self) -> None:
+    def test_e2e_proves_each_private_users_authorization_boundary(self) -> None:
         module = load_e2e_module()
         source = E2E.read_text(encoding="utf-8")
         self.assertEqual(
@@ -63,6 +63,9 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         )
         for username in ("preprod-admin", "preprod-developer", "preprod-user"):
             self.assertIn(f'"{username}"', source)
+        self.assertIn("password = directory_password(username)", source)
+        self.assertIn("metadata.st_gid != os.getegid()", source)
+        self.assertNotIn("OnlyForTesting", source)
         self.assertIn('"PORTAL_DIRECTORY_ADMIN_DENIED_PASS"', source)
         self.assertIn('"PORTAL_DIRECTORY_ADMIN_PASS"', source)
         self.assertIn('"forbidden",', source)

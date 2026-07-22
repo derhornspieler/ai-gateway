@@ -228,7 +228,7 @@ def main() -> int:
     parser.add_argument("--ca", required=True)
     args = parser.parse_args()
     if sys.stdin.isatty():
-        raise SystemExit("pipe the static preprod password on stdin")
+        raise SystemExit("pipe the private preprod password on stdin")
     raw_password = sys.stdin.buffer.read(513)
     if not raw_password or len(raw_password) > 512:
         raise SystemExit("invalid preprod password length")

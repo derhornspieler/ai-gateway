@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -20,13 +22,21 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	maxBodyBytes = 1 << 20
-	testToken    = "sk-ant-oat01-preprod-only-static-token"
+	testTokenTTL = 10 * time.Minute
 )
+
+type tokenStore struct {
+	mutex   sync.Mutex
+	digest  [sha256.Size]byte
+	expires time.Time
+	ready   bool
+}
 
 type config struct {
 	address          string
@@ -42,6 +52,7 @@ type config struct {
 	serviceAccountID string
 	federationRuleID string
 	workspaceID      string
+	tokens           *tokenStore
 }
 
 type jwksDocument struct {
@@ -143,6 +154,7 @@ func loadConfig() (config, error) {
 	if cfg.serverName != "wif-provider-mock.aigw.internal" && !strings.HasSuffix(cfg.serverName, ".aigw.internal") {
 		return config{}, errors.New("TLS_SERVER_NAME must be under aigw.internal")
 	}
+	cfg.tokens = &tokenStore{}
 	return cfg, nil
 }
 
@@ -212,10 +224,15 @@ func (cfg config) exchange(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid assertion", http.StatusUnauthorized)
 		return
 	}
+	token, err := cfg.tokens.issue(time.Now())
+	if err != nil {
+		http.Error(w, "could not issue token", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token": testToken,
+		"access_token": token,
 		"token_type":   "Bearer",
-		"expires_in":   600,
+		"expires_in":   int(testTokenTTL / time.Second),
 	})
 }
 
@@ -224,7 +241,7 @@ func (cfg config) messages(w http.ResponseWriter, r *http.Request) {
 	if credential == "" {
 		credential = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	}
-	if credential != testToken {
+	if !cfg.tokens.valid(credential, time.Now()) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -249,6 +266,32 @@ func (cfg config) messages(w http.ResponseWriter, r *http.Request) {
 		"stop_sequence": nil,
 		"usage":         map[string]int{"input_tokens": 1, "output_tokens": 1},
 	})
+}
+
+func (store *tokenStore) issue(now time.Time) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, raw); err != nil {
+		return "", errors.New("secure random token generation failed")
+	}
+	token := "sk-ant-oat01-" + base64.RawURLEncoding.EncodeToString(raw)
+	digest := sha256.Sum256([]byte(token))
+	store.mutex.Lock()
+	store.digest = digest
+	store.expires = now.Add(testTokenTTL)
+	store.ready = true
+	store.mutex.Unlock()
+	return token, nil
+}
+
+func (store *tokenStore) valid(token string, now time.Time) bool {
+	if token == "" {
+		return false
+	}
+	digest := sha256.Sum256([]byte(token))
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	return store.ready && now.Before(store.expires) &&
+		subtle.ConstantTimeCompare(digest[:], store.digest[:]) == 1
 }
 
 func decodeSegment(value string, target any) error {

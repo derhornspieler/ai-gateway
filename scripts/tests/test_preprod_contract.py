@@ -2408,8 +2408,12 @@ class PreprodContractTests(unittest.TestCase):
                 (root / "one.txt").write_text("one\n", encoding="utf-8")
                 (root / "nested").mkdir()
                 (root / "nested/two.txt").write_text("two\n", encoding="utf-8")
+                seed = root / "credential-seed"
+                seed.write_bytes(b"s" * module.PREPROD_CREDENTIAL_SEED_BYTES)
+                seed.chmod(0o600)
                 with (
                     mock.patch.object(module, "COMPOSE_DIR", root),
+                    mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed),
                     mock.patch.object(
                         module, "PREPROD_BIND_SOURCES", ("one.txt", "nested")
                     ),
@@ -2435,8 +2439,12 @@ class PreprodContractTests(unittest.TestCase):
             )
             (root / "immutable.txt").write_text("fixed\n", encoding="utf-8")
             (root / "runtime.json").write_text('{"keys":[]}\n', encoding="utf-8")
+            seed = root / "credential-seed"
+            seed.write_bytes(b"s" * module.PREPROD_CREDENTIAL_SEED_BYTES)
+            seed.chmod(0o600)
             with (
                 mock.patch.object(module, "COMPOSE_DIR", root),
+                mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed),
                 mock.patch.object(
                     module,
                     "PREPROD_BIND_SOURCES",
@@ -3153,11 +3161,15 @@ class PreprodContractTests(unittest.TestCase):
             "claims.Subject != cfg.subject",
             "exactAudience",
             "expires <= now.Unix()",
+            "rand.Reader",
+            "now.Before(store.expires)",
+            "subtle.ConstantTimeCompare",
             'POST /v1/oauth/token',
             'POST /v1/messages',
             "tls.VersionTLS13",
         ):
             self.assertIn(required, source)
+        self.assertNotIn("preprod-only-static-token", source)
         self.assertRegex(dockerfile.splitlines()[0], r"^# syntax=.*@sha256:[0-9a-f]{64}$")
         self.assertIn("RUN --network=none go test ./...", dockerfile)
         self.assertIn("USER 65532:65532", dockerfile)
@@ -3223,7 +3235,140 @@ class PreprodContractTests(unittest.TestCase):
         self.assertIn("compose/secrets/", gitignore)
         self.assertIn("preprod-root-ca.key", self.script)
         self.assertIn("preprod-edge-certs", self.script)
-        self.assertIn("OnlyForTesting1!PreprodAdmin", self.script)
+        self.assertIn("preprod-credential-seed-v1", self.script)
+        self.assertIn('(\"samba_user_preprod-admin_password\", \"samba-user-admin\")', self.script)
+        self.assertNotIn("OnlyForTesting", self.script)
+        self.assertNotIn("aigw-preprod-only:", self.script)
+        module = load_preprod_module()
+        self.assertNotIn(
+            "secrets/preprod-credential-seed-v1", module.PREPROD_BIND_SOURCES
+        )
+
+    def test_private_credential_seed_is_stable_and_local_to_each_checkout(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(project="aigw-preprod")
+
+        def create_credentials(directory: str) -> tuple[bytes, str, str]:
+            secret_dir = Path(directory)
+            secret_dir.chmod(0o700)
+            seed = secret_dir / "preprod-credential-seed-v1"
+            with (
+                mock.patch.object(module, "SECRETS_DIR", secret_dir),
+                mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed),
+                mock.patch.object(
+                    module, "preprod_docker_state_exists", return_value=False
+                ),
+            ):
+                module.ensure_credential_seed(args)
+                first = module.credential_hex("redis")
+                second = module.credential_hex("redis")
+                password = module.credential_password("samba-user-admin")
+            self.assertEqual(stat.S_IMODE(seed.stat().st_mode), 0o600)
+            self.assertEqual(first, second)
+            return seed.read_bytes(), first, password
+
+        with tempfile.TemporaryDirectory() as first_directory:
+            first_seed, first_value, first_password = create_credentials(
+                first_directory
+            )
+        with tempfile.TemporaryDirectory() as second_directory:
+            second_seed, second_value, second_password = create_credentials(
+                second_directory
+            )
+
+        self.assertNotEqual(first_seed, second_seed)
+        self.assertNotEqual(first_value, second_value)
+        self.assertNotEqual(first_password, second_password)
+        self.assertEqual(len(first_seed), module.PREPROD_CREDENTIAL_SEED_BYTES)
+
+        with tempfile.TemporaryDirectory() as directory:
+            seed = Path(directory) / "seed"
+            seed.write_bytes(first_seed)
+            seed.chmod(0o600)
+            with mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed):
+                self.assertNotEqual(
+                    module.credential_hex("redis"),
+                    module.credential_hex("pg-super"),
+                )
+                with self.assertRaisesRegex(SystemExit, "length is invalid"):
+                    module.credential_hex("redis", 16)
+
+    def test_missing_private_seed_refuses_existing_preprod_state(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(project="aigw-preprod")
+        with tempfile.TemporaryDirectory() as directory:
+            secret_dir = Path(directory)
+            secret_dir.chmod(0o700)
+            seed = secret_dir / "preprod-credential-seed-v1"
+            with (
+                mock.patch.object(module, "SECRETS_DIR", secret_dir),
+                mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed),
+                mock.patch.object(
+                    module, "preprod_docker_state_exists", return_value=True
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    SystemExit, "destroy PreProd before rotating credentials"
+                ):
+                    module.ensure_credential_seed(args)
+            self.assertFalse(seed.exists())
+
+    def test_private_seed_boundary_fails_closed(self) -> None:
+        module = load_preprod_module()
+        with tempfile.TemporaryDirectory() as directory:
+            seed = Path(directory) / "seed"
+            seed.write_bytes(b"s" * module.PREPROD_CREDENTIAL_SEED_BYTES)
+            seed.chmod(0o644)
+            with mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed):
+                with self.assertRaisesRegex(SystemExit, "unsafe boundary"):
+                    module.credential_hex("redis")
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            target.write_bytes(b"s" * module.PREPROD_CREDENTIAL_SEED_BYTES)
+            target.chmod(0o600)
+            seed = Path(directory) / "seed"
+            seed.symlink_to(target)
+            with mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed):
+                with self.assertRaisesRegex(SystemExit, "unsafe boundary"):
+                    module.credential_hex("redis")
+
+        with tempfile.TemporaryDirectory() as directory:
+            seed = Path(directory) / "seed"
+            seed.write_bytes(b"s" * module.PREPROD_CREDENTIAL_SEED_BYTES)
+            seed.chmod(0o600)
+            os.link(seed, Path(directory) / "second-link")
+            with mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed):
+                with self.assertRaisesRegex(SystemExit, "unsafe boundary"):
+                    module.credential_hex("redis")
+
+    def test_failed_seed_write_leaves_no_partial_seed_and_can_retry(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(project="aigw-preprod")
+        with tempfile.TemporaryDirectory() as directory:
+            secret_dir = Path(directory)
+            secret_dir.chmod(0o700)
+            seed = secret_dir / "preprod-credential-seed-v1"
+            patches = (
+                mock.patch.object(module, "SECRETS_DIR", secret_dir),
+                mock.patch.object(module, "PREPROD_CREDENTIAL_SEED", seed),
+                mock.patch.object(
+                    module, "preprod_docker_state_exists", return_value=False
+                ),
+            )
+            with patches[0], patches[1], patches[2]:
+                with mock.patch.object(module.os, "write", return_value=0):
+                    with self.assertRaisesRegex(SystemExit, "could not create"):
+                        module.ensure_credential_seed(args)
+                self.assertFalse(seed.exists())
+                self.assertEqual(
+                    list(secret_dir.glob(".preprod-credential-seed-v1.tmp-*")),
+                    [],
+                )
+                module.ensure_credential_seed(args)
+                self.assertEqual(
+                    len(seed.read_bytes()), module.PREPROD_CREDENTIAL_SEED_BYTES
+                )
 
 
 if __name__ == "__main__":

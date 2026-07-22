@@ -95,6 +95,9 @@ jobs:
             --directory "$RUNNER_TEMP/docker-scout"
 
       - name: Fetch and verify exact DHI VEX statements
+        env:
+          DOCKER_SCOUT_HUB_USER: ${{ secrets.DHI_USERNAME }}
+          DOCKER_SCOUT_HUB_PASSWORD: ${{ secrets.DHI_PASSWORD }}
         run: |
           python3 -I .github/scripts/manage-dhi-vex.py fetch \
             --policy .github/dhi-vex-policy.json \

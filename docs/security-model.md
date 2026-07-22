@@ -127,6 +127,22 @@ The project uses separate CA stores for separate jobs.
 Do not reuse one bundle for another job. A Cribl, LDAPS, or edge CA file is not
 provider trust.
 
+## Local PreProd credentials
+
+PreProd keeps fixed test usernames, but its passwords are private. The first
+Ansible preparation creates a random 256-bit seed at
+`compose/secrets/preprod-credential-seed-v1`. The file is ignored by Git and
+uses mode `0600`.
+
+The PreProd helper uses HMAC-SHA-256 and a different label for each password,
+token, and client secret. The same seed makes the same values after a local
+destroy and redeploy. A different controller seed makes different values.
+Production never reads this seed.
+
+If the seed is missing while the PreProd project still has containers or
+volumes, preparation fails. Destroy the local project before rotating the
+seed. See [Private test users](preprod.md#private-test-users).
+
 ## What CA evidence proves
 
 These terms answer different questions:

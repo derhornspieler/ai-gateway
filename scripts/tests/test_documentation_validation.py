@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -259,6 +260,50 @@ class DocumentationValidationTests(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0].line, 1)
         self.assertIn("local link leaves repository", issues[0].message)
+
+    def test_root_readme_accepts_only_existing_owner_neutral_workflow_badges(
+        self,
+    ) -> None:
+        temporary, root = self.make_root()
+        self.addCleanup(temporary.cleanup)
+        workflows = root / ".github/workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "checks.yml").write_text("name: Checks\n", encoding="utf-8")
+        (root / "README.md").write_text(
+            "[![Checks](../../actions/workflows/checks.yml/badge.svg?branch=main)]"
+            "(../../actions/workflows/checks.yml)\n",
+            encoding="utf-8",
+        )
+
+        _, issues = VALIDATOR.validate(root)
+
+        self.assertEqual(issues, [])
+
+        (root / "README.md").write_text(
+            "[![Missing](../../actions/workflows/missing.yml/badge.svg?branch=main)]"
+            "(../../actions/workflows/missing.yml)\n",
+            encoding="utf-8",
+        )
+        _, issues = VALIDATOR.validate(root)
+        self.assertEqual(len(issues), 2)
+        self.assertTrue(all("leaves repository" in issue.message for issue in issues))
+
+    def test_root_readme_has_one_owner_neutral_badge_per_workflow(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        badge_files = set(
+            re.findall(
+                r"\.\./\.\./actions/workflows/"
+                r"([A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml)/badge\.svg\?branch=main",
+                readme,
+            )
+        )
+        workflow_files = {
+            path.name for path in (ROOT / ".github/workflows").glob("*.yml")
+        }
+        workflow_files.update(
+            path.name for path in (ROOT / ".github/workflows").glob("*.yaml")
+        )
+        self.assertEqual(badge_files, workflow_files)
 
     def test_cli_prints_machine_readable_file_and_line_errors(self) -> None:
         temporary, root = self.make_root()

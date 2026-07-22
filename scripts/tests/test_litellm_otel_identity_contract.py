@@ -264,7 +264,7 @@ class LiteLLMOtelIdentityContractTests(unittest.TestCase):
         self.assertNotIn("OPENWEBUI_FORWARD_JWT_SECRET={{ webui_secret_key", env_template)
 
         preprod = PREPROD.read_text(encoding="utf-8")
-        self.assertIn('"OPENWEBUI_FORWARD_JWT_SECRET": static_hex(', preprod)
+        self.assertIn('"OPENWEBUI_FORWARD_JWT_SECRET": credential_hex(', preprod)
         self.assertIn('"openwebui-forward-jwt", 64', preprod)
 
         callback = CALLBACK.read_text(encoding="utf-8")

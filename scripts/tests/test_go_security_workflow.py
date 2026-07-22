@@ -55,6 +55,10 @@ class GoSecurityWorkflowTests(unittest.TestCase):
 
     def test_envoy_build_is_provider_bound_and_reproducible(self) -> None:
         for required in (
+            "Set up Buildx for deterministic Envoy archives",
+            "uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0",
+            "driver: docker-container",
+            "image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec",
             "--provider anthropic",
             "--network=none",
             "--provenance=false --sbom=false",
@@ -68,6 +72,10 @@ class GoSecurityWorkflowTests(unittest.TestCase):
             'test "$live_receipt" = "$receipt"',
         ):
             self.assertIn(required, WORKFLOW)
+        self.assertLess(
+            WORKFLOW.index("Set up Buildx for deterministic Envoy archives"),
+            WORKFLOW.index("Build the actual final runtime image"),
+        )
 
 
 if __name__ == "__main__":

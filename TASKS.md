@@ -5,23 +5,23 @@
 <a id="complete-current-candidate-release-acceptance"></a>
 
 - [ ] **Complete the current source candidate release acceptance** - The
-  runtime image inputs were built from `77c50d3`. Commits `5e84392` and
-  `3e8cafa` repair only the local PostgreSQL rehearsal and exact cleanup
-  helpers. Commit `689bb67` also makes the production migration remove its
-  temporary age identity after an early input failure. None of these changes
-  alters a seed runtime image. The schema-v2 reader accepted the same release.
+  release built from `77c50d3` is the last fully tested exact seed. The current
+  source removes committed deterministic PreProd credentials and the static
+  WIF mock token. The WIF image therefore changed. Do not promote the older
+  archive as the current release. Build a new schema-v2 seed and repeat the
+  clean-room Ansible PreProd test after these fixes reach `main`.
 
-  - The Anthropic-only ARM64 production release contains 23 external and 17
+  - The previous Anthropic-only ARM64 production release contains 23 external and 17
     custom images. Its archive SHA-256 is
     `45d6495e63ff09fca7d15579bea1878150c44d64e31203cc6c5b086128823390`.
     Its manifest SHA-256 is
     `d735d17e08d7720d1e6649b3fedbf4d95f62e3f4616cb23b6651eed5b52cac80`.
-  - The matching preprod release contains 25 external and 19 custom images.
+  - The matching previous preprod release contains 25 external and 19 custom images.
     Its archive SHA-256 is
     `ac87381f624463f5badc8b0d2c35c8e80786ac939ffc24d369e04a52a21db119`.
     Its manifest SHA-256 is
     `3552fe7f29ff2190348093f374ee48e2368a131ac04b80c50ed0b988e1a41d3b`.
-  - The provider-policy digest is
+  - That release's provider-policy digest is
     `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
     The exact Envoy image ID is
     `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
@@ -43,25 +43,53 @@
     Ansible contracts passed. The real commands remain an approved maintenance-
     window gate on the existing production Linux host. No rehearsal VM will be
     created, and the local receipt does not claim those commands ran.
-  - The 875 infrastructure contracts, 532 Python service tests, four Go
+  - The previous release passed 875 infrastructure contracts, 532 Python
+    service tests, four Go
     race/vet suites, Compose, identity, ShellCheck, yamllint, Bandit, Ruff,
     dependency audit, documentation links, and Ansible syntax checks passed.
   - Final exact-manifest teardown removed 26 containers, 19 networks, 11
     volumes, all 44 release aliases and image IDs, and six run-state files
     while preserving all 16 unrelated image IDs. Separate read-only checks
     found no owned container, seed image alias, volume, network, or hosts
-    entry. Reusable local test CA, keys, static test credentials, and rendered
-    inputs remain by design so later PreProd deployments use the same identity.
-  - Eight of ten GitHub workflows passed on `689bb67`. Repository Trivy,
-    CodeQL, secret scanning, infrastructure, Python, Go, policy, runtime-skew,
-    and hygiene checks passed. The two red workflows stopped only at the
-    protected DHI credential gates, so final DHI image, VEX, SBOM, and
-    container scans remain blocked until a repository administrator adds both
-    required secrets.
+    entry. Reusable local test CA, keys, the private credential seed, and
+    rendered inputs remain by design so later PreProd deployments on this
+    controller use the same identity without publishing passwords.
+  - The current source creates one ignored 256-bit controller seed and derives
+    separate PreProd credentials from it. Missing or unsafe seed state fails
+    closed. The generated user passwords are read from owner-only files. WIF
+    provider tokens are now random, expire after ten minutes, and rotate on a
+    new exchange. Treat every older committed PreProd password and token as
+    compromised test data that must never be reused.
+  - The protected DHI secrets were added on 2026-07-22. The first rerun proved
+    DHI login and built three final images, then exposed two workflow defects:
+    Envoy used an unsupported Buildx exporter driver, and standalone Docker
+    Scout did not receive its documented backend credential variables. The
+    fixes pass local contract tests, a byte-for-byte two-build Envoy check, and
+    an isolated signed-VEX fetch with no Docker Desktop credential fallback.
+    Push them and require the complete GitHub image matrices to pass.
+  - Current-source local validation passes 882 infrastructure contracts,
+    Compose rendering, identity policy, documentation links, ShellCheck,
+    PreProd Ansible syntax, and the changed WIF Go race/vet suite.
   - Real-browser acceptance remains `BLOCKED/NOT RUN`: this session exposed no
     browser backend. The browserless OIDC, cookie-scope, role, logout, and
     callback tests passed, but they do not replace the manual browser checklist.
     Do not create a Rocky or Parallels test VM for either remaining gate.
+
+<a id="provide-protected-dhi-credentials-and-finish-the-release-security-audit"></a>
+
+- [ ] **Finish the credential-gated release security audit** - The protected
+  credentials now exist and authenticate. Push the locally validated Buildx
+  and Docker Scout fixes, then run every exact external-image and custom-image
+  job for the new release commit.
+
+  - GitHub must scan the source and every exact external and custom image in the
+    production and preprod union. Save raw Trivy JSON, blocking VEX-aware Docker
+    Scout results, SBOMs, provenance, and final image IDs.
+  - Review every finding. Fix it or add an owned, dated, package-specific waiver
+    with a clear reason. Record the remaining risk. A skipped image is not a
+    pass.
+  - Keep this as one release gate with the active current-candidate item. The
+    customer Cribl receipt and retention are a separate acceptance task.
 
 - [x] ~~Finish the current-candidate Cribl release receipt~~ (2026-07-22) -
   The exact new preprod seed produced the final receipt. Manifest
@@ -90,27 +118,6 @@
     `LOGIN_ERROR`, and `LOGOUT` records through the TLS Cribl mock.
 
 ## Waiting On
-
-<a id="provide-protected-dhi-credentials-and-finish-the-release-security-audit"></a>
-
-- [ ] **Provide protected DHI credentials and finish the release security
-  audit** - The credential-independent quality, dependency, CodeQL,
-  secret-scanning, and release-contract jobs are green. The image jobs stop at
-  the required credential gate because the protected
-  `release-container-security` environment has no `DHI_USERNAME` or
-  `DHI_PASSWORD` secret.
-
-  - A repository administrator must add approved DHI credentials and rerun the
-    jobs for the exact release commit. Do not copy a developer's local login
-    into GitHub or weaken the gate.
-  - GitHub must scan the source and every exact external and custom image in the
-    production and preprod union. Save raw Trivy JSON, blocking VEX-aware Docker
-    Scout results, SBOMs, provenance, and the final image IDs.
-  - Review every finding. Fix it or add an owned, dated, package-specific waiver
-    with a clear reason. Record the remaining risk. A missing credential or
-    skipped image is not a pass.
-  - Keep this as one release gate with the active current-candidate item. Customer
-    Cribl receipt and retention remain the separate acceptance task below.
 
 <a id="complete-the-customer-cribl-acceptance-ceremony"></a>
 

@@ -204,10 +204,10 @@ class LiteLLMOtelAuthenticationContractTests(unittest.TestCase):
         self.assertIn("preserve_modes=True", RESTORE_ARCHIVE)
         self.assertIn("current-source Ansible converge", STATE_RESTORE)
 
-    def test_preprod_uses_a_static_local_token_and_both_mounts(self) -> None:
+    def test_preprod_uses_a_private_seeded_token_and_both_mounts(self) -> None:
         self.assertIn(
             'SECRETS_DIR / "litellm_otel_token",\n'
-            '        static_hex("litellm-otel", 64),\n'
+            '        credential_hex("litellm-otel", 64),\n'
             "        0o600,",
             PREPROD_SCRIPT,
         )

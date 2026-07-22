@@ -187,7 +187,7 @@ def admin_portal_denial(context: ssl.SSLContext, username: str, password: str) -
 
 def read_password() -> str:
     if sys.stdin.isatty():
-        raise SystemExit("pipe the static preprod password on stdin")
+        raise SystemExit("pipe the private preprod password on stdin")
     raw = sys.stdin.buffer.read(513)
     if not raw or len(raw) > 512:
         raise SystemExit("invalid preprod password length")

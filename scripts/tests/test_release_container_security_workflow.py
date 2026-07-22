@@ -134,6 +134,19 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
         self.assertNotIn("explicitly skipped", release_workflow.lower())
         self.assertNotIn("available=false", release_workflow)
 
+    def test_docker_scout_receives_protected_backend_credentials(self) -> None:
+        fetch = WORKFLOW.split(
+            "      - name: Fetch and verify exact DHI VEX statements", 1
+        )[1].split("      - name: Remove DHI registry credentials", 1)[0]
+        self.assertIn(
+            "DOCKER_SCOUT_HUB_USER: ${{ secrets.DHI_USERNAME }}", fetch
+        )
+        self.assertIn(
+            "DOCKER_SCOUT_HUB_PASSWORD: ${{ secrets.DHI_PASSWORD }}", fetch
+        )
+        self.assertNotIn("--username", fetch)
+        self.assertNotIn("--password", fetch)
+
     def test_plan_uses_the_authoritative_full_seed_union(self) -> None:
         scopes = SEED.collect_project_image_reference_scopes(ROOT)
         self.assertTrue(scopes[SEED.RELEASE_SCOPE_PRODUCTION])

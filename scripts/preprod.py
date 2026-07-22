@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -30,6 +32,9 @@ EDGE_CERTS_DIR = SECRETS_DIR / "preprod-edge-certs"
 VAULT_INIT_FILE = SECRETS_DIR / "preprod-vault-init.json"
 SEED_RECEIPT = SECRETS_DIR / "preprod-seed-receipt.json"
 SEED_OVERLAY = SECRETS_DIR / "preprod-seed-images.yml"
+PREPROD_CREDENTIAL_SEED = SECRETS_DIR / "preprod-credential-seed-v1"
+PREPROD_CREDENTIAL_SEED_BYTES = 32
+PREPROD_CREDENTIAL_CONTEXT = b"aigw-preprod-credential-v1"
 POSTGRES18_REHEARSAL_RECEIPT = (
     SECRETS_DIR / "preprod-postgres18-rehearsal-receipt.json"
 )
@@ -1100,6 +1105,26 @@ def ensure_directory(path: Path, mode: int = 0o700) -> None:
     path.chmod(mode)
 
 
+def ensure_private_directory(path: Path) -> None:
+    """Create or validate one owner-only directory without following links."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        try:
+            path.mkdir(mode=0o700)
+        except OSError:
+            fail(f"could not create private directory {path}")
+        metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or (metadata.st_uid, metadata.st_gid) != (os.geteuid(), os.getegid())
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail(f"private directory has an unsafe boundary: {path}")
+
+
 def write_file(path: Path, content: str, mode: int, *, replace: bool = True) -> None:
     if path.exists() and not path.is_file():
         fail(f"refusing non-file path {path}")
@@ -1533,9 +1558,136 @@ def remove_loopback_aliases(_: argparse.Namespace) -> None:
     print("PREPROD_LOOPBACK_ALIASES_REMOVED " + " ".join(removed))
 
 
-def static_hex(label: str, length: int = 48) -> str:
-    value = hashlib.sha256(f"aigw-preprod-only:{label}".encode()).hexdigest()
+def preprod_docker_state_exists(args: argparse.Namespace) -> bool:
+    """Return true when rotating credentials would break this PreProd project."""
+
+    container_names = docker(
+        "ps", "-a", "--format", "{{.Names}}", capture=True
+    ).stdout.splitlines()
+    if any(name.startswith(args.project + "-") for name in container_names):
+        return True
+
+    volume_names = docker(
+        "volume", "ls", "--format", "{{.Name}}", capture=True
+    ).stdout.splitlines()
+    if any(name.startswith(args.project + "_") for name in volume_names):
+        return True
+
+    network_names = docker(
+        "network", "ls", "--format", "{{.Name}}", capture=True
+    ).stdout.splitlines()
+    return any(name.startswith(args.project + "-") for name in network_names)
+
+
+def _read_credential_seed() -> bytes:
+    """Read the private controller seed through one bounded, no-follow file."""
+
+    try:
+        before = PREPROD_CREDENTIAL_SEED.lstat()
+    except FileNotFoundError:
+        fail("the private preprod credential seed is missing; run prepare first")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1
+        or (before.st_uid, before.st_gid) != (os.geteuid(), os.getegid())
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_size != PREPROD_CREDENTIAL_SEED_BYTES
+    ):
+        fail("the private preprod credential seed has an unsafe boundary")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(PREPROD_CREDENTIAL_SEED, flags)
+    except OSError:
+        fail("the private preprod credential seed changed while opening")
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            fail("the private preprod credential seed changed while opening")
+        value = os.read(descriptor, PREPROD_CREDENTIAL_SEED_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(value) != PREPROD_CREDENTIAL_SEED_BYTES:
+        fail("the private preprod credential seed has an invalid length")
+    return value
+
+
+def ensure_credential_seed(args: argparse.Namespace) -> None:
+    """Create one private seed, but never rotate credentials under live state."""
+
+    try:
+        directory = SECRETS_DIR.lstat()
+    except FileNotFoundError:
+        fail("the private preprod secrets directory is missing")
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or stat.S_ISLNK(directory.st_mode)
+        or (directory.st_uid, directory.st_gid) != (os.geteuid(), os.getegid())
+        or stat.S_IMODE(directory.st_mode) != 0o700
+    ):
+        fail("the private preprod secrets directory has an unsafe boundary")
+
+    if PREPROD_CREDENTIAL_SEED.exists():
+        _read_credential_seed()
+        return
+    if PREPROD_CREDENTIAL_SEED.is_symlink():
+        fail("the private preprod credential seed must not be a symlink")
+    if preprod_docker_state_exists(args):
+        fail(
+            "the private preprod credential seed is missing while PreProd Docker "
+            "state exists; destroy PreProd before rotating credentials"
+        )
+
+    value = secrets.token_bytes(PREPROD_CREDENTIAL_SEED_BYTES)
+    temporary = PREPROD_CREDENTIAL_SEED.with_name(
+        f".{PREPROD_CREDENTIAL_SEED.name}.tmp-{os.getpid()}-{uuid4().hex}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(value):
+            written = os.write(descriptor, value[offset:])
+            if written <= 0:
+                raise OSError("short credential seed write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.link(temporary, PREPROD_CREDENTIAL_SEED, follow_symlinks=False)
+        temporary.unlink()
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        fail("could not create the private preprod credential seed safely")
+    _read_credential_seed()
+
+
+def credential_hex(label: str, length: int = 48) -> str:
+    """Derive a stable, label-separated secret from the private seed."""
+
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", label) is None:
+        fail("a preprod credential label is invalid")
+    if length < 32 or length > 256:
+        fail("a preprod credential length is invalid")
+    seed = _read_credential_seed()
+    value = ""
+    counter = 1
+    while len(value) < length:
+        message = PREPROD_CREDENTIAL_CONTEXT + b":" + label.encode() + bytes([counter])
+        value += hmac.new(seed, message, hashlib.sha256).hexdigest()
+        counter += 1
     return value[:length]
+
+
+def credential_password(label: str) -> str:
+    """Build a strong test password with guaranteed character classes."""
+
+    return "Aigw1!" + credential_hex(label, 42)
 
 
 def certificate_paths() -> dict[str, Path]:
@@ -1949,7 +2101,7 @@ def digest_inputs() -> str:
             str(COMPOSE_DIR.resolve()),
             manifest,
         ],
-        input_text=static_hex("bind-source-digest", 64),
+        input_text=credential_hex("bind-source-digest", 64),
         capture=True,
         sensitive=True,
     )
@@ -2003,35 +2155,39 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "PORTAL_KEY_DEFAULT_RPM_LIMIT": "none",
         "PORTAL_KEY_DEFAULT_DURATION": "none",
         "PORTAL_KEY_PROJECT_LIMITS": "{}",
-        "PG_SUPER_PASSWORD": static_hex("pg-super"),
-        "PG_LITELLM_PASSWORD": static_hex("pg-litellm"),
-        "PG_KEYCLOAK_PASSWORD": static_hex("pg-keycloak"),
-        "PG_ROTATOR_PASSWORD": static_hex("pg-rotator"),
-        "PG_GRAFANA_RO_PASSWORD": static_hex("pg-grafana"),
-        "KC_ADMIN_PASSWORD": "OnlyForTesting1!Keycloak",
-        "KC_BOOTSTRAP_ADMIN_CLIENT_SECRET": static_hex("keycloak-bootstrap"),
-        "LITELLM_MASTER_KEY": "sk-" + static_hex("litellm-master"),
-        "LITELLM_SALT_KEY": static_hex("litellm-salt"),
-        "LITELLM_UI_BREAKGLASS_PASSWORD": "OnlyForTesting1!LiteLLM",
-        "REDIS_PASSWORD": static_hex("redis"),
-        "WEBUI_LITELLM_KEY": "sk-" + static_hex("webui-litellm"),
-        "WEBUI_SECRET_KEY": static_hex("webui-session"),
-        "OPENWEBUI_FORWARD_JWT_SECRET": static_hex(
+        "PG_SUPER_PASSWORD": credential_hex("pg-super"),
+        "PG_LITELLM_PASSWORD": credential_hex("pg-litellm"),
+        "PG_KEYCLOAK_PASSWORD": credential_hex("pg-keycloak"),
+        "PG_ROTATOR_PASSWORD": credential_hex("pg-rotator"),
+        "PG_GRAFANA_RO_PASSWORD": credential_hex("pg-grafana"),
+        "KC_ADMIN_PASSWORD": credential_password("keycloak-admin"),
+        "KC_BOOTSTRAP_ADMIN_CLIENT_SECRET": credential_hex("keycloak-bootstrap"),
+        "LITELLM_MASTER_KEY": "sk-" + credential_hex("litellm-master"),
+        "LITELLM_SALT_KEY": credential_hex("litellm-salt"),
+        "LITELLM_UI_BREAKGLASS_PASSWORD": credential_password(
+            "litellm-breakglass"
+        ),
+        "REDIS_PASSWORD": credential_hex("redis"),
+        "WEBUI_LITELLM_KEY": "sk-" + credential_hex("webui-litellm"),
+        "WEBUI_SECRET_KEY": credential_hex("webui-session"),
+        "OPENWEBUI_FORWARD_JWT_SECRET": credential_hex(
             "openwebui-forward-jwt", 64
         ),
-        "WEBUI_OIDC_CLIENT_SECRET": static_hex("webui-oidc"),
-        "PORTAL_OIDC_CLIENT_SECRET": static_hex("portal-oidc"),
-        "ADMIN_PORTAL_OIDC_CLIENT_SECRET": static_hex("admin-portal-oidc"),
-        "OAUTH2_PROXY_CLIENT_SECRET": static_hex("oauth-client"),
-        "VAULT_OIDC_CLIENT_SECRET": static_hex("vault-oidc"),
-        "OAUTH2_PROXY_LITELLM_COOKIE_SECRET": static_hex("cookie-litellm", 32),
-        "OAUTH2_PROXY_GRAFANA_COOKIE_SECRET": static_hex("cookie-grafana", 32),
-        "OAUTH2_PROXY_PROMETHEUS_COOKIE_SECRET": static_hex("cookie-prometheus", 32),
-        "OAUTH2_PROXY_VAULT_COOKIE_SECRET": static_hex("cookie-vault", 32),
-        "PORTAL_SESSION_SECRET": static_hex("portal-session"),
-        "ADMIN_PORTAL_SESSION_SECRET": static_hex("admin-session"),
-        "ROTATOR_INTERNAL_TOKEN": static_hex("rotator-internal"),
-        "PORTAL_IDENTITY_TOKEN": static_hex("portal-identity"),
+        "WEBUI_OIDC_CLIENT_SECRET": credential_hex("webui-oidc"),
+        "PORTAL_OIDC_CLIENT_SECRET": credential_hex("portal-oidc"),
+        "ADMIN_PORTAL_OIDC_CLIENT_SECRET": credential_hex("admin-portal-oidc"),
+        "OAUTH2_PROXY_CLIENT_SECRET": credential_hex("oauth-client"),
+        "VAULT_OIDC_CLIENT_SECRET": credential_hex("vault-oidc"),
+        "OAUTH2_PROXY_LITELLM_COOKIE_SECRET": credential_hex("cookie-litellm", 32),
+        "OAUTH2_PROXY_GRAFANA_COOKIE_SECRET": credential_hex("cookie-grafana", 32),
+        "OAUTH2_PROXY_PROMETHEUS_COOKIE_SECRET": credential_hex(
+            "cookie-prometheus", 32
+        ),
+        "OAUTH2_PROXY_VAULT_COOKIE_SECRET": credential_hex("cookie-vault", 32),
+        "PORTAL_SESSION_SECRET": credential_hex("portal-session"),
+        "ADMIN_PORTAL_SESSION_SECRET": credential_hex("admin-session"),
+        "ROTATOR_INTERNAL_TOKEN": credential_hex("rotator-internal"),
+        "PORTAL_IDENTITY_TOKEN": credential_hex("portal-identity"),
         "ROTATOR_VAULT_TOKEN": current_vault_token(),
         "KC_CLIENT_ASSERTION_KEY_VAULT_PATH": "ai-gateway/anthropic-wif-client-key",
         "IDENTITY_CONTROLLER_KEY_VAULT_PATH": "ai-gateway/keycloak/identity-controller-key",
@@ -2039,7 +2195,7 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "BREAK_GLASS_ADMIN_ENABLED": "true",
         "BREAK_GLASS_ADMIN_VAULT_PATH": "ai-gateway/keycloak/break-glass-admin",
         "VAULT_OIDC_RP_VAULT_PATH": "ai-gateway/keycloak/vault-oidc-rp",
-        "GRAFANA_ADMIN_PASSWORD": "OnlyForTesting1!Grafana",
+        "GRAFANA_ADMIN_PASSWORD": credential_password("grafana-admin"),
         "CRIBL_OTLP_ENDPOINT": "cribl-mock:4317",
         "CRIBL_OTLP_INSECURE": "false",
         "CRIBL_OTLP_CA_FILE": "/etc/ssl/certs/aigw-cribl-ca.pem",
@@ -2066,7 +2222,7 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
 
 def render_environment(args: argparse.Namespace) -> None:
     values = environment_values(args)
-    content = "# Generated by ansible/preprod.yml. Test credentials only.\n"
+    content = "# Generated private PreProd credentials. Do not commit.\n"
     content += "".join(f"{name}={value}\n" for name, value in values.items())
     write_file(ENV_FILE, content, 0o600)
 
@@ -2075,9 +2231,10 @@ def prepare(args: argparse.Namespace) -> None:
     check_context(args)
     if shutil.which("openssl") is None:
         fail("openssl is required to create the local test CA")
-    ensure_directory(SECRETS_DIR)
+    ensure_private_directory(SECRETS_DIR)
     ensure_directory(REALMS_DIR, 0o755)
     ensure_directory(EDGE_CERTS_DIR)
+    ensure_credential_seed(args)
     prepare_controller_audit_fixture()
     prepare_certificates(args.domain)
     render_realms(args.domain)
@@ -2086,27 +2243,34 @@ def prepare(args: argparse.Namespace) -> None:
     render_preprod_litellm_config()
     render_preprod_alloy_config()
     render_edge_forwarder()
-    write_file(SECRETS_DIR / "preprod-samba-admin-password", "OnlyForTesting1!DomainAdmin\n", 0o600, replace=False)
-    write_file(SECRETS_DIR / "preprod-samba-bind-password", "OnlyForTesting1!LdapBind\n", 0o600, replace=False)
-    write_file(SECRETS_DIR / "samba_user_preprod-admin_password", "OnlyForTesting1!PreprodAdmin\n", 0o600, replace=False)
-    write_file(SECRETS_DIR / "samba_user_preprod-developer_password", "OnlyForTesting1!PreprodDeveloper\n", 0o600, replace=False)
-    write_file(SECRETS_DIR / "samba_user_preprod-user_password", "OnlyForTesting1!PreprodUser\n", 0o600, replace=False)
-    redis_password = static_hex("redis")
+    for filename, label in (
+        ("preprod-samba-admin-password", "samba-domain-admin"),
+        ("preprod-samba-bind-password", "samba-ldap-bind"),
+        ("samba_user_preprod-admin_password", "samba-user-admin"),
+        ("samba_user_preprod-developer_password", "samba-user-developer"),
+        ("samba_user_preprod-user_password", "samba-user-standard"),
+    ):
+        write_file(
+            SECRETS_DIR / filename,
+            credential_password(label) + "\n",
+            0o600,
+        )
+    redis_password = credential_hex("redis")
     redis_password_hash = hashlib.sha256(redis_password.encode()).hexdigest()
-    # These values are fixed, local test credentials. Local preprod runs Redis
-    # as the recorded checkout owner, so Docker Desktop can bind these files
-    # without making the password readable by other users.
+    # These private test credentials stay stable while the ignored controller
+    # seed exists. Docker Desktop can bind the files without exposing them to
+    # other local users.
     write_file(SECRETS_DIR / "redis_password", redis_password + "\n", 0o600)
     write_file(
         SECRETS_DIR / "redis_users.acl",
         f"user default reset on #{redis_password_hash} ~* &* +@all\n",
         0o600,
     )
-    # Stable local-only source credential for LiteLLM's authenticated Alloy
-    # receiver. Production generates its own token once on the target host.
+    # Private local-only source credential for LiteLLM's authenticated Alloy
+    # receiver. Production generates its own token on the target host.
     write_file(
         SECRETS_DIR / "litellm_otel_token",
-        static_hex("litellm-otel", 64),
+        credential_hex("litellm-otel", 64),
         0o600,
     )
     jwks_path = SECRETS_DIR / "preprod-wif-jwks.json"
@@ -2549,7 +2713,7 @@ def _activate_seed(args: argparse.Namespace) -> None:
     values["AIGW_EGRESS_SOURCE_DATE_EPOCH"] = "0"
     values["AIGW_EGRESS_PROVIDERS"] = ",".join(policy["selected_providers"])
     values["AIGW_EGRESS_POLICY_SHA256"] = policy["egress_policy_sha256"]
-    content = "# Generated by ansible/preprod.yml. Test credentials only.\n"
+    content = "# Generated private PreProd credentials. Do not commit.\n"
     content += "".join(f"{name}={value}\n" for name, value in values.items())
     write_file(ENV_FILE, content, 0o600)
 
@@ -3369,7 +3533,7 @@ def bootstrap_vault(args: argparse.Namespace) -> None:
             fail("Vault returned no rotator token")
         values = environment_values(args)
         values["ROTATOR_VAULT_TOKEN"] = token
-        content = "# Generated by ansible/preprod.yml. Test credentials only.\n"
+        content = "# Generated private PreProd credentials. Do not commit.\n"
         content += "".join(f"{name}={value}\n" for name, value in values.items())
         write_file(ENV_FILE, content, 0o600)
     model = rendered_compose_model(args)
