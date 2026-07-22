@@ -324,8 +324,8 @@ docker_data_root: /var/lib/docker
 # in docs/operations.md. There is intentionally no dnf versionlock: the converge
 # re-asserts these on every run and is the sole sanctioned change path on a
 # dedicated host, matching the inline age/SDK pins and the image tag+digest pins.
-aigw_docker_ce_version: "29.6.1-1.el9"
-aigw_docker_ce_cli_version: "29.6.1-1.el9"
+aigw_docker_ce_version: "29.6.2-1.el9"
+aigw_docker_ce_cli_version: "29.6.2-1.el9"
 aigw_containerd_version: "2.2.6-1.el9"
 aigw_docker_compose_plugin_version: "5.3.1-1.el9"
 # Optional pre-staged Docker image archive. Generic/customer deployments are

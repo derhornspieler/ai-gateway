@@ -123,8 +123,8 @@ Current host pins are:
 
 | Package | Version |
 | --- | --- |
-| `docker-ce` | `29.6.1-1.el9` |
-| `docker-ce-cli` | `29.6.1-1.el9` |
+| `docker-ce` | `29.6.2-1.el9` |
+| `docker-ce-cli` | `29.6.2-1.el9` |
 | `containerd.io` | `2.2.6-1.el9` |
 | `docker-compose-plugin` | `5.3.1-1.el9` |
 | `age` | `1.3.1-1.el9` |

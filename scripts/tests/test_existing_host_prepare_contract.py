@@ -408,8 +408,8 @@ class ExistingRockyHostPrepareContractTests(unittest.TestCase):
         # verify/e2e suite is the single source of truth in group_vars/all.yml,
         # consumed by the os_baseline install task via a name-version spec.
         for pin in (
-            'aigw_docker_ce_version: "29.6.1-1.el9"',
-            'aigw_docker_ce_cli_version: "29.6.1-1.el9"',
+            'aigw_docker_ce_version: "29.6.2-1.el9"',
+            'aigw_docker_ce_cli_version: "29.6.2-1.el9"',
             'aigw_containerd_version: "2.2.6-1.el9"',
             'aigw_docker_compose_plugin_version: "5.3.1-1.el9"',
         ):
