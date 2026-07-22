@@ -5,44 +5,52 @@
 <a id="complete-current-candidate-release-acceptance"></a>
 
 - [ ] **Complete the current source candidate release acceptance** - The
-  runtime source is committed at `71c044b`; `7fcd027` adds only the reviewed
-  Vault restart runbook. The schema-v2 reader accepted the same release against
-  `7fcd027`, so the documentation commit changed no tracked runtime input.
+  runtime image inputs were built from `77c50d3`. Commits `5e84392` and
+  `3e8cafa` repair only the local PostgreSQL rehearsal and exact cleanup
+  helpers. They do not change a seed runtime image. The schema-v2 reader
+  accepted the same release against both fixes.
 
   - The Anthropic-only ARM64 production release contains 23 external and 17
     custom images. Its archive SHA-256 is
-    `52ac5ed7136e038b5884ff3b98241fce408fb9c6778d692e9fb4d90e1ca3943a`.
+    `45d6495e63ff09fca7d15579bea1878150c44d64e31203cc6c5b086128823390`.
     Its manifest SHA-256 is
-    `835a07f2c8ab7e0464fb6a66928ea8603894a8e64f5c8431b60923ff20741a6e`.
-  - The matching preprod release contains 24 external and 19 custom images.
+    `d735d17e08d7720d1e6649b3fedbf4d95f62e3f4616cb23b6651eed5b52cac80`.
+  - The matching preprod release contains 25 external and 19 custom images.
     Its archive SHA-256 is
-    `0cdb573370dad8507683eadbea7e5522a599ca3336b8130861b155381dbec62f`.
+    `ac87381f624463f5badc8b0d2c35c8e80786ac939ffc24d369e04a52a21db119`.
     Its manifest SHA-256 is
-    `c19b82a39c5d07342361d431e8bad0d978ef71c314f530c1c0d9aa4689a5eea7`.
+    `3552fe7f29ff2190348093f374ee48e2368a131ac04b80c50ed0b988e1a41d3b`.
   - The provider-policy digest is
     `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
     The exact Envoy image ID is
     `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
-  - The release-grade run removed the old owned deployment, preserved 222
-    unrelated image IDs, freshly loaded all 43 exact preprod image IDs, kept
-    pulls and builds disabled, and passed `PREPROD_CLEAN_ROOM_OK`,
-    `PREPROD_E2E_PASSED`, and `SEEDED_PREPROD_E2E_PASSED`. All 25 long-running
-    containers were healthy on the exact seed IDs.
-  - A Vault restart retained `initialized=true`, returned `sealed=true` and
-    HTTP 503, then the documented no-load Ansible run restored `sealed=false`,
-    HTTP 200, and both end-to-end markers. The 842 infrastructure contracts,
-    532 Python service tests, four Go race/vet suites, Compose, identity,
-    ShellCheck, yamllint, Bandit, Ruff, dependency audit, documentation links,
-    and Ansible syntax checks passed.
+  - The release-grade run started with an exact Ansible clean room, loaded all
+    44 preprod image IDs from the archive, and kept pulls and source builds
+    disabled. All 25 long-running services were healthy on PostgreSQL 16.14.
+    The application and Cribl acceptance tests passed before and after the
+    forced pre-cutover recovery.
+  - The same run restored more than 128 MiB of deterministic data in each of
+    the Keycloak, LiteLLM, and rotator databases to the exact PostgreSQL 18.4
+    seed image. It proved each service role still owned and could read and
+    write its data, passed full application and Cribl checks, refused a real
+    PostgreSQL 16 downgrade without mutation after writes opened, restored a
+    same-major physical backup, and passed the full checks again. Receipt
+    SHA-256: `5be54a1d8cb4d918f4addb060101adb14f8d9631c1ae3401275b8319904a2085`.
+  - The 872 infrastructure contracts, 532 Python service tests, four Go
+    race/vet suites, Compose, identity, ShellCheck, yamllint, Bandit, Ruff,
+    dependency audit, documentation links, and Ansible syntax checks passed.
   - Final exact-manifest teardown removed 26 containers, 19 networks, 11
-    volumes, all 43 release image IDs, 43 owned loopback aliases, and five
-    generated state files while preserving 222 unrelated image IDs. Separate
-    read-only checks found no owned container, image, volume, network, hosts
-    entry, loopback alias, or temporary test environment.
-  - Eight of ten GitHub workflows passed on `7fcd027`. The repository Trivy
-    scan passed. The two red workflows stopped only at the protected DHI
-    credential gates, so final image, VEX, SBOM, and container scans remain
-    blocked until a repository administrator adds both required secrets.
+    volumes, all 44 release aliases and image IDs, and six run-state files
+    while preserving all 16 unrelated image IDs. Separate read-only checks
+    found no owned container, seed image alias, volume, network, or hosts
+    entry. Reusable local test CA, keys, static test credentials, and rendered
+    inputs remain by design so later PreProd deployments use the same identity.
+  - Eight of ten GitHub workflows passed on `3e8cafa`. Repository Trivy,
+    CodeQL, secret scanning, infrastructure, Python, Go, policy, runtime-skew,
+    and hygiene checks passed. The two red workflows stopped only at the
+    protected DHI credential gates, so final DHI image, VEX, SBOM, and
+    container scans remain blocked until a repository administrator adds both
+    required secrets.
   - Real-browser acceptance remains `BLOCKED/NOT RUN`: this session exposed no
     browser backend. The browserless OIDC, cookie-scope, role, logout, and
     callback tests passed, but they do not replace the manual browser checklist.
@@ -149,24 +157,6 @@
     which host-level signals local Docker Desktop preprod cannot faithfully
     prove. Do not claim those host-only checks passed based on Docker Desktop
     results, and do not require a separate rehearsal VM.
-- [ ] **Rehearse the PostgreSQL 18 migration with production-sized data** -
-  The source now pins PostgreSQL 18.4 and includes the separate, fail-closed
-  logical migration workflow, fresh-volume cutover, validation, bounded
-  pre-write rollback, and plain-language SOP. The general image updater still
-  refuses major changes. A bounded ARM64 check on 2026-07-21 proved that the
-  exact DHI PostgreSQL 17.10 and 18.4 images both work with the current
-  database setup, LiteLLM, Keycloak, key-rotator, Grafana access rules,
-  PostgreSQL 16 logical restore, and same-major physical restore. PostgreSQL
-  18.4 is stable, and the operator selected it. Earlier seeded preprod runs put
-  the exact PostgreSQL 18 image in both seeds and started every database
-  consumer. Finish this item in local Docker preprod, using the exact current
-  preprod seed and synthetic production-sized PostgreSQL 16 data. Force a safe
-  pre-cutover rollback, prove a post-cutover downgrade is refused, and restore
-  a same-major PostgreSQL 18 backup. End with exact-manifest clean-room
-  teardown. Do not create a separate host or VM. Git history contains no
-  recorded technical reason for the original PostgreSQL 16 choice; describe
-  any claim beyond that as an inference.
-
 <a id="review-every-container-image-and-language-dependency-version"></a>
 
 - [ ] **Review every container image and language dependency version** - Check
@@ -251,6 +241,24 @@
 The dated `r7` through `r14` entries below are historical checkpoints. They do
 not approve the current source candidate.
 
+- [x] ~~Rehearse the PostgreSQL 18 migration with production-sized data~~
+  (2026-07-22)
+  - The exact 44-image ARM64 PreProd seed contained PostgreSQL 16.14 and 18.4.
+    Ansible started the complete PostgreSQL 16 graph and passed application and
+    Cribl checks before creating more than 128 MiB of fixed test data in each
+    application database.
+  - A forced failure before cutover restarted the unchanged source volume and
+    passed the full checks again. The logical move preserved table ownership
+    and grants. Keycloak, LiteLLM, and the rotator could each read and write
+    their restored data as their own restricted database role.
+  - PostgreSQL 18.4 passed the full application and Cribl checks. A real
+    PostgreSQL 16 command then failed closed after writes opened without
+    changing the target. A same-major physical backup and restore passed the
+    complete checks a final time.
+  - The exact-manifest teardown removed the whole deployment and all 44 seed
+    image IDs. No separate Rocky or Parallels rehearsal VM was created. The
+    migration SOP states that Git history gives no reason for the old
+    PostgreSQL 16 choice; any other explanation would be an inference.
 - [x] ~~Rewrite active documentation and add automated documentation checks~~ (2026-07-21)
   - Active documentation separates preprod from production and uses short,
     direct operator language. Obsolete lab material is archived and labeled as
