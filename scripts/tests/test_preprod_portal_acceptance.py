@@ -150,7 +150,7 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
 
         # The temporary key has one explicit model and a canonical policy.
         self.assertIn('"models": [MODEL]', limits)
-        self.assertIn('"created_via": "dev-portal"', limits)
+        self.assertNotIn('"created_via": "dev-portal"', limits)
         self.assertIn('"aigw_model_limits_v1": policy', limits)
         self.assertNotIn('"key": virtual_key', limits)
         self.assertIn('generated_key = response.get("key")', limits)
@@ -211,7 +211,17 @@ class PreprodPortalAcceptanceTests(unittest.TestCase):
         self.assertIn('"visible_in_discovery": False', lifecycle)
         self.assertIn('"/model-governance/models/" + model + "/activate"', lifecycle)
         self.assertIn('"/v1/messages"', lifecycle)
-        self.assertIn('"allowed_models": [model]', lifecycle)
+        self.assertIn('"allowed_routes": ["/v1/messages", "/v1/models"]', lifecycle)
+        self.assertNotIn('"created_via": "dev-portal"', lifecycle)
+        self.assertIn('generated_key = created_key.get("key")', lifecycle)
+        self.assertIn("generated_key == master_key", lifecycle)
+        self.assertIn('"capabilities": ["aigw-chat"]', lifecycle)
+        self.assertIn("for index in range(31)", lifecycle)
+        self.assertIn('"x" * (128 - len(prefix))', lifecycle)
+        self.assertIn('"max_output_tokens_per_request": 1_000_000', lifecycle)
+        self.assertIn('"output_tokens_per_utc_minute": 1_000_000_000', lifecycle)
+        self.assertIn("PREPROD_MODEL_POLICY_CHUNKS_PASSED", lifecycle)
+        self.assertIn('"allowed_models": policy_models', lifecycle)
         self.assertIn('policy_operation_id = str(uuid.uuid4())', lifecycle)
         self.assertEqual(lifecycle.count("operation_id=policy_operation_id"), 3)
         self.assertIn(

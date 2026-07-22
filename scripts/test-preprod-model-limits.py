@@ -310,7 +310,9 @@ def main() -> int:
                 "models": [MODEL],
                 "allowed_routes": ["/v1/chat/completions"],
                 "metadata": {
-                    "created_via": "dev-portal",
+                    # This is an operator test key, not a portal key. Claiming
+                    # portal ownership would correctly make the identity
+                    # reconciler revoke its synthetic Keycloak project.
                     "aigw_project_id": project,
                     "aigw_model_limits_v1": policy,
                 },

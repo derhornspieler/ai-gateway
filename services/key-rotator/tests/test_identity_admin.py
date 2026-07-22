@@ -1819,11 +1819,22 @@ def test_group_policy_parses_attributes_and_fails_closed_on_malformed() -> None:
 
     # A malformed restriction must never fall back to unlimited.
     for attributes in (
+        {"aigw.policy.tpm_limit": None},
+        {"aigw.policy.tpm_limit": []},
+        {"aigw.policy.tpm_limit": [""]},
+        {"aigw.policy.tpm_limit": [" " + ("1" * 255)]},
+        {"aigw.policy.tpm_limit": ["", "5"]},
+        {"aigw.policy.allowed_models_v2": ["claude-sonnet"]},
         {"aigw.policy.tpm_limit": ["-5"]},
         {"aigw.policy.tpm_limit": ["0"]},
         {"aigw.policy.rpm_limit": ["sixty"]},
         {"aigw.policy.tpm_limit": ["1", "2"]},
         {"aigw.policy.allowed_models": ["claude sonnet"]},
+        {"aigw.policy.allowed_models": None},
+        {"aigw.policy.allowed_models": []},
+        {"aigw.policy.allowed_models": [""]},
+        {"aigw.policy.allowed_models": [" " + ("m" * 255)]},
+        {"aigw.policy.allowed_models": ["", "claude-sonnet"]},
         {"aigw.policy.allowed_models": ["claude-sonnet,claude-sonnet"]},
         {"aigw.policy.allowed_models": [",".join(f"m{i}" for i in range(33))]},
         {
@@ -1863,6 +1874,108 @@ def test_group_policy_parses_attributes_and_fails_closed_on_malformed() -> None:
             parse({"attributes": attributes})
 
 
+@pytest.mark.parametrize("attributes", (None, [], "", 0, False))
+def test_group_policy_rejects_falsy_malformed_attribute_maps(attributes) -> None:
+    group = {"attributes": attributes}
+    with pytest.raises(IdentityConflict, match="group attributes were invalid"):
+        KeycloakAdmin._group_policy(group)
+    with pytest.raises(IdentityConflict, match="group attributes were invalid"):
+        KeycloakAdmin._pending_group_policy(group)
+
+
+def test_policy_text_chunks_are_order_independent_and_fail_closed() -> None:
+    value = "model-" + ("x" * 700)
+    chunks = KeycloakAdmin._encode_policy_text(
+        "policy", value, 1024, "test policy is invalid"
+    )
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 255 for chunk in chunks)
+    assert (
+        KeycloakAdmin._policy_text_attribute(
+            {"policy": list(reversed(chunks))},
+            "policy",
+            1024,
+            "test policy is invalid",
+        )
+        == value
+    )
+    assert (
+        KeycloakAdmin._policy_text_attribute(
+            {"policy": ["legacy-value"]},
+            "policy",
+            1024,
+            "test policy is invalid",
+        )
+        == "legacy-value"
+    )
+    assert KeycloakAdmin._encode_policy_text(
+        "policy", "x" * 255, 1024, "test policy is invalid"
+    ) == ["x" * 255]
+    boundary_chunks = KeycloakAdmin._encode_policy_text(
+        "policy", "x" * 256, 1024, "test policy is invalid"
+    )
+    assert len(boundary_chunks) > 1
+    assert all(len(chunk) <= 255 for chunk in boundary_chunks)
+
+    fake_digest = "0" * 64
+    for malformed in (
+        [],
+        [""],
+        [f"~aigw-p2:0001/0001:{fake_digest}:unknown-version"],
+        [f"~aigw-p1:0001/0002:{fake_digest}:missing-second"],
+        [
+            f"~aigw-p1:0001/0002:{fake_digest}:first",
+            f"~aigw-p1:0001/0002:{fake_digest}:duplicate",
+        ],
+        [
+            f"~aigw-p1:0001/0002:{fake_digest}:first",
+            f"~aigw-p1:0002/0003:{fake_digest}:wrong-total",
+        ],
+        [
+            f"~aigw-p1:0001/0002:{fake_digest}:a",
+            f"~aigw-p1:0002/0002:{fake_digest}:b",
+        ],
+        ["legacy", f"~aigw-p1:0002/0002:{fake_digest}:chunk"],
+        [f"~aigw-p1:0001/0001:{fake_digest}:" + ("x" * 172)],
+        ["not-ascii-é"],
+    ):
+        with pytest.raises(IdentityConflict, match="test policy is invalid"):
+            KeycloakAdmin._policy_text_attribute(
+                {"policy": malformed},
+                "policy",
+                1024,
+                "test policy is invalid",
+            )
+
+    other = KeycloakAdmin._encode_policy_text(
+        "policy", "other-" + ("y" * 700), 1024, "test policy is invalid"
+    )
+    mixed = list(chunks)
+    mixed[-1] = other[-1]
+    with pytest.raises(IdentityConflict, match="test policy is invalid"):
+        KeycloakAdmin._policy_text_attribute(
+            {"policy": mixed},
+            "policy",
+            1024,
+            "test policy is invalid",
+        )
+
+    # A complete value cannot be copied into a different policy attribute.
+    with pytest.raises(IdentityConflict, match="test policy is invalid"):
+        KeycloakAdmin._policy_text_attribute(
+            {"other-policy": chunks},
+            "other-policy",
+            1024,
+            "test policy is invalid",
+        )
+
+    # The chunk marker is outside the reviewed model-name grammar. A normal
+    # colon-bearing model remains a valid legacy scalar.
+    assert KeycloakAdmin._group_policy(
+        {"attributes": {"aigw.policy.allowed_models": ["v1:model"]}}
+    )["allowed_models"] == ["v1:model"]
+
+
 class PolicyAdmin(KeycloakAdmin):
     """Managed-group double with an in-memory Keycloak group record."""
 
@@ -1888,6 +2001,16 @@ class PolicyAdmin(KeycloakAdmin):
             return httpx.Response(200, json=copy.deepcopy(self.group))
         if method == "PUT" and path.endswith("/groups/group-1"):
             body = kwargs.get("json_body")
+            for name, values in body.get("attributes", {}).items():
+                if name.startswith("aigw.policy."):
+                    assert isinstance(values, list)
+                    assert values
+                    assert all(
+                        isinstance(value, str)
+                        and value.strip()
+                        and len(value) <= 255
+                        for value in values
+                    )
             self.puts.append(copy.deepcopy(body))
             if self.persist_writes:
                 self.group = {**self.group, **copy.deepcopy(body)}
@@ -1906,6 +2029,31 @@ def policy_admin() -> PolicyAdmin:
         }
     )
     return PolicyAdmin(cfg, vault, FakeDB())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("values", (None, [], [""], ["", "model"]))
+async def test_group_policy_writer_rejects_malformed_values(values) -> None:
+    admin = policy_admin()
+    attributes = copy.deepcopy(admin.group["attributes"])
+    attributes["aigw.policy.allowed_models"] = values
+    with pytest.raises(IdentityConflict, match="group policy attribute is invalid"):
+        await admin._write_group_attributes(
+            "group-1", admin.group, attributes, "controller-token"
+        )
+    assert admin.puts == []
+
+
+@pytest.mark.asyncio
+async def test_group_policy_writer_rejects_unknown_reserved_attribute() -> None:
+    admin = policy_admin()
+    attributes = copy.deepcopy(admin.group["attributes"])
+    attributes["aigw.policy.allowed_models_v2"] = ["claude-sonnet"]
+    with pytest.raises(IdentityConflict, match="policy attribute is unsupported"):
+        await admin._write_group_attributes(
+            "group-1", admin.group, attributes, "controller-token"
+        )
+    assert admin.puts == []
 
 
 @pytest.mark.asyncio
@@ -1996,6 +2144,49 @@ async def test_set_group_policy_writes_verifies_and_preserves_foreign_attributes
         "group-1", clear_revision, "22222222-2222-4222-8222-222222222222"
     )
     assert admin.puts[-1]["attributes"] == {"custom.marker": ["keep-me"]}
+
+
+@pytest.mark.asyncio
+async def test_full_group_policy_fits_keycloak_attribute_rows() -> None:
+    admin = policy_admin()
+    models = [f"model-{index:02d}-" + ("x" * 119) for index in range(32)]
+    desired = {
+        "tpm_limit": 1_000_000_000,
+        "rpm_limit": 1_000_000_000,
+        "allowed_models": models,
+        "default_model": models[0],
+        "model_limits": {
+            model: {
+                "max_output_tokens_per_request": 1_000_000,
+                "output_tokens_per_utc_minute": 1_000_000_000,
+            }
+            for model in models
+        },
+    }
+    operation_id = "33333333-3333-4333-8333-333333333333"
+
+    staged = await admin.set_group_policy("group-1", desired, operation_id)
+    pending = admin.puts[0]["attributes"]["aigw.policy.pending_v1"]
+    assert len(pending) > 1
+    assert all(len(value) <= 255 for value in pending)
+
+    await admin.activate_group_policy(
+        "group-1", staged["policy_revision"], operation_id
+    )
+    active = admin.puts[1]["attributes"]
+    for name in (
+        "aigw.policy.allowed_models",
+        "aigw.policy.model_limits_v1",
+        "aigw.policy.pending_v1",
+    ):
+        assert len(active[name]) > 1
+        assert all(len(value) <= 255 for value in active[name])
+    assert admin._group_policy(admin.group) == desired
+
+    await admin.complete_group_policy(
+        "group-1", staged["policy_revision"], operation_id
+    )
+    assert "aigw.policy.pending_v1" not in admin.group["attributes"]
 
 
 @pytest.mark.asyncio

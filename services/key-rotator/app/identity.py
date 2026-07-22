@@ -111,6 +111,19 @@ POLICY_MODEL_LIMITS_ATTRIBUTE = "aigw.policy.model_limits_v1"
 POLICY_PENDING_ATTRIBUTE = "aigw.policy.pending_v1"
 POLICY_PENDING_SCHEMA = 1
 POLICY_REVISION_RE = re.compile(r"[0-9a-f]{64}")
+# Keycloak 26.7 stores each group-attribute value in VARCHAR(255). Policy
+# documents can be larger, so split only the reviewed policy fields into
+# numbered values. The prefix makes order independent of database row order.
+KEYCLOAK_ATTRIBUTE_VALUE_MAX_CHARS = 255
+POLICY_CHUNK_PREFIX_TEMPLATE = "~aigw-p1:0001/0001:" + ("0" * 64) + ":"
+POLICY_CHUNK_RE = re.compile(
+    r"~aigw-p1:([0-9]{4})/([0-9]{4}):([0-9a-f]{64}):(.*)"
+)
+POLICY_CHUNK_PAYLOAD_CHARS = (
+    KEYCLOAK_ATTRIBUTE_VALUE_MAX_CHARS - len(POLICY_CHUNK_PREFIX_TEMPLATE)
+)
+POLICY_MODEL_LIMITS_MAX_BYTES = 8192
+POLICY_PENDING_MAX_BYTES = 16 * 1024
 ACTIVE_POLICY_ATTRIBUTES = frozenset(
     {
         POLICY_TPM_ATTRIBUTE,
@@ -123,6 +136,7 @@ ACTIVE_POLICY_ATTRIBUTES = frozenset(
 POLICY_ATTRIBUTES = ACTIVE_POLICY_ATTRIBUTES | {POLICY_PENDING_ATTRIBUTE}
 MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}")
 MAX_POLICY_MODELS = 32
+POLICY_MODELS_MAX_BYTES = MAX_POLICY_MODELS * 129
 POLICY_LIMIT_MAX = 1_000_000_000
 MODEL_REQUEST_OUTPUT_MAX = 1_000_000
 MODEL_LIMIT_FIELDS = frozenset(
@@ -4815,19 +4829,157 @@ class KeycloakAdmin:
     ) -> str | None:
         """Read one single-valued policy attribute or fail on ambiguity."""
 
-        raw = attributes.get(name)
-        if raw is None:
+        if name not in attributes:
             return None
+        raw = attributes[name]
         if not isinstance(raw, list) or any(
             not isinstance(value, str) for value in raw
         ):
             raise IdentityConflict("group policy attribute is invalid")
-        values = [value.strip() for value in raw if value.strip()]
-        if not values:
+        if len(raw) != 1:
+            if len(raw) > 1:
+                raise IdentityConflict("group policy attribute has multiple values")
+            raise IdentityConflict("group policy attribute is invalid")
+        if len(raw[0]) > KEYCLOAK_ATTRIBUTE_VALUE_MAX_CHARS:
+            raise IdentityConflict("group policy attribute is invalid")
+        value = raw[0].strip()
+        if not value:
+            raise IdentityConflict("group policy attribute is invalid")
+        return value
+
+    @staticmethod
+    def _policy_group_attributes(group: dict[str, Any]) -> dict[str, Any]:
+        """Return a group's attributes without hiding malformed values."""
+
+        if "attributes" not in group:
+            return {}
+        attributes = group["attributes"]
+        if not isinstance(attributes, dict):
+            raise IdentityConflict("group attributes were invalid")
+        KeycloakAdmin._validate_policy_attribute_names(attributes)
+        return attributes
+
+    @staticmethod
+    def _validate_policy_attribute_names(attributes: dict[str, Any]) -> None:
+        """Reject unknown keys in the controller-owned policy namespace."""
+
+        for name in attributes:
+            if not isinstance(name, str):
+                raise IdentityConflict("group attributes were invalid")
+            if name.startswith("aigw.policy.") and name not in POLICY_ATTRIBUTES:
+                raise IdentityConflict("group policy attribute is unsupported")
+
+    @staticmethod
+    def _encode_policy_text(
+        name: str, value: str, max_bytes: int, error: str
+    ) -> list[str]:
+        """Split one canonical ASCII policy value for Keycloak VARCHAR(255)."""
+
+        try:
+            encoded_name = name.encode("ascii")
+            encoded = value.encode("ascii")
+        except (AttributeError, UnicodeEncodeError) as exc:
+            raise IdentityConflict(error) from exc
+        if not encoded_name or not encoded or len(encoded) > max_bytes:
+            raise IdentityConflict(error)
+        if len(value) <= KEYCLOAK_ATTRIBUTE_VALUE_MAX_CHARS:
+            return [value]
+        digest = hashlib.sha256(
+            b"aigw-keycloak-policy-chunk-v1\0"
+            + encoded_name
+            + b"\0"
+            + encoded
+        ).hexdigest()
+        parts = [
+            value[offset : offset + POLICY_CHUNK_PAYLOAD_CHARS]
+            for offset in range(0, len(value), POLICY_CHUNK_PAYLOAD_CHARS)
+        ]
+        total = len(parts)
+        if total > 9999:
+            raise IdentityConflict(error)
+        return [
+            f"~aigw-p1:{index:04d}/{total:04d}:{digest}:{part}"
+            for index, part in enumerate(parts, start=1)
+        ]
+
+    @classmethod
+    def _policy_text_attribute(
+        cls,
+        attributes: dict[str, Any],
+        name: str,
+        max_bytes: int,
+        error: str,
+    ) -> str | None:
+        """Read a legacy scalar or exact, order-independent policy chunks."""
+
+        if name not in attributes:
             return None
-        if len(values) > 1:
-            raise IdentityConflict("group policy attribute has multiple values")
-        return values[0]
+        raw = attributes[name]
+        if not isinstance(raw, list) or any(
+            not isinstance(value, str) for value in raw
+        ):
+            raise IdentityConflict(error)
+        if not raw or any(not value.strip() for value in raw):
+            raise IdentityConflict(error)
+
+        # Keep short values compatible with existing deployments. Longer
+        # values use the versioned format below.
+        if len(raw) == 1 and POLICY_CHUNK_RE.fullmatch(raw[0]) is None:
+            if raw[0].startswith("~aigw-p"):
+                raise IdentityConflict(error)
+            if len(raw[0]) > KEYCLOAK_ATTRIBUTE_VALUE_MAX_CHARS:
+                raise IdentityConflict(error)
+            value = raw[0].strip()
+            try:
+                encoded = value.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise IdentityConflict(error) from exc
+            if not encoded or len(encoded) > max_bytes:
+                raise IdentityConflict(error)
+            return value
+
+        max_chunks = (
+            max_bytes + POLICY_CHUNK_PAYLOAD_CHARS - 1
+        ) // POLICY_CHUNK_PAYLOAD_CHARS
+        if len(raw) > max_chunks:
+            raise IdentityConflict(error)
+        chunks: dict[int, str] = {}
+        expected_total: int | None = None
+        expected_digest: str | None = None
+        for value in raw:
+            if len(value) > KEYCLOAK_ATTRIBUTE_VALUE_MAX_CHARS:
+                raise IdentityConflict(error)
+            match = POLICY_CHUNK_RE.fullmatch(value)
+            if match is None:
+                raise IdentityConflict(error)
+            index = int(match.group(1))
+            total = int(match.group(2))
+            digest = match.group(3)
+            if (
+                index < 1
+                or total < 1
+                or index > total
+                or (expected_total is not None and total != expected_total)
+                or (expected_digest is not None and digest != expected_digest)
+                or index in chunks
+            ):
+                raise IdentityConflict(error)
+            expected_total = total
+            expected_digest = digest
+            chunks[index] = match.group(4)
+        if expected_total != len(raw) or set(chunks) != set(
+            range(1, len(raw) + 1)
+        ):
+            raise IdentityConflict(error)
+        value = "".join(chunks[index] for index in range(1, len(raw) + 1))
+        canonical = cls._encode_policy_text(name, value, max_bytes, error)
+        ordered = [
+            f"~aigw-p1:{index:04d}/{len(raw):04d}:{expected_digest}:{chunks[index]}"
+            for index in range(1, len(raw) + 1)
+        ]
+        if canonical != ordered:
+            raise IdentityConflict(error)
+        return value
 
     @classmethod
     def _group_policy(cls, group: dict[str, Any]) -> dict[str, Any]:
@@ -4838,9 +4990,7 @@ class KeycloakAdmin:
         silent fallback — a broken restriction must not mint unlimited keys.
         """
 
-        attributes = group.get("attributes") or {}
-        if not isinstance(attributes, dict):
-            raise IdentityConflict("group attributes were invalid")
+        attributes = cls._policy_group_attributes(group)
 
         policy: dict[str, Any] = {
             "tpm_limit": None,
@@ -4860,7 +5010,12 @@ class KeycloakAdmin:
                 raise IdentityConflict("group rate-limit policy is invalid")
             policy[knob] = int(raw)
 
-        raw_models = cls._single_policy_attribute(attributes, POLICY_MODELS_ATTRIBUTE)
+        raw_models = cls._policy_text_attribute(
+            attributes,
+            POLICY_MODELS_ATTRIBUTE,
+            POLICY_MODELS_MAX_BYTES,
+            "group model policy is invalid",
+        )
         if raw_models is not None:
             names = [name.strip() for name in raw_models.split(",")]
             if (
@@ -4885,12 +5040,13 @@ class KeycloakAdmin:
                 )
             policy["default_model"] = raw_default
 
-        raw_model_limits = cls._single_policy_attribute(
-            attributes, POLICY_MODEL_LIMITS_ATTRIBUTE
+        raw_model_limits = cls._policy_text_attribute(
+            attributes,
+            POLICY_MODEL_LIMITS_ATTRIBUTE,
+            POLICY_MODEL_LIMITS_MAX_BYTES,
+            "group per-model limit policy is invalid",
         )
         if raw_model_limits is not None:
-            if len(raw_model_limits.encode("utf-8")) > 8192:
-                raise IdentityConflict("group per-model limit policy is invalid")
             try:
                 model_limits = json.loads(raw_model_limits)
             except (TypeError, ValueError) as exc:
@@ -5041,14 +5197,15 @@ class KeycloakAdmin:
     def _pending_group_policy(cls, group: dict[str, Any]) -> dict[str, Any] | None:
         """Read one durable pending policy without weakening malformed state."""
 
-        attributes = group.get("attributes") or {}
-        if not isinstance(attributes, dict):
-            raise IdentityConflict("group attributes were invalid")
-        raw = cls._single_policy_attribute(attributes, POLICY_PENDING_ATTRIBUTE)
+        attributes = cls._policy_group_attributes(group)
+        raw = cls._policy_text_attribute(
+            attributes,
+            POLICY_PENDING_ATTRIBUTE,
+            POLICY_PENDING_MAX_BYTES,
+            "pending group policy is invalid",
+        )
         if raw is None:
             return None
-        if len(raw.encode("utf-8")) > 16 * 1024:
-            raise IdentityConflict("pending group policy is invalid")
         try:
             document = json.loads(raw)
         except (TypeError, ValueError) as exc:
@@ -5108,20 +5265,30 @@ class KeycloakAdmin:
         if policy["rpm_limit"] is not None:
             attributes[POLICY_RPM_ATTRIBUTE] = [str(policy["rpm_limit"])]
         if policy["allowed_models"] is not None:
-            attributes[POLICY_MODELS_ATTRIBUTE] = [
-                ",".join(policy["allowed_models"])
-            ]
+            attributes[POLICY_MODELS_ATTRIBUTE] = (
+                KeycloakAdmin._encode_policy_text(
+                    POLICY_MODELS_ATTRIBUTE,
+                    ",".join(policy["allowed_models"]),
+                    POLICY_MODELS_MAX_BYTES,
+                    "group model policy is invalid",
+                )
+            )
         if policy["default_model"] is not None:
             attributes[POLICY_DEFAULT_MODEL_ATTRIBUTE] = [policy["default_model"]]
         if policy["model_limits"]:
-            attributes[POLICY_MODEL_LIMITS_ATTRIBUTE] = [
-                json.dumps(
-                    policy["model_limits"],
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=True,
+            attributes[POLICY_MODEL_LIMITS_ATTRIBUTE] = (
+                KeycloakAdmin._encode_policy_text(
+                    POLICY_MODEL_LIMITS_ATTRIBUTE,
+                    json.dumps(
+                        policy["model_limits"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ),
+                    POLICY_MODEL_LIMITS_MAX_BYTES,
+                    "group per-model limit policy is invalid",
                 )
-            ]
+            )
         return attributes
 
     async def _write_group_attributes(
@@ -5131,6 +5298,18 @@ class KeycloakAdmin:
         attributes: dict[str, Any],
         token: str,
     ) -> dict[str, Any]:
+        self._validate_policy_attribute_names(attributes)
+        for name in POLICY_ATTRIBUTES:
+            if name not in attributes:
+                continue
+            values = attributes[name]
+            if not isinstance(values, list) or not values or any(
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > KEYCLOAK_ATTRIBUTE_VALUE_MAX_CHARS
+                for value in values
+            ):
+                raise IdentityConflict("group policy attribute is invalid")
         realm = path_segment(self.settings.identity_realm, label="Keycloak realm")
         safe_group = path_segment(group_id, label="group UUID")
         await self._request(
@@ -5195,9 +5374,7 @@ class KeycloakAdmin:
         token = await self._controller_token()
         group = await self._managed_group(group_id, token)
         project_id = self._managed_project_id(group)
-        raw_attributes = group.get("attributes") or {}
-        if not isinstance(raw_attributes, dict):
-            raise IdentityConflict("group attributes were invalid")
+        raw_attributes = self._policy_group_attributes(group)
         safe_group = path_segment(group_id, label="group UUID")
         existing = self._pending_group_policy(group)
         if existing is not None:
@@ -5219,7 +5396,12 @@ class KeycloakAdmin:
                 ensure_ascii=True,
             )
             attributes = dict(raw_attributes)
-            attributes[POLICY_PENDING_ATTRIBUTE] = [pending_document]
+            attributes[POLICY_PENDING_ATTRIBUTE] = self._encode_policy_text(
+                POLICY_PENDING_ATTRIBUTE,
+                pending_document,
+                POLICY_PENDING_MAX_BYTES,
+                "pending group policy is invalid",
+            )
             verified = await self._write_group_attributes(
                 group_id, group, attributes, token
             )
@@ -5272,9 +5454,7 @@ class KeycloakAdmin:
             if not hmac.compare_digest(pending["revision"], revision):
                 raise IdentityConflict("group policy revision changed")
             if active != pending["policy"]:
-                raw_attributes = group.get("attributes") or {}
-                if not isinstance(raw_attributes, dict):
-                    raise IdentityConflict("group attributes were invalid")
+                raw_attributes = self._policy_group_attributes(group)
                 attributes = self._attributes_with_active_policy(
                     raw_attributes, pending["policy"]
                 )
@@ -5324,9 +5504,7 @@ class KeycloakAdmin:
                 or active != pending["policy"]
             ):
                 raise IdentityConflict("group policy is not ready to complete")
-            raw_attributes = group.get("attributes") or {}
-            if not isinstance(raw_attributes, dict):
-                raise IdentityConflict("group attributes were invalid")
+            raw_attributes = self._policy_group_attributes(group)
             attributes = dict(raw_attributes)
             attributes.pop(POLICY_PENDING_ATTRIBUTE, None)
             group = await self._write_group_attributes(

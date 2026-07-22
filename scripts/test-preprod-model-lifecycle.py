@@ -108,7 +108,7 @@ def discovery(token):
     return {row.get("id") for row in rows if isinstance(row, dict)}
 
 
-key = "sk-" + secrets.token_hex(24)
+key = None
 key_created = False
 model_created = False
 model_active = False
@@ -153,21 +153,32 @@ try:
     status, created_key = litellm(
         "/key/generate",
         {
-            "key": key,
             "key_alias": "preprod-model-lifecycle-" + suffix,
             "user_id": "preprod-model-lifecycle-" + suffix,
             "models": [model],
-            "allowed_routes": ["/v1/messages"],
+            # This key proves both filtered discovery and one inference call.
+            # LiteLLM enforces this list before the portal can filter models.
+            "allowed_routes": ["/v1/messages", "/v1/models"],
             "metadata": {
-                "created_via": "dev-portal",
+                # This operator acceptance key has no real Keycloak owner.
+                # Never label it as a portal key or reconciliation will
+                # correctly revoke the synthetic project binding.
                 "aigw_project_id": "preprod-model-lifecycle-" + suffix,
             },
             "permissions": {},
             "blocked": False,
         },
     )
-    if status != 200 or created_key.get("key") != key:
+    generated_key = created_key.get("key") if isinstance(created_key, dict) else None
+    if (
+        status != 200
+        or not isinstance(generated_key, str)
+        or not generated_key.startswith("sk-")
+        or not 24 <= len(generated_key) <= 2048
+        or generated_key == master_key
+    ):
         raise SystemExit("the test key was not created")
+    key = generated_key
     key_created = True
 
     if model in discovery(key):
@@ -219,7 +230,7 @@ try:
     status, group = control(
         "POST",
         "/identity/groups",
-        {"name": project, "capabilities": ["chat"]},
+        {"name": project, "capabilities": ["aigw-chat"]},
         write=True,
     )
     if status != 201 or not isinstance(group, dict):
@@ -228,16 +239,31 @@ try:
     if not isinstance(group_id, str) or not group_id:
         raise SystemExit("the temporary project ID was invalid")
 
+    # Fill every supported policy slot with long, valid model names. This
+    # proves the real Keycloak/Postgres path can store and read a policy that
+    # spans many 255-character attribute rows.
+    policy_models = [model]
+    for index in range(31):
+        prefix = "preprod-policy-" + suffix + f"-{index:02d}-"
+        policy_models.append(prefix + ("x" * (128 - len(prefix))))
+    policy_models = sorted(policy_models)
+    model_limits = {
+        name: {
+            "max_output_tokens_per_request": 1_000_000,
+            "output_tokens_per_utc_minute": 1_000_000_000,
+        }
+        for name in policy_models
+    }
     policy_operation_id = str(uuid.uuid4())
     status, policy = control(
         "PUT",
         "/identity/groups/" + group_id + "/policy",
         {
-            "tpm_limit": None,
-            "rpm_limit": None,
-            "allowed_models": [model],
+            "tpm_limit": 1_000_000_000,
+            "rpm_limit": 1_000_000_000,
+            "allowed_models": policy_models,
             "default_model": model,
-            "model_limits": {},
+            "model_limits": model_limits,
         },
         write=True,
         operation_id=policy_operation_id,
@@ -283,6 +309,7 @@ try:
         or completed.get("active_policy") != intended_policy
     ):
         raise SystemExit("the temporary project policy was not completed")
+    print("PREPROD_MODEL_POLICY_CHUNKS_PASSED")
 
     status, denied_retirement = control(
         "POST",
@@ -460,6 +487,7 @@ def main() -> int:
         "PREPROD_MODEL_DRAFT_HIDDEN_PASSED",
         "PREPROD_MODEL_HIDDEN_CALL_PASSED",
         "PREPROD_MODEL_DISCOVERY_PASSED",
+        "PREPROD_MODEL_POLICY_CHUNKS_PASSED",
         "PREPROD_MODEL_ASSIGNMENT_GATE_PASSED",
         "PREPROD_MODEL_RETIREMENT_PASSED",
         "PREPROD_MODEL_LIFECYCLE_PASSED",
