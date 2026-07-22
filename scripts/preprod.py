@@ -2107,6 +2107,30 @@ def render_preprod_litellm_config() -> None:
     write_file(SECRETS_DIR / "preprod-litellm-config.yaml", rendered, 0o644)
 
 
+def configured_preprod_model_names() -> list[str]:
+    """Read the reviewed model names from the production LiteLLM config."""
+
+    source = COMPOSE_DIR / "litellm/config.yaml"
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        fail(f"cannot read the production LiteLLM config: {exc}")
+    names: list[str] = []
+    pattern = re.compile(
+        r"\s*- model_name: ([A-Za-z0-9][A-Za-z0-9_./:-]{0,127})\s*"
+    )
+    for line in lines:
+        if "- model_name:" not in line:
+            continue
+        match = pattern.fullmatch(line)
+        if match is None:
+            fail("the production LiteLLM model list is not in the reviewed form")
+        names.append(match.group(1))
+    if not 1 <= len(names) <= 32 or len(set(names)) != len(names):
+        fail("the production LiteLLM model list is empty, duplicated, or too large")
+    return sorted(names)
+
+
 def render_preprod_alloy_config() -> None:
     """Render the normal Alloy policy with verified TLS for the local mock."""
 
@@ -4303,6 +4327,84 @@ def auto_initialize_identity(args: argparse.Namespace) -> None:
     print(marker)
 
 
+def ensure_preprod_group_policy(
+    args: argparse.Namespace,
+    group: dict[str, Any],
+    model_names: list[str],
+    *,
+    created: bool,
+) -> None:
+    """Give a new static test group one explicit, repeatable model policy."""
+
+    group_id = group.get("id")
+    if not isinstance(group_id, str) or not group_id:
+        fail("a managed preprod group has no valid ID")
+    desired = {
+        "tpm_limit": None,
+        "rpm_limit": None,
+        "allowed_models": model_names,
+        "default_model": None,
+        "model_limits": {},
+    }
+    if group.get("policy") == desired:
+        return
+    if not created:
+        fail(
+            "an existing static preprod group has an unexpected model policy; "
+            "run the release clean-room test"
+        )
+
+    operation_id = str(uuid4())
+    status_code, staged = internal_call(
+        args,
+        "PUT",
+        f"/identity/groups/{group_id}/policy",
+        desired,
+        operation_id=operation_id,
+    )
+    revision = staged.get("policy_revision") if isinstance(staged, dict) else None
+    if (
+        status_code != 200
+        or not isinstance(revision, str)
+        or len(revision) != 64
+        or staged.get("policy") != desired
+        or staged.get("reconciliation_pending") is not True
+    ):
+        fail("a static preprod group policy could not be staged")
+
+    status_code, activated = internal_call(
+        args,
+        "POST",
+        f"/identity/groups/{group_id}/policy/activate",
+        {"policy_revision": revision},
+        operation_id=operation_id,
+    )
+    if (
+        status_code != 200
+        or not isinstance(activated, dict)
+        or activated.get("active_policy") != desired
+        or activated.get("policy_revision") != revision
+        or activated.get("reconciliation_pending") is not True
+    ):
+        fail("a static preprod group policy could not be activated")
+
+    status_code, completed = internal_call(
+        args,
+        "POST",
+        f"/identity/groups/{group_id}/policy/complete",
+        {"policy_revision": revision},
+        operation_id=operation_id,
+    )
+    if (
+        status_code != 200
+        or not isinstance(completed, dict)
+        or completed.get("active_policy") != desired
+        or completed.get("policy_revision") != revision
+        or completed.get("reconciliation_pending") is not False
+    ):
+        fail("a static preprod group policy could not be completed")
+
+
 def configure_preprod_users(args: argparse.Namespace) -> None:
     desired = {
         "preprod-admins": ("preprod-admin", ["aigw-admins", "aigw-chat"]),
@@ -4315,8 +4417,10 @@ def configure_preprod_users(args: argparse.Namespace) -> None:
     groups_by_name = {
         group.get("name"): group for group in groups if isinstance(group, dict)
     }
+    model_names = configured_preprod_model_names()
     for group_name, (_, capabilities) in desired.items():
         group = groups_by_name.get(group_name)
+        created = False
         if group is None:
             status_code, group = internal_call(
                 args,
@@ -4327,8 +4431,10 @@ def configure_preprod_users(args: argparse.Namespace) -> None:
             if status_code != 201 or not isinstance(group, dict):
                 fail(f"the managed group {group_name} could not be created")
             groups_by_name[group_name] = group
+            created = True
         if sorted(group.get("capabilities", [])) != sorted(capabilities):
             fail(f"the managed group {group_name} has unexpected capabilities")
+        ensure_preprod_group_policy(args, group, model_names, created=created)
 
     for group_name, (username, _) in desired.items():
         status_code, users = internal_call(
@@ -4389,13 +4495,17 @@ def internal_call(
     method: str,
     path: str,
     body: Any | None = None,
+    *,
+    operation_id: str | None = None,
 ) -> tuple[int, Any]:
     request: dict[str, Any] = {"method": method, "path": path}
     if (
         path.startswith("/identity/")
         and method in {"DELETE", "PATCH", "POST", "PUT"}
     ):
-        request["operation_id"] = str(uuid4())
+        request["operation_id"] = operation_id or str(uuid4())
+    elif operation_id is not None:
+        fail("an operation ID was supplied for a non-identity mutation")
     if body is not None:
         request["body"] = body
     result = compose(

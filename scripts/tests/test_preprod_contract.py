@@ -3220,6 +3220,7 @@ class PreprodContractTests(unittest.TestCase):
             stderr="",
         )
         with mock.patch.object(module, "compose", return_value=response) as compose:
+            fixed_operation_id = "11111111-1111-4111-8111-111111111111"
             module.internal_call(mock.Mock(), "GET", "/identity/groups")
             module.internal_call(
                 mock.Mock(),
@@ -3231,6 +3232,13 @@ class PreprodContractTests(unittest.TestCase):
                 mock.Mock(),
                 "PUT",
                 "/identity/groups/group-1/members/user-1",
+            )
+            module.internal_call(
+                mock.Mock(),
+                "POST",
+                "/identity/groups/group-1/policy/activate",
+                {"policy_revision": "a" * 64},
+                operation_id=fixed_operation_id,
             )
             module.internal_call(
                 mock.Mock(),
@@ -3250,11 +3258,117 @@ class PreprodContractTests(unittest.TestCase):
             parsed = UUID(operation_id)
             self.assertEqual(parsed.version, 4)
             self.assertEqual(str(parsed), operation_id)
-        self.assertNotIn("operation_id", requests[3])
+        self.assertEqual(requests[3]["operation_id"], fixed_operation_id)
+        self.assertNotIn("operation_id", requests[4])
         self.assertIn(
             'headers["X-AIGW-Operation-ID"] = request["operation_id"]',
             module.INTERNAL_HTTP_HELPER,
         )
+
+    def test_static_preprod_group_policy_is_explicit_and_three_phase(self) -> None:
+        module = load_preprod_module()
+        models = module.configured_preprod_model_names()
+        self.assertEqual(
+            models,
+            [
+                "claude-fable-5",
+                "claude-haiku-4-5",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-sonnet-4-5",
+                "claude-sonnet-5",
+            ],
+        )
+        desired = {
+            "tpm_limit": None,
+            "rpm_limit": None,
+            "allowed_models": models,
+            "default_model": None,
+            "model_limits": {},
+        }
+        revision = "a" * 64
+        responses = [
+            (
+                200,
+                {
+                    "policy": desired,
+                    "policy_revision": revision,
+                    "reconciliation_pending": True,
+                },
+            ),
+            (
+                200,
+                {
+                    "active_policy": desired,
+                    "policy_revision": revision,
+                    "reconciliation_pending": True,
+                },
+            ),
+            (
+                200,
+                {
+                    "active_policy": desired,
+                    "policy_revision": revision,
+                    "reconciliation_pending": False,
+                },
+            ),
+        ]
+        with mock.patch.object(
+            module, "internal_call", side_effect=responses
+        ) as internal:
+            module.ensure_preprod_group_policy(
+                mock.Mock(),
+                {"id": "group-1", "name": "preprod-users"},
+                models,
+                created=True,
+            )
+
+        self.assertEqual(
+            [(call.args[1], call.args[2]) for call in internal.call_args_list],
+            [
+                ("PUT", "/identity/groups/group-1/policy"),
+                ("POST", "/identity/groups/group-1/policy/activate"),
+                ("POST", "/identity/groups/group-1/policy/complete"),
+            ],
+        )
+        operation_ids = {
+            call.kwargs["operation_id"] for call in internal.call_args_list
+        }
+        self.assertEqual(len(operation_ids), 1)
+        operation_id = operation_ids.pop()
+        self.assertEqual(str(UUID(operation_id)), operation_id)
+
+        with mock.patch.object(module, "internal_call") as internal:
+            module.ensure_preprod_group_policy(
+                mock.Mock(),
+                {"id": "group-1", "policy": desired},
+                models,
+                created=False,
+            )
+        internal.assert_not_called()
+
+    def test_static_preprod_group_policy_refuses_existing_drift(self) -> None:
+        module = load_preprod_module()
+        with (
+            mock.patch.object(module, "internal_call") as internal,
+            self.assertRaisesRegex(SystemExit, "release clean-room test"),
+        ):
+            module.ensure_preprod_group_policy(
+                mock.Mock(),
+                {
+                    "id": "group-1",
+                    "policy": {
+                        "tpm_limit": None,
+                        "rpm_limit": None,
+                        "allowed_models": None,
+                        "default_model": None,
+                        "model_limits": {},
+                    },
+                },
+                ["claude-sonnet-4-5"],
+                created=False,
+            )
+        internal.assert_not_called()
 
     def test_verify_checks_every_rendered_service_and_completed_volume_init(self) -> None:
         module = load_preprod_module()
