@@ -351,11 +351,13 @@ def fixture_sql(database: str, rows: int) -> str:
         for salt in range(4)
     )
     return (
+        f"SET ROLE {database};"
         "CREATE TABLE IF NOT EXISTS public.aigw_preprod_migration_fixture ("
         "id bigint PRIMARY KEY, payload text NOT NULL);"
         "TRUNCATE public.aigw_preprod_migration_fixture;"
         "INSERT INTO public.aigw_preprod_migration_fixture(id,payload) "
         f"SELECT value, {literals} FROM generate_series(1,{rows}) AS value;"
+        "RESET ROLE;"
     )
 
 
@@ -414,6 +416,30 @@ def verify_fixtures(
     return actual
 
 
+def verify_service_role_access(endpoint: str) -> None:
+    """Prove each restored service role can read and write its own data."""
+
+    for database in FIXTURE_PROFILE:
+        postgres_exec(
+            endpoint,
+            "psql",
+            "--username",
+            "postgres",
+            "--dbname",
+            database,
+            "--quiet",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--command",
+            "BEGIN; "
+            f"SET LOCAL ROLE {database}; "
+            "SELECT count(*) FROM public.aigw_preprod_migration_fixture; "
+            "UPDATE public.aigw_preprod_migration_fixture "
+            "SET payload=payload WHERE id=1; "
+            "ROLLBACK;",
+        )
+
+
 def logical_dumps(endpoint: str, directory: Path) -> dict[str, dict[str, object]]:
     records: dict[str, dict[str, object]] = {}
     for database in FIXTURE_PROFILE:
@@ -426,8 +452,6 @@ def logical_dumps(endpoint: str, directory: Path) -> dict[str, dict[str, object]
             database,
             "--format",
             "custom",
-            "--no-owner",
-            "--no-privileges",
             capture=True,
         ).stdout
         if len(data) < 1024:
@@ -520,7 +544,7 @@ def stop_application_writers(endpoint: str) -> None:
             writer_ids.append(str(document.get("Id")))
     if len(postgres_ids) != 1 or not writer_ids:
         fail("the full PreProd writer graph is incomplete")
-    docker(endpoint, "stop", "--time", "60", *sorted(writer_ids))
+    docker(endpoint, "stop", "--timeout", "60", *sorted(writer_ids))
     psql(endpoint, "postgres", "CHECKPOINT;")
 
 
@@ -557,11 +581,10 @@ def restore_logical_dumps(endpoint: str, directory: Path) -> None:
             "--exit-on-error",
             "--clean",
             "--if-exists",
-            "--no-owner",
-            "--no-privileges",
             input_bytes=data,
         )
     postgres_exec(endpoint, POSTGRES_RECONCILE)
+    verify_service_role_access(endpoint)
 
 
 def stable_runtime_fingerprint(endpoint: str) -> str:

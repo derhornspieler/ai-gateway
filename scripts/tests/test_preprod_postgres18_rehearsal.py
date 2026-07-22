@@ -54,6 +54,38 @@ class PreprodPostgres18RehearsalTests(unittest.TestCase):
                 self.assertEqual(first, second)
                 self.assertIn("sha256", first)
                 self.assertIn("generate_series", first)
+                self.assertIn(f"SET ROLE {database};", first)
+                self.assertIn("RESET ROLE;", first)
+
+    def test_logical_migration_preserves_owners_and_grants(self) -> None:
+        source = (ROOT / "scripts/preprod-postgres18-rehearsal.py").read_text()
+        logical = source.split("def logical_dumps", 1)[1].split(
+            "def volume_document", 1
+        )[0]
+        restore = source.split("def restore_logical_dumps", 1)[1].split(
+            "def stable_runtime_fingerprint", 1
+        )[0]
+        for section in (logical, restore):
+            self.assertNotIn("--no-owner", section)
+            self.assertNotIn("--no-privileges", section)
+        self.assertIn("verify_service_role_access(endpoint)", restore)
+
+    def test_service_role_access_proves_read_and_write_without_committing(self) -> None:
+        result = types.SimpleNamespace(stdout=b"", stderr=b"", returncode=0)
+        with mock.patch.object(
+            REHEARSAL, "postgres_exec", return_value=result
+        ) as postgres_exec:
+            REHEARSAL.verify_service_role_access("unix:///tmp/docker.sock")
+        self.assertEqual(postgres_exec.call_count, 3)
+        for database, call in zip(
+            REHEARSAL.FIXTURE_PROFILE, postgres_exec.call_args_list
+        ):
+            arguments = call.args
+            self.assertEqual(arguments[0], "unix:///tmp/docker.sock")
+            sql = arguments[-1]
+            self.assertIn(f"SET LOCAL ROLE {database};", sql)
+            self.assertIn("UPDATE public.aigw_preprod_migration_fixture", sql)
+            self.assertIn("ROLLBACK;", sql)
 
     def test_seed_receipt_requires_both_exact_postgres_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -173,7 +205,7 @@ class PreprodPostgres18RehearsalTests(unittest.TestCase):
             REHEARSAL.stop_application_writers("unix:///tmp/docker.sock")
         self.assertEqual(
             docker.call_args_list[-1].args,
-            ("unix:///tmp/docker.sock", "stop", "--time", "60", writer_id),
+            ("unix:///tmp/docker.sock", "stop", "--timeout", "60", writer_id),
         )
         psql.assert_called_once_with(
             "unix:///tmp/docker.sock", "postgres", "CHECKPOINT;"
