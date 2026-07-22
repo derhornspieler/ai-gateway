@@ -260,6 +260,19 @@ class PreprodPostgres18RehearsalTests(unittest.TestCase):
         harness = (ROOT / "scripts/preprod-postgres18-rehearsal.py").read_text()
         self.assertIn("docker-compose.preprod-postgres16.yml", harness)
 
+    def test_docs_state_the_no_vm_production_tooling_boundary(self) -> None:
+        for relative in ("docs/preprod.md", "docs/test-runbook.md", "TASKS.md"):
+            with self.subTest(relative=relative):
+                text = (ROOT / relative).read_text(encoding="utf-8")
+                self.assertIn("state-backup.sh", text)
+                self.assertIn("postgres-major-migrate.py", text)
+                self.assertIn("migrate-postgres18.yml", text)
+                self.assertIn("production Linux host", text)
+        preprod = (ROOT / "docs/preprod.md").read_text(encoding="utf-8")
+        runbook = (ROOT / "docs/test-runbook.md").read_text(encoding="utf-8")
+        self.assertIn("does not create a separate\nrehearsal VM", preprod)
+        self.assertIn("accepted no-rehearsal-VM\nboundary", runbook)
+
 
 if __name__ == "__main__":
     unittest.main()

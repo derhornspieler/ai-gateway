@@ -7,8 +7,9 @@
 - [ ] **Complete the current source candidate release acceptance** - The
   runtime image inputs were built from `77c50d3`. Commits `5e84392` and
   `3e8cafa` repair only the local PostgreSQL rehearsal and exact cleanup
-  helpers. They do not change a seed runtime image. The schema-v2 reader
-  accepted the same release against both fixes.
+  helpers. Commit `689bb67` also makes the production migration remove its
+  temporary age identity after an early input failure. None of these changes
+  alters a seed runtime image. The schema-v2 reader accepted the same release.
 
   - The Anthropic-only ARM64 production release contains 23 external and 17
     custom images. Its archive SHA-256 is
@@ -36,7 +37,13 @@
     PostgreSQL 16 downgrade without mutation after writes opened, restored a
     same-major physical backup, and passed the full checks again. Receipt
     SHA-256: `5be54a1d8cb4d918f4addb060101adb14f8d9631c1ae3401275b8319904a2085`.
-  - The 872 infrastructure contracts, 532 Python service tests, four Go
+  - Accepted test boundary: the macOS exact-seed run did not literally execute
+    the Linux/root `state-backup.sh`, `postgres-major-migrate.py`, or the
+    `generic_rocky9` plays in `migrate-postgres18.yml`. Their unit, source, and
+    Ansible contracts passed. The real commands remain an approved maintenance-
+    window gate on the existing production Linux host. No rehearsal VM will be
+    created, and the local receipt does not claim those commands ran.
+  - The 874 infrastructure contracts, 532 Python service tests, four Go
     race/vet suites, Compose, identity, ShellCheck, yamllint, Bandit, Ruff,
     dependency audit, documentation links, and Ansible syntax checks passed.
   - Final exact-manifest teardown removed 26 containers, 19 networks, 11
@@ -45,7 +52,7 @@
     found no owned container, seed image alias, volume, network, or hosts
     entry. Reusable local test CA, keys, static test credentials, and rendered
     inputs remain by design so later PreProd deployments use the same identity.
-  - Eight of ten GitHub workflows passed on `3e8cafa`. Repository Trivy,
+  - Eight of ten GitHub workflows passed on `689bb67`. Repository Trivy,
     CodeQL, secret scanning, infrastructure, Python, Go, policy, runtime-skew,
     and hygiene checks passed. The two red workflows stopped only at the
     protected DHI credential gates, so final DHI image, VEX, SBOM, and

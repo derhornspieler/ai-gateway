@@ -318,6 +318,14 @@ See [Local preprod](preprod.md) for the users and network model.
 Run this step for a release that adds or changes the PostgreSQL major-version
 move. It uses local Docker only. It does not create a Rocky or Parallels VM.
 
+This step proves application, data, failure-recovery, and rollback behavior. It
+does not literally run the Linux/root `scripts/state-backup.sh`,
+`scripts/postgres-major-migrate.py`, or the `generic_rocky9` plays in
+`ansible/migrate-postgres18.yml`. Those production paths have unit, source, and
+Ansible contract coverage here. They run on the existing production Linux host
+during the approved maintenance window. This is the accepted no-rehearsal-VM
+boundary, not proof that the Linux-only commands ran.
+
 ```bash
 python3 -I scripts/update-images.py test-postgres18-preprod \
   --archive /absolute/private/path/2026-07-21-linux-amd64/aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst \

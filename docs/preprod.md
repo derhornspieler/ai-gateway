@@ -291,6 +291,18 @@ python3 -I scripts/update-images.py test-postgres18-preprod \
 You may use `--ask-become-pass` instead. There is no quick or no-load form of
 this command.
 
+This is a local behavior test. It proves the data move, application checks,
+failure recovery, and rollback rules with the exact seeded images. It does not
+literally run the Linux/root `scripts/state-backup.sh`,
+`scripts/postgres-major-migrate.py`, or the `generic_rocky9` plays in
+`ansible/migrate-postgres18.yml`.
+
+Those production tools keep their unit, source, and Ansible contract coverage.
+They run on the existing production Linux host during its approved maintenance
+window. We accept this boundary because this project does not create a separate
+rehearsal VM. A green local receipt does not claim that the Linux-only commands
+ran.
+
 The command checks this full path:
 
 1. Validate the schema-v2 manifest and both exact PostgreSQL image IDs.
