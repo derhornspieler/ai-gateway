@@ -142,7 +142,7 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
             len(scopes[SEED.RELEASE_SCOPE_PRODUCTION]),
         )
         self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PRODUCTION]), 23)
-        self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PREPROD]), 24)
+        self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PREPROD]), 25)
         for required in (
             "plan_egress_policy",
             "render_deployable_compose_model",

@@ -687,7 +687,10 @@ def collect_project_image_reference_scopes(
     ]
     preprod_only_paths = [
         path
-        for path in (compose_root / "docker-compose.preprod.yml",)
+        for path in (
+            compose_root / "docker-compose.preprod.yml",
+            compose_root / "docker-compose.preprod-postgres16.yml",
+        )
         if path.is_file()
     ]
     if services_root.is_dir():

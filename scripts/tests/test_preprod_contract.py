@@ -17,6 +17,10 @@ from uuid import UUID
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PREPROD_POSTGRES16_IMAGE = (
+    "dhi.io/postgres:16.14@sha256:"
+    "47a12e559e8c418ed54e27da521efcbf4c00fc1c26e86eb58d82845afd7c57c7"
+)
 
 
 def load_preprod_module():
@@ -83,6 +87,64 @@ class PreprodContractTests(unittest.TestCase):
             ]
         )
         self.assertEqual(parsed.command, "clean-room-seed")
+
+    def test_postgres16_mode_is_fixed_to_confirmed_seed_rehearsal(self) -> None:
+        module = load_preprod_module()
+        parser = module.parser()
+        parsed = parser.parse_args(
+            [
+                "--image-mode",
+                "seed",
+                "--postgres-major",
+                "16",
+                "--confirm-postgres16-rehearsal",
+                "compose-config",
+            ]
+        )
+        module.validate_inputs(parsed)
+        self.assertEqual(parsed.postgres_major, "16")
+
+        for arguments in (
+            ["--postgres-major", "16", "compose-config"],
+            [
+                "--image-mode",
+                "seed",
+                "--confirm-postgres16-rehearsal",
+                "compose-config",
+            ],
+        ):
+            with self.subTest(arguments=arguments):
+                refused = parser.parse_args(arguments)
+                with self.assertRaisesRegex(SystemExit, "PostgreSQL 16|requires"):
+                    module.validate_inputs(refused)
+
+    def test_postgres16_overlay_is_added_last_and_is_exactly_pinned(self) -> None:
+        module = load_preprod_module()
+        overlay = module.POSTGRES16_OVERLAY.read_text(encoding="utf-8")
+        self.assertIn(PREPROD_POSTGRES16_IMAGE, overlay)
+        self.assertIn("pg_data:/var/lib/postgresql/16/data", overlay)
+        args = types.SimpleNamespace(
+            project="aigw-preprod",
+            image_mode="seed",
+            postgres_major="16",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            seed_overlay = Path(directory) / "seed.yml"
+            seed_overlay.write_text("services: {}\n", encoding="utf-8")
+            with (
+                mock.patch.object(module, "SEED_OVERLAY", seed_overlay),
+                mock.patch.object(
+                    module,
+                    "local_docker_endpoint",
+                    return_value="unix:///tmp/docker.sock",
+                ),
+            ):
+                command = module.compose_command(args, "config")
+        self.assertEqual(command[-3:-1], ["--profile", "preprod"])
+        self.assertLess(
+            command.index(str(seed_overlay)),
+            command.index(str(module.POSTGRES16_OVERLAY)),
+        )
 
     def test_preprod_reconciles_the_openwebui_key_before_acceptance(self) -> None:
         start = self.tasks.index("Start the isolated preprod project")
@@ -343,7 +405,7 @@ class PreprodContractTests(unittest.TestCase):
             self.assertIn(name, self.compose)
         self.assertIn('"ETH1_IP": "127.0.3.1"', self.script)
         self.assertIn('"ETH2_IP": "127.0.2.1"', self.script)
-        self.assertIn('"PG_DATA_VOLUME_NAME": f"{args.project}_pg18_data"', self.script)
+        self.assertIn("PG_DATA_VOLUME_NAME", self.script)
         self.assertIn("com.aigw.preprod.project", self.script)
         self.assertIn("local Unix-socket Docker context", self.script)
 
@@ -2090,6 +2152,7 @@ class PreprodContractTests(unittest.TestCase):
         for changed_name in (
             "docker-compose.yml",
             "docker-compose.preprod.yml",
+            "docker-compose.preprod-postgres16.yml",
             "one.txt",
             "nested",
         ):
@@ -2098,6 +2161,9 @@ class PreprodContractTests(unittest.TestCase):
                 (root / "docker-compose.yml").write_text("base\n", encoding="utf-8")
                 (root / "docker-compose.preprod.yml").write_text(
                     "overlay\n", encoding="utf-8"
+                )
+                (root / "docker-compose.preprod-postgres16.yml").write_text(
+                    "postgres16\n", encoding="utf-8"
                 )
                 (root / "one.txt").write_text("one\n", encoding="utf-8")
                 (root / "nested").mkdir()
@@ -2123,6 +2189,9 @@ class PreprodContractTests(unittest.TestCase):
             (root / "docker-compose.yml").write_text("base\n", encoding="utf-8")
             (root / "docker-compose.preprod.yml").write_text(
                 "overlay\n", encoding="utf-8"
+            )
+            (root / "docker-compose.preprod-postgres16.yml").write_text(
+                "postgres16\n", encoding="utf-8"
             )
             (root / "immutable.txt").write_text("fixed\n", encoding="utf-8")
             (root / "runtime.json").write_text('{"keys":[]}\n', encoding="utf-8")

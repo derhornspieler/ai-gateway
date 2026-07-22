@@ -30,6 +30,7 @@ EDGE_CERTS_DIR = SECRETS_DIR / "preprod-edge-certs"
 VAULT_INIT_FILE = SECRETS_DIR / "preprod-vault-init.json"
 SEED_RECEIPT = SECRETS_DIR / "preprod-seed-receipt.json"
 SEED_OVERLAY = SECRETS_DIR / "preprod-seed-images.yml"
+POSTGRES16_OVERLAY = COMPOSE_DIR / "docker-compose.preprod-postgres16.yml"
 PREPROD_ROOT_CA_FILE = SECRETS_DIR / "preprod-root-ca.pem"
 PREPROD_CONTROLLER_AUDIT_DIR = SECRETS_DIR / "preprod-controller-lifecycle"
 PREPROD_CONTROLLER_AUDIT_FILES = (
@@ -275,6 +276,16 @@ def validate_inputs(args: argparse.Namespace) -> None:
         fail(f"local preprod uses the fixed resource prefix {ALLOWED_PREFIX}")
     if args.subnet_octet != ALLOWED_SUBNET_OCTET:
         fail(f"local preprod uses the fixed private subnet octet {ALLOWED_SUBNET_OCTET}")
+    postgres_major = getattr(args, "postgres_major", "18")
+    rehearsal_confirmed = getattr(args, "confirm_postgres16_rehearsal", False)
+    if postgres_major == "16":
+        if args.image_mode != "seed" or not rehearsal_confirmed:
+            fail(
+                "PostgreSQL 16 is allowed only in seed mode with the fixed "
+                "migration-rehearsal confirmation"
+            )
+    elif rehearsal_confirmed:
+        fail("the PostgreSQL 16 rehearsal confirmation requires --postgres-major 16")
 
 
 def clean_environment() -> dict[str, str]:
@@ -450,6 +461,8 @@ def compose_command(args: argparse.Namespace, *arguments: str) -> list[str]:
         if not SEED_OVERLAY.is_file():
             fail("seed image mode requires the activate-seed step")
         command.extend(["-f", str(SEED_OVERLAY)])
+    if getattr(args, "postgres_major", "18") == "16":
+        command.extend(["-f", str(POSTGRES16_OVERLAY)])
     command.extend(["--profile", "preprod"])
     command.extend(arguments)
     return command
@@ -1867,7 +1880,11 @@ static_resources:
 def digest_inputs() -> str:
     """Hash every immutable preprod bind with the production-safe walker."""
 
-    sources = ["docker-compose.yml", "docker-compose.preprod.yml"]
+    sources = [
+        "docker-compose.yml",
+        "docker-compose.preprod.yml",
+        "docker-compose.preprod-postgres16.yml",
+    ]
     sources.extend(
         source
         for source in PREPROD_BIND_SOURCES
@@ -1979,7 +1996,9 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "CRIBL_OTLP_SERVER_NAME": "cribl-mock",
         "PREPROD_PROJECT": args.project,
         "PREPROD_PREFIX": args.prefix,
-        "PG_DATA_VOLUME_NAME": f"{args.project}_pg18_data",
+        "PG_DATA_VOLUME_NAME": (
+            f"{args.project}_pg{getattr(args, 'postgres_major', '18')}_data"
+        ),
         "PREPROD_HOST_UID": str(os.getuid()),
         "PREPROD_HOST_GID": str(os.getgid()),
         "PREPROD_DOCKER_ENDPOINT": local_docker_endpoint(),
@@ -2323,7 +2342,9 @@ def verify_rendered_resource_ownership(
         rendered_name = definition.get("name")
         labels = definition.get("labels")
         if volume_name == "pg_data":
-            expected_name = f"{args.project}_pg18_data"
+            expected_name = (
+                f"{args.project}_pg{getattr(args, 'postgres_major', '18')}_data"
+            )
             if preprod_env_value("PG_DATA_VOLUME_NAME") != expected_name:
                 fail("the preprod PostgreSQL volume selector escaped its fixed project")
         else:
@@ -4048,6 +4069,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--prefix", default="aigw-preprod")
     result.add_argument("--subnet-octet", type=int, default=29)
     result.add_argument("--image-mode", choices=("source", "seed"), default="source")
+    result.add_argument("--postgres-major", choices=("16", "18"), default="18")
+    result.add_argument("--confirm-postgres16-rehearsal", action="store_true")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("check-context")
     commands.add_parser("check-root-seed-engine")

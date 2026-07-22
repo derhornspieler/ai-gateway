@@ -1200,6 +1200,9 @@ class OfflineImageSeedBuilderTests(unittest.TestCase):
             compose.joinpath("docker-compose.preprod.yml").write_text(
                 f"services:\n  preprod:\n    image: {preprod_reference}\n"
             )
+            compose.joinpath("docker-compose.preprod-postgres16.yml").write_text(
+                "services:\n  postgres:\n    image: " + preprod_reference + "\n"
+            )
             service.joinpath("Dockerfile").write_text("FROM scratch\n")
 
             self.assertEqual(
