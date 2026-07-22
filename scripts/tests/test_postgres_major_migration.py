@@ -16,6 +16,89 @@ assert spec and spec.loader
 migration = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(migration)
 
+SOURCE_ID = "a" * 64
+WRITER_ID = "b" * 64
+STOPPED_ID = "c" * 64
+UNKNOWN_ID = "d" * 64
+SOURCE_IMAGE = "dhi.io/postgres:16.10@sha256:" + "1" * 64
+SOURCE_IMAGE_ID = "sha256:" + "2" * 64
+
+
+def project_container(container_id: str, service: str, *, running: bool) -> dict[str, object]:
+    container: dict[str, object] = {
+        "Id": container_id,
+        "Image": SOURCE_IMAGE_ID if service == "postgres" else "sha256:" + "3" * 64,
+        "Config": {
+            "Image": SOURCE_IMAGE if service == "postgres" else "example.invalid/app:1@sha256:" + "4" * 64,
+            "Labels": {
+                "com.docker.compose.project": "ai-gateway",
+                "com.docker.compose.service": service,
+            },
+        },
+        "State": {
+            "Running": running,
+            "StartedAt": f"started-{container_id[0]}",
+            "FinishedAt": f"finished-{container_id[0]}",
+        },
+        "RestartCount": 0,
+        "Mounts": [],
+    }
+    if service == "postgres":
+        container["Mounts"] = [
+            {
+                "Type": "volume",
+                "Name": "ai-gateway_pg_data",
+                "Destination": migration.SOURCE_DATA_PATH,
+            }
+        ]
+    return container
+
+
+def migration_receipt(phase: str = "migrated") -> dict[str, object]:
+    return {
+        "format": migration.RECEIPT_FORMAT,
+        "migration_id": "12345678-1234-1234-1234-123456789abc",
+        "phase": phase,
+        "project": "ai-gateway",
+        "source_volume": "ai-gateway_pg_data",
+        "target_volume": "ai-gateway_pg18_data",
+        "source_quiesce_format": migration.BACKUP_QUIESCE_FORMAT,
+        "source_project_container_ids": [SOURCE_ID, WRITER_ID, STOPPED_ID],
+        "source_running_container_ids": [SOURCE_ID, WRITER_ID],
+        "source_writer_container_ids": [WRITER_ID],
+        "source_stopped_container_states": {
+            WRITER_ID: {
+                "started_at": "started-b",
+                "finished_at": "finished-b",
+                "restart_count": 0,
+            },
+            STOPPED_ID: {
+                "started_at": "started-c",
+                "finished_at": "finished-c",
+                "restart_count": 0,
+            },
+        },
+        "source_container_id": SOURCE_ID,
+        "source_image": SOURCE_IMAGE,
+        "source_image_id": SOURCE_IMAGE_ID,
+        "source_data_path": migration.SOURCE_DATA_PATH,
+    }
+
+
+def volume(name: str) -> dict[str, object]:
+    labels = {
+        "com.docker.compose.project": "ai-gateway",
+        "com.docker.compose.volume": "pg_data",
+    }
+    if name == "ai-gateway_pg18_data":
+        labels.update(
+            {
+                "com.aigw.postgres.major": migration.TARGET_MAJOR,
+                "com.aigw.postgres.migration-id": "12345678-1234-1234-1234-123456789abc",
+            }
+        )
+    return {"Name": name, "Labels": labels}
+
 
 class PostgresMigrationUnitTests(unittest.TestCase):
     def test_exact_postgres_18_image_contract_is_pinned(self) -> None:
@@ -153,16 +236,38 @@ class PostgresMigrationUnitTests(unittest.TestCase):
                 with self.assertRaisesRegex(migration.MigrationError, "checkpoint barrier"):
                     migration.require_backup_write_barrier(manifest)
 
+    def test_backup_quiesce_contract_records_exact_source_and_container_graph(self) -> None:
+        receipt = migration_receipt()
+        contract = migration.quiesce_contract_from_receipt(receipt)
+        self.assertEqual(
+            contract["project_container_ids"], [SOURCE_ID, WRITER_ID, STOPPED_ID]
+        )
+        self.assertEqual(contract["prior_running_container_ids"], [SOURCE_ID, WRITER_ID])
+        self.assertEqual(contract["writer_container_ids"], [WRITER_ID])
+        self.assertEqual(
+            set(contract["stopped_container_states"]), {WRITER_ID, STOPPED_ID}
+        )
+        self.assertEqual(contract["source"]["image_id"], SOURCE_IMAGE_ID)
+
+    def test_quiesce_requires_only_the_recorded_postgres_source_running(self) -> None:
+        receipt = migration_receipt()
+        contract = migration.quiesce_contract_from_receipt(receipt)
+        containers = [
+            project_container(SOURCE_ID, "postgres", running=True),
+            project_container(WRITER_ID, "litellm", running=False),
+            project_container(STOPPED_ID, "volume-init", running=False),
+        ]
+        migration.verify_quiesced_source(
+            containers, containers[0], contract, project="ai-gateway"
+        )
+        containers[1]["State"] = {"Running": True}
+        with self.assertRaisesRegex(migration.MigrationError, "restarted"):
+            migration.verify_quiesced_source(
+                containers, containers[0], contract, project="ai-gateway"
+            )
+
     def test_rollback_restarts_only_the_receipted_container_inventory(self) -> None:
-        receipt = {
-            "format": migration.RECEIPT_FORMAT,
-            "migration_id": "12345678-1234-1234-1234-123456789abc",
-            "phase": "migrated",
-            "project": "ai-gateway",
-            "source_volume": "ai-gateway_pg_data",
-            "target_volume": "ai-gateway_pg18_data",
-            "source_running_container_ids": ["a" * 64, "b" * 64],
-        }
+        receipt = migration_receipt()
         args = migration.parse_args(
             [
                 "rollback",
@@ -177,27 +282,210 @@ class PostgresMigrationUnitTests(unittest.TestCase):
             ]
         )
 
+        before = [
+            project_container(SOURCE_ID, "postgres", running=True),
+            project_container(WRITER_ID, "litellm", running=True),
+            project_container(STOPPED_ID, "volume-init", running=False),
+        ]
+        stopped = [
+            project_container(SOURCE_ID, "postgres", running=False),
+            project_container(WRITER_ID, "litellm", running=False),
+            project_container(STOPPED_ID, "volume-init", running=False),
+        ]
+        restored = [
+            project_container(SOURCE_ID, "postgres", running=True),
+            project_container(WRITER_ID, "litellm", running=True),
+            project_container(STOPPED_ID, "volume-init", running=False),
+        ]
+
         def fake_docker(*arguments: str, **_kwargs: object):
             result = mock.Mock(returncode=0, stdout=b"", stderr=b"")
-            if arguments[:2] == ("ps", "-q"):
-                result.stdout = b""
-            elif arguments[0] == "inspect":
-                result.stdout = b"[{}, {}]"
-            elif arguments[:2] == ("ps", "-aq"):
+            if arguments[:2] == ("ps", "-aq"):
                 result.stdout = b""
             return result
 
+        def fake_volume_info(name: str):
+            return volume(name)
+
         with (
             mock.patch.object(migration, "read_receipt", return_value=receipt),
-            mock.patch.object(migration, "check_volume_receipt"),
-            mock.patch.object(migration, "volume_info", return_value={}),
+            mock.patch.object(migration, "volume_info", side_effect=fake_volume_info),
+            mock.patch.object(
+                migration, "project_containers", side_effect=[before, stopped, restored]
+            ),
             mock.patch.object(migration, "docker", side_effect=fake_docker) as docker,
             mock.patch.object(migration, "atomic_json"),
             mock.patch("builtins.print"),
         ):
             migration.command_rollback(args)
+        docker.assert_any_call("stop", "--time", "60", SOURCE_ID, WRITER_ID)
         docker.assert_any_call("volume", "rm", "ai-gateway_pg18_data")
-        docker.assert_any_call("start", "a" * 64, "b" * 64)
+        docker.assert_any_call("start", SOURCE_ID, WRITER_ID)
+
+    def test_rollback_refuses_unknown_project_container_before_mutation(self) -> None:
+        receipt = migration_receipt()
+        args = migration.parse_args(
+            [
+                "rollback",
+                "--receipt",
+                "/tmp/receipt",
+                "--project",
+                "ai-gateway",
+                "--target-volume",
+                "ai-gateway_pg18_data",
+                "--confirm",
+                "ROLLBACK_POSTGRES_18_TO_16",
+            ]
+        )
+        containers = [
+            project_container(SOURCE_ID, "postgres", running=False),
+            project_container(WRITER_ID, "litellm", running=False),
+            project_container(STOPPED_ID, "volume-init", running=False),
+            project_container(UNKNOWN_ID, "surprise", running=False),
+        ]
+        with (
+            mock.patch.object(migration, "read_receipt", return_value=receipt),
+            mock.patch.object(migration, "volume_info", side_effect=lambda name: volume(name)),
+            mock.patch.object(migration, "project_containers", return_value=containers),
+            mock.patch.object(migration, "docker") as docker,
+            mock.patch.object(migration, "atomic_json") as atomic_json,
+        ):
+            with self.assertRaisesRegex(migration.MigrationError, "containers changed"):
+                migration.command_rollback(args)
+        docker.assert_not_called()
+        atomic_json.assert_not_called()
+
+    def test_rollback_after_writes_opened_or_validated_has_zero_docker_mutations(self) -> None:
+        args = migration.parse_args(
+            [
+                "rollback",
+                "--receipt",
+                "/tmp/receipt",
+                "--project",
+                "ai-gateway",
+                "--target-volume",
+                "ai-gateway_pg18_data",
+                "--confirm",
+                "ROLLBACK_POSTGRES_18_TO_16",
+            ]
+        )
+        for phase in ("writes_opened", "validated"):
+            with self.subTest(phase=phase):
+                with (
+                    mock.patch.object(
+                        migration, "read_receipt", return_value=migration_receipt(phase)
+                    ),
+                    mock.patch.object(migration, "volume_info") as volume_info,
+                    mock.patch.object(
+                        migration, "project_containers"
+                    ) as project_containers,
+                    mock.patch.object(migration, "docker") as docker,
+                    mock.patch.object(migration, "atomic_json") as atomic_json,
+                ):
+                    with self.assertRaisesRegex(migration.MigrationError, "writes reopened"):
+                        migration.command_rollback(args)
+                volume_info.assert_not_called()
+                project_containers.assert_not_called()
+                docker.assert_not_called()
+                atomic_json.assert_not_called()
+
+    def test_completed_rollback_is_idempotent_without_docker_mutation(self) -> None:
+        receipt = migration_receipt("rolled_back")
+        args = migration.parse_args(
+            [
+                "rollback",
+                "--receipt",
+                "/tmp/receipt",
+                "--project",
+                "ai-gateway",
+                "--target-volume",
+                "ai-gateway_pg18_data",
+                "--confirm",
+                "ROLLBACK_POSTGRES_18_TO_16",
+            ]
+        )
+        containers = [
+            project_container(SOURCE_ID, "postgres", running=True),
+            project_container(WRITER_ID, "litellm", running=True),
+            project_container(STOPPED_ID, "volume-init", running=False),
+        ]
+        with (
+            mock.patch.object(migration, "read_receipt", return_value=receipt),
+            mock.patch.object(
+                migration,
+                "volume_info",
+                side_effect=lambda name: volume(name) if name.endswith("pg_data") else None,
+            ),
+            mock.patch.object(migration, "project_containers", return_value=containers),
+            mock.patch.object(migration, "docker") as docker,
+            mock.patch.object(migration, "atomic_json") as atomic_json,
+            mock.patch("builtins.print"),
+        ):
+            migration.command_rollback(args)
+        docker.assert_not_called()
+        atomic_json.assert_not_called()
+
+    def test_interrupted_rollback_resumes_after_target_removal_and_partial_start(self) -> None:
+        receipt = migration_receipt("rollback_in_progress")
+        receipt["rollback_target_existed"] = True
+        args = migration.parse_args(
+            [
+                "rollback",
+                "--receipt",
+                "/tmp/receipt",
+                "--project",
+                "ai-gateway",
+                "--target-volume",
+                "ai-gateway_pg18_data",
+                "--confirm",
+                "ROLLBACK_POSTGRES_18_TO_16",
+            ]
+        )
+        partial = [
+            project_container(SOURCE_ID, "postgres", running=True),
+            project_container(WRITER_ID, "litellm", running=False),
+            project_container(STOPPED_ID, "volume-init", running=False),
+        ]
+        stopped = [
+            project_container(SOURCE_ID, "postgres", running=False),
+            project_container(WRITER_ID, "litellm", running=False),
+            project_container(STOPPED_ID, "volume-init", running=False),
+        ]
+        restored = [
+            project_container(SOURCE_ID, "postgres", running=True),
+            project_container(WRITER_ID, "litellm", running=True),
+            project_container(STOPPED_ID, "volume-init", running=False),
+        ]
+
+        def fake_docker(*arguments: str, **_kwargs: object):
+            result = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+            if arguments[:2] == ("ps", "-aq"):
+                result.stdout = b""
+            return result
+
+        with (
+            mock.patch.object(migration, "read_receipt", return_value=receipt),
+            mock.patch.object(
+                migration,
+                "volume_info",
+                side_effect=lambda name: volume(name) if name.endswith("pg_data") else None,
+            ),
+            mock.patch.object(
+                migration,
+                "project_containers",
+                side_effect=[partial, stopped, restored],
+            ),
+            mock.patch.object(migration, "docker", side_effect=fake_docker) as docker,
+            mock.patch.object(migration, "atomic_json") as atomic_json,
+            mock.patch("builtins.print"),
+        ):
+            migration.command_rollback(args)
+        docker.assert_any_call("stop", "--time", "60", SOURCE_ID)
+        docker.assert_any_call("start", SOURCE_ID, WRITER_ID)
+        self.assertNotIn(
+            mock.call("volume", "rm", "ai-gateway_pg18_data"), docker.mock_calls
+        )
+        atomic_json.assert_called_once()
 
 
 class PostgresMigrationRepositoryContracts(unittest.TestCase):
@@ -220,25 +508,31 @@ class PostgresMigrationRepositoryContracts(unittest.TestCase):
         self.assertIn("fix forward", source)
         self.assertIn("PostgreSQL changed after the backup", source)
 
-    def test_writers_stop_before_the_final_checkpoint_proof(self) -> None:
+    def test_quiesced_writers_are_proved_before_the_final_checkpoint(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        writer_stop = source.index(
-            'docker("stop", "--time", "60", *writer_ids)'
-        )
-        forced_checkpoint = source.index("force_checkpoint(postgres_id)", writer_stop)
-        final_checkpoint = source.index(
+        migrate = source.split("def command_migrate", 1)[1].split(
+            "def check_volume_receipt", 1
+        )[0]
+        self.assertNotIn('docker("stop", "--time", "60", *writer_ids)', migrate)
+        quiesce_proof = migrate.index("verify_quiesced_source(")
+        forced_checkpoint = migrate.index("force_checkpoint(postgres_id)", quiesce_proof)
+        final_checkpoint = migrate.index(
             'postgres_id, "SELECT next_xid FROM pg_control_checkpoint();"',
             forced_checkpoint,
         )
-        postgres_stop = source.index(
+        final_quiesce_proof = migrate.index(
+            "verify_quiesced_source(", final_checkpoint
+        )
+        postgres_stop = migrate.index(
             'docker("stop", "--time", "60", postgres_id)', final_checkpoint
         )
-        restore = source.index('"pg_restore",', postgres_stop)
-        self.assertLess(writer_stop, forced_checkpoint)
+        restore = migrate.index('"pg_restore",', postgres_stop)
+        self.assertLess(quiesce_proof, forced_checkpoint)
         self.assertLess(forced_checkpoint, final_checkpoint)
+        self.assertLess(final_checkpoint, final_quiesce_proof)
         self.assertLess(final_checkpoint, postgres_stop)
         self.assertLess(postgres_stop, restore)
-        self.assertIn('plan["source_running_container_ids"] = sorted(running_ids)', source)
+        self.assertIn('"source_writer_container_ids": quiesce["writer_container_ids"]', source)
 
     def test_target_database_contract_runs_before_and_after_restore(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -263,6 +557,12 @@ class PostgresMigrationRepositoryContracts(unittest.TestCase):
         self.assertIn("- import_playbook: deploy-stack-only.yml", playbook)
         self.assertIn("postgres_migration_stage", playbook)
         self.assertIn("MIGRATE_POSTGRES_16_TO_18", playbook)
+        bounded = playbook.split(
+            "- name: Plan and run the bounded PostgreSQL 18 migration", 1
+        )[1].split("- import_playbook: deploy-stack-only.yml", 1)[0]
+        self.assertLess(bounded.index("- plan"), bounded.index("always:"))
+        self.assertLess(bounded.index("- migrate"), bounded.index("always:"))
+        self.assertIn("Remove the temporary PostgreSQL migration age identity", bounded)
 
     def test_ordinary_image_update_refuses_postgres_major_change(self) -> None:
         updater = (ROOT / "scripts/update-images.py").read_text(encoding="utf-8")
@@ -276,6 +576,16 @@ class PostgresMigrationRepositoryContracts(unittest.TestCase):
         self.assertIn('"postgres_next_xid":', backup)
         self.assertIn('"postgres_write_barrier":', backup)
         self.assertIn(migration.BACKUP_WRITE_BARRIER, backup)
+        self.assertIn("--major-migration-quiesce", backup)
+        self.assertIn("QUIESCE_POSTGRES_16_FOR_MAJOR_MIGRATION", backup)
+        self.assertIn(migration.BACKUP_QUIESCE_FORMAT, backup)
+        self.assertIn('"project_container_ids": project_ids', backup)
+        self.assertIn('"prior_running_container_ids": prior_running_ids', backup)
+        self.assertIn('"writer_container_ids": writer_ids', backup)
+        self.assertIn('"stopped_container_states": stopped_states', backup)
+        self.assertIn('"source": source', backup)
+        self.assertIn('"${docker_cmd[@]}" start "$postgres_cid"', backup)
+        self.assertIn('elif ((${#running_containers[@]})); then', backup)
         dumps_end = backup.index("done\n# Flush the post-dump transaction state")
         final_checkpoint = backup.index("-c CHECKPOINT", dumps_end)
         checkpoint_read = backup.index("SELECT next_xid FROM pg_control_checkpoint()")

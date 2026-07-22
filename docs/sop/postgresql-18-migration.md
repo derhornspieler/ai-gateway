@@ -90,22 +90,31 @@ On the Docker host, run:
 ```bash
 sudo /opt/ai-gateway/scripts/state-backup.sh \
   --recipient age1REPLACE_WITH_THE_REAL_AGE_RECIPIENT \
-  --output /mnt/aigw-backups/gateway01-pg16-final.tar.gz.age
+  --output /mnt/aigw-backups/gateway01-pg16-final.tar.gz.age \
+  --major-migration-quiesce \
+  --confirm QUIESCE_POSTGRES_16_FOR_MAJOR_MIGRATION
 ```
 
-The backup stops writers and creates custom-format logical dumps. It then
-forces a PostgreSQL checkpoint and records the checkpoint ID. This last step
-makes PostgreSQL flush accepted transaction state before it records the ID.
-The script encrypts the result and restarts the same containers. It also seals
-Vault because Vault was restarted. Perform the normal Vault unseal procedure
-if you need the live system before cutover.
+This confirmation is required only for a major migration. An ordinary state
+backup still restarts the exact containers that were running before it began.
+
+Major-migration mode stops every application container and leaves it stopped.
+It creates the logical dumps, forces a PostgreSQL checkpoint, and records the
+checkpoint ID. It also records the full project container list, the exact
+containers that were running, and the PostgreSQL 16 container, image, and
+volume IDs. It records the stopped-state generation of every other container,
+so a brief restart is also detected. The encrypted backup protects this
+record. At the end, the script starts only that exact PostgreSQL 16 container.
+
+Do not unseal Vault, start a portal, or run the normal stack deploy now. Those
+actions would reopen database writers. Continue directly to the migration.
 
 Copy the SHA-256 shown by the command into the next step. The migration accepts
-backups that are no more than 30 minutes old. It also compares the saved
-PostgreSQL checkpoint ID with the live server. After it stops all writers, it
-forces another checkpoint before reading the live ID. If a database write
-happened after the backup, the IDs differ and the migration asks for a new
-backup.
+backups that are no more than 30 minutes old. During both plan and migration,
+it proves that the full container list is unchanged, the recorded PostgreSQL
+16 source is the only running project container, and every application writer
+is still stopped. It then forces another checkpoint and compares the live ID
+with the saved ID. If the source changed, the migration asks for a new backup.
 
 The migration rejects backups made by an older script that did not record the
 post-dump checkpoint barrier. Stage the current scripts and take a new backup.
@@ -127,8 +136,8 @@ ssh gateway01 \
    sudo chmod 0600 /run/ai-gateway-postgres18/backup.agekey'
 ```
 
-The playbook deletes this temporary identity after the logical restore,
-whether the restore passes or rolls back.
+The playbook deletes this temporary identity after planning and restoring. It
+also deletes the identity when planning fails before the restore starts.
 
 ## 4. Run migration, deploy, and validation
 
@@ -149,18 +158,20 @@ ansible-playbook \
 The playbook performs these steps:
 
 1. Check the backup hash, age envelope, manifest, PostgreSQL version,
-   post-dump checkpoint barrier, and checkpoint ID.
-2. Check the exact PostgreSQL 18.4 image metadata.
-3. Stop the exact running AI Gateway containers.
-4. Create `ai-gateway_pg18_data` as a fresh volume.
-5. Start a network-disabled temporary PostgreSQL 18 container.
-6. Run the reviewed database setup script to create the roles and databases.
-7. Restore each dump with `pg_restore --single-transaction --exit-on-error`.
-8. Run the setup script again, then check database owners, role flags,
+   post-dump checkpoint barrier, checkpoint ID, and exact source identity.
+2. Prove that only the recorded PostgreSQL 16 source is running.
+3. Check the exact PostgreSQL 18.4 image metadata.
+4. Stop PostgreSQL 16. The application writers were already stopped by the
+   major-migration backup and must stay stopped.
+5. Create `ai-gateway_pg18_data` as a fresh volume.
+6. Start a network-disabled temporary PostgreSQL 18 container.
+7. Run the reviewed database setup script to create the roles and databases.
+8. Restore each dump with `pg_restore --single-transaction --exit-on-error`.
+9. Run the setup script again, then check database owners, role flags,
    memberships, and access. The second run repairs any restored access drift.
-9. Remove the temporary container and age identity.
-10. Run the normal stack-only Ansible deploy and full verify role.
-11. Check the live image ID, volume mount, PostgreSQL version, database
+10. Remove the temporary container and age identity.
+11. Run the normal stack-only Ansible deploy and full verify role.
+12. Check the live image ID, volume mount, PostgreSQL version, database
     objects, and security matrix.
 
 The receipt is stored at:
@@ -176,9 +187,18 @@ It is root-owned mode `0600`.
 There are two clear states.
 
 Before PostgreSQL 18 starts in the normal stack, rollback is allowed. If the
-logical restore or its first validation fails, Ansible removes the failed new
-volume and restarts the exact PostgreSQL 16 container graph. The old volume was
-never changed.
+logical restore fails, rollback first checks the full recorded container list
+and source identity. It refuses an unknown or missing project container. It
+safely stops any recorded containers that are still running, removes only the
+PostgreSQL 18 volume with matching migration labels, and restarts the exact
+graph that was running before the backup. The old volume was never changed.
+Repeating rollback is safe after a partial stop or a completed rollback.
+
+If the read-only plan refuses an input, it does not change Docker. PostgreSQL
+16 remains the only running project container, and the playbook deletes the
+temporary age identity. Fix the input, copy the identity back, and retry while
+the maintenance window stays closed. Take a new major-migration backup if the
+source or container inventory changed.
 
 Before the normal deploy starts PostgreSQL 18, Ansible changes the receipt to
 `writes_opened`. This closes the rollback window. PostgreSQL does not support
@@ -212,6 +232,15 @@ database checks, and application acceptance evidence.
 
 `PostgreSQL changed after the backup` means at least one transaction advanced
 the source checkpoint. Take a new backup and retry.
+
+`major migration requires the exact PostgreSQL 16 source to be the only
+running project container` means an application container was started after
+the backup. Stop and investigate it. Take a new major-migration backup; do not
+bypass the check.
+
+`project containers changed after the major-migration backup` means a
+container was added, removed, or replaced. Take a new major-migration backup
+from the reviewed stack.
 
 `backup lacks the forced post-dump PostgreSQL checkpoint barrier` means the
 backup came from an older script or its manifest changed. Stage the current

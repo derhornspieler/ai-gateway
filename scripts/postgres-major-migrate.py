@@ -31,10 +31,12 @@ POSTGRES_IMAGE_DIGEST = (
     "sha256:a807e832c1fc9ded731956abcb53dc98ed003fd82e27275eaef8dcf52fb90236"
 )
 POSTGRES_DATA_PATH = "/var/lib/postgresql/18/data"
+SOURCE_DATA_PATH = "/var/lib/postgresql/16/data"
 POSTGRES_IMAGE_USER = "70"
 SOURCE_MAJOR = "16"
 TARGET_MAJOR = "18"
 RECEIPT_FORMAT = "aigw-postgres-major-migration-v1"
+BACKUP_QUIESCE_FORMAT = "aigw-postgres-major-migration-quiesce-v1"
 BACKUP_WRITE_BARRIER = "forced-checkpoint-after-logical-dumps-v1"
 EXPECTED_ROLES = frozenset({"postgres", "litellm", "keycloak", "rotator", "grafana_ro"})
 EXPECTED_DATABASES = ("litellm", "keycloak", "rotator")
@@ -50,6 +52,9 @@ ABSOLUTE_PATH = re.compile(
     r"^/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){0,15}$"
 )
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+DIGEST_PINNED_IMAGE = re.compile(r"^[^\s@]+:[^\s@]+@sha256:[0-9a-f]{64}$")
 NEXT_XID = re.compile(r"^[0-9]+:[0-9]+$")
 ROLE_LINE = re.compile(
     r'^(?:CREATE|ALTER) ROLE (?:"((?:[^"]|"")+)"|([a-zA-Z_][a-zA-Z0-9_$]*))(?:[ ;])'
@@ -266,6 +271,254 @@ def project_containers(project: str) -> list[dict[str, object]]:
     return value
 
 
+def exact_container_ids(
+    value: object, label: str, *, allow_empty: bool = False
+) -> tuple[str, ...]:
+    """Return one sorted, duplicate-free list of full Docker container IDs."""
+
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise MigrationError(f"{label} is missing")
+    if any(
+        not isinstance(item, str) or CONTAINER_ID.fullmatch(item) is None
+        for item in value
+    ):
+        raise MigrationError(f"{label} contains a malformed container ID")
+    if value != sorted(value) or len(value) != len(set(value)):
+        raise MigrationError(f"{label} is not a canonical container inventory")
+    return tuple(value)
+
+
+def exact_project_inventory(
+    containers: list[dict[str, object]], project: str
+) -> dict[str, dict[str, object]]:
+    """Index an exact Compose project inventory and reject ambiguous records."""
+
+    inventory: dict[str, dict[str, object]] = {}
+    for container in containers:
+        if not isinstance(container, dict):
+            raise MigrationError("project container inventory is malformed")
+        container_id = container.get("Id")
+        if (
+            not isinstance(container_id, str)
+            or CONTAINER_ID.fullmatch(container_id) is None
+        ):
+            raise MigrationError("project container inventory has a malformed ID")
+        if container_id in inventory:
+            raise MigrationError("project container inventory contains a duplicate ID")
+        labels = (container.get("Config") or {}).get("Labels") or {}
+        if labels.get("com.docker.compose.project") != project:
+            raise MigrationError(
+                "project container inventory has an unexpected project label"
+            )
+        inventory[container_id] = container
+    return inventory
+
+
+def backup_quiesce_contract(
+    manifest: dict[str, object], *, source_volume: str
+) -> dict[str, object]:
+    """Validate the authenticated PG16 quiesce record from the backup."""
+
+    value = manifest.get("postgres_major_migration_quiesce")
+    if not isinstance(value, dict) or set(value) != {
+        "format",
+        "project_container_ids",
+        "prior_running_container_ids",
+        "writer_container_ids",
+        "stopped_container_states",
+        "source",
+    }:
+        raise MigrationError("backup lacks the major-migration quiesce record")
+    if value.get("format") != BACKUP_QUIESCE_FORMAT:
+        raise MigrationError("backup has an unsupported major-migration quiesce record")
+
+    project_ids = exact_container_ids(
+        value.get("project_container_ids"), "backup project container inventory"
+    )
+    prior_running_ids = exact_container_ids(
+        value.get("prior_running_container_ids"), "backup running container inventory"
+    )
+    writer_ids = exact_container_ids(
+        value.get("writer_container_ids"),
+        "backup writer container inventory",
+        allow_empty=True,
+    )
+    source = value.get("source")
+    if not isinstance(source, dict) or set(source) != {
+        "container_id",
+        "image",
+        "image_id",
+        "volume",
+        "data_path",
+    }:
+        raise MigrationError("backup PostgreSQL 16 source identity is malformed")
+    source_id = source.get("container_id")
+    source_image = source.get("image")
+    source_image_id = source.get("image_id")
+    if not isinstance(source_id, str) or CONTAINER_ID.fullmatch(source_id) is None:
+        raise MigrationError("backup PostgreSQL 16 source container ID is malformed")
+    if (
+        not isinstance(source_image, str)
+        or DIGEST_PINNED_IMAGE.fullmatch(source_image) is None
+    ):
+        raise MigrationError("backup PostgreSQL 16 source image is not digest-pinned")
+    if not isinstance(source_image_id, str) or IMAGE_ID.fullmatch(source_image_id) is None:
+        raise MigrationError("backup PostgreSQL 16 source image ID is malformed")
+    if (
+        source.get("volume") != source_volume
+        or source.get("data_path") != SOURCE_DATA_PATH
+    ):
+        raise MigrationError("backup PostgreSQL 16 source volume identity changed")
+
+    project_set = set(project_ids)
+    prior_set = set(prior_running_ids)
+    if source_id not in project_set or source_id not in prior_set:
+        raise MigrationError("backup PostgreSQL 16 source is absent from its inventory")
+    if not prior_set.issubset(project_set):
+        raise MigrationError("backup running containers are absent from the project inventory")
+    if set(writer_ids) != prior_set - {source_id}:
+        raise MigrationError("backup writer inventory does not match the prior running graph")
+    stopped_states = value.get("stopped_container_states")
+    if (
+        not isinstance(stopped_states, dict)
+        or set(stopped_states) != project_set - {source_id}
+    ):
+        raise MigrationError("backup stopped-container state inventory is incomplete")
+    for container_id, state in stopped_states.items():
+        if (
+            not isinstance(container_id, str)
+            or CONTAINER_ID.fullmatch(container_id) is None
+            or not isinstance(state, dict)
+            or set(state) != {"started_at", "finished_at", "restart_count"}
+            or not isinstance(state.get("started_at"), str)
+            or not isinstance(state.get("finished_at"), str)
+            or type(state.get("restart_count")) is not int
+            or state["restart_count"] < 0
+        ):
+            raise MigrationError("backup stopped-container state inventory is malformed")
+
+    # Keep the normalized record easy to compare and safe to put in a receipt.
+    return {
+        "format": BACKUP_QUIESCE_FORMAT,
+        "project_container_ids": list(project_ids),
+        "prior_running_container_ids": list(prior_running_ids),
+        "writer_container_ids": list(writer_ids),
+        "stopped_container_states": dict(sorted(stopped_states.items())),
+        "source": dict(source),
+    }
+
+
+def quiesce_contract_from_receipt(receipt: dict[str, object]) -> dict[str, object]:
+    """Rebuild and validate the quiesce record stored in a migration receipt."""
+
+    manifest = {
+        "postgres_major_migration_quiesce": {
+            "format": receipt.get("source_quiesce_format"),
+            "project_container_ids": receipt.get("source_project_container_ids"),
+            "prior_running_container_ids": receipt.get("source_running_container_ids"),
+            "writer_container_ids": receipt.get("source_writer_container_ids"),
+            "stopped_container_states": receipt.get("source_stopped_container_states"),
+            "source": {
+                "container_id": receipt.get("source_container_id"),
+                "image": receipt.get("source_image"),
+                "image_id": receipt.get("source_image_id"),
+                "volume": receipt.get("source_volume"),
+                "data_path": receipt.get("source_data_path"),
+            },
+        }
+    }
+    return backup_quiesce_contract(
+        manifest,
+        source_volume=str(receipt.get("source_volume", "")),
+    )
+
+
+def verify_quiesced_source(
+    containers: list[dict[str, object]],
+    postgres: dict[str, object],
+    quiesce: dict[str, object],
+    *,
+    project: str,
+) -> None:
+    """Prove the same PG16 source is running and every other container is stopped."""
+
+    inventory = exact_project_inventory(containers, project)
+    expected_ids = set(
+        exact_container_ids(
+            quiesce.get("project_container_ids"),
+            "quiesced project container inventory",
+        )
+    )
+    if set(inventory) != expected_ids:
+        raise MigrationError("project containers changed after the major-migration backup")
+
+    live_source = verify_recorded_source(inventory, quiesce)
+    if postgres is not live_source:
+        raise MigrationError("PostgreSQL 16 source container changed after backup")
+
+    stopped_states = quiesce.get("stopped_container_states")
+    if not isinstance(stopped_states, dict):
+        raise MigrationError("quiesced stopped-container state inventory is malformed")
+    for container_id, expected in stopped_states.items():
+        container = inventory[container_id]
+        state = container.get("State") or {}
+        actual = {
+            "started_at": state.get("StartedAt"),
+            "finished_at": state.get("FinishedAt"),
+            "restart_count": container.get("RestartCount"),
+        }
+        if state.get("Running") is not False or actual != expected:
+            raise MigrationError(
+                "an application container restarted after the major-migration backup"
+            )
+
+    source = quiesce["source"]
+    source_id = str(source["container_id"])
+    running_ids = {
+        container_id
+        for container_id, container in inventory.items()
+        if (container.get("State") or {}).get("Running") is True
+    }
+    if running_ids != {source_id}:
+        raise MigrationError(
+            "major migration requires the exact PostgreSQL 16 source to be the only running project container"
+        )
+
+
+def verify_recorded_source(
+    inventory: dict[str, dict[str, object]], quiesce: dict[str, object]
+) -> dict[str, object]:
+    """Find the exact recorded PG16 container without requiring it to run."""
+
+    source = quiesce.get("source")
+    if not isinstance(source, dict):
+        raise MigrationError("quiesced PostgreSQL 16 source identity is malformed")
+    source_id = str(source.get("container_id", ""))
+    postgres = inventory.get(source_id)
+    if postgres is None:
+        raise MigrationError("PostgreSQL 16 source container changed after backup")
+    config = postgres.get("Config") or {}
+    labels = config.get("Labels") or {}
+    if labels.get("com.docker.compose.service") != "postgres":
+        raise MigrationError("PostgreSQL 16 source service label changed after backup")
+    if (
+        config.get("Image") != source.get("image")
+        or postgres.get("Image") != source.get("image_id")
+    ):
+        raise MigrationError("PostgreSQL 16 source image changed after backup")
+    matching_mounts = [
+        mount
+        for mount in postgres.get("Mounts") or []
+        if isinstance(mount, dict)
+        and mount.get("Type") == "volume"
+        and mount.get("Name") == source.get("volume")
+        and mount.get("Destination") == source.get("data_path")
+    ]
+    if len(matching_mounts) != 1:
+        raise MigrationError("PostgreSQL 16 source mount changed after backup")
+    return postgres
+
+
 def source_postgres(containers: list[dict[str, object]], source_volume: str) -> dict[str, object]:
     matches = []
     for container in containers:
@@ -279,7 +532,7 @@ def source_postgres(containers: list[dict[str, object]], source_volume: str) -> 
     if not any(
         mount.get("Type") == "volume"
         and mount.get("Name") == source_volume
-        and mount.get("Destination") == "/var/lib/postgresql/16/data"
+        and mount.get("Destination") == SOURCE_DATA_PATH
         for mount in mounts
         if isinstance(mount, dict)
     ):
@@ -435,6 +688,12 @@ def validate_plan_inputs(args: argparse.Namespace) -> tuple[dict[str, object], d
         raise MigrationError("migration receipt must use the fixed stack state path")
     with tempfile.TemporaryDirectory(prefix="postgres18-plan.", dir=state_dir) as temporary:
         manifest, extracted = validate_backup_inputs(args, Path(temporary))
+        quiesce = backup_quiesce_contract(
+            manifest, source_volume=args.source_volume
+        )
+        verify_quiesced_source(
+            containers, postgres, quiesce, project=args.project
+        )
         backup_version = str(manifest.get("postgres_version", ""))
         backup_next_xid = str(manifest.get("postgres_next_xid", ""))
         require_backup_write_barrier(manifest)
@@ -499,6 +758,15 @@ def validate_plan_inputs(args: argparse.Namespace) -> tuple[dict[str, object], d
             "source_version": live_version,
             "source_next_xid": live_next_xid,
             "source_volume": args.source_volume,
+            "source_quiesce_format": quiesce["format"],
+            "source_project_container_ids": quiesce["project_container_ids"],
+            "source_running_container_ids": quiesce["prior_running_container_ids"],
+            "source_writer_container_ids": quiesce["writer_container_ids"],
+            "source_stopped_container_states": quiesce["stopped_container_states"],
+            "source_container_id": quiesce["source"]["container_id"],
+            "source_image": quiesce["source"]["image"],
+            "source_image_id": quiesce["source"]["image_id"],
+            "source_data_path": quiesce["source"]["data_path"],
             "target_major": TARGET_MAJOR,
             "target_version": "18.4",
             "target_volume": args.target_volume,
@@ -510,7 +778,12 @@ def validate_plan_inputs(args: argparse.Namespace) -> tuple[dict[str, object], d
             "backup_created_at": manifest.get("created_at"),
             "dumps": dumps,
         }
-        details = {"containers": containers, "extracted": extracted, "manifest": manifest}
+        details = {
+            "containers": containers,
+            "extracted": extracted,
+            "manifest": manifest,
+            "quiesce": quiesce,
+        }
         # ``extracted`` is valid only until this function returns, so callers
         # that migrate validate and extract the backup again after stopping.
         return plan, details
@@ -678,28 +951,35 @@ def command_migrate(args: argparse.Namespace) -> None:
         "backup_sha256",
         "source_version",
         "source_next_xid",
+        "source_quiesce_format",
+        "source_project_container_ids",
+        "source_running_container_ids",
+        "source_writer_container_ids",
+        "source_stopped_container_states",
+        "source_container_id",
+        "source_image",
+        "source_image_id",
+        "source_data_path",
         "dumps",
     ):
         if existing.get(key) != plan.get(key):
             raise MigrationError(f"planned migration input changed: {key}")
     plan = existing
     containers = details["containers"]
-    running_ids = [
-        str(container["Id"])
-        for container in containers
-        if (container.get("State") or {}).get("Running")
-    ]
-    plan["source_running_container_ids"] = sorted(running_ids)
+    quiesce = details["quiesce"]
+    postgres = source_postgres(containers, args.source_volume)
+    verify_quiesced_source(containers, postgres, quiesce, project=args.project)
     plan["phase"] = "source_stopping"
     plan["source_stopping_at"] = utc_now()
     atomic_json(receipt_path, plan)
-    postgres_id = str(source_postgres(containers, args.source_volume)["Id"])
-    writer_ids = [container_id for container_id in running_ids if container_id != postgres_id]
-    if writer_ids:
-        docker("stop", "--time", "60", *writer_ids)
-    # Close the only race left after the read-only plan. All application
-    # writers are stopped. Force a new checkpoint before reading pg_control so
-    # accepted writes cannot remain hidden behind the earlier checkpoint.
+
+    # The backup deliberately left every application writer stopped. Prove the
+    # exact container inventory again immediately before the last checkpoint;
+    # this command never tries to create quiescence itself.
+    containers = project_containers(args.project)
+    postgres = source_postgres(containers, args.source_volume)
+    verify_quiesced_source(containers, postgres, quiesce, project=args.project)
+    postgres_id = str(postgres["Id"])
     stopped_source_version = postgres_scalar(postgres_id, "SHOW server_version;")
     force_checkpoint(postgres_id)
     stopped_source_next_xid = postgres_scalar(
@@ -715,6 +995,9 @@ def command_migrate(args: argparse.Namespace) -> None:
         raise MigrationError(
             "PostgreSQL changed after the backup; take a new backup and keep writers stopped"
         )
+    containers = project_containers(args.project)
+    postgres = source_postgres(containers, args.source_volume)
+    verify_quiesced_source(containers, postgres, quiesce, project=args.project)
     docker("stop", "--time", "60", postgres_id)
 
     # Revalidate the backup after quiescing. This creates a new private
@@ -827,13 +1110,18 @@ def check_volume_receipt(receipt: dict[str, object]) -> None:
     source_info = volume_info(source)
     if target_info is None or source_info is None:
         raise MigrationError("source or target migration volume is missing")
+    project = receipt.get("project")
     labels = target_info.get("Labels") or {}
+    source_labels = source_info.get("Labels") or {}
     if (
-        labels.get("com.aigw.postgres.major") != TARGET_MAJOR
+        labels.get("com.docker.compose.project") != project
+        or labels.get("com.aigw.postgres.major") != TARGET_MAJOR
         or labels.get("com.aigw.postgres.migration-id") != receipt.get("migration_id")
         or labels.get("com.docker.compose.volume") != "pg_data"
+        or source_labels.get("com.docker.compose.project") != project
+        or source_labels.get("com.docker.compose.volume") != "pg_data"
     ):
-        raise MigrationError("PostgreSQL 18 volume labels do not match the receipt")
+        raise MigrationError("PostgreSQL migration volume labels do not match the receipt")
 
 
 def command_check_ready(args: argparse.Namespace) -> None:
@@ -908,50 +1196,160 @@ def command_rollback(args: argparse.Namespace) -> None:
         raise MigrationError("rollback confirmation is missing")
     path = Path(args.receipt)
     receipt = read_receipt(path)
-    if receipt.get("phase") == "planned":
-        receipt["phase"] = "rolled_back"
-        receipt["rolled_back_at"] = utc_now()
-        receipt["target_volume_removed"] = False
-        atomic_json(path, receipt)
-        print(f"POSTGRES_MIGRATION_ROLLED_BACK {receipt['migration_id']}")
-        return
-    if receipt.get("phase") not in {"source_stopping", "failed", "migrated"}:
+    phase = receipt.get("phase")
+    if phase not in {
+        "planned",
+        "source_stopping",
+        "failed",
+        "migrated",
+        "rollback_in_progress",
+        "rolled_back",
+    }:
         raise MigrationError(
             "rollback refused after writes reopened; keep PostgreSQL 18 and fix forward"
         )
+
+    if (
+        receipt.get("project") != args.project
+        or receipt.get("target_volume") != args.target_volume
+    ):
+        raise MigrationError("migration receipt does not match this rollback request")
+    quiesce = quiesce_contract_from_receipt(receipt)
+    project_ids = set(
+        exact_container_ids(
+            quiesce["project_container_ids"], "receipt project container inventory"
+        )
+    )
+    prior_running_ids = exact_container_ids(
+        quiesce["prior_running_container_ids"], "receipt running container inventory"
+    )
+
     source = str(receipt.get("source_volume", ""))
-    if not VOLUME_NAME.fullmatch(source) or volume_info(source) is None:
+    source_info = volume_info(source) if VOLUME_NAME.fullmatch(source) else None
+    source_labels = (source_info or {}).get("Labels") or {}
+    if (
+        source_info is None
+        or source_labels.get("com.docker.compose.project") != args.project
+        or source_labels.get("com.docker.compose.volume") != "pg_data"
+    ):
         raise MigrationError("source PostgreSQL 16 volume is missing")
+
     target = str(receipt.get("target_volume", ""))
-    target_exists = volume_info(target) is not None
+    target_info = volume_info(target)
+    target_exists = target_info is not None
     if target_exists:
-        check_volume_receipt(receipt)
-    elif receipt.get("phase") == "migrated":
+        labels = target_info.get("Labels") or {}
+        if (
+            labels.get("com.docker.compose.project") != args.project
+            or labels.get("com.docker.compose.volume") != "pg_data"
+            or labels.get("com.aigw.postgres.major") != TARGET_MAJOR
+            or labels.get("com.aigw.postgres.migration-id") != receipt.get("migration_id")
+        ):
+            raise MigrationError("PostgreSQL 18 volume labels do not match the receipt")
+    elif phase == "migrated":
         raise MigrationError("migrated PostgreSQL 18 volume is missing")
-    project = str(receipt.get("project", ""))
-    running = docker("ps", "-q", "--filter", f"label=com.docker.compose.project={project}")
-    if running.stdout.decode().split():
-        raise MigrationError("rollback requires every project container to be stopped")
-    old_ids = receipt.get("source_running_container_ids")
-    if not isinstance(old_ids, list) or not old_ids:
-        raise MigrationError("receipt has no exact PostgreSQL 16 container inventory")
-    inspected = json.loads(docker("inspect", *[str(item) for item in old_ids]).stdout)
-    if len(inspected) != len(old_ids):
-        raise MigrationError("one or more original containers no longer exist")
+
+    containers = project_containers(args.project)
+    inventory = exact_project_inventory(containers, args.project)
+    if set(inventory) != project_ids:
+        raise MigrationError("rollback refused because project containers changed")
+    verify_recorded_source(inventory, quiesce)
+    running_ids = sorted(
+        container_id
+        for container_id, container in inventory.items()
+        if (container.get("State") or {}).get("Running") is True
+    )
+
+    # A completed rollback is a no-op when the exact old graph is already
+    # running and the verified PG18 target is gone.
+    if (
+        phase == "rolled_back"
+        and not target_exists
+        and running_ids == list(prior_running_ids)
+    ):
+        print(f"POSTGRES_MIGRATION_ROLLED_BACK {receipt['migration_id']}")
+        return
+
     temporary = docker(
         "ps",
         "-aq",
+        "--no-trunc",
         "--filter",
         f"label=com.aigw.postgres.migration-id={receipt['migration_id']}",
     ).stdout.decode().split()
+    if any(CONTAINER_ID.fullmatch(container_id) is None for container_id in temporary):
+        raise MigrationError("temporary migration container inventory is malformed")
+    if temporary:
+        if len(temporary) != 1:
+            raise MigrationError("temporary migration container inventory is not exact")
+        try:
+            inspected_temporary = json.loads(docker("inspect", temporary[0]).stdout)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise MigrationError("temporary migration container cannot be inspected") from exc
+        if (
+            not isinstance(inspected_temporary, list)
+            or len(inspected_temporary) != 1
+            or not isinstance(inspected_temporary[0], dict)
+        ):
+            raise MigrationError("temporary migration container cannot be inspected")
+        temporary_container = inspected_temporary[0]
+        temporary_config = temporary_container.get("Config") or {}
+        temporary_labels = temporary_config.get("Labels") or {}
+        expected_name = f"/aigw-postgres18-migration-{str(receipt['migration_id'])[:8]}"
+        if (
+            temporary_container.get("Id") != temporary[0]
+            or temporary_container.get("Name") != expected_name
+            or temporary_config.get("Image") != POSTGRES_IMAGE
+            or temporary_container.get("Image") != receipt.get("postgres_image_id")
+            or temporary_labels.get("com.aigw.postgres.migration-id")
+            != receipt.get("migration_id")
+            or "com.docker.compose.project" in temporary_labels
+        ):
+            raise MigrationError("temporary migration container does not match the receipt")
+
+    # Write the resumable phase before the first stop/remove operation. A
+    # retry can safely finish after an interrupted partial stop or removal.
+    if phase != "rollback_in_progress":
+        receipt["phase"] = "rollback_in_progress"
+        receipt["rollback_started_at"] = utc_now()
+        receipt["rollback_target_existed"] = target_exists
+        atomic_json(path, receipt)
+    if running_ids:
+        docker("stop", "--time", "60", *running_ids)
+
+    stopped_containers = project_containers(args.project)
+    stopped_inventory = exact_project_inventory(stopped_containers, args.project)
+    if set(stopped_inventory) != project_ids:
+        raise MigrationError("rollback refused because project containers changed while stopping")
+    verify_recorded_source(stopped_inventory, quiesce)
+    if any(
+        (container.get("State") or {}).get("Running") is True
+        for container in stopped_inventory.values()
+    ):
+        raise MigrationError("rollback could not stop the exact project container inventory")
+
     if temporary:
         docker("rm", "--force", *temporary)
     if target_exists:
         docker("volume", "rm", target)
-        receipt["target_volume_removed"] = True
-    else:
-        receipt["target_volume_removed"] = False
-    docker("start", *[str(item) for item in old_ids])
+    docker("start", *prior_running_ids)
+
+    restored_containers = project_containers(args.project)
+    restored_inventory = exact_project_inventory(restored_containers, args.project)
+    if set(restored_inventory) != project_ids:
+        raise MigrationError("rollback refused because project containers changed while starting")
+    verify_recorded_source(restored_inventory, quiesce)
+    restored_running_ids = sorted(
+        container_id
+        for container_id, container in restored_inventory.items()
+        if (container.get("State") or {}).get("Running") is True
+    )
+    if restored_running_ids != list(prior_running_ids):
+        raise MigrationError("rollback did not restore the exact prior running graph")
+
+    receipt["target_volume_removed"] = bool(
+        target_exists or receipt.get("rollback_target_existed")
+    )
     receipt["phase"] = "rolled_back"
     receipt["rolled_back_at"] = utc_now()
     atomic_json(path, receipt)

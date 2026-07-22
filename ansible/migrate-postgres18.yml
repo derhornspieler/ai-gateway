@@ -60,50 +60,15 @@
       no_log: true
       tags: [postgres_migration_run]
 
-    - name: Plan the PostgreSQL 18 migration without changing Docker state
-      ansible.builtin.command:
-        argv:
-          - python3
-          - -I
-          - "{{ stack_dir }}/scripts/postgres-major-migrate.py"
-          - plan
-          - --input
-          - "{{ postgres_migration_backup_path }}"
-          - --identity
-          - "{{ postgres_migration_age_identity_path }}"
-          - --sha256
-          - "{{ postgres_migration_backup_sha256 }}"
-          - --source-volume
-          - "{{ compose_project_name }}_pg_data"
-          - --target-volume
-          - "{{ pg_data_volume_name }}"
-          - --receipt
-          - "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
-          - --project
-          - "{{ compose_project_name }}"
-          - --stack-dir
-          - "{{ stack_dir }}"
-          - --deployment-profile
-          - "{{ deployment_profile }}"
-          - --max-backup-age-minutes
-          - "{{ postgres_migration_max_backup_age_minutes | default(30) | string }}"
-      register: postgres_migration_plan
-      changed_when: true
-      failed_when: >-
-        postgres_migration_plan.rc != 0 or
-        'POSTGRES_MIGRATION_PLANNED' not in postgres_migration_plan.stdout
-      no_log: true
-      tags: [postgres_migration_run]
-
-    - name: Restore PostgreSQL 16 logical dumps into the fresh PostgreSQL 18 volume
+    - name: Plan and run the bounded PostgreSQL 18 migration
       block:
-        - name: Run the bounded PostgreSQL 18 migration
+        - name: Plan the PostgreSQL 18 migration without changing Docker state
           ansible.builtin.command:
             argv:
               - python3
               - -I
               - "{{ stack_dir }}/scripts/postgres-major-migrate.py"
-              - migrate
+              - plan
               - --input
               - "{{ postgres_migration_backup_path }}"
               - --identity
@@ -124,43 +89,79 @@
               - "{{ deployment_profile }}"
               - --max-backup-age-minutes
               - "{{ postgres_migration_max_backup_age_minutes | default(30) | string }}"
-              - --confirm
-              - MIGRATE_POSTGRES_16_TO_18
-          register: postgres_migration_restore
+          register: postgres_migration_plan
           changed_when: true
           failed_when: >-
-            postgres_migration_restore.rc != 0 or
-            'POSTGRES_MIGRATION_RESTORED' not in postgres_migration_restore.stdout
-          no_log: true
-      rescue:
-        - name: Restart the exact PostgreSQL 16 graph after a pre-cutover failure
-          ansible.builtin.command:
-            argv:
-              - python3
-              - -I
-              - "{{ stack_dir }}/scripts/postgres-major-migrate.py"
-              - rollback
-              - --receipt
-              - "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
-              - --project
-              - "{{ compose_project_name }}"
-              - --target-volume
-              - "{{ pg_data_volume_name }}"
-              - --confirm
-              - ROLLBACK_POSTGRES_18_TO_16
-          register: postgres_migration_rollback
-          changed_when: true
-          failed_when: >-
-            postgres_migration_rollback.rc != 0 or
-            'POSTGRES_MIGRATION_ROLLED_BACK' not in postgres_migration_rollback.stdout
+            postgres_migration_plan.rc != 0 or
+            'POSTGRES_MIGRATION_PLANNED' not in postgres_migration_plan.stdout
           no_log: true
 
-        - name: Stop after the safe PostgreSQL 16 rollback
-          ansible.builtin.fail:
-            msg: >-
-              PostgreSQL 18 restore or validation failed. The exact PostgreSQL
-              16 container graph was restarted and the PG16 volume was not
-              changed. Fix the reported cause and take a new backup before retry.
+        - name: Restore PostgreSQL 16 logical dumps into the fresh PostgreSQL 18 volume
+          block:
+            - name: Run the bounded PostgreSQL 18 migration
+              ansible.builtin.command:
+                argv:
+                  - python3
+                  - -I
+                  - "{{ stack_dir }}/scripts/postgres-major-migrate.py"
+                  - migrate
+                  - --input
+                  - "{{ postgres_migration_backup_path }}"
+                  - --identity
+                  - "{{ postgres_migration_age_identity_path }}"
+                  - --sha256
+                  - "{{ postgres_migration_backup_sha256 }}"
+                  - --source-volume
+                  - "{{ compose_project_name }}_pg_data"
+                  - --target-volume
+                  - "{{ pg_data_volume_name }}"
+                  - --receipt
+                  - "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
+                  - --project
+                  - "{{ compose_project_name }}"
+                  - --stack-dir
+                  - "{{ stack_dir }}"
+                  - --deployment-profile
+                  - "{{ deployment_profile }}"
+                  - --max-backup-age-minutes
+                  - "{{ postgres_migration_max_backup_age_minutes | default(30) | string }}"
+                  - --confirm
+                  - MIGRATE_POSTGRES_16_TO_18
+              register: postgres_migration_restore
+              changed_when: true
+              failed_when: >-
+                postgres_migration_restore.rc != 0 or
+                'POSTGRES_MIGRATION_RESTORED' not in postgres_migration_restore.stdout
+              no_log: true
+          rescue:
+            - name: Restart the exact PostgreSQL 16 graph after a pre-cutover failure
+              ansible.builtin.command:
+                argv:
+                  - python3
+                  - -I
+                  - "{{ stack_dir }}/scripts/postgres-major-migrate.py"
+                  - rollback
+                  - --receipt
+                  - "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
+                  - --project
+                  - "{{ compose_project_name }}"
+                  - --target-volume
+                  - "{{ pg_data_volume_name }}"
+                  - --confirm
+                  - ROLLBACK_POSTGRES_18_TO_16
+              register: postgres_migration_rollback
+              changed_when: true
+              failed_when: >-
+                postgres_migration_rollback.rc != 0 or
+                'POSTGRES_MIGRATION_ROLLED_BACK' not in postgres_migration_rollback.stdout
+              no_log: true
+
+            - name: Stop after the safe PostgreSQL 16 rollback
+              ansible.builtin.fail:
+                msg: >-
+                  PostgreSQL 18 restore or validation failed. The exact PostgreSQL
+                  16 container graph was restarted and the PG16 volume was not
+                  changed. Fix the reported cause and take a new backup before retry.
       always:
         - name: Remove the temporary PostgreSQL migration age identity
           ansible.builtin.file:

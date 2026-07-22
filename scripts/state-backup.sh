@@ -4,7 +4,11 @@ set -euo pipefail
 umask 077
 
 usage() {
-  echo "usage: sudo $0 --recipient age1... --output /independent/mount/aigw-STATE.tar.gz.age" >&2
+  cat >&2 <<EOF
+usage: sudo $0 --recipient age1... --output /independent/mount/aigw-STATE.tar.gz.age
+       sudo $0 --recipient age1... --output /independent/mount/aigw-PG16.tar.gz.age \\
+         --major-migration-quiesce --confirm QUIESCE_POSTGRES_16_FOR_MAJOR_MIGRATION
+EOF
   exit 2
 }
 
@@ -19,13 +23,22 @@ unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH D
 docker_cmd=(docker --host unix:///run/docker.sock)
 recipient=""
 output=""
+major_migration_quiesce=false
+confirmation=""
 while (($#)); do
   case "$1" in
     --recipient) [[ $# -ge 2 ]] || usage; recipient="$2"; shift 2 ;;
     --output) [[ $# -ge 2 ]] || usage; output="$2"; shift 2 ;;
+    --major-migration-quiesce) major_migration_quiesce=true; shift ;;
+    --confirm) [[ $# -ge 2 ]] || usage; confirmation="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
+if [[ "$major_migration_quiesce" == true ]]; then
+  [[ "$confirmation" == QUIESCE_POSTGRES_16_FOR_MAJOR_MIGRATION ]] || usage
+else
+  [[ -z "$confirmation" ]] || usage
+fi
 [[ "$recipient" =~ ^age1[0-9a-z]{58}$ ]] || { echo "only an age X25519 recipient is accepted" >&2; exit 2; }
 [[ "$output" = /* && "$output" == *.age ]] || { echo "--output must be an absolute .age path" >&2; exit 2; }
 [[ -d "$STACK_DIR" && -f "$STACK_DIR/docker-compose.yml" && -f "$STACK_DIR/docker-compose.dns.yml" && -f "$STACK_DIR/docker-compose.platform-dns.yml" ]] || { echo "stack directory is not deployed" >&2; exit 1; }
@@ -65,6 +78,11 @@ for service in "${running[@]}"; do
   }
   running_containers+=("${service_containers[@]}")
 done
+if ((${#running_containers[@]} > 0)); then
+  mapfile -t running_containers < <(
+    printf '%s\n' "${running_containers[@]}" | LC_ALL=C sort -u
+  )
+fi
 
 restart_original() {
   local rc=$?
@@ -86,6 +104,98 @@ trap restart_original EXIT INT TERM
 
 postgres_cid="$("${compose[@]}" ps -q postgres)"
 [[ -n "$postgres_cid" ]] || { echo "PostgreSQL must be running" >&2; exit 1; }
+
+project_container_ids=()
+writer_container_ids=()
+postgres_source_json=""
+stopped_container_states_json=""
+
+prove_major_migration_quiesce() {
+  local -a current_running=()
+  mapfile -t current_running < <(
+    "${docker_cmd[@]}" ps -q --no-trunc \
+      --filter "label=com.docker.compose.project=$PROJECT" | LC_ALL=C sort -u
+  )
+  if ((${#current_running[@]} != 1)) || [[ "${current_running[0]:-}" != "$postgres_cid" ]]; then
+    echo "major migration requires PostgreSQL to be the only running project container" >&2
+    return 1
+  fi
+}
+
+if [[ "$major_migration_quiesce" == true ]]; then
+  mapfile -t project_container_ids < <(
+    "${docker_cmd[@]}" ps -aq --no-trunc \
+      --filter "label=com.docker.compose.project=$PROJECT" | LC_ALL=C sort -u
+  )
+  mapfile -t docker_running_containers < <(
+    "${docker_cmd[@]}" ps -q --no-trunc \
+      --filter "label=com.docker.compose.project=$PROJECT" | LC_ALL=C sort -u
+  )
+  ((${#project_container_ids[@]} > 0)) || {
+    echo "major migration found no project container inventory" >&2
+    exit 1
+  }
+  for container_id in "${project_container_ids[@]}" "${running_containers[@]}"; do
+    [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || {
+      echo "major migration found a malformed project container ID" >&2
+      exit 1
+    }
+  done
+  [[ "$(printf '%s\n' "${docker_running_containers[@]}")" == \
+      "$(printf '%s\n' "${running_containers[@]}")" ]] || {
+    echo "Compose and Docker disagree about the exact running project containers" >&2
+    exit 1
+  }
+  [[ " ${project_container_ids[*]} " == *" $postgres_cid "* ]] || {
+    echo "PostgreSQL is missing from the exact project container inventory" >&2
+    exit 1
+  }
+  for container_id in "${running_containers[@]}"; do
+    [[ "$container_id" == "$postgres_cid" ]] || writer_container_ids+=("$container_id")
+  done
+
+  postgres_inspect="$staging/.postgres-source-inspect.json"
+  "${docker_cmd[@]}" inspect "$postgres_cid" > "$postgres_inspect"
+  postgres_source_json="$(
+    python3 - "$postgres_inspect" "$PROJECT" "$postgres_cid" <<'PY'
+import json, re, sys
+
+documents = json.load(open(sys.argv[1], encoding="utf-8"))
+if not isinstance(documents, list) or len(documents) != 1:
+    raise SystemExit("PostgreSQL source inspection is not exact")
+container = documents[0]
+config = container.get("Config") or {}
+labels = config.get("Labels") or {}
+container_id = container.get("Id")
+image_id = container.get("Image")
+image = config.get("Image")
+if container_id != sys.argv[3] or re.fullmatch(r"[0-9a-f]{64}", str(container_id)) is None:
+    raise SystemExit("PostgreSQL source container ID is malformed")
+if labels.get("com.docker.compose.project") != sys.argv[2] or labels.get("com.docker.compose.service") != "postgres":
+    raise SystemExit("PostgreSQL source labels are not exact")
+if re.fullmatch(r"sha256:[0-9a-f]{64}", str(image_id)) is None:
+    raise SystemExit("PostgreSQL source image ID is malformed")
+if re.fullmatch(r"[^\s@]+:[^\s@]+@sha256:[0-9a-f]{64}", str(image)) is None:
+    raise SystemExit("PostgreSQL source image reference is not digest-pinned")
+mounts = [
+    mount for mount in container.get("Mounts") or []
+    if isinstance(mount, dict) and mount.get("Destination") == "/var/lib/postgresql/16/data"
+]
+if len(mounts) != 1 or mounts[0].get("Type") != "volume" or re.fullmatch(
+    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", str(mounts[0].get("Name", ""))
+) is None:
+    raise SystemExit("PostgreSQL 16 source volume identity is not exact")
+print(json.dumps({
+    "container_id": container_id,
+    "image": image,
+    "image_id": image_id,
+    "volume": mounts[0]["Name"],
+    "data_path": "/var/lib/postgresql/16/data",
+}, sort_keys=True, separators=(",", ":")))
+PY
+  )"
+  rm -f "$postgres_inspect"
+fi
 
 # Refuse a backup in the middle of an external credential transition.
 if "${compose[@]}" ps -q key-rotator | grep -q .; then
@@ -113,6 +223,50 @@ for service in "${running[@]}"; do
 done
 if ((${#writers[@]})); then
   "${compose[@]}" stop -t 60 "${writers[@]}" >/dev/null
+fi
+if [[ "$major_migration_quiesce" == true ]]; then
+  prove_major_migration_quiesce
+  project_inspect="$staging/.quiesced-project-inspect.json"
+  "${docker_cmd[@]}" inspect "${project_container_ids[@]}" > "$project_inspect"
+  stopped_container_states_json="$(
+    python3 - "$project_inspect" "$postgres_cid" "${project_container_ids[@]}" <<'PY'
+import json, re, sys
+
+documents = json.load(open(sys.argv[1], encoding="utf-8"))
+source_id = sys.argv[2]
+expected_ids = set(sys.argv[3:])
+if not isinstance(documents, list) or len(documents) != len(expected_ids):
+    raise SystemExit("quiesced project inspection is not exact")
+states = {}
+for container in documents:
+    container_id = container.get("Id")
+    if container_id not in expected_ids or container_id in states:
+        raise SystemExit("quiesced project container identity changed")
+    if container_id == source_id:
+        continue
+    state = container.get("State") or {}
+    restart_count = container.get("RestartCount")
+    if state.get("Running") is not False:
+        raise SystemExit("a non-PostgreSQL project container is still running")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", str(container_id)) is None
+        or not isinstance(state.get("StartedAt"), str)
+        or not isinstance(state.get("FinishedAt"), str)
+        or not isinstance(restart_count, int)
+        or restart_count < 0
+    ):
+        raise SystemExit("quiesced project container state is malformed")
+    states[container_id] = {
+        "started_at": state["StartedAt"],
+        "finished_at": state["FinishedAt"],
+        "restart_count": restart_count,
+    }
+if set(states) != expected_ids - {source_id}:
+    raise SystemExit("quiesced stopped-container inventory is incomplete")
+print(json.dumps(states, sort_keys=True, separators=(",", ":")))
+PY
+  )"
+  rm -f "$project_inspect"
 fi
 
 mkdir -p "$staging/postgres" "$staging/volumes"
@@ -183,12 +337,20 @@ export AIGW_BACKUP_STAGING="$staging" AIGW_BACKUP_PROJECT="$PROJECT"
 export AIGW_BACKUP_PG_VERSION="$pg_version"
 export AIGW_BACKUP_PG_NEXT_XID="$pg_next_xid"
 export AIGW_BACKUP_PG_WRITE_BARRIER="forced-checkpoint-after-logical-dumps-v1"
+AIGW_BACKUP_MAJOR_MIGRATION_QUIESCE="$major_migration_quiesce"
+AIGW_BACKUP_PROJECT_CONTAINER_IDS="$(printf '%s\n' "${project_container_ids[@]}")"
+AIGW_BACKUP_PRIOR_RUNNING_CONTAINER_IDS="$(printf '%s\n' "${running_containers[@]}")"
+AIGW_BACKUP_WRITER_CONTAINER_IDS="$(printf '%s\n' "${writer_container_ids[@]}")"
+export AIGW_BACKUP_MAJOR_MIGRATION_QUIESCE AIGW_BACKUP_PROJECT_CONTAINER_IDS
+export AIGW_BACKUP_PRIOR_RUNNING_CONTAINER_IDS AIGW_BACKUP_WRITER_CONTAINER_IDS
+export AIGW_BACKUP_POSTGRES_SOURCE_JSON="$postgres_source_json"
+export AIGW_BACKUP_STOPPED_CONTAINER_STATES_JSON="$stopped_container_states_json"
 AIGW_BACKUP_VOLUMES="$(printf '%s\n' "${archived_volumes[@]}")"
 export AIGW_BACKUP_VOLUMES
 export AIGW_BACKUP_DEPLOYMENT_PROFILE="$deployment_profile"
 export AIGW_BACKUP_COMPOSE_WRAPPER="$STACK_DIR/scripts/aigw-compose.sh"
 python3 - <<'PY'
-import datetime, hashlib, json, os, pathlib, subprocess, uuid
+import datetime, hashlib, json, os, pathlib, re, subprocess, uuid
 root = pathlib.Path(os.environ["AIGW_BACKUP_STAGING"])
 files = sorted(p for p in root.rglob("*") if p.is_file() and p.name != "manifest.json")
 manifest = {
@@ -210,6 +372,37 @@ manifest = {
         str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files
     },
 }
+if os.environ["AIGW_BACKUP_MAJOR_MIGRATION_QUIESCE"] == "true":
+    def container_ids(name, *, allow_empty=False):
+        values = [value for value in os.environ[name].splitlines() if value]
+        if (not allow_empty and not values) or len(values) != len(set(values)) or any(
+            not re.fullmatch(r"[0-9a-f]{64}", value) for value in values
+        ):
+            raise SystemExit(f"invalid {name} inventory")
+        return sorted(values)
+
+    project_ids = container_ids("AIGW_BACKUP_PROJECT_CONTAINER_IDS")
+    prior_running_ids = container_ids("AIGW_BACKUP_PRIOR_RUNNING_CONTAINER_IDS")
+    writer_ids = container_ids("AIGW_BACKUP_WRITER_CONTAINER_IDS", allow_empty=True)
+    source = json.loads(os.environ["AIGW_BACKUP_POSTGRES_SOURCE_JSON"])
+    stopped_states = json.loads(os.environ["AIGW_BACKUP_STOPPED_CONTAINER_STATES_JSON"])
+    source_id = source.get("container_id")
+    if (
+        source_id not in project_ids
+        or source_id not in prior_running_ids
+        or not set(prior_running_ids).issubset(project_ids)
+        or set(writer_ids) != set(prior_running_ids) - {source_id}
+        or set(stopped_states) != set(project_ids) - {source_id}
+    ):
+        raise SystemExit("major-migration quiesce inventory is inconsistent")
+    manifest["postgres_major_migration_quiesce"] = {
+        "format": "aigw-postgres-major-migration-quiesce-v1",
+        "project_container_ids": project_ids,
+        "prior_running_container_ids": prior_running_ids,
+        "writer_container_ids": writer_ids,
+        "stopped_container_states": stopped_states,
+        "source": source,
+    }
 (root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
 
@@ -220,11 +413,14 @@ chmod 0600 "$partial"
 mv "$partial" "$output"
 backup_sha="$(sha256sum "$output" | awk '{print $1}')"
 
-# Restore exactly the concrete containers that were running before
-# maintenance. Do not use Compose dependency traversal: volume-init is a
-# successful exited one-shot and must stay exited. Vault's file backend seals
-# on process restart, so post-backup full readiness still requires unseal.
-if ((${#running_containers[@]})); then
+# Ordinary backup restores the exact prior graph. Major-migration mode keeps
+# every application writer stopped and starts only PostgreSQL for the reviewed
+# plan/migrate checks. Any earlier failure still reaches the EXIT trap, which
+# restores the full prior graph because the quiesce did not complete.
+if [[ "$major_migration_quiesce" == true ]]; then
+  "${docker_cmd[@]}" start "$postgres_cid" >/dev/null
+  prove_major_migration_quiesce
+elif ((${#running_containers[@]})); then
   "${docker_cmd[@]}" start "${running_containers[@]}" >/dev/null
 fi
 restarted=true
@@ -237,6 +433,7 @@ receipt = {
     "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "path": os.environ["AIGW_BACKUP_OUTPUT"],
     "sha256": os.environ["AIGW_BACKUP_SHA"],
+    "major_migration_quiesced": os.environ["AIGW_BACKUP_MAJOR_MIGRATION_QUIESCE"] == "true",
 }
 path = pathlib.Path(".state/last-backup.json")
 tmp = path.with_suffix(".tmp")
@@ -248,4 +445,8 @@ PY
 rm -rf "$staging"
 trap - EXIT INT TERM
 printf 'backup=%s\nsha256=%s\n' "$output" "$backup_sha"
-echo "Backup complete. Vault restarted sealed; perform the normal manual unseal before full readiness." >&2
+if [[ "$major_migration_quiesce" == true ]]; then
+  echo "Major-migration backup complete. PostgreSQL 16 is running; every recorded application writer remains stopped." >&2
+else
+  echo "Backup complete. Vault restarted sealed; perform the normal manual unseal before full readiness." >&2
+fi
