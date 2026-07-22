@@ -88,6 +88,42 @@ class PreprodContractTests(unittest.TestCase):
         )
         self.assertEqual(parsed.command, "clean-room-seed")
 
+    def test_vault_token_update_preserves_the_verified_seed_policy(self) -> None:
+        module = load_preprod_module()
+        policy_values = {
+            name: f"verified-{index}"
+            for index, name in enumerate(module.SEED_POLICY_ENVIRONMENT_NAMES)
+        }
+        base = {
+            "ROTATOR_VAULT_TOKEN": "old-token",
+            **{name: "" for name in module.SEED_POLICY_ENVIRONMENT_NAMES},
+        }
+        with (
+            mock.patch.object(module, "environment_values", return_value=base.copy()),
+            mock.patch.object(
+                module,
+                "preprod_env_value",
+                side_effect=policy_values.__getitem__,
+            ),
+        ):
+            updated = module.environment_with_vault_token(
+                types.SimpleNamespace(image_mode="seed"), "new-token"
+            )
+        self.assertEqual(updated["ROTATOR_VAULT_TOKEN"], "new-token")
+        for name, value in policy_values.items():
+            self.assertEqual(updated[name], value)
+
+        with (
+            mock.patch.object(module, "environment_values", return_value=base.copy()),
+            mock.patch.object(module, "preprod_env_value") as read_seed_value,
+        ):
+            source = module.environment_with_vault_token(
+                types.SimpleNamespace(image_mode="source"), "source-token"
+            )
+        self.assertEqual(source["ROTATOR_VAULT_TOKEN"], "source-token")
+        self.assertEqual(source["KEY_ROTATOR_EGRESS_POLICY_SHA256"], "")
+        read_seed_value.assert_not_called()
+
     def test_postgres16_mode_is_fixed_to_confirmed_seed_rehearsal(self) -> None:
         module = load_preprod_module()
         parser = module.parser()

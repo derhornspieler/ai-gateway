@@ -91,6 +91,13 @@ POSTGRES_RECONCILE_RESULTS = frozenset(
     {"AIGW_POSTGRES_CHANGED", "AIGW_POSTGRES_OK"}
 )
 EDGE_RESPONSE_MAX_BYTES = 64 * 1024
+SEED_POLICY_ENVIRONMENT_NAMES = (
+    "AIGW_EGRESS_SOURCE_DATE_EPOCH",
+    "AIGW_EGRESS_PROVIDERS",
+    "AIGW_EGRESS_POLICY_SHA256",
+    "KEY_ROTATOR_PROVIDER_POLICY_RECEIPT_FILE",
+    "KEY_ROTATOR_EGRESS_POLICY_SHA256",
+)
 PREPROD_USERNAMES = frozenset(
     {"preprod-admin", "preprod-developer", "preprod-user"}
 )
@@ -2390,6 +2397,19 @@ def render_environment(args: argparse.Namespace) -> None:
     write_file(ENV_FILE, content, 0o600)
 
 
+def environment_with_vault_token(
+    args: argparse.Namespace, token: str
+) -> dict[str, str]:
+    """Update the Vault token without dropping a verified seed policy."""
+
+    values = environment_values(args)
+    if args.image_mode == "seed":
+        for name in SEED_POLICY_ENVIRONMENT_NAMES:
+            values[name] = preprod_env_value(name)
+    values["ROTATOR_VAULT_TOKEN"] = token
+    return values
+
+
 def prepare(args: argparse.Namespace) -> None:
     check_context(args)
     if shutil.which("openssl") is None:
@@ -4167,8 +4187,7 @@ def bootstrap_vault(args: argparse.Namespace) -> None:
         token = token_response.get("auth", {}).get("client_token", "")
         if not token:
             fail("Vault returned no rotator token")
-        values = environment_values(args)
-        values["ROTATOR_VAULT_TOKEN"] = token
+        values = environment_with_vault_token(args, token)
         content = "# Generated private PreProd credentials. Do not commit.\n"
         content += "".join(f"{name}={value}\n" for name, value in values.items())
         write_file(ENV_FILE, content, 0o600)
