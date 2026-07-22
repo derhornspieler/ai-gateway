@@ -157,17 +157,6 @@
     which host-level signals local Docker Desktop preprod cannot faithfully
     prove. Do not claim those host-only checks passed based on Docker Desktop
     results, and do not require a separate rehearsal VM.
-<a id="review-every-container-image-and-language-dependency-version"></a>
-
-- [ ] **Review every container image and language dependency version** - Check
-  each DHI and non-DHI runtime, build image, Python package, and Go toolchain.
-  Prefer the newest compatible stable release. Keep an older version only with
-  a written support, migration, or compatibility reason. For every promoted
-  pin, rebuild both schema-v2 seed pairs, run the full exact-seed local preprod
-  gate, prove rollback, and let GitHub scan the exact release. Record the
-  platform, digest, support state, security fixes, and decision. See the
-  [image update workflow](docs/image-update-workflow.md).
-
 <a id="run-a-new-operator-documentation-usability-review"></a>
 
 - [ ] **Run a new-operator documentation usability review** - The active guides
@@ -259,6 +248,28 @@ not approve the current source candidate.
     image IDs. No separate Rocky or Parallels rehearsal VM was created. The
     migration SOP states that Git history gives no reason for the old
     PostgreSQL 16 choice; any other explanation would be an inference.
+
+<a id="review-every-container-image-and-language-dependency-version"></a>
+
+- [x] ~~Review every container image and language dependency version~~
+  (2026-07-22)
+  - The DHI catalog confirmed that every selected DHI tag is the newest stable
+    matching tag for its major version and image variant. Alloy `1.18.0`,
+    Grafana `13.1.1`, and Traefik `3.7.8` were newer upstream, but matching DHI
+    tags did not exist. The release keeps the newest DHI Alloy and Grafana
+    images. Its custom Traefik image adds the reviewed current `3.7.8` binary
+    to the newest DHI Traefik runtime.
+  - Official release sources confirmed current PostgreSQL `18.4`, Python
+    `3.14.6`, Go `1.26.5`, Debian `13.6`, Docker Engine `29.6.2`, and Docker
+    Compose `5.3.1`. The selected containerd `2.2.6` is the version Docker
+    Engine `29.6.2` packages, so it remains a tested compatibility set instead
+    of mixing in upstream containerd `2.3`.
+  - Every direct Python runtime and test dependency matched its current PyPI
+    project version. The four Go modules use only the standard library. The
+    exact ARM64 seed build and full local rehearsal passed. See the
+    [dated version review](docs/image-version-review.md) for every pin and the
+    review method. GitHub's protected DHI scans remain the separate security
+    audit gate; version review does not replace those scans.
 - [x] ~~Rewrite active documentation and add automated documentation checks~~ (2026-07-21)
   - Active documentation separates preprod from production and uses short,
     direct operator language. Obsolete lab material is archived and labeled as

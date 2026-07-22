@@ -356,6 +356,7 @@ from the exact preprod seed. Production still uses the separate
 
 ## Related pages
 
+- [Dated image and dependency version review](image-version-review.md)
 - [Local preprod](preprod.md)
 - [Acceptance test runbook](test-runbook.md)
 - [Offline seed details](offline-image-seed.md)
