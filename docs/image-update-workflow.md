@@ -135,6 +135,17 @@ dependency graph for Python 3.14, and run the clean temporary-environment steps
 in the [test runbook](test-runbook.md#python-services). CI currently pins
 ansible-core 2.21.2 and yamllint 1.38.0.
 
+Regenerate each Python lock from its service directory with the reviewed tool:
+
+```bash
+uvx --from uv==0.11.31 uv pip compile requirements.txt \
+  --python-version 3.14 --python-platform linux --generate-hashes \
+  --output-file requirements.lock
+```
+
+Keep the tool version in the command. A floating lock generator can change the
+file even when the application requirements did not change.
+
 The newest upstream application tag is not always present in DHI. These are
 the current reviewed holds:
 
