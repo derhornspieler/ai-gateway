@@ -2,27 +2,34 @@
 
 ## Active
 
-- [ ] **Finish `r13` visual browser acceptance** - Candidate `r13` was built
-  from pushed commit `15e47d6d48a82a05281b386f3446bbbd1760d455`. Its exact
+<a id="finish-r14-visual-browser-acceptance"></a>
+
+- [ ] **Finish `r14` visual browser acceptance** - Candidate `r14` was built
+  from pushed commit `c5c1e503053c76e35f8bb93d242a9ac630d1b98e`. Its exact
   preprod pair passed clean-room purge, fresh archive loading, one Ansible
-  seed-mode deploy, and the full integration and end-to-end gate. The receipt
-  removed 26 containers, 19 networks, 11 volumes, 62 aliases, and all 43 target
-  image IDs while preserving 185 unrelated IDs. Pulls and source builds stayed
-  off. All 25 long-running containers were healthy on the exact manifest image
-  IDs. The run ended with `PREPROD_CLEAN_ROOM_OK`, `PREPROD_E2E_PASSED`, and
+  seed-mode deploy, and the full integration and end-to-end gate. The initial
+  pre-deploy purge receipt removed 26 containers, 19 networks, 11 volumes, 62
+  aliases, and all 43 target image IDs while preserving 185 unrelated IDs.
+  Pulls and source builds stayed off. All 25 long-running containers were
+  healthy on the exact manifest image IDs. The run ended with
+  `PREPROD_CLEAN_ROOM_OK`, `PREPROD_E2E_PASSED`, and
   `SEEDED_PREPROD_E2E_PASSED`.
 
-  The exact Open WebUI runtime image is
-  `sha256:83cf446e3f3fffb5c99c2f8d8a09e59e1c3b9c5c5c65d4836692caf28c294792`.
-  It was healthy, and its hardened-path gate passed.
+  The r14 test also proved that LiteLLM audit spans use Alloy's authenticated
+  receiver and that missing, wrong, or caller-forged source proof is rejected.
+  The visual browser replay could not run because no browser session exists.
+  Reload the exact r14 preprod pair and run that replay when a browser is
+  available. Keep the `r10` Chrome result as historical evidence; do not use it
+  as `r14` proof.
 
-  After a Vault restart, the test proved `initialized=true` and `sealed=true`.
-  A second identical seed-mode converge auto-unsealed Vault and passed the full
-  end-to-end and Cribl tests again. The visual browser replay could not run
-  because the current test runtime exposed no browser. Run that replay when a
-  browser is available.
-  Keep the `r10` Chrome result as historical evidence; do not use it as `r13`
-  proof.
+  After testing, the final bounded clean-room teardown returned
+  `PREPROD_CLEAN_ROOM_OK` for project `aigw-preprod`, cleanup-receipt schema 1,
+  and manifest
+  `1ab6902ace9c1b25a3e8a3a1d1a81e014dbf60d0045d8e67a4b8604b7b58ceab`.
+  It removed 26 containers, 19 networks, 11 volumes, 43 image aliases, 43 image
+  IDs, and three generated state files while preserving 185 unrelated image
+  IDs. Ansible also removed the owned macOS loopback aliases and marker-bounded
+  hosts fragment.
 - [ ] **Finish the approved Cribl security-event feed** - Alloy now sends a
   small, versioned security feed over verified OTLP/gRPC TLS. Raw metrics, raw
   traces, alerts, ordinary service logs, and the raw Vault audit file stay
@@ -54,27 +61,28 @@
     reviewed string patterns for other supported secret formats. Do not use a
     generic high-entropy rule that would destroy useful prompt records.
   - **Attribution gap:** AI request export now requires bounded user ID, user
-    name, key hash, project ID, and request ID fields. Still prove source
-    authenticity and readable-name quality for chat, direct API, and every
-    supported client path. `aigw.user.name` is readable attribution, not an
-    authorization fact. Keep stable subject, key, and project evidence
-    separate.
-  - **Source-authentication gap:** the shared OTLP listener trusts a caller's
-    `service.name=litellm` attribute. A peer on the telemetry network can spoof
-    an AI request record. Add a dedicated authenticated LiteLLM ingest path,
-    stamp a server-owned source marker, require that marker in the AI filter,
-    and prove another container cannot forge it. Do not accept a caller-owned
-    attribute as proof of source.
+    name, key hash, project ID, and request ID fields. Still prove readable-name
+    quality for chat, direct API, and every supported client path.
+    `aigw.user.name` is readable attribution, not an authorization fact. Keep
+    stable subject, key, and project evidence separate.
+  - **Source authentication is complete:** commit `c5c1e50` added a dedicated
+    bearer-authenticated LiteLLM receiver. The open receiver removes a
+    caller-owned trust marker and rejects `service.name=litellm`. Alloy stamps
+    its own marker only after the token passes. Commit `33c79e5` validates a
+    restored token before it repairs the exact reader group and file mode.
   - **Common-record gap:** the handoff expects a recent UTC time, fixed
     environment, producer, and schema on every record. The current projection
     does not enforce all four fields for every event class. Add fixed
     `preprod`/`production` values, a reviewed producer name, and recent-time
     checks. Test every record class and reject a zero or stale timestamp.
   - **Event gaps:** add a reviewed sender for controller-only events; provider
-    rotation start, attempt, rollback, and recovery; application authorization
+    rotation start, attempt, failure, and recovery; application authorization
     denials and uncovered privileged changes; LDAP and managed-identity drift,
     reconcile failure, and recovery; and break-glass activation, disable, and
-    cleanup. Add natural producer receipt tests for every new event.
+    cleanup. Current provider-key promotion does not restore the previous
+    secret. Design and implement a safe recovery or rollback capability before
+    adding an event that claims it happened. Add natural producer receipt tests
+    for every new event.
   - **External acceptance:** the Cribl/SOC team must supply the approved
     endpoint and CA, repeat the wire and field receipt, enforce and prove
     24-hour destination retention, and decide whether the gateway also needs a
@@ -83,23 +91,29 @@
 
 ## Waiting On
 
-- [ ] **Add approved DHI credentials to GitHub release scans** - The
-  credential-independent `main` jobs are green. The release image jobs stop at
-  the required credential gate before their raw Trivy records and blocking
-  VEX-aware Scout checks can finish because the protected
+<a id="provide-protected-dhi-credentials-and-finish-the-release-security-audit"></a>
+
+- [ ] **Provide protected DHI credentials and finish the release security
+  audit** - The credential-independent quality, dependency, CodeQL,
+  secret-scanning, and release-contract jobs are green. The image jobs stop at
+  the required credential gate because the protected
   `release-container-security` environment has no `DHI_USERNAME` or
-  `DHI_PASSWORD` secret. A repository administrator must add approved
-  credentials and rerun the failed jobs. Do not copy a developer's local login
-  into GitHub or weaken the gate without explicit approval.
-- [ ] **Run the Rocky Linux 9 deployment, upgrade, and rollback test** - The
-  operator requested this test, but no reachable Rocky VM exists. The old
-  `10.8.10.10` VM and its dedicated networks were removed. Get an existing
-  three-NIC Rocky Linux 9 target or approval to create a new VM and networks.
-  Then use the newest production-scoped release that passes every local and CI
-  gate. Run bootstrap, preflight, the two-pass Ansible converge, validation,
-  guarded upgrade, forced validation failure, and rollback. Keep Anthropic
-  enrollment as a separate operator step after the platform and identity proof.
-  Never send the preprod-only image pair to production.
+  `DHI_PASSWORD` secret.
+
+  - A repository administrator must add approved DHI credentials and rerun the
+    jobs for the exact release commit. Do not copy a developer's local login
+    into GitHub or weaken the gate.
+  - GitHub must scan the source and every exact external and custom image in the
+    production and preprod union. Save raw Trivy JSON, blocking VEX-aware Docker
+    Scout results, SBOMs, provenance, and the final image IDs.
+  - Review every finding. Fix it or add an owned, dated, package-specific waiver
+    with a clear reason. Record the remaining risk. A missing credential or
+    skipped image is not a pass.
+  - Keep this as one release gate with the active r14 browser item. Customer
+    Cribl receipt and retention remain the separate acceptance task below.
+
+<a id="complete-the-customer-cribl-acceptance-ceremony"></a>
+
 - [ ] **Complete the customer Cribl acceptance ceremony** - The local TLS mock,
   allow-list, redaction, queue outage, and recovery tests pass. The Cribl/SOC
   team must supply its approved endpoint and CA, enforce and prove 24-hour
@@ -109,105 +123,6 @@
 
 ## Someday
 
-- [ ] **Finish external acceptance for immutable, provider-selectable Envoy
-  releases** - The reviewed catalog, repeated `--provider` interface,
-  network-disabled image build, baked CA bundles, startup gate, schema-v2
-  release record, loader contracts, documentation, diagrams, and exact seeded
-  local preprod proof are complete. Release `r10` selected only `anthropic` and
-  reproduced the same Envoy image ID twice. Candidate `r13` also selects only
-  `anthropic` and passed the exact seeded local preprod gate. Its policy digest
-  is `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`,
-  and its Envoy image ID is
-  `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
-  Its visual browser replay is still active above. Keep the full design below
-  so a future developer can finish the remaining protected GitHub image scan
-  and approved remote promote/validate/rollback proof without this
-  conversation.
-  - **Operator interface:** Accept repeated provider selections while preparing
-    the offline seed. The intended command shape is:
-
-    ```bash
-    python3 -I scripts/update-images.py prepare \
-      --provider anthropic \
-      --platform linux/amd64 \
-      --archive /release/aigw.docker.tar.zst \
-      --manifest /release/aigw.manifest.json
-    ```
-
-    Canonicalize provider ordering, handle duplicate arguments safely, and
-    reject unknown providers and an empty selection. Never accept an arbitrary
-    provider hostname or CA path through the CLI.
-  - **Reviewed provider catalog:** Resolve every provider name through a
-    committed, reviewed catalog. Each entry must contain the provider name, API
-    hostname, Envoy route prefix, SNI requirement, exact SAN requirement,
-    reviewed CA bundle, and expected SHA-256 fingerprint for every CA
-    certificate. Adding a provider requires a reviewed catalog change and a new
-    release build.
-  - **Immutable and reproducible build:** Keep the Docker build network-disabled
-    and reproducible. Ansible must never discover or download CA trust material
-    during deployment. Put only the selected providers' routes, policy, and CA
-    bundles in the final Envoy image. Identical canonical selections must
-    reproduce the same policy inputs, while different selections must produce
-    different immutable image IDs.
-  - **Fail-closed startup gate:** Refuse startup when selected CA material is
-    missing, unexpected, malformed, expired, or does not match the reviewed
-    fingerprints. Validate the configured hostname, SNI, and exact SAN rules as
-    part of the gate. Do not silently fall back to host or system trust.
-  - **Schema-v2 release record:** Record the canonical selected providers,
-    provider hostnames, CA certificate fingerprints, generated egress-policy
-    digest, and final Envoy image ID in the schema-v2 offline-seed manifest.
-    Make the Envoy image and provider policy one release unit for seed loading,
-    remote upgrade, validation, and rollback.
-  - **Offline and preprod proof:** Load the exact generated image through the
-    offline-seed loader and exercise it in the full local preprod validation.
-    Remote promotion must validate that exact image and policy. A failed
-    validation must restore the previous Envoy image and matching provider
-    policy together.
-  - **Trusted CA maintenance:** Capture CA certificates only through a separate,
-    trusted release-maintenance procedure with recorded provenance verification,
-    review, and approval. Document CA rotation as a catalog update followed by a
-    new release build, seed, validation, and rollback rehearsal. State clearly
-    that a certificate subject containing `C=US` and a matching hash proves
-    certificate integrity only; it does not prove original trust provenance,
-    endpoint geography, US data residency, or where a provider processes data.
-  - **Documentation:** Find and correct any claim that provider CA bundles are
-    runtime-mounted placeholders; the current design bakes reviewed bundles into
-    the image. At about an eighth-grade reading level, document why provider CA
-    bundles are immutable, how operators select providers, how a provider is
-    added and reviewed, how CA rotation works, how selection changes the offline
-    seed, and how validation and rollback work. Explain the differences among
-    certificate integrity, the CA organization's country, endpoint geography,
-    and data residency. Update the architecture documentation, image-update
-    workflow, deployment and operator runbooks, security model, and
-    provider-onboarding documentation. Create any missing required document and
-    include direct commands and examples.
-  - **Diagrams and navigation:** Review every architecture and deployment
-    diagram for consistency. Add or update diagrams for: (1) provider selection
-    through catalog validation, immutable Envoy build, and offline seed; (2) the
-    runtime request path through Envoy to selected vendors; (3) CA capture,
-    review, rotation, and the release-approval boundary; and (4) offline-seed
-    deployment, validation, and rollback. Create missing diagrams. Verify all
-    diagram labels, internal links, anchors/bookmarks, and navigation between
-    related pages.
-  - **Contract and security tests:** Cover repeated `--provider` arguments,
-    canonical ordering, duplicates, unknown providers, and empty selections.
-    Prove arbitrary hostnames and CA paths are rejected. Test CA fingerprints,
-    expiration, SAN, SNI, and every fail-closed startup condition.
-  - **Build and contents tests:** Prove identical canonical selections produce
-    deterministic build inputs and policy output; prove different selections
-    change both policy and image identity. Inspect the final image to confirm
-    that only selected routes and CA files are present.
-  - **Release acceptance:** Add offline-seed manifest and loader contract tests,
-    run a full local preprod test from the generated seed, and validate
-    documentation links and diagram references. The task is complete only when
-    all tests pass and the tested artifacts show the Envoy image ID and policy
-    digest promoted and rolled back as one unit.
-- [ ] **Finish the credential-gated security audit** - Local quality, security,
-  dependency, CodeQL, secret-scanning, and release-contract gates are green.
-  GitHub still must run Trivy against the source and every exact upstream and
-  custom image after an administrator supplies the protected DHI credentials.
-  Record fixes, waivers, SBOMs, provenance, and remaining risk; do not describe
-  a credential-blocked scan as passed.
 - [ ] **Add proactive capacity alerts to the Grafana dashboard** - Build
   this after the current release work is complete. Docker health checks only
   mark one container healthy or unhealthy; they do not forecast host pressure
@@ -265,36 +180,65 @@
   restore on an approved production-like host. Git history contains no recorded
   technical reason for the original PostgreSQL 16 choice; describe any claim
   beyond that as an inference.
-- [ ] **Finish protected scans for the newest supported image release** - The
-  authoritative upstream and DHI catalog review, exact version-and-digest pins,
-  compatibility fixes, software/toolchain review, network-disabled `r13`
-  builds, and exact seeded local preprod checks are complete. The visual `r13`
-  browser replay is still active above. The release cannot pass until that
-  replay is complete and GitHub builds and scans every final image with
-  protected credentials. Save raw Trivy JSON, VEX-aware Scout results,
-  waivers, SBOMs, provenance, and remaining risk.
-  - Update the image-update SOP and operator runbook with the complete engineer
-    workflow: identify whether the exact pin belongs in Compose, a Dockerfile,
-    or a Compose build argument; review upstream compatibility and security
-    notes; change the Git-tracked `tag@sha256:digest`; update configuration and
-    health checks for the new image contract; run
-    `scripts/update-images.py prepare` with selected providers and the seeded
-    preprod option; require the
-    full stack to pass from the generated preprod archive; and promote only the
-    generated production-scoped archive through the remote upgrade/rollback
-    command. State clearly that generated schema-v2 manifests are immutable
-    outputs and are never hand-edited as the image-selection input. Include
-    direct commands, expected success markers, failure handling, and the dated
-    production/preprod artifact naming convention at an eighth-grade reading
-    level.
-  - Treat the software inside each image as part of the same update. Review the
-    newest supported stable Python and Go toolchains, regenerate Python locks
-    for the selected Python version, verify every exact direct and transitive
-    dependency, keep `go.mod` versions aligned with the builder, and review the
-    pinned Ansible, test, lint, security, and CI tools. Record why any component
-    is held below the newest stable release. Run Python service tests and lint,
-    Go race tests and vet, network-disabled Docker builds, source/container
-    Trivy scans, and the full seeded preprod suite before promotion.
+- [ ] **Add model-aware usage, limits, catalog, cost, dashboards, and routing**
+  - Start this only after the current release gates are complete. It does not
+    block r14. Reuse the existing LiteLLM, portal, Postgres, and Grafana paths;
+    do not add a second billing or identity source without an approved design.
+  - **Track tokens by model, user, and project:** Record the requested model,
+    actual provider model, stable user ID, project ID, input tokens, output
+    tokens, cache-write tokens, and cache-read tokens for each completed
+    request. Keep request IDs for audit joins. Do not put prompts, API keys, or
+    high-cardinality request IDs in Prometheus labels. Define retry, streaming,
+    failed-request, and missing-usage behavior. Acceptance requires contract
+    tests, database migration and rollback tests, and seeded preprod requests
+    proving the totals match LiteLLM and provider receipts.
+  - **Design and enforce per-model token limits:** Decide which controls the
+    product needs before writing code: a per-request maximum output, a fixed or
+    rolling time-window quota, tokens per minute, a money budget, or a reviewed
+    combination. Define units, reset rules, and precedence when model, user,
+    project, and key rules overlap. Do not treat these controls as the same
+    limit. For each hard limit, reserve or check capacity before the provider
+    call so parallel requests cannot bypass it. Return a safe denial and emit an
+    audit event. Acceptance requires tests for every chosen control, precedence,
+    boundaries, reset or rolling windows, concurrency, streaming, retries,
+    admin RBAC, and fail-closed database errors.
+  - **Add hidden custom models:** Let an administrator add a model that normal
+    users cannot see until it is assigned. Require an explicit reviewed
+    provider and provider model name. Store an explicit
+    `visible_in_discovery` flag, or an equally clear inverse `hidden` flag. A
+    hidden model must stay absent from `/v1/models` and user-facing discovery
+    until an administrator makes it visible, even if the model can be assigned
+    through the admin path. Reject an arbitrary provider hostname, route, CA
+    file, or provider that is absent from the immutable Envoy release. Keep
+    credentials in Vault and never return them through the portal. Acceptance
+    requires create, update, assign, visibility, hidden-discovery, revoke,
+    duplicate-name, unsupported-provider, audit, restart, backup, restore, and
+    seeded preprod tests.
+  - **Build Grafana token dashboards:** Add admin-only views for token use by
+    model, project, and user. Show input, output, cache-write, cache-read, total,
+    request count, failures, and cost. Use bounded filters and a data source that
+    can answer per-user questions without unsafe Prometheus labels. Show the
+    data time range and an `unknown` bucket instead of hiding incomplete rows.
+    Acceptance requires dashboard schema tests, role checks, seeded data, and
+    totals that reconcile with the usage store.
+  - **Account for cached and regular token cost:** Research the current official
+    Anthropic request/response fields and pricing documentation before design.
+    Record regular input, cache creation, cache read, and output units
+    separately. Version and date every price entry so a later price change does
+    not rewrite old cost. Handle models, cache durations, or usage fields with
+    no reviewed price as `unknown`, not zero. Acceptance requires saved source
+    links, dated pricing fixtures, payload fixtures, rounding tests, historical
+    price-change tests, and totals reconciled to an approved Anthropic example.
+  - **Explore automatic model routing:** Write an ADR before code. Evaluate the
+    LiteLLM routing features that can choose a model from a user's prompt.
+    Document prompt privacy, supported signals, quality, latency, cost, limits,
+    fallback, auditability, and failure modes. Routing may choose only models
+    assigned to that user or project and only providers built into the immutable
+    Envoy release. It must not send a prompt to an extra model just to classify
+    it unless that separate disclosure is approved. Acceptance for this future
+    item is a reviewed design, a disabled-by-default prototype, fixed test
+    prompts with expected choices, an operator override, and proof that a
+    routing failure cannot bypass access or token limits.
 
 ## Done
 
@@ -366,6 +310,85 @@
     release, verify every checksum and image ID, and keep image plus state
     rollback fail closed. Contract tests cover source-tag materialization,
     exact transfer IDs, preprod-byte rejection, validation, and rollback.
+
+- [x] ~~Complete immutable, provider-selectable Envoy releases~~ (2026-07-21)
+  - The release CLI accepts repeated provider names, canonicalizes them, and
+    resolves them only through the committed provider catalog. It rejects an
+    empty set, unknown provider, arbitrary hostname, and arbitrary CA path.
+  - The network-disabled build bakes only the selected routes, policy, and
+    reviewed CA files into Envoy. The startup gate fails closed for missing,
+    extra, malformed, expired, fingerprint-mismatched, SNI-mismatched, or
+    SAN-mismatched trust data. Ansible downloads no provider trust at deploy
+    time.
+  - Schema-v2 manifests bind the provider list, hostnames, CA fingerprints,
+    policy digest, and final Envoy image ID. The loader and validation path
+    treat the image and policy as one release unit. Provider and CA changes
+    require a reviewed catalog change and a new offline release.
+  - The provider, CA-maintenance, architecture, image-update, security, and
+    operator guides explain selection, capture provenance, CA rotation,
+    validation, and recovery. They also separate certificate integrity, CA
+    organization country, endpoint geography, and data residency.
+  - Exact r14 seeded preprod selected only `anthropic` and passed the owner-
+    approved live acceptance gate. Its policy digest is
+    `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`,
+    and its Envoy image ID is
+    `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
+    Seeded local preprod is the owner-approved live acceptance gate. No
+    separate rehearsal environment is required.
+  - This closes the Envoy core, not the whole release. The
+    [active r14 browser check](#finish-r14-visual-browser-acceptance),
+    [credential-gated DHI security audit](#provide-protected-dhi-credentials-and-finish-the-release-security-audit),
+    and [customer Cribl acceptance](#complete-the-customer-cribl-acceptance-ceremony)
+    remain open.
+
+- [x] ~~Authenticate the LiteLLM request-audit source~~ (2026-07-21)
+  - Commit `c5c1e50` added a private OTLP/HTTP trace receiver on port 4319.
+    LiteLLM reads a fixed-shape token from a read-only file and sends it as a
+    bearer header. The token is not in Compose environment data, command
+    arguments, LiteLLM settings, or logs.
+  - Alloy checks the token, stamps the server-owned source marker, and requires
+    it before an AI request can enter Loki or Cribl. Its ordinary OTLP receiver
+    deletes a caller-supplied marker and rejects a caller that claims to be
+    LiteLLM. Preprod tests rejected a missing token, wrong token, and forged
+    marker.
+  - Commit `33c79e5` completed the state-restore path. Ansible accepts only the
+    safe temporary `root:root` restore state, validates the token contents, then
+    restores group 473 and mode `0440` before the final boundary check.
+
+- [x] ~~Build, hash-check, seed-test, and clean up the `r14` schema-v2
+  candidate~~ (2026-07-21)
+  - The candidate was built from pushed commit
+    `c5c1e503053c76e35f8bb93d242a9ac630d1b98e`. Production contains 23 exact
+    external and 17 repository-built references, for 40 total. Preprod contains
+    24 exact external and 19 repository-built references, for 43 total.
+    Anthropic is the only selected provider.
+  - Production archive SHA-256:
+    `b04cce16df11c366a098b3a9d801bc57a96051e0766caba182cd342493285298`.
+    Production manifest SHA-256:
+    `9b2efbd2f6768bd98f969b3f4312cf8d0cff9b1761d5d59dd7ebd44a6869c92f`.
+    Preprod archive SHA-256:
+    `482618f21eb5e09c3f41e9c9c55deada7e317edf4c4fada0f96dd7e93ff2a691`.
+    Preprod manifest SHA-256:
+    `1ab6902ace9c1b25a3e8a3a1d1a81e014dbf60d0045d8e67a4b8604b7b58ceab`.
+  - The exact manifest selects `anthropic`, route `/anthropic/`, and hostname,
+    SNI, and SAN `api.anthropic.com`. Its Envoy policy digest is
+    `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
+    Its Envoy image ID is
+    `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
+  - Fresh seed loading and Ansible ended with `PREPROD_E2E_PASSED` and
+    `SEEDED_PREPROD_E2E_PASSED`. The tests covered the authenticated LiteLLM
+    audit path and the full Cribl gate. Browser acceptance did not run because
+    no browser session exists, so it remains active above.
+  - The initial pre-deploy purge removed 26 containers, 19 networks, 11
+    volumes, 62 aliases, and all 43 target image IDs while preserving 185
+    unrelated image IDs.
+  - The final clean-room teardown returned `PREPROD_CLEAN_ROOM_OK` for project
+    `aigw-preprod`, cleanup-receipt schema 1, and manifest
+    `1ab6902ace9c1b25a3e8a3a1d1a81e014dbf60d0045d8e67a4b8604b7b58ceab`.
+    It removed 26 containers, 19 networks, 11 volumes, 43 image aliases, 43
+    image IDs, and three generated state files while preserving 185 unrelated
+    image IDs. Ansible separately removed the owned macOS loopback aliases and
+    marker-bounded hosts fragment.
 
 - [x] ~~Build, hash-check, seed-test, and restart-test the `r13` schema-v2
   candidate~~ (2026-07-21)

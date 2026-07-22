@@ -19,7 +19,9 @@ mount. Alloy never receives the Docker socket.
 
 ```mermaid
 flowchart LR
-  APP[Applications and Docker logs] --> AL[Alloy]
+  LLM[LiteLLM audit traces] -->|bearer-auth OTLP/HTTP<br/>port 4319| AL[Alloy]
+  APP[Other internal telemetry] -->|ordinary OTLP<br/>ports 4317 and 4318| AL
+  LOG[Docker JSON logs<br/>read-only files] --> AL
   AL --> LK[(Loki<br/>local logs, 7 days)]
   AL --> PR[(Prometheus<br/>local metrics, 30 days or 5 GB)]
   PR -.approved backlog.-> AM[Future Alertmanager<br/>local group and resolve]
@@ -52,6 +54,24 @@ LiteLLM emits a `litellm_request` span for an AI request. Alloy sanitizes it and
 creates one structured log record. The log is stored locally in Loki as
 `service_name="aigw-requests"`. The same log may enter the reviewed Cribl SOC
 feed. The raw span must never reach Cribl.
+
+LiteLLM sends this span to a separate OTLP/HTTP receiver on Alloy port 4319.
+Its callback reads a private bearer token from a read-only file. The token does
+not appear in Compose environment data, command arguments, LiteLLM settings, or
+logs. Alloy checks the token, then stamps its own source marker. The request
+audit filter requires that marker.
+
+The ordinary receivers on ports 4317 and 4318 are still available for other
+internal telemetry. They remove a caller-supplied trust marker and reject any
+trace that claims `service.name=litellm`. Port 4319 uses HTTP only on the
+private telemetry network and is not published on the host. Preprod tests prove
+that a missing token, wrong token, and forged marker cannot create an AI
+request record.
+
+Production creates one stable target-local token. After a state restore,
+Ansible validates the restored file and token before it restores the reader
+group and mode. Never copy the preprod token into production or put this token
+in an inventory value.
 
 The request log may contain prompt and completion content. This is approved
 high-sensitivity data. It must not appear in ordinary service logs, metrics, or
@@ -232,9 +252,10 @@ A real Cribl endpoint uses a literal `IP:4317`, native OTLP/gRPC, verified TLS,
 a dedicated CA file, and an exact TLS server name. Plaintext is allowed only
 for the in-stack `cribl-mock`.
 
-The current sender does not support a bearer token or client certificate. If
-the customer requires either, the release is blocked until that feature is
-implemented and tested.
+The external Cribl sender does not support a bearer token or client
+certificate. If the customer requires either, the release is blocked until
+that feature is implemented and tested. This is separate from LiteLLM's
+internal bearer token on port 4319.
 
 The host firewall permits only Alloy's fixed `172.28.2.2` address to one Cribl
 destination `/32` and TCP port over the internal NIC. The Cribl listener should
@@ -305,6 +326,8 @@ release blocker.
 
 For the request audit, prove:
 
+- LiteLLM uses the authenticated receiver, and missing, wrong, or forged source
+  proof is rejected;
 - one valid request has the expected user, key, project, model, and request ID;
 - malformed identity fields do not become trusted fields;
 - prompt and completion content appears only in the approved request dataset;

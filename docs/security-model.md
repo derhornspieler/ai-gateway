@@ -39,6 +39,7 @@ does not prove production firewall, SELinux, disk encryption, or Cribl rules.
 | One service plane to another | Reviewed service calls only | Small Docker networks and two packet filters |
 | Gateway to provider | Selected requests through Envoy only | Fixed Envoy IP, exact route, SNI, SAN, and CA bundle |
 | Gateway to Cribl | Approved SOC log records only | Alloy filter, redaction, one address and port, verified TLS |
+| LiteLLM to Alloy | AI request audit spans only | Private port 4319, file-backed bearer token, and Alloy-owned source marker |
 | Controller to VM | Ansible work and protected input | Key-only SSH, ADM source rule, pipelining, and secrets on stdin |
 
 ## Layers of defense
@@ -167,6 +168,8 @@ See the [Cribl queue and back-pressure rules](cribl-soc-handoff.md#queue-retry-a
   may break TLS until a reviewed release is ready.
 - Prompt and reply logs are high-sensitivity data. Access, retention, and disk
   space are security controls.
+- LiteLLM's internal telemetry token proves the source of an AI audit span. It
+  stays in a read-only file and never enters the external Cribl record.
 - Cribl uses server-authenticated TLS today. Required mTLS or bearer auth needs
   a reviewed change.
 - Prometheus evaluates local alert rules. Alertmanager grouping, inhibition,

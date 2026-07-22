@@ -15,7 +15,7 @@ Schema v2 makes two file pairs from one build:
 The production archive has no preprod-only image bytes. Do not send the
 preprod pair to a production host.
 
-For the current `r13` candidate, production has 23 external and 17 custom
+For the current `r14` candidate, production has 23 external and 17 custom
 references, for 40 total. Preprod has 24 external and 19 custom references,
 for 43 total. Samba AD and the WIF provider mock are the two preprod-only
 custom services. Their Debian 13.6-slim base is the third extra preprod

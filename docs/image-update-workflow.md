@@ -11,7 +11,7 @@ One build makes two file pairs:
 
 Never send the preprod pair to production.
 
-For the current `r13` candidate, production has 23 external and 17 custom
+For the current `r14` candidate, production has 23 external and 17 custom
 image references, for 40 total. Preprod has 24 external and 19 custom
 references, for 43 total. Only two custom services are preprod-only: Samba AD
 and the WIF provider mock. Their Debian 13.6-slim build base is the third extra
@@ -205,7 +205,8 @@ acceptance, or staging-cleanup failure fails the test.
 The test covers Samba LDAPS, the local Root CA, Vault, automatic Keycloak
 setup, domain-based redirects, static users, roles, WIF, LiteLLM, the exact
 production Envoy startup gate, and inference through the preprod-only TLS
-Envoy and provider mock.
+Envoy and provider mock. It also proves that only the bearer-authenticated
+LiteLLM receiver can create an AI request audit record.
 
 Keep the release only when the clean test passes. Follow the exact order in
 the [acceptance test runbook](test-runbook.md#2-build-and-test-the-offline-release).

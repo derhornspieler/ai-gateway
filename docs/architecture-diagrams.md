@@ -292,7 +292,8 @@ See [observability operations](observability-operations.md) and the
 
 ```mermaid
 flowchart LR
-  LL[LiteLLM<br/>AI spans and runtime logs] --> AL[Alloy]
+  LL[LiteLLM<br/>AI audit spans] -->|bearer-auth OTLP/HTTP<br/>port 4319| AL[Alloy]
+  OT[Other internal telemetry] -->|ordinary OTLP<br/>ports 4317 and 4318| AL
   KC[Keycloak<br/>auth events] --> AL
   SE[Reviewed trust and<br/>security-control events] --> AL
   DL[Other Docker JSON logs<br/>uid-473 ACL tail] --> AL
@@ -305,6 +306,10 @@ flowchart LR
   AL -.curated OTLP logs over TLS only.-> CR[Cribl SOC destination<br/>24-hour retention]
   GF[Grafana — ADM leg,<br/>behind oauth2-proxy] --> LK & PR
 ```
+
+Alloy adds the trusted LiteLLM source marker only after port 4319 checks the
+private token. The ordinary OTLP path removes a caller-supplied marker and
+rejects a caller that claims to be LiteLLM.
 
 ## 10. Deployment logic — Ansible converge order
 

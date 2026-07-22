@@ -215,7 +215,7 @@ aigw-2026-07-21-linux-amd64.preprod.docker.tar.zst
 aigw-2026-07-21-linux-amd64.preprod.manifest.json
 ```
 
-For the current `r13` candidate, production has 23 external and 17 custom
+For the current `r14` candidate, production has 23 external and 17 custom
 image references, for 40 total. Preprod has 24 external and 19 custom image
 references, for 43 total. The two preprod-only custom services are Samba AD
 and the WIF provider mock. Their Debian 13.6-slim base is the third extra
@@ -300,6 +300,8 @@ The run must prove:
 - OIDC callbacks and logout work;
 - WIF checks a real Keycloak JWT;
 - LiteLLM gets `pong` through the preprod-only TLS Envoy;
+- LiteLLM audit spans enter Alloy only through the bearer-authenticated
+  receiver, while a missing token, wrong token, or forged source marker fails;
 - the exact production Envoy passes its immutable policy and CA startup gate; and
 - the approved SOC test logs reach the Cribl mock without secret fields.
 
@@ -402,4 +404,4 @@ Accept the release only when every required step passed for the same source
 and files. If access, disk, registry login, or another input is missing, mark
 the release `BLOCKED`. A browser result from an older release does not approve
 a newer release. In particular, keep the accepted `r10` browser record as
-historical evidence until the browser test is run again for `r13`.
+historical evidence until the browser test is run again for `r14`.

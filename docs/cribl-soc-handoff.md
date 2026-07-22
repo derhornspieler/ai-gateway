@@ -54,6 +54,10 @@ The current gateway supports server-authenticated TLS. It does not send a
 client certificate or bearer token. If the Cribl team requires mTLS or a token,
 stop the cutover. Add and test that feature first.
 
+That rule describes the external Alloy-to-Cribl link. LiteLLM uses a separate
+internal bearer token when it sends audit traces to Alloy. The internal token
+is never sent to Cribl.
+
 ## Exact outbound scope
 
 Every outbound record must be an OTLP **log** record in one of the classes
@@ -87,8 +91,31 @@ key metadata. AI request export now fails closed unless bounded user ID,
 readable user name, key hash, project ID, and request ID fields are all present.
 `aigw.user.name` is readable attribution only. A direct API caller can label its
 own already-authorized request, so that name must not be treated as proof of
-identity. Source authenticity and readable-name quality checks for every
-client path remain open.
+identity. Readable-name quality checks for every client path remain open.
+
+#### How Alloy proves the LiteLLM source
+
+LiteLLM does not use Alloy's ordinary OTLP receiver for audit traces. Its
+reviewed callback reads one 64-character token from a read-only secret file and
+sends traces to Alloy's internal OTLP/HTTP port 4319 with a bearer header. The
+token is not stored in Compose environment data, command arguments, LiteLLM
+settings, or logs.
+
+Alloy checks the token before it adds
+`aigw.security.source_authenticated=litellm_bearer_v1`. The AI request filter
+requires that server-owned marker. The ordinary OTLP receiver on ports 4317
+and 4318 deletes any caller-supplied marker and rejects a trace that claims
+`service.name=litellm`. A peer cannot turn its own field into source proof.
+
+Port 4319 uses HTTP only on the private telemetry network and is not published
+on the host. This internal bearer check proves which workload sent the trace.
+It is not a replacement for TLS on the external Cribl link.
+
+Production Ansible creates the token once as a fixed-shape, read-only file. A
+state restore may leave that safe file owned by `root:root`. Current source
+validates the file and token first, then restores the exact reader group and
+mode. Commit `c5c1e50` added the authenticated receiver. Commit `33c79e5`
+completed the restore repair.
 
 ### 2. Authentication and authorization events
 
@@ -158,10 +185,12 @@ record type, approved operation, a short path class, outcome, and the fact that
 the source value was HMAC-protected. It never contains a Vault token, request
 body, response body, full path, or raw JSON.
 
-Controller-side Ansible output is not collected by Alloy. Rotation start and
-rollback stages, broader break-glass actions, authorization denials, and
-LDAP/managed-identity drift and recovery still need reviewed producers and
-receipt tests. Do not claim those events reach Cribl today.
+Controller-side Ansible output is not collected by Alloy. Rotation start,
+attempt, failure, and recovery stages, broader break-glass actions,
+authorization denials, and LDAP/managed-identity drift and recovery still need
+reviewed producers and receipt tests. Provider-key promotion does not restore
+the previous secret today. Design and implement safe recovery or rollback
+before adding an event that claims it happened.
 
 ### Current structured marker allow-list
 
@@ -244,7 +273,7 @@ One fail-closed Alloy transform adds the common schema attribute immediately
 before the only Cribl batch. A producer may also carry `schema_version=1` in
 its JSON body, but the OTLP attribute above is the machine contract.
 
-This table is the required target contract. In `r13`, the schema field is
+This table is the required target contract. In `r14`, the schema field is
 enforced, but every event class does not yet enforce the environment, producer,
 and recent UTC time. Keep the common-record backlog item open until live tests
 prove all four common fields for every event class.
@@ -276,27 +305,25 @@ Keep the Cribl backlog item open until these gaps are closed:
 1. Extend prompt and completion redaction beyond the three current string
    patterns. Add only narrow, reviewed patterns for supported secret formats.
    Keep removing non-string and nested values before export.
-2. Add a source-authenticated LiteLLM ingest path. The shared OTLP receiver now
-   trusts a caller-owned `service.name` field, so another telemetry peer can
-   spoof an AI record. Stamp and require a server-owned source marker, and test
-   that another container cannot forge it.
-3. Enforce the common record contract. Every event class needs a recent UTC
+2. Enforce the common record contract. Every event class needs a recent UTC
    time, fixed `preprod` or `production` environment, reviewed producer name,
    and schema version. Reject a missing, zero, stale, or caller-controlled
    value.
-4. Prove attribution authenticity and readable-name quality for chat, direct
+3. Prove readable-name quality for chat, direct
    API, and every other supported client path. Keep readable names separate
    from authorization evidence.
-5. Add a reviewed path for controller-only events. Alloy cannot read Ansible
+4. Add a reviewed path for controller-only events. Alloy cannot read Ansible
    output today.
-6. Add the provider-rotation start, attempt, rollback, and recovery lifecycle.
-   Only the terminal result is exported now.
-7. Add application authorization-denial and privileged-change events that are
+5. Add provider-rotation start, attempt, failure, and recovery events. Only the
+   terminal result is exported now. Current promotion does not restore the
+   previous secret, so design and implement safe recovery or rollback before
+   adding a rollback event.
+6. Add application authorization-denial and privileged-change events that are
    not already covered by the exact Keycloak event list.
-8. Add LDAP and managed-identity drift detection, reconcile failure, and
+7. Add LDAP and managed-identity drift detection, reconcile failure, and
    recovery events.
-9. Add the remaining break-glass activation, disable, and cleanup events.
-10. Add natural producer receipt tests for each new event before calling it
+8. Add the remaining break-glass activation, disable, and cleanup events.
+9. Add natural producer receipt tests for each new event before calling it
    implemented.
 
 The separate customer endpoint, 24-hour retention, and hard queue-age choices
@@ -433,8 +460,10 @@ Know what this test proves:
   deny rules. They do not prove that every live producer emitted every event.
 - The fixture includes an unknown field and a nested secret. The test proves
   neither value reached the Cribl mock.
-- The AI request test uses Alloy's real OTLP receiver, filter, batch, and queue.
-  Its input is a test span, but it follows the natural OTLP path.
+- The AI request test uses Alloy's bearer-authenticated LiteLLM receiver,
+  filter, batch, and queue. Its input is a test span, but it follows the natural
+  OTLP path. The test also proves that the ordinary receiver cannot forge the
+  source marker and that port 4319 rejects a missing or wrong token.
 - The Vault audit check reads the real Vault audit file path. It does not place
   a fake Vault record in the Docker-log fixture.
 
