@@ -3812,11 +3812,20 @@ def panel_expression(title):
     if len(rows) != 1:
         raise SystemExit("Grafana alert dashboard is missing")
     dashboard = json.loads(rows[0][0]).get("spec", {})
-    matches = [panel for panel in dashboard.get("panels", []) if panel.get("title") == title]
-    if len(matches) != 1 or len(matches[0].get("targets", [])) != 1:
+    matches = [
+        panel
+        for panel in dashboard.get("panels", [])
+        if panel.get("title") == title
+    ]
+    expected_datasource = {"type": "prometheus", "uid": "prometheus"}
+    if (
+        len(matches) != 1
+        or matches[0].get("datasource") != expected_datasource
+        or len(matches[0].get("targets", [])) != 1
+    ):
         raise SystemExit("Grafana alert panel query drifted")
     target = matches[0]["targets"][0]
-    if target.get("datasource") != {"type": "prometheus", "uid": "prometheus"}:
+    if target.get("datasource") not in (None, expected_datasource):
         raise SystemExit("Grafana alert panel left the Prometheus datasource")
     return target.get("expr")
 
@@ -3892,6 +3901,7 @@ else:
             "Prometheus query failed",
             "Grafana alert dashboard is missing",
             "Grafana alert panel query drifted",
+            "Grafana alert panel left the Prometheus datasource",
             "PreProd acceptance rule is missing or unhealthy",
             "the live PreProd alert did not reach every firing path",
             "the live PreProd alert did not reach every resolved path",

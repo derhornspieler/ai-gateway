@@ -291,6 +291,8 @@ class AlertmanagerLifecycleContractTests(unittest.TestCase):
             "AIGatewayWatchdog",
             "PREPROD_ALERTING_GRAPH_PASS",
             "AIGatewayPreprodAcceptance",
+            'matches[0].get("datasource") != expected_datasource',
+            'target.get("datasource") not in (None, expected_datasource)',
             "PREPROD_ALERT_LIVE_FIRING_PASS",
             "PREPROD_ALERT_CRIBL_EXPORT_PASS",
             "PREPROD_ALERT_LIVE_RESOLVED_PASS",
