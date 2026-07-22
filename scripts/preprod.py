@@ -2187,9 +2187,9 @@ groups:
 def render_edge_forwarder() -> None:
     """Write the preprod-only TLS passthrough for Docker Desktop.
 
-    Docker Desktop cannot publish the same IPv4 host port from two containers.
-    One Envoy container owns both exact loopback publications and forwards raw
-    TLS to the two unchanged Traefik edges on their separate Docker networks.
+    Docker Desktop can misroute two loopback publications from one container.
+    Compose runs this reviewed config in one container per host plane. Each
+    container publishes one listener and joins only its Traefik network.
     """
 
     configuration = """\
@@ -2647,7 +2647,11 @@ def seed_service_images(
         or IMAGE_ID_RE.fullmatch(expected_wif_envoy_id) is None
     ):
         fail("the offline seed has no exact Envoy base image for the WIF mock proxy")
-    for service_name in ("preprod-edge-forwarder", "wif-egress-mock"):
+    for service_name in (
+        "preprod-edge-forwarder",
+        "preprod-edge-forwarder-adm",
+        "wif-egress-mock",
+    ):
         if service_name in service_images:
             fail(f"the preprod Envoy service collides with {service_name}")
         service_images[service_name] = wif_envoy_image
@@ -3337,18 +3341,12 @@ def start(args: argparse.Namespace) -> None:
     verify_existing_project_boundary(args, expected_volume_names)
     wait_for_container(args, "traefik-int", "healthy", 300)
     wait_for_container(args, "traefik-adm", "healthy", 300)
-    # Docker Desktop can leave the passthrough proxy with unusable upstream
-    # sockets even though its configuration-only healthcheck is green. Restart
-    # it after both Traefik edges are ready, then prove both real TLS routes.
-    compose(
-        args,
-        "restart",
-        "--no-deps",
-        "--timeout",
-        "30",
-        "preprod-edge-forwarder",
-    )
+    # Each publisher starts behind its own healthy Traefik dependency. A
+    # container restart can leave Docker Desktop with a stale host-port
+    # forward, so do not restart it here. The real TLS checks below are the
+    # readiness proof; the Envoy config-only healthcheck is not enough.
     wait_for_container(args, "preprod-edge-forwarder", "healthy", 120)
+    wait_for_container(args, "preprod-edge-forwarder-adm", "healthy", 120)
     wait_for_container(args, "samba-ad", "healthy", 300)
     wait_for_container(args, "litellm", "healthy", 600)
     wait_for_container(args, "keycloak", "healthy", 600)

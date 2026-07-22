@@ -756,6 +756,23 @@ class PreprodContractTests(unittest.TestCase):
         self.assertIn("com.aigw.preprod.project", self.script)
         self.assertIn("local Unix-socket Docker context", self.script)
 
+        internal = self.compose.split("  preprod-edge-forwarder:\n", 1)[1].split(
+            "\n  preprod-edge-forwarder-adm:\n", 1
+        )[0]
+        admin = self.compose.split(
+            "  preprod-edge-forwarder-adm:\n", 1
+        )[1].split("\n  oauth2-proxy:\n", 1)[0]
+        self.assertIn("${ETH2_IP:?ETH2_IP must be set}:443:8443", internal)
+        self.assertNotIn("ETH1_IP", internal)
+        self.assertIn("networks: [net-int-edge]", internal)
+        self.assertNotIn("net-adm", internal)
+        self.assertIn("preprod-edge-forwarder.yaml:ro,z", internal)
+        self.assertIn("${ETH1_IP:?ETH1_IP must be set}:443:9443", admin)
+        self.assertNotIn("ETH2_IP", admin)
+        self.assertIn("networks: [net-adm]", admin)
+        self.assertNotIn("net-int-edge", admin)
+        self.assertIn("preprod-edge-forwarder.yaml:ro,z", admin)
+
         module = load_preprod_module()
         networks = module.desired_networks(
             types.SimpleNamespace(prefix="aigw-preprod", subnet_octet=29)
@@ -2563,7 +2580,7 @@ class PreprodContractTests(unittest.TestCase):
             overlay = overlay_path.read_text(encoding="utf-8")
             provider_policy = provider_policy_path.read_text(encoding="utf-8")
 
-        self.assertEqual(overlay.count("pull_policy: never"), 7)
+        self.assertEqual(overlay.count("pull_policy: never"), 8)
         self.assertEqual(overlay.count("build: !reset null"), 4)
         self.assertIn(f"image: {external_reference}", overlay)
         vault_block = overlay.split("  vault:\n", 1)[1].split("\n  ", 1)[0]
@@ -2578,6 +2595,7 @@ class PreprodContractTests(unittest.TestCase):
         )
         self.assertIn("  wif-egress-mock:\n", overlay)
         self.assertIn("  preprod-edge-forwarder:\n", overlay)
+        self.assertIn("  preprod-edge-forwarder-adm:\n", overlay)
         self.assertIn(f"image: {envoy_base_reference}", overlay)
         self.assertNotIn("envoy_image_id", provider_policy)
         self.assertEqual(
@@ -3068,20 +3086,11 @@ class PreprodContractTests(unittest.TestCase):
         traefik_adm_ready = events.index(
             ("wait", ("traefik-adm", "healthy", 300))
         )
-        forwarder_restart = events.index(
-            (
-                "compose",
-                (
-                    "restart",
-                    "--no-deps",
-                    "--timeout",
-                    "30",
-                    "preprod-edge-forwarder",
-                ),
-            )
-        )
         forwarder_ready = events.index(
             ("wait", ("preprod-edge-forwarder", "healthy", 120))
+        )
+        adm_forwarder_ready = events.index(
+            ("wait", ("preprod-edge-forwarder-adm", "healthy", 120))
         )
         litellm_ready = events.index(("wait", ("litellm", "healthy", 600)))
         keycloak_ready = events.index(("wait", ("keycloak", "healthy", 600)))
@@ -3093,9 +3102,14 @@ class PreprodContractTests(unittest.TestCase):
         self.assertLess(reconciles[0], full_up)
         self.assertLess(full_up, traefik_int_ready)
         self.assertLess(full_up, traefik_adm_ready)
-        self.assertLess(traefik_int_ready, forwarder_restart)
-        self.assertLess(traefik_adm_ready, forwarder_restart)
-        self.assertLess(forwarder_restart, forwarder_ready)
+        self.assertLess(traefik_int_ready, forwarder_ready)
+        self.assertLess(traefik_adm_ready, adm_forwarder_ready)
+        self.assertFalse(
+            any(
+                event[0] == "compose" and event[1] and event[1][0] == "restart"
+                for event in events
+            )
+        )
         self.assertLess(full_up, litellm_ready)
         self.assertLess(litellm_ready, edge_verified)
         self.assertLess(keycloak_ready, edge_verified)

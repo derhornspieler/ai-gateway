@@ -98,10 +98,9 @@ services:
       - ./traefik/dynamic-adm.yml:/etc/traefik/dynamic/dynamic.yml:ro,Z
       - ./secrets/preprod-edge-certs:/certs:ro,z
 
-  # Envoy does raw TCP passthrough; TLS still terminates in the separate
-  # Traefik edges. Keeping both host publications on this one container works
-  # around Docker Desktop's duplicate-IPv4-port limitation without changing
-  # the production Compose model or using a wildcard host bind.
+  # Envoy does raw TCP passthrough; TLS still terminates in Traefik. Docker
+  # Desktop can misroute two loopback publications owned by one container, so
+  # each host plane gets one small publisher with one exact network and bind.
   preprod-edge-forwarder:
     labels: *preprod-labels
     profiles: [preprod]
@@ -117,14 +116,37 @@ services:
     tmpfs: [/tmp]
     ports:
       - "${ETH2_IP:?ETH2_IP must be set}:443:8443"
-      - "${ETH1_IP:?ETH1_IP must be set}:443:9443"
     volumes:
-      - ./secrets/preprod-edge-forwarder.yaml:/etc/envoy/preprod-edge-forwarder.yaml:ro,Z
-    networks:
-      net-int-edge: {}
-      net-adm: {}
+      - ./secrets/preprod-edge-forwarder.yaml:/etc/envoy/preprod-edge-forwarder.yaml:ro,z
+    networks: [net-int-edge]
     depends_on:
       traefik-int: { condition: service_healthy, required: true }
+    healthcheck:
+      test: [CMD, /usr/local/bin/envoy, --mode, validate, -c, /etc/envoy/preprod-edge-forwarder.yaml]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  preprod-edge-forwarder-adm:
+    labels: *preprod-labels
+    profiles: [preprod]
+    image: "${PREPROD_WIF_ENVOY_IMAGE:?PREPROD_WIF_ENVOY_IMAGE must be set}"
+    entrypoint: [/usr/local/bin/envoy]
+    command: [-c, /etc/envoy/preprod-edge-forwarder.yaml, --log-level, warning]
+    user: "65532:65532"
+    read_only: true
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 128
+    tmpfs: [/tmp]
+    ports:
+      - "${ETH1_IP:?ETH1_IP must be set}:443:9443"
+    volumes:
+      - ./secrets/preprod-edge-forwarder.yaml:/etc/envoy/preprod-edge-forwarder.yaml:ro,z
+    networks: [net-adm]
+    depends_on:
       traefik-adm: { condition: service_healthy, required: true }
     healthcheck:
       test: [CMD, /usr/local/bin/envoy, --mode, validate, -c, /etc/envoy/preprod-edge-forwarder.yaml]
