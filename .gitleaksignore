@@ -1,0 +1,13 @@
+# These exact findings are synthetic inputs for the Cribl redaction and
+# identity-policy tests. Keep the full fingerprint so the same text in any
+# other commit or file is still reported.
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:services/key-rotator/tests/test_identity_deployment_converge.py:generic-api-key:32
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:services/key-rotator/tests/test_identity_deployment_converge.py:generic-api-key:38
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:services/key-rotator/tests/test_identity_deployment_converge.py:generic-api-key:981
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:generic-api-key:123
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:generic-api-key:1999
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:jwt:120
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:jwt:2183
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:private-key:186
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:private-key:189
+1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:private-key:217
