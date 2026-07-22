@@ -54,3 +54,18 @@ short waiver with an owner, reason, and end date.
 
 Publish a dated report. Include commands, tool versions, image IDs, findings,
 fixes, waivers, and remaining risk.
+
+## Plan model controls, pricing, and routing
+
+The future model-control work now has a durable
+[implementation plan](model-governance-plan.md). It covers:
+
+- hidden models tied to the immutable provider release;
+- per-model usage and hard limits;
+- admin-managed, effective-dated, and backdated token prices;
+- model, project, user, cache, and cost dashboards;
+- audited Alloy-to-Cribl events over OTLP/gRPC and TLS; and
+- a disabled local-only automatic-routing prototype.
+
+This plan is not a finished feature. Follow its phased tests, migrations, and
+rollback gates after the current release work is complete.

@@ -171,11 +171,16 @@
   new preprod operator and a production operator to follow them without verbal
   help. Fix unclear words, steps, links, bookmarks, and diagram labels. Save the
   review notes with the next release evidence.
+<a id="add-model-aware-usage-limits-catalog-cost-dashboards-and-routing"></a>
+
 - [ ] **Add model-aware usage, limits, catalog, cost, dashboards, and routing**
   - Start this only after the current release gates are complete. It does not
     block the current release. Reuse the existing LiteLLM, portal, Postgres,
     and Grafana paths; do not add a second billing or identity source without
     an approved design.
+  - Use the durable
+    [implementation plan](docs/model-governance-plan.md). Keep it current when
+    a design decision or upstream contract changes.
   - **Track tokens by model, user, and project:** Record the requested model,
     actual provider model, stable user ID, project ID, input tokens, output
     tokens, cache-write tokens, and cache-read tokens for each completed
@@ -221,6 +226,17 @@
     no reviewed price as `unknown`, not zero. Acceptance requires saved source
     links, dated pricing fixtures, payload fixtures, rounding tests, historical
     price-change tests, and totals reconciled to an approved Anthropic example.
+    Add an admin portal price workflow. An admin selects the model, usage class,
+    token unit, decimal price, currency, and effective time. Support an explicit
+    audited backdated-price and reprice flow that previews the affected rows and
+    cost delta, appends new immutable revisions, and never overwrites old price
+    or calculation history.
+  - **Export the new audit events through Alloy to Cribl:** Send model-policy,
+    pricing, backdating, limit-denial, and routing security events through the
+    existing sanitized OTLP log branch. The external hop remains native OTLP
+    over gRPC and verified TLS. Do not send metrics, raw traces, alert payloads,
+    or unrelated debug logs. Add schema, redaction, allow-list, queue,
+    back-pressure, and Cribl receipt tests.
   - **Explore automatic model routing:** Write an ADR before code. Evaluate the
     LiteLLM routing features that can choose a model from a user's prompt.
     Document prompt privacy, supported signals, quality, latency, cost, limits,
