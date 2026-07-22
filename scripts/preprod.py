@@ -103,6 +103,24 @@ CLEAN_ROOM_MAX_RECORDS = 512
 CLEAN_ROOM_MAX_ALIASES = CLEAN_ROOM_MAX_RECORDS * 3
 CLEAN_ROOM_MAX_PLAN_BYTES = 512 * 1024
 CLEAN_ROOM_MAX_DOCKER_OBJECTS = 4096
+PREPROD_BIND_DIGEST_NAMES = (
+    "TRAEFIK_INT",
+    "TRAEFIK_ADM",
+    "LITELLM",
+    "OPEN_WEBUI",
+    "KEYCLOAK",
+    "VAULT",
+    "POSTGRES",
+    "REDIS",
+    "ALLOY",
+    "PROMETHEUS",
+    "ALERTMANAGER",
+    "LOKI",
+    "GRAFANA",
+    "CRIBL_MOCK",
+    "SAMBA_AD",
+    "KEY_ROTATOR",
+)
 CUSTOM_TRANSFER_REFERENCE_RE = re.compile(
     r"^(?:[a-z0-9]+(?:[._-]+[a-z0-9]+)*/)*"
     r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*:aigw-seed-[0-9a-f]{64}$"
@@ -179,7 +197,6 @@ PREPROD_BIND_SOURCES = (
     "litellm/aigw_usage_callback.py",
     "loki/config.yml",
     "postgres/init",
-    "prometheus/prometheus.yml",
     "prometheus/rules.yml",
     "secrets/preprod-edge-certs",
     "secrets/preprod-edge-forwarder.yaml",
@@ -410,11 +427,29 @@ def run(
     input_text: str | None = None,
     capture: bool = False,
     sensitive: bool = False,
+    environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    environment = clean_environment()
+    if environment_overrides:
+        allowed_names = {
+            "ALERTMANAGER_OBSERVABILITY_IP",
+            *(f"AIGW_BIND_DIGEST_{name}" for name in PREPROD_BIND_DIGEST_NAMES),
+        }
+        if not set(environment_overrides).issubset(allowed_names):
+            fail("refusing an unreviewed Compose environment override")
+        for name, value in environment_overrides.items():
+            valid = (
+                value == f"172.{ALLOWED_SUBNET_OCTET}.15.4"
+                if name == "ALERTMANAGER_OBSERVABILITY_IP"
+                else re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            )
+            if not valid:
+                fail("refusing an invalid Compose environment override")
+        environment.update(environment_overrides)
     result = subprocess.run(
         command,
         cwd=REPO_ROOT,
-        env=clean_environment(),
+        env=environment,
         input=input_text,
         text=True,
         capture_output=capture,
@@ -541,12 +576,14 @@ def compose(
     input_text: str | None = None,
     capture: bool = False,
     sensitive: bool = False,
+    environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return run(
         compose_command(args, *arguments),
         input_text=input_text,
         capture=capture,
         sensitive=sensitive,
+        environment_overrides=environment_overrides,
     )
 
 
@@ -2341,11 +2378,7 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
         "KEY_ROTATOR_EGRESS_POLICY_SHA256": "",
         "AIGW_PREPROD_CONFIG_DIGEST": digest,
     }
-    for name in (
-        "TRAEFIK_INT", "TRAEFIK_ADM", "LITELLM", "OPEN_WEBUI", "KEYCLOAK",
-        "VAULT", "POSTGRES", "REDIS", "ALLOY", "PROMETHEUS", "ALERTMANAGER", "LOKI",
-        "GRAFANA", "CRIBL_MOCK", "SAMBA_AD", "KEY_ROTATOR",
-    ):
+    for name in PREPROD_BIND_DIGEST_NAMES:
         values[f"AIGW_BIND_DIGEST_{name}"] = digest
     return values
 
@@ -2627,8 +2660,19 @@ def seed_service_images(
     return service_images
 
 
-def rendered_compose_model(args: argparse.Namespace) -> dict[str, Any]:
-    result = compose(args, "config", "--format", "json", capture=True)
+def rendered_compose_model(
+    args: argparse.Namespace,
+    *,
+    environment_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    result = compose(
+        args,
+        "config",
+        "--format",
+        "json",
+        capture=True,
+        environment_overrides=environment_overrides,
+    )
     try:
         model = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -2643,6 +2687,7 @@ def verify_rendered_resource_ownership(
     model: dict[str, Any],
     *,
     allow_missing_bind_sources: bool = False,
+    allow_missing_provider_policy: bool = False,
 ) -> set[str]:
     """Require the rendered model to keep every mutable resource in preprod."""
 
@@ -2694,7 +2739,7 @@ def verify_rendered_resource_ownership(
     # reduced service map. The real Compose model always has key-rotator; when
     # present, its governance activation is an exact fail-closed contract.
     rotator = services.get("key-rotator")
-    if rotator is not None:
+    if rotator is not None and not allow_missing_provider_policy:
         if not isinstance(rotator, dict):
             fail("the rendered preprod key-rotator is invalid")
         rotator_environment = rotator.get("environment")
@@ -4468,6 +4513,34 @@ def _clean_room_source_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
+def _clean_room_compose_overrides(args: argparse.Namespace) -> dict[str, str]:
+    """Supply reviewed non-secret values added after an old env was written.
+
+    Clean-room must render the old deployment before it may remove anything.
+    A newer checkout can require another bind digest or fixed service address.
+    Reconstruct only the reviewed values below. Never rewrite the ownership
+    evidence, accept arbitrary missing names, or import values from the shell.
+    """
+
+    overrides: dict[str, str] = {}
+    if not preprod_env_value("ALERTMANAGER_OBSERVABILITY_IP"):
+        overrides["ALERTMANAGER_OBSERVABILITY_IP"] = (
+            f"172.{args.subnet_octet}.15.4"
+        )
+    missing = [
+        f"AIGW_BIND_DIGEST_{name}"
+        for name in PREPROD_BIND_DIGEST_NAMES
+        if not preprod_env_value(f"AIGW_BIND_DIGEST_{name}")
+    ]
+    if not missing:
+        return overrides
+    digest = preprod_env_value("AIGW_PREPROD_CONFIG_DIGEST")
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        fail("the older preprod environment has no valid compatibility digest")
+    overrides.update({name: digest for name in missing})
+    return overrides
+
+
 def postgres_rehearsal_volume_names(args: argparse.Namespace) -> tuple[str, str]:
     """Return the only two database volumes used by the local rehearsal."""
 
@@ -4541,9 +4614,15 @@ def preflight_clean_room_resources(
     source_args = _clean_room_source_args(args)
     expected_volumes: set[str] = set()
     if ENV_FILE.exists():
-        model = rendered_compose_model(source_args)
+        model = rendered_compose_model(
+            source_args,
+            environment_overrides=_clean_room_compose_overrides(source_args),
+        )
         expected_volumes = verify_rendered_resource_ownership(
-            source_args, model, allow_missing_bind_sources=True
+            source_args,
+            model,
+            allow_missing_bind_sources=True,
+            allow_missing_provider_policy=True,
         )
         verify_existing_project_boundary(source_args, expected_volumes)
 
@@ -4773,9 +4852,16 @@ def _destroy_project_resources(
     else:
         validate_local_docker_context()
     if ENV_FILE.exists():
-        model = rendered_compose_model(args)
+        compatibility_environment = _clean_room_compose_overrides(args)
+        model = rendered_compose_model(
+            args,
+            environment_overrides=compatibility_environment,
+        )
         expected_volume_names = verify_rendered_resource_ownership(
-            args, model, allow_missing_bind_sources=True
+            args,
+            model,
+            allow_missing_bind_sources=True,
+            allow_missing_provider_policy=True,
         )
         verify_existing_project_boundary(args, expected_volume_names)
         compose(
@@ -4786,6 +4872,7 @@ def _destroy_project_resources(
             "--timeout",
             "30",
             capture=quiet,
+            environment_overrides=compatibility_environment,
         )
     remove_postgres_rehearsal_volumes(args)
     existing_names = set(

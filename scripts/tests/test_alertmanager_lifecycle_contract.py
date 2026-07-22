@@ -245,7 +245,8 @@ class AlertmanagerLifecycleContractTests(unittest.TestCase):
             self.assertIn(required, self.verify)
         for required in (
             '"ALERTMANAGER_OBSERVABILITY_IP": f"172.{subnet}.15.4"',
-            '"ALLOY", "PROMETHEUS", "ALERTMANAGER", "LOKI"',
+            "PREPROD_BIND_DIGEST_NAMES = (",
+            '"ALERTMANAGER",',
             '"alertmanager/alertmanager.yml"',
         ):
             self.assertIn(required, self.preprod)

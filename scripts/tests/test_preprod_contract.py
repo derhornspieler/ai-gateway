@@ -207,6 +207,102 @@ class PreprodContractTests(unittest.TestCase):
         self.assertEqual(cleaned.postgres_major, "16")
         self.assertTrue(cleaned.confirm_postgres16_rehearsal)
 
+    def test_clean_room_reconstructs_only_missing_bind_digests(self) -> None:
+        module = load_preprod_module()
+        digest = "a" * 64
+        args = types.SimpleNamespace(subnet_octet=29)
+        preserved_name = "AIGW_BIND_DIGEST_TRAEFIK_INT"
+        preserved_value = "b" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "preprod.env"
+            env_file.write_text(
+                f"AIGW_PREPROD_CONFIG_DIGEST={digest}\n"
+                f"{preserved_name}={preserved_value}\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(module, "ENV_FILE", env_file):
+                overrides = module._clean_room_compose_overrides(args)
+
+            self.assertNotIn(preserved_name, overrides)
+            self.assertEqual(
+                set(overrides) - {"ALERTMANAGER_OBSERVABILITY_IP"},
+                {
+                    f"AIGW_BIND_DIGEST_{name}"
+                    for name in module.PREPROD_BIND_DIGEST_NAMES
+                    if name != "TRAEFIK_INT"
+                },
+            )
+            self.assertEqual(
+                overrides["ALERTMANAGER_OBSERVABILITY_IP"], "172.29.15.4"
+            )
+            self.assertEqual(
+                {
+                    value
+                    for name, value in overrides.items()
+                    if name != "ALERTMANAGER_OBSERVABILITY_IP"
+                },
+                {digest},
+            )
+
+            env_file.write_text(
+                f"{preserved_name}={preserved_value}\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(module, "ENV_FILE", env_file),
+                self.assertRaisesRegex(SystemExit, "valid compatibility digest"),
+            ):
+                module._clean_room_compose_overrides(args)
+
+    def test_clean_room_passes_compatibility_digests_without_rewriting_env(self) -> None:
+        module = load_preprod_module()
+        digest = "c" * 64
+        args = types.SimpleNamespace(
+            project="aigw-preprod",
+            prefix="aigw-preprod",
+            subnet_octet=29,
+            image_mode="seed",
+            postgres_major="18",
+            confirm_postgres16_rehearsal=False,
+        )
+        inventory = {"containers": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "preprod.env"
+            original = (
+                f"AIGW_PREPROD_CONFIG_DIGEST={digest}\n"
+                "PG_DATA_VOLUME_NAME=aigw-preprod_pg18_data\n"
+            )
+            env_file.write_text(original, encoding="utf-8")
+            with (
+                mock.patch.object(module, "ENV_FILE", env_file),
+                mock.patch.object(
+                    module, "rendered_compose_model", return_value={}
+                ) as rendered,
+                mock.patch.object(
+                    module, "verify_rendered_resource_ownership", return_value=set()
+                ),
+                mock.patch.object(module, "verify_existing_project_boundary"),
+                mock.patch.object(
+                    module, "_validate_clean_room_generated_state", return_value=0
+                ),
+                mock.patch.object(module, "_clean_room_list", return_value=[]),
+                mock.patch.object(
+                    module, "_clean_room_network_inventory", return_value=[]
+                ),
+            ):
+                resources = module.preflight_clean_room_resources(args, inventory)
+
+            expected = {
+                f"AIGW_BIND_DIGEST_{name}": digest
+                for name in module.PREPROD_BIND_DIGEST_NAMES
+            }
+            expected["ALERTMANAGER_OBSERVABILITY_IP"] = "172.29.15.4"
+            self.assertEqual(
+                rendered.call_args.kwargs["environment_overrides"], expected
+            )
+            self.assertEqual(env_file.read_text(encoding="utf-8"), original)
+            self.assertEqual(resources["source_args"].image_mode, "source")
+
     def test_failed_rehearsal_volume_cleanup_requires_exact_labels(self) -> None:
         module = load_preprod_module()
         args = types.SimpleNamespace(project="aigw-preprod")
@@ -282,6 +378,9 @@ class PreprodContractTests(unittest.TestCase):
         with (
             mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
             mock.patch.object(module, "_clean_room_source_args", return_value=args),
+            mock.patch.object(
+                module, "_clean_room_compose_overrides", return_value={}
+            ),
             mock.patch.object(module, "rendered_compose_model", return_value={}),
             mock.patch.object(
                 module,
@@ -311,6 +410,9 @@ class PreprodContractTests(unittest.TestCase):
         with (
             mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
             mock.patch.object(module, "_clean_room_source_args", return_value=args),
+            mock.patch.object(
+                module, "_clean_room_compose_overrides", return_value={}
+            ),
             mock.patch.object(module, "rendered_compose_model", return_value={}),
             mock.patch.object(
                 module,
@@ -341,6 +443,9 @@ class PreprodContractTests(unittest.TestCase):
         with (
             mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
             mock.patch.object(module, "_clean_room_source_args", return_value=args),
+            mock.patch.object(
+                module, "_clean_room_compose_overrides", return_value={}
+            ),
             mock.patch.object(module, "rendered_compose_model", return_value={}),
             mock.patch.object(
                 module,
@@ -807,6 +912,63 @@ class PreprodContractTests(unittest.TestCase):
                     args, model, allow_missing_bind_sources=True
                 )
             self.assertEqual(names, {"aigw-preprod_vault_data"})
+
+    def test_teardown_tolerates_only_missing_provider_policy_state(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(
+            project="aigw-preprod", image_mode="source"
+        )
+        labels = {
+            "com.aigw.preprod.project": args.project,
+            "com.aigw.preprod.config-digest": "a" * 64,
+        }
+        model = {
+            "services": {
+                "alloy": {
+                    "labels": labels,
+                    "volumes": [
+                        {
+                            "type": "volume",
+                            "source": "preprod_empty_docker_logs",
+                            "target": "/var/lib/docker/containers",
+                            "read_only": True,
+                        }
+                    ],
+                },
+                "key-rotator": {
+                    "labels": labels,
+                    "environment": {
+                        "PROVIDER_POLICY_RECEIPT_FILE": "",
+                        "AIGW_EGRESS_POLICY_SHA256": "",
+                    },
+                },
+            },
+            "networks": {},
+            "volumes": {
+                "vault_data": {
+                    "name": "aigw-preprod_vault_data",
+                    "labels": labels,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            missing_policy = Path(directory) / "missing-policy.json"
+            with (
+                mock.patch.object(module, "PROVIDER_POLICY_RECEIPT", missing_policy),
+                mock.patch.object(module, "PREPROD_BIND_SOURCES", ()),
+                mock.patch.object(module, "desired_networks", return_value={}),
+                mock.patch.object(
+                    module, "preprod_env_value", return_value="a" * 64
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    SystemExit, "source-build provider policy boundary is missing"
+                ):
+                    module.verify_rendered_resource_ownership(args, model)
+                names = module.verify_rendered_resource_ownership(
+                    args, model, allow_missing_provider_policy=True
+                )
+        self.assertEqual(names, {"aigw-preprod_vault_data"})
 
     def test_macos_seed_loader_runs_as_the_recorded_docker_user(self) -> None:
         module = load_preprod_module()
@@ -1548,6 +1710,9 @@ class PreprodContractTests(unittest.TestCase):
             env_file.write_text("test\n", encoding="utf-8")
             with (
                 mock.patch.object(module, "ENV_FILE", env_file),
+                mock.patch.object(
+                    module, "_clean_room_compose_overrides", return_value={}
+                ),
                 mock.patch.object(module, "rendered_compose_model", return_value={}),
                 mock.patch.object(
                     module, "verify_rendered_resource_ownership", return_value=set()
@@ -1570,6 +1735,9 @@ class PreprodContractTests(unittest.TestCase):
 
             with (
                 mock.patch.object(module, "ENV_FILE", env_file),
+                mock.patch.object(
+                    module, "_clean_room_compose_overrides", return_value={}
+                ),
                 mock.patch.object(module, "rendered_compose_model", return_value={}),
                 mock.patch.object(
                     module, "verify_rendered_resource_ownership", return_value=set()
@@ -1715,6 +1883,52 @@ class PreprodContractTests(unittest.TestCase):
                     mock.call("network", "rm", network, capture=False),
                     docker.call_args_list,
                 )
+
+    def test_clean_room_destroy_uses_the_same_compatibility_environment(self) -> None:
+        module = load_preprod_module()
+        args = types.SimpleNamespace(project="aigw-preprod")
+        compatibility = {"AIGW_BIND_DIGEST_ALERTMANAGER": "d" * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "preprod.env"
+            env_file.write_text("test=value\n", encoding="utf-8")
+            missing_vault = Path(directory) / "missing-vault.json"
+            with (
+                mock.patch.object(module, "ENV_FILE", env_file),
+                mock.patch.object(module, "VAULT_INIT_FILE", missing_vault),
+                mock.patch.object(module, "validate_local_docker_context"),
+                mock.patch.object(
+                    module,
+                    "_clean_room_compose_overrides",
+                    return_value=compatibility,
+                ),
+                mock.patch.object(
+                    module, "rendered_compose_model", return_value={}
+                ) as rendered,
+                mock.patch.object(
+                    module, "verify_rendered_resource_ownership", return_value=set()
+                ),
+                mock.patch.object(module, "verify_existing_project_boundary"),
+                mock.patch.object(module, "compose") as compose,
+                mock.patch.object(module, "remove_postgres_rehearsal_volumes"),
+                mock.patch.object(
+                    module,
+                    "docker",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ),
+                mock.patch.object(module, "desired_networks", return_value={}),
+                mock.patch.object(module, "remove_seed_output_files"),
+                mock.patch.object(module, "remove_controller_audit_fixture"),
+            ):
+                module._destroy_project_resources(
+                    args, emit_context=False, emit_receipt=False
+                )
+
+            rendered.assert_called_once_with(
+                args, environment_overrides=compatibility
+            )
+            self.assertEqual(
+                compose.call_args.kwargs["environment_overrides"], compatibility
+            )
 
     def test_post_destroy_foreign_container_stops_before_any_image_removal(self) -> None:
         module = load_preprod_module()
@@ -2390,6 +2604,10 @@ class PreprodContractTests(unittest.TestCase):
         self.assertIn("com.aigw.preprod.config-digest", self.compose)
         self.assertIn("complete preprod digest inventory", self.script)
         self.assertIn("wrong SELinux relabel", self.script)
+        self.assertNotIn("prometheus/prometheus.yml", module.PREPROD_BIND_SOURCES)
+        self.assertIn(
+            "secrets/preprod-prometheus.yml", module.PREPROD_BIND_SOURCES
+        )
         for shared_source in (
             "./secrets/preprod-edge-certs:/certs:ro,z",
             "./secrets/preprod-root-ca.pem:/run/preprod/ca.pem:ro,z",
@@ -2647,6 +2865,38 @@ class PreprodContractTests(unittest.TestCase):
                 "PATH": "/usr/bin:/bin",
             },
         )
+
+    def test_compose_overrides_are_narrow_validated_and_shell_scrubbed(self) -> None:
+        module = load_preprod_module()
+        hostile = {
+            "COMPOSE_FILE": "/tmp/hostile-compose.yml",
+            "DOCKER_HOST": "tcp://hostile.example:2375",
+            "HOME": "/private/test-home",
+            "PATH": "/usr/bin:/bin",
+        }
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        reviewed = {"AIGW_BIND_DIGEST_ALERTMANAGER": "a" * 64}
+        with (
+            mock.patch.dict(module.os.environ, hostile, clear=True),
+            mock.patch.object(module.subprocess, "run", return_value=completed) as runner,
+        ):
+            module.run(["true"], environment_overrides=reviewed)
+        self.assertEqual(
+            runner.call_args.kwargs["env"],
+            {
+                "HOME": "/private/test-home",
+                "PATH": "/usr/bin:/bin",
+                **reviewed,
+            },
+        )
+
+        with self.assertRaisesRegex(SystemExit, "unreviewed Compose"):
+            module.run(["true"], environment_overrides={"DOCKER_HOST": "hostile"})
+        with self.assertRaisesRegex(SystemExit, "invalid Compose"):
+            module.run(
+                ["true"],
+                environment_overrides={"AIGW_BIND_DIGEST_ALERTMANAGER": "bad"},
+            )
 
     def test_root_seed_commands_use_the_prepared_callers_exact_docker_socket(self) -> None:
         if os.geteuid() == 0:
