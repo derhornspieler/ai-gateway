@@ -11,3 +11,11 @@
 1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:private-key:186
 1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:private-key:189
 1ba2c43b06b56dd39b8197e7d4d4f4d5901ee63f:scripts/test-preprod-cribl-security.py:private-key:217
+# The four entries below are exact findings from the model-governance feature
+# commit. They are, in order: a public metadata key name, a deliberately
+# invalid PEM-shaped redaction fixture, a synthetic fixture user ID, and a
+# fixed unit-test token. Exact fingerprints keep every other occurrence live.
+fbbe6ddf71e8990187155de2d2cb52f301db67ac:services/dev-portal/app/litellm_client.py:generic-api-key:45
+fbbe6ddf71e8990187155de2d2cb52f301db67ac:scripts/test-preprod-cribl-security.py:private-key:1356
+fbbe6ddf71e8990187155de2d2cb52f301db67ac:services/key-rotator/tests/fixtures/litellm-1.93.0-anthropic-usage.json:generic-api-key:29
+fbbe6ddf71e8990187155de2d2cb52f301db67ac:scripts/tests/test_preprod_portal_acceptance.py:generic-api-key:397
