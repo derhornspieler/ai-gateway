@@ -11,6 +11,11 @@
 # type a SHA-256:
 #   scripts/preprod-up.sh --seed /path/to/release-folder
 #
+# Blocked from galaxy.ansible.com? Download the collections on a machine that
+# has internet, move the folder over, and point this at it:
+#   ansible-galaxy collection download -r ansible/requirements.yml -p aigw-collections
+#   scripts/preprod-up.sh --collections-dir /path/to/aigw-collections
+#
 # It asks for your sudo password once (macOS loopback aliases + the bounded
 # /etc/hosts block). Pass --become-password-file /path to skip the prompt.
 set -euo pipefail
@@ -20,11 +25,17 @@ cd "$REPO_ROOT"
 
 SEED_DIR=""
 BECOME_FILE=""
+COLLECTIONS_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --seed)
       SEED_DIR="${2:-}"
       [[ -n "$SEED_DIR" ]] || { echo "ERROR: --seed needs a folder path" >&2; exit 2; }
+      shift 2
+      ;;
+    --collections-dir)
+      COLLECTIONS_DIR="${2:-}"
+      [[ -n "$COLLECTIONS_DIR" ]] || { echo "ERROR: --collections-dir needs a folder path" >&2; exit 2; }
       shift 2
       ;;
     --become-password-file)
@@ -62,11 +73,49 @@ command -v ansible-galaxy >/dev/null 2>&1 \
   || die "ansible-galaxy is missing. Reinstall with:  pip3 install ansible-core"
 echo "OK: Ansible is installed."
 
-say "Step 3 of 5: installing the Ansible add-ons this deploy needs"
-# Idempotent: re-running just confirms they are present.
-ansible-galaxy collection install -r ansible/requirements.yml >/dev/null \
-  || die "Could not install the Ansible collections. Check your internet connection and try again."
-echo "OK: Ansible collections are ready."
+say "Step 3 of 5: making sure the Ansible add-ons (collections) are present"
+# The deploy needs three collections. On a machine with no route to
+# galaxy.ansible.com (a locked-down work site), the online install fails, so
+# handle that plainly instead of telling you to "check your connection".
+required_collections=(community.docker community.general ansible.posix)
+missing_collections=()
+installed_list="$(ansible-galaxy collection list 2>/dev/null || true)"
+for name in "${required_collections[@]}"; do
+  printf '%s\n' "$installed_list" | grep -q "^${name} " || missing_collections+=("$name")
+done
+
+if [[ ${#missing_collections[@]} -eq 0 ]]; then
+  echo "OK: the collections are already installed."
+elif [[ -n "$COLLECTIONS_DIR" ]]; then
+  # Offline install from a folder you moved over from a connected machine.
+  [[ -d "$COLLECTIONS_DIR" ]] || die "That collections folder does not exist: $COLLECTIONS_DIR"
+  if [[ -f "$COLLECTIONS_DIR/requirements.yml" ]]; then
+    ansible-galaxy collection install -r "$COLLECTIONS_DIR/requirements.yml" >/dev/null \
+      || die "Could not install the collections from $COLLECTIONS_DIR."
+  else
+    ansible-galaxy collection install "$COLLECTIONS_DIR"/*.tar.gz >/dev/null \
+      || die "Could not install the collections from $COLLECTIONS_DIR. Expected .tar.gz files or a requirements.yml there."
+  fi
+  echo "OK: installed the collections from $COLLECTIONS_DIR."
+else
+  # Try the normal online install; if it fails, give the exact offline recipe.
+  if ansible-galaxy collection install -r ansible/requirements.yml >/dev/null 2>&1; then
+    echo "OK: installed the collections."
+  else
+    cat >&2 <<EOF
+
+STOP: could not download the Ansible collections. This machine may be blocked
+from galaxy.ansible.com. Do this once from a machine that HAS internet:
+
+  ansible-galaxy collection download -r ansible/requirements.yml -p aigw-collections
+
+Copy the whole "aigw-collections" folder to this machine, then run:
+
+  scripts/preprod-up.sh --collections-dir /path/to/aigw-collections
+EOF
+    exit 1
+  fi
+fi
 
 # Sudo method: a password file if given, otherwise prompt once.
 BECOME_ARGS=()

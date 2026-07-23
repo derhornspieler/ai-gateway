@@ -20,13 +20,38 @@ You need three things first. The script checks all three for you:
 1. **Docker Desktop**, installed and running.
 2. **Ansible.** If it is missing, the script tells you to run
    `pip3 install ansible-core`.
-3. **A `dhi.io` login** so Docker can download the images. If you are not
+3. **Ansible collections** (three add-ons). The script installs them for
+   you. If your machine is blocked from `galaxy.ansible.com`, see
+   [Locked-down site: bring the collections yourself](#locked-down-site-bring-the-collections-yourself).
+4. **A `dhi.io` login** so Docker can download the images. If you are not
    logged in, run `docker login dhi.io` once, or use the offline seed way
    below (which needs no login).
 
 The build takes a while the first time. When it finishes, open
 `https://chat.aigw.internal` in a browser. Every test login is written to
 one private file: `compose/secrets/preprod-test-logins.md`.
+
+## Locked-down site: bring the collections yourself
+
+Some work networks block `galaxy.ansible.com`, so the script cannot download
+the Ansible collections. Do this once from a machine that has internet,
+using a copy of this repository:
+
+```bash
+ansible-galaxy collection download -r ansible/requirements.yml -p aigw-collections
+```
+
+That makes a folder named `aigw-collections` with the three collections and
+a `requirements.yml`. Copy the whole folder to the work machine. Then point
+the bring-up script at it:
+
+```bash
+scripts/preprod-up.sh --collections-dir /path/to/aigw-collections
+```
+
+The script installs the collections from that folder instead of the
+internet. If the collections are already installed, the script skips this
+step on its own.
 
 ## The offline seed way — no `dhi.io` login needed
 
