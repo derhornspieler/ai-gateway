@@ -5516,6 +5516,297 @@ def test_selected_group_deconfigured_restriction_renders_the_widening_guard(
     assert 'name="remove_model_restrictions"' in response.text
 
 
+# --- active custom (non-discovery) governed model assignability ---------------
+
+
+def _identity_and_governance_rotator(monkeypatch, *, groups, governed_models):
+    """Configured identity controller plus a governed-model catalog.
+
+    Mirrors the two internal control planes admin_page reads: the identity
+    controller (groups/members) and the append-only governance catalog.
+    """
+
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        if path in {"/status", "/settings"} or path.startswith("/history"):
+            return []
+        if path == "/providers/anthropic":
+            return {
+                "vendor": "anthropic",
+                "state": "awaiting_enrollment",
+                "configured": False,
+                "enabled": False,
+                "private_key_jwt_ready": True,
+                "nonsecret_ids": {},
+            }
+        if path == "/identity/status":
+            return {
+                "configured": True,
+                "controller_usable": True,
+                "bootstrap_available": False,
+                "ldap_configured": True,
+                "break_glass_escrowed": True,
+                "vault_oidc_rp_escrowed": True,
+            }
+        if path == "/identity/groups":
+            return [dict(group) for group in groups]
+        if path.startswith("/identity/users?"):
+            return []
+        if path.endswith("/members") and path.startswith("/identity/groups/"):
+            return []
+        if path == "/model-governance/models":
+            return list(governed_models)
+        if path.startswith("/model-governance/models/") and path.endswith(
+            "/prices"
+        ):
+            return []
+        if path == "/model-governance/audit?limit=50":
+            return []
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+
+
+def test_project_policy_checklist_offers_active_custom_models_badged(
+    admin_client, set_admin_session, monkeypatch
+):
+    """Active custom (non-discovery) models are assignable and badged; draft
+    and retired models are not offered at all."""
+
+    async def model_names():
+        # Public discovery: static plus the active-visible governed model.
+        return ["claude-haiku", "claude-sonnet", "claude-visible-5"]
+
+    monkeypatch.setattr(litellm_client, "model_names", model_names)
+    _identity_and_governance_rotator(
+        monkeypatch,
+        groups=[_unlimited_group()],
+        governed_models=[
+            _governed_model_row(
+                gateway_model_name="claude-mythos-5",
+                lifecycle_state="active",
+                active=True,
+                visible_in_discovery=False,
+                last_event_sequence=3,
+            ),
+            _governed_model_row(
+                gateway_model_name="claude-visible-5",
+                lifecycle_state="active",
+                active=True,
+                visible_in_discovery=True,
+                last_event_sequence=2,
+            ),
+            _governed_model_row(
+                gateway_model_name="claude-draft-9",
+                lifecycle_state="draft",
+            ),
+            _governed_model_row(
+                gateway_model_name="claude-retired-9",
+                lifecycle_state="retired",
+                active=False,
+                visible_in_discovery=False,
+                last_event_sequence=5,
+            ),
+        ],
+    )
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": "c" * 43,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.get("/admin?group_id=group-1")
+
+    assert response.status_code == 200
+    # The active custom model IS an assignable checkbox, badged "custom".
+    assert 'name="allowed_models" value="claude-mythos-5"' in response.text
+    assert 'claude-mythos-5 <span class="chip">custom</span>' in response.text
+    # An active visible governed model is assignable but NOT badged custom.
+    assert 'name="allowed_models" value="claude-visible-5"' in response.text
+    assert 'claude-visible-5 <span class="chip">custom</span>' not in response.text
+    # Draft and retired models are never offered as an allowed-models checkbox.
+    assert 'name="allowed_models" value="claude-draft-9"' not in response.text
+    assert 'name="allowed_models" value="claude-retired-9"' not in response.text
+    # Copy makes the never-implicit rule explicit, and the state badge reads
+    # "custom", never "hidden".
+    assert "custom models always need an explicit check" in response.text
+    assert "active · custom" in response.text
+    assert "active · hidden" not in response.text
+
+
+def test_project_policy_save_accepts_active_custom_model_selection(
+    admin_client, set_admin_session, monkeypatch
+):
+    """An operator may explicitly assign an active custom model; the implicit
+    'all public models' re-tune scope stays public-only."""
+
+    captured: dict[str, Any] = {}
+
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        if path == "/identity/groups":
+            return [_unlimited_group()]
+        if path == "/model-governance/models":
+            return [
+                _governed_model_row(
+                    gateway_model_name="claude-mythos-5",
+                    lifecycle_state="active",
+                    active=True,
+                    visible_in_discovery=False,
+                    last_event_sequence=3,
+                )
+            ]
+        return {"admin": True}
+
+    async def fake_apply(group_id, payload, operation_id, available_models):
+        captured["payload"] = payload
+        captured["available"] = available_models
+        return ("ai-gateway", 0, 0)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_apply_project_policy", fake_apply)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={"allowed_models": "claude-mythos-5", "csrf_token": csrf},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert "Choose only configured models" not in response.text
+    assert "no longer configured in LiteLLM" not in response.text
+    assert captured["payload"]["allowed_models"] == ["claude-mythos-5"]
+    # The re-tune "all public models" fallback never folds in the custom model.
+    assert captured["available"] == ["claude-haiku", "claude-sonnet"]
+
+
+def test_project_policy_save_keeps_assigned_custom_model_not_deconfigured(
+    admin_client, set_admin_session, monkeypatch
+):
+    """A stored restriction to an active custom model is still assignable, so a
+    plain resubmit is not blocked by the anti-silent-widening guard."""
+
+    captured: dict[str, Any] = {}
+
+    async def rotator_get(path):
+        if path == "/identity/authorization/subject-123":
+            return {"admin": True}
+        if path == "/identity/groups":
+            return [
+                _unlimited_group(
+                    allowed_models=["claude-mythos-5"],
+                    default_model="claude-mythos-5",
+                )
+            ]
+        if path == "/model-governance/models":
+            return [
+                _governed_model_row(
+                    gateway_model_name="claude-mythos-5",
+                    lifecycle_state="active",
+                    active=True,
+                    visible_in_discovery=False,
+                    last_event_sequence=3,
+                )
+            ]
+        return {"admin": True}
+
+    async def fake_apply(group_id, payload, operation_id, available_models):
+        captured["payload"] = payload
+        return ("ai-gateway", 0, 0)
+
+    monkeypatch.setattr(main, "_rotator_get", rotator_get)
+    monkeypatch.setattr(main, "_apply_project_policy", fake_apply)
+    csrf = "c" * 43
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": csrf,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.post(
+        "/admin/identity/groups/group-1/policy",
+        data={
+            "tpm_limit": "1000",
+            "allowed_models": "claude-mythos-5",
+            "default_model": "claude-mythos-5",
+            "csrf_token": csrf,
+        },
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert "no longer configured in LiteLLM" not in response.text
+    assert captured["payload"]["allowed_models"] == ["claude-mythos-5"]
+    assert captured["payload"]["default_model"] == "claude-mythos-5"
+
+
+def test_governed_models_list_collapses_retired_records_behind_a_toggle(
+    admin_client, set_admin_session, monkeypatch
+):
+    """Append-only retired records stay, but collapse behind a default-closed
+    'Show retired (N)' disclosure so the live catalog stays readable."""
+
+    _identity_and_governance_rotator(
+        monkeypatch,
+        groups=[_unlimited_group()],
+        governed_models=[
+            _governed_model_row(
+                gateway_model_name="claude-active-5",
+                lifecycle_state="active",
+                active=True,
+                visible_in_discovery=True,
+                last_event_sequence=2,
+            ),
+            _governed_model_row(
+                gateway_model_name="claude-preprod-f0b8c0fc6008",
+                lifecycle_state="retired",
+                active=False,
+                visible_in_discovery=False,
+                last_event_sequence=4,
+            ),
+            _governed_model_row(
+                gateway_model_name="claude-usage-a1a9336ea65f",
+                lifecycle_state="retired",
+                active=False,
+                visible_in_discovery=False,
+                last_event_sequence=5,
+            ),
+        ],
+    )
+    set_admin_session(
+        {
+            "user": portal_user(roles=[settings.admin_role]),
+            "csrf_token": "c" * 43,
+            "admin_reauth_at": int(time.time()),
+        }
+    )
+
+    response = admin_client.get("/admin#tab-models")
+
+    assert response.status_code == 200
+    # Retired records are collapsed behind a counted toggle, not deleted.
+    assert "Show retired (2)" in response.text
+    assert "claude-preprod-f0b8c0fc6008" in response.text
+    assert "claude-usage-a1a9336ea65f" in response.text
+    # The live catalog still shows active models with their lifecycle controls.
+    assert "claude-active-5" in response.text
+    assert 'value="hide"' in response.text
+
+
 # --- egress trust pin ---------------------------------------------------------
 
 

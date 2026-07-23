@@ -2531,9 +2531,12 @@ async def _egress_trust_canary_loop() -> None:
     module note above); cancellation on shutdown propagates cleanly.
     """
     interval = settings.egress_trust_canary_interval_seconds
+    jitter = secrets.SystemRandom()
     while True:
         _run_egress_trust_canary_once()
-        await asyncio.sleep(interval)
+        # +/-25% jitter keeps the daily check time unpredictable while the
+        # snapshot's staleness bound (2x interval) still holds.
+        await asyncio.sleep(interval * jitter.uniform(0.75, 1.25))
 
 
 def _start_egress_trust_canary() -> None:
@@ -2785,6 +2788,19 @@ async def admin_page(
             "error",
         )
 
+    # Active custom (non-discovery) governed models are deployed in LiteLLM and
+    # callable by exact name, so they belong in the project-policy checklist as
+    # an EXPLICIT, badged choice — but never in the implicit "all public models"
+    # scope. Draft and retired models stay out of the checklist entirely. The
+    # checklist only opens when the public model list verified above is present.
+    policy_custom_models = sorted(
+        model["gateway_model_name"]
+        for model in governed_models
+        if _is_active_custom_model(model)
+    )
+    if policy_models:
+        policy_models = sorted(set(policy_models) | set(policy_custom_models))
+
     return templates.TemplateResponse(
         request,
         "admin.html",
@@ -2810,6 +2826,7 @@ async def admin_page(
             ),
             "egress_trust_canary": _egress_trust_canary_snapshot(),
             "policy_models": policy_models,
+            "policy_custom_models": policy_custom_models,
             "no_models_sentinel": litellm_client.NO_MODELS_SENTINEL,
             "governance_available": governance_available,
             "governed_models": governed_models,
@@ -4077,6 +4094,45 @@ async def _retune_project_keys(
     return retuned, failed
 
 
+def _is_active_custom_model(model: dict[str, Any]) -> bool:
+    """A governed model that is active but excluded from user-facing discovery.
+
+    Such a model IS deployed in LiteLLM and callable by its exact gateway name
+    (docs/sop/model-lifecycle.md), so it is a legitimate EXPLICIT project-
+    assignment target. It is deliberately never part of the implicit
+    "all public models" scope: a project only ever gets it by an explicit
+    check. (The internal state name for this is "active + not visible"; the
+    admin surface calls it "custom" — presentation only, no contract change.)
+    """
+
+    return (
+        model.get("lifecycle_state") == "active"
+        and model.get("visible_in_discovery") is False
+    )
+
+
+async def _active_custom_model_names() -> set[str]:
+    """Names of active custom (non-discovery) governed models, fail-closed.
+
+    Used by the project-policy save path so an operator may assign a custom
+    model by explicit check. Any failure returns an empty set: it must never
+    widen the implicit "all public models" scope, and never silently drop a
+    stored restriction to a model it simply could not read.
+    """
+
+    try:
+        governed = model_admin.safe_governed_models(
+            await _rotator_get("/model-governance/models")
+        )
+    except Exception:  # noqa: BLE001 - unreadable catalog fails closed to none
+        return set()
+    return {
+        model["gateway_model_name"]
+        for model in governed
+        if _is_active_custom_model(model)
+    }
+
+
 async def _current_group_policy(group_id: str) -> dict[str, Any] | None:
     """Authoritatively re-read one managed group's stored issuance policy.
 
@@ -4258,6 +4314,12 @@ async def admin_identity_set_group_policy(
             "error",
         )
         return redirect
+    # `available` is the public discovery set: the none-checked default and the
+    # key re-tune expand to exactly it. `assignable` additionally admits active
+    # custom (non-discovery) models, which an operator may assign only by an
+    # explicit check — they are validated and un-flagged below, but never fold
+    # into the implicit "all public models" scope.
+    assignable = set(available) | await _active_custom_model_names()
 
     clear_restrictions = remove_model_restrictions is not None
     deny_all = deny_all_models is not None
@@ -4267,7 +4329,7 @@ async def admin_identity_set_group_policy(
         )
         return redirect
     selected = sorted({model.strip() for model in allowed_models if model.strip()})
-    if any(model not in available for model in selected):
+    if any(model not in assignable for model in selected):
         auth.flash(request, "Choose only configured models.", "error")
         return redirect
 
@@ -4291,7 +4353,7 @@ async def admin_identity_set_group_policy(
         if not request_cap and not minute_cap:
             continue
         if (
-            model not in available
+            model not in assignable
             or model not in selected
             or not request_cap.isdigit()
             or not minute_cap.isdigit()
@@ -4320,13 +4382,15 @@ async def admin_identity_set_group_policy(
         return redirect
 
     # Anti-silent-widening guard. The model checkboxes render ONLY from the
-    # live LiteLLM model list, so if this project is currently restricted to a
-    # model that has since been removed from LiteLLM's config, that model has
-    # no checkbox and the full-replace form physically cannot re-express the
-    # restriction — submitting (even just to change a rate limit) would
-    # silently widen it. Re-read the authoritative stored policy and REFUSE to
-    # widen unless the operator explicitly opts to remove all model
-    # restrictions. Same rule for a deconfigured default model.
+    # currently assignable set (live LiteLLM discovery plus active custom
+    # models), so if this project is currently restricted to a model that has
+    # since been removed or retired, that model has no checkbox and the
+    # full-replace form physically cannot re-express the restriction —
+    # submitting (even just to change a rate limit) would silently widen it.
+    # An active custom model is still assignable, so it is NOT deconfigured.
+    # Re-read the authoritative stored policy and REFUSE to widen unless the
+    # operator explicitly opts to remove all model restrictions. Same rule for
+    # a deconfigured default model.
     try:
         stored_policy = await _current_group_policy(group_id)
     except Exception:  # noqa: BLE001 - unreadable current policy is unsafe
@@ -4350,7 +4414,7 @@ async def admin_identity_set_group_policy(
         set(stored_allowed or [])
         .union([stored_default] if stored_default else [])
         .union(stored_limits)
-        - set(available)
+        - assignable
         - {litellm_client.NO_MODELS_SENTINEL}
     )
     # Setting deny-all is a NARROWING (to nothing), never a silent widening, so

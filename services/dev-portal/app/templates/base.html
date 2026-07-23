@@ -71,9 +71,17 @@
   .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
   /* ---- tab rail ---- */
+  /* The rail is full-bleed (its background + bottom border span the viewport),
+     but its horizontal padding tracks the centered `main` container so the
+     first tab's label lines up with the page content at every width. Below the
+     centering threshold it falls back to the fixed 16px inset. Keeping this in
+     sync with `main`'s max-width (1080px) and its 20px inset (tab labels carry
+     their own 15px inset, hence +5px) is what prevents the wide-viewport
+     offset where content drifts far right of the tabs. */
   nav.tabs {
     position: sticky; top: 54px; z-index: 15;
-    display: flex; gap: 2px; padding: 0 16px;
+    display: flex; gap: 2px;
+    padding: 0 max(16px, calc((100% - 1080px) / 2 + 5px));
     background: var(--bg); border-bottom: 1px solid var(--border);
     overflow-x: auto;
   }

@@ -71,7 +71,7 @@ PRICE_BACKDATE_CONFIRMATION = "CONFIRM BACKDATED PRICE"
 ACTIONS = {
     "activate": ("model.governance.activate", "Model activated."),
     "show": ("model.governance.show", "Model is now visible in discovery."),
-    "hide": ("model.governance.hide", "Model is now hidden from discovery."),
+    "hide": ("model.governance.hide", "Model is now custom — no longer offered in user discovery."),
     "retire": ("model.governance.retire", "Model retired."),
 }
 
@@ -811,7 +811,7 @@ def build_router(
             )
             auth.flash(
                 request,
-                "Hidden model version created. It is not available to users yet.",
+                "Custom model version created. It is not available to users yet.",
                 "success",
             )
         except Exception as exc:  # noqa: BLE001 - keep upstream detail internal
@@ -825,7 +825,7 @@ def build_router(
             )
             auth.flash(
                 request,
-                "The hidden model version was not created. Existing models were not changed.",
+                "The custom model version was not created. Existing models were not changed.",
                 "error",
             )
         return redirect

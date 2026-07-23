@@ -23,7 +23,7 @@ Today, `anthropic` is the only approved provider.
 | State | Can a key call it? | Is it in model discovery? |
 | --- | --- | --- |
 | Draft | No | No |
-| Active and hidden | Yes, by exact name when allowed | No |
+| Active and custom (kept out of discovery) | Yes, by exact name when allowed | No |
 | Active and visible | Yes, when allowed | Yes |
 | Retired | No | No |
 
@@ -37,7 +37,7 @@ delete the old evidence.
 3. Select `anthropic`.
 4. Enter the exact Anthropic model ID.
 5. Enter the reviewed source reference and a short review note.
-6. Select **Create hidden model**.
+6. Select **Create custom model**.
 
 The result is a draft. No LiteLLM model is created yet.
 
@@ -45,11 +45,13 @@ The result is a draft. No LiteLLM model is created yet.
 
 1. Select **Activate**.
 2. Wait for the success message.
-3. Add the exact model name to one test project's allowed model list.
+3. Add the exact model name to one test project's allowed model list: open
+   **Identity & Access** in the admin portal, select the project group, and
+   check the model in **Allowed models** — it is badged **custom** there.
 4. Mint or refresh a test key for that project.
 5. Call the model by its exact name through `https://api.<domain>`.
 6. Check that the request used Envoy and the approved provider path.
-7. Check `/v1/models` with the test key. The hidden model must not be listed.
+7. Check `/v1/models` with the test key. The custom model must not be listed.
 
 Activation records the event before it changes LiteLLM. If LiteLLM is down,
 the portal reports that runtime reconciliation failed. The controller retries.
@@ -144,10 +146,10 @@ it is not offline-seed release evidence.
 - Do not use the native LiteLLM UI to repair a model. Its mutation routes are
   blocked at the admin edge.
 - Do not add a database row by hand.
-- Keep the model hidden or remove its project assignments.
+- Keep the model out of discovery or remove its project assignments.
 - Fix the catalog or runtime problem, then let the controller reconcile.
 - Roll back the whole offline release if the candidate cannot become healthy.
 
 The previous release must restore its matching Envoy policy and runtime model
-projection together. A rollback must never make a hidden or retired model
+projection together. A rollback must never make a custom or retired model
 public.

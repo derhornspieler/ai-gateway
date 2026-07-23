@@ -159,11 +159,14 @@ class Settings(BaseSettings):
 
     # How often the process-local egress-trust canary re-verifies the shipped
     # Anthropic CA pin against the reviewed fingerprints. The check is local
-    # (no network) and cheap; the default is deliberately infrequent because
-    # the pinned bundle only changes on an Ansible re-converge. Bounded so a
-    # config typo can neither spin the loop nor disable it outright. 6h.
+    # (no network). Daily is the honest cadence: the bundle only legitimately
+    # changes at a converge, and dropped-connection alerting is Envoy's job
+    # (see the egress-trust Prometheus rules), so the canary is attestation,
+    # not monitoring. The loop adds a small random jitter to each sleep so
+    # the check time is not predictable. Bounded so a config typo can neither
+    # spin the loop nor disable it outright.
     egress_trust_canary_interval_seconds: int = Field(
-        default=6 * 60 * 60, ge=60, le=7 * 24 * 60 * 60
+        default=24 * 60 * 60, ge=60, le=7 * 24 * 60 * 60
     )
 
     # --- Key-issuance guardrails (reviewed config, never runtime-editable) ---

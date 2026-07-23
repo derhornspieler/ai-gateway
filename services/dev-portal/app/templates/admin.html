@@ -108,9 +108,9 @@
           </div>
           {% set no_models = selected_group.policy.allowed_models == [no_models_sentinel] %}
           <div>
-            <label class="fld" style="margin-top: 0;">Allowed models (none checked = all public models configured now)</label>
+            <label class="fld" style="margin-top: 0;">Allowed models (none checked = all public models configured now; custom models always need an explicit check and are never included by default)</label>
             {% for model in policy_models %}
-            <label class="check"><input type="checkbox" name="allowed_models" value="{{ model }}"{% if not no_models and selected_group.policy.allowed_models and model in selected_group.policy.allowed_models %} checked{% endif %}> {{ model }}</label>
+            <label class="check"><input type="checkbox" name="allowed_models" value="{{ model }}"{% if not no_models and selected_group.policy.allowed_models and model in selected_group.policy.allowed_models %} checked{% endif %}> {{ model }}{% if model in policy_custom_models %} <span class="chip">custom</span>{% endif %}</label>
             {% endfor %}
             <label class="check" style="margin-top: 8px;"><input type="checkbox" name="deny_all_models" value="1"{% if no_models %} checked{% endif %}> <strong>No model access</strong> — deny all API/tooling models (chat is gated separately by the aigw-chat role)</label>
             <label class="fld" for="policy-default-{{ selected_group.id }}">Default model (enforced — requests that omit a model use it)</label>
@@ -259,7 +259,7 @@
 <!-- ===================== MODELS & PRICING ===================== -->
 <section class="panel" id="tab-models" role="tabpanel" aria-labelledby="tabbtn-models">
 <h1 class="page">Models &amp; pricing</h1>
-<p class="sub">Create reviewed model and price versions. Records are append-only. New models stay hidden from users until a later activation workflow approves them.</p>
+<p class="sub">Create reviewed model and price versions. Records are append-only. A new model is a draft: not offered to users, not callable, and not assignable until you activate it.</p>
 
 {% if governance_available %}
 <div class="trustbox ok">
@@ -270,19 +270,22 @@
 <div class="grid2" style="margin-top: 18px;">
   <div>
     <div class="eyebrow" style="margin-top: 0;">Governed models</div>
-    {% if governed_models %}
-    <div class="glist">
-      {% for model in governed_models %}
-      <a class="grow" href="/admin?price_model={{ model.gateway_model_name | urlencode }}#tab-models" aria-current="{{ 'true' if model.gateway_model_name == selected_price_model else 'false' }}">
-        <span class="gname">{{ model.gateway_model_name }} <span class="pill {{ 'ok' if model.visible_in_discovery else 'off' }}">{% if model.lifecycle_state == 'retired' %}retired{% elif model.lifecycle_state == 'draft' %}draft{% elif model.visible_in_discovery %}active · visible{% else %}active · hidden{% endif %}</span></span>
+    {# One card renders identically in the live list and behind the retired
+       disclosure. All render inputs are passed explicitly so the macro never
+       depends on outer context. "active · custom" is the operator-facing label
+       for an active model kept out of user discovery. #}
+    {% macro governed_model_card(model, step_up, csrf, selected) %}
+      <a class="grow" href="/admin?price_model={{ model.gateway_model_name | urlencode }}#tab-models" aria-current="{{ 'true' if model.gateway_model_name == selected else 'false' }}">
+        <span class="gname">{{ model.gateway_model_name }} <span class="pill {{ 'ok' if model.visible_in_discovery else 'off' }}">{% if model.lifecycle_state == 'retired' %}retired{% elif model.lifecycle_state == 'draft' %}draft{% elif model.visible_in_discovery %}active · visible{% else %}active · custom{% endif %}</span></span>
         <span class="gmeta">
           <span class="chip cap">{{ model.provider_name }}</span>
           <span class="chip">{{ model.provider_model_id }}</span>
         </span>
+        {% if model.lifecycle_state == 'draft' %}<span class="note" style="display: block; margin-top: 7px;">Draft — not usable until you activate it. It cannot be assigned to a project or called by name yet.</span>{% endif %}
       </a>
-      {% if identity_step_up_recent and model.lifecycle_state != 'retired' %}
+      {% if step_up and model.lifecycle_state != 'retired' %}
       <form method="post" action="/admin/model-governance/lifecycle" class="actions">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
         <input type="hidden" name="gateway_model_name" value="{{ model.gateway_model_name }}">
         {% if model.lifecycle_state == 'draft' %}
         <button type="submit" name="action" value="activate">Activate</button>
@@ -295,15 +298,39 @@
         {% endif %}
       </form>
       {% endif %}
+    {% endmacro %}
+    {% set active_models = governed_models | rejectattr('lifecycle_state', 'equalto', 'retired') | list %}
+    {% set retired_models = governed_models | selectattr('lifecycle_state', 'equalto', 'retired') | list %}
+    {% if governed_models %}
+    {% if active_models %}
+    <div class="glist">
+      {% for model in active_models %}
+      {{ governed_model_card(model, identity_step_up_recent, csrf_token, selected_price_model) }}
       {% endfor %}
     </div>
+    {% endif %}
+    {# Retired records are append-only and kept forever; acceptance-harness
+       artifacts pile up here, so collapse them by default to keep the live
+       catalog readable. #}
+    {% if retired_models %}
+    <details class="adv">
+      <summary>Show retired ({{ retired_models | length }})</summary>
+      <div class="advbody">
+        <div class="glist">
+          {% for model in retired_models %}
+          {{ governed_model_card(model, identity_step_up_recent, csrf_token, selected_price_model) }}
+          {% endfor %}
+        </div>
+      </div>
+    </details>
+    {% endif %}
     {% else %}
-    <div class="card"><p class="muted" style="margin: 0;">No governed models exist yet. Create the first hidden model below.</p></div>
+    <div class="card"><p class="muted" style="margin: 0;">No governed models exist yet. Create the first custom model below.</p></div>
     {% endif %}
 
     {% if identity_step_up_recent %}
     <details class="adv">
-      <summary>Create a hidden model</summary>
+      <summary>Create a custom model</summary>
       <div class="advbody">
         <form method="post" action="/admin/model-governance/models">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -320,7 +347,7 @@
           <p class="note" style="margin: 5px 0 0;">Enter a review record ID, not a URL.</p>
           <label class="fld" for="governed-model-note">Review note</label>
           <input type="text" id="governed-model-note" name="review_note" required minlength="8" maxlength="500" autocomplete="off" placeholder="Reviewed against the approved provider catalog.">
-          <div style="margin-top: 14px;"><button type="submit">Create hidden model</button></div>
+          <div style="margin-top: 14px;"><button type="submit">Create custom model</button></div>
         </form>
       </div>
     </details>
