@@ -146,11 +146,19 @@ def validate_trusted_directory_lineage(directory: Path, label: str) -> None:
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise SeedError(f"{label} path ancestor must be a real directory: {cursor}")
         if metadata.st_uid not in trusted_uids:
-            raise SeedError(f"{label} path ancestor has an untrusted owner: {cursor}")
+            raise SeedError(
+                f"{label} path ancestor has an untrusted owner: {cursor}"
+                " (fix: move the release files into a directory you own,"
+                " such as a folder in your home directory)"
+            )
         if _mode(metadata) & 0o022 and not (
             metadata.st_mode & stat.S_ISVTX
         ):
-            raise SeedError(f"{label} path ancestor is writable without sticky protection: {cursor}")
+            raise SeedError(
+                f"{label} path ancestor is writable without sticky protection:"
+                f" {cursor} (fix: chmod go-w {cursor}, or move the release"
+                " files to a private directory)"
+            )
         if cursor == cursor.parent:
             return
         cursor = cursor.parent
@@ -243,7 +251,10 @@ def validate_regular_file(path: Path, label: str) -> os.stat_result:
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise SeedError(f"{label} must be a regular file, not a symlink")
     if metadata.st_uid != ROOT_UID:
-        raise SeedError(f"{label} must be owned by the loading user")
+        raise SeedError(
+            f"{label} must be owned by the loading user"
+            f" (fix for a local load: sudo chown \"$(id -un)\" {path})"
+        )
     # Integrity comes from the SHA-256 checks; the mode only has to stop other
     # users from rewriting the file. Read bits on a release artifact are safe,
     # so a normal copied file (0644) with any group is accepted as-is.
@@ -2025,7 +2036,10 @@ def _validate_local_release_file(
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise SeedError(f"local {label} must be a regular file, not a symlink")
     if metadata.st_uid != os.geteuid():
-        raise SeedError(f"local {label} must be owned by the invoking user")
+        raise SeedError(
+            f"local {label} must be owned by the invoking user"
+            f" (fix: sudo chown \"$(id -un)\" {path})"
+        )
     # Integrity comes from the SHA-256 checks; the mode only has to stop other
     # users from rewriting the file. Read bits on a release artifact are safe,
     # so a normal copied file (0644) with any group is accepted as-is.

@@ -230,7 +230,11 @@ def require_caller_owned_parent(path: Path, label: str) -> None:
                 f"not a symlink: {cursor}"
             )
         if metadata.st_uid not in trusted_uids:
-            fail(f"{label} directory lineage has an untrusted owner: {cursor}")
+            fail(
+                f"{label} directory lineage has an untrusted owner: {cursor}"
+                " (fix: move the release files into a directory you own,"
+                " such as a folder in your home directory)"
+            )
         if stat.S_IMODE(metadata.st_mode) & 0o022:
             root_sticky = metadata.st_uid == 0 and bool(
                 metadata.st_mode & stat.S_ISVTX
@@ -239,6 +243,8 @@ def require_caller_owned_parent(path: Path, label: str) -> None:
                 fail(
                     f"{label} directory lineage is group/other writable without "
                     f"a root-owned sticky boundary: {cursor}"
+                    f" (fix: chmod go-w {cursor}, or move the release files"
+                    " to a private directory)"
                 )
         if cursor == cursor.parent:
             return
@@ -256,7 +262,10 @@ def require_local_file(path: Path, suffix: str, label: str, maximum: int | None 
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         fail(f"{label} must be a regular file, not a symlink")
     if metadata.st_uid != os.geteuid():
-        fail(f"{label} must be owned by the user running this command")
+        fail(
+            f"{label} must be owned by the user running this command"
+            f" (fix: sudo chown \"$(id -un)\" {path})"
+        )
     # Integrity comes from the SHA-256 checks; the mode only has to stop other
     # users from rewriting the file. Read bits on a release artifact are safe,
     # so a normal copied file (0644) is accepted as-is.
