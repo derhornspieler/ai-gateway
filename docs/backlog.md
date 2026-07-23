@@ -66,7 +66,9 @@ fixes, waivers, and remaining risk.
 
 ## Recheck current upstream container findings
 
-The release scan stays red when an upstream image contains an unpatched high
+The [dated scan report](container-security-report-2026-07-22.md) records the
+current findings, one per image and advisory, with fixed versions where they
+exist. The release scan stays red when an upstream image contains an unpatched high
 or critical finding. Do not hide these findings and do not add a broad local
 waiver. Keep the newest reviewed image pin until its publisher releases a
 fixed tag, a rebuilt digest, or a signed VEX statement that applies to the
@@ -79,6 +81,42 @@ After a fix is available:
 3. Load that exact seed into local PreProd.
 4. Run the full Ansible, application, identity, telemetry, and rollback tests.
 5. Require the GitHub image scan to pass for the new image ID.
+
+## Finish the release-file custody and permission review
+
+A release archive or manifest copied to another machine used to be rejected
+unless its mode was exactly `0600` and its group matched the operator's
+group. An operator hit this in the field: a normal copied file (mode `0644`)
+could not be loaded into local Docker. The local checks now accept any
+caller-owned file that no other user can write, because content integrity
+comes from the SHA-256 checks, not from read permissions.
+
+Remaining work:
+
+1. Map every custody check across the image update, seed rebuild, seed
+   loader, PreProd staging, and remote upgrade code. Decide which checks
+   protect the release while it is built and which still apply after a
+   transfer.
+2. Review the parent-directory lineage rules for safe shared locations.
+   Keep rejecting directories another user can write.
+3. Support safe root-owned and Ansible-staged files on the controller.
+4. Keep every fail-closed rule for symlinks, hard links, replacement during
+   verification, wrong SHA-256, and manifest mismatches.
+5. Make every rejection name the path, the failed rule, and a safe repair
+   command.
+6. Add macOS and Linux contract tests for the safe and unsafe cases.
+7. Update the seed and image-update guides to explain ownership, write
+   permission, custody, and integrity in plain language.
+
+## Explore Admin Portal access to Grafana dashboards
+
+A future convenience feature, not part of the current release. Compare a
+normal link to the existing admin-only Grafana origin against embedded
+panels. Prefer the link unless embedding has a clear operator benefit. Any
+iframe work first needs a review of CSP, clickjacking, cross-origin cookies,
+OIDC redirects, logout, role checks, and the ADM-only network boundary. Never
+copy a Grafana token or session cookie into the portal. An ADR, browser
+tests, and rollback steps come before implementation.
 
 ## Finish model controls, pricing, and routing
 
