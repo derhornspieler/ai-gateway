@@ -10,6 +10,9 @@ Compose command by hand.
 | App-only deploy on a prepared host | `ansible/deploy-stack-only.yml` |
 | Vault unlock after reboot | [Vault unseal SOP](sop/vault-unseal-after-reboot.md) |
 | Image update | [Image update workflow](image-update-workflow.md) |
+| Upgrade production images | [Production image upgrade SOP](sop/production-image-upgrade.md) |
+| Test a release in local preprod | [Preprod test deploy SOP](sop/preprod-test-deploy.md) |
+| First production install | [Production new-deploy SOP](sop/production-new-deploy.md) |
 | Add, hide, or retire a model | [Model lifecycle SOP](sop/model-lifecycle.md) |
 | Alerts, dashboards, and telemetry | [Observability operations](observability-operations.md) |
 | New production install | [Deployment runbook](deploy-runbook.md) |
