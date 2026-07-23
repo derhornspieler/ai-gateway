@@ -188,6 +188,13 @@ less compose/secrets/samba_user_preprod-admin_password
 Press `q` to close `less`. Do not paste the password into Git, chat, a ticket,
 or a command argument.
 
+Every successful deploy also writes one combined summary for testers:
+`compose/secrets/preprod-test-logins.md`. It lists the three test users, the
+break-glass logins (Keycloak, Grafana, LiteLLM, the Samba domain admin, and
+the Vault root token and unseal share), and every service name. It follows
+the same rules as every other file here: private mode, never committed,
+never shared.
+
 The seed and generated files use mode `0600`. Git ignores the whole
 `compose/secrets/` directory. The same checkout keeps the same passwords after
 destroy and redeploy. A different checkout gets different passwords.

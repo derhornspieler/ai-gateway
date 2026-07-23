@@ -30,6 +30,7 @@ ENV_FILE = SECRETS_DIR / "preprod.env"
 REALMS_DIR = SECRETS_DIR / "preprod-realms"
 EDGE_CERTS_DIR = SECRETS_DIR / "preprod-edge-certs"
 VAULT_INIT_FILE = SECRETS_DIR / "preprod-vault-init.json"
+TEST_LOGIN_SUMMARY_FILE = SECRETS_DIR / "preprod-test-logins.md"
 SEED_RECEIPT = SECRETS_DIR / "preprod-seed-receipt.json"
 SEED_OVERLAY = SECRETS_DIR / "preprod-seed-images.yml"
 PROVIDER_POLICY_RECEIPT = SECRETS_DIR / "provider_policy_receipt.json"
@@ -4618,6 +4619,90 @@ def configure_wif(args: argparse.Namespace) -> None:
     fail("the preprod WIF token exchange did not complete successfully")
 
 
+def _test_login_summary_document(values: dict[str, str]) -> str:
+    """Render the operator-readable test login summary from resolved values."""
+
+    return f"""# Local preprod test logins
+
+**Local test credentials only.** This file is regenerated on every preprod
+deploy. It lives in the ignored `compose/secrets/` directory and must never
+be committed, shared, or copied off this machine.
+
+## User-testing logins
+
+Sign in at `https://chat.aigw.internal` or the portals below.
+
+| Username | Password | Access |
+| --- | --- | --- |
+| `preprod-admin` | `{values["user_admin"]}` | admin portal and chat |
+| `preprod-developer` | `{values["user_developer"]}` | developer portal and chat |
+| `preprod-user` | `{values["user_standard"]}` | chat only |
+
+## Break-glass logins
+
+Use these only when normal SSO login is broken or for deep admin work.
+
+| Where | Username | Password or token |
+| --- | --- | --- |
+| Keycloak admin console (`auth.aigw.internal`) | `admin` | `{values["keycloak_admin"]}` |
+| Grafana local admin (`grafana.aigw.internal`) | `admin` | `{values["grafana_admin"]}` |
+| LiteLLM UI (`litellm-admin.aigw.internal`) | `litellm-breakglass` | `{values["litellm_breakglass"]}` |
+| Samba AD domain admin (`samba-ad.aigw.internal`) | `Administrator` | `{values["samba_domain_admin"]}` |
+| Vault root token (`vault.aigw.internal`) | — | `{values["vault_root_token"]}` |
+| Vault unseal share | — | `{values["vault_unseal_share"]}` |
+
+## Service names
+
+| Name | What it serves |
+| --- | --- |
+| `chat.aigw.internal` | Open WebUI chat |
+| `portal.aigw.internal` | developer portal |
+| `admin.aigw.internal` | admin portal |
+| `api.aigw.internal` | gateway API |
+| `auth.aigw.internal` | Keycloak login |
+| `grafana.aigw.internal` | dashboards |
+| `prometheus.aigw.internal` | metrics |
+| `litellm-admin.aigw.internal` | LiteLLM admin UI |
+| `vault.aigw.internal` | Vault (UI profile only) |
+| `samba-ad.aigw.internal:636` | test directory over LDAPS |
+"""
+
+
+def write_test_login_summary(_: argparse.Namespace | None = None) -> None:
+    """Write one private summary file of every local test login.
+
+    Testers get one place to look instead of hunting through the
+    per-credential files. The file carries the same custody rules as every
+    other file in the ignored secrets directory.
+    """
+
+    vault_root_token = "pending Vault initialization"
+    vault_unseal_share = "pending Vault initialization"
+    if VAULT_INIT_FILE.exists():
+        document = json.loads(VAULT_INIT_FILE.read_text())
+        vault_root_token = str(document.get("root_token") or vault_root_token)
+        shares = document.get("keys_base64") or []
+        if shares:
+            vault_unseal_share = str(shares[0])
+    write_file(
+        TEST_LOGIN_SUMMARY_FILE,
+        _test_login_summary_document(
+            {
+                "user_admin": credential_password("samba-user-admin"),
+                "user_developer": credential_password("samba-user-developer"),
+                "user_standard": credential_password("samba-user-standard"),
+                "keycloak_admin": credential_password("keycloak-admin"),
+                "grafana_admin": credential_password("grafana-admin"),
+                "litellm_breakglass": credential_password("litellm-breakglass"),
+                "samba_domain_admin": credential_password("samba-domain-admin"),
+                "vault_root_token": vault_root_token,
+                "vault_unseal_share": vault_unseal_share,
+            }
+        ),
+        0o600,
+    )
+
+
 def verify(args: argparse.Namespace) -> None:
     services = rendered_compose_model(args)["services"]
     if "volume-init" not in services:
@@ -4666,6 +4751,7 @@ def verify(args: argparse.Namespace) -> None:
     status_code, provider = internal_call(args, "GET", "/providers/anthropic")
     if status_code != 200 or provider.get("state") != "configured" or provider.get("enabled") is not True:
         fail("WIF provider verification failed")
+    write_test_login_summary(args)
     print("PREPROD_VERIFIED")
 
 

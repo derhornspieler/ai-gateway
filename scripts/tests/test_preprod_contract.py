@@ -3930,5 +3930,63 @@ class PreprodContractTests(unittest.TestCase):
                 )
 
 
+class TestLoginSummaryContractTests(unittest.TestCase):
+    """The deploy writes one private summary of every local test login."""
+
+    SAMPLE_VALUES = {
+        "user_admin": "SAMPLE-USER-ADMIN",
+        "user_developer": "SAMPLE-USER-DEVELOPER",
+        "user_standard": "SAMPLE-USER-STANDARD",
+        "keycloak_admin": "SAMPLE-KEYCLOAK-BREAKGLASS",
+        "grafana_admin": "SAMPLE-GRAFANA-BREAKGLASS",
+        "litellm_breakglass": "SAMPLE-LITELLM-BREAKGLASS",
+        "samba_domain_admin": "SAMPLE-DOMAIN-ADMIN",
+        "vault_root_token": "SAMPLE-VAULT-ROOT",
+        "vault_unseal_share": "SAMPLE-VAULT-SHARE",
+    }
+
+    def test_summary_lists_users_break_glass_and_service_names(self) -> None:
+        module = load_preprod_module()
+        text = module._test_login_summary_document(dict(self.SAMPLE_VALUES))
+        self.assertIn("Local test credentials only.", text)
+        self.assertIn("## User-testing logins", text)
+        self.assertIn("## Break-glass logins", text)
+        self.assertIn("## Service names", text)
+        for value in self.SAMPLE_VALUES.values():
+            self.assertIn(value, text)
+        for name in (
+            "chat.aigw.internal",
+            "portal.aigw.internal",
+            "admin.aigw.internal",
+            "api.aigw.internal",
+            "auth.aigw.internal",
+            "grafana.aigw.internal",
+            "prometheus.aigw.internal",
+            "litellm-admin.aigw.internal",
+            "vault.aigw.internal",
+            "samba-ad.aigw.internal:636",
+        ):
+            self.assertIn(f"`{name}`", text)
+
+    def test_verify_writes_the_private_summary_before_the_marker(self) -> None:
+        source = (ROOT / "scripts/preprod.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'TEST_LOGIN_SUMMARY_FILE = SECRETS_DIR / "preprod-test-logins.md"',
+            source,
+        )
+        verify_body = source.split("def verify(", 1)[1]
+        self.assertLess(
+            verify_body.index("write_test_login_summary(args)"),
+            verify_body.index('print("PREPROD_VERIFIED")'),
+        )
+        # The summary is written with the same private mode as every other
+        # generated credential file, through the shared writer.
+        writer_body = source.split("def write_test_login_summary(", 1)[1].split(
+            "\ndef ", 1
+        )[0]
+        self.assertIn("TEST_LOGIN_SUMMARY_FILE", writer_body)
+        self.assertIn("0o600", writer_body)
+
+
 if __name__ == "__main__":
     unittest.main()

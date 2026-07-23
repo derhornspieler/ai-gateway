@@ -77,6 +77,10 @@ production pair automatically.
 You can then browse the stack at `aigw.internal` and re-check any time with
 `python3 -I scripts/test-e2e-preprod.py`.
 
+For browser testing, every login you need is in one generated private file:
+`compose/secrets/preprod-test-logins.md` — the three test users, the
+break-glass logins, and all service names. Never commit or share it.
+
 ## Clean up
 
 The test is a clean-room flow: it removes only resources owned by the
