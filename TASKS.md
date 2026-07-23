@@ -34,6 +34,33 @@
     fix failures, and push each validated fix. An unavailable external system
     is a recorded exception, not a reason to abandon independent work.
 
+  Current release evidence (2026-07-22):
+
+  - Runtime commit `ada03be` produced an Anthropic-only `linux/arm64`
+    schema-v2 production seed with 43 images and a PreProd seed with 46 images.
+    Both use PostgreSQL 18.4 only.
+  - Production archive SHA-256:
+    `84a76e0ac3c25e7fabf2d9fce598d1d1714211ca1b671f0263d2d8a48c146d05`.
+    Production manifest SHA-256:
+    `cef1162e3f457e7e184a83880d05dbb7d96a60893ef6001fac1e267e7eba93f2`.
+  - PreProd archive SHA-256:
+    `800fabcc3b2c64af4a820f01fc8ae9bbd95cef99b494bc156653c12456e1674a`.
+    PreProd manifest SHA-256:
+    `5f63a881a9fa75048bc1b64d9cd3b9b42455fdabd764d637097b73ddb31a7be5`.
+  - The immutable Anthropic policy digest is
+    `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
+    Its Envoy image ID is
+    `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
+  - The exact loaded PreProd seed passed Ansible deployment and the full
+    automated acceptance suite three times without pulls or source builds.
+    Vault restart, sealed-state detection, Ansible unseal, and a PostgreSQL
+    18 same-major physical backup and restore also passed.
+  - A browser controller was not available. Browserless OIDC and portal tests
+    passed, but the manual Back and Forward key check is still open. The final
+    exact clean room removed 29 containers, 12 volumes, 19 networks, 46 image
+    IDs, 46 aliases, and six generated state files. It preserved two unrelated
+    image IDs. Push and GitHub Actions are still open.
+
 - [ ] **Prove one-time developer keys cannot return through browser history** -
   The portal now hides the key panel until its exit guards are active. It
   clears the plaintext and removes the whole panel on a portal-tab change,

@@ -377,8 +377,9 @@ Envoy image and provider policy as one release unit.
 
 - This is one VM, not a highly available system.
 - LiteLLM and both portal apps use reviewed single-worker limits.
-- The current source has no final browser or exact-seed receipt. See
-  [project status](project-status.md#current-source-candidate).
+- The current source has an automated exact-seed receipt, but no manual
+  browser receipt. See
+  [project status](project-status.md#current-exact-seed-evidence).
 - Production LDAPS, TLS, Vault custody, Anthropic enrollment, Cribl, backup,
   and change-window steps need customer operators.
 - Fresh production and preprod installs use PostgreSQL 18. The release flow

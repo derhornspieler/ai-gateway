@@ -61,44 +61,34 @@ before it changes anything.
 - Production keeps its firewall, routing, SELinux, encrypted-state, backup,
   Vault, and network checks. Preprod does not weaken those production rules.
 
-## Last accepted exact-seed evidence
+## Current exact-seed evidence
 
-The release built from commit `77c50d3` is the last candidate that passed the
-full exact-seed test. This is historical evidence only. It included a retired
-database test path and does not match the current image inventory. Do not load
-or promote its files. Later source changes also affect runtime images and
-configuration, so a new release test is required.
+Runtime commit `ada03be` produced a new Anthropic-only schema-v2 release for
+`linux/arm64` on 2026-07-22. The production seed has 43 images. The PreProd
+seed has 46 images. Both use PostgreSQL 18.4 only. Neither seed contains a
+PostgreSQL 16 or migration-rehearsal image.
 
-The still-relevant results were:
+Ansible loaded the exact PreProd archive and deployed `aigw.internal` with
+pulls and source builds disabled. The full automated acceptance suite passed
+three times. Vault restart, sealed-state detection, Ansible unseal, and a
+PostgreSQL 18 same-major physical backup and restore also passed.
 
-1. Ansible proved a clean local boundary and loaded an exact seed.
-2. The ordinary PostgreSQL 18 graph passed application, identity, WIF, and
-   Cribl checks.
-3. A same-major PostgreSQL 18 physical backup and restore kept the required
-   application data and database permissions.
-4. Final exact-manifest cleanup removed every owned container, seed image,
-   volume, network, hosts entry, and loopback alias. It preserved unrelated
-   image IDs.
+The production archive SHA-256 is
+`84a76e0ac3c25e7fabf2d9fce598d1d1714211ca1b671f0263d2d8a48c146d05`.
+Its manifest SHA-256 is
+`cef1162e3f457e7e184a83880d05dbb7d96a60893ef6001fac1e267e7eba93f2`.
+The PreProd archive SHA-256 is
+`800fabcc3b2c64af4a820f01fc8ae9bbd95cef99b494bc156653c12456e1674a`.
+Its manifest SHA-256 is
+`5f63a881a9fa75048bc1b64d9cd3b9b42455fdabd764d637097b73ddb31a7be5`.
 
-The browser controller available during that run could not start a browser.
-The browserless redirect, callback, cookie, role, logout, LDAP, Keycloak, and
-portal tests passed. They did not replace a visual browser pass for that seed.
-
-## Current source candidate
-
-The current source includes new private PreProd credential handling, refreshed
-same-tag image digests, a private Alertmanager and Grafana alert dashboard, and
-model governance, usage, pricing, and limit work. These changes affect runtime
-images or configuration. They need a new Anthropic-only schema-v2 seed and a
-fresh Ansible PreProd run.
-
-The browser controller is now available. Run the browser checklist against the
-new exact-seed deployment. It must also prove that a one-time developer key
-does not return after the user leaves the page and uses Back or Forward.
-
-Source-level checks are being rerun while the feature work settles. Record the
-final test counts and exact seed hashes only after the same commit passes every
-required gate.
+No browser controller was available for this run. Browserless redirect,
+callback, cookie, role, logout, LDAP, Keycloak, and portal tests passed. They
+do not replace the manual one-time-key Back and Forward check. The final exact
+clean room removed all 29 owned containers, 12 volumes, 19 networks, 46 image
+IDs, 46 aliases, and six generated state files. It preserved two unrelated
+image IDs. The push and GitHub Actions results are not recorded as complete
+until those steps finish.
 
 The [dated version review](image-version-review.md) found that every selected
 image and direct library is current for its reviewed source. The reusable
@@ -109,14 +99,11 @@ deployment state.
 
 ## Gates that remain open
 
-- **Current-candidate exact-seed check:** build a fresh ARM64 production and
-  PreProd pair, remove only owned PreProd resources and manifest-listed images,
-  load the exact PreProd archive, deploy it once through Ansible, and pass the
-  full automated checks. Use local Docker only. Do not create a Rocky or
-  Parallels rehearsal VM.
-- **Current-candidate browser check:** while that exact seed is running, use
-  the available browser controller to test redirects, login, roles, cookies,
-  logout, and the one-time-key Back and Forward rule. Then revoke the test key.
+- **Current-candidate release closeout:** push the tested source and
+  documentation, then make the required GitHub Actions checks green.
+- **Current-candidate browser check:** when a browser controller is available,
+  test redirects, login, roles, cookies, logout, and the one-time-key Back and
+  Forward rule against a newly loaded exact seed. Then revoke the test key.
 - **Credential-gated security audit:** the protected DHI credentials were added
   on 2026-07-22 and authentication now passes. Earlier runs exposed release
   workflow defects. Push the tested fixes, run every exact image job for the

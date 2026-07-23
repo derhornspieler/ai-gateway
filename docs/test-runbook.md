@@ -406,7 +406,7 @@ Vault restart and Ansible recovery path. It does not create or reboot a VM.
 Restart only the preprod Vault container:
 
 ```bash
-docker restart --time 30 aigw-preprod-vault-1
+docker restart --timeout 30 aigw-preprod-vault-1
 ```
 
 Check Vault from inside that container:
