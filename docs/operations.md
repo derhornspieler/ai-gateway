@@ -9,6 +9,7 @@ Compose command by hand.
 | Full host and stack check | `ansible/site.yml` |
 | App-only deploy on a prepared host | `ansible/deploy-stack-only.yml` |
 | Vault unlock after reboot | [Vault unseal SOP](sop/vault-unseal-after-reboot.md) |
+| What a service does and how to check it | [Service reference](services/README.md) |
 | Image update | [Image update workflow](image-update-workflow.md) |
 | Upgrade production images | [Production image upgrade SOP](sop/production-image-upgrade.md) |
 | Test a release in local preprod | [Preprod test deploy SOP](sop/preprod-test-deploy.md) |

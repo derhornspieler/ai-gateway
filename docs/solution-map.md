@@ -109,7 +109,7 @@ and runs 26 long-running containers in its normal profile.
 | `node-exporter` | Host capacity metrics |
 | `loki` | Local operational, audit, and request logs |
 | `grafana` | Local dashboards and alert views |
-| `cribl-mock` | Local TLS receipt test for admitted logs, metrics, and traces |
+| `cribl-mock` | Receipt test endpoint for admitted logs, metrics, and traces; plaintext in the base stack, TLS added by the local preprod overlay |
 | `platform-dns` | Optional split, non-recursive DNS for the domain |
 
 Preprod adds these test-only services:

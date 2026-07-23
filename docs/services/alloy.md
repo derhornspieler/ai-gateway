@@ -18,8 +18,10 @@ through it before any of it can leave the gateway.
 - LiteLLM sends AI-request trace spans to Alloy's authenticated port 4319
   (`http://alloy:4319/v1/traces`, from `compose/litellm/aigw_otel_callback.py`),
   proven by a bearer token read from a file.
-- key-rotator, dev-portal, and admin-portal send ordinary OTLP telemetry to
-  Alloy's open port 4318 (`OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318`).
+- key-rotator sends ordinary OTLP telemetry to Alloy's open port 4318. The
+  two portals do not speak OTLP at all — they write structured JSON security
+  events to stdout, and Alloy's Docker log pipeline picks those up like any
+  other container log.
 - Alloy scrapes Traefik, Envoy egress, Keycloak, Grafana, Prometheus,
   Alertmanager, Loki, node-exporter, and itself (`prometheus.scrape
   "gateway"` in `compose/alloy/config.alloy`) — Prometheus never scrapes

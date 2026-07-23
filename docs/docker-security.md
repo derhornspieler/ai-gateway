@@ -231,7 +231,7 @@ project container log. The database stores its hash, not its plaintext.
 
 ## Volumes and config mounts
 
-The one-shot initializer owns eight state-volume root contracts. It runs only
+The one-shot initializer owns nine state-volume root contracts. It runs only
 when it is missing, failed, changed, or the required owner or mode drifted.
 Ansible checks the state again after it exits.
 

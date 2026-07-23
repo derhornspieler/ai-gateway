@@ -46,6 +46,12 @@ Grafana **AI Gateway Alerts and Capacity** dashboard. Prometheus is the only
 rule evaluator. Grafana is the operator UI. Alertmanager has no host port or
 FQDN, and it sends no direct notification to Cribl.
 
+Known scrape gaps found while writing the service reference pages:
+`key-rotator`, the four `oauth2-proxy` variants, `postgres`, and `redis`
+have no Alloy/Prometheus scrape target, so their only signals today are the
+compose healthcheck and Loki logs. Closing each gap needs a reviewed scrape
+target and matching alert rules — never a privileged collector.
+
 Keep this work open until the current exact seed proves the live watchdog,
 active and resolved alerts, fault recovery, and dashboard data. Local Docker
 cannot prove Rocky host network, container restart, Vault seal, or backup
