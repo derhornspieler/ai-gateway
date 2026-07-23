@@ -12,12 +12,11 @@ One build makes two file pairs:
 Never send the preprod pair to production.
 
 At this source revision, production has 24 external and 19 custom image
-references, for 43 total. Preprod has 26 external and 21 custom references,
-for 47 total. Two custom services are preprod-only: Samba AD and the WIF
-provider mock. Their Debian 13.6-slim build base is also preprod-only. The
-fourth extra reference is the archive-only PostgreSQL 16 source used to test
-the PostgreSQL 18 migration. Compose never starts that source image during an
-ordinary PreProd deploy.
+references, for 43 total. Preprod has 25 external and 21 custom references,
+for 46 total. Two custom services are preprod-only: Samba AD and the WIF
+provider mock. Their Debian 13.6-slim build base is the only preprod-only
+external reference. Fresh production and preprod deployments both use the
+PostgreSQL 18 image from the production Compose file.
 
 ## The normal engineer flow
 
@@ -369,10 +368,10 @@ An old release may stop working after a provider CA cutover. Plan CA rotation
 with an overlap window. See the
 [Provider CA SOP](sop/provider-ca-maintenance.md#rotation-with-an-overlap-window).
 
-The normal remote image workflow refuses a PostgreSQL major change. First run
-the fixed [local PostgreSQL 16 to 18 rehearsal](preprod.md#rehearse-the-postgresql-move)
-from the exact preprod seed. Production still uses the separate
-[PostgreSQL 18 migration SOP](sop/postgresql-18-migration.md).
+The normal remote image workflow refuses a PostgreSQL major change. This
+repository supports fresh PostgreSQL 18 deployments and same-major PostgreSQL
+18 image updates. A future major change needs a separate reviewed design; do
+not bypass the refusal or change the data-volume mount by hand.
 
 ## Related pages
 

@@ -95,15 +95,23 @@ class StackSyncHygieneContractTest(unittest.TestCase):
 
 
 class RestoreVersionGuardContractTest(unittest.TestCase):
-    """Audit 2026-07-16 risk 2: a cross-major PostgreSQL restore is unsafe (a
-    logical dump from major N cannot load into a different major's server), and
-    the converge's rollback manifest keeps the old image one edit away. The
-    backup records server_version; the restore must refuse a major mismatch
-    against the deployed pin BEFORE any destructive step."""
+    """A physical PostgreSQL data directory cannot cross server majors.
 
-    def test_backup_records_the_postgres_version(self) -> None:
+    The ordinary backup records ``server_version``. Restore must refuse a
+    major mismatch against the deployed pin before any destructive step.
+    """
+
+    def test_backup_is_one_ordinary_same_major_flow(self) -> None:
         self.assertIn('"postgres_version"', STATE_BACKUP)
         self.assertIn("show server_version", STATE_BACKUP)
+        self.assertIn(
+            '"${docker_cmd[@]}" start "${running_containers[@]}"', STATE_BACKUP
+        )
+        self.assertIn('"format": "aigw-state-backup-v1"', STATE_BACKUP)
+        self.assertNotIn("--major-migration-quiesce", STATE_BACKUP)
+        self.assertNotIn("postgres_major_migration_quiesce", STATE_BACKUP)
+        self.assertNotIn("postgres_next_xid", STATE_BACKUP)
+        self.assertNotIn("postgres_write_barrier", STATE_BACKUP)
 
     def test_restore_refuses_cross_major_before_destruction(self) -> None:
         # The guard must read both majors and refuse a mismatch.
@@ -120,6 +128,12 @@ class RestoreVersionGuardContractTest(unittest.TestCase):
             guard, destruct,
             "the version guard must run before the stack is stopped",
         )
+
+    def test_restore_uses_the_authenticated_explicit_pg18_volume(self) -> None:
+        self.assertIn("PG_DATA_VOLUME_NAME=", STATE_RESTORE)
+        self.assertIn('volume_name="$restored_pg_volume"', STATE_RESTORE)
+        self.assertIn("Cross-major physical restore", STATE_RESTORE)
+        self.assertNotIn("postgres-major-migrate.py", STATE_RESTORE)
 
 
 if __name__ == "__main__":

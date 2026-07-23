@@ -155,11 +155,7 @@ def curl_json(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-mode", choices=("source", "seed"), default="source")
-    parser.add_argument("--postgres-major", choices=("16", "18"), default="18")
-    parser.add_argument("--confirm-postgres16-rehearsal", action="store_true")
     args = parser.parse_args()
-    if (args.postgres_major == "16") != args.confirm_postgres16_rehearsal:
-        fail("PostgreSQL 16 acceptance requires its fixed rehearsal confirmation")
     if shutil.which("curl") is None:
         fail("curl is required for the edge TLS checks")
     if not CA_FILE.is_file():
@@ -170,11 +166,7 @@ def main() -> int:
         str(ROOT / "scripts/preprod.py"),
         "--image-mode",
         args.image_mode,
-        "--postgres-major",
-        args.postgres_major,
     ]
-    if args.postgres_major == "16":
-        preprod_arguments.append("--confirm-postgres16-rehearsal")
     verification = run([*preprod_arguments, "verify"])
     if "PREPROD_VERIFIED" not in verification:
         fail("the complete preprod service graph was not verified")
@@ -339,8 +331,6 @@ def main() -> int:
         str(ROOT / "scripts/test-preprod-model-limits.py"),
         "--image-mode",
         args.image_mode,
-        "--postgres-major",
-        args.postgres_major,
     ]
     limit_acceptance = run(limit_arguments)
     for marker in (
@@ -362,8 +352,6 @@ def main() -> int:
                 str(ROOT / "scripts/test-preprod-model-lifecycle.py"),
                 "--image-mode",
                 "seed",
-                "--postgres-major",
-                args.postgres_major,
             ]
         )
         for marker in (
@@ -386,8 +374,6 @@ def main() -> int:
                 str(ROOT / "scripts/test-preprod-usage-accounting.py"),
                 "--image-mode",
                 "seed",
-                "--postgres-major",
-                args.postgres_major,
             ],
             body=directory_password("preprod-admin") + "\n",
         )

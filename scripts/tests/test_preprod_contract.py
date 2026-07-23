@@ -17,10 +17,6 @@ from uuid import UUID
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PREPROD_POSTGRES16_IMAGE = (
-    "dhi.io/postgres:16.14@sha256:"
-    "47a12e559e8c418ed54e27da521efcbf4c00fc1c26e86eb58d82845afd7c57c7"
-)
 
 
 def load_preprod_module():
@@ -280,124 +276,24 @@ class PreprodContractTests(unittest.TestCase):
                     "existing-policy\n",
                 )
 
-    def test_postgres16_mode_is_fixed_to_confirmed_seed_rehearsal(self) -> None:
+    def test_postgres18_is_the_only_preprod_database_major(self) -> None:
         module = load_preprod_module()
         parser = module.parser()
-        parsed = parser.parse_args(
-            [
-                "--image-mode",
-                "seed",
-                "--postgres-major",
-                "16",
-                "--confirm-postgres16-rehearsal",
-                "compose-config",
-            ]
-        )
+        parsed = parser.parse_args(["compose-config"])
         module.validate_inputs(parsed)
-        self.assertEqual(parsed.postgres_major, "16")
-
-        for arguments in (
-            ["--postgres-major", "16", "compose-config"],
-            [
-                "--image-mode",
-                "seed",
-                "--confirm-postgres16-rehearsal",
-                "compose-config",
-            ],
-        ):
-            with self.subTest(arguments=arguments):
-                refused = parser.parse_args(arguments)
-                with self.assertRaisesRegex(SystemExit, "PostgreSQL 16|requires"):
-                    module.validate_inputs(refused)
-
-    def test_postgres16_real_command_refuses_after_writes_before_docker(self) -> None:
-        module = load_preprod_module()
-        phase = {
-            "format": module.POSTGRES18_REHEARSAL_FORMAT,
-            "project": "aigw-preprod",
-            "status": "running",
-            "phase": "writes_opened",
-        }
-        arguments = [
-            "preprod.py",
-            "--image-mode",
-            "seed",
-            "--postgres-major",
-            "16",
-            "--confirm-postgres16-rehearsal",
-            "compose-config",
-        ]
-        with tempfile.TemporaryDirectory() as directory:
-            receipt = Path(directory) / "postgres18-rehearsal.json"
-            receipt.write_text(json.dumps(phase) + "\n", encoding="utf-8")
-            receipt.chmod(0o644)
-            with (
-                mock.patch.object(module, "POSTGRES18_REHEARSAL_RECEIPT", receipt),
-                mock.patch.object(module.sys, "argv", arguments),
-                mock.patch.object(module, "docker") as docker,
-                mock.patch.object(module, "check_context") as check_context,
-                mock.patch.object(module, "compose_config") as compose_config,
-            ):
-                with self.assertRaisesRegex(
-                    SystemExit,
-                    "downgrade refused after PostgreSQL 18 writes opened",
-                ):
-                    module.main()
-        docker.assert_not_called()
-        check_context.assert_not_called()
-        compose_config.assert_not_called()
-
-    def test_postgres16_rehearsal_receipt_unknown_state_fails_closed(self) -> None:
-        module = load_preprod_module()
-        parser = module.parser()
-        arguments = parser.parse_args(
-            [
-                "--image-mode",
-                "seed",
-                "--postgres-major",
-                "16",
-                "--confirm-postgres16-rehearsal",
-                "compose-config",
-            ]
+        self.assertFalse(hasattr(parsed, "postgres_major"))
+        self.assertNotIn("--postgres-major", self.script)
+        self.assertNotIn("--confirm-postgres16-rehearsal", self.script)
+        self.assertNotIn("POSTGRES16_OVERLAY", self.script)
+        self.assertIn(
+            '"PG_DATA_VOLUME_NAME": f"{args.project}_pg18_data"', self.script
         )
-        phase = {
-            "format": module.POSTGRES18_REHEARSAL_FORMAT,
-            "project": "aigw-preprod",
-            "status": "running",
-            "phase": "unexpected",
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            receipt = Path(directory) / "postgres18-rehearsal.json"
-            receipt.write_text(json.dumps(phase) + "\n", encoding="utf-8")
-            receipt.chmod(0o644)
-            with mock.patch.object(
-                module, "POSTGRES18_REHEARSAL_RECEIPT", receipt
-            ):
-                with self.assertRaisesRegex(SystemExit, "unknown state"):
-                    module.validate_inputs(arguments)
 
-    def test_clean_room_uses_the_recorded_postgres_major(self) -> None:
-        module = load_preprod_module()
-        args = types.SimpleNamespace(
-            project="aigw-preprod",
-            image_mode="seed",
-            postgres_major="18",
-            confirm_postgres16_rehearsal=False,
-        )
-        with (
-            mock.patch.object(
-                module, "ENV_FILE", mock.Mock(exists=mock.Mock(return_value=True))
-            ),
-            mock.patch.object(
-                module,
-                "preprod_env_value",
-                return_value="aigw-preprod_pg16_data",
-            ),
-        ):
-            cleaned = module._clean_room_source_args(args)
+        args = types.SimpleNamespace(project="aigw-preprod", image_mode="seed")
+        cleaned = module._clean_room_source_args(args)
         self.assertEqual(cleaned.image_mode, "source")
-        self.assertEqual(cleaned.postgres_major, "16")
-        self.assertTrue(cleaned.confirm_postgres16_rehearsal)
+        self.assertEqual(cleaned.project, "aigw-preprod")
+        self.assertFalse(hasattr(cleaned, "postgres_major"))
 
     def test_clean_room_reconstructs_only_missing_bind_digests(self) -> None:
         module = load_preprod_module()
@@ -454,8 +350,6 @@ class PreprodContractTests(unittest.TestCase):
             prefix="aigw-preprod",
             subnet_octet=29,
             image_mode="seed",
-            postgres_major="18",
-            confirm_postgres16_rehearsal=False,
         )
         inventory = {"containers": {}}
         with tempfile.TemporaryDirectory() as directory:
@@ -495,55 +389,7 @@ class PreprodContractTests(unittest.TestCase):
             self.assertEqual(env_file.read_text(encoding="utf-8"), original)
             self.assertEqual(resources["source_args"].image_mode, "source")
 
-    def test_failed_rehearsal_volume_cleanup_requires_exact_labels(self) -> None:
-        module = load_preprod_module()
-        args = types.SimpleNamespace(project="aigw-preprod")
-        listed = types.SimpleNamespace(
-            stdout="aigw-preprod_pg16_data\naigw-preprod_pg18_data\n"
-        )
-        owned = types.SimpleNamespace(
-            stdout=json.dumps(
-                [
-                    {
-                        "Driver": "local",
-                        "Scope": "local",
-                        "Labels": {
-                            "com.aigw.preprod.project": "aigw-preprod",
-                            "com.docker.compose.project": "aigw-preprod",
-                            "com.docker.compose.volume": "pg_data",
-                        }
-                    }
-                ]
-            )
-        )
-        removed = types.SimpleNamespace(stdout="")
-        with mock.patch.object(
-            module,
-            "docker",
-            side_effect=[listed, owned, removed, owned, removed],
-        ) as docker:
-            module.remove_postgres_rehearsal_volumes(args)
-        self.assertEqual(
-            [
-                call.args
-                for call in docker.call_args_list
-                if call.args[:2] == ("volume", "rm")
-            ],
-            [
-                ("volume", "rm", "aigw-preprod_pg16_data"),
-                ("volume", "rm", "aigw-preprod_pg18_data"),
-            ],
-        )
-        for call in docker.call_args_list:
-            if call.args[:2] == ("volume", "rm"):
-                self.assertTrue(call.kwargs["capture"])
-
-        foreign = types.SimpleNamespace(stdout='[{"Labels":{}}]')
-        with mock.patch.object(module, "docker", side_effect=[listed, foreign]):
-            with self.assertRaisesRegex(SystemExit, "unowned PostgreSQL"):
-                module.remove_postgres_rehearsal_volumes(args)
-
-    def test_clean_room_accepts_only_the_exact_postgres_rehearsal_volumes(self) -> None:
+    def test_clean_room_accepts_only_the_rendered_postgres18_volume(self) -> None:
         module = load_preprod_module()
         args = types.SimpleNamespace(
             project="aigw-preprod",
@@ -551,7 +397,7 @@ class PreprodContractTests(unittest.TestCase):
             subnet_octet=29,
         )
         expected = "aigw-preprod_pg18_data"
-        retained = "aigw-preprod_pg16_data"
+        unexpected = "aigw-preprod_unexpected_data"
 
         def volume(name: str, *, compose_volume: str = "pg_data") -> dict:
             return {
@@ -565,7 +411,7 @@ class PreprodContractTests(unittest.TestCase):
                 },
             }
 
-        documents = {expected: volume(expected), retained: volume(retained)}
+        documents = {expected: volume(expected), unexpected: volume(unexpected)}
         inventory = {"containers": {}}
         with (
             mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
@@ -583,7 +429,7 @@ class PreprodContractTests(unittest.TestCase):
             mock.patch.object(
                 module,
                 "_clean_room_list",
-                return_value=[expected, retained],
+                return_value=[expected],
             ),
             mock.patch.object(
                 module,
@@ -597,41 +443,8 @@ class PreprodContractTests(unittest.TestCase):
             ),
         ):
             resources = module.preflight_clean_room_resources(args, inventory)
-        self.assertEqual(resources["volumes"], {expected, retained})
+        self.assertEqual(resources["volumes"], {expected})
 
-        with (
-            mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
-            mock.patch.object(module, "_clean_room_source_args", return_value=args),
-            mock.patch.object(
-                module, "_clean_room_compose_overrides", return_value={}
-            ),
-            mock.patch.object(module, "rendered_compose_model", return_value={}),
-            mock.patch.object(
-                module,
-                "verify_rendered_resource_ownership",
-                return_value={retained},
-            ),
-            mock.patch.object(module, "verify_existing_project_boundary"),
-            mock.patch.object(
-                module,
-                "_clean_room_list",
-                return_value=[retained, expected],
-            ),
-            mock.patch.object(
-                module,
-                "_clean_room_inspect_required",
-                side_effect=lambda _kind, name: documents[name],
-            ),
-            mock.patch.object(module, "desired_networks", return_value={}),
-            mock.patch.object(module, "_clean_room_network_inventory", return_value=[]),
-            mock.patch.object(
-                module, "_validate_clean_room_generated_state", return_value=0
-            ),
-        ):
-            resources = module.preflight_clean_room_resources(args, inventory)
-        self.assertEqual(resources["volumes"], {expected, retained})
-
-        documents[retained] = volume(retained, compose_volume="not-pg-data")
         with (
             mock.patch.object(module, "ENV_FILE", mock.Mock(exists=lambda: True)),
             mock.patch.object(module, "_clean_room_source_args", return_value=args),
@@ -645,7 +458,11 @@ class PreprodContractTests(unittest.TestCase):
                 return_value={expected},
             ),
             mock.patch.object(module, "verify_existing_project_boundary"),
-            mock.patch.object(module, "_clean_room_list", return_value=[retained]),
+            mock.patch.object(
+                module,
+                "_clean_room_list",
+                return_value=[expected, unexpected],
+            ),
             mock.patch.object(
                 module,
                 "_clean_room_inspect_required",
@@ -654,16 +471,14 @@ class PreprodContractTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(SystemExit, "outside the exact clean-room"):
                 module.preflight_clean_room_resources(args, inventory)
+        self.assertNotIn("postgres_rehearsal_volume_names", self.script)
+        self.assertNotIn("remove_postgres_rehearsal_volumes", self.script)
 
-    def test_postgres16_overlay_is_added_last_and_is_exactly_pinned(self) -> None:
+    def test_seed_compose_command_has_no_database_major_overlay(self) -> None:
         module = load_preprod_module()
-        overlay = module.POSTGRES16_OVERLAY.read_text(encoding="utf-8")
-        self.assertIn(PREPROD_POSTGRES16_IMAGE, overlay)
-        self.assertIn("pg_data:/var/lib/postgresql/16/data", overlay)
         args = types.SimpleNamespace(
             project="aigw-preprod",
             image_mode="seed",
-            postgres_major="16",
         )
         with tempfile.TemporaryDirectory() as directory:
             seed_overlay = Path(directory) / "seed.yml"
@@ -678,10 +493,8 @@ class PreprodContractTests(unittest.TestCase):
             ):
                 command = module.compose_command(args, "config")
         self.assertEqual(command[-3:-1], ["--profile", "preprod"])
-        self.assertLess(
-            command.index(str(seed_overlay)),
-            command.index(str(module.POSTGRES16_OVERLAY)),
-        )
+        self.assertIn(str(seed_overlay), command)
+        self.assertFalse(any("postgres16" in argument for argument in command))
 
     def test_preprod_reconciles_the_openwebui_key_before_acceptance(self) -> None:
         start = self.tasks.index("Start the isolated preprod project")
@@ -2123,7 +1936,6 @@ class PreprodContractTests(unittest.TestCase):
                 ),
                 mock.patch.object(module, "verify_existing_project_boundary"),
                 mock.patch.object(module, "compose") as compose,
-                mock.patch.object(module, "remove_postgres_rehearsal_volumes"),
                 mock.patch.object(
                     module,
                     "docker",
@@ -2847,7 +2659,6 @@ class PreprodContractTests(unittest.TestCase):
         for changed_name in (
             "docker-compose.yml",
             "docker-compose.preprod.yml",
-            "docker-compose.preprod-postgres16.yml",
             "one.txt",
             "nested",
         ):
@@ -2856,9 +2667,6 @@ class PreprodContractTests(unittest.TestCase):
                 (root / "docker-compose.yml").write_text("base\n", encoding="utf-8")
                 (root / "docker-compose.preprod.yml").write_text(
                     "overlay\n", encoding="utf-8"
-                )
-                (root / "docker-compose.preprod-postgres16.yml").write_text(
-                    "postgres16\n", encoding="utf-8"
                 )
                 (root / "one.txt").write_text("one\n", encoding="utf-8")
                 (root / "nested").mkdir()
@@ -2888,9 +2696,6 @@ class PreprodContractTests(unittest.TestCase):
             (root / "docker-compose.yml").write_text("base\n", encoding="utf-8")
             (root / "docker-compose.preprod.yml").write_text(
                 "overlay\n", encoding="utf-8"
-            )
-            (root / "docker-compose.preprod-postgres16.yml").write_text(
-                "postgres16\n", encoding="utf-8"
             )
             (root / "immutable.txt").write_text("fixed\n", encoding="utf-8")
             (root / "runtime.json").write_text('{"keys":[]}\n', encoding="utf-8")
@@ -3850,7 +3655,6 @@ class PreprodContractTests(unittest.TestCase):
             receipt = secrets / "preprod-seed-receipt.json"
             overlay = secrets / "preprod-seed-images.yml"
             provider_policy = secrets / "provider_policy_receipt.json"
-            rehearsal = secrets / "preprod-postgres18-rehearsal-receipt.json"
             uid = os.geteuid()
             gid = os.getegid()
             env_file.write_text(
@@ -3865,9 +3669,6 @@ class PreprodContractTests(unittest.TestCase):
                 mock.patch.object(module, "SEED_RECEIPT", receipt),
                 mock.patch.object(module, "SEED_OVERLAY", overlay),
                 mock.patch.object(module, "PROVIDER_POLICY_RECEIPT", provider_policy),
-                mock.patch.object(
-                    module, "POSTGRES18_REHEARSAL_RECEIPT", rehearsal
-                ),
                 mock.patch.object(module.os, "geteuid", return_value=0),
             ):
                 with self.assertRaisesRegex(SystemExit, "recorded non-root operator"):
@@ -3884,9 +3685,6 @@ class PreprodContractTests(unittest.TestCase):
                 mock.patch.object(module, "SEED_RECEIPT", receipt),
                 mock.patch.object(module, "SEED_OVERLAY", overlay),
                 mock.patch.object(module, "PROVIDER_POLICY_RECEIPT", provider_policy),
-                mock.patch.object(
-                    module, "POSTGRES18_REHEARSAL_RECEIPT", rehearsal
-                ),
                 mock.patch.object(module, "_activate_seed", side_effect=write_caller_outputs),
                 mock.patch.object(module.os, "geteuid", return_value=uid),
                 mock.patch.object(module.os, "getegid", return_value=gid),
@@ -3896,6 +3694,10 @@ class PreprodContractTests(unittest.TestCase):
             self.assertFalse(receipt.exists())
             self.assertFalse(overlay.exists())
             self.assertFalse(provider_policy.exists())
+            self.assertEqual(
+                module.seed_output_files(),
+                (module.SEED_RECEIPT, module.SEED_OVERLAY, module.PROVIDER_POLICY_RECEIPT),
+            )
 
     def test_root_loader_marker_stays_in_digest_scoped_temporary_stage(self) -> None:
         defaults = (ROOT / "ansible/roles/preprod_stack/defaults/main.yml").read_text()

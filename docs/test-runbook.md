@@ -219,11 +219,12 @@ aigw-2026-07-22-linux-amd64.preprod.manifest.json
 ```
 
 At this source revision, production has 24 external and 19 custom image
-references, for 43 total. Preprod has 26 external and 21 custom image
-references, for 47 total. The two preprod-only custom services are Samba AD
-and the WIF provider mock. Their Debian 13.6-slim base and the archive-only
-PostgreSQL 16 migration source are the two extra external references. None of
-these four PreProd-only references belongs in the production archive.
+references, for 43 total. Preprod has 25 external and 21 custom image
+references, for 46 total. The two preprod-only custom services are Samba AD
+and the WIF provider mock. Their Debian 13.6-slim base is the only extra
+external reference. None of these three PreProd-only references belongs in
+the production archive. Both pairs contain the exact PostgreSQL 18 runtime
+image and no older PostgreSQL major.
 
 Record all four SHA-256 values:
 
@@ -397,41 +398,6 @@ security rules.
 
 See [Local preprod](preprod.md) for the users and network model.
 
-### Step 3 — Rehearse PostgreSQL 16 to 18
-
-Run this step for a release that adds or changes the PostgreSQL major-version
-move. It uses local Docker only. It does not create a Rocky or Parallels VM.
-
-This step proves application, data, failure-recovery, and rollback behavior. It
-does not literally run the Linux/root `scripts/state-backup.sh`,
-`scripts/postgres-major-migrate.py`, or the `generic_rocky9` plays in
-`ansible/migrate-postgres18.yml`. Those production paths have unit, source, and
-Ansible contract coverage here. They run on the existing production Linux host
-during the approved maintenance window. This is the accepted no-rehearsal-VM
-boundary, not proof that the Linux-only commands ran.
-
-```bash
-python3 -I scripts/update-images.py test-postgres18-preprod \
-  --archive /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst \
-  --manifest /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64.preprod.manifest.json \
-  --become-password-file "$HOME/.ssh/become"
-```
-
-This command always does another exact clean-room load. It must prove the
-PostgreSQL 16 application graph, fixed fixtures of at least 384 MiB, fixture
-hashes, pre-cutover rollback, and logical restore to the exact PostgreSQL 18
-image. It must also prove post-write downgrade refusal with no mutation, then
-complete a same-major physical backup and restore. It runs the full PreProd
-acceptance gate again after the restore.
-
-Save these two markers and the JSON receipt named in
-[Local preprod](preprod.md#rehearse-the-postgresql-move):
-
-```text
-POSTGRES18_PREPROD_REHEARSAL_PASSED ...
-SEEDED_PREPROD_POSTGRES18_REHEARSAL_PASSED
-```
-
 ## 3. Prove Vault restart recovery
 
 Keep the exact seeded preprod deployment running. This test proves the normal
@@ -571,8 +537,10 @@ Do not create a rehearsal VM. Do not force a test failure on production. The
 upgrade state machine has contract tests. Real validation runs only in the
 approved maintenance window.
 
-PostgreSQL major changes use the
-[PostgreSQL 18 migration SOP](sop/postgresql-18-migration.md).
+Fresh installs use PostgreSQL 18. Image updates must remain on that major
+version. The updater refuses a PostgreSQL major change. For ordinary encrypted
+PostgreSQL 18 backup and same-major restore commands, use
+[Production operations](operations.md#backup-and-restore).
 
 ## 7. Record the result
 

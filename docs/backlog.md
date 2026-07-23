@@ -86,7 +86,8 @@ choices and keeps the proposed router disabled until its release tests pass.
 The governed catalog, lifecycle, filtered discovery, project assignment gate,
 two per-model output controls, prompt-free usage ledger, five-part configured
 cost, backdate adjustment flow, and usage dashboard are complete in source.
-They have unit, contract, portal, migration, and PostgreSQL 18 coverage plus
-seed-only PreProd acceptance harnesses. They are not release-accepted until
-the new exact seed, browser, Grafana, Cribl, backup, restore, and rollback
-gates pass. Automatic routing remains design-only and disabled.
+They have unit, contract, portal, application-schema, and PostgreSQL 18
+coverage plus seed-only PreProd acceptance harnesses. They are not
+release-accepted until the new exact seed, browser, Grafana, Cribl, backup,
+restore, and rollback gates pass. Automatic routing remains design-only and
+disabled.

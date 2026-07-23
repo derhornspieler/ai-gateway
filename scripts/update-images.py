@@ -58,9 +58,6 @@ REMOTE_RECOVERY_IDENTITY = "/run/ai-gateway-image-update/rollback.agekey"
 PREPROD_INVENTORY = ROOT / "ansible/inventory/preprod.yml"
 PREPROD_PLAYBOOK = ROOT / "ansible/preprod.yml"
 PREPROD_CLEAN_ROOM_PLAYBOOK = ROOT / "ansible/preprod-clean-room.yml"
-PREPROD_POSTGRES18_REHEARSAL_PLAYBOOK = (
-    ROOT / "ansible/preprod-postgres18-rehearsal.yml"
-)
 STAGE_PLAYBOOK = ROOT / "ansible/stage-offline-image-seed.yml"
 RECOVERY_IDENTITY_PLAYBOOK = ROOT / "ansible/manage-update-recovery-identity.yml"
 LIFECYCLE_AUDIT_PLAYBOOK = ROOT / "ansible/record-controller-lifecycle.yml"
@@ -95,14 +92,6 @@ PREPROD_IMAGE_BY_SERVICE = {
     "wif-provider-mock": "ai-gateway/wif-provider-mock:preprod",
 }
 PREPROD_CLEAN_ROOM_CONFIRMATION = "DESTROY_AIGW_PREPROD_RELEASE_IMAGES"
-PREPROD_POSTGRES16_IMAGE = (
-    "dhi.io/postgres:16.14@sha256:"
-    "47a12e559e8c418ed54e27da521efcbf4c00fc1c26e86eb58d82845afd7c57c7"
-)
-PREPROD_POSTGRES18_IMAGE = (
-    "dhi.io/postgres:18.4@sha256:"
-    "a807e832c1fc9ded731956abcb53dc98ed003fd82e27275eaef8dcf52fb90236"
-)
 
 
 class WorkflowError(RuntimeError):
@@ -746,86 +735,6 @@ def test_preprod(
     print("SEEDED_PREPROD_E2E_PASSED")
 
 
-def require_postgres18_rehearsal_images(release: Release) -> None:
-    """Bind the local major-version rehearsal to both reviewed seed images."""
-
-    require_release_scope(release, RELEASE_SCOPE_PREPROD)
-    images = release.document.get("images")
-    if not isinstance(images, list):
-        fail("the preprod release has no external image inventory")
-    actual = {
-        record.get("reference"): record.get("image_id")
-        for record in images
-        if isinstance(record, dict)
-    }
-    for reference in (PREPROD_POSTGRES16_IMAGE, PREPROD_POSTGRES18_IMAGE):
-        expected_id = "sha256:" + reference.rsplit("@sha256:", 1)[1]
-        if actual.get(reference) != expected_id:
-            fail(
-                "the PostgreSQL rehearsal release lacks the exact reviewed "
-                + reference.split("@", 1)[0]
-            )
-
-
-def test_postgres18_preprod(
-    release: Release,
-    *,
-    ask_become_pass: bool,
-    become_password_file: Path | None = None,
-) -> None:
-    """Clean, load, and run the fixed local PostgreSQL 16 to 18 rehearsal."""
-
-    require_postgres18_rehearsal_images(release)
-    validate_release_source_pins(release, ROOT)
-    clean_room_preprod_release(
-        release,
-        ask_become_pass=ask_become_pass,
-        become_password_file=become_password_file,
-    )
-    privileged_stage = sys.platform != "darwin"
-    staged = False
-    if privileged_stage:
-        loader_archive, loader_manifest = stage_preprod_release(
-            release,
-            state="present",
-            ask_become_pass=ask_become_pass,
-            become_password_file=become_password_file,
-        )
-        staged = True
-    else:
-        loader_archive, loader_manifest = release.archive, release.manifest
-    values = {
-        "preprod_seed_archive": str(release.archive),
-        "preprod_seed_archive_sha256": release.archive_sha256,
-        "preprod_seed_manifest": str(release.manifest),
-        "preprod_seed_manifest_sha256": release.manifest_sha256,
-        "preprod_seed_load_archive": True,
-        "preprod_seed_require_fresh_load": True,
-        "preprod_seed_loader_archive": str(loader_archive),
-        "preprod_seed_loader_manifest": str(loader_manifest),
-    }
-    try:
-        ansible_command(
-            root=ROOT,
-            inventory=PREPROD_INVENTORY,
-            playbook=PREPROD_POSTGRES18_REHEARSAL_PLAYBOOK,
-            limit=None,
-            vault_id=None,
-            extra_vars=values,
-            ask_become_pass=ask_become_pass,
-            become_password_file=become_password_file,
-        )
-    finally:
-        if staged:
-            stage_preprod_release(
-                release,
-                state="absent",
-                ask_become_pass=ask_become_pass,
-                become_password_file=become_password_file,
-            )
-    print("SEEDED_PREPROD_POSTGRES18_REHEARSAL_PASSED")
-
-
 def cmd_prepare(args: argparse.Namespace) -> int:
     if not args.archive.is_absolute() or not args.manifest.is_absolute():
         fail("--archive and --manifest must be absolute paths")
@@ -928,24 +837,6 @@ def cmd_test_preprod(args: argparse.Namespace) -> int:
     test_preprod(
         release,
         load_archive=args.load_archive,
-        ask_become_pass=args.ask_become_pass,
-        become_password_file=(
-            normalize_become_password_file(args.become_password_file)
-            if args.become_password_file is not None
-            else None
-        ),
-    )
-    return 0
-
-
-def cmd_test_postgres18_preprod(args: argparse.Namespace) -> int:
-    release = read_release(
-        args.archive,
-        args.manifest,
-        required_scope=RELEASE_SCOPE_PREPROD,
-    )
-    test_postgres18_preprod(
-        release,
         ask_become_pass=args.ask_become_pass,
         become_password_file=(
             normalize_become_password_file(args.become_password_file)
@@ -2026,24 +1917,6 @@ def parser() -> argparse.ArgumentParser:
     )
     add_preprod_become_arguments(preprod)
     preprod.set_defaults(function=cmd_test_preprod)
-
-    postgres18_preprod = commands.add_parser(
-        "test-postgres18-preprod",
-        help=(
-            "clean-load an exact seed and rehearse PostgreSQL 16 to 18 in "
-            "local Ansible PreProd"
-        ),
-        epilog=(
-            "Example:\n  python3 -I scripts/update-images.py "
-            "test-postgres18-preprod "
-            "--archive /srv/aigw/candidate.preprod.docker.tar.zst "
-            "--manifest /srv/aigw/candidate.preprod.manifest.json"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    add_release_arguments(postgres18_preprod)
-    add_preprod_become_arguments(postgres18_preprod)
-    postgres18_preprod.set_defaults(function=cmd_test_postgres18_preprod)
 
     upgrade = commands.add_parser(
         "upgrade",

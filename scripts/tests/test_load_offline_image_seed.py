@@ -2194,7 +2194,7 @@ class OfflineImageSeedTests(unittest.TestCase):
 
         self.assertEqual(module.VALUE, 42)
 
-    def test_local_receipt_proves_loaded_ids_source_and_build_input_parity(self) -> None:
+    def test_local_receipt_proves_loaded_archive_tags_source_and_build_input_parity(self) -> None:
         manifest = self.schema_v2_manifest()
         self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
         self.manifest.chmod(0o600)
@@ -2203,11 +2203,10 @@ class OfflineImageSeedTests(unittest.TestCase):
             manifest, self.archive, "linux/arm64"
         )
         by_reference = {
-            image["reference"]: {
+            image["reference"].rsplit("@sha256:", 1)[0]: {
                 "Id": image["image_id"],
-                "RepoDigests": [
-                    "registry.example/base@sha256:" + "a" * 64
-                ],
+                # Docker does not restore RepoDigests from a saved archive.
+                "RepoDigests": [],
                 "Os": "linux",
                 "Architecture": "arm64",
             }
@@ -2287,6 +2286,9 @@ class OfflineImageSeedTests(unittest.TestCase):
 
         self.assertIn("ai-gateway/samba-ad:preprod", receipt["custom_images"])
         self.assertIn("ai-gateway/wif-provider-mock:preprod", receipt["custom_images"])
+        inspected = [call.args[-1] for call in client.run.call_args_list]
+        self.assertIn("registry.example/base:1", inspected)
+        self.assertNotIn(self.reference, inspected)
         builder.add_preprod_build_services.assert_called_once()
         builder._load_build_planner.assert_called_once_with(
             self.project, privileged=False

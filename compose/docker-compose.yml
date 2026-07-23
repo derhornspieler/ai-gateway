@@ -1690,9 +1690,8 @@ services:
 
 volumes:
   pg_data:
-    # The physical name is release state, not a Compose default. A PostgreSQL
-    # major migration points this at a fresh volume and preserves the PG16
-    # volume for the bounded pre-cutover rollback window.
+    # The fixed physical name keeps PostgreSQL 18 state explicit and makes a
+    # same-major backup or restore easy to verify.
     name: ${PG_DATA_VOLUME_NAME:?PG_DATA_VOLUME_NAME must be set}
   openwebui_data:
   vault_data:

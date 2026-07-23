@@ -607,9 +607,9 @@ first. A Cribl outage must not stop inference.
 Current source status:
 
 - Phases 0 through 4 are implemented and pass source-level tests.
-- The PostgreSQL 18 migrations pass a clean-volume and repeated
-  existing-volume check. Existing evidence survives, and mutation guards are
-  restored before commit.
+- The PostgreSQL 18 application-schema reconciler passes clean-volume and
+  repeated existing-volume checks. Existing evidence survives, and mutation
+  guards are restored before commit.
 - Phases 1 through 4 remain release-open until the same schema-v2 offline seed
   passes clean Ansible PreProd, browser, backup, restore, upgrade, rollback,
   Grafana, and Cribl acceptance.

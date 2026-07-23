@@ -130,8 +130,7 @@ still running, you can repeat only that test with:
 
 ```bash
 python3 -I scripts/test-preprod-model-lifecycle.py \
-  --image-mode seed \
-  --postgres-major 18
+  --image-mode seed
 ```
 
 The full release pass must include all six `PREPROD_MODEL_*` lifecycle

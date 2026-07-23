@@ -45,20 +45,14 @@ class OperatorBacklogContractTests(unittest.TestCase):
         ):
             self.assertIn(requirement, backlog)
 
-    def test_completed_release_reviews_remain_recorded(self) -> None:
+    def test_completed_image_review_remains_recorded(self) -> None:
         backlog = BACKLOG.read_text(encoding="utf-8")
         normalized_backlog = " ".join(backlog.split())
         tasks = TASKS.read_text(encoding="utf-8")
         version_review = VERSION_REVIEW.read_text(encoding="utf-8")
 
-        self.assertIn("PostgreSQL 18 rehearsal", normalized_backlog)
         self.assertIn("image/dependency version review", normalized_backlog)
         self.assertIn("PostgreSQL `18.4`", tasks)
-        self.assertIn(
-            "Rehearse the PostgreSQL 18 migration with production-sized data",
-            tasks,
-        )
-        self.assertIn("forced pre-cutover recovery", tasks)
         self.assertIn("## DHI release images", version_review)
         self.assertIn("## Other release images", version_review)
 

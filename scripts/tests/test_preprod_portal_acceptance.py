@@ -75,6 +75,21 @@ def load_portal_identity_flow_module():
 
 
 class PreprodPortalAcceptanceTests(unittest.TestCase):
+    def test_local_acceptance_harnesses_are_postgres18_only(self) -> None:
+        harnesses = (
+            E2E,
+            MODEL_LIMIT_E2E,
+            MODEL_LIFECYCLE_E2E,
+            USAGE_ACCOUNTING_E2E,
+        )
+        for harness in harnesses:
+            source = harness.read_text(encoding="utf-8")
+            with self.subTest(harness=harness.name):
+                self.assertNotIn("--postgres-major", source)
+                self.assertNotIn("--confirm-postgres16-rehearsal", source)
+                self.assertNotIn("docker-compose.preprod-postgres16.yml", source)
+                self.assertNotIn("POSTGRES16_OVERLAY", source)
+
     def test_form_parser_matches_browser_checkbox_and_radio_submission(self) -> None:
         module = load_portal_identity_flow_module()
         forms = module.parse_forms(

@@ -17,7 +17,6 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_DIR = ROOT / "compose"
 ENV_FILE = COMPOSE_DIR / "secrets/preprod.env"
 SEED_OVERLAY = COMPOSE_DIR / "secrets/preprod-seed-images.yml"
-POSTGRES16_OVERLAY = COMPOSE_DIR / "docker-compose.preprod-postgres16.yml"
 PROJECT = "aigw-preprod"
 MAX_OUTPUT_BYTES = 1024 * 1024
 
@@ -407,7 +406,7 @@ def read_environment() -> dict[str, str]:
     return values
 
 
-def compose_prefix(postgres_major: str) -> list[str]:
+def compose_prefix() -> list[str]:
     if shutil.which("docker") is None:
         fail("docker is required for the model lifecycle test")
     values = read_environment()
@@ -446,8 +445,6 @@ def compose_prefix(postgres_major: str) -> list[str]:
         "-f",
         str(SEED_OVERLAY),
     ]
-    if postgres_major == "16":
-        command.extend(["-f", str(POSTGRES16_OVERLAY)])
     command.extend(["--profile", "preprod"])
     return command
 
@@ -455,11 +452,10 @@ def compose_prefix(postgres_major: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-mode", choices=("seed",), default="seed")
-    parser.add_argument("--postgres-major", choices=("16", "18"), default="18")
-    args = parser.parse_args()
+    parser.parse_args()
 
     command = [
-        *compose_prefix(args.postgres_major),
+        *compose_prefix(),
         "exec",
         "-T",
         "admin-portal",

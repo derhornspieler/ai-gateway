@@ -685,14 +685,7 @@ def collect_project_image_reference_scopes(
             compose_root / "docker-compose.platform-dns.yml",
         ) if path.is_file()),
     ]
-    preprod_only_paths = [
-        path
-        for path in (
-            compose_root / "docker-compose.preprod.yml",
-            compose_root / "docker-compose.preprod-postgres16.yml",
-        )
-        if path.is_file()
-    ]
+    preprod_only_paths = [compose_root / "docker-compose.preprod.yml"]
     if services_root.is_dir():
         for path in sorted(services_root.glob("**/Dockerfile*")):
             relative = path.relative_to(services_root)

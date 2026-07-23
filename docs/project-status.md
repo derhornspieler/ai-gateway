@@ -39,6 +39,9 @@ before it changes anything.
 - `scripts/update-images.py` pulls exact pins, builds custom images, creates
   schema-v2 offline seeds, tests the preprod seed, and provides the guarded
   remote upgrade and rollback flow.
+- Fresh production and preprod deployments use PostgreSQL 18. Same-major image
+  updates, encrypted backups, and same-major restores are supported. The image
+  updater refuses PostgreSQL major changes.
 - Operators select Envoy providers from a reviewed catalog. The image contains
   only the chosen routes and CA files. Anthropic is the only approved provider
   in this release.
@@ -48,8 +51,8 @@ before it changes anything.
 - The current source has an append-only, prompt-free usage ledger, five token
   price classes, immutable future and backdated prices, read-only Grafana usage
   views, and bounded accounting-gap audit events. Existing PostgreSQL volumes
-  run the governance and usage migrations in order and must return both schema
-  receipts before consumers start. This source still needs the current
+  run the governance and usage schema updates in order and must return both
+  schema receipts before consumers start. This source still needs the current
   exact-seed acceptance run described below.
 - Seed mode uses exact image IDs. It disables pulls and source builds.
 - Open WebUI uses the chat-only `0.10.2-aigw2` derivative. Its root filesystem
@@ -61,32 +64,20 @@ before it changes anything.
 ## Last accepted exact-seed evidence
 
 The release built from commit `77c50d3` is the last candidate that passed the
-full exact-seed test. This is historical evidence. Later source changes affect
-runtime images and configuration, so this seed is not the current release.
+full exact-seed test. This is historical evidence only. It included a retired
+database test path and does not match the current image inventory. Do not load
+or promote its files. Later source changes also affect runtime images and
+configuration, so a new release test is required.
 
-The Anthropic-only ARM64 production release had 23 external and 17 custom
-images. The matching PreProd release had 25 external and 19 custom images. The
-PreProd pair adds Samba AD, the WIF provider mock, their build base, and the
-archive-only PostgreSQL 16.14 migration source. Exact file hashes, the Envoy
-image ID, and the provider-policy hash are in
-[TASKS.md](../TASKS.md#complete-current-candidate-release-acceptance).
+The still-relevant results were:
 
-That historical seed passed these local release checks:
-
-1. Ansible proved a clean boundary and freshly loaded all 44 PreProd images.
-2. The full PostgreSQL 16.14 stack passed application and Cribl checks.
-3. Each application database received more than 128 MiB of fixed test data.
-4. A forced pre-cutover failure restarted the unchanged PostgreSQL 16 source
-   and passed the full checks again.
-5. Logical restore to PostgreSQL 18.4 kept the Keycloak, LiteLLM, and rotator
-   table owners and grants. Each restricted service role could read and write.
-6. PostgreSQL 18 passed the full checks. A real downgrade request then failed
-   closed without changing data after writes opened.
-7. A PostgreSQL 18 physical backup and restore passed the full checks again.
-8. A second fresh seed load started the ordinary PostgreSQL 18 graph and
-   passed the application, identity, WIF, and Cribl checks.
-9. Final exact-manifest cleanup removed every owned container, seed image,
-   volume, network, hosts entry, and loopback alias. It preserved all unrelated
+1. Ansible proved a clean local boundary and loaded an exact seed.
+2. The ordinary PostgreSQL 18 graph passed application, identity, WIF, and
+   Cribl checks.
+3. A same-major PostgreSQL 18 physical backup and restore kept the required
+   application data and database permissions.
+4. Final exact-manifest cleanup removed every owned container, seed image,
+   volume, network, hosts entry, and loopback alias. It preserved unrelated
    image IDs.
 
 The browser controller available during that run could not start a browser.

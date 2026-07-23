@@ -230,7 +230,26 @@ class ReleaseContainerSecurityWorkflowTests(unittest.TestCase):
             len(scopes[SEED.RELEASE_SCOPE_PRODUCTION]),
         )
         self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PRODUCTION]), 24)
-        self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PREPROD]), 26)
+        self.assertEqual(len(scopes[SEED.RELEASE_SCOPE_PREPROD]), 25)
+        for scope in (SEED.RELEASE_SCOPE_PRODUCTION, SEED.RELEASE_SCOPE_PREPROD):
+            postgres = {
+                reference
+                for reference in scopes[scope]
+                if reference.startswith("dhi.io/postgres:")
+            }
+            self.assertEqual(
+                postgres,
+                {
+                    "dhi.io/postgres:18.4@sha256:"
+                    "a807e832c1fc9ded731956abcb53dc98ed003fd82e27275eaef8dcf52fb90236"
+                },
+            )
+            self.assertFalse(
+                any(
+                    reference.startswith("dhi.io/postgres:16")
+                    for reference in scopes[scope]
+                )
+            )
         for required in (
             "plan_egress_policy",
             "render_deployable_compose_model",

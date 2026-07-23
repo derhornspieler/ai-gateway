@@ -28,9 +28,9 @@ PINNED_FRONTEND = (
     "docker/dockerfile:1.25.0@sha256:"
     "0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12"
 )
-PINNED_PREPROD_POSTGRES16 = (
-    "dhi.io/postgres:16.14@sha256:"
-    "47a12e559e8c418ed54e27da521efcbf4c00fc1c26e86eb58d82845afd7c57c7"
+PINNED_POSTGRES18 = (
+    "dhi.io/postgres:18.4@sha256:"
+    "a807e832c1fc9ded731956abcb53dc98ed003fd82e27275eaef8dcf52fb90236"
 )
 
 
@@ -1149,10 +1149,10 @@ class OfflineImageSeedBuilderTests(unittest.TestCase):
         scopes = builder.collect_project_image_reference_scopes(project_root)
         references = scopes["preprod"]
 
-        self.assertEqual(len(references), 26)
+        self.assertEqual(len(references), 25)
         self.assertIn(PINNED_DEBIAN, references)
         self.assertIn(PINNED_FRONTEND, references)
-        self.assertIn(PINNED_PREPROD_POSTGRES16, references)
+        self.assertIn(PINNED_POSTGRES18, references)
         self.assertIn(
             "dhi.io/golang:1.26.5-alpine-dev@sha256:"
             "711ea0b8f09f549c50f2f550dc26859d3e6441ca11d5640caecf69c29a862f0c",
@@ -1160,8 +1160,21 @@ class OfflineImageSeedBuilderTests(unittest.TestCase):
         )
         self.assertNotIn(PINNED_DEBIAN, scopes["production"])
         self.assertIn(PINNED_DEBIAN, scopes["preprod"])
-        self.assertNotIn(PINNED_PREPROD_POSTGRES16, scopes["production"])
-        self.assertIn(PINNED_PREPROD_POSTGRES16, scopes["preprod"])
+        for scope in ("production", "preprod"):
+            self.assertEqual(
+                {
+                    reference
+                    for reference in scopes[scope]
+                    if reference.startswith("dhi.io/postgres:")
+                },
+                {PINNED_POSTGRES18},
+            )
+            self.assertFalse(
+                any(
+                    reference.startswith("dhi.io/postgres:16")
+                    for reference in scopes[scope]
+                )
+            )
         self.assertIn(
             "dhi.io/golang:1.26.5-alpine-dev@sha256:"
             "711ea0b8f09f549c50f2f550dc26859d3e6441ca11d5640caecf69c29a862f0c",
@@ -1199,9 +1212,6 @@ class OfflineImageSeedBuilderTests(unittest.TestCase):
             )
             compose.joinpath("docker-compose.preprod.yml").write_text(
                 f"services:\n  preprod:\n    image: {preprod_reference}\n"
-            )
-            compose.joinpath("docker-compose.preprod-postgres16.yml").write_text(
-                "services:\n  postgres:\n    image: " + preprod_reference + "\n"
             )
             service.joinpath("Dockerfile").write_text("FROM scratch\n")
 

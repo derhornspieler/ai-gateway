@@ -2258,19 +2258,17 @@ def local_release_receipt(
         raise SeedError("local release manifest does not exactly match current source pins")
 
     for image in external_images:
-        record = _inspect_local_release_image(client, image["reference"])
-        repo_digests = record.get("RepoDigests") or []
-        pinned_digest = image["reference"].rsplit("@sha256:", 1)[1]
+        # `docker image save` stores an ordinary tag, not the registry's
+        # RepoDigest metadata. After a clean transfer and `docker image load`,
+        # inspect that archived tag and bind it to the exact manifest image ID.
+        # The archive allow-list below independently proves the saved config
+        # digest matches the reviewed digest-pinned source reference.
+        archive_reference = image["reference"].rsplit("@sha256:", 1)[0]
+        record = _inspect_local_release_image(client, archive_reference)
         if (
             record.get("Id") != image["image_id"]
-            or not isinstance(repo_digests, list)
-            or not any(
-                isinstance(value, str)
-                and value.endswith(f"@sha256:{pinned_digest}")
-                for value in repo_digests
-            )
             or not _local_release_image_has_platform(
-                client, image["reference"], record, platform
+                client, archive_reference, record, platform
             )
         ):
             raise SeedError(f"local external image does not match release: {image['reference']}")

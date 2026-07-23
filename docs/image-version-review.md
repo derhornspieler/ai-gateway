@@ -23,10 +23,10 @@ from each reviewed source. Version selection is complete. Runtime acceptance
 is not: the current source now renders 26 long-running services in normal
 PreProd and still needs a new exact-seed test.
 
-The last accepted seed ran 25 long-running services. It passed the full
-Ansible test, the PostgreSQL 16-to-18 move, rollback, downgrade refusal,
-physical restore, and final cleanup. That result is historical evidence, not a
-pass for the new image digests and feature changes.
+The last accepted seed ran 25 long-running services. Its still-supported
+results include the full Ansible test, ordinary PostgreSQL 18 operation,
+same-major physical restore, and final cleanup. That result is historical
+evidence, not a pass for the new image digests and feature changes.
 
 One project published a newer upstream release after its matching Docker
 Hardened Image (DHI):
@@ -57,7 +57,6 @@ version and image variant.
 | Node Exporter | `1.12.1` | Current |
 | OAuth2 Proxy | `7.15.3` | Current |
 | OpenTelemetry Collector | `0.156.0-contrib` | Current |
-| PostgreSQL rehearsal source | `16.14` | Latest PostgreSQL 16 maintenance release |
 | PostgreSQL runtime | `18.4` | Latest stable PostgreSQL 18 maintenance release |
 | Prometheus | `3.13.1` | Current |
 | Python build image | `3.14.6-dev` | Current |

@@ -23,7 +23,6 @@ COMPOSE_DIR = ROOT / "compose"
 ENV_FILE = COMPOSE_DIR / "secrets/preprod.env"
 SEED_OVERLAY = COMPOSE_DIR / "secrets/preprod-seed-images.yml"
 CA_FILE = COMPOSE_DIR / "secrets/preprod-root-ca.pem"
-POSTGRES16_OVERLAY = COMPOSE_DIR / "docker-compose.preprod-postgres16.yml"
 PROJECT = "aigw-preprod"
 OWNER_LABEL = "com.aigw.preprod.project"
 CONFIG_LABEL = "com.aigw.preprod.config-digest"
@@ -993,7 +992,7 @@ def read_admin_password() -> str:
 class Preprod:
     """Run bounded commands against one exact seeded PreProd project."""
 
-    def __init__(self, postgres_major: str) -> None:
+    def __init__(self) -> None:
         if shutil.which("docker") is None:
             fail("docker is required for the usage-accounting test")
         values = read_environment()
@@ -1036,8 +1035,6 @@ class Preprod:
             "-f",
             str(SEED_OVERLAY),
         ]
-        if postgres_major == "16":
-            self.compose_prefix.extend(["-f", str(POSTGRES16_OVERLAY)])
         self.compose_prefix.extend(["--profile", "preprod"])
 
     def docker(
@@ -1507,11 +1504,10 @@ def bridge_and_wait(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-mode", choices=("seed",), default="seed")
-    parser.add_argument("--postgres-major", choices=("16", "18"), default="18")
-    args = parser.parse_args()
+    parser.parse_args()
 
     admin_password = read_admin_password()
-    preprod = Preprod(args.postgres_major)
+    preprod = Preprod()
     compose_model = preprod.model()
     suffix = secrets.token_hex(6)
     portal_started_at = int(time.time()) - 2

@@ -564,7 +564,6 @@ if ansible.is_file():
         "edge-tls.py",
         "load-offline-image-seed.py",
         "plan-compose-builds.py",
-        "postgres-major-migrate.py",
         "preserve-compose-rollbacks.py",
         "pre-upgrade-check.sh",
         "reconcile-openwebui-key.py",

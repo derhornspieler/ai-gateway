@@ -10,20 +10,19 @@ Schema v2 makes two file pairs from one build:
 | Scope | Contents | Use |
 | --- | --- | --- |
 | `production` | All production image references | A production VM |
-| `preprod` | Production plus test services, their base, and the PostgreSQL 16 migration source | Local preprod |
+| `preprod` | Production plus test services and their build base | Local preprod |
 
 The production archive has no preprod-only image bytes. Do not send the
 preprod pair to a production host.
 
 At this source revision, production has 24 external and 19 custom references,
-for 43 total. Preprod has 26 external and 21 custom references, for 47 total.
+for 43 total. Preprod has 25 external and 21 custom references, for 46 total.
 The production count now includes the Alertmanager base and custom image and
 the reviewed LiteLLM security derivative.
 Samba AD and the WIF provider mock are the two preprod-only custom services.
-Their Debian 13.6-slim base is also preprod-only. The last extra reference is
-the archive-only PostgreSQL 16 source used to rehearse the PostgreSQL 18
-migration. Ordinary PreProd deployment does not start it. None of these four
-extra references enters the production archive.
+Their Debian 13.6-slim base is also preprod-only. None of these three extra
+references enters the production archive. Both scopes contain the same exact
+PostgreSQL 18 runtime image; neither scope contains an older PostgreSQL major.
 
 Schema v1 is still accepted for old external-only seeds. Use schema v2 for all
 new releases.

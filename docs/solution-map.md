@@ -381,9 +381,8 @@ Envoy image and provider policy as one release unit.
   [project status](project-status.md#current-source-candidate).
 - Production LDAPS, TLS, Vault custody, Anthropic enrollment, Cribl, backup,
   and change-window steps need customer operators.
-- The production-sized PostgreSQL 16-to-18 local seeded-PreProd rehearsal
-  passed for the last accepted seed. The real Linux migration commands remain
-  a production maintenance-window gate; no rehearsal VM is required.
+- Fresh production and preprod installs use PostgreSQL 18. The release flow
+  supports same-major PostgreSQL 18 image updates and refuses a major change.
 - The protected GitHub environment has approved DHI credentials. The current
   commit still needs every exact image build and blocking security check.
 - The current exact-seed test, protected container scan, and live alert-path

@@ -225,21 +225,20 @@ security usage records do not create a separate alert stream.
 
 ## Deploy and rollback
 
-The PostgreSQL migration runs before the updated application is accepted.
-This includes a host with an existing PostgreSQL volume. After PostgreSQL is
-healthy and before database consumers start, Ansible runs the idempotent
-database reconciler. It runs `02-governance.sql` and then
-`03-usage-accounting.sql`. Each file must return its exact, content-free schema
-receipt. A missing receipt stops the converge.
+Fresh installs use PostgreSQL 18. After PostgreSQL is healthy and before
+database consumers start, Ansible runs the idempotent application-schema
+reconciler. This also runs on an existing PostgreSQL 18 volume. It runs
+`02-governance.sql` and then `03-usage-accounting.sql`. Each file must return
+its exact, content-free schema receipt. A missing receipt stops the converge.
 
-The migrations create append-only tables, mutation guards, and read-only
+The schema updates create append-only tables, mutation guards, and read-only
 report views. Re-running them keeps existing rows. The application role may
 read price policy and append usage evidence. It cannot update, delete,
 truncate, disable a guard, or own the schema.
 
-The usage callback, `key-rotator` image, database migration, and dashboard are
-one release unit. Test that exact unit through offline-seed loading and local
-preprod before production promotion.
+The usage callback, `key-rotator` image, application-schema update, and
+dashboard are one release unit. Test that exact unit through offline-seed
+loading and local preprod before production promotion.
 
 Rollback must keep the usage tables. Do not drop them and do not delete rows.
 An older application image may ignore the newer tables, but the evidence

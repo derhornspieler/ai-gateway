@@ -110,7 +110,7 @@ def _outer_backup(
         "created_at": "2026-01-01T00:00:00+00:00",
         "project": "ai-gateway",
         "deployment_profile": profile,
-        "postgres_version": "16.14",
+        "postgres_version": "18.4",
         "volumes": manifest_volumes,
         "running_services": ["postgres"],
         "images": ["example.invalid/image@sha256:" + "a" * 64],

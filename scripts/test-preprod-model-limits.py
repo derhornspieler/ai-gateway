@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_DIR = ROOT / "compose"
 ENV_FILE = COMPOSE_DIR / "secrets/preprod.env"
 SEED_OVERLAY = COMPOSE_DIR / "secrets/preprod-seed-images.yml"
-POSTGRES16_OVERLAY = COMPOSE_DIR / "docker-compose.preprod-postgres16.yml"
 PROJECT = "aigw-preprod"
 OWNER_LABEL = "com.aigw.preprod.project"
 MODEL = "claude-sonnet-4-5"
@@ -132,7 +131,7 @@ def read_environment() -> dict[str, str]:
 class Preprod:
     """Run commands against one exact, already verified PreProd project."""
 
-    def __init__(self, image_mode: str, postgres_major: str) -> None:
+    def __init__(self, image_mode: str) -> None:
         if shutil.which("docker") is None:
             fail("docker is required for the model-limit test")
         values = read_environment()
@@ -173,8 +172,6 @@ class Preprod:
             if not SEED_OVERLAY.is_file():
                 fail("seed mode requires the activated preprod image overlay")
             self.compose_prefix.extend(["-f", str(SEED_OVERLAY)])
-        if postgres_major == "16":
-            self.compose_prefix.extend(["-f", str(POSTGRES16_OVERLAY)])
         self.compose_prefix.extend(["--profile", "preprod"])
 
     def docker(self, *arguments: str) -> str:
@@ -278,10 +275,9 @@ def expect_error(status: int, body: Any, expected: int, message: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-mode", choices=("source", "seed"), default="source")
-    parser.add_argument("--postgres-major", choices=("16", "18"), default="18")
     args = parser.parse_args()
 
-    preprod = Preprod(args.image_mode, args.postgres_major)
+    preprod = Preprod(args.image_mode)
     marker = secrets.token_hex(8)
     virtual_key: str | None = None
     project = "preprod-limit-" + marker

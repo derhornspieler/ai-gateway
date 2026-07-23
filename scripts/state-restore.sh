@@ -78,9 +78,8 @@ python3 "$STACK_DIR/scripts/restore_archive.py" \
 rm -f "$staging/outer.tar.gz"
 
 # PostgreSQL major-version guard. This command restores the physical pg_data
-# archive, so source and target majors must match. A deliberate major move uses
-# postgres-major-migrate.py and the logical dumps in the same backup instead.
-# Same-major minor differences are allowed.
+# archive, so source and target majors must match. Cross-major physical restore
+# is unsupported. Same-major minor differences are allowed.
 backup_pg_major="$(python3 - "$staging/extracted/manifest.json" <<'PY'
 import json, re, sys
 v = str(json.load(open(sys.argv[1])).get("postgres_version", ""))
@@ -106,14 +105,13 @@ PY
 [[ "$backup_pg_major" == "$target_pg_major" ]] || {
   echo "restore refused: backup PostgreSQL major $backup_pg_major != deployed" \
        "major $target_pg_major — physical data directories cannot cross majors." \
-       "Use postgres-major-migrate.py for the reviewed logical migration." >&2
+       "Use a separately reviewed logical migration procedure." >&2
   exit 1
 }
 echo "PostgreSQL major $backup_pg_major matches the deployed pin." >&2
 
-# The PostgreSQL 18 Compose graph uses an explicit physical volume name so a
-# major migration can preserve the PostgreSQL 16 volume. Read the authenticated
-# restored .env as data; never source it as shell code.
+# The PostgreSQL 18 Compose graph uses an explicit physical volume name. Read
+# the authenticated restored .env as data; never source it as shell code.
 restored_pg_volume="$(python3 - "$staging/stack-config/.env" <<'PY'
 import re, sys
 values = [

@@ -211,13 +211,12 @@
     that:
       - pg_data_volume_name is string
       - pg_data_volume_name is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
-      - pg_data_volume_name != compose_project_name ~ '_pg_data'
+      - pg_data_volume_name == compose_project_name ~ '_pg18_data'
     quiet: true
     fail_msg: >-
-      PostgreSQL 18 must use a canonical fresh physical volume name. Never
-      point it at the legacy {{ compose_project_name }}_pg_data PG16 volume.
+      PostgreSQL must use the fixed fresh PostgreSQL 18 physical volume.
 
-- name: Inspect legacy and desired PostgreSQL volumes before deployment
+- name: Inspect an unsupported legacy PostgreSQL volume before deployment
   ansible.builtin.command:
     argv:
       - docker
@@ -225,71 +224,20 @@
       - unix:///run/docker.sock
       - volume
       - inspect
-      - "{{ item }}"
-  loop:
-    - "{{ compose_project_name }}_pg_data"
-    - "{{ pg_data_volume_name }}"
-  register: aigw_postgres_volume_transition
+      - "{{ compose_project_name }}_pg_data"
+  register: aigw_legacy_postgres_volume
   changed_when: false
   failed_when: false
 
-- name: Inspect the PostgreSQL major-migration receipt
-  ansible.builtin.stat:
-    path: "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
-    follow: false
-    get_checksum: false
-  register: aigw_postgres_migration_receipt_stat
-  changed_when: false
-
-- name: Read the PostgreSQL major-migration receipt
-  ansible.builtin.slurp:
-    src: "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
-  register: aigw_postgres_migration_receipt_raw
-  when: aigw_postgres_migration_receipt_stat.stat.exists | default(false)
-  no_log: true
-
-- name: Record the PostgreSQL major-migration receipt
-  ansible.builtin.set_fact:
-    aigw_postgres_migration_receipt: >-
-      {{
-        (aigw_postgres_migration_receipt_raw.content | b64decode | from_json)
-        if (aigw_postgres_migration_receipt_stat.stat.exists | default(false))
-        else {}
-      }}
-  no_log: true
-
-- name: Refuse a PostgreSQL 18 cutover without the exact logical-migration receipt
+- name: Refuse an unsupported legacy PostgreSQL volume
   ansible.builtin.assert:
     that:
-      - >-
-        aigw_postgres_volume_transition.results[0].rc != 0 or
-        (
-          aigw_postgres_volume_transition.results[1].rc == 0 and
-          (aigw_postgres_migration_receipt_stat.stat.isreg | default(false)) and
-          not (aigw_postgres_migration_receipt_stat.stat.islnk | default(false)) and
-          aigw_postgres_migration_receipt_stat.stat.uid == 0 and
-          aigw_postgres_migration_receipt_stat.stat.gid == 0 and
-          aigw_postgres_migration_receipt_stat.stat.mode == '0600' and
-          (aigw_postgres_migration_receipt_stat.stat.nlink | int) == 1 and
-          aigw_postgres_migration_receipt.format == 'aigw-postgres-major-migration-v1' and
-          aigw_postgres_migration_receipt.project == compose_project_name and
-          aigw_postgres_migration_receipt.source_major == '16' and
-          aigw_postgres_migration_receipt.target_major == '18' and
-          aigw_postgres_migration_receipt.source_volume == compose_project_name ~ '_pg_data' and
-          aigw_postgres_migration_receipt.target_volume == pg_data_volume_name and
-          aigw_postgres_migration_receipt.postgres_image ==
-            'dhi.io/postgres:18.4@sha256:a807e832c1fc9ded731956abcb53dc98ed003fd82e27275eaef8dcf52fb90236' and
-          aigw_postgres_migration_receipt.phase in ['migrated', 'writes_opened', 'validated'] and
-          ((aigw_postgres_volume_transition.results[1].stdout | from_json)[0].Labels['com.aigw.postgres.major'] | default('')) == '18' and
-          ((aigw_postgres_volume_transition.results[1].stdout | from_json)[0].Labels['com.aigw.postgres.migration-id'] | default('')) ==
-            aigw_postgres_migration_receipt.migration_id
-        )
+      - aigw_legacy_postgres_volume.rc != 0
     quiet: true
     fail_msg: >-
-      The legacy PostgreSQL 16 volume exists. Run ansible/migrate-postgres18.yml
-      with a new authenticated backup before an ordinary converge. The general
-      image-update workflow may not perform a PostgreSQL major upgrade.
-  no_log: true
+      An unsupported legacy PostgreSQL volume exists. This release supports a
+      fresh PostgreSQL 18 deployment only. Audit and remove or archive the old
+      volume before converging; Ansible will not delete database data.
 
 # Keycloak imports client secrets only while a realm is first created. The
 # post-bootstrap identity controller deliberately has no manage-clients role,
@@ -792,7 +740,6 @@
       - edge-tls.py
       - load-offline-image-seed.py
       - plan-compose-builds.py
-      - postgres-major-migrate.py
       - preserve-compose-rollbacks.py
       - pre-upgrade-check.sh
       - reconcile-openwebui-key.py
@@ -2923,31 +2870,6 @@
   register: verified_volume_init_permissions
   changed_when: false
   failed_when: verified_volume_init_permissions.stdout_lines | length > 0
-
-# Replacing the old PostgreSQL container is the last point where the exact
-# stopped PG16 graph can be restarted safely. Close that rollback window before
-# Compose touches PostgreSQL 18. Any later failure must keep PG18 and fix
-# forward; PostgreSQL does not support writing on 18 and then downgrading to 16.
-- name: Close the PostgreSQL 16 rollback window before PostgreSQL 18 starts
-  ansible.builtin.command:
-    argv:
-      - python3
-      - -I
-      - "{{ stack_dir }}/scripts/postgres-major-migrate.py"
-      - mark-writes-opened
-      - --receipt
-      - "{{ stack_dir }}/.state/postgres-major-migration-v1.json"
-      - --project
-      - "{{ compose_project_name }}"
-      - --target-volume
-      - "{{ pg_data_volume_name }}"
-  register: aigw_postgres_migration_writes_opened
-  changed_when: aigw_postgres_migration_receipt.phase == 'migrated'
-  failed_when: >-
-    aigw_postgres_migration_writes_opened.rc != 0 or
-    'POSTGRES_MIGRATION_WRITES_OPENED' not in aigw_postgres_migration_writes_opened.stdout
-  when: aigw_postgres_volume_transition.results[0].rc == 0
-  no_log: true
 
 - name: Start PostgreSQL before credential reconciliation
   community.docker.docker_compose_v2:

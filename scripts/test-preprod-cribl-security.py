@@ -954,7 +954,7 @@ def docker_endpoint(values: dict[str, str]) -> str:
 
 
 class Preprod:
-    def __init__(self, image_mode: str, postgres_major: str = "18") -> None:
+    def __init__(self, image_mode: str) -> None:
         if shutil.which("docker") is None:
             fail("docker is required for the preprod Cribl receipt test")
         self.image_mode = image_mode
@@ -977,10 +977,6 @@ class Preprod:
             if not SEED_OVERLAY.is_file():
                 fail("seed receipt testing requires the activated seed overlay")
             self.compose_prefix.extend(["-f", str(SEED_OVERLAY)])
-        if postgres_major == "16":
-            self.compose_prefix.extend(
-                ["-f", str(COMPOSE_DIR / "docker-compose.preprod-postgres16.yml")]
-            )
         self.compose_prefix.extend(["--profile", "preprod"])
         self.config_digest = self.values.get("AIGW_PREPROD_CONFIG_DIGEST", "")
         if re.fullmatch(r"[0-9a-f]{64}", self.config_digest) is None:
@@ -2779,26 +2775,18 @@ def exercise_outage_recovery(preprod: Preprod, model: dict[str, Any], token: str
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-mode", choices=("source", "seed"), default="source")
-    parser.add_argument("--postgres-major", choices=("16", "18"), default="18")
-    parser.add_argument("--confirm-postgres16-rehearsal", action="store_true")
     args = parser.parse_args()
-    if (args.postgres_major == "16") != args.confirm_postgres16_rehearsal:
-        fail("PostgreSQL 16 acceptance requires its fixed rehearsal confirmation")
     token = secrets.token_hex(8)
     tls_token = secrets.token_hex(8)
     outage_token = secrets.token_hex(8)
 
-    preprod = Preprod(args.image_mode, args.postgres_major)
+    preprod = Preprod(args.image_mode)
     preprod_arguments = [
         sys.executable,
         str(ROOT / "scripts/preprod.py"),
         "--image-mode",
         args.image_mode,
-        "--postgres-major",
-        args.postgres_major,
     ]
-    if args.postgres_major == "16":
-        preprod_arguments.append("--confirm-postgres16-rehearsal")
     # Reuse the main preprod guard before this script performs any mutation.
     guard = run([*preprod_arguments, "compose-config"])
     if "PREPROD_COMPOSE_VALID" not in guard:

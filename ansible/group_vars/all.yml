@@ -356,9 +356,8 @@ encrypted_state_paths:
   - "{{ docker_data_root }}"
   - "{{ stack_dir }}"
 compose_project_name: ai-gateway
-# PostgreSQL major versions never share a physical data directory. Existing
-# PostgreSQL 16 hosts must run ansible/migrate-postgres18.yml before converge;
-# clean deployments create this PostgreSQL 18 volume directly.
+# Fresh deployments create this fixed PostgreSQL 18 volume directly. Ansible
+# refuses an unsupported legacy database volume instead of deleting data.
 pg_data_volume_name: "{{ compose_project_name }}_pg18_data"
 aigw_domain: aigw.example.internal
 # Optional pre-Vault recovery bridge. Generic/customer inventories inherit no

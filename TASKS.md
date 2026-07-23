@@ -4,84 +4,35 @@
 
 <a id="complete-current-candidate-release-acceptance"></a>
 
-- [ ] **Complete the current source candidate release acceptance** - The
-  release built from `77c50d3` is the last fully tested exact seed. The current
-  source changes PreProd credentials, image digests, alerting, telemetry, model
-  controls, usage, and pricing. Runtime image inputs changed. Do not promote
-  the older archive as the current release. After the feature work settles,
-  build a new schema-v2 seed from the same candidate commit and repeat the
-  clean-room Ansible PreProd test before pushing that commit to `main`.
+- [ ] **Complete the current source candidate release acceptance** - Build and
+  test one release from the exact commit that will be pushed to `main`.
 
-  - Keep working when one external or environment-specific check cannot run.
-    Do not weaken that check or claim it passed. Finish every independent task
-    and list the exact uncompleted check, reason, evidence, and next command in
-    the final release summary. An unavailable outside dependency is a recorded
-    exception, not a reason to abandon the rest of the goal.
-
-  - The previous Anthropic-only ARM64 production release contains 23 external and 17
-    custom images. Its archive SHA-256 is
-    `45d6495e63ff09fca7d15579bea1878150c44d64e31203cc6c5b086128823390`.
-    Its manifest SHA-256 is
-    `d735d17e08d7720d1e6649b3fedbf4d95f62e3f4616cb23b6651eed5b52cac80`.
-  - The matching previous preprod release contains 25 external and 19 custom images.
-    Its archive SHA-256 is
-    `ac87381f624463f5badc8b0d2c35c8e80786ac939ffc24d369e04a52a21db119`.
-    Its manifest SHA-256 is
-    `3552fe7f29ff2190348093f374ee48e2368a131ac04b80c50ed0b988e1a41d3b`.
-  - That release's provider-policy digest is
-    `8c553d83bc98edeee4e1157368b8620ec6234e557b59a8195be6390677cdada6`.
-    The exact Envoy image ID is
-    `sha256:04f3d74c450509bdf288ec64fdbee584e616522f503428a3699442a48b8cc08f`.
-  - The release-grade run started with an exact Ansible clean room, loaded all
-    44 preprod image IDs from the archive, and kept pulls and source builds
-    disabled. All 25 long-running services were healthy on PostgreSQL 16.14.
-    The application and Cribl acceptance tests passed before and after the
-    forced pre-cutover recovery.
-  - The same run restored more than 128 MiB of deterministic data in each of
-    the Keycloak, LiteLLM, and rotator databases to the exact PostgreSQL 18.4
-    seed image. It proved each service role still owned and could read and
-    write its data, passed full application and Cribl checks, refused a real
-    PostgreSQL 16 downgrade without mutation after writes opened, restored a
-    same-major physical backup, and passed the full checks again. Receipt
-    SHA-256: `5be54a1d8cb4d918f4addb060101adb14f8d9631c1ae3401275b8319904a2085`.
-  - Accepted test boundary: the macOS exact-seed run did not literally execute
-    the Linux/root `state-backup.sh`, `postgres-major-migrate.py`, or the
-    `generic_rocky9` plays in `migrate-postgres18.yml`. Their unit, source, and
-    Ansible contracts passed. The real commands remain an approved maintenance-
-    window gate on the existing production Linux host. No rehearsal VM will be
-    created, and the local receipt does not claim those commands ran.
-  - The previous release passed 875 infrastructure contracts, 532 Python
-    service tests, four Go race/vet suites, Compose, identity, ShellCheck,
-    yamllint, Bandit, Ruff, dependency audit, documentation links, and Ansible
-    syntax checks.
-  - Final exact-manifest teardown removed 26 containers, 19 networks, 11
-    volumes, all 44 release aliases and image IDs, and six run-state files
-    while preserving all 16 unrelated image IDs. Separate read-only checks
-    found no owned container, seed image alias, volume, network, or hosts
-    entry. Reusable local test CA, keys, the private credential seed, and
-    rendered inputs remain by design so later PreProd deployments on this
-    controller use the same identity without publishing passwords.
-  - The current source creates one ignored 256-bit controller seed and derives
-    separate PreProd credentials from it. Missing or unsafe seed state fails
-    closed. The generated user passwords are read from owner-only files. WIF
-    provider tokens are now random, expire after ten minutes, and rotate on a
-    new exchange. Treat every older committed PreProd password and token as
-    compromised test data that must never be reused.
-  - The protected DHI secrets were added on 2026-07-22. The first rerun proved
-    DHI login and built three final images, then exposed two workflow defects:
-    Envoy used an unsupported Buildx exporter driver, and standalone Docker
-    Scout did not receive its documented backend credential variables. The
-    fixes pass local contract tests, a byte-for-byte two-build Envoy check, and
-    an isolated signed-VEX fetch with no Docker Desktop credential fallback.
-    Push them and require the complete GitHub image matrices to pass.
-  - Current-source checks are being rerun as the active features settle. Do not
-    copy an interim test count into release evidence. Record the final count
-    only after every source-level gate passes on the exact candidate commit.
-  - Real-browser acceptance is `NOT RUN` for the current candidate. A browser
-    controller is available now, but the exact seed is not running yet. The
-    browserless OIDC, cookie, role, logout, and callback tests do not replace
-    the browser checklist. Do not create a Rocky or Parallels test VM for this
-    gate.
+  - Build Anthropic-only schema-v2 production and PreProd archives for
+    `linux/arm64`. The manifests must use PostgreSQL 18.4 only. They must not
+    contain PostgreSQL 16 or a migration rehearsal image.
+  - Start with an Ansible clean room. Remove only resources and image IDs owned
+    by this PreProd release. Load the new archive, keep pulls and source builds
+    off, and deploy the whole `aigw.internal` stack through Ansible.
+  - Require every long-running service to become healthy on the fixed
+    `aigw-preprod_pg18_data` volume. Run identity, OIDC, portal, model,
+    key-lifecycle, usage, pricing, limit, alert, telemetry, and Cribl checks.
+  - Restart and unseal Vault, then repeat the acceptance checks. Test an
+    ordinary PostgreSQL 18 backup and same-major restore. Test the image-update
+    validation and rollback contracts without creating a Rocky or Parallels
+    VM.
+  - Run Compose, infrastructure, identity, Python service, Go race/vet,
+    ShellCheck, YAML, Ansible syntax, security, documentation-link, anchor, and
+    diagram gates on the exact candidate. Record only final counts and hashes.
+  - Use a real browser for the portal history and redirect checklist when a
+    browser controller is available. If it is unavailable, record that exact
+    gap and finish all other checks. Never call a browserless test a browser
+    pass.
+  - Tear down the tested deployment and delete its owned seed images, volumes,
+    networks, hosts block, and generated run state. Preserve unrelated Docker
+    resources and reusable ignored test credentials.
+  - Commit and push the validated candidate to `main`. Watch GitHub Actions,
+    fix failures, and push each validated fix. An unavailable external system
+    is a recorded exception, not a reason to abandon independent work.
 
 - [ ] **Prove one-time developer keys cannot return through browser history** -
   The portal now hides the key panel until its exit guards are active. It
@@ -406,24 +357,10 @@
 The dated `r7` through `r14` entries below are historical checkpoints. They do
 not approve the current source candidate.
 
-- [x] ~~Rehearse the PostgreSQL 18 migration with production-sized data~~
-  (2026-07-22)
-  - The exact 44-image ARM64 PreProd seed contained PostgreSQL 16.14 and 18.4.
-    Ansible started the complete PostgreSQL 16 graph and passed application and
-    Cribl checks before creating more than 128 MiB of fixed test data in each
-    application database.
-  - A forced failure before cutover restarted the unchanged source volume and
-    passed the full checks again. The logical move preserved table ownership
-    and grants. Keycloak, LiteLLM, and the rotator could each read and write
-    their restored data as their own restricted database role.
-  - PostgreSQL 18.4 passed the full application and Cribl checks. A real
-    PostgreSQL 16 command then failed closed after writes opened without
-    changing the target. A same-major physical backup and restore passed the
-    complete checks a final time.
-  - The exact-manifest teardown removed the whole deployment and all 44 seed
-    image IDs. No separate Rocky or Parallels rehearsal VM was created. The
-    migration SOP states that Git history gives no reason for the old
-    PostgreSQL 16 choice; any other explanation would be an inference.
+- [x] ~~Retire the PostgreSQL major-migration rehearsal~~ (2026-07-22) - The
+  product is a fresh PostgreSQL 18 deployment. The release seed, Ansible path,
+  tests, and active guides no longer carry PostgreSQL 16. Ordinary PostgreSQL
+  18 backup and same-major restore checks remain.
 
 <a id="review-every-container-image-and-language-dependency-version"></a>
 

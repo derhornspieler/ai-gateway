@@ -53,6 +53,11 @@ EVENTS = (
 
 
 class CriblSecurityFeedContractTests(unittest.TestCase):
+    def test_preprod_receipt_harness_is_postgres18_only(self) -> None:
+        self.assertNotIn("--postgres-major", PREPROD_RECEIPT)
+        self.assertNotIn("--confirm-postgres16-rehearsal", PREPROD_RECEIPT)
+        self.assertNotIn("docker-compose.preprod-postgres16.yml", PREPROD_RECEIPT)
+
     def test_keycloak_imports_have_the_exact_user_event_policy(self) -> None:
         for name in ("aigw-realm.json", "anthropic-wif-realm.json"):
             realm = json.loads(
