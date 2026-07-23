@@ -22,10 +22,10 @@ The current code provides these safety boundaries:
   a recent Keycloak login;
 - a draft never creates a LiteLLM deployment;
 - the controller rebuilds or checks active LiteLLM database models at startup;
-- the public `/v1/models` and `/models` routes remove hidden, retired,
+- the public `/v1/models` and `/models` routes remove custom, retired,
   unmanaged, and ambiguous database models;
-- a hidden active model can still be called by its exact name when the key is
-  allowed to use it;
+- an active custom model can still be called by its exact name when the key
+  is allowed to use it;
 - retirement is blocked while a Keycloak project still assigns the model;
 - the shared Open WebUI key is rebuilt from the filtered public model list;
 - the native LiteLLM admin edge blocks model and config mutation routes;
@@ -56,7 +56,7 @@ The gateway already has parts we can reuse:
 
 | Current part | What it does now | Main gap |
 | --- | --- | --- |
-| Governed model catalog | Keeps append-only draft, active, visible, hidden, and retired state tied to the loaded Envoy policy | New exact-seed, backup, restore, and rollback evidence is still open |
+| Governed model catalog | Keeps append-only draft, active, visible, custom, and retired state tied to the loaded Envoy policy | New exact-seed, backup, restore, and rollback evidence is still open |
 | Project model policy | Uses an explicit model set, default model, and per-model output controls | More limit types need separate product decisions |
 | Key limits | Keeps existing whole-key TPM, RPM, and budget controls; adds per-model request and fixed UTC-minute output controls | No per-user, rolling-window, or per-model money control is claimed |
 | Prompt-free usage ledger | Stores requested and actual model, stable user and project, five token classes, three cost sources, and completeness | New exact-seed reconciliation and rollback evidence is still open |
@@ -162,7 +162,7 @@ review, but each object needs one clear job.
 Use stable IDs for joins. Display names may change, but an old usage row must
 still resolve to the model and price version used at that time.
 
-## Plan 1: governed and hidden models
+## Plan 1: governed and custom models
 
 ### Admin workflow
 
@@ -170,13 +170,23 @@ Add a Models page to the admin portal. It should let an admin:
 
 1. Choose a provider from the providers in the loaded release receipt.
 2. Enter a gateway model name and the provider's model ID.
-3. Save the model as a draft. A draft is always hidden and cannot be called.
+3. Save the model as a draft. A draft is inert: not offered to users, not
+   callable, and not assignable until it is activated.
 4. Activate it. The controller creates the exact checked LiteLLM deployment.
-5. Assign it to one or more projects in a separate step.
-6. Call the hidden model by its exact name and check the normal Envoy path.
-7. Select **Show** only when it should appear in model discovery.
-8. Select **Hide** to remove it from discovery without stopping exact-name
-   calls by already allowed keys.
+   Operators call this a **custom model**: active, but excluded from
+   discovery until shown. It now appears, badged **custom**, in every
+   project's **Allowed models** checklist; no project gets it until an admin
+   checks it in, and a draft or retired model never appears in that
+   checklist.
+5. Assign it to one or more projects by checking it into each project's
+   Allowed models list. Once checked in, that project's users see and use it
+   like any other allowed model (portal dropdowns, tooling). Users outside
+   the granted projects never see it in discovery.
+6. Call the custom model by its exact name and check the normal Envoy path.
+7. Select **Show** only when it should appear in model discovery for every
+   allowed caller.
+8. Select **Hide** to return it to custom (out of discovery) without
+   stopping exact-name calls by already allowed keys.
 9. Remove every project assignment before selecting **Retire**.
 
 The portal supports these state changes now. Provider entitlement testing
@@ -198,20 +208,20 @@ row alone is never proof that a provider is present in the deployed release.
 
 ### Visibility rules
 
-- A hidden model stays out of `/v1/models`, even when a project may call it.
-- An assigned caller may call a hidden model by its exact gateway name.
+- A custom model stays out of `/v1/models`, even when a project may call it.
+- An assigned caller may call a custom model by its exact gateway name.
 - A public model appears only to callers that are allowed to use it.
-- The shared Open WebUI key receives only the public chat model set. A hidden
+- The shared Open WebUI key receives only the public chat model set. A custom
   model must not appear in browser chat during the first release.
-- Before loading the first hidden model, replace every non-admin wildcard or
+- Before loading the first custom model, replace every non-admin wildcard or
   empty model scope with an explicit effective model set. This includes portal
   keys and the shared Open WebUI key. A master-key management call may inspect
   the full catalog, but that response must never become a user discovery
   response.
-- The current meaning of an empty model allowlist must change from "all
-  configured models, including future models" to an explicit set of public
-  models allowed by the project. Otherwise a new hidden model could become
-  visible by accident.
+- An empty model allowlist means an explicit set of public models allowed by
+  the project, never "all configured models, including future models." A
+  custom model is never granted implicitly by an empty allowlist; a project
+  gets one only by an explicit check.
 - Retiring a model blocks new calls but keeps old usage and price joins valid.
 
 ### Runtime reconciliation
@@ -441,7 +451,7 @@ map into each project key and re-tunes existing keys when the policy changes.
 A model in the map must also be in the project's explicit model list. Portal
 keys and the shared Open WebUI key never use LiteLLM's empty or
 `all-proxy-models` wildcard. The Open WebUI key receives a sorted snapshot of
-the current public model list during each converge. This keeps a future hidden
+the current public model list during each converge. This keeps a future custom
 model from becoming allowed by accident.
 
 The pinned LiteLLM `v1.93.0` native Redis limiter can fall back to a local
@@ -631,7 +641,7 @@ Exit: the team can state which upstream features are safe to reuse.
 
 - Add schema migrations and rollback migrations.
 - Add the control API and admin pages.
-- Add hidden model, project assignment, and immutable price-version flows.
+- Add custom model, project assignment, and immutable price-version flows.
 - Keep runtime model changes behind a disabled feature flag.
 
 Exit: policy can be created, read, audited, backed up, restored, and rolled
@@ -640,11 +650,11 @@ back without changing live inference.
 ### Phase 2: runtime models and usage
 
 - Reconcile the model catalog to LiteLLM.
-- Enforce hidden discovery and exact assignment.
+- Enforce custom-model discovery exclusion and exact assignment.
 - Add normalized usage and configured-cost calculation.
 - Reconcile seeded totals with LiteLLM and provider-shaped fixtures.
 
-Exit: a hidden model works by exact name for one assigned project and stays
+Exit: a custom model works by exact name for one assigned project and stays
 absent from `/v1/models`.
 
 ### Phase 3: hard limits
@@ -723,7 +733,7 @@ changing an unknown cost to zero or by replaying the provider request.
 - Provider names must match the loaded Envoy release policy.
 - No admin request may carry a provider URL, hostname, route, CA, SNI, or
   credential.
-- `/v1/models` never returns a hidden model.
+- `/v1/models` never returns a custom model.
 - Old price versions cannot be edited or deleted.
 - Unknown price remains unknown and blocks a money limit.
 - Every new security and admin event uses the reviewed fixed-field Alloy log
@@ -752,7 +762,7 @@ changing an unknown cost to zero or by replaying the provider request.
 3. Remove only images owned by the candidate test.
 4. Load the exact seed with pulls and source builds disabled.
 5. Deploy `aigw.internal` with `ansible/preprod.yml`.
-6. Add one hidden Anthropic test model and a versioned test price.
+6. Add one custom Anthropic test model and a versioned test price.
 7. Assign it to one project and prove another project is denied.
 8. Prove it is absent from `/v1/models` and browser chat.
 9. Send normal, cached, retried, streaming, over-limit, and routing test calls.
@@ -778,7 +788,7 @@ changing an unknown cost to zero or by replaying the provider request.
 The source uses project-wide fixed UTC-minute output limits and one-admin
 price approval today. The owner still needs to decide:
 
-1. Are hidden models for API tools only, or should assigned users also see
+1. Are custom models for API tools only, or should assigned users also see
    them in Open WebUI later?
 2. Which additional controls are needed beyond maximum output per request and
    output tokens per fixed UTC minute?

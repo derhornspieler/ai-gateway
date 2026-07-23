@@ -283,7 +283,7 @@ The check uses a safe local name map. It does not need `/etc/hosts`. It proves:
   Prometheus, Alertmanager, the Grafana dashboard query, and Cribl through
   Alloy, then resolves after the fixture is reset;
 - in seed mode, a temporary governed model stays inert as a draft, works by
-  exact name while hidden, follows filtered discovery, refuses retirement
+  exact name while custom, follows filtered discovery, refuses retirement
   while a temporary project assigns it, then removes its test state and
   retires cleanly;
 - the exact production Envoy passes its immutable policy and CA startup gate; and

@@ -1,5 +1,50 @@
 version: 2
+
+# The docker entries below are WATCH SIGNALS, not merge candidates. Image
+# changes only ship through the reviewed image-update workflow (version
+# review, exact pin update, schema-v2 seed rebuild, full PreProd, GitHub
+# scans), so never merge a Dependabot image PR directly — even one that
+# happens to pass CI. Treat an image PR as the notification that a
+# publisher shipped a new tag or a rebuilt digest (for example a DHI
+# rebuild that clears an accepted finding), then close it and follow
+# docs/image-update-workflow.md.
+#
+# The dhi.io registry needs credentials stored as DEPENDABOT secrets
+# (Settings -> Secrets and variables -> Dependabot): DHI_USERNAME and
+# DHI_PASSWORD. Actions secrets are a separate store and are not visible
+# to Dependabot.
+registries:
+  dhi:
+    type: docker-registry
+    url: https://dhi.io
+    username: ${{secrets.DHI_USERNAME}}
+    password: ${{secrets.DHI_PASSWORD}}
+
 updates:
+  - package-ecosystem: docker
+    directories: ["/services/*"]
+    registries: [dhi]
+    schedule:
+      interval: weekly
+      day: monday
+      time: "11:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: docker-compose
+    directory: /compose
+    registries: [dhi]
+    schedule:
+      interval: weekly
+      day: monday
+      time: "11:15"
+      timezone: America/New_York
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

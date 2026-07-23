@@ -164,6 +164,47 @@ These diagrams show the release flow:
 - [CA review and rotation](architecture-diagrams.md#13-ca-capture-review-rotation-and-approval).
 - [Seed deploy and rollback](architecture-diagrams.md#14-offline-seed-validation-deployment-and-rollback).
 
+### How the CA pin is enforced, checked, and watched
+
+Three different jobs, three different tools. Do not mix them up.
+
+**1. Enforcement — Envoy, on every connection.** This is the part that
+drops bad traffic. The Envoy config
+(`services/egress-proxy/envoy.yaml.tmpl`) replaces the normal system trust
+store with one reviewed CA file and one exact name:
+
+```yaml
+validation_context:
+  trusted_ca: { filename: /etc/envoy/certs/<reviewed-provider-ca> }
+  match_typed_subject_alt_names:
+    - san_type: DNS
+      matcher: { exact: api.anthropic.com }
+```
+
+On every TLS handshake, Envoy checks that the provider's certificate chains
+to that one pinned CA and carries that exact name. If either check fails,
+the connection is dropped. This never pauses and never falls back to the
+system trust store.
+
+**2. Attestation — proving the pin itself is the reviewed one.** Two
+checks answer a different question: "is the CA file we trust still the file
+that was reviewed?"
+
+- At container start, Envoy's compiled entrypoint compares the baked-in CA
+  file against the reviewed fingerprints and refuses to start on any
+  mismatch.
+- Once a day, the admin-console canary re-checks the control plane's copy
+  of the pin against the same reviewed fingerprints and shows the result as
+  the "Pin verified" badge. This is a local file check. It opens no
+  connections.
+
+**3. Watching — telling an operator when traffic is dropped.** Envoy
+counts every failed certificate check. Alloy scrapes those counters into
+Prometheus, and an alert fires when real provider traffic is being dropped
+because a certificate did not chain to the pinned CA. See
+[observability operations](observability-operations.md) for the alert
+response steps.
+
 ## The CA stores are not interchangeable
 
 The project uses separate CA stores for separate jobs.
@@ -271,6 +312,11 @@ See the [Cribl queue and back-pressure rules](cribl-soc-handoff.md#queue-retry-a
 ## Short glossary
 
 - **CA:** A system or organization that signs TLS certificates.
+- **Custom model:** An active model an admin has not marked visible in
+  model discovery. It never reaches a project by default; an admin must
+  check it into that project's Allowed models list before that project's
+  users can see or use it. See the
+  [model lifecycle SOP](sop/model-lifecycle.md).
 - **Immutable:** Replaced with a new complete artifact instead of edited while
   running.
 - **OIDC:** The browser login protocol used with Keycloak.

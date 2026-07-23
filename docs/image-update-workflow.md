@@ -238,7 +238,7 @@ roles, WIF, LiteLLM, the exact
 production Envoy startup gate, and inference through the preprod-only TLS
 Envoy and provider mock. It also proves that only the bearer-authenticated
 LiteLLM receiver can create an AI request audit record. The same run checks the
-model-limit denial path; draft, hidden, discovery, and retirement behavior;
+model-limit denial path; draft, custom, discovery, and retirement behavior;
 Prometheus rule fault and recovery cases; the private
 Prometheus-to-Alertmanager-to-Grafana watchdog path; and the admitted log,
 metric, and trace mirror to the Cribl mock.

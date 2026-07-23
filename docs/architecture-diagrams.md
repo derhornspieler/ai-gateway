@@ -541,7 +541,7 @@ flowchart TD
   FULL[Full LiteLLM inventory] --> FILTER
   POLICY --> FILTER
   FILTER --> PUBLIC[Return only active, visible,<br/>caller-allowed models]
-  POLICY --> EXACT[Hidden active model:<br/>callable only by assigned exact name]
+  POLICY --> EXACT[Custom active model:<br/>callable only by assigned exact name]
   PROJECT --> RETIRE{Any live assignment remains?}
   RETIRE -- yes --> BLOCK[Block retirement]
   RETIRE -- no --> ABSENT

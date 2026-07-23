@@ -340,7 +340,7 @@ The run must prove:
 - WIF checks a real Keycloak JWT;
 - LiteLLM gets `pong` through the preprod-only TLS Envoy;
 - the reserved `aigw-auto` model returns HTTP 400 before provider dispatch;
-- a temporary model stays inert as a draft, works by exact name while hidden,
+- a temporary model stays inert as a draft, works by exact name while custom,
   follows filtered discovery, refuses retirement while a temporary project
   assigns it, then removes its test state and retires cleanly;
 - fixed alert faults activate and recover in the committed Prometheus rules,

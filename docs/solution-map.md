@@ -286,7 +286,7 @@ role owns that schema, so the application cannot edit or delete old evidence.
 The saved model policy is the source of truth. key-rotator checks and repairs
 the LiteLLM runtime copy, and it fails readiness on unmanaged or changed model
 rows. Public discovery shows only active, visible models allowed for the
-caller. An assigned hidden model remains callable only by its exact name.
+caller. An assigned custom model remains callable only by its exact name.
 
 A project may set a maximum output size per request and a fixed UTC-minute
 output quota for each allowed model. LiteLLM checks the request cap and makes

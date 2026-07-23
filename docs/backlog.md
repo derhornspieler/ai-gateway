@@ -26,7 +26,18 @@ One human plain-language review remains:
 2. Ask a production operator to review the production commands.
 3. Fix any sentence, command, or diagram they cannot follow the first time.
 4. Define any security word they do not know.
-5. Save the notes and final link report with release evidence.
+5. Give every security mechanism one "how it works" section that shows the
+   exact enforcing code or config next to the plain-language explanation,
+   and separates enforcement, attestation, and alerting. The egress CA-pin
+   section in the [security model](security-model.md#how-the-ca-pin-is-enforced-checked-and-watched)
+   is the pattern to follow.
+6. Extend that same pattern to the whole ecosystem: one reference section
+   per service (all 25, plus the controller tooling) that says in plain
+   words what the service does, who talks to it, shows the load-bearing
+   code or config excerpt, and names how an operator knows it is healthy
+   (health check, metric, alert, or log). Keep each section short; link to
+   the deep guides instead of repeating them.
+7. Save the notes and final link report with release evidence.
 
 ## Finish alert dashboard acceptance
 
@@ -108,6 +119,28 @@ Remaining work:
 7. Update the seed and image-update guides to explain ownership, write
    permission, custody, and integrity in plain language.
 
+## Publish dual-architecture offline seeds as downloadable artifacts
+
+Build the offline seed for both `linux/amd64` and `linux/arm64` from one
+tagged commit and publish the four files as downloadable artifacts, so an
+operator does not need a build machine. Open design questions to settle
+first:
+
+1. A seed archive is about 4 GB. GitHub release assets cap at 2 GiB per
+   file, so plain release uploads need split archives with checksums, while
+   a container-registry artifact (ORAS to GHCR) has no practical size
+   limit. Pick one.
+2. The seeds contain Docker Hardened Images pulled with the paid DHI
+   subscription. Publishing them to a public download point redistributes
+   licensed images. Legal review must decide public release, private
+   registry, or customer-scoped delivery before anything is published.
+3. Hosted CI runners may lack the disk for two full seed builds; the
+   workflow likely needs one platform per job or a larger runner, with the
+   protected DHI credentials environment.
+
+Until this lands, seeds are built locally with
+`update-images.py prepare` per platform and delivered by the operator.
+
 ## Explore Admin Portal access to Grafana dashboards
 
 A future convenience feature, not part of the current release. Compare a
@@ -123,7 +156,7 @@ tests, and rollback steps come before implementation.
 The current model-control work has a durable
 [implementation plan](model-governance-plan.md). It covers:
 
-- hidden models tied to the immutable provider release;
+- custom models tied to the immutable provider release;
 - per-model usage and hard limits;
 - admin-managed, effective-dated, and backdated token prices;
 - model, project, user, cache, and cost dashboards;
