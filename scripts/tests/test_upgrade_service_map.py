@@ -544,7 +544,9 @@ class UpdateImagesContractTest(unittest.TestCase):
                 ],
                 check=True,
             )
-            (root / "TASKS.md").write_text("local notes\n", encoding="utf-8")
+            (root / "operator-notes.local").write_text(
+                "local notes\n", encoding="utf-8"
+            )
             commit = TOOL.git_release(root, "test source")
             self.assertRegex(commit, r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 

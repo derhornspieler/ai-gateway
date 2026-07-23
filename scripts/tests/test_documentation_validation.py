@@ -35,7 +35,7 @@ class DocumentationValidationTests(unittest.TestCase):
         (root / "docs").mkdir()
         return temporary, root
 
-    def test_discovers_active_docs_and_skips_archive_generated_and_private(self) -> None:
+    def test_discovers_active_docs_and_skips_local_assistant_files(self) -> None:
         temporary, root = self.make_root()
         self.addCleanup(temporary.cleanup)
         (root / "README.md").write_text("# Home\n", encoding="utf-8")
@@ -74,10 +74,7 @@ class DocumentationValidationTests(unittest.TestCase):
         self.assertEqual(
             names,
             {
-                ".claude/agents/reviewer.md",
-                "CLAUDE.md",
                 "README.md",
-                "TASKS.md",
                 "docs/guide.md",
                 "docs/page.html",
                 "services/egress-proxy/README.md",

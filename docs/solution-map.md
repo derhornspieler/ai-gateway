@@ -387,7 +387,7 @@ Envoy image and provider policy as one release unit.
 - The protected GitHub environment has approved DHI credentials. The current
   commit still needs every exact image build and blocking security check.
 - The current exact-seed test, protected container scan, and live alert-path
-  acceptance are tracked in [TASKS.md](../TASKS.md).
+  acceptance are tracked in the [engineering backlog](backlog.md).
 
 Do not call the release production-approved until the dated gates in
 [project status](project-status.md) pass and the release owner accepts the

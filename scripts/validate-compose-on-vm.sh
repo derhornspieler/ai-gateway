@@ -21,10 +21,12 @@ root="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 cd "$root"
 
 # COPYFILE_DISABLE + discarding tar stderr silences macOS AppleDouble/xattr
-# noise; the working tree (minus VCS, agent worktrees, and runtime state) is
-# streamed straight into a fresh remote directory.
+# noise; the working tree (minus VCS, local assistant state, and runtime
+# state) is streamed straight into a fresh remote directory.
 COPYFILE_DISABLE=1 tar czf - \
-  --exclude='./.git' --exclude='./.claude' --exclude='./.state' . 2>/dev/null \
+  --exclude='./.git' --exclude='./.claude' --exclude='./.codex' \
+  --exclude='./AGENTS.md' --exclude='./CLAUDE.md' --exclude='./TASKS.md' \
+  --exclude='./.state' . 2>/dev/null \
   | ssh -o BatchMode=yes "$VM" \
       "rm -rf ${REMOTE} && mkdir -p ${REMOTE} && tar xzf - -C ${REMOTE} 2>/dev/null"
 

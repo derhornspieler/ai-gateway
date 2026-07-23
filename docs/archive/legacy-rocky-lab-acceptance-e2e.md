@@ -10,9 +10,9 @@ in [Production differences](#production-differences).
 
 It is authored to be executed top-to-bottom by an operator (or an orchestrator). Every
 command has been checked against the actual playbooks and scripts in this repo — nothing
-here is invented. Read [CLAUDE.md](../CLAUDE.md) once first; the invariants it lists
-(repo-root converges, pipelining as a confidentiality control, secrets on stdin only,
-two-pass converge) are load-bearing here.
+here is invented. The repository invariants (repo-root converges, pipelining as a
+confidentiality control, secrets on stdin only, two-pass converge) are load-bearing
+here.
 
 > **Edge-TLS mode used by this runbook.** The lab path below exercises
 > **`customer-intermediate`** end to end (operator supplies an intermediate CA

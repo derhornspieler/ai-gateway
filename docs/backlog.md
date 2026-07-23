@@ -1,12 +1,11 @@
 # Engineering backlog
 
-[TASKS.md](../TASKS.md) is the source of truth for task status. This page adds
-short notes for the largest open jobs. If the files differ, fix `TASKS.md`
-first.
+This page is the public engineering backlog. It contains product work only.
+Local assistant instructions, working notes, and task memory are not part of
+the repository.
 
-The production-size PostgreSQL 18 rehearsal and the image/dependency version
-review are complete. See the [dated version review](image-version-review.md)
-and the Done section in [TASKS.md](../TASKS.md#done).
+The PostgreSQL 18 release test and the image/dependency version review are
+complete. See the [dated version review](image-version-review.md).
 
 ## Finish the plain-language documentation review
 
@@ -23,8 +22,7 @@ The diagrams and main design guides were checked against the deployed code.
 The release test uses the offline seed in local Docker preprod. It does not use
 a Rocky or Parallels test VM.
 
-One human plain language review remains. It is tracked in
-[TASKS.md](../TASKS.md#run-a-new-operator-documentation-usability-review):
+One human plain-language review remains:
 
 1. Ask a new operator to follow local preprod with no verbal help.
 2. Ask a production operator to review the production commands.
@@ -67,6 +65,22 @@ a short waiver with an owner, reason, and end date.
 
 Publish a dated report. Include commands, tool versions, image IDs, findings,
 fixes, waivers, and remaining risk.
+
+## Recheck current upstream container findings
+
+The release scan stays red when an upstream image contains an unpatched high
+or critical finding. Do not hide these findings and do not add a broad local
+waiver. Keep the newest reviewed image pin until its publisher releases a
+fixed tag, a rebuilt digest, or a signed VEX statement that applies to the
+exact image.
+
+After a fix is available:
+
+1. Update the exact tag and digest.
+2. Build a new schema-v2 offline seed.
+3. Load that exact seed into local PreProd.
+4. Run the full Ansible, application, identity, telemetry, and rollback tests.
+5. Require the GitHub image scan to pass for the new image ID.
 
 ## Finish model controls, pricing, and routing
 

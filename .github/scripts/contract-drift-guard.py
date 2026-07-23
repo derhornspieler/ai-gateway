@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Advisory reviewer prompt: reviewed surface changed, contract suite did not.
 
-CLAUDE.md states the rule this enforces: "Exact-string contract tests pin the
-reviewed text ... Most edits there require a matching test/validator update —
-this is by design, not test brittleness."
+The repository convention this enforces: exact-string contract tests pin the
+reviewed text of the deployment surfaces, so most edits there require a
+matching test/validator update — by design, not test brittleness.
 
 Nothing mechanically reminds a reviewer of that. `scripts/tests` only fails when
 a pinned string *moves*; it stays green when a pull request adds a brand-new
@@ -94,7 +94,7 @@ def report(touched: dict[str, list[str]], evidence: list[str]) -> list[str]:
             lines.append(f"  - …and {len(paths) - 10} more")
     lines += [
         "",
-        "Per CLAUDE.md, edits to these surfaces normally require a matching "
+        "By repository convention, edits to these surfaces normally require a matching "
         "contract-test or validator update. If this change is genuinely "
         "assertion-free (a comment, a revert, a pure rename), say so in the "
         "review and move on — this guard never blocks a merge.",
@@ -131,7 +131,7 @@ def main() -> int:
         surfaces = ", ".join(sorted(touched))
         print(
             f"::warning title=Contract-test drift::{surfaces} changed with no "
-            "matching contract test or validator update. See CLAUDE.md — exact-string "
+            "matching contract test or validator update. Exact-string "
             "contract tests pin the reviewed text of these surfaces."
         )
     return 0

@@ -6,7 +6,7 @@ cost, backdated-price adjustment flow, and Grafana usage dashboard are built
 in the current source. They still need one exact offline-seed PreProd release
 test. Automatic routing remains a later, disabled-by-default project.
 The source backlog item is
-[model-aware usage, limits, catalog, cost, dashboards, and routing](../TASKS.md#add-model-aware-usage-limits-catalog-cost-dashboards-and-routing).
+[model controls, pricing, and routing](backlog.md#finish-model-controls-pricing-and-routing).
 
 The current release gates remain the first promotion priority. Source work may
 be built in parallel. Build the feature in small releases. Each

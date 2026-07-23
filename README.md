@@ -149,8 +149,8 @@ bash scripts/validate-compose.sh
   [container security](docs/docker-security.md)
 - Monitoring and logs: [observability](docs/observability-operations.md) and
   [Cribl telemetry handoff](docs/cribl-soc-handoff.md)
-- Current work: [project status](docs/project-status.md) and
-  [TASKS.md](TASKS.md)
+- Current work: [project status](docs/project-status.md) and the
+  [engineering backlog](docs/backlog.md)
 - Model governance and accounting: [model lifecycle SOP](docs/sop/model-lifecycle.md),
   [implementation plan](docs/model-governance-plan.md),
   [usage and cost accounting](docs/usage-and-cost-accounting.md), and

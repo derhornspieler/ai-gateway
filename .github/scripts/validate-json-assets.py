@@ -31,9 +31,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Editor/agent state, never deployed and never reviewed as a security artefact.
-EXCLUDED_PREFIXES = (".claude/",)
-
 
 def tracked_json_files() -> list[Path]:
     listed = subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -42,11 +39,7 @@ def tracked_json_files() -> list[Path]:
         text=True,
         check=True,
     ).stdout
-    return [
-        ROOT / name
-        for name in listed.split("\0")
-        if name and not name.startswith(EXCLUDED_PREFIXES)
-    ]
+    return [ROOT / name for name in listed.split("\0") if name]
 
 
 def reject_duplicate_keys(path: Path):

@@ -8,7 +8,6 @@ ROOT = Path(__file__).resolve().parents[2]
 SOP = ROOT / "docs/sop/vault-unseal-after-reboot.md"
 OPERATIONS = ROOT / "docs/operations.md"
 BACKLOG = ROOT / "docs/backlog.md"
-TASKS = ROOT / "TASKS.md"
 VERSION_REVIEW = ROOT / "docs/image-version-review.md"
 
 
@@ -36,7 +35,7 @@ class OperatorBacklogContractTests(unittest.TestCase):
         ):
             self.assertIn(heading, backlog)
         for requirement in (
-            "plain language",
+            "plain-language",
             "diagram",
             "heading bookmarks",
             "local Docker preprod",
@@ -48,11 +47,10 @@ class OperatorBacklogContractTests(unittest.TestCase):
     def test_completed_image_review_remains_recorded(self) -> None:
         backlog = BACKLOG.read_text(encoding="utf-8")
         normalized_backlog = " ".join(backlog.split())
-        tasks = TASKS.read_text(encoding="utf-8")
         version_review = VERSION_REVIEW.read_text(encoding="utf-8")
 
         self.assertIn("image/dependency version review", normalized_backlog)
-        self.assertIn("PostgreSQL `18.4`", tasks)
+        self.assertIn("| PostgreSQL runtime | `18.4` |", version_review)
         self.assertIn("## DHI release images", version_review)
         self.assertIn("## Other release images", version_review)
 

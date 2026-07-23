@@ -19,6 +19,13 @@ htmlcov/
 # workstation metadata
 .DS_Store
 
+# Local AI-assistant instructions and working memory — never commit
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
+TASKS.md
+
 # ansible
 *.retry
 .aigw-vault-pass

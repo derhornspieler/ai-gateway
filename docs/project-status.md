@@ -111,7 +111,8 @@ deployment state.
   provenance record, waivers, and remaining risk before release. The current
   DHI Alertmanager `0.33.1` image has an open gRPC HIGH finding on both
   architectures. DHI has no fixed digest or signed VEX yet. Keep the scan
-  blocking and follow the [durable recheck task](../TASKS.md#recheck-and-clear-the-dhi-alertmanager-security-finding).
+  blocking and follow the
+  [durable recheck task](backlog.md#recheck-current-upstream-container-findings).
 - **Production ceremonies:** customer TLS, external LDAPS, Vault key custody,
   Anthropic enrollment, production backups, the real Cribl endpoint, and final
   access approval need customer operators. This is operator-owned work.

@@ -21,7 +21,7 @@ from urllib.parse import unquote, urlsplit
 
 DOCUMENT_SUFFIXES = {".md", ".markdown", ".html", ".htm"}
 SKIPPED_DIRECTORIES = {"archive", "generated", "private", ".state"}
-ACTIVE_ROOT_DOCUMENTS = (Path("README.md"), Path("CLAUDE.md"), Path("TASKS.md"))
+ACTIVE_ROOT_DOCUMENTS = (Path("README.md"),)
 GENERATED_HTML_MARKERS = (
     '<body for="html-export"',
     "<body for='html-export'",
@@ -105,10 +105,6 @@ def discover_documents(root: Path) -> list[Path]:
         document = root / relative_path
         if document.is_file():
             documents.append(document)
-
-    agents = root / ".claude" / "agents"
-    if agents.is_dir():
-        documents.extend(path for path in agents.glob("*.md") if path.is_file())
 
     services = root / "services"
     if services.is_dir():

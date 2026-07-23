@@ -144,8 +144,8 @@ library inside Alertmanager `0.33.1` on both AMD64 and ARM64. gRPC `1.82.1`
 contains the fix. DHI had no rebuilt Alertmanager image and no signed VEX
 statement for this finding. Older DHI tags and the Alpine `0.33.1` image were
 not safer. Keep the newest Debian pin, keep the scan blocking, and recheck DHI.
-Do not create a local waiver. The durable acceptance steps are in
-[TASKS.md](../TASKS.md#recheck-and-clear-the-dhi-alertmanager-security-finding).
+Do not create a local waiver. The durable acceptance steps are in the
+[engineering backlog](backlog.md#recheck-current-upstream-container-findings).
 
 ## Sources and next review
 
