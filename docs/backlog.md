@@ -1,8 +1,6 @@
 # Engineering backlog
 
 This page is the public engineering backlog. It contains product work only.
-Local assistant instructions, working notes, and task memory are not part of
-the repository.
 
 The PostgreSQL 18 release test and the image/dependency version review are
 complete. See the [dated version review](image-version-review.md).
