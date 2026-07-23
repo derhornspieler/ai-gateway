@@ -1,70 +1,76 @@
-# Test a release in local Docker preprod
+# Bring up local preprod
 
-Use this SOP to prove a release works before it goes anywhere near
-production. The test loads the exact offline seed into your local Docker,
-deploys the whole stack with Ansible, and runs the acceptance checks.
+This guide brings the whole AI Gateway up on your own computer's Docker so
+you can click around and test it. Run every command from the top folder of
+this repository.
 
-The same command works on macOS or Windows Docker Desktop and on a rootful
-Linux Docker Engine. Docker Desktop reads your own release files directly.
-Rootful Linux first makes a private root-owned staging copy. You do not need
-to know the difference; the tool picks the right path.
-
-## Before you start
-
-You need:
-
-- this repository, with commands run from its root;
-- a running local Docker (Docker Desktop, or a rootful Linux Engine);
-- `ansible-playbook` and `ansible-vault` on `PATH`, with the collections
-  from `ansible-galaxy collection install -r ansible/requirements.yml`;
-- sudo rights for the bounded hosts block (and loopback aliases on macOS);
-- the release archive and manifest pair for your platform — or internet
-  access with a `dhi.io` login if you still need to build one.
-
-Your release files must be owned by you, and no other user may be able to
-write them. Normal copied permissions (mode `0644`) are fine. If a check
-rejects a file or folder, the error names the exact fix command.
-
-## Option A — test an existing seed
-
-Replace the sample paths with your absolute release paths:
+## The easy way — one command
 
 ```bash
-python3 -I scripts/update-images.py test-preprod \
-  --archive /absolute/private/path/aigw-2026-07-22-linux-arm64.preprod.docker.tar.zst \
-  --manifest /absolute/private/path/aigw-2026-07-22-linux-arm64.preprod.manifest.json \
-  --load-archive \
-  --ask-become-pass
+scripts/preprod-up.sh
 ```
 
-Use the `.preprod` pair, not the production pair.
+That is it. The script checks each thing you need, and if something is
+missing it stops and tells you the exact command to fix it. When everything
+is ready it builds the images and starts the whole stack. It asks for your
+computer password once, near the start.
 
-`--ask-become-pass` prompts once per Ansible play: twice on Docker Desktop
-(clean room, then deploy), and four times on a rootful Linux Docker host
-(root staging and its cleanup add two). This is normal. To avoid every
-prompt, keep a private sudo password file and pass
-`--become-password-file /absolute/private/path` instead. See
-[Local preprod](../preprod.md) for how to create that file safely.
+You need three things first. The script checks all three for you:
 
-## Option B — build a new seed, then test it
+1. **Docker Desktop**, installed and running.
+2. **Ansible.** If it is missing, the script tells you to run
+   `pip3 install ansible-core`.
+3. **A `dhi.io` login** so Docker can download the images. If you are not
+   logged in, run `docker login dhi.io` once, or use the offline seed way
+   below (which needs no login).
 
-When no seed files exist yet, one command builds all four release files and
-then runs the same full test. This build half needs internet access and a
-`dhi.io` login:
+The build takes a while the first time. When it finishes, open
+`https://chat.aigw.internal` in a browser. Every test login is written to
+one private file: `compose/secrets/preprod-test-logins.md`.
+
+## The offline seed way — no `dhi.io` login needed
+
+If your machine cannot download from `dhi.io`, use a release folder that
+already holds the two preprod files (the `.preprod.docker.tar.zst` archive
+and its `.preprod.manifest.json`). Point the script at that folder:
 
 ```bash
-install -d -m 0700 /absolute/private/path/releases/2026-07-22-linux-arm64
+scripts/preprod-up.sh --seed /path/to/your/release-folder
+```
+
+You never type a SHA-256. The script finds the two files and reads their
+hashes for you.
+
+## Skip the password prompt
+
+The script asks for your computer (sudo) password to set up local names. To
+avoid the prompt, keep the password in a private file and pass it:
+
+```bash
+scripts/preprod-up.sh --become-password-file "$HOME/.ssh/become"
+```
+
+See [Local preprod](../preprod.md) for how to make that file safely.
+
+## Build a fresh release seed to test
+
+The steps above deploy the current code. To build a brand-new offline seed
+from source and test it in one command (needs a `dhi.io` login):
+
+```bash
+install -d -m 0700 /absolute/private/path/releases/2026-07-23-linux-arm64
 python3 -I scripts/update-images.py prepare \
   --provider anthropic \
   --platform linux/arm64 \
-  --archive /absolute/private/path/releases/2026-07-22-linux-arm64/aigw-2026-07-22-linux-arm64.docker.tar.zst \
-  --manifest /absolute/private/path/releases/2026-07-22-linux-arm64/aigw-2026-07-22-linux-arm64.manifest.json \
+  --archive /absolute/private/path/releases/2026-07-23-linux-arm64/aigw-2026-07-23-linux-arm64.docker.tar.zst \
+  --manifest /absolute/private/path/releases/2026-07-23-linux-arm64/aigw-2026-07-23-linux-arm64.manifest.json \
   --test-preprod \
   --ask-become-pass
 ```
 
 Use `linux/amd64` for an x86 target. The preprod pair is written next to the
-production pair automatically.
+production pair. This is the release-engineer path; for a plain test, use the
+one-command way above.
 
 ## What success looks like
 

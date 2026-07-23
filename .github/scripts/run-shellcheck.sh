@@ -37,6 +37,7 @@ TARGETS=(
   scripts/aigw-runtime-up.sh
   scripts/e2e-fresh-vm-check.sh
   scripts/pre-upgrade-check.sh
+  scripts/preprod-up.sh
   scripts/rotate-vault-audit.sh
   scripts/state-backup.sh
   scripts/state-restore.sh
