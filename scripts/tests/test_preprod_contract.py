@@ -3410,10 +3410,12 @@ class PreprodContractTests(unittest.TestCase):
                 side_effect=[(200, identity), (200, provider)],
             ),
             mock.patch.object(module, "verify_edge_routes") as edge_routes,
+            mock.patch.object(module, "write_test_login_summary") as login_summary,
             mock.patch("sys.stdout", new_callable=io.StringIO),
         ):
             module.verify(mock.Mock())
         volume_init.assert_called_once()
+        login_summary.assert_called_once()
         alerting_graph.assert_called_once()
         edge_routes.assert_called_once()
         self.assertEqual(

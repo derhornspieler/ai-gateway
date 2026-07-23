@@ -191,6 +191,7 @@ tests:
         exp_alerts:
           - exp_labels:
               alert_class: egress-trust
+              job: envoy-egress
               owner: platform-operations
               severity: warning
             exp_annotations:
