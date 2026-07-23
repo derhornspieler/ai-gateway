@@ -38,7 +38,17 @@ ansible-config dump | grep PIPELINING
 
 The output must show `= True`. Stop if it shows the default `False`.
 
-## 2. Bootstrap the inventory
+## 2. Generate the inventory and secrets
+
+The easy path is the guided setup. Run the bootstrap with no options and
+answer its questions:
+
+```bash
+scripts/bootstrap-rocky9-production.py
+```
+
+It never shows a secret on screen. The direct form does the same thing
+with explicit options:
 
 ```bash
 scripts/bootstrap-rocky9-production.py \
@@ -47,12 +57,25 @@ scripts/bootstrap-rocky9-production.py \
   --vault-password-file /secure/path/mygateway.vault-password
 ```
 
-This generates the encrypted inventory and stack secrets under
-`ansible/inventory/generated/mygateway/`. Then edit
-`ansible/inventory/generated/mygateway/host_vars/mygateway.yml` and fill in
-your site values: addresses, domain, edge-TLS mode, and — for the offline
-image path — the five `offline_image_seed_*` values from
+Both forms create these files under
+`ansible/inventory/generated/mygateway/`:
+
+| File | What it is | Do you edit it? |
+| --- | --- | --- |
+| `hosts.yml` | The inventory Ansible reads | No |
+| `host_vars/mygateway.yml` | Your site settings | **Yes — this is the one file you fill in** |
+| `group_vars/production_rocky9/vault.yml` | All stack passwords, generated randomly and stored encrypted | Only with `ansible-vault edit`, and normally never |
+| `group_vars/production_rocky9/vault-unseal.yml` | The encrypted Vault unseal key | Never by hand — step 5 creates it |
+
+Open `host_vars/mygateway.yml`. The file explains itself in plain words at
+the top. Fill in SECTION 1 (your VM's addresses, interfaces, DNS, and
+domain), pick one HTTPS mode in SECTION 5, and — for the offline image
+path — set the five `offline_image_seed_*` values from
 [stage a production pair](../offline-image-seed.md#stage-a-production-pair).
+Skip SECTION 3 and SECTION 4 for now; the file tells you when they apply.
+
+Never paste a decrypted password into `host_vars`. The generated secrets
+stay encrypted and the deploy reads them for you.
 
 ## 3. Preflight the VM
 

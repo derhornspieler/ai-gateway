@@ -3,6 +3,12 @@
 # `rocky9-production` is the canonical profile (Ansible group
 # production_rocky9); `generic-rocky9` remains the backwards-compatible
 # DEPRECATED alias and keeps working for previously generated inventories.
+#
+# In plain words: every <ANGLE_BRACKET> value is a placeholder. Replace it
+# with your site's real value. The generated file made by
+# scripts/bootstrap-rocky9-production.py explains each setting; the
+# operator checklist is docs/sop/production-new-deploy.md. This example
+# holds no secrets — passwords are generated encrypted by the bootstrap.
 aigw_generic_inventory_alias: production-aigw01
 deployment_profile: rocky9-production
 

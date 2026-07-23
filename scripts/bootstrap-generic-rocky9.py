@@ -472,6 +472,19 @@ def production_host_vars_document(alias: str) -> str:
 # SECTION 5 (edge TLS) requires you to choose exactly one mode before the
 # converge. SECTION 4 is an optional feature that ships disabled and fails
 # closed until every value is supplied.
+#
+# READ ME FIRST (plain words):
+# - This file holds your site's settings. No passwords live in this file.
+# - Fill in every empty "" value in SECTION 1. They describe your VM.
+# - All stack passwords were already made for you. They are stored
+#   encrypted in group_vars/production_rocky9/vault.yml beside this file.
+#   To view or change one, use `ansible-vault edit` on that file. Never
+#   copy a decrypted value into this file.
+# - SECTION 3 describes the one secret you add later, after the first
+#   deploy pass. Do not try to add it now.
+# - SECTION 4 is optional. Skip it unless you connect a company directory.
+# - SECTION 5 makes you pick one HTTPS certificate mode. The deploy will
+#   not start until you pick one.
 aigw_generic_inventory_alias: {alias}
 deployment_profile: rocky9-production
 
@@ -558,8 +571,20 @@ offline_image_seed_manifest_sha256: ""
 # converge auto-unseals from the encrypted controller custody. See
 # ansible/inventory/examples/production-rocky9.first-init.sh.example for the
 # exact runnable sequence.
+#
+# In plain words: run the first deploy. It leaves Vault new and locked.
+# Follow the runbook ceremony once to create Vault's keys. Then run the
+# store script above and type the unseal key when it asks. The key is
+# saved encrypted on this controller. Every later deploy unlocks Vault
+# for you automatically.
 
 # ── SECTION 4 — external AD / LDAPS inputs (optional, ships disabled) ────
+# In plain words: leave this whole section alone unless your company wants
+# its existing directory accounts (Active Directory) to log in here. If
+# you do enable it, fill every value below, and store the directory
+# password with the helper script named below — never type it into this
+# file.
+#
 # Binds this gateway's Keycloak to the CUSTOMER's existing Active Directory (or
 # another LDAPS directory) as a READ-ONLY user federation provider. Leave
 # identity_ldap_enabled false to keep local Keycloak users only; nothing below
@@ -596,6 +621,11 @@ identity_ldap_user_object_classes: "person, organizationalPerson, user"
 identity_ldap_user_filter: ""
 
 # ── SECTION 5 — edge TLS / PKI inputs (choose exactly one mode) ───────────
+# In plain words: pick the mode that matches what your security team gives
+# you. A signed certificate for this site's name = customer-supplied. An
+# intermediate CA certificate plus its private key = customer-intermediate.
+# Nothing yet, but your CA team can sign a request = vault-intermediate.
+#
 # HTTPS terminates at the two Traefik edges; container-to-container traffic
 # stays plain HTTP on segmented internal bridges. Select exactly one mode -- the
 # converge refuses to start without one. The private-key file paths below are
