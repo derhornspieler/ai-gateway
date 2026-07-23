@@ -257,8 +257,14 @@ def require_local_file(path: Path, suffix: str, label: str, maximum: int | None 
         fail(f"{label} must be a regular file, not a symlink")
     if metadata.st_uid != os.geteuid():
         fail(f"{label} must be owned by the user running this command")
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        fail(f"{label} must have mode 0600")
+    # Integrity comes from the SHA-256 checks; the mode only has to stop other
+    # users from rewriting the file. Read bits on a release artifact are safe,
+    # so a normal copied file (0644) is accepted as-is.
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        fail(
+            f"{label} must not be group- or world-writable"
+            f" (fix: chmod go-w {path})"
+        )
     if metadata.st_size < 1:
         fail(f"{label} must not be empty")
     if maximum is not None and metadata.st_size > maximum:

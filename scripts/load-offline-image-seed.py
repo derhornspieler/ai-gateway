@@ -242,10 +242,15 @@ def validate_regular_file(path: Path, label: str) -> os.stat_result:
 
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise SeedError(f"{label} must be a regular file, not a symlink")
-    if (metadata.st_uid, metadata.st_gid) != (ROOT_UID, ROOT_GID):
-        raise SeedError(f"{label} must be owned by root:root")
-    if _mode(metadata) != SEED_MODE:
-        raise SeedError(f"{label} mode must be 0600")
+    if metadata.st_uid != ROOT_UID:
+        raise SeedError(f"{label} must be owned by the loading user")
+    # Integrity comes from the SHA-256 checks; the mode only has to stop other
+    # users from rewriting the file. Read bits on a release artifact are safe,
+    # so a normal copied file (0644) with any group is accepted as-is.
+    if _mode(metadata) & 0o022:
+        raise SeedError(
+            f"{label} must not be group- or world-writable (fix: chmod go-w {path})"
+        )
     if metadata.st_size <= 0:
         raise SeedError(f"{label} must not be empty")
     return metadata
@@ -299,7 +304,7 @@ def configure_local_controller_docker(host: str) -> None:
     The normal loader remains root-only and fixed to ``/run/docker.sock``.
     Docker Desktop has neither that path nor a root-trusted Docker CLI, so its
     local rehearsal loads as the same non-root user that owns the selected
-    desktop Docker socket and the 0600 release files.
+    desktop Docker socket and the release files.
     """
 
     global ROOT_UID, ROOT_GID, FIXED_PATH, LOCAL_DOCKER_HOST, FIXED_DOCKER_ENV
@@ -2019,10 +2024,16 @@ def _validate_local_release_file(
         raise SeedError(f"local {label} is missing: {path}") from exc
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise SeedError(f"local {label} must be a regular file, not a symlink")
-    if (metadata.st_uid, metadata.st_gid) != (os.geteuid(), os.getegid()):
-        raise SeedError(f"local {label} must be owned by the invoking user and group")
-    if _mode(metadata) != SEED_MODE:
-        raise SeedError(f"local {label} mode must be 0600")
+    if metadata.st_uid != os.geteuid():
+        raise SeedError(f"local {label} must be owned by the invoking user")
+    # Integrity comes from the SHA-256 checks; the mode only has to stop other
+    # users from rewriting the file. Read bits on a release artifact are safe,
+    # so a normal copied file (0644) with any group is accepted as-is.
+    if _mode(metadata) & 0o022:
+        raise SeedError(
+            f"local {label} must not be group- or world-writable"
+            f" (fix: chmod go-w {path})"
+        )
     if metadata.st_size < 1:
         raise SeedError(f"local {label} must not be empty")
     if maximum_size is not None and metadata.st_size > maximum_size:

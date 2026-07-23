@@ -258,7 +258,8 @@ python3 -I scripts/load-offline-image-seed.py local-release-receipt \
 ```
 
 Run that command as the local Docker user, not root. It accepts only a local
-Unix Docker socket and caller-owned mode-`0600` files.
+Unix Docker socket and caller-owned files that no other user can write. A
+copied file with normal read permissions (mode `0644`) is fine.
 
 ## Recovery and retention
 

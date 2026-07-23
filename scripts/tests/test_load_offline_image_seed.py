@@ -549,6 +549,10 @@ class OfflineImageSeedTests(unittest.TestCase):
     def test_local_preprod_purge_plan_groups_only_canonical_reviewed_aliases(self) -> None:
         manifest = self.schema_v2_manifest()
         self.write_release_manifest(manifest)
+        # A copied release keeps the normal umask; the whole plan must accept
+        # caller-owned, non-writable 0644 files end to end.
+        self.archive.chmod(0o644)
+        self.manifest.chmod(0o644)
         builder, client, _ = self.purge_plan_builder(manifest)
 
         with (
@@ -650,8 +654,10 @@ class OfflineImageSeedTests(unittest.TestCase):
                 self.project,
             )
 
-        self.archive.chmod(0o644)
-        with self.assertRaisesRegex(loader.SeedError, "mode must be 0600"):
+        self.archive.chmod(0o664)
+        with self.assertRaisesRegex(
+            loader.SeedError, "must not be group- or world-writable"
+        ):
             loader.local_preprod_purge_plan(
                 self.archive,
                 self.archive_digest,
@@ -672,6 +678,30 @@ class OfflineImageSeedTests(unittest.TestCase):
                 self.manifest_digest,
                 self.project,
             )
+
+    def test_local_release_files_accept_safe_copied_permissions(self) -> None:
+        # A file copied by the operator keeps the normal umask (0644) and may
+        # keep a foreign group. Both are safe: integrity comes from the digest
+        # checks, and only writability by other users must stay closed.
+        self.archive.chmod(0o644)
+        loader._validate_local_release_file(
+            self.archive, "release archive", ".docker.tar.zst"
+        )
+        with mock.patch.object(
+            loader.os, "getegid", return_value=os.getegid() + 1
+        ):
+            loader._validate_local_release_file(
+                self.archive, "release archive", ".docker.tar.zst"
+            )
+        for unsafe_mode in (0o622, 0o646, 0o664, 0o666):
+            self.archive.chmod(unsafe_mode)
+            with self.assertRaisesRegex(
+                loader.SeedError, "must not be group- or world-writable"
+            ):
+                loader._validate_local_release_file(
+                    self.archive, "release archive", ".docker.tar.zst"
+                )
+        self.archive.chmod(0o600)
 
     def test_local_preprod_purge_plan_checks_source_build_and_oci_contracts(self) -> None:
         manifest = self.schema_v2_manifest()
@@ -1076,9 +1106,13 @@ class OfflineImageSeedTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_archive_digest_and_permissions_fail_closed(self) -> None:
-        self.archive.chmod(0o644)
-        with self.assertRaisesRegex(loader.SeedError, "mode must be 0600"):
+        self.archive.chmod(0o664)
+        with self.assertRaisesRegex(
+            loader.SeedError, "must not be group- or world-writable"
+        ):
             loader.validate_archive(self.archive, self.archive_digest)
+        self.archive.chmod(0o644)
+        loader.validate_archive(self.archive, self.archive_digest)
         self.archive.chmod(0o600)
         with self.assertRaisesRegex(loader.SeedError, "SHA-256"):
             loader.validate_archive(self.archive, "0" * 64)

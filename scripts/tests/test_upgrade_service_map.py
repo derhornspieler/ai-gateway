@@ -490,6 +490,32 @@ class UpdateImagesContractTest(unittest.TestCase):
                     linked_path, ".docker.tar.zst", "release archive"
                 )
 
+    def test_release_files_accept_safe_copied_permissions(self) -> None:
+        # An operator-copied archive keeps the normal umask (0644). That is
+        # safe: integrity comes from the digest checks, and only writability
+        # by other users must stay closed.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            root.chmod(0o700)
+            archive = root / "release.docker.tar.zst"
+            archive.write_bytes(b"archive")
+            for safe_mode in (0o600, 0o640, 0o644):
+                archive.chmod(safe_mode)
+                self.assertEqual(
+                    TOOL.require_local_file(
+                        archive, ".docker.tar.zst", "release archive"
+                    ),
+                    archive,
+                )
+            for unsafe_mode in (0o622, 0o646, 0o664, 0o666):
+                archive.chmod(unsafe_mode)
+                with self.assertRaisesRegex(
+                    TOOL.WorkflowError, "must not be group- or world-writable"
+                ):
+                    TOOL.require_local_file(
+                        archive, ".docker.tar.zst", "release archive"
+                    )
+
     def test_inventory_and_root_ca_reject_leaf_symlinks_before_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
