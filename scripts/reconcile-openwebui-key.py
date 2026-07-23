@@ -41,6 +41,7 @@ def request(
     path: str,
     master: str,
     *,
+    label: str,
     method: str = "GET",
     payload=None,
     base: str = BASE,
@@ -64,9 +65,9 @@ def request(
                 fail("LiteLLM management response exceeded 1 MiB")
             return response.status, json.loads(raw)
     except urllib.error.HTTPError as exc:
-        fail(f"LiteLLM management request failed: HTTP {exc.code}")
+        fail(f"{label} failed: HTTP {exc.code}")
     except (OSError, ValueError, json.JSONDecodeError):
-        fail("LiteLLM management request failed or returned invalid JSON")
+        fail(f"{label} failed or returned invalid JSON")
 
 
 def records(data) -> list[dict]:
@@ -85,7 +86,7 @@ def lookup(master: str, field: str, value: str) -> list[dict]:
     query = urllib.parse.urlencode(
         {field: value, "return_full_object": "true", "page": 1, "size": 100}
     )
-    _, data = request("/key/list?" + query, master)
+    _, data = request("/key/list?" + query, master, label="key lookup")
     return records(data)
 
 
@@ -93,7 +94,10 @@ def model_names(credential: str) -> list[str]:
     """Return one bounded, canonical model list visible to a credential."""
 
     _, data = request(
-        "/v1/models", credential, base=PUBLIC_MODELS_BASE
+        "/v1/models",
+        credential,
+        label="public model list",
+        base=PUBLIC_MODELS_BASE,
     )
     rows = data.get("data") if isinstance(data, dict) else None
     if not isinstance(rows, list) or not 0 < len(rows) <= MAX_MODELS:
@@ -177,7 +181,11 @@ def main() -> int:
     created = not by_alias
     if created:
         _, generated = request(
-            "/key/generate", master, method="POST", payload={**payload, "key": candidate}
+            "/key/generate",
+            master,
+            label="key creation",
+            method="POST",
+            payload={**payload, "key": candidate},
         )
         returned = generated.get("key") if isinstance(generated, dict) else None
         if not isinstance(returned, str) or hashlib.sha256(returned.encode()).hexdigest() != token_hash:
@@ -186,6 +194,7 @@ def main() -> int:
         request(
             "/key/update",
             master,
+            label="key update",
             method="POST",
             payload={**payload, "key": token_hash},
         )

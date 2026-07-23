@@ -124,6 +124,162 @@ class PreprodContractTests(unittest.TestCase):
         self.assertEqual(source["KEY_ROTATOR_EGRESS_POLICY_SHA256"], "")
         read_seed_value.assert_not_called()
 
+    def test_reprepare_regenerates_the_activated_seed_policy(self) -> None:
+        module = load_preprod_module()
+        image_id = "sha256:" + "a" * 64
+        policy = {
+            "schema_version": 1,
+            "egress_policy_sha256": "b" * 64,
+            "envoy_config_sha256": "c" * 64,
+            "selected_providers": ["anthropic"],
+            "providers": [
+                {
+                    "name": "anthropic",
+                    "api_hostname": "api.anthropic.com",
+                    "route_prefix": "/anthropic/",
+                    "sni": "api.anthropic.com",
+                    "exact_sans": ["api.anthropic.com"],
+                    "ca_file": "anthropic-ca.pem",
+                    "ca_bundle_sha256": "d" * 64,
+                    "ca_sha256_fingerprints": ["e" * 64],
+                    "provenance_sha256": "f" * 64,
+                }
+            ],
+            "envoy_image_id": image_id,
+        }
+        receipt = {
+            "schema_version": 2,
+            "release_scope": "preprod",
+            "manifest_sha256": "1" * 64,
+            "custom_images": {
+                module.ENVOY_EGRESS_IMAGE: {"image_id": image_id}
+            },
+            "egress_policy": policy,
+        }
+        args = types.SimpleNamespace(image_mode="seed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt_path = root / "receipt.json"
+            environment_path = root / "preprod.env"
+            provider_policy_path = root / "provider-policy.json"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            receipt_path.chmod(0o644)
+            base = {
+                name: "" for name in module.SEED_POLICY_ENVIRONMENT_NAMES
+            }
+            base["PG_DATA_VOLUME_NAME"] = "aigw-preprod_pg18_data"
+            with (
+                mock.patch.object(module, "SEED_RECEIPT", receipt_path),
+                mock.patch.object(module, "ENV_FILE", environment_path),
+                mock.patch.object(
+                    module, "PROVIDER_POLICY_RECEIPT", provider_policy_path
+                ),
+                mock.patch.object(
+                    module, "environment_values", return_value=base.copy()
+                ),
+            ):
+                activated = module.prepare_seed_policy(args)
+                module.render_environment(args, activated)
+
+            values = dict(
+                line.split("=", 1)
+                for line in environment_path.read_text(encoding="utf-8").splitlines()
+                if "=" in line
+            )
+            provider_policy = provider_policy_path.read_text(encoding="utf-8")
+
+        self.assertEqual(activated, policy)
+        self.assertEqual(values["AIGW_EGRESS_PROVIDERS"], "anthropic")
+        self.assertEqual(values["AIGW_EGRESS_POLICY_SHA256"], "b" * 64)
+        self.assertEqual(
+            values["KEY_ROTATOR_PROVIDER_POLICY_RECEIPT_FILE"],
+            "/run/secrets/provider_policy_receipt.json",
+        )
+        self.assertEqual(values["KEY_ROTATOR_EGRESS_POLICY_SHA256"], "b" * 64)
+        self.assertEqual(values["PG_DATA_VOLUME_NAME"], "aigw-preprod_pg18_data")
+        self.assertEqual(
+            provider_policy, module.canonical_provider_policy_receipt(policy)
+        )
+        self.assertIn("seed_policy = prepare_seed_policy(args)", self.script)
+        self.assertIn("render_environment(args, seed_policy)", self.script)
+
+    def test_unactivated_or_source_prepare_has_no_seed_policy(self) -> None:
+        module = load_preprod_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing.json"
+            provider_policy = root / "provider-policy.json"
+            provider_policy.write_text("old-policy\n", encoding="utf-8")
+            with (
+                mock.patch.object(module, "SEED_RECEIPT", missing),
+                mock.patch.object(
+                    module, "PROVIDER_POLICY_RECEIPT", provider_policy
+                ),
+            ):
+                self.assertIsNone(
+                    module.prepare_seed_policy(
+                        types.SimpleNamespace(image_mode="seed")
+                    )
+                )
+                self.assertEqual(provider_policy.read_text(encoding="utf-8"), "")
+                provider_policy.write_text("old-policy\n", encoding="utf-8")
+                self.assertIsNone(
+                    module.prepare_seed_policy(
+                        types.SimpleNamespace(image_mode="source")
+                    )
+                )
+                self.assertEqual(provider_policy.read_text(encoding="utf-8"), "")
+
+    def test_bad_activated_seed_receipt_fails_before_policy_mutation(self) -> None:
+        module = load_preprod_module()
+        cases = (
+            ("malformed", "{", 0o644),
+            (
+                "wrong-scope",
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "release_scope": "production",
+                        "manifest_sha256": "a" * 64,
+                    }
+                ),
+                0o644,
+            ),
+            (
+                "unsafe-mode",
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "release_scope": "preprod",
+                        "manifest_sha256": "a" * 64,
+                    }
+                ),
+                0o600,
+            ),
+        )
+        for name, content, mode in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                receipt = root / "receipt.json"
+                provider_policy = root / "provider-policy.json"
+                receipt.write_text(content, encoding="utf-8")
+                receipt.chmod(mode)
+                provider_policy.write_text("existing-policy\n", encoding="utf-8")
+                with (
+                    mock.patch.object(module, "SEED_RECEIPT", receipt),
+                    mock.patch.object(
+                        module, "PROVIDER_POLICY_RECEIPT", provider_policy
+                    ),
+                    self.assertRaises(SystemExit),
+                ):
+                    module.prepare_seed_policy(
+                        types.SimpleNamespace(image_mode="seed")
+                    )
+                self.assertEqual(
+                    provider_policy.read_text(encoding="utf-8"),
+                    "existing-policy\n",
+                )
+
     def test_postgres16_mode_is_fixed_to_confirmed_seed_rehearsal(self) -> None:
         module = load_preprod_module()
         parser = module.parser()
@@ -580,6 +736,7 @@ class PreprodContractTests(unittest.TestCase):
                     "local_docker_endpoint",
                     return_value="unix:///tmp/docker.sock",
                 ),
+                mock.patch.object(module, "wait_for_container") as wait,
                 mock.patch.object(module, "verify_secret_bearing_portal_network"),
                 mock.patch.object(
                     module, "compose", side_effect=[image, scope]
@@ -594,12 +751,14 @@ class PreprodContractTests(unittest.TestCase):
         self.assertNotIn(secret_input["master_key"], command)
         self.assertNotIn(secret_input["candidate_key"], command)
         self.assertTrue(runner.call_args.kwargs["sensitive"])
+        self.assertEqual(runner.call_args.kwargs["attempts"], 30)
         self.assertIn("--read-only", command)
         self.assertIn("no-new-privileges:true", command)
         self.assertIn("aigw-preprod-net-portal", command)
         self.assertTrue(
             any(value.endswith(":/reconcile.py:ro,Z") for value in command)
         )
+        wait.assert_called_once_with(args, "dev-portal", "healthy", 300)
         self.assertEqual(compose.call_count, 2)
 
     def test_openwebui_reconciliation_refuses_an_unowned_portal_endpoint(self) -> None:
@@ -2953,6 +3112,47 @@ class PreprodContractTests(unittest.TestCase):
                 ["true"],
                 environment_overrides={"AIGW_BIND_DIGEST_ALERTMANAGER": "bad"},
             )
+
+    def test_sensitive_command_retry_is_bounded_and_stays_redacted(self) -> None:
+        module = load_preprod_module()
+        failed = subprocess.CompletedProcess([], 1, "", "fixed safe error")
+        passed = subprocess.CompletedProcess([], 0, "receipt\n", "")
+        with (
+            mock.patch.object(
+                module.subprocess, "run", side_effect=[failed, passed]
+            ) as runner,
+            mock.patch.object(module.time, "sleep") as sleep,
+        ):
+            result = module.run(
+                ["true"],
+                input_text="secret-input",
+                capture=True,
+                sensitive=True,
+                attempts=2,
+            )
+        self.assertEqual(result.stdout, "receipt\n")
+        self.assertEqual(runner.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+        with (
+            mock.patch.object(
+                module.subprocess, "run", side_effect=[failed, failed]
+            ),
+            mock.patch.object(module.time, "sleep"),
+            self.assertRaisesRegex(SystemExit, "secret-bearing"),
+        ):
+            module.run(
+                ["true"],
+                input_text="secret-input",
+                capture=True,
+                sensitive=True,
+                attempts=2,
+            )
+        for invalid in (False, 0, 31):
+            with self.subTest(attempts=invalid), self.assertRaisesRegex(
+                SystemExit, "attempts"
+            ):
+                module.run(["true"], attempts=invalid)
 
     def test_root_seed_commands_use_the_prepared_callers_exact_docker_socket(self) -> None:
         if os.geteuid() == 0:

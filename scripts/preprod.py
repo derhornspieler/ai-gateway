@@ -436,8 +436,11 @@ def run(
     input_text: str | None = None,
     capture: bool = False,
     sensitive: bool = False,
+    attempts: int = 1,
     environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if type(attempts) is not int or not 1 <= attempts <= 30:
+        fail("local command attempts must be an integer from 1 through 30")
     environment = clean_environment()
     if environment_overrides:
         allowed_names = {
@@ -455,16 +458,21 @@ def run(
             if not valid:
                 fail("refusing an invalid Compose environment override")
         environment.update(environment_overrides)
-    result = subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        env=environment,
-        input=input_text,
-        text=True,
-        capture_output=capture,
-        check=False,
-    )
-    if result.returncode != 0:
+    for attempt in range(attempts):
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=environment,
+            input=input_text,
+            text=True,
+            capture_output=capture,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result
+        if attempt + 1 < attempts:
+            time.sleep(2)
+            continue
         if sensitive:
             fail("a secret-bearing local preprod command failed")
         if capture:
@@ -473,7 +481,7 @@ def run(
             if result.stderr:
                 print(result.stderr, end="", file=sys.stderr)
         fail(f"command failed with exit code {result.returncode}: {command[0]}")
-    return result
+    raise AssertionError("the bounded command loop did not return")
 
 
 def local_docker_endpoint() -> str:
@@ -2416,8 +2424,78 @@ def environment_values(args: argparse.Namespace) -> dict[str, str]:
     return values
 
 
-def render_environment(args: argparse.Namespace) -> None:
+def apply_seed_policy(
+    values: dict[str, str], policy: dict[str, Any]
+) -> None:
+    """Put one verified seed policy into the generated environment."""
+
+    values["AIGW_EGRESS_SOURCE_DATE_EPOCH"] = "0"
+    values["AIGW_EGRESS_PROVIDERS"] = ",".join(policy["selected_providers"])
+    values["AIGW_EGRESS_POLICY_SHA256"] = policy["egress_policy_sha256"]
+    values["KEY_ROTATOR_PROVIDER_POLICY_RECEIPT_FILE"] = (
+        "/run/secrets/provider_policy_receipt.json"
+    )
+    values["KEY_ROTATOR_EGRESS_POLICY_SHA256"] = policy[
+        "egress_policy_sha256"
+    ]
+
+
+def activated_seed_policy(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Return the policy from an already activated local seed, if present."""
+
+    if args.image_mode != "seed":
+        return None
+    try:
+        metadata = SEED_RECEIPT.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o644
+        or metadata.st_size < 2
+        or metadata.st_size > 512 * 1024
+    ):
+        fail("the activated preprod seed receipt is unsafe")
+    try:
+        receipt = json.loads(SEED_RECEIPT.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        fail("the activated preprod seed receipt is malformed")
+    manifest_sha256 = (
+        receipt.get("manifest_sha256") if isinstance(receipt, dict) else None
+    )
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema_version") != 2
+        or receipt.get("release_scope") != "preprod"
+        or not isinstance(manifest_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
+    ):
+        fail("the activated preprod seed receipt is not schema-v2 preprod")
+    return seed_egress_policy(receipt)
+
+
+def prepare_seed_policy(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Rebuild provider trust from an activated seed, or clear it."""
+
+    policy = activated_seed_policy(args)
+    content = (
+        canonical_provider_policy_receipt(policy)
+        if policy is not None
+        else ""
+    )
+    write_file(PROVIDER_POLICY_RECEIPT, content, 0o644)
+    return policy
+
+
+def render_environment(
+    args: argparse.Namespace, seed_policy: dict[str, Any] | None = None
+) -> None:
     values = environment_values(args)
+    if seed_policy is not None:
+        apply_seed_policy(values, seed_policy)
     content = "# Generated private PreProd credentials. Do not commit.\n"
     content += "".join(f"{name}={value}\n" for name, value in values.items())
     write_file(ENV_FILE, content, 0o600)
@@ -2444,10 +2522,9 @@ def prepare(args: argparse.Namespace) -> None:
     ensure_directory(REALMS_DIR, 0o755)
     ensure_directory(EDGE_CERTS_DIR)
     ensure_credential_seed(args)
-    # Source mode never inherits trust from an earlier seeded rehearsal.
-    # Seed activation replaces this zero-byte file only after the loader has
-    # verified the exact schema-v2 archive, manifest, and image IDs.
-    write_file(PROVIDER_POLICY_RECEIPT, "", 0o644)
+    # Source mode and a seed's first prepare begin without provider trust.
+    # A later prepare rebuilds the receipt from the activated schema-v2 seed.
+    seed_policy = prepare_seed_policy(args)
     prepare_controller_audit_fixture()
     prepare_certificates(args.domain)
     render_realms(args.domain)
@@ -2497,7 +2574,7 @@ def prepare(args: argparse.Namespace) -> None:
     jwks_path = SECRETS_DIR / "preprod-wif-jwks.json"
     if not jwks_path.exists():
         write_file(jwks_path, '{"keys":[]}\n', 0o600)
-    render_environment(args)
+    render_environment(args, seed_policy)
     print("PREPROD_PREPARED")
 
 
@@ -3037,15 +3114,7 @@ def _activate_seed(args: argparse.Namespace) -> None:
     write_file(PROVIDER_POLICY_RECEIPT, provider_policy_content, 0o644)
 
     values = environment_values(args)
-    values["AIGW_EGRESS_SOURCE_DATE_EPOCH"] = "0"
-    values["AIGW_EGRESS_PROVIDERS"] = ",".join(policy["selected_providers"])
-    values["AIGW_EGRESS_POLICY_SHA256"] = policy["egress_policy_sha256"]
-    values["KEY_ROTATOR_PROVIDER_POLICY_RECEIPT_FILE"] = (
-        "/run/secrets/provider_policy_receipt.json"
-    )
-    values["KEY_ROTATOR_EGRESS_POLICY_SHA256"] = policy[
-        "egress_policy_sha256"
-    ]
+    apply_seed_policy(values, policy)
     content = "# Generated private PreProd credentials. Do not commit.\n"
     content += "".join(f"{name}={value}\n" for name, value in values.items())
     write_file(ENV_FILE, content, 0o600)
@@ -3494,6 +3563,10 @@ def reconcile_openwebui_key(args: argparse.Namespace) -> None:
         or master_key == candidate_key
     ):
         fail("the generated Open WebUI key inputs are invalid")
+    # The helper reads the public model catalog from dev-portal. Compose may
+    # return from `up --wait` while this independent service is still inside
+    # its healthcheck start period, so make this command's dependency clear.
+    wait_for_container(args, "dev-portal", "healthy", 300)
     verify_secret_bearing_portal_network(args)
 
     with tempfile.TemporaryDirectory(
@@ -3537,6 +3610,10 @@ def reconcile_openwebui_key(args: argparse.Namespace) -> None:
             ),
             capture=True,
             sensitive=True,
+            # LiteLLM reports healthy before its management routes always
+            # leave their short startup 503 window. The whole operation is
+            # designed to reconcile safely after any partial earlier try.
+            attempts=30,
         )
     receipt = result.stdout.strip()
     match = re.fullmatch(

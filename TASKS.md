@@ -213,6 +213,39 @@
 
 ## Someday
 
+- [ ] **Review offline-seed ownership and parent-directory permission failures**
+  - Reproduce the ownership error with `scripts/update-images.py test-preprod`
+    and the production upgrade path. Test an archive and manifest created by
+    the current user, copied from another system, copied by `root`, and staged
+    by Ansible. Record the exact check and path that rejects each safe case.
+  - Map every custody and permission check in the image update, seed rebuild,
+    seed loader, PreProd staging, and remote upgrade code. Decide which checks
+    protect a release while it is built and which checks are still needed
+    after an operator transfers it to another host.
+  - Allow normal local-user read, write, and ownership permissions when the
+    archive and manifest can be handled safely. Do not require the receiving
+    user ID to match the user ID that created the files unless that match is a
+    real security boundary. Support safe root-owned and Ansible-staged files.
+  - Keep the release fail closed when a file is not regular, is a symlink, has
+    extra hard links, changes during verification, has the wrong SHA-256, does
+    not match its manifest, or can be replaced by an untrusted user. Do not
+    weaken atomic staging or the archive-to-manifest binding. Define clearly
+    which group-writable or world-writable files and parent directories are
+    unsafe.
+  - Return one clear error that names the rejected path, the failed rule, and a
+    safe repair command. Do not tell an operator to make a release directory
+    broadly writable or to change ownership without explaining why.
+  - Add macOS and Linux contract tests for safe owner changes, copied files,
+    rootless and root Docker controllers, nested parent directories, and the
+    unsafe symlink, hard-link, replacement, and writable-parent cases. Prove
+    the same rules work for local PreProd, controller-host staging, production
+    upgrade, validation, and rollback.
+  - Update the offline-seed and image-update SOPs at an eighth-grade reading
+    level. Explain the difference between file ownership, permission to read
+    or write, trusted custody, and content integrity. Complete this item after
+    the current candidate is committed and pushed; do not change the active
+    release rules during the current acceptance run.
+
 - [ ] **Explore Admin Portal access to Grafana dashboards** - This is a future
   convenience feature, not part of the current release. Compare a normal link
   to the existing admin-only Grafana origin with embedded panels. Prefer the
