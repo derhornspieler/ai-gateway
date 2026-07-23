@@ -7,7 +7,6 @@
   "id": null,
   "links": [
     {"keepTime": true, "tags": [], "targetBlank": false, "title": "AI Gateway Overview", "type": "link", "url": "/d/aigw-overview/ai-gateway-overview"},
-    {"keepTime": false, "tags": [], "targetBlank": false, "title": "Alert response runbooks", "type": "link", "url": "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"},
     {"keepTime": false, "tags": [], "targetBlank": false, "title": "Alert response runbooks", "type": "link", "url": "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"}
   ],
   "liveNow": false,
@@ -155,12 +154,13 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Days until the soonest-expiring Traefik EDGE TLS certificate (the traefik-int and traefik-adm listeners under job=\"traefik\"). Scope is the edge listeners only. The pinned Anthropic provider-CA bundles are NOT measured here; Envoy egress and the admin-console continuous canary validate those. See the per-certificate table below for the common name, SANs, and days remaining.",
       "fieldConfig": {"defaults": {"unit": "d"}, "overrides": []},
       "gridPos": {"h": 4, "w": 8, "x": 0, "y": 43},
       "id": 14,
       "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
       "targets": [{"editorMode": "code", "expr": "min((traefik_tls_certs_not_after{job=\"traefik\"} - time()) / 86400)", "instant": true, "legendFormat": "Days", "range": false, "refId": "A"}],
-      "title": "Shortest Certificate Lifetime",
+      "title": "Edge TLS: Days Until First Expiry",
       "type": "stat"
     },
     {
@@ -186,7 +186,30 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 47},
+      "description": "Every edge TLS certificate served by Traefik, one row per certificate, with days until expiry. The source metric traefik_tls_certs_not_after{job=\"traefik\"} carries the cn (common name), sans (subject alternative names), and serial labels; this table shows the common name, SANs, and days remaining. Scope is the Traefik edge only — pinned provider-CA bundles are validated by Envoy egress and the admin-console canary, not here.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}, "filterable": false, "inspect": false}, "unit": "d"}, "overrides": [{"matcher": {"id": "byName", "options": "Days remaining"}, "properties": [{"id": "unit", "value": "d"}, {"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 7}, {"color": "green", "value": 30}]}}]}]},
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 47},
+      "id": 18,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": false, "displayName": "Days remaining"}]},
+      "targets": [{"editorMode": "code", "expr": "(traefik_tls_certs_not_after{job=\"traefik\"} - time()) / 86400", "format": "table", "instant": true, "legendFormat": "", "range": false, "refId": "A"}],
+      "title": "Edge TLS Certificates by Common Name and Expiry",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true, "serial": true}, "indexByName": {"cn": 0, "sans": 1, "Value": 2}, "renameByName": {"Value": "Days remaining", "cn": "Common name", "sans": "SANs"}}}],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "TLS certificate-chain verification failures for real traffic to the pinned Anthropic upstream during the last fifteen minutes. Zero is healthy; a non-zero value means Envoy dropped traffic rather than bypassing the provider CA pin.",
+      "fieldConfig": {"defaults": {"color": {"fixedColor": "green", "mode": "fixed"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 65},
+      "id": 19,
+      "options": {"colorMode": "background", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"editorMode": "code", "expr": "sum(increase(envoy_cluster_ssl_fail_verify_error{job=\"envoy-egress\",envoy_cluster_name=\"anthropic\"}[15m])) or vector(0)", "instant": true, "legendFormat": "Verify failures", "range": false, "refId": "A"}],
+      "title": "Egress TLS Verify Failures (15m)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 53},
       "id": 17,
       "options": {
         "code": {"language": "plaintext", "showLineNumbers": false, "showMiniMap": false},

@@ -2112,12 +2112,12 @@ def render_preprod_alloy_config() -> None:
     fixture_prefix, fixture_remainder = rendered.split(fixture_begin, 1)
     _old_fixture, fixture_suffix = fixture_remainder.split(fixture_end, 1)
     rendered = fixture_prefix + fixture_block + fixture_suffix
-    alert_suffix = '|AIGatewayCertificateExpiryCritical"'
+    alert_suffix = '|AIGatewayEgressScrapeAbsent"'
     if rendered.count(alert_suffix) != 1:
         fail("the Alloy alert-state allow-list changed")
     rendered = rendered.replace(
         alert_suffix,
-        '|AIGatewayCertificateExpiryCritical|AIGatewayPreprodAcceptance"',
+        '|AIGatewayEgressScrapeAbsent|AIGatewayPreprodAcceptance"',
         1,
     )
     write_file(SECRETS_DIR / "preprod-alloy-config.alloy", rendered, 0o644)
@@ -2135,12 +2135,12 @@ def render_preprod_prometheus_config() -> None:
         rule_files + "  - /etc/prometheus/preprod-alert-rules.yml\n",
         1,
     )
-    alert_suffix = "|AIGatewayCertificateExpiryCritical\n"
+    alert_suffix = "|AIGatewayEgressScrapeAbsent\n"
     if rendered.count(alert_suffix) != 1:
         fail("the Prometheus alert-state allow-list changed")
     rendered = rendered.replace(
         alert_suffix,
-        "|AIGatewayCertificateExpiryCritical|AIGatewayPreprodAcceptance\n",
+        "|AIGatewayEgressScrapeAbsent|AIGatewayPreprodAcceptance\n",
         1,
     )
     write_file(SECRETS_DIR / "preprod-prometheus.yml", rendered, 0o644)

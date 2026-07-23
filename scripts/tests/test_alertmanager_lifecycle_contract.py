@@ -161,7 +161,7 @@ class AlertmanagerLifecycleContractTests(unittest.TestCase):
         self.assertIs(self.dashboard["editable"], False)
         self.assertIn("Prometheus-evaluated", self.dashboard["description"])
         panels = all_panels(self.dashboard)
-        self.assertEqual({panel["id"] for panel in panels}, set(range(1, 18)))
+        self.assertEqual({panel["id"] for panel in panels}, set(range(1, 20)))
         self.assertEqual(
             [panel["title"] for panel in self.dashboard["panels"][:7]],
             [
@@ -195,6 +195,7 @@ class AlertmanagerLifecycleContractTests(unittest.TestCase):
             "traefik_service_requests_total",
             "traefik_tls_certs_not_after",
             "otelcol_exporter_queue_size",
+            "envoy_cluster_ssl_fail_verify_error",
         ):
             self.assertIn(required, expressions)
         for panel in panels:

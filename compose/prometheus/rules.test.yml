@@ -139,3 +139,86 @@ tests:
       - eval_time: 30m
         alertname: AIGatewayFilesystemSpaceLow
         exp_alerts: []
+
+  - name: egress-tls-verify-failures-fire-sustain-and-recover
+    interval: 1m
+    input_series:
+      - series: 'envoy_cluster_ssl_fail_verify_error{job="envoy-egress",instance="envoy-egress:9902",envoy_cluster_name="anthropic"}'
+        values: '0+1x45 45x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AIGatewayEgressTLSVerifyFailures
+        exp_alerts:
+          - exp_labels:
+              alert_class: egress-trust
+              envoy_cluster_name: anthropic
+              instance: envoy-egress:9902
+              job: envoy-egress
+              owner: platform-operations
+              severity: warning
+            exp_annotations:
+              summary: Envoy is rejecting Anthropic TLS certificates
+              description: Real traffic to the provider is being dropped because a presented certificate did not chain to the pinned CA.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#egress-trust-alerts
+      - eval_time: 40m
+        alertname: AIGatewayEgressTLSVerifyFailuresSustained
+        exp_alerts:
+          - exp_labels:
+              alert_class: egress-trust
+              envoy_cluster_name: anthropic
+              instance: envoy-egress:9902
+              job: envoy-egress
+              owner: platform-operations
+              severity: critical
+            exp_annotations:
+              summary: Envoy has sustained Anthropic TLS certificate rejections
+              description: Real traffic to the provider is being dropped because a presented certificate did not chain to the pinned CA.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#egress-trust-alerts
+      - eval_time: 62m
+        alertname: AIGatewayEgressTLSVerifyFailures
+        exp_alerts: []
+      - eval_time: 62m
+        alertname: AIGatewayEgressTLSVerifyFailuresSustained
+        exp_alerts: []
+
+  - name: egress-scrape-absent-fires-when-target-disappears
+    interval: 1m
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AIGatewayEgressScrapeAbsent
+        exp_alerts:
+          - exp_labels:
+              alert_class: egress-trust
+              owner: platform-operations
+              severity: warning
+            exp_annotations:
+              summary: Envoy egress metrics scrape is absent
+              description: Alloy has had no successful Envoy egress metrics scrape for two minutes, so TLS pin verification failures cannot be observed.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#egress-trust-alerts
+
+  - name: egress-scrape-absent-fires-when-target-is-down-and-recovers
+    interval: 1m
+    input_series:
+      - series: 'up{job="envoy-egress",instance="envoy-egress:9902"}'
+        values: '0x5 1x4'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AIGatewayEgressScrapeAbsent
+        exp_alerts:
+          - exp_labels:
+              alert_class: egress-trust
+              instance: envoy-egress:9902
+              job: envoy-egress
+              owner: platform-operations
+              severity: warning
+            exp_annotations:
+              summary: Envoy egress metrics scrape is absent
+              description: Alloy has had no successful Envoy egress metrics scrape for two minutes, so TLS pin verification failures cannot be observed.
+              runbook_url: /d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17
+              runbook_source: docs/observability-operations.md#egress-trust-alerts
+      - eval_time: 7m
+        alertname: AIGatewayEgressScrapeAbsent
+        exp_alerts: []

@@ -437,3 +437,37 @@ groups:
           description: "At least one certificate loaded by {{ $labels.instance }} needs immediate renewal."
           runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
           runbook_source: "docs/observability-operations.md#certificate-expiry-alerts"
+
+      - alert: AIGatewayEgressTLSVerifyFailures
+        expr: >-
+          increase(envoy_cluster_ssl_fail_verify_error{job="envoy-egress",envoy_cluster_name="anthropic"}[15m]) > 0
+        for: 0m
+        labels: { severity: warning, owner: platform-operations, alert_class: egress-trust }
+        annotations:
+          summary: "Envoy is rejecting Anthropic TLS certificates"
+          description: "Real traffic to the provider is being dropped because a presented certificate did not chain to the pinned CA."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#egress-trust-alerts"
+
+      - alert: AIGatewayEgressTLSVerifyFailuresSustained
+        expr: >-
+          increase(envoy_cluster_ssl_fail_verify_error{job="envoy-egress",envoy_cluster_name="anthropic"}[15m]) > 0
+        for: 30m
+        labels: { severity: critical, owner: platform-operations, alert_class: egress-trust }
+        annotations:
+          summary: "Envoy has sustained Anthropic TLS certificate rejections"
+          description: "Real traffic to the provider is being dropped because a presented certificate did not chain to the pinned CA."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#egress-trust-alerts"
+
+      - alert: AIGatewayEgressScrapeAbsent
+        expr: >-
+          absent(up{job="envoy-egress"})
+          or up{job="envoy-egress"} == 0
+        for: 2m
+        labels: { severity: warning, owner: platform-operations, alert_class: egress-trust }
+        annotations:
+          summary: "Envoy egress metrics scrape is absent"
+          description: "Alloy has had no successful Envoy egress metrics scrape for two minutes, so TLS pin verification failures cannot be observed."
+          runbook_url: "/d/aigw-alerts-capacity/ai-gateway-alerts-and-capacity?viewPanel=17"
+          runbook_source: "docs/observability-operations.md#egress-trust-alerts"

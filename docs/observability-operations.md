@@ -236,6 +236,38 @@ clickjacking and frame policy, CSRF, token leakage, and same-origin or reverse-
 proxy behavior. It must never copy a Grafana token or session cookie into the
 portal.
 
+## Live Logs filters and Drilldown labels
+
+The **AI Gateway Live Logs** dashboard (URL
+`/d/aigw-live-logs/ai-gateway-live-logs`) shows recent service logs from Loki.
+It has four filters at the top: **Service**, **Job**, **Project**, and
+**Stream**. Each filter is one Loki label that Alloy adds when it reads the
+logs. Here is what each one means:
+
+| Filter | Loki label | What it means | Example values |
+|---|---|---|---|
+| Service | `service` | The Compose service that wrote the line. Alloy reads it from the container's `com.docker.compose.service` label. The Vault audit stream uses the fixed value `vault-audit`. | `litellm`, `keycloak`, `grafana`, `vault-audit` |
+| Job | `job` | Which log source the line came from. Container logs use `docker`. The Vault audit file uses `vault-audit`. Controller upgrade and rollback records use `controller-lifecycle`. | `docker`, `vault-audit`, `controller-lifecycle` |
+| Project | `project` | The Compose project. Alloy reads it from `com.docker.compose.project`. Production is `ai-gateway`; local preprod is `aigw-preprod`. Only container logs have it. | `ai-gateway`, `aigw-preprod` |
+| Stream | `stream` | Which output the line came from: standard output or standard error. Only container logs have it. | `stdout`, `stderr` |
+
+**How to read logs.** Pick the **Service** first. That is almost always the
+fastest way to reach the right logs. Then narrow the time range with the time
+picker in the top right. If one service is noisy, set **Stream** to `stderr` to
+see only its error output, or change **Job** to look at Vault audit or
+controller records. Leave a filter on **All** when you do not want to narrow by
+it.
+
+**The same labels work in Drilldown.** The dashboard also links to **Drilldown
+Logs (ad-hoc)**, Grafana's built-in log explorer at
+`/a/grafana-lokiexplore-app/explore`. Drilldown opens with a **Service** list
+built from the same service names. (Alloy also copies each service name into the
+`service_name` label that Drilldown needs to see the stream.) Pick a service,
+then add `job`, `project`, or `stream` to narrow, exactly like the dashboard
+filters. Drilldown is for free-form digging; the dashboard is for a quick, fixed
+view. Both read the same Loki labels, so what you learn in one carries over to
+the other.
+
 ## Local alerts
 
 Prometheus is the only rule evaluator. It evaluates the committed health and
@@ -285,7 +317,9 @@ collects:
 - host CPU, load, memory, swap, OOM kills, file descriptors, disk I/O, free
   filesystem space, free inodes, and predicted filesystem exhaustion;
 - service p95 latency and 5xx rate from Traefik; and
-- edge certificate expiry from Traefik.
+- edge certificate expiry from Traefik; and
+- Envoy egress TLS verification failures and availability of its dedicated
+  metrics scrape.
 
 There is no reliable per-record queue-age metric or hard queue TTL today. Do
 not invent an age alert from queue size.
@@ -398,6 +432,24 @@ recovers.
 3. Converge the replacement through Ansible.
 4. Confirm Traefik loaded the new certificate and the shortest-lifetime panel
    shows the expected number of days.
+
+## Egress trust alerts
+
+These alerts mean Envoy has either rejected real Anthropic traffic because the
+presented certificate did not chain to the pinned CA, or Alloy cannot collect
+the egress metrics needed to observe that condition.
+
+1. Check the egress-trust canary status in the Admin Console. It re-verifies
+   the shipped Anthropic CA pin locally about once a day, so its result can
+   be up to a day old — Envoy's per-connection check and these alerts are
+   the real-time signal, not the canary.
+2. Check Anthropic's published service status and any current certificate or
+   endpoint incident before changing the gateway.
+3. Check the Envoy egress scrape and recent Envoy logs through the approved
+   operator workflow. Restore the private metrics path if the scrape is absent.
+4. Do not bypass, disable, or replace the pinned CA validation to restore
+   traffic. Escalate a certificate-chain failure for reviewed provider and
+   release handling instead.
 
 ## Retention and limits
 

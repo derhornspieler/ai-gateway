@@ -130,6 +130,9 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "AIGatewayServiceErrorRateCritical",
             "AIGatewayCertificateExpiresSoon",
             "AIGatewayCertificateExpiryCritical",
+            "AIGatewayEgressTLSVerifyFailures",
+            "AIGatewayEgressTLSVerifyFailuresSustained",
+            "AIGatewayEgressScrapeAbsent",
         }
         self.assertEqual(alerts, expected)
 
@@ -180,6 +183,22 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
                 "prometheus_remote_storage_samples_pending",
                 "prometheus_remote_storage_max_samples_per_send",
             ),
+            "AIGatewayEgressTLSVerifyFailures": (
+                "envoy_cluster_ssl_fail_verify_error",
+                'job="envoy-egress"',
+                'envoy_cluster_name="anthropic"',
+                "[15m]) > 0",
+            ),
+            "AIGatewayEgressTLSVerifyFailuresSustained": (
+                "envoy_cluster_ssl_fail_verify_error",
+                'job="envoy-egress"',
+                'envoy_cluster_name="anthropic"',
+                "[15m]) > 0",
+            ),
+            "AIGatewayEgressScrapeAbsent": (
+                'absent(up{job="envoy-egress"})',
+                'up{job="envoy-egress"} == 0',
+            ),
         }
         for name, required in fragments.items():
             expression = alert_block(self.rules, name)
@@ -206,6 +225,25 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
         self.assertIn('component_id="otelcol.exporter.otlp.cribl"} > 0', enqueue_failures)
         self.assertIn("enqueue_failed_spans", enqueue_failures)
         self.assertIn("enqueue_failed_metric_points", enqueue_failures)
+
+        verify_failures = alert_block(self.rules, "AIGatewayEgressTLSVerifyFailures")
+        self.assertIn("for: 0m", verify_failures)
+        self.assertIn("severity: warning", verify_failures)
+        self.assertIn("presented certificate did not chain to the pinned CA", verify_failures)
+
+        sustained_verify_failures = alert_block(
+            self.rules, "AIGatewayEgressTLSVerifyFailuresSustained"
+        )
+        self.assertIn("for: 30m", sustained_verify_failures)
+        self.assertIn("severity: critical", sustained_verify_failures)
+        self.assertIn(
+            "presented certificate did not chain to the pinned CA",
+            sustained_verify_failures,
+        )
+
+        egress_scrape = alert_block(self.rules, "AIGatewayEgressScrapeAbsent")
+        self.assertIn("for: 2m", egress_scrape)
+        self.assertIn("severity: warning", egress_scrape)
 
         self.assertIn("\nalerting:\n", self.prometheus)
         self.assertIn("- targets: [alertmanager:9093]", self.prometheus)
@@ -273,7 +311,7 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             'client_ca_file   = "/run/secrets/alert_state_ca.pem"',
             'min_version      = "VersionTLS13"',
             'regex         = "ALERTS|ALERTS_FOR_STATE"',
-            'regex  = "__name__|alertname|alertstate|severity|owner|alert_class|instance|job|device|mountpoint|service|component_id|remote_name"',
+            'regex  = "__name__|alertname|alertstate|severity|owner|alert_class|instance|job|device|mountpoint|service|component_id|remote_name|envoy_cluster_name"',
             'replacement  = "alert-state"',
             "max_cache_size = 128",
             'limit          = "384MiB"',
@@ -335,6 +373,9 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "cpu-memory-and-disk-pressure-fire-and-recover",
             "cribl-queue-pressure-fires-and-recovers",
             "filesystem-space-pressure-fires-and-recovers",
+            "egress-tls-verify-failures-fire-sustain-and-recover",
+            "egress-scrape-absent-fires-when-target-disappears",
+            "egress-scrape-absent-fires-when-target-is-down-and-recovers",
             "node_cpu_seconds_total",
             "node_memory_MemAvailable_bytes",
             "node_disk_io_time_seconds_total",
@@ -342,6 +383,10 @@ class PrometheusObservabilityContractTests(unittest.TestCase):
             "node_filesystem_avail_bytes",
             "node_filesystem_size_bytes",
             "node_filesystem_readonly",
+            "envoy_cluster_ssl_fail_verify_error",
+            "AIGatewayEgressTLSVerifyFailures",
+            "AIGatewayEgressTLSVerifyFailuresSustained",
+            "AIGatewayEgressScrapeAbsent",
             "AIGatewayHostCPUHigh",
             "AIGatewayHostMemoryLow",
             "AIGatewayHostDiskIOSaturation",

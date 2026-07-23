@@ -23,6 +23,14 @@
       "title": "Request Audit",
       "type": "link",
       "url": "/d/aigw-request-audit/ai-gateway-request-audit"
+    },
+    {
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Drilldown Logs (ad-hoc)",
+      "type": "link",
+      "url": "/a/grafana-lokiexplore-app/explore"
     }
   ],
   "liveNow": false,
