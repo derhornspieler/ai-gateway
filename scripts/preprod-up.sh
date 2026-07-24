@@ -6,15 +6,15 @@
 #   scripts/preprod-up.sh
 #
 # Offline seed path (no dhi.io needed; images come from the release files).
-# Point it at the folder that holds the .preprod.docker.tar.zst and its
-# .preprod.manifest.json. This script reads the hashes for you; you never
-# type a SHA-256:
-#   scripts/preprod-up.sh --seed /path/to/release-folder
+# Give --seed the FOLDER that holds the release files -- the folder, not a
+# file. It finds the .preprod.docker.tar.zst and .preprod.manifest.json inside
+# and reads their hashes for you; you never type a SHA-256. Example:
+#   scripts/preprod-up.sh --seed ~/ai-gateway-releases/2026-07-22-linux-arm64
 #
 # Blocked from galaxy.ansible.com? Download the collections on a machine that
 # has internet, move the folder over, and point this at it:
 #   ansible-galaxy collection download -r ansible/requirements.yml -p aigw-collections
-#   scripts/preprod-up.sh --collections-dir /path/to/aigw-collections
+#   scripts/preprod-up.sh --collections-dir ~/aigw-collections
 #
 # It asks for your sudo password once (macOS loopback aliases + the bounded
 # /etc/hosts block). Pass --become-password-file /path to skip the prompt.
@@ -111,7 +111,7 @@ from galaxy.ansible.com. Do this once from a machine that HAS internet:
 
 Copy the whole "aigw-collections" folder to this machine, then run:
 
-  scripts/preprod-up.sh --collections-dir /path/to/aigw-collections
+  scripts/preprod-up.sh --collections-dir /the/folder/you/copied/aigw-collections
 EOF
     exit 1
   fi
@@ -132,6 +132,9 @@ LOG_FILE="$LOG_DIR/preprod-up.log"
 
 if [[ -n "$SEED_DIR" ]]; then
   say "Step 4 of 5: reading the release files (no dhi.io login needed)"
+  if [[ -f "$SEED_DIR" ]]; then
+    die "--seed takes the FOLDER holding the release files, not a file. Try: $(dirname "$SEED_DIR")"
+  fi
   [[ -d "$SEED_DIR" ]] || die "That seed folder does not exist: $SEED_DIR"
   # Find exactly one preprod archive and one preprod manifest in the folder.
   shopt -s nullglob
@@ -165,7 +168,8 @@ else
   if ! grep -q 'dhi.io' "${HOME}/.docker/config.json" 2>/dev/null; then
     echo "WARNING: no dhi.io login found in ~/.docker/config.json."
     echo "         If the build fails to pull images, run:  docker login dhi.io"
-    echo "         Or use the offline seed path:  scripts/preprod-up.sh --seed /path/to/release-folder"
+    echo "         Or use the offline seed path, giving it the folder holding your release files:"
+    echo "           scripts/preprod-up.sh --seed ~/ai-gateway-releases/2026-07-22-linux-arm64"
   else
     echo "OK: a dhi.io login is present."
   fi
@@ -191,5 +195,5 @@ To take it all down later:
 
 If you were testing a release and need the teardown receipt, point that at the
 release folder instead:
-  scripts/preprod-down.sh --seed /path/to/release-folder
+  scripts/preprod-down.sh --seed ~/ai-gateway-releases/2026-07-22-linux-arm64
 EOF

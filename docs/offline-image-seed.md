@@ -161,8 +161,9 @@ bad, or expired CA data. It does not download trust data during deployment.
 
 ## Stage a production pair
 
-One command copies the release to the VM and fills in the inventory. Point it
-at the folder holding the production pair:
+One command copies the release to the VM and fills in the inventory. Give
+`--release-dir` the **folder** holding the release files, not a file inside
+it:
 
 ```bash
 python3 -I scripts/stage-production-seed.py \
@@ -250,7 +251,7 @@ and acceptance. Seed mode has no pull or build sections. The play installs the
 bounded preprod hosts block for browser tests.
 
 After all release tests, tear the stack down against the same exact pair with
-`scripts/preprod-down.sh --seed /path/to/release-folder`. That final receipt
+`scripts/preprod-down.sh --seed <the release folder>`. That final receipt
 must prove every owned resource and every manifest-listed image is absent. It
 must also prove that unrelated image IDs are unchanged. Ordinary cleanup does
 not provide this release proof. See

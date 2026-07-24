@@ -376,11 +376,11 @@ Follow the clean build, destroy, load, deploy, and browser order in the
 ## Finish with exact-manifest teardown
 
 After the release tests pass or fail, tear the stack down against the exact
-tested preprod pair. Point the script at the folder holding those release
-files:
+tested preprod pair. Give `--seed` the **folder** holding those release files,
+not a file inside it:
 
 ```bash
-scripts/preprod-down.sh --seed /path/to/release-folder
+scripts/preprod-down.sh --seed ~/ai-gateway-releases/2026-07-22-linux-arm64
 ```
 
 The script finds the one preprod archive and manifest in that folder and

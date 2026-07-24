@@ -37,7 +37,8 @@ ansible-galaxy collection download -r ansible/requirements.yml -p aigw-collectio
 ```
 
 Copy the whole `aigw-collections` folder to the controller and install from
-it: `ansible-galaxy collection install -r /path/to/aigw-collections/requirements.yml`.
+it, naming the folder you copied:
+`ansible-galaxy collection install -r ~/aigw-collections/requirements.yml`.
 
 Run everything that follows from the repository root. Then check
 pipelining — it is a confidentiality control, not a preference:
@@ -104,9 +105,10 @@ You never type a SHA-256. The command reads the hashes from the release
 files, copies both to a private root-owned folder on the VM, checks the bytes
 again there, and then writes the five values into `host_vars/mygateway.yml`.
 
-Point `--release-dir` at the folder holding the release. It picks the
-production pair and ignores the `.preprod` one. The release platform must
-match the VM: an `arm64` release cannot deploy to an x86 VM.
+`--release-dir` takes the **folder** holding the release files, not a file
+inside it. The command picks the production pair and ignores the `.preprod`
+one. The release platform must match the VM: an `arm64` release cannot deploy
+to an x86 VM.
 
 Your copies of the release files must be owned by you and not writable by
 anyone else. Ordinary copied permissions are fine.

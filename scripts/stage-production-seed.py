@@ -310,6 +310,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.release_dir is not None:
         directory = args.release_dir.expanduser().resolve()
+        if directory.is_file():
+            fail(
+                "--release-dir takes the folder holding the release files, not"
+                f" a file. Try: {directory.parent}"
+            )
         if not directory.is_dir():
             fail(f"that release folder does not exist: {directory}")
         archive = sole_match(directory, "*.docker.tar.zst", "production archive")

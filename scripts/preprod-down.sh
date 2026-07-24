@@ -5,9 +5,10 @@
 # not have to trust a new one next time):
 #   scripts/preprod-down.sh
 #
-# Release teardown, when you need the exact-manifest receipt. Point it at the
-# folder holding the release files you tested. It reads their hashes for you:
-#   scripts/preprod-down.sh --seed /path/to/release-folder
+# Release teardown, when you need the exact-manifest receipt. Give --seed the
+# FOLDER that holds the release files you tested -- the folder, not a file.
+# It finds the preprod pair inside and reads their hashes for you. Example:
+#   scripts/preprod-down.sh --seed ~/ai-gateway-releases/2026-07-22-linux-arm64
 #
 # It asks for your sudo password once (it removes the /etc/hosts block and the
 # macOS loopback aliases). Pass --become-password-file /path to skip the prompt.
@@ -64,13 +65,17 @@ if [[ -z "$SEED_DIR" ]]; then
 Done. Only resources named aigw-preprod were removed. The local test Root CA
 was kept, so a new run does not need a fresh browser trust step.
 
-This is development cleanup. It is NOT the release receipt. For that, run:
-  scripts/preprod-down.sh --seed /path/to/release-folder
+This is development cleanup. It is NOT the release receipt. For that, give
+--seed the folder holding the release files you tested, for example:
+  scripts/preprod-down.sh --seed ~/ai-gateway-releases/2026-07-22-linux-arm64
 EOF
   exit 0
 fi
 
 say "Step 1 of 2: reading the release files you tested"
+if [[ -f "$SEED_DIR" ]]; then
+  die "--seed takes the FOLDER holding the release files, not a file. Try: $(dirname "$SEED_DIR")"
+fi
 [[ -d "$SEED_DIR" ]] || die "That seed folder does not exist: $SEED_DIR"
 shopt -s nullglob
 archives=("$SEED_DIR"/*.preprod.docker.tar.zst)

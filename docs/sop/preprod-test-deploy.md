@@ -43,10 +43,10 @@ ansible-galaxy collection download -r ansible/requirements.yml -p aigw-collectio
 
 That makes a folder named `aigw-collections` with the three collections and
 a `requirements.yml`. Copy the whole folder to the work machine. Then point
-the bring-up script at it:
+the bring-up script at it — the folder you copied, not a file inside it:
 
 ```bash
-scripts/preprod-up.sh --collections-dir /path/to/aigw-collections
+scripts/preprod-up.sh --collections-dir ~/aigw-collections
 ```
 
 The script installs the collections from that folder instead of the
@@ -57,14 +57,26 @@ step on its own.
 
 If your machine cannot download from `dhi.io`, use a release folder that
 already holds the two preprod files (the `.preprod.docker.tar.zst` archive
-and its `.preprod.manifest.json`). Point the script at that folder:
+and its `.preprod.manifest.json`).
 
-```bash
-scripts/preprod-up.sh --seed /path/to/your/release-folder
+Give `--seed` the **folder**, not a file. A release folder normally looks
+like this, and you point at the folder on the first line:
+
+```text
+~/ai-gateway-releases/2026-07-22-linux-arm64/     <-- give this to --seed
+  aigw-2026-07-22-linux-arm64.docker.tar.zst          production pair
+  aigw-2026-07-22-linux-arm64.manifest.json
+  aigw-2026-07-22-linux-arm64.preprod.docker.tar.zst  preprod pair
+  aigw-2026-07-22-linux-arm64.preprod.manifest.json
 ```
 
-You never type a SHA-256. The script finds the two files and reads their
-hashes for you.
+```bash
+scripts/preprod-up.sh --seed ~/ai-gateway-releases/2026-07-22-linux-arm64
+```
+
+You never type a SHA-256. The script finds the two preprod files inside the
+folder and reads their hashes for you. Keep one release per folder; if it
+finds two, it stops and lists what it saw.
 
 ## Skip the password prompt
 
@@ -124,10 +136,10 @@ That removes only the `aigw-preprod` resources and keeps the local test Root
 CA, so your browser does not have to trust a new one next time.
 
 If you were testing a release and need the receipt that proves every release
-image is gone, point it at the release folder instead:
+image is gone, give `--seed` the same release **folder** you deployed from:
 
 ```bash
-scripts/preprod-down.sh --seed /path/to/your/release-folder
+scripts/preprod-down.sh --seed ~/ai-gateway-releases/2026-07-22-linux-arm64
 ```
 
 You never type a SHA-256; the script reads the hashes from the files. Save the
