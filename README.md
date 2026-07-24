@@ -94,6 +94,7 @@ Pick the task that matches your goal:
 | Test a release in local Docker | [Local preprod](docs/preprod.md) |
 | Run the full release checks | [Acceptance test runbook](docs/test-runbook.md) |
 | Install on a production VM | [Production deployment](docs/deploy-runbook.md) |
+| Build an offline seed release | [Build offline seed SOP](docs/sop/build-offline-seed.md) |
 | Update images and build an offline seed | [Image update workflow](docs/image-update-workflow.md) |
 | Unlock Vault after a reboot | [Vault unseal SOP](docs/sop/vault-unseal-after-reboot.md) |
 | Run daily production tasks | [Production operations](docs/operations.md) |

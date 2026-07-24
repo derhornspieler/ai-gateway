@@ -48,6 +48,10 @@ CA work is covered in the
 
 ## 1. Build the offline release
 
+For the plain operator checklist, use the
+[build offline seed SOP](sop/build-offline-seed.md). This section is the
+reference detail behind it.
+
 Make a new private directory. Put the date and platform in its name:
 
 ```bash

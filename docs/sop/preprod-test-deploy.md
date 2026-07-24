@@ -92,7 +92,9 @@ See [Local preprod](../preprod.md) for how to make that file safely.
 ## Build a fresh release seed to test
 
 The steps above deploy the current code. To build a brand-new offline seed
-from source and test it in one command (needs a `dhi.io` login):
+from source, the full checklist is the
+[build offline seed SOP](build-offline-seed.md). To build and test in one
+command (needs a `dhi.io` login):
 
 ```bash
 install -d -m 0700 /absolute/private/path/releases/2026-07-23-linux-arm64

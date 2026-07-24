@@ -29,7 +29,9 @@ new releases.
 
 ## Build both release pairs
 
-Most operators should use the image updater. Run it from the repository root:
+Most operators should follow the
+[build offline seed SOP](sop/build-offline-seed.md), which wraps this in a
+numbered checklist. Run the updater from the repository root:
 
 ```bash
 python3 -I scripts/update-images.py prepare \
