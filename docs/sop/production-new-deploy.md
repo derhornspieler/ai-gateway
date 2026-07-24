@@ -29,6 +29,16 @@ cd ai-gateway
 ansible-galaxy collection install -r ansible/requirements.yml
 ```
 
+If your site blocks `galaxy.ansible.com`, that last command fails. Run this
+once on a machine that has internet, using a copy of this repository:
+
+```bash
+ansible-galaxy collection download -r ansible/requirements.yml -p aigw-collections
+```
+
+Copy the whole `aigw-collections` folder to the controller and install from
+it: `ansible-galaxy collection install -r /path/to/aigw-collections/requirements.yml`.
+
 Run everything that follows from the repository root. Then check
 pipelining — it is a confidentiality control, not a preference:
 
@@ -65,19 +75,46 @@ Both forms create these files under
 | `hosts.yml` | The inventory Ansible reads | No |
 | `host_vars/mygateway.yml` | Your site settings | **Yes — this is the one file you fill in** |
 | `group_vars/production_rocky9/vault.yml` | All stack passwords, generated randomly and stored encrypted | Only with `ansible-vault edit`, and normally never |
-| `group_vars/production_rocky9/vault-unseal.yml` | The encrypted Vault unseal key | Never by hand — step 5 creates it |
+| `group_vars/production_rocky9/vault-unseal.yml` | The encrypted Vault unseal key | Never by hand — step 6 creates it |
 
 Open `host_vars/mygateway.yml`. The file explains itself in plain words at
 the top. Fill in SECTION 1 (your VM's addresses, interfaces, DNS, and
-domain), pick one HTTPS mode in SECTION 5, and — for the offline image
-path — set the five `offline_image_seed_*` values from
-[stage a production pair](../offline-image-seed.md#stage-a-production-pair).
-Skip SECTION 3 and SECTION 4 for now; the file tells you when they apply.
+domain) and pick one HTTPS mode in SECTION 5. Skip SECTION 3 and SECTION 4
+for now; the file tells you when they apply. Leave the five
+`offline_image_seed_*` values alone — step 3 fills those in for you.
 
 Never paste a decrypted password into `host_vars`. The generated secrets
 stay encrypted and the deploy reads them for you.
 
-## 3. Preflight the VM
+## 3. Put the images on the VM (offline path only)
+
+Skip this step if the VM's **root** Docker daemon is logged in to `dhi.io`
+and can pull. Otherwise, one command copies the release to the VM and fills
+in the five image values in your `host_vars` file:
+
+```bash
+python3 -I scripts/stage-production-seed.py \
+  --release-dir /absolute/private/path/2026-07-22-linux-amd64 \
+  --inventory ansible/inventory/generated/mygateway/hosts.yml \
+  --limit mygateway \
+  --vault-id mygateway@/secure/path/mygateway.vault-password
+```
+
+You never type a SHA-256. The command reads the hashes from the release
+files, copies both to a private root-owned folder on the VM, checks the bytes
+again there, and then writes the five values into `host_vars/mygateway.yml`.
+
+Point `--release-dir` at the folder holding the release. It picks the
+production pair and ignores the `.preprod` one. The release platform must
+match the VM: an `arm64` release cannot deploy to an x86 VM.
+
+Your copies of the release files must be owned by you and not writable by
+anyone else. Ordinary copied permissions are fine.
+
+A pass prints `STAGED_PRODUCTION_SEED` and the values it wrote. Details:
+[offline image releases](../offline-image-seed.md#stage-a-production-pair).
+
+## 4. Preflight the VM
 
 ```bash
 ansible-playbook \
@@ -89,7 +126,7 @@ ansible-playbook \
 
 Fix every reported problem before the converge.
 
-## 4. First converge pass
+## 5. First converge pass
 
 ```bash
 ansible-playbook \
@@ -102,7 +139,7 @@ ansible-playbook \
 This pass ends with Vault **uninitialized**. That is expected, not a
 failure.
 
-## 5. One-time Vault ceremony
+## 6. One-time Vault ceremony
 
 Run the reviewed production Vault initialization ceremony from the
 [deployment runbook](../deploy-runbook.md). Then store the unseal share on
@@ -123,9 +160,9 @@ Never initialize Vault again after this day; see
 [unseal Vault after a reboot](vault-unseal-after-reboot.md) for every later
 restart.
 
-## 6. Second converge pass
+## 7. Second converge pass
 
-Run the exact same `site.yml` command from step 4 again. This pass
+Run the exact same `site.yml` command from step 5 again. This pass
 auto-unseals Vault from the encrypted controller-held share and must end
 with strict readiness: exit status `0` and every required service healthy.
 

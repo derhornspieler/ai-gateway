@@ -995,7 +995,7 @@ class UpdateImagesContractTest(unittest.TestCase):
     def test_remote_stage_proves_production_bytes_on_controller_before_copy(self) -> None:
         playbook = (ROOT / "ansible/stage-offline-image-seed.yml").read_text()
         controller_hash = playbook.index(
-            "Require private regular controller release files with exact hashes"
+            "Require regular unwritable controller release files with exact hashes"
         )
         production_gate = playbook.index(
             "Prove production release scope and archive allow-list before transfer"
@@ -1345,6 +1345,35 @@ class UpdateImagesContractTest(unittest.TestCase):
             "follow: false",
         ):
             self.assertIn(contract, source)
+
+    def test_stage_playbook_accepts_normally_readable_controller_files(self) -> None:
+        """The controller gate proves bytes and non-writability, never 0600.
+
+        An ordinary copied release is 0644. Demanding an exact private mode on
+        the controller side rejected a byte-identical release and gave the
+        operator no way forward. The staged target copy is still 0600.
+        """
+
+        source = (ROOT / "ansible/stage-offline-image-seed.yml").read_text()
+        gate_start = source.index(
+            "Require regular unwritable controller release files with exact hashes"
+        )
+        gate_end = source.index(
+            "Prove production release scope and archive allow-list before transfer"
+        )
+        self.assertLess(gate_start, gate_end)
+        controller_gate = source[gate_start:gate_end]
+        for contract in (
+            "not (item.stat.wgrp | default(true))",
+            "not (item.stat.woth | default(true))",
+            "item.stat.checksum == item.item.sha256",
+        ):
+            self.assertIn(contract, controller_gate)
+        self.assertNotIn("item.stat.mode", controller_gate)
+
+        target_gate = source[source.index("Require exact private target release files") :]
+        self.assertIn("item.stat.mode == '0600'", target_gate)
+        self.assertIn("item.stat.uid == 0", target_gate)
 
     def test_vault_id_requires_private_absolute_password_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

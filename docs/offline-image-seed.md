@@ -161,27 +161,44 @@ bad, or expired CA data. It does not download trust data during deployment.
 
 ## Stage a production pair
 
-Set these five inventory values. Each path is on the production VM:
+One command copies the release to the VM and fills in the inventory. Point it
+at the folder holding the production pair:
+
+```bash
+python3 -I scripts/stage-production-seed.py \
+  --release-dir /absolute/private/path/2026-07-22-linux-amd64 \
+  --inventory ansible/inventory/generated/mygateway/hosts.yml \
+  --limit mygateway \
+  --vault-id mygateway@/secure/path/mygateway.vault-password
+```
+
+It picks the production pair (never the `.preprod` one), reads both SHA-256
+values from the files, copies them to a private root-owned directory on the
+VM, checks the bytes again there, and then writes these five values into
+`host_vars/mygateway.yml` for you:
 
 ```yaml
 offline_image_seed_enabled: true
-offline_image_seed_remote_path: /var/tmp/aigw-2026-07-22-linux-amd64.docker.tar.zst
-offline_image_seed_sha256: <archive-sha256>
-offline_image_seed_manifest_remote_path: /var/tmp/aigw-2026-07-22-linux-amd64.manifest.json
-offline_image_seed_manifest_sha256: <manifest-sha256>
+offline_image_seed_remote_path: "/var/lib/ai-gateway/image-seeds/candidate-<16-hex>/aigw-2026-07-22-linux-amd64.docker.tar.zst"
+offline_image_seed_sha256: "<archive-sha256>"
+offline_image_seed_manifest_remote_path: "/var/lib/ai-gateway/image-seeds/candidate-<16-hex>/aigw-2026-07-22-linux-amd64.manifest.json"
+offline_image_seed_manifest_sha256: "<manifest-sha256>"
 ```
 
-Use the production pair. Copy both files to temp names first. Check their
-SHA-256 values on the controller:
+You never type a hash. The release is still pinned by exact SHA-256 at every
+hop: the file on the controller, the copy on the VM, and every image the
+loader unpacks.
 
-```bash
-shasum -a 256 \
-  /absolute/private/path/aigw-2026-07-22-linux-amd64.docker.tar.zst \
-  /absolute/private/path/aigw-2026-07-22-linux-amd64.manifest.json
-```
+Add `--print-only` to see the five values without writing them. Add
+`--expect-manifest-sha256 <hash>` when you hold the release hash from a
+separate record — the copy then refuses to start unless the file matches.
 
-On the VM, install each file as a regular, non-symlink file. Use owner
-`root:root` and mode `0600`.
+Your release files must be owned by you and not writable by any other user.
+Normal copied permissions (`0644`) are fine. The staged copy on the VM is
+created as `root:root` mode `0600`.
+
+For a later image update, use `scripts/update-images.py upgrade` instead. It
+does all of this and adds the backup, rollback, and validation steps.
 
 ## What Ansible checks
 
@@ -232,11 +249,11 @@ The updater then runs `ansible/preprod.yml` once for seed activation, deploy,
 and acceptance. Seed mode has no pull or build sections. The play installs the
 bounded preprod hosts block for browser tests.
 
-After all release tests, run `ansible/preprod-clean-room.yml` again with these
-same four exact file and hash values. That final receipt must prove every owned
-resource and every manifest-listed image is absent. It must also prove that
-unrelated image IDs are unchanged. The ordinary destroy play does not provide
-this release proof. See
+After all release tests, tear the stack down against the same exact pair with
+`scripts/preprod-down.sh --seed /path/to/release-folder`. That final receipt
+must prove every owned resource and every manifest-listed image is absent. It
+must also prove that unrelated image IDs are unchanged. Ordinary cleanup does
+not provide this release proof. See
 [final release teardown](preprod.md#finish-with-exact-manifest-teardown).
 
 The become password file, when used, must be an absolute, caller-owned,
@@ -247,14 +264,16 @@ Running `test-preprod` without `--load-archive` is a quick check of images that
 are already present. It skips the clean-room and load steps. Do not use it as
 release evidence.
 
-The lower-level receipt command is for troubleshooting:
+The lower-level receipt command is for troubleshooting. It is the one command
+here that takes a hash as an argument, so let the shell supply it:
 
 ```bash
+REL=/absolute/private/path/aigw-2026-07-22-linux-amd64
 python3 -I scripts/load-offline-image-seed.py local-release-receipt \
-  /absolute/private/path/aigw-2026-07-22-linux-amd64.preprod.docker.tar.zst \
-  /absolute/private/path/aigw-2026-07-22-linux-amd64.preprod.manifest.json \
-  <preprod-manifest-sha256> \
-  "$PWD"
+  "$REL.preprod.docker.tar.zst" \
+  "$REL.preprod.manifest.json" \
+  "$(shasum -a 256 "$REL.preprod.manifest.json" | cut -d' ' -f1)" \
+  "$(pwd)"
 ```
 
 Run that command as the local Docker user, not root. It accepts only a local

@@ -226,7 +226,7 @@ external reference. None of these three PreProd-only references belongs in
 the production archive. Both pairs contain the exact PostgreSQL 18 runtime
 image and no older PostgreSQL major.
 
-Record all four SHA-256 values:
+Record all four SHA-256 values for the release record:
 
 ```bash
 # macOS
@@ -236,7 +236,9 @@ shasum -a 256 /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linu
 sha256sum /absolute/private/path/2026-07-22-linux-amd64/aigw-2026-07-22-linux-amd64*
 ```
 
-Run the command for your operating system.
+Run the command for your operating system. This is only for the written
+record in step 7. No command below asks you to type a hash — every tool reads
+the release files and works out the hashes on its own.
 
 ### Step 2 — Clean, load, and test the exact preprod pair
 
@@ -484,33 +486,29 @@ that the one-time display test passed; never record the key value.
 
 ## 5. Clean up and handle a failure
 
-After a release pass or failure, run the clean-room play with the exact tested
-preprod paths and hashes:
+After a release pass or failure, tear the stack down against the exact tested
+preprod pair. Point the script at the release folder:
 
 ```bash
-ansible-playbook -i ansible/inventory/preprod.yml \
-  ansible/preprod-clean-room.yml \
-  -e preprod_seed_archive=/absolute/private/path/aigw-YYYY-MM-DD.preprod.docker.tar.zst \
-  -e preprod_seed_archive_sha256=REPLACE_WITH_ARCHIVE_SHA256 \
-  -e preprod_seed_manifest=/absolute/private/path/aigw-YYYY-MM-DD.preprod.manifest.json \
-  -e preprod_seed_manifest_sha256=REPLACE_WITH_MANIFEST_SHA256 \
-  -e preprod_clean_room_confirmation=DESTROY_AIGW_PREPROD_RELEASE_IMAGES \
-  --become-password-file "$HOME/.ssh/become"
+scripts/preprod-down.sh --seed /absolute/private/path/2026-07-22-linux-amd64
 ```
 
-Use `--ask-become-pass` instead when needed. This final step must prove that
-all owned containers, image aliases, image IDs, volumes, networks, generated
-state, hosts entries, and loopback aliases are absent. It must also prove that
-unrelated image IDs are unchanged. A pass prints one bounded receipt:
+It reads both SHA-256 values from the files themselves, so no hash is typed.
+Add `--become-password-file "$HOME/.ssh/become"` to skip the sudo prompt.
+
+This final step must prove that all owned containers, image aliases, image
+IDs, volumes, networks, generated state, hosts entries, and loopback aliases
+are absent. It must also prove that unrelated image IDs are unchanged. A pass
+prints one bounded receipt:
 
 ```text
 PREPROD_CLEAN_ROOM_OK {...}
 ```
 
-`ansible/preprod-destroy.yml` is still available for quick development
-cleanup. It preserves the test CA and does not prove absence of the exact
-manifest image set. Do not use its `PREPROD_DESTROYED_CA_PRESERVED` marker as
-release evidence.
+`scripts/preprod-down.sh` with no options is quick development cleanup. It
+preserves the test CA and does not prove absence of the exact manifest image
+set. Do not use its `PREPROD_DESTROYED_CA_PRESERVED` marker as release
+evidence.
 
 If a required check fails:
 

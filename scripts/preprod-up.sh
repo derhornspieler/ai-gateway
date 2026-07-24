@@ -187,6 +187,9 @@ Every test login is written to one private file:
   compose/secrets/preprod-test-logins.md
 
 To take it all down later:
-  ansible-playbook -i ansible/inventory/preprod.yml ansible/preprod-destroy.yml \
-    -e preprod_destroy_confirmation=DESTROY_AIGW_PREPROD --ask-become-pass
+  scripts/preprod-down.sh
+
+If you were testing a release and need the teardown receipt, point that at the
+release folder instead:
+  scripts/preprod-down.sh --seed /path/to/release-folder
 EOF

@@ -114,9 +114,24 @@ break-glass logins, and all service names. Never commit or share it.
 
 ## Clean up
 
-The test is a clean-room flow: it removes only resources owned by the
-`aigw-preprod` project before it loads, and the final teardown play proves
-removal again after testing. Follow
+For ordinary cleanup after poking around:
+
+```bash
+scripts/preprod-down.sh
+```
+
+That removes only the `aigw-preprod` resources and keeps the local test Root
+CA, so your browser does not have to trust a new one next time.
+
+If you were testing a release and need the receipt that proves every release
+image is gone, point it at the release folder instead:
+
+```bash
+scripts/preprod-down.sh --seed /path/to/your/release-folder
+```
+
+You never type a SHA-256; the script reads the hashes from the files. Save the
+`PREPROD_CLEAN_ROOM_OK` line it prints. Background:
 [finish with exact manifest teardown](../preprod.md#finish-with-exact-manifest-teardown).
 
 ## If it fails

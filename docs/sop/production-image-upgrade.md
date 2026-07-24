@@ -3,8 +3,8 @@
 Use this SOP to move an existing production VM to a new tested release. One
 controller command stages the new seed on the VM over SSH, verifies it,
 takes an encrypted backup, deploys, validates, and rolls back by itself if
-validation fails. You never copy images by hand and you never run
-`docker compose` on the VM.
+validation fails. You never copy images by hand, you never type a SHA-256,
+and you never run `docker compose` on the VM.
 
 The full background is the [image update workflow](../image-update-workflow.md).
 This SOP is the operator checklist for step 4 of that workflow.

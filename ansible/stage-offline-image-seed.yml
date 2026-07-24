@@ -52,18 +52,25 @@
           sha256: "{{ image_seed_stage_manifest_sha256 }}"
       register: image_seed_stage_controller_files
 
-    - name: Require private regular controller release files with exact hashes
+    # Integrity of a controller release file comes from its exact SHA-256, not
+    # from its read bits. Requiring exactly 0600 rejected an ordinary copied
+    # release (0644) and left the operator with no way forward, so the gate is
+    # "no other user may rewrite it". The staged target copy below is still
+    # created and re-checked as root-owned 0600.
+    - name: Require regular unwritable controller release files with exact hashes
       ansible.builtin.assert:
         that:
           - item.stat.exists
           - item.stat.isreg
           - not (item.stat.islnk | default(false))
-          - item.stat.mode == '0600'
+          - not (item.stat.wgrp | default(true))
+          - not (item.stat.woth | default(true))
           - item.stat.checksum == item.item.sha256
         quiet: true
         fail_msg: >-
-          A controller release file is missing, is not a private regular file,
-          or does not match its reviewed SHA-256.
+          A controller release file is missing, is not a regular file, is
+          writable by another user (fix: chmod go-w <path>), or does not match
+          its reviewed SHA-256.
       loop: "{{ image_seed_stage_controller_files.results }}"
 
     - name: Prove production release scope and archive allow-list before transfer
